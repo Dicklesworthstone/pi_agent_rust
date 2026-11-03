@@ -16,7 +16,8 @@
   <a href="#features">Features</a> •
   <a href="#installation">Installation</a> •
   <a href="#commands">Commands</a> •
-  <a href="#configuration">Configuration</a>
+  <a href="#configuration">Configuration</a> •
+  <a href="docs/README.md">User Guide</a>
 </p>
 
 <p align="center">
@@ -29,6 +30,21 @@
 # Install latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
 ```
+
+## Start here
+
+| What you need | Guide |
+| --- | --- |
+| Use Pi | [Quick start](#quick-start), [commands and shortcuts](docs/tui.md), [settings](docs/settings.md) |
+| Set up language servers | [Supported servers, installation, and automatic detection](docs/lsp-configuration.md) |
+| Find `/goal` | [Version and interface availability](docs/goal-mode.md#availability), [terminal quick start](docs/goal-mode.md#terminal-quick-start) |
+| Give the agent project instructions | [Skills, prompts, and context files](docs/README.md#instructions-for-the-agent-working-on-your-project) |
+| Develop Pi or integrate with it | [Contributor and API references](docs/README.md#developing-pi-and-integrating-with-it) |
+
+See the [documentation home](docs/README.md) for the full user guide. These docs
+describe `main`; use your release tag for version-matched documentation. Keep
+the full `pi --version` output, including the commit hash, when reporting a
+missing command.
 
 ---
 
@@ -2243,6 +2259,7 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
+| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). FrankenTUI only, added after the published `v0.8.0` release |
 | `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
 | `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |
@@ -3566,15 +3583,18 @@ src/
 
 ## Documentation Index
 
-This index intentionally lists the load-bearing docs, not every generated
-snapshot under `docs/`. Historical planning and review material lives in the
+For task-based user guides, start at the [documentation home](docs/README.md).
+It separates using Pi, instructions for your agent, and contributing to Pi.
+The reference index below keeps the detailed material available without listing
+every generated snapshot under `docs/`. Historical planning and review material lives in the
 [planning archive](docs/planning/); see
 [the docs classification record](docs/docs-classification-bd-we34i1.md) for the
 broader inventory.
 
 | Area | Primary docs |
 |---|---|
-| Getting started and operations | [development](docs/development.md), [terminal setup](docs/terminal-setup.md), [settings](docs/settings.md), [models](docs/models.md), [keybindings](docs/keybindings.md), [packages](docs/packages.md), [troubleshooting](docs/troubleshooting.md), [releasing](docs/releasing.md) |
+| User guides | [terminal setup](docs/terminal-setup.md), [settings](docs/settings.md), [models](docs/models.md), [keybindings](docs/keybindings.md), [LSP setup](docs/lsp-configuration.md), [goals](docs/goal-mode.md), [packages](docs/packages.md), [troubleshooting](docs/troubleshooting.md) |
+| Contributor workflow | [repository instructions](AGENTS.md), [development](docs/development.md), [testing policy](docs/testing-policy.md), [releasing](docs/releasing.md) |
 | Swarm operations and replay | [operations runbook](docs/swarm-operations-runbook.md), [replay operator workflow](docs/swarm-replay-operator-workflow.md), [activity ledger](docs/swarm-activity-ledger.md), [flight recorder](docs/swarm-flight-recorder.md) |
 | Core runtime surfaces | [session](docs/session.md), [tree](docs/tree.md), [TUI](docs/tui.md), [RPC](docs/rpc.md), [SDK](docs/sdk.md), [skills](docs/skills.md), [prompt templates](docs/prompt-templates.md), [streaming hostcalls](docs/streaming-hostcalls.md), [context intelligence](docs/context-intelligence.md) |
 | Historical legacy-Pi comparison and migration records | [retired certification contract](docs/contracts/dropin-certification-contract.json), [historical verdict](docs/evidence/dropin-certification-verdict.json), [historical parity gap ledger](docs/evidence/dropin-parity-gap-ledger.json), [historical differential suite](docs/evidence/dropin-differential-evidence-suite.json), [historical feature inventory](docs/evidence/dropin-feature-inventory-matrix.json), [migration playbook](docs/integrator-migration-playbook.md), [historical parity snapshot](docs/parity-certification.json) |

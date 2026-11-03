@@ -82,6 +82,16 @@ block is omitted for a different or untrusted workspace.
 
 ## Supported settings (snake_case JSON keys)
 
+### Language servers (LSP)
+
+Pi includes definitions for rust-analyzer, TypeScript Language Server, Pyright,
+gopls, and clangd. Install the server executable yourself; the defaults select
+and launch it lazily for matching source files. A settings entry is only needed
+to override a default or add another server.
+
+See [language-server setup and configuration](lsp-configuration.md) for the
+installation table, automatic detection behavior, and `lsp.servers` examples.
+
 ### Optional tools
 
 Persistently enable `eval`, `github`, `security_scan`, or `subagent` in the

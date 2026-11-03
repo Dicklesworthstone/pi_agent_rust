@@ -1,11 +1,197 @@
-# Language-server workspace settings
+# Language servers: setup and configuration
+
+[Documentation home](README.md) · [Settings reference](settings.md)
+
+**For Pi users:** start with installation and setup below.
+**For agents and integrators:** see the [tool and protocol reference](#tool-and-protocol-reference).
+
+Pi uses language servers for diagnostics, symbol navigation, completion, and
+refactoring. It includes **five server definitions**, but does **not install the
+server programs**. With the default tool selection, an installed server on
+`PATH` needs no `settings.json` entry for the file types below.
+
+The five defaults and executable overrides described here are available in
+`v0.8.0`. The later workspace-settings reference has a separate version note.
+
+## Quick start
+
+1. Install the server for your language from the table below.
+2. Start `pi` from your project directory, using the same environment in which
+   the server executable is available.
+3. Ask Pi: **“Use the LSP tool to check `src/main.rs` for diagnostics.”**
+   Replace `src/main.rs` with an existing source file in your project.
+
+`lsp` is an **agent tool**, not a built-in `/lsp` slash command or `pi lsp` shell
+subcommand. You request it in ordinary language. With the default tool selection,
+the agent discovers and calls it through `xdev`; it does not need an extension.
+Explicit `--tools`, `--no-tools`, or `tools.loadMode` settings can change tool
+availability.
+
+## Built-in server definitions
+
+Run installation commands in your shell. The relevant toolchain or package
+manager must already be installed.
+
+| Language and file extensions | Definition key | Executable Pi starts | Installation |
+| --- | --- | --- | --- |
+| Rust: `.rs` | `rust-analyzer` | `rust-analyzer` | `rustup component add rust-analyzer` |
+| JavaScript / TypeScript: `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs` | `typescript-language-server` | `typescript-language-server --stdio` | `npm install -g typescript-language-server typescript` |
+| Python: `.py`, `.pyi` | `pyright` | `pyright-langserver --stdio` | `npm install -g pyright` |
+| Go: `.go` | `gopls` | `gopls` | `go install golang.org/x/tools/gopls@latest` |
+| C / C++: `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp` | `clangd` | `clangd` | Debian/Ubuntu: `sudo apt install clangd`; macOS/Homebrew: `brew install llvm` |
+
+Pi supplies the arguments shown in the executable column; you do not need to
+launch these processes yourself. A server installed only inside an editor
+extension may not be available to Pi.
+
+Check the executable from the shell you use to launch Pi, for example:
+
+```sh
+command -v pyright-langserver
+```
+
+On PowerShell, use `Get-Command pyright-langserver`. For Go, ensure the install
+directory (`GOBIN`, or normally `GOPATH/bin`) is on `PATH`. Homebrew LLVM's `bin`
+directory may also need to be added to `PATH`. Alternatively, configure an
+absolute executable path as shown below.
+
+For platform options, dependencies, and compatible versions, see the upstream
+instructions for [rust-analyzer](https://rust-analyzer.github.io/book/rust_analyzer_binary.html),
+[TypeScript Language Server](https://github.com/typescript-language-server/typescript-language-server#installing),
+[Pyright](https://github.com/microsoft/pyright/blob/main/docs/installation.md),
+[gopls](https://go.dev/gopls/#installation), and
+[clangd](https://clangd.llvm.org/installation.html).
+
+## What Pi detects automatically
+
+When the agent requests an LSP operation for a source file, Pi:
+
+1. Selects a configured server by the file's extension.
+2. Walks upward from that file to the nearest directory containing any root
+   marker for that server.
+3. Falls back to Pi's working directory if no marker is found.
+4. Resolves the executable by its configured path or through `PATH`, starts it when needed,
+   and reuses the connection for that server and workspace root.
+
+| Server | Workspace-root markers |
+| --- | --- |
+| `rust-analyzer` | `Cargo.toml`, `.git` |
+| `typescript-language-server` | `package.json`, `tsconfig.json` |
+| `pyright` | `pyproject.toml`, `setup.py`, `requirements.txt` |
+| `gopls` | `go.mod`, `go.work` |
+| `clangd` | `compile_commands.json`, `compile_flags.txt`, `.git` |
+
+Pi selects and starts servers lazily. It does not install them or scan for every
+language server at startup. Ask Pi **“Show the configured and running LSP
+servers”** to inspect status. Configured entries are definitions; they do not
+prove that the executable is installed. An empty list of live servers is normal
+before a file-specific operation.
+
+To check a file, request diagnostics explicitly. For a group of files, ask for
+an active `workspace_diagnostics` scan. The `diagnostics` action with a glob
+only reads reports already cached; it does not check previously unopened files.
+See [active workspace diagnostics](lsp-workspace-diagnostics.md).
+
+## Override a built-in server
+
+Add configuration to `~/.pi/agent/settings.json` for all projects, or to a trusted
+project's `.pi/settings.json`. See [settings locations and precedence](settings.md).
+
+For example, use a specific rust-analyzer executable:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "rust-analyzer": {
+        "command": "/absolute/path/to/rust-analyzer"
+      }
+    }
+  }
+}
+```
+
+Replace the example path with your installed executable. `command` is one
+executable name or path; put command-line arguments in an `args` array rather
+than inside `command`.
+
+An entry with a built-in name overrides only the fields you supply. The example
+keeps rust-analyzer's default extensions and root markers. Supplied arrays and
+objects replace that entire field, so include every argument, extension, or
+setting you want to retain. To replace a built-in server for its existing file
+types, override its existing definition key.
+
+## Add another language server
+
+For example, install [Bash Language Server](https://github.com/bash-lsp/bash-language-server):
+
+```sh
+npm install -g bash-language-server
+```
+
+Then add:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "bash-language-server": {
+        "command": "bash-language-server",
+        "args": ["start"],
+        "languages": ["shellscript"],
+        "extensions": [".sh", ".bash"],
+        "rootMarkers": [".git"]
+      }
+    }
+  }
+}
+```
+
+A new definition needs `command` and matching `extensions` to serve files.
+Use lowercase extensions with leading dots. Supported operations depend on
+the server's capabilities.
+
+Quit and restart Pi after editing `settings.json`. The LSP `reload` action
+restarts server processes using the configuration already loaded for that tool
+instance; it does not reread the settings files.
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `LSP_SERVER_MISSING` | Read the spawn error and installation hint. Check the executable name, `PATH`, and execute permissions; use an absolute `command` path if needed. |
+| `LSP_NO_SERVER` | Check the file extension against the table, or add a matching `lsp.servers` definition. |
+| No live servers in status | Request diagnostics or capabilities for an existing source file; status alone does not start a server. |
+| Project configuration has no effect | Confirm that the project is trusted and restart Pi after editing settings. |
+| An operation returns `LSP_UNSUPPORTED` | Ask Pi to inspect the server's capabilities; individual servers support different LSP operations. |
+
+## Tool and protocol reference
+
+The JSON requests in the following sections are inputs to the agent's `lsp`
+tool. They are not terminal commands or text to paste into Pi's slash-command
+prompt. For example, the default `xdev` dispatcher can invoke LSP diagnostics
+with this tool input:
+
+```json
+{"action":"run","name":"lsp","args":{"action":"diagnostics","file":"src/main.rs"}}
+```
+
+Related references: [navigation](lsp-navigation.md),
+[completion](lsp-completion.md), [formatting](lsp-formatting.md),
+[refactor previews](lsp-refactor-previews.md),
+[project diagnostics](lsp-project-diagnostics.md), and
+[active workspace diagnostics](lsp-workspace-diagnostics.md).
+
+**Version note:** the per-server `settings` field and the `configure` action
+in the following sections were added on `main` after the published `v0.8.0`
+release. They are not included in that release.
 
 The native LSP client answers `workspace/configuration` and
 `workspace/workspaceFolders` requests, including requests made while its
 initialization is pending. These services remain installed alongside the
 selected-code-action edit handler. They never open an edit permission window.
 
-## Persist a server's settings across sessions
+### Persist a server's settings across sessions
 
 Add an explicit `settings` object to that server in global `settings.json` or a
 trusted project's `.pi/settings.json`. For example:
@@ -54,7 +240,7 @@ the connection starts with an empty response snapshot and no initial notificatio
 Queue acceptance does not establish that the server has adopted the settings or
 finished analyzing the workspace.
 
-## Inspect, preview, and explicitly replace settings
+### Inspect, preview, and explicitly replace settings
 
 Choose one server/root using an existing regular anchor file:
 
@@ -99,7 +285,7 @@ notification has no response. The local revision is not a server revision.
 A failed queue admission does not publish the new settings or advance that
 revision; the transport may be retired and prior document evidence invalidated.
 
-## Lifetime, isolation, and evidence
+### Lifetime, isolation, and evidence
 
 A replacement made through `configure` belongs to one live server connection.
 The tool does not write it into `settings.json` or persist it in the session.
@@ -122,7 +308,7 @@ workflow lane is acquired; synchronous filesystem calls cannot be preempted.
 Once a configuration notification is accepted, the operation reports that effect
 rather than describing a later cancellation as proof nothing was sent.
 
-## Server requests
+### Server requests
 
 `workspace/configuration` returns one value for each requested item, in the
 original order, including duplicates. `section` uses dot-separated nested object

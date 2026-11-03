@@ -551,6 +551,103 @@ mod tests {
     }
 
     #[test]
+    fn user_documentation_matches_builtin_server_definitions() {
+        fn table<'a>(
+            document: &'a str,
+            heading: &str,
+            header: &str,
+            columns: usize,
+        ) -> Vec<Vec<&'a str>> {
+            let section = document
+                .split_once(heading)
+                .expect("LSP guide section")
+                .1
+                .split("\n## ")
+                .next()
+                .expect("LSP guide section body");
+            let mut lines = section.lines().skip_while(|line| *line != header);
+            assert_eq!(lines.next(), Some(header), "LSP guide table header");
+            lines.next().expect("Markdown table separator");
+            lines
+                .take_while(|line| line.starts_with('|'))
+                .map(|line| {
+                    let cells: Vec<_> =
+                        line.trim_matches('|').split('|').map(str::trim).collect();
+                    assert_eq!(cells.len(), columns, "unexpected table row: {line}");
+                    cells
+                })
+                .collect()
+        }
+
+        fn sorted_code_values(cell: &str) -> Vec<&str> {
+            let mut values: Vec<_> = cell.split('`').skip(1).step_by(2).collect();
+            values.sort_unstable();
+            values
+        }
+
+        let guide = include_str!("../../docs/lsp-configuration.md");
+        let presets = table(
+            guide,
+            "## Built-in server definitions",
+            "| Language and file extensions | Definition key | Executable Pi starts | Installation |",
+            4,
+        );
+        let roots = table(
+            guide,
+            "## What Pi detects automatically",
+            "| Server | Workspace-root markers |",
+            2,
+        );
+        let servers = default_servers();
+        let mut expected_names: Vec<_> = servers
+            .iter()
+            .map(|server| format!("`{}`", server.name))
+            .collect();
+        expected_names.sort_unstable();
+        for (rows, name_column) in [(&presets, 1), (&roots, 0)] {
+            let mut names: Vec<_> = rows.iter().map(|row| row[name_column]).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                expected_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                "each table must document every built-in server exactly once"
+            );
+        }
+
+        for server in &servers {
+            let name = format!("`{}`", server.name);
+            let preset = presets.iter().find(|row| row[1] == name).expect("preset row");
+            let root = roots.iter().find(|row| row[0] == name).expect("root row");
+            let invocation = std::iter::once(server.command.as_str())
+                .chain(server.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                preset[2],
+                format!("`{invocation}`"),
+                "{} executable and arguments",
+                server.name
+            );
+            let mut extensions: Vec<_> = server.extensions.iter().map(String::as_str).collect();
+            extensions.sort_unstable();
+            assert_eq!(
+                sorted_code_values(preset[0]),
+                extensions,
+                "{} file extensions",
+                server.name
+            );
+            let mut markers: Vec<_> = server.root_markers.iter().map(String::as_str).collect();
+            markers.sort_unstable();
+            assert_eq!(
+                sorted_code_values(root[1]),
+                markers,
+                "{} workspace-root markers",
+                server.name
+            );
+        }
+    }
+
+    #[test]
     fn merge_overrides_named_server_fields() {
         let mut overrides = HashMap::new();
         overrides.insert(
