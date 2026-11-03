@@ -984,7 +984,7 @@ fn a_replaced_session_never_receives_a_deferred_planning_selection() {
     run(controller.execute(&mut first, "enter")).unwrap();
     assert!(controller.pending_model_selection.is_some());
     let (mut second, _) = role_fixture(Session::in_memory(), false);
-    run(second.enter_plan_mode(&AgentCx::for_current_or_request())).unwrap();
+    let _ = run(second.enter_plan_mode(&AgentCx::for_current_or_request())).unwrap();
     run(controller.execute(&mut second, "save")).unwrap();
     assert_eq!(second.model().0, "openai");
     assert!(controller.pending_model_selection.is_none());
