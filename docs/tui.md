@@ -1,5 +1,7 @@
 # Interactive Interface (TUI)
 
+[Documentation home](README.md) · **Audience:** people using Pi in a terminal.
+
 Pi's interactive mode provides a full-screen terminal UI for chatting, streaming
 responses, and managing sessions.
 
@@ -11,8 +13,11 @@ responses, and managing sessions.
 | `pi --inline` | FrankenTUI, inline | UI drawn at the bottom of the terminal; shell scrollback preserved |
 | `pi --classic` | charmed_rust / bubbletea (`src/interactive.rs`) | Previous stack, kept until removal; aliases `--classic-tui`, `--charmed`, `--bubbletea` |
 
-Both stacks share the agent-event vocabulary (`PiMsg`), keybinding catalog,
-slash commands, autocomplete, overlays, and session persistence.
+The stacks share the agent-event vocabulary (`PiMsg`), keybinding catalog,
+autocomplete infrastructure, and session persistence. Command availability can
+differ: `/goal` runs only in FrankenTUI builds that include the feature.
+It was added after the published `v0.8.0` release. See
+[goal availability](goal-mode.md#availability) before trying the examples.
 
 ## Layout
 
@@ -71,14 +76,18 @@ from `~/.pi/agent/keybindings.json`).
 
 ## Slash commands
 
-Type a slash command into the editor (prefix with `/`) and press Enter.
+Type a slash command into Pi's message editor (prefix with `/`) and press Enter.
+Use `/help` to see in-app help, or type a prefix such as `/go` and press Tab
+to complete a command. These are interactive commands, not shell subcommands.
 
-`/help` is the authoritative, in-app list. This section documents the current
-command surface implemented in `src/interactive.rs`.
+The table below covers commonly used commands on current `main`. Interface
+exceptions are marked explicitly. A published release can predate these docs;
+check the full `pi --version` output, including the commit hash.
 
 | Command | Description |
 |---------|-------------|
 | `/help` (`/h`, `/?`) | Show help text and shortcut tips. |
+| `/goal [status]` | Inspect an objective and its review receipt. **FrankenTUI only; added after published v0.8.0.** See the [goal quick start](goal-mode.md#terminal-quick-start) for create, step, run, pause, and complete. |
 | `/login [provider]` | Login/setup credentials (OAuth for built-ins; API key prompts for supported providers). Run without args to see status table. |
 | `/logout [provider]` | Remove stored OAuth credentials. |
 | `/clear` (`/cls`) | Clear conversation view/history. |
@@ -103,6 +112,10 @@ command surface implemented in `src/interactive.rs`.
 | `/template <name> [args]` | Expand a prompt template by name. |
 | `/share` | Upload the current branch as bounded HTML to a secret, unlisted GitHub gist and show its URL. Secret gists are not private; anyone with the URL can view them. Pi redacts recognized secrets and the exact workspace cwd, but the transcript may still contain other sensitive local context. |
 | `/exit` (`/quit`, `/q`) | Exit Pi. |
+
+Language-server operations use the agent-facing `lsp` tool, not a `/lsp`
+command. Ask Pi to use LSP in ordinary language; see
+[supported servers and setup](lsp-configuration.md).
 
 ### Model selection
 - Use `/model` to switch models (by `provider/id` or fuzzy match).

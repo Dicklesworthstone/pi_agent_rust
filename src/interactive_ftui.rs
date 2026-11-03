@@ -5039,7 +5039,7 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from(
                     "pi commands: /model or /switch [model[:level]], /queue <message>, /resume, /new, \
-                     /session, /name <name>, /plan, /compact [focus], /tree, /undo [n], /redo [n], \
+                     /session, /name <name>, /plan, /goal status, /compact [focus], /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
                      /thinking or /effort [level], /fast [on|off|status|default|flex|scale|priority|ultrafast], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
@@ -5054,7 +5054,8 @@ impl PiFtuiModel {
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
                      /context, /todo, /jobs, /stats, /settings (F2), /help, \
                      /restart, /exit, !<cmd> (runs + sends output to the agent), !!<cmd> \
-                     (display-only)",
+                     (display-only)\n\
+                     Goal guide: https://github.com/Dicklesworthstone/pi_agent_rust/blob/main/docs/goal-mode.md",
                 ),
             );
             return true;
@@ -23993,6 +23994,45 @@ mod tests {
     }
 
     // ── Slash-command completion popup (issue #208) ─────────────────────
+
+    #[test]
+    fn goal_is_discoverable_in_help_and_completion_and_dispatches_natively() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        assert!(model.route_slash_command("/help"));
+        let help = &model.transcript.last().expect("help entry").text;
+        assert!(help.contains("/goal status"));
+        assert!(help.contains("docs/goal-mode.md"));
+
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/go");
+        assert!(sim.model().completion_visible());
+        let item = &sim.model().autocomplete.items[0];
+        assert_eq!(item.insert, "/goal");
+        assert_eq!(item.kind, AutocompleteItemKind::SlashCommand);
+        assert!(
+            item.description
+                .as_deref()
+                .is_some_and(|description| description.contains("FrankenTUI only"))
+        );
+        sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "/goal");
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "accepting completion must not submit the command"
+        );
+        type_str(&mut sim, " status");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("native goal command"),
+            UiCommand::Workspace {
+                command: workspace_commands::WorkspaceCommand::Goal,
+                args: "status".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn slash_prefix_opens_completion_popup_with_descriptions() {

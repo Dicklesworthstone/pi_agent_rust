@@ -842,6 +842,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
             description: "Set thinking level (off/minimal/low/medium/high/xhigh/max)",
         },
         BuiltinSlashCommand {
+            name: "fast",
+            description: "Show or change the model's serving tier",
+        },
+        BuiltinSlashCommand {
             name: "scoped-models",
             description: "Show or set model scope patterns",
         },
@@ -924,6 +928,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         BuiltinSlashCommand {
             name: "plan",
             description: "Enter or manage read-only plan mode",
+        },
+        BuiltinSlashCommand {
+            name: "goal",
+            description: "Manage goals (FrankenTUI only; /goal status)",
         },
         BuiltinSlashCommand {
             name: "prewalk",

@@ -1,14 +1,104 @@
-# Goal-driven SDK sessions
+# Goals: terminal guide and SDK reference
 
-Pi's in-process SDK can retain an objective across several native prompts,
-stop for review, and resume with its remaining prompt/token budget. This is an
-OMP-inspired workflow. The default FrankenTUI exposes `/goal` lifecycle controls
-and bounded execution described below. There is no model-facing `goal` tool.
-The separate RPC lifecycle adapter is not the in-process execution driver.
-The types currently live in `pi::goal`, an unstable module under the library's
-public API policy; the lifecycle methods are on `AgentSessionHandle`.
+[Documentation home](README.md) · [Terminal quick start](#terminal-quick-start) ·
+[Command table](#goal-commands) · [SDK reference](#sdk-and-protocol-reference)
 
-## Default terminal: inspect and control a saved objective
+A goal keeps an objective and a prompt/token budget in your session. Use
+`/goal` in a supported FrankenTUI build to inspect it, run bounded goal prompts,
+pause, and record completion after reviewing the results.
+
+## Availability
+
+**The published `v0.8.0` release does not include `/goal`.** The terminal
+command was [added on `main` after that release](https://github.com/Dicklesworthstone/pi_agent_rust/commit/6f5d50224eb5c893139aae64ea8d6d21b3a5f8a4).
+Installing or updating to `v0.8.0` will not add it. The
+[v0.8.0 release notes](https://github.com/Dicklesworthstone/pi_agent_rust/releases/tag/v0.8.0)
+describe that release; this page describes current `main`.
+
+| Build and interface | Can I use `/goal`? | What to do |
+| --- | --- | --- |
+| Current `main`, default FrankenTUI (`pi`, `pi --ftui`, or `pi --inline`) | Yes | Enter `/goal status` in Pi's message editor while idle |
+| Current `main`, classic terminal (`pi --classic`) | No goal execution | Use the FrankenTUI interface |
+| Build without the `ftui` feature | No | Use a build that includes FrankenTUI and the goal feature |
+| Published `v0.8.0` or `v0.7.1`, either terminal | No | Use the matching release docs; these releases predate the command |
+
+If you cannot find the command, run `pi --version` in your shell and retain the
+**full output, including the commit hash**, along with the command you use to
+launch Pi. Some newer `main` builds still report package version `0.8.0`.
+In a supported build, `/help` and completion for `/go` show the command.
+Contributor build instructions are in [development](development.md).
+
+`/goal` is an interactive command, not a `pi goal` shell subcommand. There is
+no model-facing `goal` tool. SDK and RPC integrations have separate APIs,
+described in the [reference below](#sdk-and-protocol-reference).
+
+## Terminal quick start
+
+1. Start a supported FrankenTUI build in your project and enter:
+
+   ```text
+   /goal status
+   ```
+
+2. Copy the value printed after `Review:`. Replace `<review>` with that
+   actual `g1-...` receipt, then create an objective:
+
+   ```text
+   /goal create <review> --tokens 50000 --prompts 8 -- Implement and verify the parser
+   ```
+
+3. Creation records the objective but does not start work. Copy its **new**
+   receipt, then authorize up to four goal prompts:
+
+   ```text
+   /goal run <review> --steps 4
+   ```
+
+4. Review the result and run `/goal status` again before another change. Use
+   the latest receipt for `pause`, `resume`, a budget revision, or completion.
+   To attest completion after checking the deliverables:
+
+   ```text
+   /goal complete <review> -- Inspected the parser changes and checked the results
+   ```
+
+A receipt identifies the session state you reviewed. Do not reuse an old one
+after changing the goal or conversation. If Pi reports `GOAL_STALE`, inspect
+`/goal status` again and use its new receipt. Turn off plan mode before creating
+or resuming a goal.
+
+While a goal is running, the default Esc interrupt binding requests a pause.
+Wait for the result and review the returned state before continuing. If a modal
+prompt is open, its own keyboard controls take precedence.
+
+## Goal commands
+
+Use these commands while idle. Replace `<review>` with the receipt from your
+most recent review. Text after `--` is literal objective text, a reason, or
+completion evidence.
+
+| Command | Result |
+| --- | --- |
+| `/goal` or `/goal status` | Show the objective, state, usage, and current receipt |
+| `/goal create <review> --tokens 50000 --prompts 8 -- <objective>` | Record an objective; does not run the agent |
+| `/goal step <review>` | Run at most one goal prompt |
+| `/goal run <review> --steps 4` | Run at most four goal prompts; accepts 1–32 |
+| `/goal pause <review>` | Pause the objective |
+| `/goal resume <review>` | Reactivate a paused objective without resetting usage; does not start a run |
+| `/goal budget <review> --tokens 150000 --prompts 24 -- <reason>` | Revise both total allowances while retaining spent usage |
+| `/goal complete <review> -- <evidence>` | Record your completion attestation |
+| `/goal drop <review> -- <reason>` | Drop the objective while retaining history |
+| `/goal save <review>` | Retry saving the current goal after a save failure |
+
+`step` and `run` also respect the remaining goal budget, native turn limits,
+and a 15-minute execution limit. They can stop earlier for lack of progress,
+errors, cancellation, or persistence problems. They never attest completion
+for you. Ordinary chat prompts do not run the goal driver or consume its prompt
+allowance; the detailed accounting rules are in the reference below.
+
+## Terminal reference
+
+### Default terminal: inspect and control a saved objective
 
 In the default FrankenTUI, run `/goal` or `/goal status` while idle. It displays
 the current branch's objective, state, prompt/token accounting, interruption
@@ -102,11 +192,21 @@ must use the SDK runner with a real verifier. Ordinary terminal prompts do not
 invoke the bounded goal driver, consume its prompt counter, or become governed
 by its token budget; active-interval assistant usage is still accounted by the
 journal.
-The classic terminal is unchanged. Regression coverage uses native sessions in
+The classic terminal does not execute goals. Regression coverage uses native sessions in
 `src/goal/terminal/tests.rs` and the default routing/driver in
 `src/interactive_ftui/workspace_commands.rs`; authored tests still require DSR.
 
-## Create an objective and drive it
+## SDK and protocol reference
+
+**Audience:** applications embedding Pi and agents working on Pi's implementation.
+Terminal users can follow the quick start and command table above.
+
+Pi's in-process SDK retains objectives across native prompts. The types live in
+`pi::goal`, an unstable module under the library's public API policy; lifecycle
+methods are on `AgentSessionHandle`. The separate RPC lifecycle adapter is not
+the in-process execution driver.
+
+### Create an objective and drive it
 
 Call `AgentSessionHandle::run_goal` on a borrowed handle, or convert it once with
 `handle.into_goal_session()` for an owned convenience wrapper. Both use the same
@@ -170,7 +270,7 @@ should inspect the actual deliverables and verification results. The callback
 is synchronous; it cannot be preempted. The driver rechecks cancellation and
 time after the callback and again before publishing its decision.
 
-## Await real host verification
+### Await real host verification
 
 `run_goal_with_verifier` is available on both `AgentSessionHandle` and
 `GoalSession`. Its host-supplied callback returns a future with output
@@ -245,7 +345,7 @@ queueing it for another prompt. Keep pending host input separately until the
 next explicit run. No autonomous verifier selection or model-facing completion
 tool is introduced by these SDK methods.
 
-## Limits and accounting
+### Limits and accounting
 
 Both budgets are mandatory: `max_prompts` is 1–1024 and `token_budget` is positive.
 Defaults are 16 prompts and 100,000 tokens. Objectives, instructions and evidence
@@ -309,7 +409,7 @@ then review and resume the paused goal. Replacing the objective instead requires
 explicitly dropping the old goal and creating a new one. See
 [budget revisions](goal-budget-revisions.md) for limits and recovery.
 
-## Pause, input and interruption
+### Pause, input and interruption
 
 `run.control()` returns a handle tied to that run only. `pause()` latches even
 between prompts and aborts a currently running prompt. A pause that wins the
@@ -331,7 +431,7 @@ goal active. Dropping after an intent was appended leaves the goal interrupted;
 awaiting cancellation is necessary to observe native cleanup and its outcome.
 The driver does not pretend that dropping undoes tool side effects.
 
-## Persistence and reopening
+### Persistence and reopening
 
 Every lifecycle change uses a bounded `goal_checkpoint` custom entry in the
 existing session format. Queries walk the current branch, not global disk
@@ -373,7 +473,11 @@ Objective/evidence and message contents are excluded from the report's Debug
 output but remain available through explicit fields and persisted session data;
 those files are not a secrets-redaction boundary.
 
-## Validation status
+### Validation status
+
+The following notes record validation limits from earlier implementation
+sessions. They do not describe the latest release's feature set or replace a
+current DSR quality result.
 
 The goal lifecycle and runner include regression tests over native sessions,
 local HTTP/SSE requests, saved-session reopening, pause races, budget exhaustion,
@@ -395,4 +499,6 @@ verdict losing without invented journal usage. Provider responses are controlled
 Agent, goal/session control, tool execution and filesystem operations are native.
 These tests are authored, not executed. DSR was attempted again and was absent
 (exit 127). Compilation, Rust tests, formatting and Clippy remain unverified.
-This change does not complete the terminal goal keyboard-control integration.
+Current FrankenTUI also routes active-goal pause through the interrupt binding;
+see the terminal quick start above. Its presence in source does not establish
+that the required DSR validation has run.
