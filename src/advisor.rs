@@ -713,7 +713,9 @@ impl AdvisorRuntime {
         let reply = match crate::text_completion::with_timeout_and_abort(timeout, abort, call).await
         {
             Ok(Ok(reply)) => reply,
-            Ok(Err(crate::error::Error::CostCap { .. })) => return AdvisorOutcome::Quiet,
+            Ok(Err(crate::error::Error::CostCap { .. })) | Err(RequestStop::Cancelled) => {
+                return AdvisorOutcome::Quiet;
+            }
             Ok(Err(error))
                 if crate::failover::marks_credential_pool_exhausted(&error.to_string()) =>
             {
@@ -721,7 +723,6 @@ impl AdvisorRuntime {
                 // called, so do not disable it through the failure watchdog.
                 return AdvisorOutcome::Quiet;
             }
-            Err(RequestStop::Cancelled) => return AdvisorOutcome::Quiet,
             Err(RequestStop::TimedOut)
                 if remaining_time.is_some_and(|time| time < self.timeout) =>
             {
