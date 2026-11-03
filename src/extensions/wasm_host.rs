@@ -2254,7 +2254,7 @@ mod tests {
         let cwd = dir.path().to_path_buf();
 
         let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
-        state.tools = Arc::new(ToolRegistry::from_tools(vec![Box::new(SleepTool)]));
+        state.tools = Arc::new(ToolRegistry::from_tools(vec![Box::new(SleepTool)])).into();
         state
             .apply_registration(&registration_payload())
             .expect("apply registration");

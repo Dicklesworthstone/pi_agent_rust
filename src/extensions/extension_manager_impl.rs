@@ -2926,7 +2926,7 @@ impl ExtensionManager {
     }
 
     #[cfg(feature = "wasm-host")]
-    fn handle(&self) -> ExtensionManagerHandle {
+    pub(super) fn handle(&self) -> ExtensionManagerHandle {
         ExtensionManagerHandle::new(self)
     }
 
