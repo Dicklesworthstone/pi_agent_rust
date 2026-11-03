@@ -165,6 +165,8 @@ fn payload(reader: &mut impl Read, size: u64, retain: bool) -> Result<Vec<u8>> {
             .map_err(|_| archive_error("Cannot allocate TAR member buffer"))?;
     }
     let mut remaining = size;
+    // A 32 KiB read buffer in a non-recursive function: fine on the stack.
+    #[allow(clippy::large_stack_arrays)]
     let mut buffer = [0; 32 * 1024];
     while remaining != 0 {
         let count = buffer.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
