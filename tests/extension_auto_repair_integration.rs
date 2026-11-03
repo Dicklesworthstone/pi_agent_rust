@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Integration tests: verify auto-repair with real-ish extension patterns (bd-k5q5.8.7).
 //!
 //! These tests simulate the structural patterns found in real community

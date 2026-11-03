@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Unit tests for the node:buffer (`Buffer`) shim (bd-1av0.6).
 //!
 //! Tests verify that `Buffer` follows Node.js semantics: `from`/`alloc`/`concat`

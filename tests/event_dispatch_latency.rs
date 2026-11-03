@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Extension event dispatch latency benchmarks (bd-1m27).
 //!
 //! Measures round-trip time for event dispatch through the extension pipeline:

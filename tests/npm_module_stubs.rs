@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Tests for npm package virtual module stubs (bd-3opk).
 //!
 //! Verifies that extensions can import the stubbed npm packages and

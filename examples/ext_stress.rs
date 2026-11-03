@@ -1,3 +1,8 @@
+// Examples are separate crates, so src/lib.rs's `recursion_limit` does not
+// reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Extension stress test harness: memory/RSS + event dispatch latency.
 #![forbid(unsafe_code)]
 

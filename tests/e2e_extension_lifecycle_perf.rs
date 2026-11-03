@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! E2E extension lifecycle and performance diagnostics (bd-3ar8v.4.9).
 //!
 //! Covers the full extension lifecycle: load → init → tool-call → event-hook →

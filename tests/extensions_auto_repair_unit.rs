@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Comprehensive unit test suite for all auto-repair patterns (bd-k5q5.8.9).
 //!
 //! Tests individual repair functions in isolation with synthetic inputs.

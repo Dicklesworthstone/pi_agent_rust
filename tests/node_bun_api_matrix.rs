@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Runtime compatibility unit-test matrix for Node and Bun API surfaces (bd-k5q5.7.3).
 //!
 //! Systematically tests every untested virtual module stub to verify that

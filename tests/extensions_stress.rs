@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Memory profiling and stress test for concurrent extensions (bd-3dxz).
 //!
 //! Loads 10+ extensions simultaneously, fires events at a controlled rate,

@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! E2E: Extension Registration lifecycle with detailed JSONL logging (bd-229v, bd-nh33).
 //!
 //! This test loads a real `.mjs` extension through the full JS → Rust pipeline,

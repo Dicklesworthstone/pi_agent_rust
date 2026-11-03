@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Integration tests for the shape-aware conformance harness (bd-ljzb).
 //!
 //! These tests load real base fixtures through the `QuickJS` runtime and verify
