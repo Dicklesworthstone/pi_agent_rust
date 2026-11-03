@@ -278,7 +278,8 @@ fn observed_url() -> (
     let (sender, receiver) = futures::channel::oneshot::channel();
     let sender = Mutex::new(Some(sender));
     (Arc::new(move |url: &str| {
-        if let Some(sender) = sender.lock().expect("URL sender").take() {
+        let taken = sender.lock().expect("URL sender").take();
+        if let Some(sender) = taken {
             sender.send(url.to_string()).expect("browser observer");
         }
     }), receiver)
