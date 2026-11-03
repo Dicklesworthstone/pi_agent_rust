@@ -44,7 +44,7 @@ pub(super) fn anthropic_tool_schema(schema: &Value) -> Cow<'_, Value> {
         if wire
             .get(key)
             .and_then(Value::as_array)
-            .is_none_or(|variants| variants.is_empty())
+            .is_none_or(std::vec::Vec::is_empty)
         {
             continue;
         }
