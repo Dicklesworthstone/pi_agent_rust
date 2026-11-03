@@ -228,6 +228,11 @@
 
 ## 8. Terminal UI
 
+> **Scope of these rows:** "Implemented" means the feature exists in Pi Rust
+> and has tests of its own behavior. It is not a claim that the interactive TUI
+> looks or responds like the TypeScript Pi TUI: no test compares the two, and
+> the snapshot tests record Pi Rust's own output.
+
 ### 8.1 Non-Interactive Output (rich_rust)
 
 | Feature | Status | Rust Location | Tests | Notes |

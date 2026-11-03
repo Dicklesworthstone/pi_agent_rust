@@ -714,6 +714,13 @@ The report includes:
 - **Filesystem scope**: Extension/workspace access retains its existing policy.
   Persistent application namespaces are separate, owner-scoped data grants;
   they do not authorize arbitrary HOME access or native addon loading.
+- **Compaction cancellation**: `compact()` / `ctx.compact()` called with a
+  signal that is already aborted rejects with an `AbortError` before any host
+  work starts. An abort that fires
+  while the compaction is running is not propagated: no JavaScript abort
+  handler runs until the compact hostcall returns. The dedicated
+  `session_before_compact` budget (300 seconds) and the provider request
+  timeout bound the call instead.
 
 ### Remaining Failure Buckets (18/223)
 
