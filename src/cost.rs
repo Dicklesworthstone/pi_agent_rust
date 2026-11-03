@@ -1336,6 +1336,9 @@ fn load_session_ledgers(
         }
     }
     for account in &closed {
+        // A closed counter is final: any difference from the covered total,
+        // however small, is an error, so the exact comparison is intended.
+        #[allow(clippy::float_cmp)]
         if let Some(writer) = journal.writers.get(account)
             && (writer.own_total > covered[account]
                 || (writer.closed && writer.own_total != covered[account]))

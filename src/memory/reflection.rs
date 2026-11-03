@@ -630,6 +630,8 @@ mod tests {
     }
 
     #[test]
+    // The cost-cap error carries the exact configured values, so `==` is intended.
+    #[allow(clippy::float_cmp)]
     fn reflection_uses_the_live_registry_budget_across_snapshots() {
         struct CostProbe(std::sync::atomic::AtomicUsize);
 

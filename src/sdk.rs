@@ -9521,6 +9521,8 @@ mod tests {
     }
 
     #[test]
+    // The cost-cap error carries the exact configured values, so `==` is intended.
+    #[allow(clippy::float_cmp)]
     fn shared_replacement_recovers_late_bills_after_both_handles_are_closed() {
         for store_kind in [
             crate::session::SessionStoreKind::Jsonl,

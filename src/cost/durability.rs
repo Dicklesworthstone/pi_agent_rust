@@ -670,6 +670,9 @@ impl Origin {
         // Only this account owns its finalized counter. A decreasing local
         // counter is an accounting error; relayed observations below may be
         // older than another process's already-persisted observation.
+        // A closed counter is final: any change to its total, however small,
+        // is an error, so the exact comparison is intended.
+        #[allow(clippy::float_cmp)]
         if writer.baseline_own > own.baseline_own
             || writer.own_total > own.own_total
             || (writer.closed && (!own.closed || writer.own_total != own.own_total))

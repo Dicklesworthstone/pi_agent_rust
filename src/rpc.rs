@@ -18179,6 +18179,8 @@ mod tests {
     }
 
     #[test]
+    // The cost-cap error carries the exact configured values, so `==` is intended.
+    #[allow(clippy::float_cmp)]
     fn rpc_manual_compaction_commits_its_bill_and_refreshes_credentials_before_acknowledging() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))

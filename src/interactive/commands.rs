@@ -6113,6 +6113,8 @@ mod tests {
     }
 
     #[test]
+    // The cost-cap error carries the exact configured values, so `==` is intended.
+    #[allow(clippy::float_cmp)]
     fn saved_fork_install_keeps_late_cost_ancestry_after_the_app_is_dropped() {
         let temp = TempDir::new().unwrap();
         let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
