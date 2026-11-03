@@ -3,7 +3,7 @@
 //! Prompt and system are data, not selectors for credentials, tools or history.
 //! A completion uses the same privacy floor and terminal collector as a judgment.
 
-use super::{Judge, Protect};
+use super::{Judge, JudgmentFailure, Protect};
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent, UserContent};
 use serde_json::Value;
@@ -166,6 +166,17 @@ impl Judge {
         &self,
         prepared: PreparedCompletion,
     ) -> Result<Value> {
+        self.run_prepared_completion_attempt(&prepared)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Borrow the screened request so a retained caller can try an explicitly
+    /// configured fallback without re-reading images or weakening its schema.
+    pub(crate) async fn run_prepared_completion_attempt(
+        &self,
+        prepared: &PreparedCompletion,
+    ) -> std::result::Result<Value, JudgmentFailure> {
         let PreparedCompletion {
             prompt,
             system,
@@ -174,19 +185,27 @@ impl Judge {
             images,
         } = prepared;
         let image_count = images.len();
-        let (text, usage) = if image_count == 0 {
-            self.request_text(system, prompt, max_tokens).await?
+        self.check_image_support(image_count > 0)?;
+        let content = if image_count == 0 {
+            UserContent::Text(prompt.clone())
         } else {
             let mut blocks = Vec::with_capacity(image_count + 1);
-            blocks.push(ContentBlock::Text(TextContent::new(prompt)));
-            blocks.extend(images.into_iter().map(ContentBlock::Image));
-            self.request_content(system, UserContent::Blocks(blocks), max_tokens)
-                .await?
+            blocks.push(ContentBlock::Text(TextContent::new(prompt.clone())));
+            blocks.extend(images.iter().cloned().map(ContentBlock::Image));
+            UserContent::Blocks(blocks)
         };
+        let (text, usage) = self
+            .request_content_attempt(system.clone(), content, *max_tokens)
+            .await?;
         let data = schema
             .as_ref()
             .map(|schema| schema.answer(&text))
-            .transpose()?;
+            .transpose()
+            .map_err(|error| JudgmentFailure {
+                error,
+                retryable: true,
+                fallback_usage_limit: Some(false),
+            })?;
         let mut reply = self.reply(
             "pi.completion.v1",
             "text",

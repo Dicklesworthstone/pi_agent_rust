@@ -260,12 +260,18 @@ where
                     "tool-free text completion requested a tool call",
                 ));
             }
-            StreamEvent::Error { error, .. } => {
+            StreamEvent::Error { reason, error } => {
+                if reason == StopReason::Aborted || error.stop_reason == StopReason::Aborted {
+                    return Err(Error::Aborted);
+                }
                 return Err(Error::api(error.error_message.unwrap_or_else(|| {
                     "provider reported a failed text completion".to_string()
                 })));
             }
             StreamEvent::Done { reason, message } => {
+                if reason == StopReason::Aborted || message.stop_reason == StopReason::Aborted {
+                    return Err(Error::Aborted);
+                }
                 if let Some(error) = message.error_message {
                     return Err(Error::api(error));
                 }
@@ -312,7 +318,7 @@ where
 
 /// Yield exactly once after real progress. An idle provider is never
 /// self-woken: its next() future continues to own readiness notification.
-async fn yield_ready_batch() {
+pub(crate) async fn yield_ready_batch() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {
         if yielded {
@@ -353,6 +359,37 @@ mod tests {
 
     async fn read(events: Vec<StreamEvent>, max_bytes: usize) -> Result<String> {
         collect_text(futures::stream::iter(events.into_iter().map(Ok)), max_bytes).await
+    }
+
+    #[test]
+    fn terminal_abort_stays_typed_for_callers_with_fallback_candidates() {
+        futures::executor::block_on(async {
+            for (event_reason, message_reason) in [
+                (StopReason::Aborted, StopReason::Stop),
+                (StopReason::Stop, StopReason::Aborted),
+            ] {
+                for is_error in [false, true] {
+                    let message = AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("partial answer"))],
+                        stop_reason: message_reason,
+                        error_message: Some("provider cancellation".to_string()),
+                        ..Default::default()
+                    };
+                    let event = if is_error {
+                        StreamEvent::Error {
+                            reason: event_reason,
+                            error: message,
+                        }
+                    } else {
+                        StreamEvent::Done {
+                            reason: event_reason,
+                            message,
+                        }
+                    };
+                    assert!(matches!(read(vec![event], 64).await, Err(Error::Aborted))); // ubs:ignore -- Regression requires a typed terminal abort, never a retryable API error.
+                }
+            }
+        });
     }
 
     #[test]

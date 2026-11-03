@@ -4,7 +4,9 @@
 //! start. The retained future owns prepared inputs and a bound provider; it
 //! never owns an Agent borrow, tool host, interpreter or privacy callback.
 
-use super::{Invocation, MAX_CALLS, MAX_TOOL_CALLS, batch, completion, images, public_error};
+use super::{
+    BoundModels, Invocation, MAX_CALLS, MAX_TOOL_CALLS, batch, completion, images, public_error,
+};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::judgment::{
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 const ACK_SCHEMA: &str = "pi.eval.model-job.v1";
 const RESULT_SCHEMA: &str = "pi.eval.model-job.result.v1";
 const PROGRESS_SCHEMA: &str = "pi.eval.model-job.progress.v1";
+const ATTEMPTS_SCHEMA: &str = "pi.eval.model-job.attempts.v1";
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 // Leave room for receipts and the native ToolOutput envelope under jobs' 1 MiB.
 const MAX_RESULT_BYTES: usize = 768 * 1024;
@@ -320,7 +323,7 @@ impl Invocation<'_> {
                     .into(),
             );
         }
-        let count = request.count();
+        let mut count = request.count();
         let item_count = match &request {
             Request::Batch(plan, _) => plan.items.len(),
             _ => 1,
@@ -375,13 +378,29 @@ impl Invocation<'_> {
             tool.require_eval_session(&owner_id).await.map_err(|_| {
                 "PI_MODEL_JOB_SESSION_CHANGED: owner changed during admission".to_string()
             })?;
-            let judge = self
-                .bound_judge(&tool.cwd, selection.as_ref())
+            let models = self
+                .bound_models(&tool.cwd, selection.as_ref(), matches!(operation, Operation::Completion | Operation::Judgment), request.has_images())
                 .await
-                .map_err(|error| operation.error(error))?;
-            judge
+                .map_err(|error| operation.error(error))?
+                .for_request(matches!(operation, Operation::Completion | Operation::Judgment), request.has_images());
+            checkpoint(&owner, deadline).map_err(|error| error.to_string())?;
+            models.primary
                 .check_image_support(request.has_images())
                 .map_err(|error| operation.error(error))?;
+            let extra = models.len() - 1;
+            if extra > MAX_CALLS.saturating_sub(self.receipts.len()) {
+                return Err("PI_MODEL_JOB_LIMIT: configured fallback attempts exceed this cell's remaining model budget".into());
+            }
+            // Freeze and reserve the entire route before reading evidence or
+            // starting a job. A later cell cannot extend this attempt budget.
+            for index in count..count + extra {
+                self.receipts.push(json!({
+                    "attempt": base + index + 1, "operation":operation.name(),
+                    "background":true, "reserved":true, "selectedModel":selection,
+                    "status":"not_started", "usage":null, "usageKnown":false,
+                }));
+            }
+            count += extra;
             self.check_image_reads(request.path_count())
                 .map_err(|error| operation.error(error))?;
             let attached = self.attach_background(request, &owner, deadline).await?;
@@ -394,7 +413,7 @@ impl Invocation<'_> {
                 .capture_json(&text)
                 .map_err(|error| operation.error(error))?;
             let prepared = attached
-                .prepare(&judge, &privacy)
+                .prepare(&models.primary, &privacy)
                 .map_err(|error| operation.error(error))?;
             let label = Value::String(operation.label().into());
             if privacy
@@ -426,7 +445,7 @@ impl Invocation<'_> {
                     let progress = start_rx.await.map_err(|_| stopped())?;
                     prepared
                         .run(
-                            judge,
+                            models,
                             operation,
                             base,
                             result_privacy,
@@ -700,6 +719,31 @@ impl JobProgress {
         // publisher separately withdraws progress if its own screening fails.
         crate::jobs::publish_owned_task_progress(&self.owner, &self.id, partial, privacy)
     }
+
+    fn publish_attempts(
+        &self,
+        operation: Operation,
+        receipts: &[Value],
+        privacy: &AuxiliaryPrivacySnapshot,
+    ) -> Result<()> {
+        let partial = self.screened(screen_output(
+            operation,
+            &ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Background {}: {} model attempt(s) observed.",
+                    operation.name(),
+                    receipts.len(),
+                )))],
+                details: Some(json!({
+                    "schema":ATTEMPTS_SCHEMA, "operation":operation.name(), "complete":false,
+                    "judgments":{"schema":"pi.eval.judgments.v1","attempts":receipts},
+                })),
+                is_error: false,
+            },
+            privacy,
+        ))?;
+        crate::jobs::publish_owned_task_progress(&self.owner, &self.id, partial, privacy)
+    }
 }
 
 enum BatchItem {
@@ -888,7 +932,7 @@ impl BatchProgress {
 impl Prepared {
     async fn run(
         self,
-        judge: Judge,
+        models: BoundModels,
         operation: Operation,
         base: usize,
         privacy: AuxiliaryPrivacySnapshot,
@@ -903,7 +947,7 @@ impl Prepared {
         check()?;
         let result = crate::text_completion::with_timeout(
             deadline.saturating_duration_since(Instant::now()),
-            self.run_prepared(judge, operation, base, privacy, deadline, progress),
+            self.run_prepared(models, operation, base, privacy, deadline, progress),
         )
         .await
         .map_err(|stop| {
@@ -920,7 +964,7 @@ impl Prepared {
 
     async fn run_prepared(
         self,
-        judge: Judge,
+        models: BoundModels,
         operation: Operation,
         base: usize,
         privacy: AuxiliaryPrivacySnapshot,
@@ -928,35 +972,10 @@ impl Prepared {
         progress: Option<JobProgress>,
     ) -> Result<ToolOutput> {
         match self {
-            Self::Completion(prepared) => {
-                let result = judge.run_prepared_completion(prepared).await;
-                let receipt = attempt(base, operation, &result);
-                match result {
-                    Ok(value) => output(operation, value, &[receipt], None, false, &privacy),
-                    Err(error) => output(
-                        operation,
-                        Value::Null,
-                        &[receipt],
-                        Some(operation.error(error)),
-                        true,
-                        &privacy,
-                    ),
-                }
-            }
-            Self::Judgment(prepared) => {
-                let result = judge.run_prepared_judgment(prepared).await;
-                let receipt = attempt(base, operation, &result);
-                match result {
-                    Ok(value) => output(operation, value, &[receipt], None, false, &privacy),
-                    Err(error) => output(
-                        operation,
-                        Value::Null,
-                        &[receipt],
-                        Some(operation.error(error)),
-                        true,
-                        &privacy,
-                    ),
-                }
+            single @ (Self::Completion(_) | Self::Judgment(_)) => {
+                single
+                    .run_models(models, operation, base, privacy, deadline, progress)
+                    .await
             }
             Self::Batch(items, concurrency, options) => {
                 let progress = progress.ok_or_else(stopped)?;
@@ -974,7 +993,7 @@ impl Prepared {
                         };
                         progress.screened(batch.running(index))?;
                         admitted = true;
-                        let judge = judge.clone();
+                        let judge = models.primary.clone(); // ubs:ignore -- Each bounded concurrent batch item needs its own Arc-backed model binding.
                         let item_owner = owner.clone();
                         let (key, request) = items[index].clone();
                         active.push(async move {
@@ -1011,6 +1030,103 @@ impl Prepared {
                 progress.screened(batch.finish(&privacy))
             }
         }
+    }
+
+    /// A failed request can change models only through this frozen route.
+    /// Every attempt reuses the same screened evidence and absolute deadline;
+    /// the Judge's provider gate and shared session spend cap remain in force.
+    async fn run_models(
+        self,
+        models: BoundModels,
+        operation: Operation,
+        base: usize,
+        privacy: AuxiliaryPrivacySnapshot,
+        deadline: Instant,
+        progress: Option<JobProgress>,
+    ) -> Result<ToolOutput> {
+        let owner = AgentCx::for_current_or_request();
+        let total = models.len();
+        let policy = models.policy;
+        let mut receipts = Vec::with_capacity(total);
+        for (index, judge) in std::iter::once(models.primary)
+            .chain(models.fallbacks)
+            .enumerate()
+        {
+            checkpoint(&owner, deadline)?;
+            let mut receipt = judge.binding_info();
+            let fields = receipt.as_object_mut().ok_or_else(stopped)?;
+            fields.extend(serde_json::Map::from_iter([
+                ("attempt".into(), json!(base + index + 1)),
+                ("operation".into(), json!(operation.name())),
+                ("status".into(), json!("running")),
+                ("usage".into(), Value::Null),
+                ("usageKnown".into(), json!(false)),
+            ]));
+            receipts.push(receipt);
+            if operation != Operation::LegacyCompletion
+                && let Some(progress) = &progress
+            {
+                progress.publish_attempts(operation, &receipts, &privacy)?;
+            }
+            let outcome = match &self {
+                Self::Completion(prepared) => judge.run_prepared_completion_attempt(prepared).await,
+                Self::Judgment(prepared) => {
+                    judge.run_prepared_judgment_attempt(prepared.clone()).await // ubs:ignore -- Each bounded attempt owns the same already-admitted evidence; never reread input between models.
+                }
+                Self::Batch(..) => return Err(stopped()),
+            };
+            let fallback = index + 1 < total
+                && outcome
+                    .as_ref()
+                    .is_err_and(|failure| failure.allows_fallback(policy));
+            let result = outcome.map_err(|failure| failure.error);
+            let Value::Object(settled) = attempt(base + index, operation, &result) else {
+                return Err(stopped());
+            };
+            let fields = receipts
+                .last_mut()
+                .and_then(Value::as_object_mut)
+                .ok_or_else(stopped)?;
+            fields.extend(settled);
+            fields.insert("fallbackScheduled".into(), json!(fallback));
+            // Screen the final answer before publishing its receipt or
+            // checking cancellation: new provider text can invalidate an
+            // earlier observation even when cancellation wins settlement.
+            let terminal = if fallback {
+                None
+            } else {
+                let result = match result {
+                    Ok(value) => output(operation, value, &receipts, None, false, &privacy),
+                    Err(error) => output(
+                        operation,
+                        Value::Null,
+                        &receipts,
+                        Some(operation.error(error)),
+                        true,
+                        &privacy,
+                    ),
+                };
+                Some(match progress.as_ref() {
+                    Some(progress) => progress.screened(result)?,
+                    None => result?,
+                })
+            };
+            if operation != Operation::LegacyCompletion
+                && let Some(progress) = &progress
+            {
+                progress.publish_attempts(operation, &receipts, &privacy)?;
+            }
+            // Settle a completed observation before checking whether another
+            // request can start. Publication still uses the jobs registry's
+            // atomic cancellation fence: if cancellation wins, the last
+            // accepted running receipt remains an explicitly unknown outcome.
+            checkpoint(&owner, deadline)?;
+            if fallback {
+                continue;
+            }
+            return terminal.ok_or_else(stopped);
+        }
+        Err(stopped())
     }
 }
 

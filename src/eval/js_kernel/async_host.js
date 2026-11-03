@@ -173,7 +173,7 @@
         return payload;
     };
     const checkModelProgress = (job, result, wrapperSchema) => {
-        if (job.operation !== 'judgment_batch' || !modelRecord(result) || !isArray(result.content)
+        if (!modelRecord(result) || !isArray(result.content)
             || (hasOwn(result,'isError') && typeof result.isError !== 'boolean')
             || !modelRecord(result.details) || result.details.schema !== wrapperSchema) throw modelProtocol();
         const partial = result.details.partialResult;
@@ -181,6 +181,24 @@
             || (hasOwn(partial,'isError') && partial.isError !== false)
             || !modelRecord(partial.details)) throw modelProtocol();
         const progress = partial.details;
+        if (job.operation !== 'judgment_batch') {
+            if (progress.schema !== 'pi.eval.model-job.attempts.v1' || progress.operation !== job.operation
+                || progress.complete !== false || !modelRecord(progress.judgments)
+                || progress.judgments.schema !== 'pi.eval.judgments.v1'
+                || !isArray(progress.judgments.attempts) || progress.judgments.attempts.length < 1
+                || progress.judgments.attempts.length > 16) throw modelProtocol();
+            let previous = 0;
+            for (const receipt of progress.judgments.attempts) {
+                if (!modelRecord(receipt) || !integer(receipt.attempt) || receipt.attempt < 1 || receipt.attempt > 16
+                    || previous && receipt.attempt !== previous + 1 || receipt.operation !== job.operation
+                    || !['running','failed','completed'].includes(receipt.status)
+                    || typeof receipt.usageKnown !== 'boolean' || !hasOwn(receipt,'usage')
+                    || ['model','provider','modelId','api'].some(name => typeof receipt[name] !== 'string')
+                    || receipt.status === 'failed' && (typeof receipt.error !== 'string' || !receipt.error)) throw modelProtocol();
+                previous = receipt.attempt;
+            }
+            return progress;
+        }
         if (progress.schema !== 'pi.eval.model-job.progress.v1' || progress.operation !== 'judgment_batch'
             || progress.complete !== false || !integer(progress.total) || progress.total < 1 || progress.total > 16
             || !isArray(progress.items) || progress.items.length !== progress.total
@@ -409,6 +427,19 @@
         async status() { return readModelJob(this,'wait',0); }
         async done() { return (await this.status()).status !== 'running'; }
         async output() { return (await this.status()).result ?? null; }
+        async attempts() {
+            const snapshot = await this.status();
+            let details = snapshot.result?.details;
+            if (!details) return [];
+            if (details.schema === 'pi.host_job.progress.v1' || details.schema === 'pi.host_job.interrupted.v1') {
+                details = details.partialResult.details;
+            }
+            const receipts = details.judgments?.attempts;
+            if (!isArray(receipts) || receipts.length > 16 || receipts.some(receipt => !modelRecord(receipt))) {
+                throw modelProtocol();
+            }
+            return receipts;
+        }
         async progress() {
             if (this.operation !== 'judgment_batch') {
                 throw new TypeErrorType('EVAL_MODEL_INPUT: progress is available only for judgment batches');

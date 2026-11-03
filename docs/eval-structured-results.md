@@ -157,8 +157,9 @@ The factories are asynchronous: **await the factory to get a handle**. Options
 use an object in JavaScript and keyword arguments in Python. Unknown options,
 including `intent`, are rejected. Requests use the
 launching cell's native binding unless they explicitly select a configured
-model role as described below, with no model fallback. Single completions and
-judgments make one attempt; retained batches can explicitly enable bounded retries.
+model role as described below. Single completions and judgments make one
+attempt by default; trusted settings can enable the bounded fallback routes
+below. Retained batches can explicitly enable bounded retries.
 Completion and
 judgment images use the existing path or embedded-image
 format; batch images map literal state keys or canonical array indices to
@@ -166,6 +167,84 @@ attachment lists. Image reads finish through the current Agent's enabled `read`
 tool before background provider admission. The selected model must declare
 image support, including when a completion also supplies a JSON Schema. Text
 privacy screening does not redact pixels or perform OCR.
+
+### Configured model fallback and attempt inspection
+
+Retained `completion()` and `judge()` jobs can recover through an explicitly
+configured `retry.fallbackChains` route. For example, trusted settings may
+contain the following, with every model registered and credentialed in the
+host catalog:
+
+```json
+{
+  "modelRoles": {"smol": "openai/gpt-5-mini"},
+  "retry": {
+    "enabled": true,
+    "maxRetries": 2,
+    "modelFallback": true,
+    "fallbackOn": "any",
+    "fallbackChains": {
+      "smol": ["openai/gpt-5:low", "anthropic/claude-sonnet-4-5"]
+    }
+  }
+}
+```
+
+The requested role's chain takes precedence over an exact `provider/model`
+chain. A named selection uses only its exact model chain; it does not inherit
+the `default` role. An explicitly empty chain disables recovery for its key.
+Nested exact-model chains expand in order, with cycles and duplicate
+model/effective-thinking pairs removed. Disabled, unregistered, uncredentialed
+or unsupported-image secondary destinations are skipped before admission.
+The primary selection must resolve successfully: missing primary credentials,
+an unset role or unsupported primary image input still fails without model
+substitution. An SDK host-bound `Judge` always remains a fixed binding.
+
+Each admitted route has at most `maxRetries + 1` requests, including the
+primary, and reserves all of them against the cell's shared **16-attempt**
+budget before image reads or provider work. This follows native `maxRetries`
+semantics; OMP v18.16 instead uses that setting as its total request cap. At
+most 64 distinct configured candidates are examined while preparing a route;
+skipped candidates consume no request reservation. Unused reservations remain
+unavailable to other calls in that cell. There are no automatic same-model
+retries without an explicit distinct effective-thinking candidate.
+
+Only malformed model answers and classified retryable provider failures can
+advance the route. `fallbackOn` supports `any`, `usage-limit` and
+`except-usage-limit`; usage exhaustion is distinguished from temporary
+rate/concurrency throttling. Authentication, policy, privacy, permission,
+cancellation, timeout, invalid-input and session cost-cap failures stop the
+job. All attempts use the same prepared prompt, images, output schema or
+judgment rubric, privacy snapshot, session cost budget and original deadline.
+The global auxiliary-provider concurrency bound also applies to fallbacks.
+Later settings or cells cannot extend or retarget an accepted route.
+
+Both kernels provide an asynchronous `attempts()` method:
+
+```javascript
+display(await extraction.attempts());
+```
+
+```python
+display(await extraction.attempts())
+```
+
+Receipts identify the actual `model`, `provider`, `modelId`, `api` and
+`thinkingLevel`, their cell-wide `attempt` number, `status`, `usageKnown`,
+`usage`, and the sanitized error or completed outcome. Settled attempts also
+report `fallbackScheduled`. Reading receipts goes through current native job
+access checks and works after attaching by job ID in a later cell. Running
+attempts have unknown usage; cancellation preserves the last accepted
+observation, which may still say `running` if settlement was never accepted.
+The terminal native job status remains authoritative. Provider diagnostic
+bodies and credentials are never included.
+
+Fallback applies only to these two retained helpers. Foreground raw model
+operations, legacy `__pi_complete_start`, and retained judgment batches keep
+their fixed model binding and never resolve fallback credentials. Batch
+`retries` remains the separate per-item policy described next. With no
+configured chain, or with retry/model fallback disabled, all existing
+single-attempt behavior remains unchanged.
 
 ### Retained batch retries and minimum successful items
 
@@ -239,8 +318,9 @@ values are role names only, not arbitrary provider/model strings, endpoints,
 credentials or thinking overrides. A host-bound SDK `Judge` remains fixed and
 rejects helper role overrides.
 
-Each distinct selection resolves once on first use in the current cell. The
-native job captures that concrete provider, credentials, thinking level and
+Each distinct selection, fixed/fallback policy and fallback image requirement
+resolves once on first use in the current cell. The native job captures its concrete providers,
+credentials, thinking levels and
 privacy snapshot; later cells and settings changes do not retarget accepted
 work. The launch receipt records `selectedModel`, and successful results retain
 the actual `provider` and `modelId`. All roles share the existing 16-attempt
@@ -258,9 +338,10 @@ optional `model` role field under these rules.
 | Handle operation | Behavior |
 |---|---|
 | `id`, `jobId` / `job_id`, `operation` | Native job identity and immutable operation kind in JavaScript; read-only public properties in Python |
-| `status()` | Current native job snapshot, including `status` and any published result or batch progress |
+| `status()` | Current native job snapshot, including `status` and any published result or progress |
 | `done()` | Whether native status has settled |
 | `output()` | Latest native `ToolOutput`, including batch progress or preserved interruption evidence, or null/None before any output exists |
+| `attempts()` | Latest native attempt receipts for this handle, including in-flight model and effort metadata; empty before any observation exists |
 | `progress()` | Batch handles only: ordered item states, counts, attempt receipts and `jobStatus`, or null/None when no valid progress was retained |
 | `drain({cursor, timeout})` | JavaScript batch handles only: native page of settled items not acknowledged by the supplied cursor; default timeout 30 seconds |
 | `wait(timeout)` | Wait up to the given seconds, then return the typed value above; default 30 seconds |

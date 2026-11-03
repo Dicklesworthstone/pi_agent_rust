@@ -53,8 +53,17 @@ to route requests to different configured models in one cell. Roles resolve
 from trusted `modelRoles` settings and the host catalog, with configured
 thinking levels and disabled-provider filtering. Unlike ordinary conversation
 role resolution, eval requires each requested role to be configured explicitly;
-it does not inherit CLI flags or fall back to another model. Host-bound SDK
-Judges cannot be overridden. Completions and
+it does not inherit CLI flags or substitute a missing or unavailable primary
+binding. Host-bound SDK Judges cannot be overridden. Retained individual
+completions and judgments support explicitly configured
+[`retry.fallbackChains` routes](eval-structured-results.md#configured-model-fallback-and-attempt-inspection),
+including nested exact-model chains, effort suffixes, error-class filtering
+and asynchronous `attempts()` inspection in both kernels. All candidate
+requests reserve the native 16-attempt cell budget up front and retain the
+original privacy snapshot, session cost cap and task deadline. Native
+`maxRetries` permits that many secondary requests after the primary; OMP
+v18.16 uses it as the total request cap. Raw model operations and retained
+batches retain fixed bindings. Completions and
 judgments accept image evidence through the current host's read policy, and
 completion images can be combined with a validated output schema. Batch
 `progress()` retains ordered per-item states and finished verdicts across cells,

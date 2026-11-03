@@ -1043,7 +1043,7 @@ def _model_payload(operation, payload):
 
 
 def _model_check_progress(job, result, wrapper_schema):
-    if (job.operation != "judgment_batch" or type(result) is not dict or type(result.get("content")) is not list
+    if (type(result) is not dict or type(result.get("content")) is not list
             or type(result.get("isError", False)) is not bool
             or type(result.get("details")) is not dict or result["details"].get("schema") != wrapper_schema):
         raise _model_protocol()
@@ -1052,6 +1052,26 @@ def _model_check_progress(job, result, wrapper_schema):
             or partial.get("isError", False) is not False or type(partial.get("details")) is not dict):
         raise _model_protocol()
     progress = partial["details"]
+    if job.operation != "judgment_batch":
+        if (progress.get("schema") != "pi.eval.model-job.attempts.v1" or progress.get("operation") != job.operation
+                or progress.get("complete") is not False or type(progress.get("judgments")) is not dict
+                or progress["judgments"].get("schema") != "pi.eval.judgments.v1"
+                or type(progress["judgments"].get("attempts")) is not list
+                or not 1 <= len(progress["judgments"]["attempts"]) <= 16):
+            raise _model_protocol()
+        previous = 0
+        for receipt in progress["judgments"]["attempts"]:
+            if (type(receipt) is not dict or type(receipt.get("attempt")) is not int
+                    or not 1 <= receipt["attempt"] <= 16
+                    or previous and receipt["attempt"] != previous + 1
+                    or receipt.get("operation") != job.operation
+                    or receipt.get("status") not in ("running", "failed", "completed")
+                    or type(receipt.get("usageKnown")) is not bool or "usage" not in receipt
+                    or any(type(receipt.get(name)) is not str for name in ("model", "provider", "modelId", "api"))
+                    or receipt["status"] == "failed" and (type(receipt.get("error")) is not str or not receipt["error"])):
+                raise _model_protocol()
+            previous = receipt["attempt"]
+        return progress
     if (progress.get("schema") != "pi.eval.model-job.progress.v1" or progress.get("operation") != "judgment_batch"
             or progress.get("complete") is not False or type(progress.get("total")) is not int
             or not 1 <= progress["total"] <= 16
@@ -1325,6 +1345,21 @@ class _ModelJob:
 
     async def output(self):
         return (await self.status()).get("result")
+
+    async def attempts(self):
+        """Observe retained request receipts through the current host policy."""
+        snapshot = await self.status()
+        result = snapshot.get("result")
+        details = result.get("details") if result is not None else None
+        if details is None:
+            return []
+        if details["schema"] in ("pi.host_job.progress.v1", "pi.host_job.interrupted.v1"):
+            details = details["partialResult"]["details"]
+        judgments = details.get("judgments")
+        receipts = judgments.get("attempts") if type(judgments) is dict else None
+        if type(receipts) is not list or len(receipts) > 16 or any(type(receipt) is not dict for receipt in receipts):
+            raise _model_protocol()
+        return receipts
 
     async def progress(self):
         if self.operation != "judgment_batch":

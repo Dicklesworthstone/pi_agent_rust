@@ -122,10 +122,14 @@ pub(crate) struct PreparedJudgment {
 }
 
 /// Retry eligibility is captured before sanitizing provider diagnostics. Only
-/// retained batches consume it; an ordinary judgment still makes one attempt.
+/// retained batches and configured model routes consume it; an ordinary
+/// judgment still makes one attempt.
 pub(crate) struct JudgmentFailure {
     pub(crate) error: Error,
     pub(crate) retryable: bool,
+    /// Classification captured before provider diagnostics are sanitized.
+    /// `None` is a terminal local/policy failure, never fallback authority.
+    pub(crate) fallback_usage_limit: Option<bool>,
 }
 
 impl From<Error> for JudgmentFailure {
@@ -133,16 +137,29 @@ impl From<Error> for JudgmentFailure {
         Self {
             error,
             retryable: false,
+            fallback_usage_limit: None,
         }
     }
 }
 
 impl JudgmentFailure {
+    pub(crate) fn allows_fallback(&self, policy: crate::failover::FallbackOn) -> bool {
+        self.retryable
+            && self
+                .fallback_usage_limit
+                .is_some_and(|usage_limit| match policy {
+                    crate::failover::FallbackOn::Any => true,
+                    crate::failover::FallbackOn::UsageLimit => usage_limit,
+                    crate::failover::FallbackOn::ExceptUsageLimit => !usage_limit,
+                })
+    }
+
     fn provider(error: Error, diagnostic: &str) -> Self {
         if matches!(&error, Error::CostCap { .. }) {
             return Self {
                 error,
                 retryable: false,
+                fallback_usage_limit: None,
             };
         }
         // Classify the actual error body, never a provider's display name or
@@ -173,11 +190,25 @@ impl JudgmentFailure {
         Self {
             error: failure(diagnostic),
             retryable,
+            fallback_usage_limit: retryable
+                .then(|| crate::failover::FallbackOn::UsageLimit.allows(&lower)),
         }
     }
 }
 
 impl Judge {
+    /// Non-secret binding provenance for retained request attempts. The
+    /// interpreter never receives request headers, endpoint or credentials.
+    pub(crate) fn binding_info(&self) -> Value {
+        json!({
+            "model": format!("{}/{}", self.provider.name(), self.provider.model_id()),
+            "provider": self.provider.name(),
+            "modelId": self.provider.model_id(),
+            "api": self.provider.api(),
+            "thinkingLevel": self.options.thinking_level,
+        })
+    }
+
     /// Bind a provider. No ambient credential is added to the supplied options.
     pub fn new(provider: Arc<dyn Provider>, options: StreamOptions) -> Self {
         Self {
@@ -303,6 +334,7 @@ impl Judge {
         let answers = rubric.answers(&answer).map_err(|error| JudgmentFailure {
             error,
             retryable: true,
+            fallback_usage_limit: Some(false),
         })?;
         Ok(self.reply("pi.judgment.v1", "answers", answers, usage.as_ref()))
     }
@@ -344,31 +376,8 @@ impl Judge {
         Ok(parts)
     }
 
-    /// Both judgments and general completions use this exact terminal-stream
-    /// path. Callers supply screened text; no tools, history, retry or fallback.
-    async fn request_text(
-        &self,
-        system: String,
-        prompt: String,
-        requested_tokens: Option<u32>,
-    ) -> Result<(String, Option<Usage>)> {
-        self.request_content(system, UserContent::Text(prompt), requested_tokens)
-            .await
-    }
-
-    /// A validated image request shares the same tool-free terminal collector,
-    /// cancellation checks, token ceiling and deadline as a text completion.
-    async fn request_content(
-        &self,
-        system: String,
-        content: UserContent,
-        requested_tokens: Option<u32>,
-    ) -> Result<(String, Option<Usage>)> {
-        self.request_content_attempt(system, content, requested_tokens)
-            .await
-            .map_err(|failure| failure.error)
-    }
-
+    /// All auxiliary requests share this tool-free terminal collector. Retry
+    /// classification is returned to the owner, never acted on by this binding.
     async fn request_content_attempt(
         &self,
         system: String,

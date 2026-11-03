@@ -77,6 +77,7 @@ impl Drop for Reply {
 }
 
 struct Fixture {
+    model: &'static str,
     gate: Arc<Gate>,
     gates: Mutex<VecDeque<Arc<Gate>>>,
     replies: Mutex<VecDeque<String>>,
@@ -87,9 +88,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(replies: &[&str], open: bool) -> Arc<Self> {
+        Self::named(replies, open, "fixed-model")
+    }
+
+    fn named(replies: &[&str], open: bool, model: &'static str) -> Arc<Self> {
         let gate = Arc::new(Gate::default());
         gate.open.store(open, Ordering::Release);
         Arc::new(Self {
+            model,
             gate,
             gates: Mutex::new(VecDeque::new()),
             replies: Mutex::new(replies.iter().map(|text| (*text).to_owned()).collect()),
@@ -125,7 +131,7 @@ impl Provider for Fixture {
         "fixture-stream"
     }
     fn model_id(&self) -> &'static str {
-        "fixed-model"
+        self.model
     }
     async fn stream(
         &self,
@@ -694,7 +700,7 @@ mod legacy {
         let prepared = Prepared::Completion(judge.prepare_completion(request, None).unwrap());
         let error = runtime()
             .block_on(prepared.run(
-                judge,
+                judge.into(),
                 Operation::LegacyCompletion,
                 0,
                 privacy(),
@@ -984,6 +990,287 @@ fn partial_details(job: &crate::jobs::JobSnapshot) -> Result<Value> {
         .ok_or_else(|| Error::tool("fixture", "missing native batch progress"))
 }
 
+fn auxiliary_binding(provider: &Arc<Fixture>) -> Judge {
+    Judge::new(
+        provider.clone(),
+        StreamOptions {
+            api_key: Some("FIXED-HOST-CREDENTIAL".into()),
+            thinking_level: Some(crate::model::ThinkingLevel::Low),
+            ..Default::default()
+        },
+    )
+    .with_image_support(true)
+}
+
+fn configured_invocation<'a>(
+    harness: &'a Harness,
+    snapshot: &'a super::super::SnapshotPrivacy<'a>,
+    fallbacks: Vec<Judge>,
+    policy: crate::failover::FallbackOn,
+) -> Result<Invocation<'a>> {
+    let selection = super::super::Selection::role(&json!("smol")).ok_or_else(stopped)?;
+    let primary = harness.tool.judge.clone().ok_or_else(stopped)?;
+    let mut invocation = Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None)?
+        .with_host(Some(&harness.host))
+        .with_snapshot_privacy(Some(snapshot));
+    invocation.bind_host_session(&harness.host.owner);
+    let models = BoundModels {
+        primary,
+        fallbacks,
+        policy,
+    };
+    invocation
+        .resolved
+        .push((selection.clone(), true, false, models.clone()));
+    invocation.resolved.push((selection, true, true, models));
+    Ok(invocation)
+}
+
+async fn provider_started(provider: &Fixture) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while provider.calls.load(Ordering::Acquire) == 0 {
+        if Instant::now() >= deadline {
+            return Err(stopped());
+        }
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+#[test]
+fn retained_fallback_keeps_images_schema_attempt_order_and_live_kernel_receipts() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&[], true)?;
+    harness
+        .provider
+        .errors
+        .lock()
+        .unwrap()
+        .push_back(Error::api("HTTP 503 overloaded PRIVATE-ERROR-CANARY"));
+    let backup = Fixture::named(&[r#"{"count":7}"#], false, "fallback-model");
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = configured_invocation(&harness, &factory, vec![auxiliary_binding(&backup)], crate::failover::FallbackOn::Any)?;
+        let ack = acknowledgment(invocation.start_background(&harness.tool, Operation::Completion,
+            json!({"prompt":"extract","images":["image.png"],"schema":{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}}))
+            .await.map_err(bridge_error)?)?;
+        assert_eq!(invocation.receipts.len(), 2, "reserve all candidate requests before launch");
+        drop(invocation);
+        provider_started(&backup).await?;
+        let id = ack["jobId"].as_str().ok_or_else(stopped)?;
+        let running = crate::jobs::wait_async(&harness.host.owner, id, Duration::ZERO).await?;
+        let partial = partial_details(&running)?;
+        assert_eq!(partial["schema"], ATTEMPTS_SCHEMA);
+        assert_eq!(partial["judgments"]["attempts"][0]["status"], "failed");
+        assert_eq!(partial["judgments"]["attempts"][0]["fallbackScheduled"], true);
+        assert_eq!(partial["judgments"]["attempts"][1]["status"], "running");
+        assert_eq!(partial["judgments"]["attempts"][1]["modelId"], "fallback-model");
+        assert_eq!(partial["judgments"]["attempts"][1]["thinkingLevel"], "low");
+        assert!(!partial.to_string().contains("PRIVATE-ERROR-CANARY"));
+        assert_eq!(harness.host.reads.load(Ordering::Acquire), 1, "fallback reuses the admitted image");
+        for kernel in ["js", "python"] {
+            if kernel == "python" && !crate::eval::judgment::tests::python_available() {
+                continue;
+            }
+            let privacy = privacy();
+            let protect = |parts: &[&str]| privacy.project_inputs(parts);
+            let snapshot = || privacy.clone();
+            let encoded_id = serde_json::to_string(id)?;
+            let code = if kernel == "js" {
+                format!("(await (await completion.attach({encoded_id})).attempts()).map(a => a.status).join(',')")
+            } else {
+                format!("','.join(a['status'] for a in await (await completion.attach({encoded_id})).attempts())")
+            };
+            let observation = harness.tool.execute_with_invocation("attempts", json!({"kernel":kernel,"code":code}), None,
+                ToolInvocationContext { protect:&protect, host:Some(&harness.host), snapshot_privacy:&snapshot }).await?;
+            assert!(!observation.is_error);
+            assert!(serde_json::to_string(&observation)?.contains("failed,running"));
+        }
+        backup.gate.release();
+        let done = harness.settle(&ack).await?;
+        assert_eq!(done.status, "exited");
+        let details = done.result.and_then(|result| result.details).ok_or_else(stopped)?;
+        assert_eq!(details["result"]["data"]["count"], 7);
+        assert_eq!(details["result"]["modelId"], "fallback-model");
+        assert_eq!(details["result"]["imageCount"], 1);
+        assert_eq!(details["judgments"]["attempts"][0]["usageKnown"], false);
+        assert_eq!(details["judgments"]["attempts"][1]["usageKnown"], true);
+        assert_eq!(details["judgments"]["attempts"][1]["status"], "completed");
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 1);
+        assert_eq!(backup.calls.load(Ordering::Acquire), 1);
+        assert!(matches!(backup.contents.lock().unwrap().first(), Some(UserContent::Blocks(blocks)) if blocks.iter().any(|block| matches!(block, ContentBlock::Image(_)))));
+        Ok(())
+    })
+}
+
+#[test]
+fn retained_fallback_honors_error_filter_and_never_retries_policy_or_local_stops() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    use crate::failover::FallbackOn::{Any, ExceptUsageLimit, UsageLimit};
+    for (error, policy, fallback) in [
+        (Error::api("HTTP 503 overloaded"), UsageLimit, false),
+        (Error::api("HTTP 429 insufficient_quota"), UsageLimit, true),
+        (
+            Error::api("HTTP 429 insufficient_quota"),
+            ExceptUsageLimit,
+            false,
+        ),
+        (Error::api("HTTP 503 overloaded"), ExceptUsageLimit, true),
+        (
+            Error::api("HTTP 401 unauthorized; upstream overloaded"),
+            Any,
+            false,
+        ),
+        (Error::Aborted, Any, false),
+        (
+            Error::api("request timed out; service overloaded"),
+            Any,
+            false,
+        ),
+        (
+            Error::CostCap {
+                spent: 1.0,
+                cap: 1.0,
+            },
+            Any,
+            false,
+        ),
+    ] {
+        let harness = Harness::new(&[], true)?;
+        harness.provider.errors.lock().unwrap().push_back(error);
+        let backup = Fixture::named(&[r#"{"q":0.9}"#], true, "filtered-backup");
+        runtime().block_on(async {
+            let factory = privacy;
+            let mut invocation = configured_invocation(
+                &harness,
+                &factory,
+                vec![auxiliary_binding(&backup)],
+                policy,
+            )?;
+            let ack = acknowledgment(
+                invocation
+                    .start_background(&harness.tool, Operation::Judgment, request())
+                    .await
+                    .map_err(bridge_error)?,
+            )?;
+            let done = harness.settle(&ack).await?;
+            assert_eq!(done.status == "exited", fallback);
+            assert_eq!(backup.calls.load(Ordering::Acquire), usize::from(fallback));
+            let details = done
+                .result
+                .and_then(|result| result.details)
+                .ok_or_else(stopped)?;
+            assert_eq!(
+                details["judgments"]["attempts"].as_array().map(Vec::len),
+                Some(if fallback { 2 } else { 1 })
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn fallback_budget_is_reserved_before_images_and_host_judges_remain_fixed() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&[], true)?;
+    let backup = Fixture::named(&["must not run"], true, "forbidden-backup");
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = configured_invocation(
+            &harness,
+            &factory,
+            vec![auxiliary_binding(&backup)],
+            crate::failover::FallbackOn::Any,
+        )?;
+        invocation
+            .receipts
+            .resize(MAX_CALLS - 1, json!({"reserved":true}));
+        let failure = invocation
+            .start_background(
+                &harness.tool,
+                Operation::Completion,
+                json!({"prompt":"x","images":["image.png"]}),
+            )
+            .await
+            .expect_err("full route exceeds the budget");
+        assert!(failure.contains("PI_MODEL_JOB_LIMIT"));
+        assert_eq!(harness.host.reads.load(Ordering::Acquire), 0);
+        assert!(crate::jobs::list(&harness.host.owner)?.is_empty());
+        assert_eq!(harness.provider.calls.load(Ordering::Acquire), 0);
+        assert_eq!(backup.calls.load(Ordering::Acquire), 0);
+        let mut invocation = configured_invocation(
+            &harness,
+            &factory,
+            vec![auxiliary_binding(&backup)],
+            crate::failover::FallbackOn::Any,
+        )?;
+        // Even a stale cached configured route cannot expand an SDK binding.
+        invocation.judge = harness.tool.judge.clone();
+        invocation.selection = None;
+        harness
+            .provider
+            .errors
+            .lock()
+            .unwrap()
+            .push_back(Error::api("HTTP 503 overloaded"));
+        let ack = acknowledgment(
+            invocation
+                .start_background(
+                    &harness.tool,
+                    Operation::Completion,
+                    json!({"prompt":"fixed"}),
+                )
+                .await
+                .map_err(bridge_error)?,
+        )?;
+        let done = harness.settle(&ack).await?;
+        assert_eq!(done.status, "failed");
+        assert_eq!(invocation.receipts.len(), 1);
+        assert_eq!(backup.calls.load(Ordering::Acquire), 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn cancellation_keeps_the_inflight_attempt_and_never_starts_a_fallback() -> Result<()> {
+    let _serial = crate::jobs::process_test_guard();
+    let harness = Harness::new(&["unused"], false)?;
+    let backup = Fixture::named(&["must not run"], true, "unstarted-backup");
+    runtime().block_on(async {
+        let factory = privacy;
+        let mut invocation = configured_invocation(
+            &harness,
+            &factory,
+            vec![auxiliary_binding(&backup)],
+            crate::failover::FallbackOn::Any,
+        )?;
+        let ack = acknowledgment(
+            invocation
+                .start_background(&harness.tool, Operation::Completion, json!({"prompt":"x"}))
+                .await
+                .map_err(bridge_error)?,
+        )?;
+        started(&harness, 1).await?;
+        let cancelled = crate::jobs::cancel_async(
+            &harness.host.owner,
+            ack["jobId"].as_str().ok_or_else(stopped)?,
+        )
+        .await?;
+        assert_eq!(cancelled.status, "killed");
+        let last = partial_details(&cancelled)?;
+        assert_eq!(
+            last["judgments"]["attempts"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(last["judgments"]["attempts"][0]["status"], "running");
+        assert_eq!(last["judgments"]["attempts"][0]["usageKnown"], false);
+        assert_eq!(backup.calls.load(Ordering::Acquire), 0);
+        assert_eq!(harness.provider.gate.dropped.load(Ordering::Acquire), 1);
+        Ok(())
+    })
+}
+
 async fn batch_observation(
     harness: &Harness,
     ack: &Value,
@@ -1088,7 +1375,7 @@ fn retained_jobs_capture_each_selected_role_before_the_invocation_disappears() -
         let mut invocation = Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None)?
             .with_host(Some(&fast.host)).with_snapshot_privacy(Some(&factory));
         invocation.bind_host_session(&fast.host.owner);
-        invocation.resolved = vec![(smol, fast_judge), (deep, slow_judge.clone())];
+        invocation.resolved = vec![(smol, true, false, fast_judge.into()), (deep.clone(), true, false, slow_judge.clone().into()), (deep, false, false, slow_judge.clone().into())];
         let first = acknowledgment(invocation.start_background(&fast.tool, Operation::Completion,
             json!({"prompt":"extract","images":["image.png"],"schema":{"type":"object","properties":{"source":{"type":"string"}},"required":["source"]}}))
             .await.map_err(bridge_error)?)?;
@@ -1104,7 +1391,7 @@ fn retained_jobs_capture_each_selected_role_before_the_invocation_disappears() -
         assert_eq!(invocation.receipts[1]["selectedModel"]["role"], "slow"); // ubs:ignore -- Each request owns its selection independently of the cell default.
         assert_eq!(invocation.receipts[2]["selectedModel"]["role"], "slow"); // ubs:ignore -- All batch items inherit that batch's selected role.
         // A later binding change cannot retarget an already admitted native job.
-        invocation.resolved[0].1 = slow_judge;
+        invocation.resolved[0].3 = slow_judge.into();
         drop(invocation);
         let second = fast.settle(&second).await?;
         let third = fast.settle(&third).await?;

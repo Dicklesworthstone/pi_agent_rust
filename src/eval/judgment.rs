@@ -24,7 +24,10 @@ mod background;
 mod batch;
 mod completion;
 mod drain;
+mod fallback;
 mod images;
+
+use fallback::BoundModels;
 
 pub(super) const BRIDGE_NAME: &str = "__pi_judge";
 const MAX_CALLS: usize = 16;
@@ -156,7 +159,12 @@ fn resolve_entry(
 
 /// Only non-secret model names may come from the cell. Model endpoints,
 /// credentials and request headers come from the host's existing registry.
-fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
+fn resolve(
+    cwd: &Path,
+    selection: &Selection,
+    allow_fallback: bool,
+    images: bool,
+) -> Result<BoundModels> {
     let global_dir = Config::global_dir();
     let override_path = std::env::var_os("PI_CONFIG_PATH").map(PathBuf::from);
     let global = Config::load_with_roots_and_project_trust(
@@ -190,9 +198,49 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
         .map_err(|_| binding_error())?;
     let registry = ModelRegistry::load(&auth, None);
     let (entry, thinking_level) = resolve_entry(cwd, selection, &config, &registry)?;
+    let primary = bind_entry(&entry, thinking_level, &config, &auth)?;
+    primary.check_image_support(images)?;
+    let candidates = if allow_fallback {
+        fallback::entries(cwd, selection, &entry, thinking_level, &config, &registry)
+    } else {
+        Vec::new()
+    };
+    let fallbacks = candidates
+        .into_iter()
+        // Filter capabilities before credentials and the request cap: a
+        // skipped text-only candidate must not hide a later vision model.
+        .filter(|(entry, _)| {
+            !images
+                || entry
+                    .model
+                    .input
+                    .contains(&crate::provider::InputType::Image)
+        })
+        // Unavailable credentials or providers cannot silently replace the
+        // primary binding. Configured secondary destinations are optional.
+        .filter_map(|(entry, thinking)| bind_entry(&entry, thinking, &config, &auth).ok())
+        .take(
+            usize::try_from(config.retry_max_retries())
+                .unwrap_or(usize::MAX)
+                .min(MAX_CALLS - 1),
+        )
+        .collect();
+    Ok(BoundModels {
+        primary,
+        fallbacks,
+        policy: config.retry_fallback_on(),
+    })
+}
+
+fn bind_entry(
+    entry: &ModelEntry,
+    thinking_level: Option<crate::model::ThinkingLevel>,
+    config: &Config,
+    auth: &AuthStorage,
+) -> Result<Judge> {
     let api_key =
-        crate::models::resolve_model_key(None, &auth, &entry).map_err(|_| binding_error())?;
-    if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
+        crate::models::resolve_model_key(None, auth, entry).map_err(|_| binding_error())?;
+    if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
         return Err(binding_error());
     }
     let options = StreamOptions {
@@ -202,7 +250,7 @@ fn resolve(cwd: &Path, selection: &Selection) -> Result<Judge> {
         thinking_level,
         ..StreamOptions::default()
     };
-    let provider = crate::providers::create_provider_with_auth(&entry, None, Some(&auth))
+    let provider = crate::providers::create_provider_with_auth(entry, None, Some(auth))
         .map_err(|_| binding_error())?;
     Ok(Judge::new(provider, options)
         .with_image_support(
@@ -223,7 +271,7 @@ pub(super) struct Invocation<'p> {
     selection: Option<Selection>,
     /// Per-cell bindings only. Retained jobs clone their selected native Judge;
     /// interpreter handles never carry provider or credential objects.
-    resolved: Vec<(Selection, Judge)>,
+    resolved: Vec<(Selection, bool, bool, BoundModels)>,
     protect: Option<&'p Protect<'p>>,
     receipts: Vec<Value>,
     host: Option<&'p dyn ToolInvocationHost>,
@@ -484,6 +532,19 @@ impl<'p> Invocation<'p> {
     // Resolve once per selected binding per invocation, not per batch item. Cloning a Judge
     // shares the existing provider, never credentials or privacy with a guest.
     async fn bound_judge(&mut self, cwd: &Path, selection: Option<&Selection>) -> Result<Judge> {
+        self.bound_models(cwd, selection, false, false)
+            .await
+            .map(|models| models.primary)
+    }
+
+    async fn bound_models(
+        &mut self,
+        cwd: &Path,
+        selection: Option<&Selection>,
+        allow_fallback: bool,
+        images: bool,
+    ) -> Result<BoundModels> {
+        let images = allow_fallback && images;
         let owner = AgentCx::for_current_or_request();
         owner
             .checkpoint()
@@ -492,11 +553,17 @@ impl<'p> Invocation<'p> {
             return Err(Error::tool("judge", "PI_JUDGE_PERMISSION"));
         }
         if let Some(judge) = &self.judge {
-            return Ok(judge.clone().with_cost_budget(self.cost_budget.clone()));
+            return Ok(BoundModels::from(
+                judge.clone().with_cost_budget(self.cost_budget.clone()),
+            ));
         }
         let selection = selection.ok_or_else(binding_error)?;
-        if let Some((_, judge)) = self.resolved.iter().find(|(key, _)| key == selection) {
-            return Ok(judge.clone());
+        if let Some((_, _, _, models)) =
+            self.resolved.iter().find(|(key, fallback, has_images, _)| {
+                key == selection && *fallback == allow_fallback && *has_images == images
+            })
+        {
+            return Ok(models.clone());
         }
         if !owner.capabilities().spawn {
             return Err(Error::tool("judge", "PI_JUDGE_PERMISSION"));
@@ -507,18 +574,19 @@ impl<'p> Invocation<'p> {
         let cwd = cwd.to_path_buf();
         let selected = selection.clone();
         let resolver_owner = owner.clone();
-        let judge = asupersync::runtime::spawn_blocking(move || {
+        let models = asupersync::runtime::spawn_blocking(move || {
             let _current = resolver_owner.cx().clone().set_current_restricted();
             resolver_owner.checkpoint().map_err(|_| binding_error())?;
-            resolve(&cwd, &selected)
+            resolve(&cwd, &selected, allow_fallback, images)
         })
         .await?
         .with_cost_budget(self.cost_budget.clone());
         owner
             .checkpoint()
             .map_err(|_| Error::tool("judge", "PI_JUDGE_CANCELLED"))?;
-        self.resolved.push((selection.clone(), judge.clone()));
-        Ok(judge)
+        self.resolved
+            .push((selection.clone(), allow_fallback, images, models.clone()));
+        Ok(models)
     }
 
     /// Keep receipts outside guest stdout. A cell may discard a verdict or

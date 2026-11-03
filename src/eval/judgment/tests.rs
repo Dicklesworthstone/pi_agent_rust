@@ -158,7 +158,7 @@ fn runtime() -> asupersync::runtime::Runtime {
         .unwrap()
 }
 
-fn python_available() -> bool {
+pub(super) fn python_available() -> bool {
     std::process::Command::new("python3")
         .arg("--version")
         .stdout(std::process::Stdio::null())
@@ -321,6 +321,99 @@ fn role_resolution_never_falls_back_or_escapes_provider_policy() {
 }
 
 #[test]
+fn retained_fallback_graph_uses_role_precedence_exact_models_effort_and_scope() {
+    let primary = catalog_entry("openai", "primary", true);
+    let registry = ModelRegistry::from_entries_for_tests(vec![
+        primary.clone(),
+        catalog_entry("openai", "backup", true),
+        catalog_entry("anthropic", "last", true),
+    ]);
+    let role = Selection::role(&json!("slow")).unwrap();
+    let cwd = Path::new("/workspace/project");
+    let mut config = Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                (
+                    "slow".into(),
+                    vec![
+                        "openai/backup:low".into(),
+                        "anthropic/last".into(),
+                        "openai/not-registered".into(),
+                    ],
+                ),
+                ("openai/primary".into(), vec!["anthropic/last".into()]),
+                (
+                    "openai/backup".into(),
+                    vec![
+                        "openai/primary:high".into(),
+                        "openai/backup:xhigh".into(),
+                        "anthropic/last".into(),
+                    ],
+                ),
+                ("anthropic/last".into(), vec!["openai/backup:low".into()]),
+            ])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let candidates = |config: &Config, selection: &Selection| {
+        fallback::entries(
+            cwd,
+            selection,
+            &primary,
+            Some(crate::model::ThinkingLevel::High),
+            config,
+            &registry,
+        )
+        .into_iter()
+        .map(|(entry, thinking)| (entry.model.id, thinking))
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        candidates(&config, &role),
+        vec![
+            ("backup".into(), Some(crate::model::ThinkingLevel::Low)),
+            ("backup".into(), Some(crate::model::ThinkingLevel::High)),
+            ("last".into(), None),
+        ]
+    );
+    let named = Selection::Named {
+        provider: "openai".into(),
+        model: "primary".into(),
+    };
+    assert_eq!(candidates(&config, &named)[0].0, "last");
+    config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+        path: "/workspace/project".into(),
+        disabled_providers: Some(vec!["anthropic".into()]),
+        ..Default::default()
+    }]);
+    assert_eq!(candidates(&config, &role).len(), 2);
+    config
+        .retry
+        .as_mut()
+        .unwrap()
+        .fallback_chains
+        .as_mut()
+        .unwrap()
+        .insert("slow".into(), Vec::new());
+    assert!(
+        candidates(&config, &role).is_empty(),
+        "an explicit empty role owns fallback policy"
+    );
+    for setting in ["enabled", "model_fallback", "max_retries"] {
+        let mut disabled = config.clone(); // ubs:ignore -- Each of three disable-policy cases must start with an independent unchanged configuration.
+        let retry = disabled.retry.as_mut().unwrap();
+        match setting {
+            "enabled" => retry.enabled = Some(false),
+            "model_fallback" => retry.model_fallback = Some(false),
+            _ => retry.max_retries = Some(0),
+        }
+        assert!(candidates(&disabled, &named).is_empty());
+    }
+    assert!(candidates(&Config::default(), &named).is_empty());
+}
+
+#[test]
 fn each_request_uses_its_selected_role_and_all_roles_share_the_cell_budget() {
     let dir = tempfile::tempdir().unwrap();
     let fast = RecordedProvider::new([Reply::Answer("fast answer")]);
@@ -332,8 +425,18 @@ fn each_request_uses_its_selected_role_and_all_roles_share_the_cell_budget() {
     let mut invocation =
         Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None).unwrap();
     invocation.resolved = vec![
-        (Selection::role(&json!("smol")).unwrap(), fast.judge()),
-        (Selection::role(&json!("slow")).unwrap(), slow.judge()),
+        (
+            Selection::role(&json!("smol")).unwrap(),
+            false,
+            false,
+            fast.judge().into(),
+        ),
+        (
+            Selection::role(&json!("slow")).unwrap(),
+            false,
+            false,
+            slow.judge().into(),
+        ),
     ];
     runtime().block_on(async {
         let reply: Value = serde_json::from_str(&invocation.complete(dir.path(), json!({"prompt":"extract"})).await.unwrap()).unwrap();

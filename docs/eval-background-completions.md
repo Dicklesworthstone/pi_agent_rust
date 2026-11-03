@@ -11,9 +11,11 @@ It uses `__pi_model_complete_start` and a uniform model-job envelope shared with
 retained judgments and batches. This page documents the existing raw
 `__pi_complete_start` acknowledgment and result contract, which remains available.
 Both entry points use the same session-owned jobs runtime.
-The typed helper also accepts image attachments and configurable bounded task
-timeouts; the raw operation documented here keeps its text-only, fixed-budget
-request contract.
+The typed helper also accepts image attachments, configurable bounded task
+timeouts and [explicitly configured model fallback](eval-structured-results.md#configured-model-fallback-and-attempt-inspection),
+with live `await handle.attempts()` inspection in both kernels. The raw
+operation documented here keeps its text-only, fixed-budget, fixed-model
+request contract and never resolves fallback credentials.
 
 This requires an owning Agent invocation with an owned privacy-snapshot factory.
 Standalone Eval and the borrowed-only `execute_with_host` entry point refuse the
