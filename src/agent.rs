@@ -16271,7 +16271,9 @@ mod turn_event_tests {
                 0,
             )
             .expect("nonempty ring");
-            let limited_at = Instant::now() - Duration::from_secs(1);
+            let limited_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("the clock origin is over 1 s ago");
             for key in [request_key, other_key] {
                 ring.report_rate_limited(
                     key,

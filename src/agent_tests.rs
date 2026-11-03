@@ -384,7 +384,9 @@ mod tests {
                 Err(Error::Aborted)
             ));
             let expired = PrewalkRunBudget {
-                started: Instant::now() - Duration::from_secs(2),
+                started: Instant::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .expect("the clock origin is over 2 s ago"),
                 max_time: Some(Duration::from_secs(1)),
                 iterations: 3,
                 pause_continuations: 0,
@@ -449,7 +451,9 @@ mod tests {
     #[test]
     fn idle_job_wake_deadline_clamps_the_original_prewalk_clock() {
         let wake_started = Instant::now();
-        let prewalk_started = wake_started - Duration::from_secs(20);
+        let prewalk_started = wake_started
+            .checked_sub(Duration::from_secs(20))
+            .expect("the clock origin is over 20 s ago");
         for (original_cap, expected_cap) in [(Some(60), 30), (Some(25), 25), (None, 30)] {
             let original_cap = original_cap.map(Duration::from_secs);
             let mut session = idle_wake_session_with_prewalk(
@@ -490,7 +494,9 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let started = Instant::now() - Duration::from_secs(20);
+            let started = Instant::now()
+                .checked_sub(Duration::from_secs(20))
+                .expect("the clock origin is over 20 s ago");
             let mut session = idle_wake_session_with_prewalk(
                 Arc::new(StallAfterToolTurnProvider {
                     calls: Arc::clone(&calls),
