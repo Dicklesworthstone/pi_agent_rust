@@ -321,11 +321,12 @@ mod tests {
             assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(60)));
             assert!(!session.stage_pending_job_follow_up().await);
 
-            let captured = calls.lock().expect("captured provider context");
-            assert_eq!(captured.len(), 1, "exactly one wake request");
-            assert_eq!(captured[0].messages.len(), 1);
-            assert_user_text(&captured[0].messages[0], "owned background result");
-            drop(captured);
+            {
+                let captured = calls.lock().expect("captured provider context");
+                assert_eq!(captured.len(), 1, "exactly one wake request");
+                assert_eq!(captured[0].messages.len(), 1);
+                assert_user_text(&captured[0].messages[0], "owned background result");
+            }
             let cx = AgentCx::for_current_or_request();
             let saved = saved.lock(cx.cx()).await.expect("saved transcript");
             let messages = saved.to_messages_for_current_path();

@@ -191,20 +191,22 @@ fn native_sync_uses_live_binding_and_survives_reopen_without_rebilling() {
         assert_eq!(reopened.sync_memory().await.unwrap().status, "unchanged");
         assert_eq!(probe.extraction_calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.primary_calls.load(Ordering::SeqCst), 0);
-        let requests = probe.requests.lock().unwrap();
-        assert_eq!(
-            requests[0].1.api_key.as_deref(),
-            Some("native-provider-pin")
-        );
-        assert_eq!(
-            requests[0]
-                .1
-                .headers
-                .get("x-native-session")
-                .map(String::as_str),
-            Some("bound-options")
-        );
-        assert_eq!(requests[0].1.max_tokens, Some(2048));
+        {
+            let requests = probe.requests.lock().unwrap();
+            assert_eq!(
+                requests[0].1.api_key.as_deref(),
+                Some("native-provider-pin")
+            );
+            assert_eq!(
+                requests[0]
+                    .1
+                    .headers
+                    .get("x-native-session")
+                    .map(String::as_str),
+                Some("bound-options")
+            );
+            assert_eq!(requests[0].1.max_tokens, Some(2048));
+        }
         let bank = MemoryStore::open(root.path()).unwrap();
         assert!(bank.mental_model().unwrap().contains("bounded queue"));
         let memory = bank.list(1).unwrap().remove(0);
@@ -221,7 +223,6 @@ fn native_sync_uses_live_binding_and_survives_reopen_without_rebilling() {
             Ok(())
         })
         .unwrap();
-        drop(requests);
         assert_eq!(reopened.sync_memory().await.unwrap().status, "unchanged");
         assert_eq!(probe.extraction_calls.load(Ordering::SeqCst), 1);
     });
