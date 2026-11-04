@@ -5,6 +5,7 @@ use super::{
     JsExtensionSnapshot, NativeRustExtensionLoadSpec, Result, extract_slash_command_name,
     parse_extension_tool_defs,
 };
+use crate::tools::ToolUpdate;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -768,20 +769,44 @@ impl ExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_tool_with_updates_ref(
+            tool_name,
+            tool_call_id,
+            input,
+            ctx_payload,
+            timeout_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Execute a tool while forwarding request-scoped incremental results.
+    /// Native descriptors return their existing immediate result and emit no
+    /// synthetic progress. JavaScript callbacks run on the awaiting caller.
+    pub async fn execute_tool_with_updates_ref(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: Value,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<Value> {
         match self {
             Self::Js(runtime) => {
                 runtime
-                    .execute_tool(
+                    .execute_tool_with_updates(
                         tool_name.to_string(),
                         tool_call_id.to_string(),
                         input,
                         ctx_payload,
                         timeout_ms,
+                        on_update,
                     )
                     .await
             }
             Self::NativeRust(runtime) => {
-                let _ = ctx_payload;
+                let _ = (ctx_payload, on_update);
                 runtime
                     .execute_tool_ref(tool_name, tool_call_id, input, timeout_ms)
                     .await

@@ -237,16 +237,17 @@ impl Tool for ExtensionToolWrapper {
         &self,
         tool_call_id: &str,
         input: Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
-            .execute_tool_ref(
+            .execute_tool_with_updates_ref(
                 &self.def.name,
                 tool_call_id,
                 input,
                 Arc::clone(&self.ctx_payload),
                 self.timeout_ms,
+                on_update,
             )
             .await
             .map_err(|err| Error::tool(self.name(), err.to_string()))?;
@@ -329,8 +330,11 @@ mod tests {
     use super::*;
 
     use crate::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
-    use crate::extensions::{ExtensionManager, JsExtensionLoadSpec};
-    use crate::extensions_js::PiJsRuntimeConfig;
+    use crate::extensions::{
+        ExtensionManager, JsExtensionLoadSpec, NativeRustExtensionLoadSpec,
+        NativeRustExtensionRuntimeHandle,
+    };
+    use crate::extensions_js::{PiJsRuntimeConfig, PiJsRuntimeLimits};
     use crate::model::{
         AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
         Usage,
@@ -344,11 +348,26 @@ mod tests {
     use futures::Stream;
     use serde_json::json;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+    use std::time::Duration;
 
     async fn setup_js_tool(
         source: &str,
         tool_name: &str,
+    ) -> (
+        tempfile::TempDir,
+        ExtensionManager,
+        JsExtensionRuntimeHandle,
+        ExtensionToolDef,
+    ) {
+        setup_js_tool_with_native_tools(source, tool_name, Vec::new()).await
+    }
+
+    async fn setup_js_tool_with_native_tools(
+        source: &str,
+        tool_name: &str,
+        native_tools: Vec<Box<dyn Tool>>,
     ) -> (
         tempfile::TempDir,
         ExtensionManager,
@@ -360,7 +379,11 @@ mod tests {
         std::fs::write(&entry_path, source).expect("write extension entry");
 
         let manager = ExtensionManager::new();
-        let tools = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+        let mut tools = ToolRegistry::new(&[], temp_dir.path(), None);
+        for tool in native_tools {
+            tools.push(tool);
+        }
+        let tools = Arc::new(tools);
         let js_runtime = JsExtensionRuntimeHandle::start(
             PiJsRuntimeConfig {
                 cwd: temp_dir.path().display().to_string(),
@@ -388,6 +411,518 @@ mod tests {
             .expect("tool registered");
 
         (temp_dir, manager, js_runtime, def)
+    }
+
+    const TOOL_INVOCATION_FIXTURE: &str = r#"
+        export default function init(pi) {
+          let abortCount = 0;
+          let savedUpdate;
+          const output = (text, details = {}) => ({
+            content: [{ type: 'text', text }], details
+          });
+          pi.registerTool({
+            name: 'invocation_tool', description: 'Invocation lifecycle fixture',
+            parameters: { type: 'object', properties: { mode: { type: 'string' } } },
+            async execute(callId, input, signal, onUpdate) {
+              if (!(signal instanceof AbortSignal) || signal.aborted) {
+                throw new Error('tool must receive its own live AbortSignal');
+              }
+              const update = typeof onUpdate === 'function' ? onUpdate : () => {};
+              savedUpdate = update;
+              if (input.mode === 'complete') {
+                if (typeof onUpdate !== 'function') throw new Error('missing update callback');
+                update(output('started', { phase: 'started', callId }));
+                // The native read fixture cannot return until the update
+                // callback releases it. Buffering updates until completion
+                // therefore deadlocks and fails the outer test timeout.
+                await pi.tool('read', {});
+                return output('finished', { phase: 'finished', callId });
+              }
+              const pending = new Promise((resolve) => {
+                signal.addEventListener('abort', () => {
+                  abortCount++;
+                  try { update(output('late abort update')); } catch (_) {}
+                  if (input.mode !== 'ignore') resolve(output('cancelled'));
+                }, { once: true });
+              });
+              update(output('started', { phase: 'started', callId }));
+              return pending;
+            }
+          });
+          pi.registerTool({
+            name: 'probe_tool', description: 'Observe the prior invocation',
+            parameters: { type: 'object' },
+            async execute(_callId, _input, signal, onUpdate) {
+              if (savedUpdate) {
+                try { savedUpdate(output('stale update')); } catch (_) {}
+              }
+              if (typeof onUpdate === 'function') {
+                onUpdate(output('probe progress', { phase: 'probe' }));
+              }
+              return output('probe', {
+                abortCount, freshSignal: signal instanceof AbortSignal && !signal.aborted
+              });
+            }
+          });
+        }
+    "#;
+
+    struct ProgressGateTool {
+        release: StdMutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ProgressGateTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+
+        fn label(&self) -> &str {
+            "Progress gate"
+        }
+
+        fn description(&self) -> &str {
+            "Test fixture released by the native progress callback"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| Error::tool("read", "progress gate entered more than once"))?;
+            release
+                .await
+                .map_err(|_| Error::tool("read", "progress callback was abandoned"))?;
+            Ok(ToolOutput {
+                content: Vec::new(),
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    type TestUpdateCallback = Box<dyn Fn(ToolUpdate) + Send + Sync>;
+
+    fn first_update_channel() -> (
+        futures::channel::oneshot::Receiver<ToolUpdate>,
+        TestUpdateCallback,
+    ) {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let sender = StdMutex::new(Some(sender));
+        let callback = Box::new(move |update| {
+            let sender = sender.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(sender) = sender {
+                let _ = sender.send(update);
+            }
+        });
+        (receiver, callback)
+    }
+
+    async fn abandon_started_tool(wrapper: &ExtensionToolWrapper, mode: &str) {
+        let (update, callback) = first_update_channel();
+        let execution = wrapper.execute("abandoned-call", json!({ "mode": mode }), Some(callback));
+        let first = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(5),
+            futures::future::select(update, execution),
+        )
+        .await
+        .expect("tool must deliver progress before its execution deadline");
+        match first {
+            futures::future::Either::Left((update, pending)) => {
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression assertion; absent from production builds.
+                assert_eq!(
+                    update
+                        .expect("initial progress")
+                        .details
+                        .expect("progress details")["phase"],
+                    "started",
+                );
+                drop(pending);
+            }
+            futures::future::Either::Right((result, _)) => {
+                panic!("tool must stay pending until cancellation, got {result:?}");
+            }
+        }
+    }
+
+    async fn probe_invocation(runtime: &JsExtensionRuntimeHandle) -> Result<Value> {
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(5),
+            runtime.execute_tool(
+                "probe_tool".to_string(),
+                "probe-call".to_string(),
+                json!({}),
+                Arc::new(json!({})),
+                5_000,
+            ),
+        )
+        .await
+        .expect("the next request must not wait for the abandoned tool's 60-second budget")
+    }
+
+    #[test]
+    fn extension_tool_updates_release_work_before_final_output_and_ignore_late_callbacks() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (release, wait) = futures::channel::oneshot::channel();
+            let gate = ProgressGateTool {
+                release: StdMutex::new(Some(wait)),
+            };
+            let (_directory, _manager, js_runtime, def) = setup_js_tool_with_native_tools(
+                TOOL_INVOCATION_FIXTURE,
+                "invocation_tool",
+                vec![Box::new(gate)],
+            )
+            .await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone());
+            let updates = Arc::new(StdMutex::new(Vec::new()));
+            let observed = Arc::clone(&updates);
+            let release = StdMutex::new(Some(release));
+            let output = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                wrapper.execute(
+                    "progress-call",
+                    json!({ "mode": "complete" }),
+                    Some(Box::new(move |update| {
+                        observed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(update);
+                        let release = release
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take();
+                        if let Some(release) = release {
+                            release.send(()).expect("release the native tool");
+                        }
+                    })),
+                ),
+            )
+            .await
+            .expect("progress must be delivered while the JS tool waits for host work")
+            .expect("completed extension tool");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression assertion; absent from production builds.
+            assert_eq!(output.details.as_ref().unwrap()["phase"], "finished");
+            {
+                let updates = updates.lock().unwrap_or_else(PoisonError::into_inner);
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression assertion; absent from production builds.
+                assert_eq!(updates.len(), 1);
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+                assert_eq!(updates[0].details.as_ref().unwrap()["phase"], "started");
+                // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+                assert_eq!(
+                    updates[0].details.as_ref().unwrap()["callId"],
+                    "progress-call"
+                );
+            }
+
+            let probe_updates = Arc::new(StdMutex::new(Vec::new()));
+            let observed_probe = Arc::clone(&probe_updates);
+            let probe = js_runtime
+                .execute_tool_with_updates(
+                    "probe_tool".to_string(),
+                    // Reusing a model-supplied call ID must not reuse the
+                    // previous invocation's signal or progress recipient.
+                    "progress-call".to_string(),
+                    json!({}),
+                    Arc::new(json!({})),
+                    5_000,
+                    Some(Box::new(move |update| {
+                        observed_probe
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(update);
+                    })),
+                )
+                .await
+                .expect("healthy runtime");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["abortCount"], 0);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["freshSignal"], true);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                updates.lock().unwrap_or_else(PoisonError::into_inner).len(),
+                1
+            );
+            let probe_updates = probe_updates.lock().unwrap_or_else(PoisonError::into_inner);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe_updates.len(), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe_updates[0].details.as_ref().unwrap()["phase"], "probe");
+        });
+    }
+
+    #[test]
+    fn extension_tool_caller_abandonment_aborts_only_its_invocation() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (_directory, _manager, js_runtime, def) =
+                setup_js_tool(TOOL_INVOCATION_FIXTURE, "invocation_tool").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone());
+            abandon_started_tool(&wrapper, "wait").await;
+            let probe = probe_invocation(&js_runtime)
+                .await
+                .expect("cooperative cancellation must retain a healthy realm");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["abortCount"], 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["freshSignal"], true);
+        });
+    }
+
+    #[test]
+    fn extension_tool_deadline_aborts_cooperative_work_without_quarantining_the_realm() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (_directory, _manager, js_runtime, def) =
+                setup_js_tool(TOOL_INVOCATION_FIXTURE, "invocation_tool").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone()).with_timeout_ms(500);
+            let failure = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                wrapper.execute("deadline-call", json!({ "mode": "wait" }), None),
+            )
+            .await
+            .expect("execution deadline must be enforced")
+            .expect_err("a completed abort cleanup must not become a successful tool result");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(failure.to_string().contains("timed out"), "{failure}");
+            let probe = probe_invocation(&js_runtime)
+                .await
+                .expect("cooperative deadline cleanup must retain a healthy realm");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["abortCount"], 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(probe["details"]["freshSignal"], true);
+        });
+    }
+
+    #[test]
+    fn extension_tool_noncooperative_cancellation_quarantines_its_realm() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (_directory, _manager, js_runtime, def) =
+                setup_js_tool(TOOL_INVOCATION_FIXTURE, "invocation_tool").await;
+            let wrapper = ExtensionToolWrapper::new(def, js_runtime.clone());
+            abandon_started_tool(&wrapper, "ignore").await;
+            let error = probe_invocation(&js_runtime)
+                .await
+                .expect_err("a tool that ignores abort cannot keep its realm live indefinitely");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(error.to_string().contains("quarantin"), "{error}");
+        });
+    }
+
+    #[test]
+    fn extension_tool_cpu_deadline_quarantines_only_the_offending_realm() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("separate extension directories");
+            let cpu_directory = directory.path().join("cpu");
+            let healthy_directory = directory.path().join("healthy");
+            std::fs::create_dir(&cpu_directory).expect("cpu directory");
+            std::fs::create_dir(&healthy_directory).expect("healthy directory");
+            let cpu_path = cpu_directory.join("index.mjs");
+            let healthy_path = healthy_directory.join("index.mjs");
+            std::fs::write(
+                &cpu_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: 'cpu_tool', description: 'Never yields to the event loop',
+                    parameters: { type: 'object' },
+                    execute() { while (true) {} }
+                  });
+                }
+                "#,
+            )
+            .expect("cpu extension");
+            std::fs::write(
+                &healthy_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: 'healthy_tool', description: 'Independent extension',
+                    parameters: { type: 'object' },
+                    execute(_callId, _input, signal, onUpdate) {
+                      return {
+                        content: [{ type: 'text', text: 'healthy' }],
+                        details: {
+                          freshSignal: signal instanceof AbortSignal && !signal.aborted,
+                          updatesOmitted: onUpdate === undefined
+                        }
+                      };
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("healthy extension");
+            let manager = ExtensionManager::new();
+            let native_tools = Arc::new(ToolRegistry::new(&[], directory.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: directory.path().display().to_string(),
+                    limits: PiJsRuntimeLimits {
+                        // This must be stopped by the per-invocation deadline,
+                        // not a global instruction-count budget.
+                        interrupt_budget: None,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                native_tools,
+                manager.clone(),
+            )
+            .await
+            .expect("start separate realms");
+            manager.set_js_runtime(js_runtime.clone());
+            manager
+                .load_js_extensions(vec![
+                    JsExtensionLoadSpec::from_entry_path(&cpu_path).expect("cpu spec"),
+                    JsExtensionLoadSpec::from_entry_path(&healthy_path).expect("healthy spec"),
+                ])
+                .await
+                .expect("load independent extensions");
+            let def = js_runtime
+                .get_registered_tools()
+                .await
+                .expect("registered tools")
+                .into_iter()
+                .find(|tool| tool.name == "cpu_tool")
+                .expect("cpu tool");
+            let cpu = ExtensionToolWrapper::new(def, js_runtime.clone()).with_timeout_ms(500);
+            let failure = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                cpu.execute("cpu-call", json!({}), None),
+            )
+            .await
+            .expect("CPU-bound JavaScript must not prevent deadline enforcement")
+            .expect_err("CPU-bound JavaScript must be interrupted");
+            let failure = failure.to_string();
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                failure.contains("timed out") || failure.contains("interrupt"),
+                "{failure}"
+            );
+            let healthy = js_runtime
+                .execute_tool(
+                    "healthy_tool".to_string(),
+                    "healthy-call".to_string(),
+                    json!({}),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("the interrupted realm must not poison an independent extension");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(healthy["content"][0]["text"], "healthy");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(healthy["details"]["freshSignal"], true);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(healthy["details"]["updatesOmitted"], true);
+            let quarantined = cpu
+                .execute("cpu-retry", json!({}), None)
+                .await
+                .expect_err("an interrupted realm must remain quarantined");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                quarantined.to_string().contains("quarantin"),
+                "{quarantined}"
+            );
+        });
+    }
+
+    #[test]
+    fn native_descriptor_tools_keep_legacy_results_without_synthetic_updates() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("native descriptor directory");
+            let path = directory.path().join("fixture.native.json");
+            let expected = json!({
+                "content": [{ "type": "text", "text": "native result" }],
+                "details": { "runtime": "native-rust" }
+            });
+            std::fs::write(
+                &path,
+                json!({
+                    "tools": [{
+                        "name": "native_tool", "description": "Native result fixture",
+                        "parameters": { "type": "object" }
+                    }],
+                    "toolOutputs": { "native_tool": expected }
+                })
+                .to_string(),
+            )
+            .expect("write native descriptor");
+            let native = NativeRustExtensionRuntimeHandle::start()
+                .await
+                .expect("native runtime");
+            let manager = ExtensionManager::new();
+            manager.set_native_runtime(native.clone());
+            manager
+                .load_native_extensions(vec![
+                    NativeRustExtensionLoadSpec::from_entry_path(&path).expect("native spec"),
+                ])
+                .await
+                .expect("load native descriptor");
+            let def = native
+                .get_registered_tools()
+                .await
+                .expect("native tools")
+                .pop()
+                .expect("native tool");
+            let handle = ExtensionRuntimeHandle::from(native);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                handle
+                    .execute_tool_ref(
+                        "native_tool",
+                        "legacy",
+                        json!({}),
+                        Arc::new(json!({})),
+                        5_000
+                    )
+                    .await
+                    .expect("legacy native execution"),
+                expected,
+            );
+            let count = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&count);
+            let output = ExtensionToolWrapper::new(def, handle)
+                .execute(
+                    "with-updates",
+                    json!({}),
+                    Some(Box::new(move |_| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    })),
+                )
+                .await
+                .expect("native execution with an update callback");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                serde_json::to_value(output).expect("native result"),
+                expected
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
@@ -973,8 +1508,8 @@ mod tests {
             .build()
             .expect("runtime build");
         runtime.block_on(async {
-            // Extension tool `execute` receives (callId, input, onUpdate,
-            // abort, ctx); the active list travels in `input.names`.
+            // Extension tool `execute` receives (callId, input, signal,
+            // onUpdate, ctx); the active list travels in `input.names`.
             let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
                 r#"
                 export default function init(pi) {

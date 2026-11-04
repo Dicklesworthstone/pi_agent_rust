@@ -50,8 +50,8 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, path::Path, path::PathBuf};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
 use swc_ecma_ast::{Module as SwcModule, Pass, Program as SwcProgram};
@@ -4750,6 +4750,34 @@ impl InterruptBudget {
 
     fn clear_trip(&self) {
         self.tripped.set(false);
+    }
+}
+
+struct ToolExecutionFence {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+    interrupted: Rc<std::cell::Cell<bool>>,
+}
+
+/// Bound synchronous guest execution as well as asynchronous tool waits. The
+/// caller's drop flag is atomic because cancellation originates on another
+/// thread while QuickJS may be executing an otherwise unbounded loop.
+#[must_use = "the tool execution fence ends when the guard is dropped"]
+pub(crate) struct ToolExecutionFenceGuard {
+    active: Rc<RefCell<Option<ToolExecutionFence>>>,
+    previous: Option<ToolExecutionFence>,
+    interrupted: Rc<std::cell::Cell<bool>>,
+}
+
+impl ToolExecutionFenceGuard {
+    pub(crate) fn was_interrupted(&self) -> bool {
+        self.interrupted.get()
+    }
+}
+
+impl Drop for ToolExecutionFenceGuard {
+    fn drop(&mut self) {
+        self.active.replace(self.previous.take());
     }
 }
 
@@ -18342,6 +18370,7 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     peak_memory_used_bytes: Arc<AtomicU64>,
     tick_counter: Arc<AtomicU64>,
     interrupt_budget: Rc<InterruptBudget>,
+    tool_execution_fence: Rc<RefCell<Option<ToolExecutionFence>>>,
     config: PiJsRuntimeConfig,
     /// Additional filesystem roots that `readFileSync` may access (e.g.
     /// extension directories).  Populated lazily as extensions are loaded.
@@ -18380,6 +18409,7 @@ struct JsRuntimeRegistrySnapshot {
     message_renderers: u64,
     mcp_servers: u64,
     pending_tasks: u64,
+    tool_invocations: u64,
     pending_hostcalls: u64,
     pending_timers: u64,
     timer_handles: u64,
@@ -18412,6 +18442,7 @@ pub struct PiJsRealmScrubReport {
     pub rust_pending_hostcall_queue: u64,
     pub rust_scheduler_pending: bool,
     pub pending_tasks_before: u64,
+    pub tool_invocations_before: u64,
     pub pending_hostcalls_before: u64,
     pub pending_timers_before: u64,
     pub residual_entries_after: u64,
@@ -18580,10 +18611,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
 
         let interrupt_budget = Rc::new(InterruptBudget::new(config.limits.interrupt_budget));
-        if config.limits.interrupt_budget.is_some() {
+        let tool_execution_fence: Rc<RefCell<Option<ToolExecutionFence>>> =
+            Rc::new(RefCell::new(None));
+        {
             let budget = Rc::clone(&interrupt_budget);
+            let fence = Rc::clone(&tool_execution_fence);
             runtime
-                .set_interrupt_handler(Some(Box::new(move || budget.on_interrupt())))
+                .set_interrupt_handler(Some(Box::new(move || {
+                    fence.borrow().as_ref().is_some_and(|active| {
+                        let stop = active.cancelled.load(AtomicOrdering::Acquire)
+                            || Instant::now() >= active.deadline;
+                        if stop {
+                            active.interrupted.set(true);
+                        }
+                        stop
+                    }) || budget.on_interrupt()
+                })))
                 .await;
         }
 
@@ -18678,6 +18721,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             peak_memory_used_bytes,
             tick_counter,
             interrupt_budget,
+            tool_execution_fence,
             config,
             allowed_read_roots: Arc::new(std::sync::Mutex::new(Vec::new())),
             repair_events,
@@ -18819,6 +18863,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             })?;
 
         report.pending_tasks_before = reset_payload.before.pending_tasks;
+        report.tool_invocations_before = reset_payload.before.tool_invocations;
         report.pending_hostcalls_before = reset_payload.before.pending_hostcalls;
         report.pending_timers_before = reset_payload
             .before
@@ -18835,6 +18880,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.message_renderers
             + reset_payload.after.mcp_servers
             + reset_payload.after.pending_tasks
+            + reset_payload.after.tool_invocations
             + reset_payload.after.pending_hostcalls
             + reset_payload.after.pending_timers
             + reset_payload.after.timer_handles
@@ -18908,6 +18954,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         report.module_cache_limit_bytes = cache_limit_bytes;
 
         if report.pending_tasks_before > 0
+            || report.tool_invocations_before > 0
             || report.pending_hostcalls_before > 0
             || report.pending_timers_before > 0
         {
@@ -19395,6 +19442,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         SessionActionOriginGuard {
             active_origin: Rc::clone(&self.active_session_action_origin),
             previous,
+        }
+    }
+
+    pub(crate) fn enter_tool_execution_fence(
+        &self,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> ToolExecutionFenceGuard {
+        let interrupted = Rc::new(std::cell::Cell::new(false));
+        let previous = self.tool_execution_fence.replace(Some(ToolExecutionFence {
+            cancelled,
+            deadline,
+            interrupted: Rc::clone(&interrupted),
+        }));
+        ToolExecutionFenceGuard {
+            active: Rc::clone(&self.tool_execution_fence),
+            previous,
+            interrupted,
         }
     }
 
@@ -22478,6 +22543,7 @@ function __pi_runtime_registry_snapshot() {
         messageRenderers: __pi_map_size_primordial(__pi_message_renderer_index),
         mcpServers: __pi_map_size_primordial(__pi_mcp_server_index),
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
+        toolInvocations: __pi_tool_invocation_runtime.count(),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
         pendingTimers: __pi_map_size_primordial(__pi_timer_callbacks),
         timerHandles: __pi_timer_runtime.count(),
@@ -22503,6 +22569,7 @@ function __pi_runtime_registry_snapshot() {
 function __pi_reset_extension_runtime_state(bridge_secret) {
     const before = __pi_runtime_registry_snapshot();
 
+    __pi_tool_invocation_runtime.reset();
     for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
         __pi_virtual_http_close(server);
     }
@@ -22582,6 +22649,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.messageRenderers === 0 &&
         after.mcpServers === 0 &&
         after.pendingTasks === 0 &&
+        after.toolInvocations === 0 &&
         after.pendingHostcalls === 0 &&
         after.pendingTimers === 0 &&
         after.timerHandles === 0 &&
@@ -24704,7 +24772,9 @@ function __pi_validate_tool_input(schema, input) {
     }
 }
 
-async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
+async function __pi_execute_tool(
+    tool_name, tool_call_id, input, ctx_payload, invocation_token, native_update
+) {
     const name = String(tool_name || '').trim();
     const record = __pi_tool_index.get(name);
     if (!record) {
@@ -24713,10 +24783,27 @@ async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
 
     __pi_validate_tool_input(record.spec && record.spec.parameters, input);
 
-    const ctx = __pi_make_extension_ctx(ctx_payload);
-    return __pi_with_extension_async(record.extensionId, () =>
-        record.execute(tool_call_id, input, undefined, undefined, ctx)
-    );
+    return __pi_with_extension_async(record.extensionId, async () => {
+        const invocation = __pi_tool_invocation_runtime.start(
+            invocation_token, record.extensionId, native_update
+        );
+        try {
+            const ctx = __pi_make_extension_ctx(ctx_payload);
+            return await record.execute(
+                tool_call_id, input, invocation.signal, invocation.onUpdate, ctx
+            );
+        } finally {
+            __pi_tool_invocation_runtime.finish(invocation_token, invocation);
+        }
+    });
+}
+
+function __pi_cancel_tool_invocation(invocation_token) {
+    return __pi_tool_invocation_runtime.cancel(invocation_token);
+}
+
+function __pi_finish_tool_invocation(invocation_token) {
+    return __pi_tool_invocation_runtime.finish(invocation_token);
 }
 
 async function __pi_execute_command(command_name, args, ctx_payload) {
@@ -27932,6 +28019,104 @@ if (typeof globalThis.fetch !== 'function') {
     globalThis.__pi_fetch_for_node_http = (input, init) => __pi_fetch(input, init, true);
 }
 
+// Tool invocation lifetime is separate from extension ownership. In particular,
+// a timer or persistent subprocess owned by the same extension is not implicitly
+// cancelled with a tool. Consumers use the supplied signal to stop their work.
+// Capture controller and collection intrinsics only after the fetch/abort
+// polyfills exist, before any extension can replace their public methods.
+const __pi_tool_invocation_runtime = (() => {
+    const active = new Map();
+    const getActive = Function.call.bind(Map.prototype.get);
+    const setActive = Function.call.bind(Map.prototype.set);
+    const deleteActive = Function.call.bind(Map.prototype.delete);
+    const forEachActive = Function.call.bind(Map.prototype.forEach);
+    const Controller = globalThis.AbortController;
+    const abort = Function.call.bind(Controller.prototype.abort);
+    const stringify = JSON.stringify;
+    const isArray = Array.isArray;
+    const createObject = Object.create;
+    const maxUpdateUnits = 1024 * 1024;
+
+    function ownsActive(token, state) {
+        return state.active && getActive(active, token) === state &&
+            __pi_get_current_extension_id() === state.owner;
+    }
+
+    function start(token, owner, sink) {
+        if (typeof token !== 'string' || token.length === 0 || token.length > 200) {
+            throw new TypeError('Tool invocation requires a host-assigned token');
+        }
+        if (getActive(active, token)) {
+            throw new Error('Tool invocation token is already active');
+        }
+        if (sink !== undefined && sink !== null && typeof sink !== 'function') {
+            throw new TypeError('Invalid native tool update callback');
+        }
+        const controller = new Controller();
+        const state = {
+            owner, controller, signal: controller.signal,
+            active: true, sink: typeof sink === 'function' ? sink : null,
+            onUpdate: undefined,
+        };
+        if (state.sink) {
+            state.onUpdate = (update) => {
+                if (!ownsActive(token, state) || !state.sink) return;
+                try {
+                    if (!update || typeof update !== 'object' || isArray(update)) return;
+                    const content = update.content;
+                    if (!isArray(content)) return;
+                    const details = update.details;
+                    const snapshot = createObject(null);
+                    snapshot.content = content;
+                    snapshot.details = details === undefined ? null : details;
+                    const encoded = stringify(snapshot);
+                    if (typeof encoded !== 'string' || encoded.length > maxUpdateUnits) return;
+                    // Getters/toJSON may run guest code during serialization.
+                    // Recheck lifetime and owner before crossing the boundary.
+                    if (ownsActive(token, state) && state.sink) state.sink(encoded);
+                } catch (_) {
+                    // Invalid or oversized progress is advisory. The native
+                    // sink independently validates bytes, shape and lifetime.
+                }
+            };
+        }
+        setActive(active, token, state);
+        return state;
+    }
+
+    function cancel(token) {
+        const state = getActive(active, token);
+        if (!state || !state.active) return false;
+        // Abort listeners must not be able to publish another progress update,
+        // and a retained callback must not retain the native mailbox after close.
+        state.active = false;
+        state.sink = null;
+        __pi_with_extension_sync(state.owner, () => abort(state.controller));
+        return true;
+    }
+
+    function finish(token, expected) {
+        const state = getActive(active, token);
+        if (!state || (expected !== undefined && state !== expected)) return false;
+        state.active = false;
+        state.sink = null;
+        deleteActive(active, token);
+        return true;
+    }
+
+    return Object.freeze({
+        start, cancel, finish,
+        count: () => __pi_map_size_primordial(active),
+        reset() {
+            forEachActive(active, (_state, token) => {
+                try { cancel(token); } catch (_) {}
+                finally { finish(token); }
+            });
+            __pi_map_clear_primordial(active);
+        },
+    });
+})();
+
 const __pi_export_privileged = (name, fn, forwardSecret = false) => {
     Object.defineProperty(globalThis, name, {
         value: (secret, ...args) => {
@@ -27971,6 +28156,8 @@ for (const [name, fn] of Object.entries({
     __pi_register_mcp_server_for_extension,
     __pi_load_extension,
     __pi_execute_tool,
+    __pi_cancel_tool_invocation,
+    __pi_finish_tool_invocation,
     __pi_execute_command,
     __pi_execute_shortcut,
     __pi_provider_stream_simple_start,
@@ -28158,11 +28345,16 @@ mod tests {
     /// second bridge literal: 250_442 -> 251_512. It projects host usage
     /// into a synchronous getter without caching it across dispatches.
     /// Published compression and native snapshot regressions cover this edit.
+    ///
+    /// Invocation-scoped tool progress and cancellation add 5_172 bytes:
+    /// 251_512 -> 256_684 (+144 inventory/reset, +635 tool dispatch,
+    /// +4_393 private lifetime controls). The pinned real-subagent source
+    /// diagnostic and native lifecycle regressions cover these edits.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            251_512,
-            "5a06bb71e394e64638d9076539fe54320e9d92bf03e7aadc6fe4be56eb34f76b",
+            256_684,
+            "2f2004075b71ba724fcda8d3be81183324eb27e34cc35027e8b9013bcfe92096",
         ),
         (
             "node:fs",

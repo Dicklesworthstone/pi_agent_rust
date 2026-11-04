@@ -780,6 +780,75 @@ snapshot regressions cover fresh usage, window changes, unknown metadata,
 post-compaction inputs, and isolation from later events. They require the DSR
 native runner before their results can be claimed as executed verification.
 
+### Tool progress and cancellation
+
+JavaScript extension tools receive the standard argument order:
+
+```typescript
+execute(toolCallId, input, signal, onUpdate, ctx)
+```
+
+`signal` is a fresh `AbortSignal` for that invocation. `onUpdate`, when the
+native caller supplies an observer, forwards `{ content, details }` snapshots
+through the existing `ToolUpdate` and `ToolExecutionUpdate` path used by the
+terminal interfaces and RPC. The final tool result stays separate. Native
+descriptor tools keep their existing immediate-result behavior.
+
+Progress belongs to a host-generated private invocation token, independently
+of the public tool-call ID. Owner checks and secret-protected lifecycle controls
+prevent guest code from selecting another invocation's destination. The host
+validates each snapshot and caps its serialized UTF-8 size at 1,000,000 bytes.
+One replaceable pending snapshot bounds the buffer: slow observers see the most
+recent state rather than an unbounded backlog. Native observers run in the
+awaiting caller, outside the JavaScript actor. Invalid progress is ignored;
+updates after completion or cancellation are suppressed, and retained guest
+callbacks release their native destination when the invocation closes.
+
+Dropping an admitted tool future, including agent cancellation, sets an atomic
+flag observed by the busy actor. It does not enqueue a cancellation request
+behind the work being cancelled. Active tool waits poll a bounded collection
+of retained native hostcalls, allowing a pending operation and a later operation
+needed to release it to make progress. Existing capability checks, native
+resource guards, session provenance, and per-extension routing remain in force.
+When the runtime's safety envelope vetoes interleaving, new admission falls to
+one retained hostcall. Previously admitted work continues to be polled without
+being dropped, and further requests wait for the conservative limit.
+
+Cancellation and the existing tool deadline close progress before dispatching
+abort listeners. The runtime gives cooperative JavaScript cleanup a 100 ms
+budget. A tool that remains unresolved is quarantined with its own isolate's
+resources; other extension isolates remain available. A QuickJS interrupt
+fence also checks cancellation and the deadline during guest CPU loops. An
+interrupted isolate is quarantined even if an async function converts the
+interruption into a rejected promise. Native synchronous host operations retain
+their own timeout behavior; the JavaScript interrupt hook cannot preempt Rust
+while it is inside one of those operations.
+
+Cancellation is cooperative for resources: pass the signal to `fetch`, or use
+an abort listener to stop a child process. The host does not infer ownership of
+all background work from its timing and does not cancel every resource owned
+by an extension that completes its abort handling. Hostcalls have extension and
+session provenance, but not automatic task-local attribution across every
+Promise continuation. A tool that settles while abandoning unrelated-looking
+background work therefore does not cause that work to be cancelled implicitly.
+
+The supplementary `scripts/pijs_tool_lifecycle_probe.mjs` diagnostic pins the
+unchanged repository subagent example and runs the actual PiJS JavaScript
+registration, dispatch, signal, and lifetime code in Node. Its 15 checks pass;
+the previous bridge fails all 15. The real example receives partial results
+and invokes its child `SIGTERM` handler on abort. Child processes, native sinks,
+and other host facilities are controlled fixtures: this verifies JavaScript
+behavior, not native child termination, actor cancellation, or Windows.
+
+Native regressions cover wrapper progress delivery, caller abandonment,
+deadlines, late callbacks, mailbox bounds, hostcall scheduling, and isolation
+after unresponsive tools. They require the DSR native runner before their
+results can be claimed as executed verification. The published
+`context-mode@1.0.169` tool callback ignores Pi's signal and progress callback;
+this host feature alone does not establish cancellation of that package.
+The existing owner-scoped configuration, persistent-storage, SQLite, session
+identity, and grapheme mechanisms are independent of invocation lifetime.
+
 ### Grapheme segmentation for extension rendering
 
 PiJS supports locale-independent extended grapheme segmentation through

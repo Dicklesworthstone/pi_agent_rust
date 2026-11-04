@@ -27,7 +27,7 @@ use crate::permissions::{PermissionStore, PersistedDecision};
 use crate::resources::ExtensionResourcePaths;
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolOutput, ToolRegistry, ToolUpdate};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
 use asupersync::channel::{mpsc, oneshot};
@@ -50,7 +50,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as StdOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11212,6 +11212,205 @@ impl Drop for JsProviderStreamStartGuard {
     }
 }
 
+/// Progress is a snapshot, not a delta. A single replaceable slot bounds memory
+/// when JavaScript produces updates faster than the caller can display them.
+/// Native callbacks are invoked by the caller's future, never inside the actor.
+struct JsToolInvocation {
+    cancelled: Arc<AtomicBool>,
+    progress: Mutex<JsToolProgress>,
+    progress_waker: futures::task::AtomicWaker,
+}
+
+#[derive(Default)]
+struct JsToolProgress {
+    open: bool,
+    latest: Option<ToolUpdate>,
+}
+
+impl std::fmt::Debug for JsToolInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JsToolInvocation")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl JsToolInvocation {
+    fn new(with_updates: bool) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            progress: Mutex::new(JsToolProgress {
+                open: with_updates,
+                latest: None,
+            }),
+            progress_waker: futures::task::AtomicWaker::new(),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(StdOrdering::Acquire)
+    }
+
+    fn publish_update(&self, json: &str) -> rquickjs::Result<()> {
+        // Check before parsing as well as under the mailbox lock. Retained JS
+        // callbacks cannot allocate queued updates for a finished invocation.
+        if !self
+            .progress
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .open
+        {
+            return Ok(());
+        }
+        if json.len() > crate::tools::DEFAULT_MAX_BYTES {
+            return Err(rquickjs::Error::new_into_js_message(
+                "tool update",
+                "ToolUpdate",
+                "Extension tool update exceeds the 1 MB snapshot limit",
+            ));
+        }
+        let output: ToolOutput = serde_json::from_str(json).map_err(|err| {
+            rquickjs::Error::new_into_js_message("tool update", "ToolUpdate", err.to_string())
+        })?;
+        {
+            let mut progress = self.progress.lock().unwrap_or_else(|err| err.into_inner());
+            if !progress.open || self.is_cancelled() {
+                return Ok(());
+            }
+            progress.latest = Some(ToolUpdate {
+                content: output.content,
+                details: output.details,
+            });
+        }
+        self.progress_waker.wake();
+        Ok(())
+    }
+
+    fn take_update(&self) -> Option<ToolUpdate> {
+        self.progress
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .latest
+            .take()
+    }
+
+    fn close_progress(&self) {
+        self.progress
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .open = false;
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, StdOrdering::Release);
+        let mut progress = self.progress.lock().unwrap_or_else(|err| err.into_inner());
+        progress.open = false;
+        progress.latest = None;
+    }
+}
+
+/// Dropping an admitted tool future must signal the busy actor out of band;
+/// a cancellation command in that actor's own queue cannot interrupt its wait.
+struct JsToolInvocationGuard(Arc<JsToolInvocation>);
+
+impl Drop for JsToolInvocationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tool_progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_coalesces_snapshots_and_closes_without_losing_the_last_one() {
+        let invocation = JsToolInvocation::new(true);
+        for sequence in 0..100 {
+            invocation
+                .publish_update(
+                    &json!({
+                        "content": [{ "type": "text", "text": sequence.to_string() }],
+                        "details": { "sequence": sequence },
+                    })
+                    .to_string(),
+                )
+                .expect("valid progress");
+        }
+        invocation.close_progress();
+        invocation
+            .publish_update(r#"{"content":[],"details":{"sequence":100}}"#)
+            .expect("late callback is inert");
+        let update = invocation.take_update().expect("last admitted snapshot");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(update.details, Some(json!({ "sequence": 99 })));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(
+            serde_json::to_value(&update.content).unwrap(),
+            json!([{ "type": "text", "text": "99" }])
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(
+            invocation.take_update().is_none(),
+            "bounded latest-state slot"
+        );
+    }
+
+    #[test]
+    fn abandoned_progress_is_released_without_affecting_another_invocation() {
+        let abandoned = Arc::new(JsToolInvocation::new(true));
+        let other = JsToolInvocation::new(true);
+        let update = r#"{"content":[],"details":{"retained":true}}"#;
+        abandoned.publish_update(update).unwrap();
+        other.publish_update(update).unwrap();
+        drop(JsToolInvocationGuard(Arc::clone(&abandoned)));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(abandoned.is_cancelled());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(abandoned.take_update().is_none());
+        abandoned
+            .publish_update("not parsed after cancellation")
+            .unwrap();
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(abandoned.take_update().is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(!other.is_cancelled());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(other.take_update().is_some());
+    }
+
+    #[test]
+    fn progress_validates_shape_and_utf8_byte_limit_before_replacing_snapshot() {
+        let invocation = JsToolInvocation::new(true);
+        invocation
+            .publish_update(r#"{"content":[],"details":"good"}"#)
+            .unwrap();
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(
+            invocation
+                .publish_update(r#"{"content":"invalid"}"#)
+                .is_err()
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(invocation.publish_update("{").is_err());
+        let oversized = json!({
+            "content": [{ "type": "text", "text": "é".repeat(crate::tools::DEFAULT_MAX_BYTES / 2) }],
+        }).to_string();
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(oversized.chars().count() < crate::tools::DEFAULT_MAX_BYTES);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(oversized.len() > crate::tools::DEFAULT_MAX_BYTES);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(invocation.publish_update(&oversized).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(
+            invocation.take_update().unwrap().details,
+            Some(json!("good"))
+        );
+    }
+}
+
 #[derive(Debug)]
 enum JsRuntimeCommand {
     LoadExtensions {
@@ -11254,6 +11453,7 @@ enum JsRuntimeCommand {
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
+        invocation: Arc<JsToolInvocation>,
         reply: oneshot::Sender<Result<Value>>,
     },
     ExecuteCommand {
@@ -11341,6 +11541,10 @@ struct JsRuntimeShard {
     /// preserves its admission lease, provenance and eventual completion while
     /// the actor receives commands or advances another extension's timers.
     pending_idle_dispatch: Option<PendingIdleHostcall>,
+    /// Tool execution admits a bounded set of independent hostcalls so a
+    /// blocked earlier request cannot prevent a later request from releasing
+    /// it. Unfinished dispatches remain owned by the shard after the tool ends.
+    pending_tool_dispatches: VecDeque<PendingIdleHostcall>,
     /// Terminal pump failure retained so unrelated shards can continue while
     /// future calls targeting this shard still receive the original failure.
     pump_fault: Option<String>,
@@ -11357,6 +11561,10 @@ impl JsRuntimeShard {
             self.runtime.cancel_hostcall(&pending.call_id);
             // Dropping the dispatch also releases admission/UI leases and
             // invokes native subprocess cancellation guards before shutdown.
+            drop(pending);
+        }
+        while let Some(pending) = self.pending_tool_dispatches.pop_front() {
+            self.runtime.cancel_hostcall(&pending.call_id);
             drop(pending);
         }
     }
@@ -12226,9 +12434,10 @@ impl JsExtensionRuntimeHandle {
                             origin,
                             timeout_ms: _,
                             deadline,
+                            invocation,
                             reply,
                         } => {
-                            if reply.is_closed() {
+                            if reply.is_closed() || invocation.is_cancelled() {
                                 continue;
                             }
                             let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "tool") {
@@ -12256,6 +12465,7 @@ impl JsExtensionRuntimeHandle {
                                             origin: origin.as_ref(),
                                             timeout_ms,
                                             deadline,
+                                            invocation,
                                         },
                                     )
                                     .await
@@ -13119,8 +13329,31 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_tool_with_updates(
+            tool_name,
+            tool_call_id,
+            input,
+            ctx_payload,
+            timeout_ms,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_tool_with_updates(
+        &self,
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
+        let invocation = Arc::new(JsToolInvocation::new(on_update.is_some()));
+        let _cancel_on_drop = JsToolInvocationGuard(Arc::clone(&invocation));
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteTool {
             tool_name,
@@ -13130,18 +13363,41 @@ impl JsExtensionRuntimeHandle {
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            invocation: Arc::clone(&invocation),
             reply: reply_tx,
         };
-        let fut = async move {
-            self.sender
-                .send(&cx, command)
+        let fut =
+            async move {
+                self.sender
+                    .send(&cx, command)
+                    .await
+                    .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+                let mut reply = Box::pin(reply_rx.recv(&cx));
+                futures::future::poll_fn(|task_cx| {
+                    invocation.progress_waker.register(task_cx.waker());
+                    if let Some(update) = invocation.take_update()
+                        && let Some(callback) = on_update.as_ref()
+                    {
+                        callback(update);
+                    }
+                    match reply.as_mut().poll(task_cx) {
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                        std::task::Poll::Ready(result) => {
+                            // The actor closes the producer before replying. Deliver
+                            // its last snapshot before returning the final output.
+                            if let Some(update) = invocation.take_update()
+                                && let Some(callback) = on_update.as_ref()
+                            {
+                                callback(update);
+                            }
+                            std::task::Poll::Ready(result.map_err(|_| {
+                                Error::extension("JS extension runtime task cancelled")
+                            })?)
+                        }
+                    }
+                })
                 .await
-                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-            reply_rx
-                .recv(&cx)
-                .await
-                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
-        };
+            };
 
         timeout(
             wall_now(),
@@ -14847,6 +15103,7 @@ async fn build_js_runtime_shards(
             runtime: Rc::new(runtime),
             snapshot,
             pending_idle_dispatch: None,
+            pending_tool_dispatches: VecDeque::new(),
             pump_fault: None,
         });
     }
@@ -15992,9 +16249,10 @@ struct JsToolExecution<'a> {
     origin: Option<&'a SessionActionOrigin>,
     timeout_ms: u64,
     deadline: Instant,
+    invocation: Arc<JsToolInvocation>,
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn execute_extension_tool_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -16009,9 +16267,15 @@ async fn execute_extension_tool_sharded(
         origin,
         timeout_ms,
         deadline,
+        invocation,
     } = execution;
     shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "tool")?;
+    let _ = remaining_js_task_timeout(deadline, "tool")?;
+    if invocation.is_cancelled() {
+        return Err(Error::extension(
+            "JS extension tool cancelled before execution",
+        ));
+    }
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.tool.start",
@@ -16021,40 +16285,142 @@ async fn execute_extension_tool_sharded(
         "Extension tool execution start"
     );
     let task_id = next_runtime_task_id("task-tool");
-    let origin_guard = {
-        let runtime = &shards
+    // The token is host-generated and unrelated to the model's call ID. It is
+    // never sent to extension code or used as filesystem/capability authority.
+    let invocation_id = Uuid::new_v4().to_string();
+    let runtime = Rc::clone(
+        &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_tool")?;
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let input_js = json_to_js(&ctx, &input)?;
-                let ctx_js = json_to_js(&ctx, ctx_payload)?;
-                let promise: rquickjs::Value<'_> = exec_fn.call((
-                    bridge_secret.as_str(),
-                    tool_name,
-                    tool_call_id,
-                    input_js,
-                    ctx_js,
-                ))?;
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
+            .runtime,
+    );
+    let origin_guard = runtime.enter_session_action_origin(origin.cloned());
+    let execution_fence =
+        runtime.enter_tool_execution_fence(Arc::clone(&invocation.cancelled), deadline);
+    let bridge_secret = runtime.bridge_secret().to_string();
+    let started = runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_tool")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let input_js = json_to_js(&ctx, &input)?;
+            let ctx_js = json_to_js(&ctx, ctx_payload)?;
+            let on_update = if invocation
+                .progress
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .open
+            {
+                let sink = Arc::clone(&invocation);
+                Some(rquickjs::Function::new(
+                    ctx.clone(),
+                    move |json: String| sink.publish_update(&json),
+                )?)
+            } else {
+                None
+            };
+            let promise: rquickjs::Value<'_> = exec_fn.call((
+                bridge_secret.as_str(),
+                tool_name,
+                tool_call_id,
+                input_js,
+                ctx_js,
+                invocation_id.as_str(),
+                on_update,
+            ))?;
+            let _task: String =
+                task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+            Ok(())
+        })
+        .await;
+    let mut outcome = match started {
+        Ok(()) => {
+            await_js_tool_task(shards, host, shard_index, &task_id, &invocation, deadline).await
+        }
+        Err(err) => JsToolTaskOutcome::Fault(err),
     };
-
-    let result =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await;
+    if execution_fence.was_interrupted() {
+        // An async function can turn an engine interruption into a rejected
+        // promise. It is still unsafe to reuse that interrupted isolate.
+        outcome = JsToolTaskOutcome::Fault(Error::extension(
+            "tool cancellation or deadline interrupted JavaScript execution",
+        ));
+    }
+    // Abort listeners need their own small budget; the original deadline or
+    // already-set drop flag must not interrupt them before they can clean up.
+    drop(execution_fence);
+    if matches!(&outcome, JsToolTaskOutcome::Finished(_)) {
+        invocation.close_progress();
+    } else {
+        invocation.cancel();
+    }
+    let cleanup_deadline = Instant::now() + Duration::from_millis(100);
+    let cleanup_fence =
+        runtime.enter_tool_execution_fence(Arc::new(AtomicBool::new(false)), cleanup_deadline);
+    let result = match outcome {
+        JsToolTaskOutcome::Finished(result) => result,
+        JsToolTaskOutcome::Stopped { settled } => {
+            let cancellation = if Instant::now() >= deadline {
+                format!("JS extension tool timed out after {timeout_ms}ms")
+            } else {
+                "JS extension tool cancelled".to_string()
+            };
+            match abort_js_tool_task(
+                shards,
+                host,
+                shard_index,
+                &task_id,
+                &invocation_id,
+                cleanup_deadline,
+                settled,
+            )
+            .await
+            {
+                Ok(()) => Err(Error::extension(cancellation)),
+                Err(err) => Err(quarantine_runtime_shard(
+                    shards,
+                    shard_index,
+                    &format!("{cancellation}; cooperative cleanup failed: {err}"),
+                )),
+            }
+        }
+        JsToolTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            &format!("tool execution interrupted or runtime pump failed: {err}"),
+        )),
+    };
+    let finish = runtime
+        .with_ctx(|ctx| {
+            let finish: rquickjs::Function<'_> =
+                ctx.globals().get("__pi_finish_tool_invocation")?;
+            finish.call::<_, ()>((bridge_secret.as_str(), invocation_id.as_str()))
+        })
+        .await;
+    let cleanup_interrupted = cleanup_fence.was_interrupted();
+    drop(cleanup_fence);
     drop(origin_guard);
+    if cleanup_interrupted {
+        return Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            "tool abort or finish handler exceeded its cleanup budget",
+        ));
+    }
+    if let Err(err) = finish {
+        return Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            &format!("tool invocation cleanup failed: {err}"),
+        ));
+    }
+    if shards.ensure_shard_healthy(shard_index).is_ok() {
+        let refresh = refresh_runtime_shard_snapshot(shards, shard_index).await;
+        if result.is_ok() {
+            refresh?;
+        }
+    }
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -16066,6 +16432,100 @@ async fn execute_extension_tool_sharded(
         "Extension tool execution end"
     );
     result
+}
+
+enum JsToolTaskOutcome {
+    Finished(Result<Value>),
+    Stopped { settled: bool },
+    Fault(Error),
+}
+
+/// Poll a bounded set of retained hostcalls so slow native I/O cannot prevent
+/// cancellation or starve a second hostcall needed to complete the first. The
+/// dispatches retain their admission leases, origin and process drop guards.
+#[allow(clippy::future_not_send)]
+async fn await_js_tool_task(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    invocation: &JsToolInvocation,
+    deadline: Instant,
+) -> JsToolTaskOutcome {
+    loop {
+        if invocation.is_cancelled() || Instant::now() >= deadline {
+            return JsToolTaskOutcome::Stopped { settled: false };
+        }
+        let shard = &mut shards.shards[shard_index];
+        if let Err(err) = pump_tool_runtime_shard(shard, host).await {
+            return JsToolTaskOutcome::Fault(err);
+        }
+        if invocation.is_cancelled() || Instant::now() >= deadline {
+            return JsToolTaskOutcome::Stopped { settled: false };
+        }
+        let state = match take_js_task_state(&shard.runtime, task_id).await {
+            Ok(state) => state,
+            Err(err) => return JsToolTaskOutcome::Fault(err),
+        };
+        if invocation.is_cancelled() || Instant::now() >= deadline {
+            return JsToolTaskOutcome::Stopped {
+                settled: matches!(
+                    state,
+                    JsTaskTakeResult::Resolved(_) | JsTaskTakeResult::Rejected { .. }
+                ),
+            };
+        }
+        match finish_js_task_take(state) {
+            Ok(Some(value)) => return JsToolTaskOutcome::Finished(Ok(value)),
+            Err(err) => return JsToolTaskOutcome::Finished(Err(err)),
+            Ok(None) => extension_wait_cooperate(deadline).await,
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn abort_js_tool_task(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    invocation_id: &str,
+    deadline: Instant,
+    already_settled: bool,
+) -> Result<()> {
+    let shard = &mut shards.shards[shard_index];
+    let secret = shard.runtime.bridge_secret().to_string();
+    shard
+        .runtime
+        .with_ctx(|ctx| {
+            let cancel: rquickjs::Function<'_> =
+                ctx.globals().get("__pi_cancel_tool_invocation")?;
+            cancel.call::<_, ()>((secret.as_str(), invocation_id))
+        })
+        .await?;
+    if already_settled {
+        // Cancellation won while the native reader consumed a completed task.
+        // Keep that settlement proof instead of treating its now-missing entry
+        // as either a new successful tool result or a corrupt live task.
+        return Ok(());
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Err(Error::extension(
+                "tool did not settle within 100ms after abort",
+            ));
+        }
+        pump_tool_runtime_shard(shard, host).await?;
+        match take_js_task_state(&shard.runtime, task_id).await? {
+            JsTaskTakeResult::Pending => extension_wait_cooperate(deadline).await,
+            // A rejection is also successful cancellation cleanup. Its value
+            // must never replace the caller's cancellation/timeout outcome.
+            JsTaskTakeResult::Resolved(_) | JsTaskTakeResult::Rejected { .. } => return Ok(()),
+            JsTaskTakeResult::Missing | JsTaskTakeResult::Snapshot(_) => {
+                return Err(Error::extension("tool task state lost during cancellation"));
+            }
+        }
+    }
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
@@ -16770,23 +17230,50 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
 /// Poll a retained dispatch exactly once. A pending hostcall keeps its future
 /// and all cancellation guards until a later turn or explicit shard teardown.
 #[allow(clippy::future_not_send)]
-async fn poll_idle_hostcall(shard: &mut JsRuntimeShard) {
-    let Some(mut pending) = shard.pending_idle_dispatch.take() else {
-        return;
-    };
-    if !shard.runtime.is_hostcall_active(&pending.call_id) {
-        return;
+async fn poll_retained_hostcall(
+    runtime: &PiJsRuntime,
+    mut pending: PendingIdleHostcall,
+) -> Option<PendingIdleHostcall> {
+    if !runtime.is_hostcall_active(&pending.call_id) {
+        return None;
     }
     let outcome =
         futures::future::poll_fn(|cx| std::task::Poll::Ready(pending.future.as_mut().poll(cx)))
             .await;
     match outcome {
-        std::task::Poll::Pending => shard.pending_idle_dispatch = Some(pending),
+        std::task::Poll::Pending => Some(pending),
         std::task::Poll::Ready(Some((call_id, outcome, elapsed_ns))) => {
             AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
-            shard.runtime.complete_hostcall(call_id, outcome);
+            runtime.complete_hostcall(call_id, outcome);
+            None
         }
-        std::task::Poll::Ready(None) => {}
+        std::task::Poll::Ready(None) => None,
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn poll_idle_hostcall(shard: &mut JsRuntimeShard) {
+    if let Some(pending) = shard.pending_idle_dispatch.take() {
+        shard.pending_idle_dispatch = poll_retained_hostcall(&shard.runtime, pending).await;
+    }
+}
+
+fn retain_hostcall_dispatch(
+    shard: &JsRuntimeShard,
+    host: &JsRuntimeHost,
+    request: HostcallRequest,
+) -> PendingIdleHostcall {
+    let call_id = request.call_id.clone();
+    let runtime = Rc::clone(&shard.runtime);
+    let host = host.clone();
+    let owner = shard.extension_id.clone();
+    PendingIdleHostcall {
+        call_id,
+        future: Box::pin(async move {
+            // Saved Session provenance belongs to the call id. An overlapping
+            // tool cannot relabel it or shorten a background call's lifetime.
+            dispatch_js_hostcall_for_owner(&runtime, &host, Some(&owner), None, request).await
+        }),
     }
 }
 
@@ -16795,30 +17282,74 @@ struct IdleRuntimeProgress {
     ran_javascript: bool,
 }
 
+const MAX_RETAINED_TOOL_HOSTCALLS: usize = 16;
+
+/// Admit independent requests in FIFO order, then poll each retained future
+/// once without awaiting arbitrary I/O. The bound includes any older idle
+/// dispatch. Ownership, capability checks and admission remain in the common
+/// dispatcher, and unfinished work stays on the shard for later idle turns.
+#[allow(clippy::future_not_send)]
+async fn pump_tool_runtime_shard(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+) -> Result<IdleRuntimeProgress> {
+    let jobs_drained = shard.runtime.drain_microtasks().await?;
+    // Preserve the shared conservative scheduling veto. Existing dispatches
+    // keep their guards and continue polling; a transition to the smaller
+    // window only prevents admitting additional parallel work.
+    let admission_limit = if host
+        .manager()
+        .is_some_and(|manager| manager.any_safety_envelope_vetoing())
+    {
+        1
+    } else {
+        MAX_RETAINED_TOOL_HOSTCALLS
+    };
+    while shard.pending_tool_dispatches.len() + usize::from(shard.pending_idle_dispatch.is_some())
+        < admission_limit
+    {
+        let Some(request) = shard.runtime.pop_hostcall_request() else {
+            break;
+        };
+        let pending = retain_hostcall_dispatch(shard, host, request);
+        shard.pending_tool_dispatches.push_back(pending);
+    }
+    poll_idle_hostcall(shard).await;
+    let retained_count = shard.pending_tool_dispatches.len();
+    for _ in 0..retained_count {
+        let Some(pending) = shard.pending_tool_dispatches.pop_front() else {
+            break;
+        };
+        if let Some(pending) = poll_retained_hostcall(&shard.runtime, pending).await {
+            shard.pending_tool_dispatches.push_back(pending);
+        }
+    }
+    let tick = shard.runtime.tick().await?;
+    Ok(IdleRuntimeProgress {
+        has_pending: shard.pending_idle_dispatch.is_some()
+            || !shard.pending_tool_dispatches.is_empty()
+            || shard.runtime.has_pending(),
+        ran_javascript: jobs_drained > 0 || tick.ran_macrotask || tick.jobs_drained > 0,
+    })
+}
+
 /// Advance one shard without awaiting arbitrary host I/O. The per-turn bound
-/// is one FIFO dispatch poll and one scheduler tick, under the runtime's
-/// existing JavaScript interruption and microtask budgets.
+/// is one FIFO dispatch poll and one scheduler tick when no tool dispatches
+/// remain. Retained tool work uses the same bounded concurrent polling as an
+/// active invocation so independent completions cannot be lost or starved.
 #[allow(clippy::future_not_send)]
 async fn pump_idle_runtime_shard(
     shard: &mut JsRuntimeShard,
     host: &JsRuntimeHost,
 ) -> Result<IdleRuntimeProgress> {
+    if !shard.pending_tool_dispatches.is_empty() {
+        return pump_tool_runtime_shard(shard, host).await;
+    }
     let jobs_drained = shard.runtime.drain_microtasks().await?;
     if shard.pending_idle_dispatch.is_none()
         && let Some(request) = shard.runtime.pop_hostcall_request()
     {
-        let call_id = request.call_id.clone();
-        let runtime = Rc::clone(&shard.runtime);
-        let host = host.clone();
-        let owner = shard.extension_id.clone();
-        shard.pending_idle_dispatch = Some(PendingIdleHostcall {
-            call_id,
-            future: Box::pin(async move {
-                // The dispatcher recovers saved Session provenance by call
-                // id; a later command's active origin cannot relabel it.
-                dispatch_js_hostcall_for_owner(&runtime, &host, Some(&owner), None, request).await
-            }),
-        });
+        shard.pending_idle_dispatch = Some(retain_hostcall_dispatch(shard, host, request));
     }
     poll_idle_hostcall(shard).await;
     let tick = shard.runtime.tick().await?;
@@ -16835,7 +17366,7 @@ fn idle_runtime_poll_delay(shards: &JsRuntimeShardSet) -> Option<Duration> {
         .filter(|shard| shard.pump_fault.is_none())
         .filter_map(|shard| {
             let delay = shard.runtime.idle_poll_delay_ms();
-            if shard.pending_idle_dispatch.is_some() {
+            if shard.pending_idle_dispatch.is_some() || !shard.pending_tool_dispatches.is_empty() {
                 Some(delay.unwrap_or(10).min(10))
             } else {
                 delay
@@ -16861,6 +17392,7 @@ async fn pump_idle_runtime_shards(shards: &mut JsRuntimeShardSet, host: &JsRunti
         let shard = &mut shards.shards[shard_index];
         if shard.pump_fault.is_some()
             || (shard.pending_idle_dispatch.is_none()
+                && shard.pending_tool_dispatches.is_empty()
                 && shard.runtime.pending_hostcall_count() == 0
                 && shard.runtime.idle_poll_delay_ms() != Some(0))
         {
@@ -16895,7 +17427,11 @@ async fn pump_runtime_shard_for_command(
     host: &JsRuntimeHost,
     root_deadline: Option<Instant>,
 ) -> Result<bool> {
-    if shard.pending_idle_dispatch.is_some() {
+    if !shard.pending_tool_dispatches.is_empty() {
+        pump_tool_runtime_shard(shard, host)
+            .await
+            .map(|progress| progress.has_pending)
+    } else if shard.pending_idle_dispatch.is_some() {
         // A command may depend on idle initialization already in progress.
         // Poll that same future without overtaking it with newer hostcalls or
         // attaching the new command's deadline to the earlier operation.
@@ -16917,6 +17453,7 @@ async fn pump_runtime_shard_for_command(
 mod idle_runtime_tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::PoisonError;
 
     struct CompletedHostcalls(Mutex<Vec<String>>);
 
@@ -16936,6 +17473,294 @@ mod idle_runtime_tests {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
+    }
+
+    struct ReleaseHostcalls {
+        gate: Arc<AtomicBool>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl HostcallInterceptor for ReleaseHostcalls {
+        fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
+            let HostcallKind::Tool { name } = &request.kind else {
+                panic!("unexpected hostcall in retained dispatch fixture");
+            };
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(name.clone());
+            if name == "release" {
+                self.gate.store(true, StdOrdering::SeqCst);
+            }
+            Some(HostcallOutcome::Success(Value::Null))
+        }
+    }
+
+    struct RetainedDispatchFixture {
+        _directory: tempfile::TempDir,
+        _manager: ExtensionManager,
+        host: JsRuntimeHost,
+        shard: JsRuntimeShard,
+    }
+
+    async fn retained_dispatch_fixture(
+        interceptor: Arc<dyn HostcallInterceptor>,
+    ) -> RetainedDispatchFixture {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let manager = ExtensionManager::new();
+        let host = JsRuntimeHost {
+            tools: Arc::new(ToolRegistry::new(&[], directory.path(), None)).into(),
+            manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+            http: Arc::new(HttpConnector::with_defaults()),
+            policy: ExtensionPolicy::default(),
+            interceptor: Some(interceptor),
+        };
+        let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            crate::scheduler::WallClock,
+            PiJsRuntimeConfig {
+                cwd: directory.path().display().to_string(),
+                disk_cache_dir: None,
+                ..Default::default()
+            },
+            None,
+            "tool-pump-fixture".to_string(),
+        )
+        .await
+        .expect("fixture runtime");
+        RetainedDispatchFixture {
+            _directory: directory,
+            _manager: manager,
+            host,
+            shard: JsRuntimeShard {
+                extension_id: "tool-pump-fixture".to_string(),
+                runtime: Rc::new(runtime),
+                snapshot: serde_json::from_value(json!({ "id": "tool-pump-fixture" }))
+                    .expect("fixture snapshot"),
+                pending_idle_dispatch: None,
+                pending_tool_dispatches: VecDeque::new(),
+                pump_fault: None,
+            },
+        }
+    }
+
+    fn held_hostcall(
+        request: HostcallRequest,
+        gate: &Arc<AtomicBool>,
+        polls: &Rc<Cell<usize>>,
+        drops: &Rc<Cell<usize>>,
+    ) -> PendingIdleHostcall {
+        let gate = Arc::clone(gate);
+        let polls = Rc::clone(polls);
+        let drops = Rc::clone(drops);
+        PendingIdleHostcall {
+            call_id: request.call_id.clone(),
+            future: Box::pin(async move {
+                let _guard = PendingDrop(drops);
+                futures::future::poll_fn(|_cx| {
+                    polls.set(polls.get() + 1);
+                    if gate.load(StdOrdering::SeqCst) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                Some((request.call_id, HostcallOutcome::Success(Value::Null), 0))
+            }),
+        }
+    }
+
+    #[test]
+    fn tool_pump_dispatches_a_release_behind_blocked_idle_work_with_bounded_admission() {
+        futures::executor::block_on(async {
+            let gate = Arc::new(AtomicBool::new(false));
+            let intercepted = Arc::new(ReleaseHostcalls {
+                gate: Arc::clone(&gate),
+                calls: Mutex::new(Vec::new()),
+            });
+            let mut fixture = retained_dispatch_fixture(intercepted.clone()).await;
+            fixture
+                .shard
+                .runtime
+                .eval(
+                    r"
+                    globalThis.released = false;
+                    Promise.all([pi.tool('wait', {}), pi.tool('release', {})])
+                        .then(() => { globalThis.released = true; });
+                    ",
+                )
+                .await
+                .expect("queue dependent hostcalls");
+            let request = fixture
+                .shard
+                .runtime
+                .pop_hostcall_request()
+                .expect("blocked first request");
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            fixture.shard.pending_idle_dispatch =
+                Some(held_hostcall(request, &gate, &polls, &drops));
+
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("poll blocked request and its successor");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(polls.get(), 1, "each retained future is polled once");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 0, "the older pending future is retained");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                *intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                ["release"]
+            );
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("complete released earlier request");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(polls.get(), 2);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                fixture
+                    .shard
+                    .runtime
+                    .read_global_json("released")
+                    .await
+                    .expect("Promise.all completion"),
+                json!(true)
+            );
+
+            fixture
+                .shard
+                .runtime
+                .eval(
+                    r"
+                    for (let index = 0; index < 17; index += 1) {
+                        pi.tool(`bounded-${index}`, {});
+                    }
+                    ",
+                )
+                .await
+                .expect("queue more than one admission window");
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("bounded first admission window");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+                1 + MAX_RETAINED_TOOL_HOSTCALLS
+            );
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("admit remaining queued request");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+                18
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(fixture.shard.pending_tool_dispatches.is_empty());
+        });
+    }
+
+    #[test]
+    fn retained_tool_dispatch_survives_idle_turns_and_is_cancelled_on_shard_drop() {
+        futures::executor::block_on(async {
+            let intercepted = Arc::new(CompletedHostcalls(Mutex::new(Vec::new())));
+            let mut fixture = retained_dispatch_fixture(intercepted).await;
+            fixture
+                .shard
+                .runtime
+                .eval(
+                    "globalThis.retained = false; pi.tool('retained', {}).then(() => { retained = true; });",
+                )
+                .await
+                .expect("queue retained hostcall");
+            let request = fixture
+                .shard
+                .runtime
+                .pop_hostcall_request()
+                .expect("request");
+            let gate = Arc::new(AtomicBool::new(false));
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            fixture
+                .shard
+                .pending_tool_dispatches
+                .push_back(held_hostcall(request, &gate, &polls, &drops));
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("initial tool poll");
+            pump_idle_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("later idle poll");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(polls.get(), 2);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 0);
+            gate.store(true, StdOrdering::SeqCst);
+            pump_idle_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("idle completion after tool returned");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                fixture
+                    .shard
+                    .runtime
+                    .read_global_json("retained")
+                    .await
+                    .expect("retained completion"),
+                json!(true)
+            );
+
+            fixture
+                .shard
+                .runtime
+                .eval("pi.tool('cancelled', {});")
+                .await
+                .expect("queue cancellation fixture");
+            let request = fixture
+                .shard
+                .runtime
+                .pop_hostcall_request()
+                .expect("request");
+            let call_id = request.call_id.clone();
+            gate.store(false, StdOrdering::SeqCst);
+            drops.set(0);
+            fixture
+                .shard
+                .pending_tool_dispatches
+                .push_back(held_hostcall(request, &gate, &polls, &drops));
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("start retained native resource guard");
+            let runtime = Rc::clone(&fixture.shard.runtime);
+            drop(fixture.shard);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                drops.get(),
+                1,
+                "shard teardown drops native dispatch guards"
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(!runtime.is_hostcall_active(&call_id));
+        });
     }
 
     #[test]
@@ -17008,6 +17833,7 @@ mod idle_runtime_tests {
                 snapshot: serde_json::from_value(json!({ "id": "idle-fifo-fixture" }))
                     .expect("fixture snapshot"),
                 pending_idle_dispatch: Some(pending),
+                pending_tool_dispatches: VecDeque::new(),
                 pump_fault: None,
             };
             for _ in 0..3 {
@@ -17059,6 +17885,160 @@ mod idle_runtime_tests {
             );
             assert_eq!(shard.runtime.pending_hostcall_count(), 0);
             assert_eq!(shard.runtime.idle_poll_delay_ms(), None);
+        });
+    }
+
+    #[test]
+    fn tool_pump_safety_veto_stops_new_parallel_admission_without_dropping_live_work() {
+        futures::executor::block_on(async {
+            let first_gate = Arc::new(AtomicBool::new(false));
+            let second_gate = Arc::new(AtomicBool::new(false));
+            let intercepted = Arc::new(ReleaseHostcalls {
+                gate: Arc::clone(&first_gate),
+                calls: Mutex::new(Vec::new()),
+            });
+            let mut fixture = retained_dispatch_fixture(intercepted.clone()).await;
+            fixture
+                .shard
+                .runtime
+                .eval("pi.tool('older-idle', {}); pi.tool('older-tool', {});")
+                .await
+                .expect("queue earlier hostcalls");
+            let first = fixture.shard.runtime.pop_hostcall_request().expect("first");
+            let second = fixture
+                .shard
+                .runtime
+                .pop_hostcall_request()
+                .expect("second");
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            fixture.shard.pending_idle_dispatch =
+                Some(held_hostcall(first, &first_gate, &polls, &drops));
+            fixture
+                .shard
+                .pending_tool_dispatches
+                .push_back(held_hostcall(second, &second_gate, &polls, &drops));
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("start both retained dispatch guards");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(polls.get(), 2);
+
+            let manager = fixture.host.manager().expect("live fixture manager");
+            manager.set_budget_controller_config(ExtensionBudgetControllerConfig {
+                enabled: true,
+                recovery_successes_to_exit: 1,
+                regime_shift: RegimeShiftConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                safety_envelope: SafetyEnvelopeConfig {
+                    enabled: true,
+                    min_observations: 1,
+                    safety_error_threshold: 0.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            // The veto is intentionally raised by a different extension: the
+            // existing safety policy applies to interleaving across the host.
+            manager.record_budget_overload_signal(Some("overloaded-peer"), "overload", None, None);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(manager.any_safety_envelope_vetoing());
+            fixture
+                .shard
+                .runtime
+                .eval("pi.tool('after-veto-one', {}); pi.tool('after-veto-two', {});")
+                .await
+                .expect("queue requests after the safety transition");
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("poll existing work while admission is vetoed");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(polls.get(), 4, "both existing futures keep polling");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 0, "the veto must not cancel live dispatches");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+            );
+
+            first_gate.store(true, StdOrdering::SeqCst);
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("drain the older idle dispatch");
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("one live dispatch still fills the conservative window");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+            );
+
+            second_gate.store(true, StdOrdering::SeqCst);
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("drain the older tool dispatch");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(drops.get(), 2);
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("admit exactly one request under the veto");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                *intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                ["after-veto-one"]
+            );
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("admit the next request on its own turn");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                *intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                ["after-veto-one", "after-veto-two"]
+            );
+
+            manager.record_budget_recovery_sample(Some("overloaded-peer"), true);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(!manager.any_safety_envelope_vetoing());
+            fixture
+                .shard
+                .runtime
+                .eval("pi.tool('recovered-one', {}); pi.tool('recovered-two', {});")
+                .await
+                .expect("queue work after safety recovery");
+            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+                .await
+                .expect("restore the bounded parallel window");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                *intercepted
+                    .calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                [
+                    "after-veto-one",
+                    "after-veto-two",
+                    "recovered-one",
+                    "recovered-two"
+                ]
+            );
         });
     }
 }
