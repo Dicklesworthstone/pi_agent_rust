@@ -109,8 +109,10 @@ pub struct KeywordActivation {
 pub const KEYWORD_TELEMETRY_SCHEMA_V1: &str = "pi.magic_keyword.v1";
 
 /// Append activation telemetry to the session's replayable custom-entry
-/// stream. Both the SDK/RPC wrapper and the interactive TUI call this shared
-/// function so audit behavior cannot drift between surfaces.
+/// stream. Telemetry is observational: replaying or flushing an older
+/// activation must never mutate the session's current thinking selection.
+/// The session wrapper persists an admitted live reduction separately through
+/// `persist_thinking_change`.
 pub fn append_session_telemetry(
     session: &mut crate::session::Session,
     activations: &[KeywordActivation],
@@ -123,7 +125,6 @@ pub fn append_session_telemetry(
         });
         if let Some(level) = activation.thinking_level {
             data["thinkingLevel"] = serde_json::Value::String(level.to_string());
-            persist_thinking_change(session, level);
         }
         session.append_custom_entry("magic_keyword".to_string(), Some(data));
     }
@@ -645,6 +646,40 @@ mod tests {
             .into_iter()
             .map(|activation| activation.word)
             .collect()
+    }
+
+    #[test]
+    fn telemetry_records_effort_without_overwriting_current_selection() {
+        let mut session = crate::session::Session::in_memory();
+        session.set_model_header(None, None, Some("high".to_string()));
+        let activation = KeywordActivation {
+            word: "chillax".to_string(),
+            action: "chillax".to_string(),
+            thinking_level: Some(crate::model::ThinkingLevel::Minimal),
+        };
+
+        append_session_telemetry(&mut session, &[activation]);
+
+        assert_eq!(
+            session
+                .effective_thinking_level_for_current_path()
+                .as_deref(),
+            Some("high"),
+            "historical keyword telemetry must not reapply an old effort selection"
+        );
+        let telemetry = session
+            .entries_for_current_path()
+            .into_iter()
+            .find_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == "magic_keyword" =>
+                {
+                    custom.data.as_ref()
+                }
+                _ => None,
+            })
+            .expect("magic keyword telemetry");
+        assert_eq!(telemetry["thinkingLevel"], serde_json::json!("minimal"));
     }
 
     #[test]
