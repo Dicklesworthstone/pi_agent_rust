@@ -4,7 +4,7 @@
 //! repository as separate arguments, never checks out remote code, and never
 //! lets a pasted hostname retarget an ambient credential to another service.
 
-use super::MAX_REVIEW_DIFF_BYTES;
+use super::{MAX_REVIEW_DIFF_BYTES, isolate_review_git_environment, review_git, run_review_git};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::tools::{
@@ -52,8 +52,65 @@ pub(super) struct Target {
 
 fn invalid_target() -> Error {
     Error::validation(
-        "PI_REVIEW_TARGET: use an explicit HTTPS GitHub pull-request URL or GitLab merge-request URL; credentials, queries, encoded paths and ambiguous path segments are not accepted",
+        "PI_REVIEW_TARGET: use an HTTPS GitHub PR / GitLab MR URL, OWNER/REPO#N, or #N / !N in a checkout; credentials, queries, encoded paths and ambiguous path segments are not accepted",
     )
+}
+
+fn request_number(raw: &str) -> Result<u64> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_target());
+    }
+    raw.parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(invalid_target)
+}
+
+fn invalid_repository() -> Error {
+    Error::validation(
+        "PI_REVIEW_REPOSITORY: #N / !N needs a checkout with one origin URL, or one unambiguous remote when origin is absent; use an explicit hosted request URL to select another repository",
+    )
+}
+
+/// Read only this checkout's repository configuration. Neither a global remote
+/// nor an ambient GH_REPO/GITLAB_REPO override may select another project.
+fn checkout_remote(cwd: &Path) -> Result<String> {
+    let config = run_review_git(
+        review_git(cwd).args([
+            "config",
+            "--local",
+            "--null",
+            "--get-regexp",
+            "^remote\\..*\\.url$",
+        ]),
+        false,
+    )
+    .map_err(|_| invalid_repository())?;
+    let mut remotes = Vec::new();
+    for entry in config.split('\0').filter(|entry| !entry.is_empty()) {
+        let (key, value) = entry.split_once('\n').ok_or_else(invalid_repository)?;
+        let name = key
+            .strip_prefix("remote.")
+            .and_then(|key| key.strip_suffix(".url"))
+            .filter(|name| !name.is_empty())
+            .ok_or_else(invalid_repository)?;
+        remotes.push((name, value));
+    }
+    let first = remotes
+        .iter()
+        .find(|(name, _)| *name == "origin")
+        .or_else(|| remotes.first())
+        .ok_or_else(invalid_repository)?;
+    if remotes.iter().any(|(name, value)| {
+        if first.0 == "origin" {
+            *name == "origin" && *value != first.1
+        } else {
+            *name != first.0 || *value != first.1
+        }
+    }) {
+        return Err(invalid_repository());
+    }
+    Ok(first.1.to_string())
 }
 
 fn authority(url: &url::Url) -> Option<String> {
@@ -125,6 +182,22 @@ fn valid_segment(segment: &str) -> bool {
 impl Target {
     pub(super) fn parse(raw: &str) -> Result<Option<Self>> {
         if !raw.contains("://") {
+            if !raw.starts_with("branch:")
+                && !raw.starts_with("commit:")
+                && let Some((project, number)) = raw.rsplit_once('#')
+                && project.contains('/')
+            {
+                let parts: Vec<_> = project.split('/').collect();
+                if parts.len() != 2 || !parts.iter().all(|part| valid_segment(part)) {
+                    return Err(invalid_target());
+                }
+                return Ok(Some(Self {
+                    forge: Forge::Github,
+                    host: "github.com".to_string(),
+                    project: project.to_string(),
+                    number: request_number(number)?,
+                }));
+            }
             return Ok(None);
         }
         if raw.len() > 4096
@@ -184,6 +257,88 @@ impl Target {
         }))
     }
 
+    pub(super) fn resolve(cwd: &Path, raw: &str) -> Result<Option<Self>> {
+        let local = raw
+            .strip_prefix('#')
+            .map(|number| (Forge::Github, number))
+            .or_else(|| raw.strip_prefix('!').map(|number| (Forge::Gitlab, number)));
+        if let Some((forge, number)) = local {
+            let number = request_number(number)?;
+            let remote = checkout_remote(cwd)?;
+            return Self::from_remote(forge, number, &remote).map(Some);
+        }
+        Self::parse(raw)
+    }
+
+    /// A remote is a location hint only: never fetch it, expand insteadOf rules,
+    /// execute its transport, or forward embedded credentials to a forge CLI.
+    fn from_remote(forge: Forge, number: u64, raw: &str) -> Result<Self> {
+        if raw.len() > 4096
+            || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+            || raw.contains(['\\', '%', '?', '#'])
+            || raw.split('/').any(|part| matches!(part, "." | ".."))
+        {
+            return Err(invalid_repository());
+        }
+        let remote = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            // Conventional SCP-style SSH remotes, e.g. git@github.com:team/repo.git.
+            let (authority, path) = raw.split_once(':').ok_or_else(invalid_repository)?;
+            if !authority.contains('@') || path.starts_with('/') {
+                return Err(invalid_repository());
+            }
+            format!("ssh://{authority}/{path}")
+        };
+        if remote.split('/').any(|part| matches!(part, "." | "..")) {
+            return Err(invalid_repository());
+        }
+        let url = url::Url::parse(&remote).map_err(|_| invalid_repository())?;
+        if !matches!(url.scheme(), "https" | "ssh" | "git")
+            || url.password().is_some()
+            || (url.scheme() != "ssh" && !url.username().is_empty())
+            || url.query().is_some()
+            || url.fragment().is_some()
+            // SSH transport ports do not identify HTTPS API ports. Ask for an
+            // explicit review URL instead of silently guessing that mapping.
+            || (url.scheme() == "ssh" && url.port().is_some_and(|port| port != 22))
+            || (url.scheme() == "git" && url.port().is_some_and(|port| port != 9418))
+        {
+            return Err(invalid_repository());
+        }
+        let host = if matches!(url.scheme(), "ssh" | "git") {
+            let mut api = url.clone();
+            api.set_port(None).map_err(|()| invalid_repository())?;
+            authority(&api).ok_or_else(invalid_repository)?
+        } else {
+            authority(&url).ok_or_else(invalid_repository)?
+        };
+        if (forge == Forge::Github && host == "gitlab.com")
+            || (forge == Forge::Gitlab && host == "github.com")
+        {
+            return Err(invalid_repository());
+        }
+        let path = url
+            .path()
+            .strip_prefix('/')
+            .ok_or_else(invalid_repository)?;
+        let path = path.strip_suffix('/').unwrap_or(path);
+        let project = path.strip_suffix(".git").unwrap_or(path);
+        let parts: Vec<_> = project.split('/').collect();
+        if parts.len() < 2
+            || (forge == Forge::Github && parts.len() != 2)
+            || !parts.iter().all(|part| valid_segment(part))
+        {
+            return Err(invalid_repository());
+        }
+        Ok(Self {
+            forge,
+            host,
+            project: project.to_string(),
+            number,
+        })
+    }
+
     pub(super) fn url(&self) -> String {
         let kind = match self.forge {
             Forge::Github => "pull",
@@ -201,6 +356,7 @@ impl Target {
         command: &mut Command,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<()> {
+        isolate_review_git_environment(command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -656,6 +812,74 @@ mod tests {
         );
         assert!(Target::parse("branch:main")?.is_none());
         assert!(Target::parse("HEAD~3..HEAD")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn checkout_remote_urls_resolve_without_transport_execution_or_host_guessing() -> Result<()> {
+        for (forge, remote, expected) in [
+            (
+                Forge::Github,
+                "git@github.com:team/repo.git",
+                "https://github.com/team/repo/pull/12",
+            ),
+            (
+                Forge::Github,
+                "https://github.com/team/repo.git",
+                "https://github.com/team/repo/pull/12",
+            ),
+            (
+                Forge::Github,
+                "ssh://git@github.com:22/team/repo.git",
+                "https://github.com/team/repo/pull/12",
+            ),
+            (
+                Forge::Github,
+                "git://github.com:9418/team/repo.git",
+                "https://github.com/team/repo/pull/12",
+            ),
+            (
+                Forge::Gitlab,
+                "ssh://git@gitlab.com/team/sub/repo.git",
+                "https://gitlab.com/team/sub/repo/-/merge_requests/12",
+            ),
+            (
+                Forge::Gitlab,
+                "https://code.example:8443/team/repo.git",
+                "https://code.example:8443/team/repo/-/merge_requests/12",
+            ),
+        ] {
+            assert_eq!(Target::from_remote(forge, 12, remote)?.url(), expected);
+        }
+        for remote in [
+            "https://token@github.com/team/repo.git",
+            "https://user:password@github.com/team/repo.git",
+            "ssh://git:password@github.com/team/repo.git",
+            "ssh://git@github.com:2222/team/repo.git",
+            "file:///tmp/team/repo",
+            "ext::arbitrary-command",
+            "git@github.com:./team/repo.git",
+            "git@github.com:team/../other/repo.git",
+            "https://github.com/team%2Frepo.git",
+            "https://github.com/team/repo.git?token=secret",
+            "https://127.0.0.1/team/repo.git",
+            "https://github.com/team/repo.git\n",
+        ] {
+            assert!(
+                Target::from_remote(Forge::Github, 12, remote).is_err(),
+                "{remote}"
+            );
+        }
+        assert!(Target::from_remote(Forge::Github, 12, "git@gitlab.com:team/repo.git").is_err());
+        assert!(Target::from_remote(Forge::Gitlab, 12, "git@github.com:team/repo.git").is_err());
+        for raw in [
+            "team/repo#0",
+            "team/repo#-1",
+            "team/repo#18446744073709551616",
+            "team//repo#12",
+        ] {
+            assert!(Target::parse(raw).is_err(), "{raw}");
+        }
         Ok(())
     }
 

@@ -302,6 +302,63 @@ mod tests {
     }
 
     #[test]
+    fn review_dispatcher_selects_another_checkout_and_preserves_focus() {
+        let fixture = review_fixture();
+        let invoking = tempfile::tempdir().expect("nonrepository session directory");
+        let provider = std::sync::Arc::new(ReviewRouteProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let mut handle = review_handle(std::sync::Arc::clone(&provider), invoking.path());
+        let messages = handle.session().agent.messages().len();
+        let process_cwd = std::env::current_dir().expect("process directory");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let args = format!("\"{}\" focus on index boundaries", fixture.path().display());
+        runtime.block_on(run(
+            WorkspaceCommand::Review,
+            &args,
+            &mut handle,
+            invoking.path(),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::System(report) = receiver.try_recv().expect("review card") else {
+            panic!("review must return a report");
+        };
+        assert!(report.contains("Reject the boundary index"));
+        assert!(report.contains("bounds.rs:1"));
+        let repository = std::fs::canonicalize(fixture.path()).expect("checkout root");
+        assert!(report.contains(&repository.display().to_string()));
+        assert_eq!(handle.session().agent.messages().len(), messages);
+        assert_eq!(
+            std::env::current_dir().expect("process directory"),
+            process_cwd
+        );
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // The same shared parser must not silently ignore model-only focus in
+        // offline mode, nor admit another provider request for that refusal.
+        runtime.block_on(run(
+            WorkspaceCommand::Review,
+            &format!("--offline {args}"),
+            &mut handle,
+            invoking.path(),
+            None,
+            None,
+            &sender,
+        ));
+        let PiMsg::AgentError(error) = receiver.try_recv().expect("focus refusal") else {
+            panic!("invalid focus must return an error");
+        };
+        assert!(error.contains("PI_REVIEW_FOCUS"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn review_dispatcher_uses_session_model_and_keeps_offline_explicit() {
         let fixture = review_fixture();
         let provider = std::sync::Arc::new(ReviewRouteProvider {

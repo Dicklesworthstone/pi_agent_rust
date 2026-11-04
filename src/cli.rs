@@ -3107,9 +3107,12 @@ pub enum Commands {
     /// Parallel model code review with prioritized findings and a ship verdict
     #[command(name = "review")]
     Review {
-        /// Target: uncommitted (default), staged, commit:REF, branch:REF, a commit range, or an HTTPS GitHub PR / GitLab MR URL
-        #[arg(value_name = "TARGET")]
-        target: Option<String>,
+        /// Optional checkout, then a Git target / PR / MR, then review focus. Hosted targets accept HTTPS URLs, OWNER/REPO#N, or #N / !N in a checkout
+        #[arg(value_name = "CHECKOUT_TARGET_FOCUS")]
+        target: Vec<String>,
+        /// Additional review instructions (model review only)
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+        focus: Option<String>,
         /// Run only local heuristics; do not send code to a model
         #[arg(long)]
         offline: bool,

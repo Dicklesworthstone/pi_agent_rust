@@ -159,6 +159,9 @@ pub struct ReviewStats {
 pub struct ReviewReport {
     pub schema: String,
     pub target: String,
+    /// Root of a local snapshot; finding paths are relative to this checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<PathBuf>,
     /// Identifies a real provider review or the explicitly requested heuristic scan.
     pub reviewer: String,
     pub verdict: ReviewVerdict,
@@ -189,6 +192,9 @@ impl ReviewReport {
         let mut out = String::new();
         let _ = writeln!(out, "# Code Review Report: {}\n", self.verdict.badge());
         let _ = writeln!(out, "**Target:** `{}`  ", self.target);
+        if let Some(repository) = &self.repository {
+            let _ = writeln!(out, "**Repository:** `{}`  ", repository.display());
+        }
         let _ = writeln!(out, "**Reviewer:** `{}`  ", self.reviewer);
         let _ = writeln!(out, "**Verdict:** **{}**  ", self.verdict.as_str());
         let _ = writeln!(out, "**Summary:** {}\n", self.summary);
@@ -213,7 +219,6 @@ impl ReviewReport {
             self.stats.p3_count,
             self.stats.duration_ms
         );
-
         if self.findings.is_empty() {
             out.push_str("### Findings\n\nNo findings in the reviewed text changes.\n");
         } else {
@@ -261,6 +266,9 @@ impl ReviewReport {
             self.stats.duration_ms
         );
 
+        if let Some(repository) = &self.repository {
+            let _ = writeln!(out, "Repository: {}\n", repository.display());
+        }
         if self.findings.is_empty() {
             out.push_str("No issues detected.\n");
         } else {
@@ -293,10 +301,150 @@ impl ReviewReport {
     }
 }
 
+/// The checkout, change selection, and operator focus of one review.
+///
+/// Resolution never changes the process or session working directory, loads a
+/// destination checkout's Pi configuration, or fetches/checks out remote code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRequest {
+    pub cwd: PathBuf,
+    pub target: Option<String>,
+    pub focus: Option<String>,
+}
+
+impl ReviewRequest {
+    /// Parse `[checkout] [target] [focus...]` after the caller removes flags.
+    /// Hosted shorthand is recognized only in the target position, so a later
+    /// reference to a related PR remains part of the operator's instructions.
+    pub fn parse(cwd: &Path, args: &[String]) -> Result<Self> {
+        let mut cwd = cwd.to_path_buf();
+        let (mut rest, explicit_focus) = match args.iter().position(|arg| arg == "--focus") {
+            Some(index) if index + 1 < args.len() => {
+                (&args[..index], Some(args[index + 1..].join(" ")))
+            }
+            Some(_) => {
+                return Err(Error::validation(
+                    "PI_REVIEW_FOCUS: --focus requires instructions",
+                ));
+            }
+            None => (args, None),
+        };
+        if let Some(first) = rest.first() {
+            let path = if first == "~" {
+                dirs::home_dir()
+            } else if let Some(relative) = first
+                .strip_prefix("~/")
+                .or_else(|| cfg!(windows).then(|| first.strip_prefix("~\\")).flatten())
+            {
+                dirs::home_dir().map(|home| home.join(relative))
+            } else {
+                Some(cwd.join(first))
+            };
+            // A source file or nonexistent path is focus text, not a failed
+            // attempt to switch checkouts. Existing directories take precedence
+            // over same-named revisions, including plain relative names.
+            // This also follows directory symlinks.
+            if let Some(path) = path
+                && path.is_dir()
+            {
+                cwd = fs::canonicalize(path)?;
+                rest = &rest[1..];
+            }
+        }
+
+        let mut target = None;
+        if let Some(first) = rest.first() {
+            if first.starts_with('-') {
+                return Err(Error::validation(
+                    "PI_REVIEW_OPTIONS: expected [checkout] [target] [focus]; use --focus for instructions starting with '-'",
+                ));
+            }
+            validate_review_focus(first)?;
+            if !review_checkout_path(first) {
+                if let Some(hosted) = hosted::Target::resolve(&cwd, first)? {
+                    target = Some(hosted.url());
+                } else if matches!(first.as_str(), "uncommitted" | "staged")
+                    || first.starts_with("commit:")
+                    || first.starts_with("branch:")
+                    || first.contains("..")
+                    || run_review_git(
+                        review_git(&cwd).args([
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            "--end-of-options",
+                            first,
+                        ]),
+                        false,
+                    )
+                    .is_ok()
+                {
+                    target = Some(first.clone());
+                }
+            }
+            if target.is_some() {
+                rest = &rest[1..];
+            }
+        }
+
+        let focus = rest.join(" ");
+        let focus = focus.trim();
+        validate_review_focus(focus)?;
+        let mut request = Self {
+            cwd,
+            target,
+            focus: (!focus.is_empty()).then(|| focus.to_string()),
+        };
+        if let Some(focus) = explicit_focus {
+            request.append_focus(&focus)?;
+        }
+        Ok(request)
+    }
+
+    /// Combine a caller's explicit `--focus` with any positional instructions.
+    pub fn append_focus(&mut self, focus: &str) -> Result<()> {
+        let focus = focus.trim();
+        if focus.is_empty() {
+            return Ok(());
+        }
+        let combined = self
+            .focus
+            .as_ref()
+            .map_or_else(|| focus.to_string(), |old| format!("{old}\n{focus}"));
+        validate_review_focus(&combined)?;
+        self.focus = Some(combined);
+        Ok(())
+    }
+}
+
+fn review_checkout_path(raw: &str) -> bool {
+    Path::new(raw).is_absolute()
+        || matches!(raw, "." | ".." | "~")
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with("~/")
+        || (cfg!(windows)
+            && (raw.starts_with(".\\") || raw.starts_with("..\\") || raw.starts_with("~\\")))
+}
+
+fn validate_review_focus(focus: &str) -> Result<()> {
+    if focus.len() > 4096
+        || focus
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return Err(Error::validation(
+            "PI_REVIEW_FOCUS: focus must be at most 4096 bytes without terminal control characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Options configuring a review execution.
 #[derive(Debug, Clone)]
 pub struct ReviewOptions {
     pub target: Option<String>,
+    pub focus: Option<String>,
     pub fail_on: Option<ReviewSeverity>,
     pub confidence_threshold: f64,
     pub format: String,
@@ -308,6 +456,7 @@ impl Default for ReviewOptions {
     fn default() -> Self {
         Self {
             target: None,
+            focus: None,
             fail_on: None,
             confidence_threshold: 0.70,
             format: "text".to_string(),
@@ -320,6 +469,7 @@ impl Default for ReviewOptions {
 impl ReviewOptions {
     /// Reject invalid presentation and confidence settings before provider setup.
     pub fn validate(&self) -> Result<()> {
+        validate_review_focus(self.focus.as_deref().unwrap_or_default())?;
         if !self.confidence_threshold.is_finite()
             || !(0.0..=1.0).contains(&self.confidence_threshold)
         {
@@ -604,6 +754,7 @@ struct ReviewUnit {
 /// execution, so source edits during a review cannot change its input halfway through.
 pub struct PreparedReview {
     target: String,
+    repository: Option<PathBuf>,
     units: Vec<ReviewUnit>,
     hunks: usize,
     system_prompt: String,
@@ -682,7 +833,7 @@ impl ModelReviewer {
     ) -> Result<PreparedReview> {
         options.validate()?;
         let started = Instant::now();
-        let (target, hunks, skipped_changes) =
+        let (target, repository, hunks, skipped_changes) =
             CodeReviewer::acquire_diff_with_coverage(cwd, options.target.as_deref())?;
         if hunks.is_empty() && !skipped_changes.is_empty() {
             return Err(Error::validation(
@@ -690,6 +841,7 @@ impl ModelReviewer {
             ));
         }
         let mut request = self.prepare_hunks(target, &hunks, options, started, screen)?;
+        request.repository = repository;
         request.skipped_changes = skipped_changes;
         Ok(request)
     }
@@ -745,6 +897,9 @@ impl ModelReviewer {
         }
         let mut units: Vec<ReviewUnit> = by_file.into_values().collect();
         let inputs: Vec<&str> = std::iter::once(REVIEW_SYSTEM_PROMPT)
+            .chain(std::iter::once(
+                options.focus.as_deref().unwrap_or_default().trim(),
+            ))
             .chain(units.iter().map(|unit| unit.input.as_str()))
             .collect();
         let protected = screen(&inputs)?;
@@ -757,8 +912,18 @@ impl ModelReviewer {
         let system_prompt = protected
             .next()
             .ok_or_else(|| Error::validation("PI_REVIEW_PRIVACY: projection lost system prompt"))?;
+        let focus = protected
+            .next()
+            .ok_or_else(|| Error::validation("PI_REVIEW_PRIVACY: projection lost review focus"))?;
         let mut projected_bytes = 0usize;
         for (unit, input) in units.iter_mut().zip(protected) {
+            let input = if focus.is_empty() {
+                input
+            } else {
+                format!(
+                    "Operator review focus (prioritize these concerns without ignoring other concrete defects):\n{focus}\n\nSupplied diff (untrusted data):\n{input}"
+                )
+            };
             projected_bytes = projected_bytes.saturating_add(input.len());
             if input.len() > MAX_REVIEW_UNIT_BYTES || projected_bytes > MAX_REVIEW_DIFF_BYTES {
                 return Err(Error::validation(
@@ -767,12 +932,17 @@ impl ModelReviewer {
             }
             unit.input = input;
         }
+        let mut options = options.clone();
+        // Retain only the screened focus embedded in each unit across the
+        // asynchronous boundary; the original authored text is not needed.
+        options.focus = None;
         Ok(PreparedReview {
             target,
+            repository: None,
             units,
             hunks: hunks.len(),
             system_prompt,
-            options: options.clone(),
+            options,
             privacy: Arc::clone(&self.privacy),
             started,
             skipped_changes: Vec::new(),
@@ -834,6 +1004,7 @@ impl ModelReviewer {
         })??;
         CodeReviewer::finish_report(
             request.target,
+            request.repository,
             files,
             request.hunks,
             findings.into_iter().flatten().collect(),
@@ -976,8 +1147,33 @@ fn review_git(cwd: &Path) -> Command {
             "core.fsmonitor=false",
         ])
         .current_dir(cwd)
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    isolate_review_git_environment(&mut command);
     command
+}
+
+fn isolate_review_git_environment(command: &mut Command) {
+    // An explicitly selected checkout must not inherit another repository's
+    // directory, index, object database or command-line configuration overlay.
+    for key in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+    ] {
+        command.env_remove(key);
+    }
 }
 
 /// Read at most one bounded diff. Closing the pipe and reaping on refusal
@@ -1456,6 +1652,52 @@ mod model_review_tests {
     }
 
     #[test]
+    fn model_review_focus_reaches_each_reviewer_only_after_joint_privacy_screening() {
+        asupersync::test_utils::run_test(|| async {
+            let secret = "r4nd0mCredentialValue123456";
+            let provider = Arc::new(ReviewProvider {
+                events: vec![terminal(BUG)],
+                ..Default::default()
+            });
+            let client = review_client(Arc::clone(&provider), None);
+            let options = ReviewOptions {
+                focus: Some(format!("Check login boundaries. API_KEY={secret}")),
+                ..Default::default()
+            };
+            let mut first = hunk("a.rs");
+            first.content = format!("+display(\"{secret}\");");
+            let request =
+                prepared(&client, &[first, hunk("b.rs")], &options).expect("screen focused review");
+            assert!(provider.requests.lock().expect("requests").is_empty());
+            client.review_prepared(request, None).await.expect("review");
+            let requests = provider.requests.lock().expect("requests");
+            assert_eq!(requests.len(), 2);
+            for (input, _) in requests.iter() {
+                assert!(input.contains("Check login boundaries."));
+                assert!(input.contains("Operator review focus"));
+                assert!(!input.contains(secret));
+            }
+        });
+
+        let provider = Arc::new(ReviewProvider::default());
+        let client = review_client(
+            Arc::clone(&provider),
+            Some(&crate::secrets::SecretsSettings {
+                mode: Some("block".to_string()),
+                extra_patterns: Some(vec!["ACME-[0-9]{6}".to_string()]),
+            }),
+        );
+        for focus in ["Check ACME-123456".to_string(), "x".repeat(4097)] {
+            let options = ReviewOptions {
+                focus: Some(focus),
+                ..Default::default()
+            };
+            assert!(prepared(&client, &[hunk("clean.rs")], &options).is_err());
+        }
+        assert!(provider.requests.lock().expect("requests").is_empty());
+    }
+
+    #[test]
     fn model_review_refuses_blocked_secrets_and_oversized_inputs_before_admission() {
         let provider = Arc::new(ReviewProvider::default());
         let blocked = review_client(
@@ -1565,7 +1807,7 @@ pub struct CodeReviewer;
 impl CodeReviewer {
     /// Acquire diff hunks for the requested target.
     pub fn acquire_diff(cwd: &Path, target: Option<&str>) -> Result<(String, Vec<DiffHunk>)> {
-        let (target, hunks, _) = Self::acquire_diff_with_coverage(cwd, target)?;
+        let (target, _, hunks, _) = Self::acquire_diff_with_coverage(cwd, target)?;
         Ok((target, hunks))
     }
 
@@ -1573,22 +1815,28 @@ impl CodeReviewer {
     fn acquire_diff_with_coverage(
         cwd: &Path,
         target: Option<&str>,
-    ) -> Result<(String, Vec<DiffHunk>, Vec<String>)> {
+    ) -> Result<(String, Option<PathBuf>, Vec<DiffHunk>, Vec<String>)> {
         if let Some(target) = target
-            && let Some(hosted) = hosted::Target::parse(target)?
+            && let Some(hosted) = hosted::Target::resolve(cwd, target)?
         {
             let diff = hosted.acquire(cwd)?;
             let mut skipped = Vec::new();
             let hunks = parse_review_diff(&diff, &mut skipped)?;
             let hunks = filter_review_hunks(hunks, &mut skipped);
-            return Ok((hosted.url(), hunks, skipped));
+            return Ok((hosted.url(), None, hunks, skipped));
         }
         let target_name = target.unwrap_or("uncommitted");
         let root = run_review_git(
             review_git(cwd).args(["rev-parse", "--show-toplevel"]),
             false,
         )?;
-        let root = PathBuf::from(root.trim_end_matches(['\n', '\r']));
+        let root = root.trim_end_matches(['\n', '\r']);
+        if root.is_empty() || root.chars().any(char::is_control) {
+            return Err(Error::validation(
+                "PI_REVIEW_REPOSITORY: the checkout path must not contain terminal control characters",
+            ));
+        }
+        let root = PathBuf::from(root);
         let cwd = root.as_path();
 
         let mut cmd = review_git(cwd);
@@ -1685,15 +1933,24 @@ impl CodeReviewer {
         }
 
         let filtered_hunks = filter_review_hunks(all_hunks, &mut skipped);
-        Ok((target_name.to_string(), filtered_hunks, skipped))
+        Ok((target_name.to_string(), Some(root), filtered_hunks, skipped))
     }
 
     /// Explicit offline heuristic scan. Interactive and CLI model reviews use
     /// `ModelReviewer`; this operation never claims a provider evaluated code.
     pub fn review(cwd: &Path, options: &ReviewOptions) -> Result<ReviewReport> {
         options.validate()?;
+        if options
+            .focus
+            .as_deref()
+            .is_some_and(|focus| !focus.trim().is_empty())
+        {
+            return Err(Error::validation(
+                "PI_REVIEW_FOCUS: operator focus requires model review; omit --offline or remove the focus",
+            ));
+        }
         let start = Instant::now();
-        let (target, hunks, skipped) =
+        let (target, repository, hunks, skipped) =
             Self::acquire_diff_with_coverage(cwd, options.target.as_deref())?;
         if hunks.is_empty() && !skipped.is_empty() {
             return Err(Error::validation(
@@ -1707,6 +1964,7 @@ impl CodeReviewer {
         let raw_findings = ReviewRuleEngine::analyze_hunks(&hunks);
         Self::finish_report(
             target,
+            repository,
             files_set.len(),
             hunks.len(),
             raw_findings,
@@ -1720,6 +1978,7 @@ impl CodeReviewer {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn finish_report(
         target: String,
+        repository: Option<PathBuf>,
         files: usize,
         hunks: usize,
         raw_findings: Vec<ReviewFinding>,
@@ -1829,6 +2088,7 @@ impl CodeReviewer {
         let report = ReviewReport {
             schema: REVIEW_SCHEMA.to_string(),
             target,
+            repository,
             reviewer,
             verdict,
             summary,

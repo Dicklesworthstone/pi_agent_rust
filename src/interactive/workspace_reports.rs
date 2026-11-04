@@ -332,24 +332,20 @@ fn review_report(report: &crate::review::ReviewReport) -> Report {
     )
 }
 
-/// `/review [--offline] [target]`: prepare a model review, or explicitly request
+/// `/review [--offline] [checkout] [target] [focus]`: prepare a model review, or explicitly request
 /// the local heuristic scan. No provider call happens before preparation succeeds.
 pub fn prepare_review(
     cwd: &Path,
     args: &str,
     agent: &crate::agent::Agent,
 ) -> crate::error::Result<PreparedWorkspaceReview> {
-    let args = args.trim();
-    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
-    let offline = first == "--offline";
-    let target = if offline { rest.trim() } else { args };
-    if target.starts_with('-') {
-        return Err(crate::error::Error::validation(
-            "Usage: /review [--offline] [uncommitted|staged|commit:REF|branch:REF|RANGE]",
-        ));
-    }
+    let args = crate::resources::parse_command_args(args);
+    let offline = args.first().is_some_and(|arg| arg == "--offline");
+    let args = if offline { &args[1..] } else { &args[..] };
+    let request = crate::review::ReviewRequest::parse(cwd, args)?;
     let options = crate::review::ReviewOptions {
-        target: (!target.is_empty()).then(|| target.to_string()),
+        target: request.target,
+        focus: request.focus,
         fail_on: None,
         confidence_threshold: 0.70,
         format: "markdown".to_string(),
@@ -357,13 +353,13 @@ pub fn prepare_review(
         out_file: None,
     };
     if offline {
-        return crate::review::CodeReviewer::review(cwd, &options)
+        return crate::review::CodeReviewer::review(&request.cwd, &options)
             .map(|report| review_report(&report))
             .map(PreparedWorkspaceReview::Offline);
     }
     let client = crate::review::ModelReviewer::for_agent(agent);
-    let request = client.prepare_with_agent(cwd, &options, agent)?;
-    Ok(PreparedWorkspaceReview::Model(Box::new(client), request))
+    let prepared = client.prepare_with_agent(&request.cwd, &options, agent)?;
+    Ok(PreparedWorkspaceReview::Model(Box::new(client), prepared))
 }
 
 /// Explicit report and preview modes never turn an unrecognized option into

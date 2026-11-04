@@ -7,7 +7,7 @@ use tempfile::tempdir;
 use pi::commit_split::DiffParser;
 use pi::review::{
     CodeReviewer, REVIEW_SCHEMA, ReviewDeduplicator, ReviewFinding, ReviewOptions, ReviewReport,
-    ReviewRuleEngine, ReviewSeverity, ReviewVerdict,
+    ReviewRequest, ReviewRuleEngine, ReviewSeverity, ReviewVerdict,
 };
 
 fn git(repo: &std::path::Path, args: &[&str]) {
@@ -37,6 +37,86 @@ fn review_repository() -> tempfile::TempDir {
 
 fn files_in(hunks: &[pi::commit_split::DiffHunk]) -> std::collections::BTreeSet<&str> {
     hunks.iter().map(|hunk| hunk.file_path.as_str()).collect()
+}
+
+#[test]
+fn review_selects_plain_and_quoted_checkouts_without_changing_the_invoking_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let parent = tempdir()?;
+    let process_cwd = std::env::current_dir()?;
+    for name in ["checkout", "project checkout"] {
+        let checkout = parent.path().join(name);
+        fs::create_dir(&checkout)?;
+        git(&checkout, &["init"]);
+        git(&checkout, &["config", "user.name", "Review Test"]);
+        git(
+            &checkout,
+            &["config", "user.email", "review@example.invalid"],
+        );
+        git(&checkout, &["config", "commit.gpgsign", "false"]);
+        fs::write(checkout.join("source.rs"), "let value = 1;\n")?;
+        git(&checkout, &["add", "source.rs"]);
+        git(&checkout, &["commit", "-m", "base"]);
+        fs::write(checkout.join("source.rs"), "let value = input.unwrap();\n")?;
+        git(&checkout, &["add", "source.rs"]);
+        fs::write(
+            checkout.join("untracked.rs"),
+            "must not enter staged review\n",
+        )?;
+        let index = fs::read(checkout.join(".git/index"))?;
+
+        for prefix in ["", "./"] {
+            let request = ReviewRequest::parse(
+                parent.path(),
+                &pi::resources::parse_command_args(&format!(
+                    "\"{prefix}{name}\" staged focus on bounds"
+                )),
+            )?;
+            assert_eq!(request.cwd, fs::canonicalize(&checkout)?);
+            assert_eq!(request.target.as_deref(), Some("staged"));
+            assert_eq!(request.focus.as_deref(), Some("focus on bounds"));
+            let options = ReviewOptions {
+                target: request.target,
+                ..Default::default()
+            };
+            let report = CodeReviewer::review(&request.cwd, &options)?;
+            assert_eq!(report.repository, Some(fs::canonicalize(&checkout)?));
+            assert_eq!(report.stats.files_analyzed, 1);
+            assert_eq!(report.findings[0].file, "source.rs");
+            assert!(report.format_markdown().contains(name));
+            assert_eq!(fs::read(checkout.join(".git/index"))?, index);
+            assert_eq!(std::env::current_dir()?, process_cwd);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn review_focus_does_not_retarget_on_source_paths_or_related_request_mentions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repo = review_repository();
+    fs::write(repo.path().join("auth.rs"), "source\n")?;
+    for focus in [
+        "./auth.rs regressed in team/related#7",
+        "./auth.rs#123 check the referenced source",
+        "./missing.rs check #123 and !8",
+        "check the change discussed in team/related#7",
+    ] {
+        let request = ReviewRequest::parse(repo.path(), &pi::resources::parse_command_args(focus))?;
+        assert!(request.target.is_none(), "{focus}");
+        assert_eq!(request.cwd, repo.path());
+        assert_eq!(request.focus.as_deref(), Some(focus));
+    }
+    let request = ReviewRequest::parse(
+        repo.path(),
+        &pi::resources::parse_command_args("team/selected#12 related to team/other#17"),
+    )?;
+    assert_eq!(
+        request.target.as_deref(),
+        Some("https://github.com/team/selected/pull/12")
+    );
+    assert_eq!(request.focus.as_deref(), Some("related to team/other#17"));
+    Ok(())
 }
 
 #[test]
@@ -281,6 +361,7 @@ fn test_report_formatting_schema_and_json() {
     let report = ReviewReport {
         schema: REVIEW_SCHEMA.to_string(),
         target: "uncommitted".to_string(),
+        repository: None,
         reviewer: "model:fixture/reviewer".to_string(),
         verdict: ReviewVerdict::Block,
         summary: "Found 1 blocker and 1 nit".to_string(),
@@ -418,6 +499,7 @@ keys = (
 )
 (root / "capture.json").write_text(json.dumps({
     "program": pathlib.Path(sys.argv[0]).name,
+    "cwd": str(pathlib.Path.cwd()),
     "args": sys.argv[1:],
     "env": {key: os.environ.get(key) for key in keys},
 }))
@@ -511,6 +593,124 @@ sys.exit(int(os.environ.get("PI_REVIEW_FIXTURE_EXIT", "0")))
         assert_eq!(capture["env"]["GH_TOKEN"], "fixture-public-token");
         assert!(capture["env"]["GH_ENTERPRISE_TOKEN"].is_null());
         assert!(capture["env"]["GH_REPO"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn github_shorthand_works_outside_a_checkout_and_does_not_retarget_host_credentials()
+    -> TestResult {
+        let fixture = Fixture::new(DIFF.as_bytes())?;
+        let output = fixture
+            .command("team/repo#42")?
+            .env("GH_HOST", "private.ghe.com")
+            .env("GH_TOKEN", "fixture-private-host-token")
+            .env("GH_REPO", "private.ghe.com/wrong/repo")
+            .output()?;
+        let report = report(&output)?;
+        assert_eq!(report["target"], "https://github.com/team/repo/pull/42");
+        assert!(report["repository"].is_null());
+        let capture = fixture.capture()?;
+        assert_eq!(capture["args"][5], "github.com/team/repo");
+        assert_eq!(capture["env"]["GH_HOST"], "github.com");
+        assert!(capture["env"]["GH_TOKEN"].is_null());
+        assert!(capture["env"]["GH_REPO"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn numbered_review_uses_the_selected_checkout_remote_without_mutating_it() -> TestResult {
+        for (number, remote, canonical, backend) in [
+            (
+                "#23",
+                "git@github.com:team/project.git",
+                "https://github.com/team/project/pull/23",
+                "gh",
+            ),
+            (
+                "!7",
+                "ssh://git@gitlab.com/group/subgroup/project.git",
+                "https://gitlab.com/group/subgroup/project/-/merge_requests/7",
+                "glab",
+            ),
+        ] {
+            let fixture = Fixture::new(DIFF.as_bytes())?;
+            let checkout = fixture.root.path().join("checkout");
+            fs::create_dir(&checkout)?;
+            git(&checkout, &["init"]);
+            git(&checkout, &["config", "remote.origin.url", remote]);
+            git(
+                &checkout,
+                &[
+                    "config",
+                    "remote.other.url",
+                    "https://github.com/wrong/repo.git",
+                ],
+            );
+            let config = fs::read(checkout.join(".git/config"))?;
+            let output = fixture
+                .command("./checkout")?
+                .arg(number)
+                .env("GIT_DIR", fixture.root.path().join("wrong-repository"))
+                .env("GIT_WORK_TREE", fixture.root.path())
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "remote.origin.url")
+                .env(
+                    "GIT_CONFIG_VALUE_0",
+                    "https://wrong.example/other/project.git",
+                )
+                .env("GH_REPO", "wrong/repo")
+                .env("GITLAB_REPO", "wrong/repo")
+                .output()?;
+            let report = report(&output)?;
+            assert_eq!(report["target"], canonical);
+            let capture = fixture.capture()?;
+            assert_eq!(capture["program"], backend);
+            assert_eq!(
+                capture["cwd"],
+                fs::canonicalize(&checkout)?.to_string_lossy().as_ref()
+            );
+            assert!(capture["env"]["GH_REPO"].is_null() || backend == "glab");
+            assert!(capture["env"]["GITLAB_REPO"].is_null() || backend == "gh");
+            assert_eq!(fs::read(checkout.join(".git/config"))?, config);
+            assert!(!checkout.join(".git/index").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_checkout_numbers_and_offline_focus_fail_before_forge_acquisition() -> TestResult {
+        let fixture = Fixture::new(DIFF.as_bytes())?;
+        let checkout = fixture.root.path().join("checkout");
+        fs::create_dir(&checkout)?;
+        git(&checkout, &["init"]);
+        git(
+            &checkout,
+            &[
+                "config",
+                "remote.first.url",
+                "https://github.com/one/repo.git",
+            ],
+        );
+        git(
+            &checkout,
+            &[
+                "config",
+                "remote.second.url",
+                "https://github.com/two/repo.git",
+            ],
+        );
+        let output = fixture.command("./checkout")?.arg("#12").output()?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("PI_REVIEW_REPOSITORY"));
+        assert!(!fixture.root.path().join("capture.json").exists());
+
+        let output = fixture
+            .command("team/repo#12")?
+            .args(["--focus", "check authentication"])
+            .output()?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("PI_REVIEW_FOCUS"));
+        assert!(!fixture.root.path().join("capture.json").exists());
         Ok(())
     }
 

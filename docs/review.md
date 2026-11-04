@@ -14,6 +14,12 @@ pi review commit:HEAD
 pi review branch:main
 pi review https://github.com/owner/repository/pull/123
 pi review https://gitlab.com/group/project/-/merge_requests/456
+pi review owner/repository#123 check authentication boundaries
+pi review checkout staged
+pi review ./checkout staged
+pi review ./checkout '#123' check error recovery
+pi review ./checkout '!7' --focus 'Check concurrent updates'
+pi review './checkout with spaces' branch:main --focus 'Check cancellation'
 pi --model PROVIDER/MODEL review HEAD~3..HEAD --format json --fail-on P1
 pi review staged --format markdown --out review.md
 pi review --offline
@@ -29,6 +35,9 @@ uses the current session's provider and privacy settings:
 /review staged
 /review branch:main
 /review https://gitlab.com/group/project/-/merge_requests/456
+/review owner/repository#123 check authentication boundaries
+/review "./checkout with spaces" #123 check cancellation
+/review ./checkout !7 check error recovery
 /review --offline commit:HEAD
 ```
 
@@ -39,6 +48,19 @@ result as a report card.
 
 ## Select the changes
 
+The argument order is `[checkout] [target] [focus...]`. A leading existing
+directory selects a checkout, including plain relative names, absolute paths,
+and `./`, `../`, or `~/` paths; quote paths containing spaces. An existing
+directory takes precedence over a same-named Git revision. Use `branch:NAME`
+or `commit:REF` to force the revision, or `--focus TEXT` to force instructions.
+The selected directory must belong to a Git checkout for local review. A leading source-file path or nonexistent path
+stays part of the review focus. The target is recognized only in the next
+position: later mentions of `owner/repo#123`, `#123`, or URLs stay instructions.
+Known selectors and resolvable Git revisions select changes; other words become
+focus for the default uncommitted review. Use `branch:NAME` or `commit:REF` to
+require a particular revision and report a typo as an error. Use `--focus TEXT`
+to force instructions when the first word could also name a Git revision.
+
 | Target | Changes reviewed |
 | --- | --- |
 | Omitted or `uncommitted` | Tracked working tree and index changes relative to HEAD, plus nonignored untracked files |
@@ -48,9 +70,16 @@ result as a report card.
 | `A..B`, `A...B`, or another Git revision | The corresponding Git diff selection |
 | `https://github.com/OWNER/REPO/pull/NUMBER` | The pull request's current unified diff, fetched with `gh` |
 | `https://gitlab.com/GROUP/PROJECT/-/merge_requests/NUMBER` | The merge request's current unified diff, fetched with `glab`; nested groups are supported |
+| `OWNER/REPO#NUMBER` | A GitHub PR on `github.com`, including when Pi runs outside any repository |
+| `#NUMBER` | A GitHub PR in the selected checkout's remote repository |
+| `!NUMBER` | A GitLab MR in the selected checkout's remote repository |
 
 Local snapshots are taken from the repository root even when Pi runs in a
-subdirectory. Text file names containing spaces are supported. Git external
+subdirectory. Reports include that root in `repository`, and finding paths are
+relative to it. Selecting another checkout changes only the review's acquisition
+directory; the session and process keep their working directories and use the
+invoking session's model, trust decision, and privacy settings. The destination's
+Pi configuration is not loaded. Text file names containing spaces are supported. Git external
 diff commands and text conversion drivers are disabled. Local review uses text
 hunks with 20 lines of surrounding context. Hosted review uses the context
 provided by the forge's diff. Neither performs additional repository exploration
@@ -70,11 +99,21 @@ requires a version supporting `glab mr diff --raw`. Public requests use the
 same CLI transport. A local checkout is unnecessary; the command reads a diff
 without checking out branches, changing the working tree, or posting a review.
 
-Use a complete HTTPS request URL. GitHub's `/files` and `/changes` and
+Use a complete HTTPS request URL or one of the shorthand forms above. GitHub's `/files` and `/changes` and
 GitLab's `/diffs` view suffixes and URL fragments are accepted; the report's `target` is the canonical
 request URL. Credentials in URLs, query parameters, encoded path segments,
 ambiguous paths, nonpositive request numbers, and IP-literal hosts are rejected.
-Bare request numbers and `mr://` shorthand are not accepted by review.
+An unprefixed request number and `mr://` shorthand are not accepted by review.
+
+`#N` and `!N` read the selected checkout's local Git configuration. They use
+`origin`, or the sole remote when `origin` is absent. Multiple candidate remotes
+or conflicting URLs require an explicit request URL. Standard HTTPS, SSH, and
+Git transport remote URLs are recognized, including `git@host:group/repo.git`;
+Pi does not execute the remote transport or expand Git `insteadOf` rules or SSH
+host aliases. Embedded credentials, encoded paths, and nonstandard SSH/Git
+transport ports require an explicit request URL. Ambient Git directory, index,
+object-database, and command-line config overrides cannot retarget this read.
+`OWNER/REPO#N` always means `github.com`; use a complete URL for enterprise hosts.
 
 For GitHub Enterprise or self-hosted GitLab, explicitly bind the host before
 running Pi. The host and optional port must match the request URL:
@@ -124,8 +163,11 @@ more for P1, capped at one. A fail-on match returns a nonzero exit status after
 printing or saving the complete report.
 
 The configured secrets policy screens all input files together before any
-provider request, including bare echoes of credentials detected in another
-file. Interactive requests also protect credentials already remembered by the
+provider request, together with the operator's review focus, including bare
+echoes of credentials detected in another input. Focus is limited to 4,096 UTF-8
+bytes and is supplied to every file reviewer after screening. It prioritizes
+the requested concerns while retaining the concrete-defect rubric and response
+schema. Interactive requests also protect credentials already remembered by the
 owning agent. Model-authored finding fields are screened before publication.
 Block-mode privacy refusal stops the review. No report file is written when
 provider execution, cancellation, or response validation fails.
@@ -149,3 +191,5 @@ Empty hosted responses are rejected because they do not establish review
 coverage. `--offline` needs no model-provider credentials and remains a limited
 local heuristic scan; its verdict is labeled accordingly. A hosted target still
 requires network access and any forge credentials, including with `--offline`.
+Operator focus requires a model review; combining it with `--offline` fails
+explicitly instead of silently ignoring the instructions.

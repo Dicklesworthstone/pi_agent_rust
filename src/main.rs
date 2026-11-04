@@ -3848,6 +3848,7 @@ async fn handle_subcommand(
         }
         cli::Commands::Review {
             target,
+            focus,
             offline,
             fail_on,
             format,
@@ -3857,7 +3858,8 @@ async fn handle_subcommand(
         } => {
             handle_review(
                 cwd,
-                target.as_deref(),
+                &target,
+                focus.as_deref(),
                 fail_on.as_deref(),
                 &format,
                 confidence_threshold,
@@ -6539,11 +6541,12 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
     Ok(())
 }
 
-/// `pi review [TARGET]` (bd-cv653.3.11): prioritized code review with ship verdict.
+/// `pi review [CHECKOUT] [TARGET] [FOCUS]`: prioritized code review with ship verdict.
 #[allow(clippy::too_many_arguments)]
 async fn handle_review(
     cwd: &Path,
-    target: Option<&str>,
+    target: &[String],
+    focus: Option<&str>,
     fail_on: Option<&str>,
     format: &str,
     confidence_threshold: f64,
@@ -6553,6 +6556,10 @@ async fn handle_review(
     project_trusted: bool,
     cli: &mut cli::Cli,
 ) -> Result<()> {
+    let mut request = pi::review::ReviewRequest::parse(cwd, target)?;
+    if let Some(focus) = focus {
+        request.append_focus(focus)?;
+    }
     // An unparseable --fail-on must not silently disable the gate (CI would
     // pass with P0 findings present).
     let fail_severity = match fail_on {
@@ -6564,7 +6571,8 @@ async fn handle_review(
         })?),
     };
     let options = pi::review::ReviewOptions {
-        target: target.map(ToString::to_string),
+        target: request.target,
+        focus: request.focus,
         fail_on: fail_severity,
         confidence_threshold,
         format: format.to_string(),
@@ -6574,10 +6582,12 @@ async fn handle_review(
     options.validate()?;
 
     let report = if offline {
-        pi::review::CodeReviewer::review(cwd, &options)?
+        pi::review::CodeReviewer::review(&request.cwd, &options)?
     } else {
+        // Keep the invoking project's model, trust and privacy policy. Selecting
+        // another checkout authorizes a diff read, not its Pi configuration.
         let client = review_model_client(cli, cwd, project_trusted).await?;
-        client.review(cwd, &options, None).await?
+        client.review(&request.cwd, &options, None).await?
     };
 
     match format {
