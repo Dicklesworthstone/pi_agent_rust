@@ -395,6 +395,20 @@ pub enum CredentialResolution {
     Exhausted { retry_after: Duration },
 }
 
+enum MediaApiKeySource<'a> {
+    Resolved(CredentialResolution),
+    Stored(&'a str),
+}
+
+fn media_key_resolution(key: Option<String>) -> CredentialResolution {
+    key.map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .map_or(
+            CredentialResolution::NotConfigured,
+            CredentialResolution::Available,
+        )
+}
+
 impl std::fmt::Debug for CredentialResolution {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1954,15 +1968,92 @@ impl AuthStorage {
     /// Resolve credentials for native media APIs from this session's auth scope.
     /// OAuth, bearer, and provider-specific credential chains are not API keys for
     /// these endpoints. Do not import credentials from other applications here.
+    /// Command sources retain the invocation owner through bounded output capture
+    /// and process cleanup. Literal/environment keys need no spawn capability.
+    pub(crate) async fn resolve_media_api_key_status_async(
+        &self,
+        provider: &str,
+        owner: &crate::agent_cx::AgentCx,
+        timeout: Duration,
+    ) -> Result<CredentialResolution> {
+        self.resolve_media_api_key_status_with_env_lookup_async(provider, owner, timeout, |var| {
+            std::env::var(var).ok()
+        })
+        .await
+    }
+
+    async fn resolve_media_api_key_status_with_env_lookup_async<F>(
+        &self,
+        provider: &str,
+        owner: &crate::agent_cx::AgentCx,
+        timeout: Duration,
+        mut env_lookup: F,
+    ) -> Result<CredentialResolution>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let started = Instant::now();
+        owner.checkpoint().map_err(|_| Error::Aborted)?;
+        let raw = match self.media_api_key_source_with_env_lookup(provider, &mut env_lookup) {
+            MediaApiKeySource::Resolved(resolution) => return Ok(resolution),
+            MediaApiKeySource::Stored(raw) => raw,
+        };
+        // Reuse the source parser without executing its synchronous command
+        // callback. Only the selected stored API-key source can reach this path.
+        let mut command = None;
+        let immediate = resolve_api_key_source_with_resolvers(raw, &mut env_lookup, |source| {
+            command = Some(source.to_string());
+            Ok(None)
+        })
+        .map_err(Error::auth)?;
+        let key = if let Some(command) = command {
+            run_media_api_key_command(
+                &command,
+                self.command_working_directory.as_deref(),
+                owner,
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .min(SECRET_CMD_DEADLINE),
+            )
+            .await?
+        } else {
+            immediate
+        };
+        owner.checkpoint().map_err(|_| Error::Aborted)?;
+        Ok(media_key_resolution(key))
+    }
+
+    // Existing source-selection tests can run synchronously. Production media
+    // dispatch always uses the owned async resolver above.
+    #[cfg(test)]
     pub(crate) fn resolve_media_api_key_status(&self, provider: &str) -> CredentialResolution {
         self.resolve_media_api_key_status_with_env_lookup(provider, |var| std::env::var(var).ok())
     }
 
+    #[cfg(test)]
     fn resolve_media_api_key_status_with_env_lookup<F>(
         &self,
         provider: &str,
-        mut env_lookup: F,
+        env_lookup: F,
     ) -> CredentialResolution
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        match self.media_api_key_source_with_env_lookup(provider, env_lookup) {
+            MediaApiKeySource::Resolved(resolution) => resolution,
+            MediaApiKeySource::Stored(raw) => media_key_resolution(
+                resolve_api_key_source_in_cwd(raw, self.command_working_directory.as_deref())
+                    .ok()
+                    .flatten(),
+            ),
+        }
+    }
+
+    fn media_api_key_source_with_env_lookup<F>(
+        &self,
+        provider: &str,
+        mut env_lookup: F,
+    ) -> MediaApiKeySource<'_>
     where
         F: FnMut(&str) -> Option<String>,
     {
@@ -1972,35 +2063,27 @@ impl AuthStorage {
             // Preserve the existing native-media singular-variable precedence.
             Some("google") => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
             Some("xai") => &["XAI_API_KEY"],
-            _ => return CredentialResolution::NotConfigured,
+            _ => return MediaApiKeySource::Resolved(CredentialResolution::NotConfigured),
         };
 
         // A configured pool owns the decision, including refusal while every
         // member is cooling down. Never escape it through a singular/stored key.
         match resolve_rotated_key(provider, &self.path, &mut env_lookup) {
             CredentialResolution::NotConfigured => {}
-            resolution => return resolution,
+            resolution => return MediaApiKeySource::Resolved(resolution),
         }
         if let Some(key) = env_keys.iter().find_map(|var| {
             env_lookup(var)
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         }) {
-            return CredentialResolution::Available(key);
+            return MediaApiKeySource::Resolved(CredentialResolution::Available(key));
         }
 
-        let Some(credential @ AuthCredential::ApiKey { .. }) =
-            self.credential_for_provider(provider)
-        else {
-            return CredentialResolution::NotConfigured;
+        let Some(AuthCredential::ApiKey { key }) = self.credential_for_provider(provider) else {
+            return MediaApiKeySource::Resolved(CredentialResolution::NotConfigured);
         };
-        api_key_from_credential(credential, self.command_working_directory.as_deref())
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-            .map_or(
-                CredentialResolution::NotConfigured,
-                CredentialResolution::Available,
-            )
+        MediaApiKeySource::Stored(key)
     }
 
     /// Prepare a same-provider fallback without admitting the credential that
@@ -2567,6 +2650,70 @@ const SECRET_CMD_DEADLINE: Duration = Duration::from_secs(10);
 const SECRET_CMD_KILL_GRACE: Duration = Duration::from_millis(750);
 const SECRET_CMD_STDOUT_CAP: usize = 64 * 1024;
 const SECRET_CMD_STDERR_CAP: usize = 16 * 1024;
+
+async fn run_media_api_key_command(
+    command: &str,
+    cwd: Option<&Path>,
+    owner: &crate::agent_cx::AgentCx,
+    timeout: Duration,
+) -> Result<Option<String>> {
+    let started = Instant::now();
+    owner.checkpoint().map_err(|_| Error::Aborted)?;
+    if !owner.capabilities().io || !owner.capabilities().spawn || !owner.capabilities().time {
+        return Err(Error::auth(
+            "[MEDIA_SECRET_CMD_DENIED] media credential commands require the invocation's I/O, spawn and timer capabilities",
+        ));
+    }
+    let shell = build_api_key_command_shell(command);
+    let mut owned = owner.process().command(shell.get_program());
+    owned
+        .args(shell.get_args())
+        .stdin(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        owned.current_dir(cwd);
+    }
+    drop(shell);
+    let output = owned
+        .output_with_limits(
+            SECRET_CMD_STDOUT_CAP,
+            SECRET_CMD_STDERR_CAP,
+            timeout.saturating_sub(started.elapsed()),
+        )
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::Interrupted => Error::Aborted,
+            std::io::ErrorKind::PermissionDenied => Error::auth(
+                "[MEDIA_SECRET_CMD_DENIED] the media credential helper was not permitted",
+            ),
+            std::io::ErrorKind::TimedOut => Error::auth(
+                "[MEDIA_SECRET_CMD_TIMEOUT] the credential helper timed out before a media request was sent",
+            ),
+            std::io::ErrorKind::InvalidData => Error::auth(
+                "[MEDIA_SECRET_CMD_OUTPUT_OVERFLOW] credential helper output exceeded the 64 KiB stdout or 16 KiB stderr limit",
+            ),
+            std::io::ErrorKind::Unsupported => Error::auth(
+                "[MEDIA_SECRET_CMD_UNSUPPORTED] cancellation-safe credential commands are unavailable on this platform",
+            ),
+            _ => Error::auth(
+                "[MEDIA_SECRET_CMD_IO] the media credential helper could not start or finish",
+            ),
+        })?;
+    owner.checkpoint().map_err(|_| Error::Aborted)?;
+    if !output.status.success() {
+        let status = output.status.code().map_or_else(
+            || "terminated by signal".to_string(),
+            |code| format!("exit code {code}"),
+        );
+        return Err(Error::auth(format!(
+            "[MEDIA_SECRET_CMD_FAILED] credential helper failed ({status})"
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        Error::auth("[MEDIA_SECRET_CMD_NOT_UTF8] credential helper stdout is not valid UTF-8")
+    })?;
+    let key = stdout.trim();
+    Ok((!key.is_empty()).then(|| key.to_string()))
+}
 
 /// Owns the spawned helper's leader pid until the run settles. If this
 /// guard drops early — error path, panic, caller cancellation — the whole
@@ -7612,6 +7759,311 @@ mod tests {
             resolve_rotated_key("openai", Path::new("/tmp/auth-d.json"), env),
             CredentialResolution::NotConfigured
         );
+    }
+
+    fn media_owner_without_capabilities() -> crate::agent_cx::AgentCx {
+        let restricted = asupersync::Cx::for_request().restrict::<asupersync::cx::cap::None>();
+        let _guard = restricted.set_current_restricted();
+        crate::agent_cx::AgentCx::for_current_or_request()
+    }
+
+    #[test]
+    fn async_media_noncommand_keys_preserve_precedence_without_spawn_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        let owner = media_owner_without_capabilities();
+        for (provider, raw, environment, expected) in [
+            ("OpenAI", "  literal-key\n", "none", "literal-key"),
+            (
+                "openai",
+                "$ENV:MEDIA_TEST_REFERENCE",
+                "reference",
+                "reference-key",
+            ),
+            (
+                "openai",
+                "$CMD:must-not-execute",
+                "openai",
+                "environment-key",
+            ),
+            (
+                "GeMiNi",
+                "$COMMAND:must-not-execute",
+                "google",
+                "gemini-first",
+            ),
+        ] {
+            auth.set(
+                provider,
+                AuthCredential::ApiKey {
+                    key: raw.to_string(),
+                },
+            );
+            let requested = if provider == "GeMiNi" {
+                " google "
+            } else {
+                provider
+            };
+            let result = futures::executor::block_on(
+                auth.resolve_media_api_key_status_with_env_lookup_async(
+                    requested,
+                    &owner,
+                    Duration::ZERO,
+                    |var| match (environment, var) {
+                        ("reference", "MEDIA_TEST_REFERENCE") => {
+                            Some("  reference-key\n".to_string())
+                        }
+                        ("openai", "OPENAI_API_KEY") => Some("environment-key".to_string()),
+                        ("google", "GEMINI_API_KEY") => Some("gemini-first".to_string()),
+                        ("google", "GOOGLE_API_KEY") => Some("google-second".to_string()),
+                        _ => None,
+                    },
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                CredentialResolution::Available(expected.to_string())
+            );
+        }
+        auth.set(
+            "anthropic",
+            AuthCredential::BearerToken {
+                token: "$CMD:must-not-execute".to_string(),
+            },
+        );
+        assert_eq!(
+            futures::executor::block_on(auth.resolve_media_api_key_status_with_env_lookup_async(
+                "anthropic",
+                &owner,
+                Duration::ZERO,
+                |_| None,
+            ))
+            .unwrap(),
+            CredentialResolution::NotConfigured,
+        );
+        assert_eq!(
+            futures::executor::block_on(auth.resolve_media_api_key_status_with_env_lookup_async(
+                "google-gemini-cli",
+                &owner,
+                Duration::ZERO,
+                |_| panic!("unsupported providers must not inspect credentials"),
+            ))
+            .unwrap(),
+            CredentialResolution::NotConfigured,
+        );
+    }
+
+    #[test]
+    fn async_media_pool_exhaustion_never_falls_through_to_a_stored_command() {
+        let _guard = ROTATION_TEST_LOCK.lock().unwrap();
+        reset_credential_rings_for_tests();
+        let directory = tempfile::tempdir().unwrap();
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "$CMD:must-not-execute".to_string(),
+            },
+        );
+        let owner = media_owner_without_capabilities();
+        let resolve = |provider| {
+            futures::executor::block_on(auth.resolve_media_api_key_status_with_env_lookup_async(
+                provider,
+                &owner,
+                Duration::ZERO,
+                |var| match var {
+                    "GOOGLE_API_KEYS" => Some("async-google-first,async-google-second".to_string()),
+                    "GEMINI_API_KEY" => Some("must-not-bypass-pool".to_string()),
+                    _ => None,
+                },
+            ))
+            .unwrap()
+        };
+        let CredentialResolution::Available(first) = resolve("gemini") else {
+            panic!("first pool credential");
+        };
+        report_provider_rate_limit("google", &first);
+        let CredentialResolution::Available(second) = resolve("google") else {
+            panic!("healthy sibling credential");
+        };
+        assert_ne!(first, second);
+        report_provider_rate_limit("gemini", &second);
+        assert!(matches!(
+            resolve("google"),
+            CredentialResolution::Exhausted { .. }
+        ));
+        reset_credential_rings_for_tests();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_media_commands_keep_the_auth_snapshots_working_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("token"), "  first-key\n").unwrap();
+        std::fs::write(second.join("token"), "  second-key\n").unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let owner = crate::agent_cx::AgentCx::for_current_or_request();
+            for prefix in ["$CMD:", "$COMMAND:"] {
+                let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+                auth.set(
+                    "openai",
+                    AuthCredential::ApiKey {
+                        key: format!("{prefix}cat token"),
+                    },
+                );
+                auth.set_command_working_directory(&first).unwrap();
+                let snapshot = auth.clone();
+                auth.set_command_working_directory(&second).unwrap();
+                for (selected, expected) in [(&auth, "second-key"), (&snapshot, "first-key")] {
+                    assert_eq!(
+                        selected
+                            .resolve_media_api_key_status_with_env_lookup_async(
+                                "OpenAI",
+                                &owner,
+                                Duration::from_secs(5),
+                                |_| None,
+                            )
+                            .await
+                            .unwrap(),
+                        CredentialResolution::Available(expected.to_string()),
+                    );
+                }
+                auth.set_command_working_directory(&directory.path().join("missing-private-cwd"))
+                    .unwrap();
+                let error = auth
+                    .resolve_media_api_key_status_with_env_lookup_async(
+                        "openai",
+                        &owner,
+                        Duration::from_secs(5),
+                        |_| None,
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("MEDIA_SECRET_CMD_IO"));
+                assert!(!error.contains("missing-private-cwd"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_media_command_errors_are_bounded_and_do_not_reveal_helper_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let owner = crate::agent_cx::AgentCx::for_current_or_request();
+            let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set_command_working_directory(directory.path())
+                .unwrap();
+            for (command, diagnostic) in [
+                (
+                    "printf private-stdout; printf private-stderr >&2; exit 7",
+                    "MEDIA_SECRET_CMD_FAILED",
+                ),
+                (
+                    "head -c 65537 /dev/zero",
+                    "MEDIA_SECRET_CMD_OUTPUT_OVERFLOW",
+                ),
+                (
+                    "head -c 16385 /dev/zero >&2; printf private-key",
+                    "MEDIA_SECRET_CMD_OUTPUT_OVERFLOW",
+                ),
+                ("printf '\\377'", "MEDIA_SECRET_CMD_NOT_UTF8"),
+            ] {
+                auth.set(
+                    "openai",
+                    AuthCredential::ApiKey {
+                        key: format!("$CMD:{command}"),
+                    },
+                );
+                let error = auth
+                    .resolve_media_api_key_status_with_env_lookup_async(
+                        "openai",
+                        &owner,
+                        Duration::from_secs(5),
+                        |_| None,
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(diagnostic), "{error}");
+                for secret in ["private-stdout", "private-stderr", "private-key", command] {
+                    assert!(!error.contains(secret));
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_media_command_refusals_do_not_launch_the_helper() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for mode in ["cancelled", "denied", "expired", "lookup-expired"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "$COMMAND:printf started > helper-started; printf private-key".to_string(),
+                },
+            );
+            auth.set_command_working_directory(directory.path())
+                .unwrap();
+            let owner = if mode == "denied" {
+                media_owner_without_capabilities()
+            } else {
+                crate::agent_cx::AgentCx::for_request()
+            };
+            if mode == "cancelled" {
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel credentials"),
+                );
+            }
+            let timeout = match mode {
+                "expired" => Duration::ZERO,
+                "lookup-expired" => Duration::from_millis(1),
+                _ => Duration::from_secs(5),
+            };
+            let mut delay_lookup = mode == "lookup-expired";
+            let result = runtime.block_on(auth.resolve_media_api_key_status_with_env_lookup_async(
+                "openai",
+                &owner,
+                timeout,
+                |_| {
+                    if delay_lookup {
+                        delay_lookup = false;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    None
+                },
+            ));
+            let error = result.unwrap_err();
+            if mode == "cancelled" {
+                assert!(matches!(error, Error::Aborted));
+            } else {
+                let marker = if mode == "denied" {
+                    "MEDIA_SECRET_CMD_DENIED"
+                } else {
+                    "MEDIA_SECRET_CMD_TIMEOUT"
+                };
+                assert!(error.to_string().contains(marker));
+            }
+            assert!(!directory.path().join("helper-started").exists());
+        }
     }
 
     #[test]

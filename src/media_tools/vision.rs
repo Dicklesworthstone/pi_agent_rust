@@ -204,7 +204,8 @@ impl Tool for InspectImageTool {
         )?;
         let api = self
             .transport
-            .api(NAME, provider, self.api_key.as_deref(), timeout)?;
+            .api(NAME, provider, self.api_key.as_deref(), timeout)
+            .await?;
         if matches!(mime, "image/svg+xml" | "image/bmp") {
             return Err(Error::tool(
                 NAME,

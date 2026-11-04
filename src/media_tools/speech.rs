@@ -175,7 +175,8 @@ impl Tool for TtsTool {
         } else {
             Some(
                 self.transport
-                    .api(NAME, provider, self.api_key.as_deref(), duration)?,
+                    .api(NAME, provider, self.api_key.as_deref(), duration)
+                    .await?,
             )
         };
         artifact::preflight(&self.cwd, requested, NAME)?;

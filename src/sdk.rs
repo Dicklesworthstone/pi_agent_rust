@@ -7817,6 +7817,337 @@ mod tests {
         assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
     }
 
+    #[cfg(unix)]
+    struct MediaCommandCleanup {
+        root_pid_path: PathBuf,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl Drop for MediaCommandCleanup {
+        fn drop(&mut self) {
+            if self.armed
+                && let Ok(text) = std::fs::read_to_string(&self.root_pid_path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 1
+            {
+                // A failed regression must not leave its fixture waiting for
+                // release. Successful assertions disarm this fallback first.
+                crate::tools::kill_process_group_tree(Some(pid));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn media_command_fixture() -> (tempfile::TempDir, SessionOptions, std::net::TcpListener) {
+        let (directory, mut options, auth_path) = media_auth_fixture("tts");
+        let cwd = options
+            .working_directory
+            .as_ref()
+            .expect("fixture workspace");
+        std::fs::write(
+            cwd.join("credential-helper.sh"),
+            r#"#!/bin/sh
+printf '%s\n' "$$" > credential-root.pid
+sh -c '
+  printf "%s\n" "$$" > credential-child.pid
+  printf ready > credential-ready
+  while [ ! -f credential-release ]; do sleep 0.01; done
+  printf completed > credential-completed
+' &
+wait
+printf sdk-owned-command-key
+"#,
+        )
+        .expect("write gated credential helper");
+        let mut auth = AuthStorage::empty_at(auth_path);
+        auth.set(
+            "openai",
+            crate::auth::AuthCredential::ApiKey {
+                key: "$CMD:exec sh credential-helper.sh".to_string(),
+            },
+        );
+        auth.save().expect("save command-backed media key");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
+            name: "tts",
+            endpoint: format!("http://{}/v1/", listener.local_addr().unwrap()),
+        }));
+        (directory, options, listener)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_media_command_marker(owner: &crate::agent_cx::AgentCx, path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "credential helper never became ready"
+            );
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn media_while_pending<F, T>(
+        call: std::pin::Pin<&mut F>,
+        observer: impl std::future::Future<Output = T>,
+        stage: &str,
+    ) -> T
+    where
+        F: std::future::Future<Output = Result<ToolOutput>> + ?Sized,
+    {
+        match futures::future::select(call, Box::pin(observer)).await {
+            futures::future::Either::Left((result, _)) => {
+                panic!("media request settled before {stage}: {result:?}");
+            }
+            futures::future::Either::Right((value, _)) => value,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_media_command_retired(owner: &crate::agent_cx::AgentCx, cwd: &Path) {
+        let read_pid = |name: &str| {
+            std::fs::read_to_string(cwd.join(name))
+                .expect("credential fixture PID")
+                .trim()
+                .parse::<u32>()
+                .expect("positive fixture PID")
+        };
+        let root = rustix::process::Pid::from_raw(
+            i32::try_from(read_pid("credential-root.pid")).expect("root PID fits i32"),
+        )
+        .expect("nonzero root PID");
+        assert!(
+            rustix::process::test_kill_process(root).is_err(),
+            "credential helper root must be reaped before the call settles"
+        );
+        let child = sysinfo::Pid::from_u32(read_pid("credential-child.pid"));
+        let mut processes = sysinfo::System::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            processes.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[child]), true);
+            if processes.process(child).is_none_or(|process| {
+                matches!(
+                    process.status(),
+                    sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+                )
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "credential descendant is still running"
+            );
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_media_command_cancellation_and_drop_stop_owned_helpers_without_http() {
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_media_command_cancellation_and_drop_stop_owned_helpers_without_http",
+            None,
+        ) {
+            return;
+        }
+        for cancel in [true, false] {
+            let (_directory, options, listener) = media_command_fixture();
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
+            let mut cleanup = MediaCommandCleanup {
+                root_pid_path: cwd.join("credential-root.pid"),
+                armed: true,
+            };
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().expect("reactor"))
+                .build()
+                .expect("current-thread runtime");
+            let invocation = crate::agent_cx::AgentCx::from_cx(
+                runtime.request_cx_with_budget(asupersync::Budget::new()),
+            );
+            runtime.block_on(Box::pin(async {
+                let observer = crate::agent_cx::AgentCx::for_current_or_request();
+                let handle = create_agent_session(options)
+                    .await
+                    .expect("native media SDK session");
+                let registry = handle.session().agent.shared_tools().snapshot();
+                let retained_tool = registry.get("tts").expect("retained native TTS tool");
+                let mut call = Box::pin(invocation.with_current(retained_tool.execute(
+                    "owned-media-command",
+                    serde_json::json!({
+                        "text":"Do not send this request","provider":"openai",
+                        "output_path":"cancelled.wav","timeout_ms":30000
+                    }),
+                    None,
+                )));
+                media_while_pending(
+                    call.as_mut(),
+                    wait_for_media_command_marker(&observer, &cwd.join("credential-ready")),
+                    "the helper readiness marker",
+                )
+                .await;
+                // This timer runs on the same current-thread runtime while the
+                // helper waits for a file only this test can create.
+                media_while_pending(
+                    call.as_mut(),
+                    observer.time().sleep(Duration::from_millis(20)),
+                    "current-thread timer progress",
+                )
+                .await;
+                if cancel {
+                    invocation.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel media helper"),
+                    );
+                    let result = match futures::future::select(
+                        call.as_mut(),
+                        Box::pin(observer.time().sleep(Duration::from_secs(2))),
+                    )
+                    .await
+                    {
+                        futures::future::Either::Left((result, _)) => result,
+                        futures::future::Either::Right(_) => {
+                            panic!("media helper ignored owner cancellation")
+                        }
+                    };
+                    let error =
+                        result.expect_err("cancelled credential preparation cannot send HTTP");
+                    assert!(
+                        matches!(&error, Error::Aborted)
+                            || error.to_string().to_ascii_lowercase().contains("cancel"),
+                        "expected cancellation, got {error}"
+                    );
+                }
+                drop(call);
+                assert_media_command_retired(&observer, &cwd).await;
+                std::fs::write(cwd.join("credential-release"), "release")
+                    .expect("release any leaked descendant");
+                observer.time().sleep(Duration::from_millis(100)).await;
+                assert!(
+                    !cwd.join("credential-completed").exists(),
+                    "a cancelled/dropped helper must not finish after release"
+                );
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+                assert!(!cwd.join("cancelled.wav").exists());
+                cleanup.armed = false;
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_media_command_preparation_shares_the_http_deadline() {
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_media_command_preparation_shares_the_http_deadline",
+            None,
+        ) {
+            return;
+        }
+        let (_directory, options, listener) = media_command_fixture();
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
+        let mut cleanup = MediaCommandCleanup {
+            root_pid_path: cwd.join("credential-root.pid"),
+            armed: true,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("reactor"))
+            .build()
+            .expect("current-thread runtime");
+        let invocation = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(Box::pin(async {
+            let observer = crate::agent_cx::AgentCx::for_current_or_request();
+            let handle = create_agent_session(options)
+                .await
+                .expect("native media SDK session");
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let retained_tool = registry.get("tts").expect("retained native TTS tool");
+            let mut call = Box::pin(invocation.with_current(retained_tool.execute(
+                "media-command-deadline",
+                serde_json::json!({
+                    "text":"Bound credential preparation and HTTP together","provider":"openai",
+                    "output_path":"deadline.wav","timeout_ms":4000
+                }),
+                None,
+            )));
+            media_while_pending(
+                call.as_mut(),
+                wait_for_media_command_marker(&observer, &cwd.join("credential-ready")),
+                "the helper readiness marker",
+            )
+            .await;
+            let helper_ready = std::time::Instant::now();
+            media_while_pending(
+                call.as_mut(),
+                observer.time().sleep(Duration::from_secs(2)),
+                "credential preparation consuming part of the request deadline",
+            )
+            .await;
+            std::fs::write(cwd.join("credential-release"), "release")
+                .expect("release successful credential helper");
+            let connection = media_while_pending(
+                call.as_mut(),
+                async {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                observer.time().sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(error) => panic!("accept native media HTTP request: {error}"),
+                        }
+                    }
+                },
+                "HTTP connection after successful credential preparation",
+            )
+            .await;
+            // Keep the real connection open without replying. A fresh four-second
+            // HTTP allowance would exceed this guard after the two-second helper.
+            // Measure after helper startup so output preflight is outside the oracle.
+            let guard = Duration::from_secs(5).saturating_sub(helper_ready.elapsed());
+            let result = match futures::future::select(
+                call.as_mut(),
+                Box::pin(observer.time().sleep(guard)),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => {
+                    panic!("HTTP received a fresh timeout after credential preparation")
+                }
+            };
+            let error = result.expect_err("the shared media deadline must expire");
+            let message = error.to_string().to_ascii_lowercase();
+            assert!(
+                message.contains("timed out") || message.contains("timeout"),
+                "{error}"
+            );
+            drop(call);
+            drop(connection);
+            assert_media_command_retired(&observer, &cwd).await;
+            assert!(cwd.join("credential-completed").exists());
+            assert!(!cwd.join("deadline.wav").exists());
+            cleanup.armed = false;
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        }));
+    }
+
     #[test]
     fn sdk_media_aggregate_aliases_respect_global_project_merge_and_trust() {
         for (global_key, project_key) in [

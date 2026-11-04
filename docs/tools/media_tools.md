@@ -46,7 +46,13 @@ existing tool instances.
 The precedence is an explicit tool-builder key, a configured provider API-key
 pool, a singular environment key, then a stored `type: "api_key"` credential.
 Stored `$ENV:` and bounded `$CMD:` / `$COMMAND:` sources retain the session's
-captured working directory. Stored OAuth, bearer, AWS, and service credentials
+captured working directory. Command sources run under the invoking operation's
+process capability. Their output is collected asynchronously, with separate
+64 KiB stdout and 16 KiB stderr limits and a ten-second ceiling that also fits
+inside the operation's remaining `timeout_ms`. Cancellation, timeout, output
+overflow, or dropping the invocation stops and reaps the owned helper rather
+than leaving it to finish in a detached task. Helper failures do not include
+the command text or captured output. Stored OAuth, bearer, AWS, and service credentials
 are not admitted as media API keys. A chat-session `--api-key` or SDK
 `SessionOptions.api_key` is not forwarded to media endpoints; configure the
 chosen media provider's credentials separately.
@@ -401,12 +407,17 @@ its prompts, image references, or speech text can leave the machine and incur
 provider charges. These adapters do not establish filesystem sandboxing or add
 a new approval system.
 
-`timeout_ms` bounds the complete network request, including response-body
-consumption, not local file preprocessing. Defaults are 120 seconds for vision
-and speech, 180 seconds for images; the maximum is 300 seconds. Cancellation
-stops further transport polling and drops the request. It cannot reverse work
-or charges already accepted by a provider. Requests are not automatically
-retried.
+`timeout_ms` starts before credential lookup and covers command-based key
+preparation plus the complete network request, including response-body
+consumption. Preparing a key does not grant a fresh network timeout. Local
+input preprocessing after credential lookup consumes the same elapsed budget,
+but blocking filesystem calls cannot be interrupted mid-call. Output
+publication is checked for cancellation separately. Defaults are 120 seconds
+for vision and speech, 180 seconds for images; the maximum is 300 seconds.
+Cancellation stops the owned credential helper or further transport polling
+and drops the request. Process cleanup uses synchronous OS kill/reap operations,
+so this is not a hard real-time guarantee. Cancellation cannot reverse work or
+charges already accepted by a provider. Requests are not automatically retried.
 
 Artifacts are staged beside their destination, synced, and published with
 no-clobber persistence. Existing files and symlinks at the destination are
@@ -419,17 +430,12 @@ correctness is made merely because a container passes these checks.
 behavior, marked `mock: true`. `with_mock(false)` overrides the environment.
 Speech fixtures support WAV only; they never stand in for a native response.
 
-Twenty regression test functions were added under the media modules, including
-real loopback TCP peers exercising the actual HTTP adapter and provider request
-layouts, malformed/filtered responses, credential redaction, no-clobber writes,
-ordered image references, masks, and one Unix-only path-serialization case.
-These are protocol fixtures, not live-provider validation.
-
-**Validation status of the implementation session:** no Rust compiler or DSR
-runner was available. `dsr quality --tool pi_agent_rust` failed with
-`dsr: command not found`. The Rust tests were authored but not executed, and
-neither a passing build nor live provider success was established. The
-required authoritative check remains:
+Regression cases under the media modules and SDK use real loopback TCP peers
+to exercise the HTTP adapters, provider request layouts, saved credential
+sources, cancellation, spend admission, malformed/filtered responses,
+credential redaction, no-clobber writes, ordered image references, and masks.
+These are protocol fixtures, not live-provider validation. Adding a regression
+does not establish that it passed; the authoritative quality entry point is:
 
 ```sh
 dsr quality --tool pi_agent_rust

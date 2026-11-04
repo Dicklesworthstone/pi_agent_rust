@@ -433,6 +433,7 @@ mod auth_scope_tests {
         futures::executor::block_on(owner.with_current(async {
             let error = transport
                 .api("tts", "openai", None, std::time::Duration::from_secs(1))
+                .await
                 .err()
                 .expect("shared session credentials must be refused");
             assert!(error.to_string().contains("multiple AgentSessions"));
@@ -444,6 +445,7 @@ mod auth_scope_tests {
                         Some("builder-key"),
                         std::time::Duration::from_secs(1),
                     )
+                    .await
                     .is_ok()
             );
             let empty_error = transport
@@ -453,6 +455,7 @@ mod auth_scope_tests {
                     Some(" "),
                     std::time::Duration::from_secs(1),
                 )
+                .await
                 .err()
                 .expect("explicit empty key must still deny fallback");
             assert!(empty_error.to_string().contains("missing API key"));

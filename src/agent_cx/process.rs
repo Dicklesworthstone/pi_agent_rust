@@ -5,7 +5,7 @@
 //! Owned children are killed and reaped on cancellation or drop. Cleanup is
 //! synchronous and is not a hard real-time bound on foreign OS operations.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod capture;
 
 use super::{AgentCx, AgentProcess};
@@ -156,6 +156,20 @@ impl AgentCommand {
         check_spawn(&self.owner)?;
         check_wait(&self.owner)?;
         self.spawn()?.wait().await
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) async fn output_with_limits(
+        self,
+        _stdout_limit: usize,
+        _stderr_limit: usize,
+        _timeout: Duration,
+    ) -> io::Result<std::process::Output> {
+        drop(self);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "owned process output capture is unavailable on this platform",
+        ))
     }
 }
 

@@ -1,5 +1,5 @@
 //! Shared transport for native media adapters. No retries, redirects, or mock fallback.
-//! An explicit owner covers connect, response-body consumption, and the request deadline.
+//! An explicit owner covers credential helpers, HTTP, and response-body consumption.
 
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -8,7 +8,7 @@ use futures::future::{Either, select};
 use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 #[derive(Default)]
@@ -38,13 +38,14 @@ impl Transport {
         self
     }
 
-    pub(super) fn api(
+    pub(super) async fn api(
         &self,
         tool: &'static str,
         provider: &'static str,
         explicit_key: Option<&str>,
         timeout: Duration,
     ) -> Result<Api<'_>> {
+        let started = Instant::now();
         let owner = AgentCx::for_current_or_request();
         check_owner(tool, &owner)?;
         // Capture the invocation's account before resolving a command-backed
@@ -89,16 +90,20 @@ impl Transport {
                 std::env::var(name).ok()
             })?
         } else if let Some(auth) = &auth {
-            auth.resolve_media_api_key_status(provider)
+            auth.resolve_media_api_key_status_async(
+                provider,
+                &owner,
+                remaining_timeout(tool, started, timeout)?,
+            )
+                .await?
                 .into_result(provider)
                 .map_err(|error| Error::tool(tool, error.to_string()))?
                 .ok_or_else(|| missing_key(tool, provider))?
         } else {
             resolve_key(tool, provider, None, |name| std::env::var(name).ok())?
         };
-        // Stored command-backed keys can take time to resolve. Recheck the
-        // invocation before constructing a request after that bounded work.
         check_owner(tool, &owner)?;
+        remaining_timeout(tool, started, timeout)?;
         Ok(Api {
             transport: self,
             tool,
@@ -108,6 +113,7 @@ impl Transport {
             cost_budget,
             base,
             owner,
+            started,
             timeout,
         })
     }
@@ -122,6 +128,7 @@ pub(super) struct Api<'a> {
     cost_budget: Option<crate::cost::CostBudget>,
     base: Url,
     pub(super) owner: AgentCx,
+    started: Instant,
     timeout: Duration,
 }
 
@@ -154,6 +161,8 @@ impl Api<'_> {
     // Keep the bounded HTTP exchange inside its shared cancellation/deadline race.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
+        check_owner(self.tool, &self.owner)?;
+        remaining_timeout(self.tool, self.started, self.timeout)?;
         // Paths are built by adapters, never accepted as model-facing arguments.
         let url = self
             .base
@@ -170,7 +179,7 @@ impl Api<'_> {
             let client = self.owner.http().bind(&self.transport.client);
             let request = client
                 .post(url.as_str())
-                .timeout(self.timeout)
+                .timeout(remaining_timeout(self.tool, self.started, self.timeout)?)
                 .json(payload)?;
             let request = match self.provider {
                 "gemini" => request.try_header("x-goog-api-key", &self.key),
@@ -185,6 +194,7 @@ impl Api<'_> {
             if let Some(budget) = &self.cost_budget {
                 budget.admit()?;
             }
+            remaining_timeout(self.tool, self.started, self.timeout)?;
             let started_at = std::time::Instant::now();
             let response = request.send().await.map_err(|error| {
                 Error::tool(
@@ -236,6 +246,12 @@ impl Api<'_> {
                 )
             })?;
             check_owner(self.tool, &self.owner)?;
+            if self.started.elapsed() >= self.timeout {
+                return Err(Error::tool(
+                    self.tool,
+                    "media request timed out; the provider may already have processed it",
+                ));
+            }
             if bytes.is_empty() {
                 return Err(Error::tool(
                     self.tool,
@@ -257,7 +273,11 @@ impl Api<'_> {
         };
         let watchdog = async {
             match select(
-                Box::pin(self.owner.time().sleep(self.timeout)),
+                Box::pin(
+                    self.owner
+                        .time()
+                        .sleep(self.timeout.saturating_sub(self.started.elapsed())),
+                ),
                 Box::pin(cancelled),
             )
             .await
@@ -278,6 +298,18 @@ impl Api<'_> {
             }
         }
     }
+}
+
+fn remaining_timeout(tool: &str, started: Instant, timeout: Duration) -> Result<Duration> {
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            Error::tool(
+                tool,
+                "media operation timed out before dispatch; no provider request was sent",
+            )
+        })
 }
 
 pub(super) fn check_owner(tool: &str, owner: &AgentCx) -> Result<()> {
@@ -781,6 +813,7 @@ pub(super) mod tests {
                         Some("captured-key"),
                         Duration::from_secs(2),
                     )
+                    .await
                     .expect("initial account permits preparation");
                 scope.set(Some(replacement));
                 if quarantine {
@@ -809,6 +842,7 @@ pub(super) mod tests {
                         Some("replacement-key"),
                         Duration::from_secs(2),
                     )
+                    .await
                     .expect("next invocation captures the healthy replacement account");
                 scope.set(Some(CostBudget::new(None, Some(1.0), 1.0).unwrap()));
                 let worker =
@@ -821,7 +855,9 @@ pub(super) mod tests {
                 let captured = worker.join().unwrap();
                 assert!(captured.headers.contains("Bearer replacement-key"));
                 assert!(matches!(
-                    transport.api("tts", "openai", Some("next-key"), Duration::from_secs(2)),
+                    transport
+                        .api("tts", "openai", Some("next-key"), Duration::from_secs(2))
+                        .await,
                     Err(Error::CostCap { .. })
                 ));
             });
@@ -861,6 +897,7 @@ pub(super) mod tests {
                 scope.set(Some(budget));
                 let error = transport
                     .api("tts", "openai", None, Duration::from_secs(1))
+                    .await
                     .err()
                     .expect("refuse before stored credential resolution");
                 if quarantine {
