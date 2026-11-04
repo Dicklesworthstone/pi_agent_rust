@@ -75,6 +75,8 @@ pub struct BrowserTool {
     sessions: session::Sessions,
     cdp_endpoint: Option<String>,
     launch_options: Option<BrowserLaunchOptions>,
+    /// `browser.headless` from settings; `PI_BROWSER_HEADLESS` overrides it.
+    configured_headless: Option<bool>,
     domain_allowlist: Option<Vec<String>>,
 }
 
@@ -86,6 +88,7 @@ impl BrowserTool {
             sessions: session::Sessions::default(),
             cdp_endpoint: None,
             launch_options: None,
+            configured_headless: None,
             domain_allowlist: None,
         }
     }
@@ -117,6 +120,15 @@ impl BrowserTool {
     #[must_use]
     pub fn with_domain_allowlist(mut self, allowlist: Option<Vec<String>>) -> Self {
         self.domain_allowlist = allowlist;
+        self
+    }
+
+    /// Apply `browser.headless` from settings to a managed launch configured
+    /// through the environment. `PI_BROWSER_HEADLESS` overrides it, and
+    /// explicit [`Self::with_launch_options`] choices replace both.
+    #[must_use]
+    pub const fn with_configured_headless(mut self, headless: Option<bool>) -> Self {
+        self.configured_headless = headless;
         self
     }
 
@@ -340,6 +352,7 @@ impl BrowserTool {
             &namespace.live_state,
             self.cdp_endpoint.as_deref(),
             self.launch_options.as_ref(),
+            self.configured_headless,
             &self.cwd,
             self.domain_allowlist.as_deref(),
             args,

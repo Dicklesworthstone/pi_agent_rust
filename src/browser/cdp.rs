@@ -253,12 +253,14 @@ pub(super) async fn execute(
     state: &std::sync::Arc<asupersync::sync::Mutex<Session>>,
     endpoint_override: Option<&str>,
     launch_options: Option<&BrowserLaunchOptions>,
+    configured_headless: Option<bool>,
     cwd: &Path,
     allowlist: Option<&[String]>,
     args: &Value,
 ) -> Result<ToolOutput> {
     let timeout_ms = validate(args, allowlist)?;
-    let connection = launch::Connection::resolve(endpoint_override, launch_options)?;
+    let connection =
+        launch::Connection::resolve(endpoint_override, launch_options, configured_headless)?;
     storage::validate_connection(args, &connection)?;
     let owner = AgentCx::for_current_or_request();
     let caps = owner.capabilities();

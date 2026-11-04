@@ -6178,12 +6178,13 @@ impl ToolRegistry {
                     ));
                 }
                 "browser" => {
-                    let domain_allowlist = config
-                        .and_then(|c| c.browser.as_ref())
-                        .and_then(|b| b.domain_allowlist.clone());
+                    let browser_cfg = config.and_then(|c| c.browser.as_ref());
                     tools.push(Box::new(
                         crate::browser::BrowserTool::new(cwd)
-                            .with_domain_allowlist(domain_allowlist),
+                            .with_domain_allowlist(
+                                browser_cfg.and_then(|b| b.domain_allowlist.clone()),
+                            )
+                            .with_configured_headless(browser_cfg.and_then(|b| b.headless)),
                     ));
                 }
                 "subagent" => {
@@ -6338,7 +6339,8 @@ impl ToolRegistry {
         {
             tools.push(Box::new(
                 crate::browser::BrowserTool::new(cwd)
-                    .with_domain_allowlist(browser_cfg.domain_allowlist.clone()),
+                    .with_domain_allowlist(browser_cfg.domain_allowlist.clone())
+                    .with_configured_headless(browser_cfg.headless),
             ));
         }
 

@@ -48,11 +48,13 @@ SDK hosts can set `BrowserLaunchOptions` through `with_launch_options`. Explicit
 SDK connection choices take precedence over the environment. Stop an existing
 managed browser before changing its connection configuration.
 
-**Settings forwarding boundary:** the existing registry still forwards browser
-activation and `domainAllowlist`, but not the legacy `executablePath`, `headless`,
-`userAgent` or `remoteDebuggingPort` fields. Use the environment variables above
-or SDK launch options. For a fixed, externally managed port, use explicit CDP
-attachment rather than asking the managed launcher to share that port.
+**Settings forwarding boundary:** the registry forwards browser activation,
+`domainAllowlist` and `headless` from settings. `"browser": {"headless": false}`
+shows the managed browser window; `PI_BROWSER_HEADLESS` overrides it, and SDK
+launch options replace both. The legacy `executablePath`, `userAgent` and
+`remoteDebuggingPort` fields are not forwarded. Use the environment variables
+above or SDK launch options. For a fixed, externally managed port, use explicit
+CDP attachment rather than asking the managed launcher to share that port.
 
 ## Lifecycle and explicit attachment
 

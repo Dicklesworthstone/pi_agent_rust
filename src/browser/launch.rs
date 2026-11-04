@@ -35,16 +35,23 @@ pub(super) enum Connection {
 }
 
 impl Connection {
+    /// `configured_headless` is `browser.headless` from settings: it applies
+    /// only to an environment-configured managed launch, and
+    /// `PI_BROWSER_HEADLESS` overrides it.
     pub(super) fn resolve(
         endpoint: Option<&str>,
         launch: Option<&BrowserLaunchOptions>,
+        configured_headless: Option<bool>,
     ) -> Result<Self> {
-        Self::with_environment(endpoint, launch, |name| std::env::var_os(name))
+        Self::with_environment(endpoint, launch, configured_headless, |name| {
+            std::env::var_os(name)
+        })
     }
 
     fn with_environment(
         endpoint: Option<&str>,
         launch: Option<&BrowserLaunchOptions>,
+        configured_headless: Option<bool>,
         mut lookup: impl FnMut(&str) -> Option<OsString>,
     ) -> Result<Self> {
         if let Some(endpoint) = endpoint {
@@ -61,7 +68,7 @@ impl Connection {
             return Ok(Self::Attach(policy::endpoint(endpoint, false)?));
         }
         let headless = match lookup("PI_BROWSER_HEADLESS") {
-            None => true,
+            None => configured_headless.unwrap_or(true),
             Some(value) => match value.to_str() {
                 Some("1" | "true") => true,
                 Some("0" | "false") => false,
@@ -445,18 +452,46 @@ mod tests {
             panic!("explicit settings must not read the environment")
         };
         assert!(matches!(
-            Connection::with_environment(Some("http://127.0.0.1:9222"), None, forbidden).unwrap(),
+            Connection::with_environment(Some("http://127.0.0.1:9222"), None, None, forbidden)
+                .unwrap(),
             Connection::Attach(_)
         ));
         let launch = BrowserLaunchOptions::default();
         assert!(matches!(
-            Connection::with_environment(None, Some(&launch), forbidden).unwrap(),
-            Connection::Managed(_)
+            Connection::with_environment(None, Some(&launch), Some(false), forbidden).unwrap(),
+            Connection::Managed(options) if options.headless
         ));
         assert!(matches!(
-            Connection::with_environment(None, None, |_| None).unwrap(),
+            Connection::with_environment(None, None, None, |_| None).unwrap(),
             Connection::Managed(_)
         ));
+    }
+
+    /// gh #281: `browser.headless: false` in settings was parsed and then
+    /// dropped, so the managed browser always started headless.
+    #[test]
+    fn configured_headless_applies_below_the_environment() {
+        let managed_headless = |configured: Option<bool>, env: Option<&str>| {
+            let connection = Connection::with_environment(None, None, configured, |name| {
+                (name == "PI_BROWSER_HEADLESS")
+                    .then_some(env)
+                    .flatten()
+                    .map(OsString::from)
+            })
+            .unwrap();
+            match connection {
+                Connection::Managed(options) => options.headless,
+                Connection::Attach(_) => panic!("no endpoint was configured"),
+            }
+        };
+        assert!(managed_headless(None, None), "headless by default");
+        assert!(!managed_headless(Some(false), None), "settings can show it");
+        assert!(managed_headless(Some(true), None));
+        assert!(
+            managed_headless(Some(false), Some("true")),
+            "PI_BROWSER_HEADLESS overrides settings"
+        );
+        assert!(!managed_headless(Some(true), Some("0")));
     }
 
     #[test]
