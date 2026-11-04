@@ -2460,6 +2460,9 @@ const FIXED_CHROME_ROWS: u16 = 3;
 /// The input editor grows with its content up to this many rows.
 const MAX_INPUT_ROWS: u16 = 5;
 
+/// Conversation rows an open completion popup always leaves visible.
+const MIN_BODY_ROWS_UNDER_COMPLETION: u16 = 3;
+
 /// The `[start, end)` slice of a `len`-item picker list that fits in
 /// `visible` rows while keeping `selected` on screen.
 ///
@@ -2476,6 +2479,42 @@ fn picker_window(selected: usize, len: usize, visible: usize) -> std::ops::Range
     let max_start = len.saturating_sub(visible);
     let start = selected.saturating_sub(visible - 1).min(max_start);
     start..(start + visible).min(len)
+}
+
+/// An error banner wider than this, or with more than one line, is also
+/// written in full to the conversation (gh #280).
+const BANNER_INLINE_MAX_WIDTH: usize = 72;
+
+/// Whether an error banner's text needs a full copy in the conversation.
+/// Width-independent so the banner's pointer to that copy never depends on
+/// a resize between the error and the frame.
+fn banner_needs_transcript(text: &str) -> bool {
+    text.trim_end().contains('\n') || display_width(text) > BANNER_INLINE_MAX_WIDTH
+}
+
+/// The single row an error banner occupies at `width` cells. Text that fits
+/// is shown as is. Otherwise the first non-empty line is cut with an
+/// ellipsis and, when the full text was also written to the conversation,
+/// followed by a pointer to it (gh #280).
+fn banner_row(banner: &str, width: usize) -> String {
+    use ftui::text::wrap::truncate_with_ellipsis;
+    const POINTER: &str = " · full error above";
+
+    let full = format!("✗ {banner}");
+    if !banner.trim_end().contains('\n') && display_width(&full) <= width {
+        return full;
+    }
+    let first = banner
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim_end();
+    let head = format!("✗ {first}");
+    let room = width.saturating_sub(display_width(POINTER));
+    if banner_needs_transcript(banner) && room >= 16 {
+        return format!("{}{POINTER}", truncate_with_ellipsis(&head, room, "…"));
+    }
+    truncate_with_ellipsis(&head, width, "…")
 }
 
 fn layout_regions(
@@ -2934,6 +2973,17 @@ impl PiFtuiModel {
         .max(1)
     }
 
+    /// Pin an error above the editor. The banner is one row, so an error it
+    /// cannot show whole (a multi-line extension stack trace, say) is also
+    /// written in full to the conversation, where it wraps and scrolls; the
+    /// banner then shows its first line and points there (gh #280).
+    fn set_error_banner(&mut self, text: String) {
+        if banner_needs_transcript(&text) {
+            self.push_entry(EntryRole::Error, text.clone());
+        }
+        self.error_banner = Some(text);
+    }
+
     /// Whether the editor is in plain prompt-composition mode: idle agent,
     /// no card or picker owning the keys. Only then may completion open.
     fn completion_allowed(&self) -> bool {
@@ -2960,14 +3010,28 @@ impl PiFtuiModel {
     }
 
     /// Rows the popup reserves above the editor: one per visible suggestion
-    /// (capped at `max_visible`) plus the keyboard hint line. The popup
-    /// never takes more than a third of the terminal so a short or inline
-    /// viewport keeps its conversation rows.
+    /// (capped at `max_visible`) plus the keyboard hint line. The popup may
+    /// use every row the chrome, editor and widgets leave, less
+    /// [`MIN_BODY_ROWS_UNDER_COMPLETION`] kept for the conversation. A fixed
+    /// third of the terminal used to cap it, so `autocompleteMaxVisible`
+    /// above about 8 had no effect on an ordinary 24-30 row window (gh #280).
     fn completion_rows(&self) -> u16 {
         if !self.completion_visible() {
             return 0;
         }
-        let budget = usize::from(self.term.1 / 3).max(2);
+        let reserved = FIXED_CHROME_ROWS
+            + u16::from(self.error_banner.is_some())
+            + self.input_rows()
+            + self.widget_rows()
+            + MIN_BODY_ROWS_UNDER_COMPLETION;
+        // `term` is the physical terminal; an inline UI is never taller than
+        // INLINE_MAX_HEIGHT, so budget against the frame it actually gets.
+        let height = if self.alt_screen {
+            self.term.1
+        } else {
+            self.term.1.min(INLINE_MAX_HEIGHT)
+        };
+        let budget = usize::from(height.saturating_sub(reserved)).max(2);
         let items = self
             .autocomplete
             .items
@@ -3837,11 +3901,11 @@ impl PiFtuiModel {
             }
             PiMsg::AgentError(err) => {
                 self.dismiss_pending_interactions();
-                // Pinned above the editor (bd-cv653.9.2), dismiss-on-send —
-                // not duplicated into the transcript. Partial streamed text
-                // is still flushed so it isn't merged into the next turn.
+                // Pinned above the editor, dismiss-on-send.
+                // Partial streamed text is still flushed so it isn't merged
+                // into the next turn.
                 self.flush_stream();
-                self.error_banner = Some(sanitize(&err).into_owned());
+                self.set_error_banner(sanitize(&err).into_owned());
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
@@ -7389,7 +7453,7 @@ impl Model for PiFtuiModel {
                         // Editors end files with a newline the draft never had.
                         self.input.set_text(text.trim_end_matches(['\n', '\r']));
                     }
-                    Err(err) => self.error_banner = Some(err),
+                    Err(err) => self.set_error_banner(sanitize(&err).into_owned()),
                 }
                 cmd
             }
@@ -7433,7 +7497,7 @@ impl Model for PiFtuiModel {
                 match result {
                     Ok((width, height)) => self.handle_term(&Event::Resize { width, height }),
                     Err(error) => {
-                        self.error_banner = Some(sanitize(&error).into_owned());
+                        self.set_error_banner(sanitize(&error).into_owned());
                         Cmd::none()
                     }
                 }
@@ -7539,14 +7603,28 @@ impl PiFtuiModel {
             ];
             // Descriptions come from templates, skills, and extensions —
             // untrusted text, so they go through sanitize like everything
-            // else that reaches a frame.
+            // else that reaches a frame. Each row is one line: a description
+            // is folded onto it and ends in an ellipsis where the row does,
+            // instead of being cut mid-word at the edge (gh #280).
+            let room = usize::from(area.width)
+                .saturating_sub(4 + label_width.max(display_width(&item.label)));
             if let Some(desc) = item
                 .description
                 .as_deref()
                 .map(str::trim)
-                .filter(|desc| !desc.is_empty())
+                .filter(|desc| !desc.is_empty() && room > 0)
             {
-                spans.push(Span::styled(format!("  {}", sanitize(desc)), muted_style));
+                let folded = sanitize(desc)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                spans.push(Span::styled(
+                    format!(
+                        "  {}",
+                        ftui::text::wrap::truncate_with_ellipsis(&folded, room, "…")
+                    ),
+                    muted_style,
+                ));
             }
             lines.push(Line::from_spans(spans));
         }
@@ -7701,7 +7779,7 @@ impl PiFtuiModel {
         if let Some(banner) = &self.error_banner {
             let banner_style = ftui::Style::new().bold().fg(self.palette.error);
             Paragraph::new(Text::from_lines([ftui::text::Line::styled(
-                format!("✗ {banner}"),
+                banner_row(banner, usize::from(regions.banner.width)),
                 banner_style,
             )]))
             .render(regions.banner, frame);
@@ -25711,6 +25789,128 @@ mod tests {
         );
     }
 
+    /// gh #280: `autocompleteMaxVisible` above 8 was ignored on a 30-row
+    /// terminal because the popup was capped at a third of the screen. The
+    /// configured count now wins while the conversation keeps its reserve.
+    #[test]
+    fn popup_honors_a_large_max_visible_and_keeps_conversation_rows() {
+        let launch = || AutocompleteLaunch {
+            catalog: AutocompleteCatalog::default(),
+            cwd: std::path::PathBuf::from("."),
+            max_visible: 20,
+            resources: None,
+            resource_source: None,
+        };
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_alt_screen(true)
+            .with_autocomplete(launch());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 100,
+            height: 30,
+        });
+        type_str(&mut sim, "/");
+        let total = sim.model().autocomplete.items.len();
+        assert!(total > 20, "need more commands than rows for this test");
+        assert_eq!(sim.model().completion_rows(), 21, "20 rows + hint");
+        assert_eq!(
+            sim.model().body_height(),
+            usize::from(MIN_BODY_ROWS_UNDER_COMPLETION) + 2,
+            "30 rows - 3 chrome - 1 editor - 21 popup"
+        );
+        let rendered = buffer_text(sim.capture_frame(100, 30), 100, 30);
+        assert!(
+            rendered.contains(&format!("20/{total} shown")),
+            "all configured rows are drawn: {rendered:?}"
+        );
+
+        // A short window shrinks the popup before the conversation reserve.
+        sim.inject_event(Event::Resize {
+            width: 100,
+            height: 12,
+        });
+        assert_eq!(
+            sim.model().completion_rows(),
+            12 - FIXED_CHROME_ROWS - 1 - MIN_BODY_ROWS_UNDER_COMPLETION
+        );
+        assert_eq!(
+            sim.model().body_height(),
+            usize::from(MIN_BODY_ROWS_UNDER_COMPLETION)
+        );
+
+        // `--inline` gets a frame of at most INLINE_MAX_HEIGHT rows however
+        // tall the terminal is, so the popup is sized against that frame and
+        // never pushes the editor out of it.
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx)
+            .with_alt_screen(false)
+            .with_autocomplete(launch());
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 100,
+            height: 50,
+        });
+        type_str(&mut sim, "/");
+        let rows = INLINE_MAX_HEIGHT - FIXED_CHROME_ROWS - 1 - MIN_BODY_ROWS_UNDER_COMPLETION;
+        assert_eq!(sim.model().completion_rows(), rows);
+        let rendered = buffer_text(
+            sim.capture_frame(100, INLINE_MAX_HEIGHT),
+            100,
+            INLINE_MAX_HEIGHT,
+        );
+        assert!(
+            rendered.contains(&format!("{}/{total} shown", rows - 1)),
+            "inline popup fits its frame: {rendered:?}"
+        );
+    }
+
+    /// gh #280: a long skill or command description ends in an ellipsis at
+    /// the row's edge, and a multi-line one stays on its own row.
+    #[test]
+    fn long_completion_descriptions_end_in_an_ellipsis_at_the_edge() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let long = format!("{}\nsecond line{}", "word ".repeat(40), " tail".repeat(10));
+        let model = PiFtuiModel::new(rx).with_autocomplete(AutocompleteLaunch {
+            catalog: AutocompleteCatalog {
+                extension_commands: vec![crate::autocomplete::NamedEntry {
+                    name: String::from("deploy"),
+                    description: Some(long),
+                }],
+                ..AutocompleteCatalog::default()
+            },
+            cwd: std::path::PathBuf::from("."),
+            max_visible: 5,
+            resources: None,
+            resource_source: None,
+        });
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 60,
+            height: 20,
+        });
+        type_str(&mut sim, "/depl");
+        assert!(sim.model().completion_visible());
+        assert_eq!(sim.model().autocomplete.items[0].label, "/deploy");
+        let rendered = buffer_text(sim.capture_frame(60, 20), 60, 20);
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("/deploy"))
+            .expect("completion row");
+        assert!(
+            row.trim_end().ends_with('…'),
+            "description must end in an ellipsis: {row:?}"
+        );
+        assert!(display_width(row.trim_end()) <= 60, "{row:?}");
+        assert!(
+            !rendered.contains("second line"),
+            "folded tail stays elided: {rendered:?}"
+        );
+    }
+
     #[test]
     fn accepting_a_completion_replaces_only_the_command_token() {
         let (_tx, model) = new_model();
@@ -26016,6 +26216,77 @@ mod tests {
             UiCommand::Prompt(String::from("hi"))
         );
     }
+
+    /// gh #280: a multi-line error used to be flattened into the one-row
+    /// banner and cut at the right edge, so an extension's stack trace could
+    /// not be read. Its full text now lands in the conversation and the
+    /// banner shows the first line with a pointer to it.
+    #[test]
+    fn multi_line_agent_error_is_kept_whole_in_the_conversation() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 60,
+            height: 20,
+        });
+        let error = "session: Extension error: host write denied: path outside extension root\n    at checkWriteAccess (node:fs:45:58)\n    at mkdirSync (node:fs:1053:49)";
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(String::from(error))));
+        assert_eq!(sim.model().error_banner.as_deref(), Some(error));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text == error),
+            "full error in the conversation: {:?}",
+            sim.model().transcript
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 20), 60, 20);
+        assert!(
+            rendered.contains("at mkdirSync (node:fs:1053:49)"),
+            "last stack frame is readable: {rendered:?}"
+        );
+        let banner = rendered
+            .lines()
+            .find(|line| line.contains("full error above"))
+            .expect("banner points at the full error");
+        assert!(
+            banner.starts_with("✗ session: Extension error:"),
+            "{banner:?}"
+        );
+        assert!(banner.contains('…'), "{banner:?}");
+
+        // A short error stays banner-only.
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(String::from("boom"))));
+        assert_eq!(
+            sim.model()
+                .transcript
+                .iter()
+                .filter(|e| e.role == EntryRole::Error)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn banner_row_fits_its_width() {
+        assert_eq!(banner_row("boom", 40), "✗ boom");
+        let long = "x".repeat(100);
+        let row = banner_row(&long, 40);
+        assert_eq!(display_width(&row), 40, "{row:?}");
+        assert!(row.ends_with(" · full error above"), "{row:?}");
+        // Too narrow for the pointer: just the ellipsis.
+        let row = banner_row(&long, 20);
+        assert_eq!(display_width(&row), 20, "{row:?}");
+        assert!(row.ends_with('…'), "{row:?}");
+        // A short message that only overflows a tiny window is not in the
+        // conversation, so it gets no pointer.
+        let row = banner_row("provider said no to this request", 24);
+        assert!(!row.contains("full error"), "{row:?}");
+        assert!(row.ends_with('…'), "{row:?}");
+    }
+
     #[test]
     fn consecutive_reads_group_with_counter() {
         let (_tx, model) = new_model();
