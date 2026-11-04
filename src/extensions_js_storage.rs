@@ -1,18 +1,20 @@
-//! Host-granted, persistent application state for PiJS extensions.
+//! Host-granted application state and read-only configuration for PiJS extensions.
 //!
 //! These roots are data capabilities, never JavaScript module search roots.
-//! Mutations use no-follow directory handles and reject linked files before
-//! modifying them; the ordinary node:fs overlay remains unchanged elsewhere.
+//! Configuration grants name one file inside a protected namespace. Reads and
+//! mutations use no-follow handles and reject linked files; the ordinary node:fs
+//! overlay remains unchanged elsewhere.
 
 use super::{PiJsModuleState, current_extension_id};
 use crate::extensions::{ExtensionPolicy, PolicyDecision};
 use crate::file_identity::FileIdentity;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rquickjs::Ctx;
 use rquickjs::function::Func;
+use rquickjs::{Ctx, Exception};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{File, Metadata};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -20,15 +22,62 @@ use std::rc::Rc;
 
 const MAX_STORAGE_WRITE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageAccess {
+    ReadWriteDirectory,
+    ReadOnlyFile { name: OsString },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageGrant {
+    /// The protected namespace, including for an exact-file grant. Other files
+    /// beneath it must never regain authority through the workspace fallback.
+    root: PathBuf,
+    access: StorageAccess,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct PersistentStorage {
-    roots: HashMap<String, Vec<PathBuf>>,
+    roots: HashMap<String, Vec<StorageGrant>>,
     foreign_roots: HashMap<String, Vec<PathBuf>>,
     policy: Option<ExtensionPolicy>,
 }
 
 fn denied(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
+}
+
+/// Preserve errno as data: extensions must distinguish absent configuration
+/// from denied or failed reads without inspecting platform-specific messages.
+pub(super) fn filesystem_error(
+    ctx: &Ctx<'_>,
+    path: &str,
+    operation: &str,
+    error: &io::Error,
+) -> rquickjs::Error {
+    let code = match error.kind() {
+        io::ErrorKind::NotFound => "ENOENT",
+        io::ErrorKind::PermissionDenied => "EACCES",
+        io::ErrorKind::AlreadyExists => "EEXIST",
+        io::ErrorKind::InvalidInput => "EINVAL",
+        io::ErrorKind::IsADirectory => "EISDIR",
+        io::ErrorKind::NotADirectory => "ENOTDIR",
+        io::ErrorKind::Unsupported => "ENOTSUP",
+        _ => "EIO",
+    };
+    let result = Exception::from_message(
+        ctx.clone(),
+        &format!("{code}: {error}, {operation} '{path}'"),
+    )
+    .and_then(|exception| {
+        exception.as_object().set("code", code)?;
+        exception.as_object().set("syscall", operation)?;
+        exception.as_object().set("path", path)?;
+        Ok(exception.throw())
+    });
+    match result {
+        Ok(error) | Err(error) => error,
+    }
 }
 
 #[cfg(windows)]
@@ -244,6 +293,48 @@ impl PersistentStorage {
             }
             return Ok(());
         }
+        self.register_grant(root, owner, StorageAccess::ReadWriteDirectory)
+    }
+
+    pub(super) fn register_configuration_file(
+        &mut self,
+        file: PathBuf,
+        owner: &str,
+    ) -> io::Result<()> {
+        // Do not canonicalize away a linked leaf before checking it. Missing
+        // files/directories are legitimate: registration creates neither.
+        reject_link_components(&file)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&file)
+            && !metadata.is_file()
+        {
+            return Err(denied("a configuration grant must name a regular file"));
+        }
+        let root = file
+            .parent()
+            .filter(|root| root.parent().is_some())
+            .ok_or_else(|| denied("configuration requires a non-root parent directory"))?;
+        let name = file
+            .file_name()
+            .ok_or_else(|| denied("configuration requires a file name"))?
+            .to_os_string();
+        self.register_grant(
+            root.to_path_buf(),
+            owner,
+            StorageAccess::ReadOnlyFile { name },
+        )
+    }
+
+    fn register_grant(
+        &mut self,
+        root: PathBuf,
+        owner: &str,
+        access: StorageAccess,
+    ) -> io::Result<()> {
+        if owner.trim().is_empty() || root.parent().is_none() {
+            return Err(denied(
+                "persistent storage requires an owner and a non-root directory",
+            ));
+        }
         reject_link_components(&root)?;
         let root = crate::extensions::safe_canonicalize(&root);
         if let Ok(metadata) = std::fs::symlink_metadata(&root)
@@ -252,13 +343,12 @@ impl PersistentStorage {
             return Err(denied("a persistent storage root must be a directory"));
         }
         for (other, roots) in &self.roots {
-            if other != owner
-                && roots.iter().any(|other_root| {
-                    within_boundary(&root, other_root) || within_boundary(other_root, &root)
-                })
-            {
+            if roots.iter().any(|grant| {
+                (other != owner || grant.access != access)
+                    && (within_boundary(&root, &grant.root) || within_boundary(&grant.root, &root))
+            }) {
                 return Err(denied(
-                    "persistent storage grants for different extensions must not overlap",
+                    "persistent storage grants with different owners or access must not overlap",
                 ));
             }
         }
@@ -270,8 +360,9 @@ impl PersistentStorage {
             ));
         }
         let entries = self.roots.entry(owner.to_string()).or_default();
-        if !entries.contains(&root) {
-            entries.push(root);
+        let grant = StorageGrant { root, access };
+        if !entries.contains(&grant) {
+            entries.push(grant);
         }
         Ok(())
     }
@@ -284,12 +375,22 @@ impl PersistentStorage {
     pub(super) fn is_registered(&self, path: &Path) -> bool {
         self.roots
             .values()
-            .chain(self.foreign_roots.values())
             .flatten()
+            .map(|grant| &grant.root)
+            .chain(self.foreign_roots.values().flatten())
             .any(|root| within_boundary(path, root))
     }
 
     pub(super) fn resolve(&self, path: &Path, owner: Option<&str>) -> io::Result<Option<PathBuf>> {
+        self.resolve_grant(path, owner)
+            .map(|resolved| resolved.map(|(path, _)| path))
+    }
+
+    fn resolve_grant(
+        &self,
+        path: &Path,
+        owner: Option<&str>,
+    ) -> io::Result<Option<(PathBuf, &StorageGrant)>> {
         if self.roots.is_empty() && self.foreign_roots.is_empty() {
             return Ok(None);
         }
@@ -326,22 +427,28 @@ impl PersistentStorage {
         }
         reject_link_components(path)?;
         let owned = owner.and_then(|id| self.roots.get(id));
-        let root = owned.and_then(|roots| {
+        let grant = owned.and_then(|roots| {
             roots
                 .iter()
-                .filter(|root| checked.starts_with(root))
-                .max_by_key(|root| root.components().count())
+                .filter(|grant| match grant.access {
+                    StorageAccess::ReadWriteDirectory => checked.starts_with(&grant.root),
+                    // Classification only. Exact target validation below never
+                    // grants authority based on Windows case folding alone.
+                    StorageAccess::ReadOnlyFile { .. } => within_boundary(&checked, &grant.root),
+                })
+                .max_by_key(|grant| grant.root.components().count())
         });
-        let Some(root) = root else {
+        let Some(grant) = grant else {
             return Err(denied(
                 "persistent storage belongs to a different extension",
             ));
         };
+        let root = &grant.root;
         for (other, roots) in &self.roots {
             if Some(other.as_str()) != owner
-                && roots.iter().any(|other_root| {
-                    checked.starts_with(other_root)
-                        && other_root.components().count() >= root.components().count()
+                && roots.iter().any(|other_grant| {
+                    within_boundary(&checked, &other_grant.root)
+                        && other_grant.root.components().count() >= root.components().count()
                 })
             {
                 return Err(denied(
@@ -349,18 +456,49 @@ impl PersistentStorage {
                 ));
             }
         }
+        if let StorageAccess::ReadOnlyFile { name } = &grant.access {
+            let granted_file = root.join(name);
+            reject_link_components(&granted_file)?;
+            let canonical_grant = crate::extensions::safe_canonicalize(&granted_file);
+            let same_file = checked == canonical_grant;
+            #[cfg(windows)]
+            let same_file = same_file || {
+                // Case-sensitive Windows directories can contain distinct
+                // config.json and Config.JSON files. Only actual file identity
+                // can authorize an alternate spelling of an existing file.
+                match (
+                    FileIdentity::of_path_nofollow(&checked),
+                    FileIdentity::of_path_nofollow(&granted_file),
+                ) {
+                    (Ok(requested), Ok(granted)) => requested == granted,
+                    _ => false,
+                }
+            };
+            if !same_file {
+                return Err(denied(
+                    "configuration access is restricted to the granted file",
+                ));
+            }
+            // Always open the literal host-selected file. Canonical/identity
+            // checks classify aliases; they must not redirect the actual I/O
+            // to a new sibling or linked target after a filesystem race.
+            return Ok(Some((granted_file, grant)));
+        }
         if !path.starts_with(root) && !checked.starts_with(root) {
             return Err(denied("persistent storage path escaped its granted root"));
         }
-        Ok(Some(checked))
+        Ok(Some((checked, grant)))
     }
 
     pub(super) fn allows(&self, path: &Path, owner: Option<&str>, capability: &str) -> bool {
-        self.resolve(path, owner)
-            .is_ok_and(|resolved| resolved.is_some())
-            && self.policy.as_ref().is_none_or(|policy| {
-                policy.evaluate_for(capability, owner).decision == PolicyDecision::Allow
+        self.resolve_grant(path, owner).is_ok_and(|resolved| {
+            resolved.is_some_and(|(_, grant)| {
+                capability == "read"
+                    || (capability == "write" && grant.access == StorageAccess::ReadWriteDirectory)
             })
+        }) && self.policy.as_ref().is_none_or(|policy| {
+            policy.evaluate_for(capability, owner).decision == PolicyDecision::Allow
+        })
     }
 }
 
@@ -530,20 +668,32 @@ fn open_file(parent: &StorageParent, append: bool, exclusive: bool) -> io::Resul
     }
 }
 
-pub(super) fn read_file(
+fn authorized_read_path(
     path: &Path,
     owner: Option<&str>,
     state: &Rc<RefCell<PiJsModuleState>>,
-) -> io::Result<Option<Vec<u8>>> {
-    let state = state.borrow();
-    let registry = &state.persistent_storage;
+) -> io::Result<Option<PathBuf>> {
+    let module_state = state.borrow();
+    let registry = &module_state.persistent_storage;
     let Some(path) = registry.resolve(path, owner)? else {
         return Ok(None);
     };
+    let checked = crate::extensions::safe_canonicalize(&path);
+    if super::path_is_in_registered_extension_root(&checked, state)
+        && !super::path_is_in_owned_extension_root(&checked, owner, state)
+    {
+        return Err(denied(
+            "persistent data overlaps another extension's code root",
+        ));
+    }
     if !registry.allows(&path, owner, "read") {
         return Err(denied("persistent storage read capability denied"));
     }
-    let parent = pin_parent(&path, false)?;
+    Ok(Some(path))
+}
+
+fn open_read_file(path: &Path) -> io::Result<(File, StorageParent)> {
+    let parent = pin_parent(path, false)?;
     #[cfg(unix)]
     let file = open_leaf(&parent, rustix::fs::OFlags::RDONLY)?;
     #[cfg(windows)]
@@ -565,7 +715,7 @@ pub(super) fn read_file(
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || metadata_is_link(&metadata)
-            || FileIdentity::of_open_file(&file)? != FileIdentity::of_path_nofollow(&path)?
+            || FileIdentity::of_open_file(&file)? != FileIdentity::of_path_nofollow(path)?
         {
             return Err(denied(
                 "persistent storage read target changed or is not a regular file",
@@ -583,15 +733,58 @@ pub(super) fn read_file(
             return Err(denied("persistent storage must not read hard-linked files"));
         }
         parent.verify()?;
-        let mut bytes = Vec::new();
-        file.take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > MAX_STORAGE_WRITE_BYTES {
-            return Err(denied("persistent storage read exceeds 64 MiB"));
-        }
-        parent.verify()?;
-        Ok(Some(bytes))
+        Ok((file, parent))
     }
+}
+
+pub(super) fn read_file(
+    path: &Path,
+    owner: Option<&str>,
+    state: &Rc<RefCell<PiJsModuleState>>,
+) -> io::Result<Option<Vec<u8>>> {
+    let Some(path) = authorized_read_path(path, owner, state)? else {
+        return Ok(None);
+    };
+    let (file, parent) = open_read_file(&path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORAGE_WRITE_BYTES {
+        return Err(denied("persistent storage read exceeds 64 MiB"));
+    }
+    parent.verify()?;
+    Ok(Some(bytes))
+}
+
+/// Metadata uses the same literal grant and pinned file as content reads.
+/// Never fall back to a case alias or follow a replacement link for stat or
+/// realpath after admitting an exact-file configuration capability.
+pub(super) fn configuration_metadata(
+    path: &Path,
+    owner: Option<&str>,
+    state: &Rc<RefCell<PiJsModuleState>>,
+) -> io::Result<Option<(PathBuf, Metadata)>> {
+    let configuration = state
+        .borrow()
+        .persistent_storage
+        .resolve_grant(path, owner)?
+        .is_some_and(|(_, grant)| matches!(grant.access, StorageAccess::ReadOnlyFile { .. }));
+    if !configuration {
+        return Ok(None);
+    }
+    let path = authorized_read_path(path, owner, state)?
+        .ok_or_else(|| denied("configuration grant disappeared during metadata access"))?;
+    let (file, parent) = open_read_file(&path)?;
+    let canonical = std::fs::canonicalize(&path).map(crate::extensions::strip_unc_prefix)?;
+    parent.verify()?;
+    if FileIdentity::of_open_file(&file)? != FileIdentity::of_path_nofollow(&canonical)? {
+        return Err(denied(
+            "configuration target changed during metadata access",
+        ));
+    }
+    let metadata = file.metadata()?;
+    parent.verify()?;
+    Ok(Some((canonical, metadata)))
 }
 
 fn mutate(
@@ -783,12 +976,7 @@ pub(super) fn install(
                     }
                     Ok(())
                 };
-                run().map_err(|error| {
-                    rquickjs::Error::new_loading_message(
-                        &path,
-                        format!("persistent storage input denied: {error}"),
-                    )
-                })
+                run().map_err(|error| filesystem_error(&ctx, &path, &capability, &error))
             }
         }),
     )?;
@@ -828,7 +1016,7 @@ pub(super) fn install(
                             .roots
                             .values()
                             .flatten()
-                            .any(|root| root == &resolved)
+                            .any(|grant| grant.root == resolved)
                     {
                         return Err(denied("cannot remove a persistent storage root"));
                     }
@@ -852,7 +1040,7 @@ pub(super) fn install(
                             .roots
                             .values()
                             .flatten()
-                            .any(|root| root == &target)
+                            .any(|grant| grant.root == target)
                         {
                             return Err(denied("cannot overwrite a persistent storage root"));
                         }

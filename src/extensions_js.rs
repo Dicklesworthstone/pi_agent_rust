@@ -5333,10 +5333,12 @@ fn path_is_in_workspace_or_registered_extension_root(
     workspace_root: &Path,
     module_state: &Rc<RefCell<PiJsModuleState>>,
 ) -> bool {
+    if module_state.borrow().persistent_storage.is_registered(path) {
+        return true;
+    }
     let checked_path = crate::extensions::safe_canonicalize(path);
     checked_path.starts_with(workspace_root)
         || path_is_in_registered_extension_root(&checked_path, module_state)
-        || module_state.borrow().persistent_storage.is_registered(path)
         || module_state
             .borrow()
             .persistent_storage
@@ -5382,18 +5384,22 @@ fn path_is_allowed_extension_fs_path(
     module_state: &Rc<RefCell<PiJsModuleState>>,
     fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
 ) -> bool {
-    let checked_path = crate::extensions::safe_canonicalize(path);
-    if module_state.borrow().persistent_storage.is_registered(path)
-        || module_state
-            .borrow()
-            .persistent_storage
-            .is_registered(&checked_path)
-    {
-        return module_state
-            .borrow()
-            .persistent_storage
-            .allows(path, extension_id, "read");
+    // Resolve registered data first: validation of raw Windows components must
+    // precede canonicalization, including direct calls to the native guards.
+    match persistent_storage_path(path, extension_id, module_state) {
+        Err(_) => return false,
+        Ok(Some(granted)) => {
+            let checked = crate::extensions::safe_canonicalize(&granted);
+            return (!path_is_in_registered_extension_root(&checked, module_state)
+                || path_is_in_owned_extension_root(&checked, extension_id, module_state))
+                && module_state
+                    .borrow()
+                    .persistent_storage
+                    .allows(path, extension_id, "read");
+        }
+        Ok(None) => {}
     }
+    let checked_path = crate::extensions::safe_canonicalize(path);
     let path = checked_path.as_path();
     let in_owned_root =
         path_is_in_allowed_extension_root(path, extension_id, module_state, fallback_roots);
@@ -13067,6 +13073,12 @@ const __pi_vfs = (() => {
       return { bytes: toBytes(content, "base64"), error: "" };
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
+      // Protected host data never falls back to the VFS or missing-config
+      // defaults after a permission, link, or I/O failure. Only native ENOENT
+      // means that an authorized configuration file is absent.
+      if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
+        throw error;
+      }
       // A standalone realm may use an unrestricted virtual overlay, but host
       // reads remain confined. Treat a denied host probe as an absent overlay
       // entry so create/write operations can proceed entirely in the VFS.
@@ -13089,6 +13101,9 @@ const __pi_vfs = (() => {
       return JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(resolved), !!followSymlinks));
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
+      if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
+        throw error;
+      }
       // Standalone harness realms have no extension identity. Their virtual
       // reads and writes intentionally bypass extension policy, so a denied
       // host metadata probe means only that no host overlay is visible. An
@@ -13362,12 +13377,8 @@ const __pi_vfs = (() => {
     const isDir = !persistent && state.dirs.has(normalized);
     let bytes = persistent ? undefined : state.files.get(normalized);
     let hostStat = null;
-    if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
-      try {
-        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(normalized), !!followSymlinks));
-      } catch (e) {
-        /* not on host FS */
-      }
+    if (!isDir && bytes === undefined) {
+      hostStat = readHostStat(normalized, followSymlinks) ?? null;
     }
     const hostKind = hostStat && typeof hostStat.kind === "string" ? hostStat.kind : "";
     const isHostDir = hostKind === "dir";
@@ -13376,7 +13387,11 @@ const __pi_vfs = (() => {
     const isHostOther = hostKind === "other";
     const isFile = bytes !== undefined || isHostFile;
     if (!isDir && !isHostDir && !isFile && !isHostSymlink && !isHostOther) {
-      throw new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      const error = new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      error.code = "ENOENT";
+      error.syscall = "stat";
+      error.path = String(path ?? "");
+      throw error;
     }
     const hostSize =
       hostStat && typeof hostStat.size === "number" && Number.isFinite(hostStat.size)
@@ -13563,7 +13578,11 @@ export function readFileSync(path, encoding) {
   }
   if (bytes === undefined) {
     const detail = hostError ? ` (host: ${hostError})` : "";
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    const error = new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    error.code = "ENOENT";
+    error.syscall = "open";
+    error.path = String(path ?? "");
+    throw error;
   }
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
@@ -19854,6 +19873,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .map_err(|error| Error::extension(format!("Invalid persistent storage grant: {error}")))
     }
 
+    /// Grant read-only access to one host configuration file. Its parent is a
+    /// protected namespace, not a directory read grant or a module search root.
+    /// Missing files remain missing; registration never creates host paths.
+    pub fn add_configuration_read_file(&self, file: PathBuf, extension_id: &str) -> Result<()> {
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner != extension_id)
+        {
+            return Err(Error::extension(
+                "Configuration owner does not match runtime owner",
+            ));
+        }
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register_configuration_file(file, extension_id)
+            .map_err(|error| Error::extension(format!("Invalid configuration read grant: {error}")))
+    }
+
     pub(crate) fn register_foreign_persistent_storage_root(
         &self,
         root: PathBuf,
@@ -20940,9 +20979,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let allowed = path_is_allowed_extension_fs_path(
                                 &requested_abs,
                                 &workspace_root,
@@ -20950,6 +20986,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &module_state,
                                 &allowed_read_roots,
                             );
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
+                            };
                             log_host_fs_decision(
                                 "read",
                                 allowed,
@@ -20965,9 +21006,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if allowed {
                                 Ok(())
                             } else {
-                                Err(rquickjs::Error::new_loading_message(
+                                Err(storage::filesystem_error(
+                                    &ctx,
                                     &path,
-                                    "host read denied: path outside extension root".to_string(),
+                                    "open",
+                                    &std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "host read denied: path outside extension root",
+                                    ),
                                 ))
                             }
                         }
@@ -21001,22 +21047,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let storage = &module_state.borrow().persistent_storage;
-                            let allowed = if storage.is_registered(&requested_abs)
-                                || storage.is_registered(&checked_path)
-                            {
-                                storage.allows(&requested_abs, extension_id.as_deref(), "write")
-                            } else {
-                                path_is_allowed_extension_fs_path(
+                            let allowed = match storage.resolve(&requested_abs, extension_id.as_deref()) {
+                                Err(_) => false,
+                                Ok(Some(_)) => storage.allows(&requested_abs, extension_id.as_deref(), "write"),
+                                Ok(None) => path_is_allowed_extension_fs_path(
                                     &requested_abs,
                                     &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
                                     &allowed_read_roots,
-                                )
+                                ),
+                            };
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
                             };
                             log_host_fs_decision(
                                 "write",
@@ -21067,9 +21113,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let allowed = path_is_allowed_extension_fs_path(
                                 &requested_abs,
                                 &workspace_root,
@@ -21077,6 +21120,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &module_state,
                                 &allowed_read_roots,
                             );
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
+                            };
                             log_host_fs_decision(
                                 "stat",
                                 allowed,
@@ -21096,16 +21144,18 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 ));
                             }
 
-                            let metadata = if follow_symlinks {
+                            let configuration = storage::configuration_metadata(
+                                &requested_abs, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "stat", &error))?;
+                            let metadata = if let Some((_, metadata)) = configuration {
+                                Ok(metadata)
+                            } else if follow_symlinks {
                                 std::fs::metadata(&requested_abs)
                             } else {
                                 std::fs::symlink_metadata(&requested_abs)
                             }
                             .map_err(|err| {
-                                rquickjs::Error::new_loading_message(
-                                    &path,
-                                    format!("host stat: {err}"),
-                                )
+                                storage::filesystem_error(&ctx, &path, "stat", &err)
                             })?;
 
                             let file_type = metadata.file_type();
@@ -21148,6 +21198,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if !allowed(&requested) {
                                 return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path outside extension root"));
                             }
+                            if let Some((canonical, _)) = storage::configuration_metadata(
+                                &requested, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "realpath", &error))? {
+                                return Ok(canonical.to_string_lossy().into_owned());
+                            }
                             let canonical = std::fs::canonicalize(&requested)
                                 .map(crate::extensions::strip_unc_prefix)
                                 .map_err(|error| rquickjs::Error::new_loading_message(&path, format!("host realpath: {error}")))?;
@@ -21180,9 +21235,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let allowed = path_is_allowed_extension_fs_path(
                                 &requested_abs,
                                 &workspace_root,
@@ -21195,6 +21247,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 return Err(rquickjs::Error::new_loading_message(
                                     &path,
                                     "host readdir denied: path outside extension root".to_string(),
+                                ));
+                            }
+                            let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
+
+                            if storage::configuration_metadata(
+                                &requested_abs, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "scandir", &error))?.is_some() {
+                                return Err(storage::filesystem_error(
+                                    &ctx, &path, "scandir",
+                                    &std::io::Error::new(std::io::ErrorKind::NotADirectory, "configuration is a file"),
                                 ));
                             }
 
@@ -21290,9 +21352,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &requested_abs,
                                 extension_id.as_deref(),
                                 &module_state,
-                            ).map_err(|error| rquickjs::Error::new_loading_message(
-                                &path, format!("persistent storage read: {error}"),
-                            ))? {
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "open", &error))? {
                                 return Ok(BASE64_STANDARD.encode(bytes));
                             }
 

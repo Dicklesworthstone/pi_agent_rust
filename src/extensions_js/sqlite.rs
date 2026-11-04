@@ -530,6 +530,13 @@ fn authorize_database(
     let path = persistent_storage_path(path, owner, modules)
         .map_err(|error| error.to_string())?
         .ok_or("File-backed SQLite requires a host-granted persistent storage root")?;
+    if !modules
+        .borrow()
+        .persistent_storage
+        .allows(&path, owner, "write")
+    {
+        return Err("SQLite write access denied by the persistent storage grant".into());
+    }
     for companion in companion_paths(&path) {
         persistent_storage_path(&companion, owner, modules)
             .map_err(|error| error.to_string())?

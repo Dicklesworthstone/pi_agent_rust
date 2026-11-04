@@ -1414,6 +1414,617 @@ async fn persistent_storage_runtime(
     runtime
 }
 
+async fn configuration_file_runtime(
+    workspace: &std::path::Path,
+    configuration: &std::path::Path,
+    policy: pi::extensions::ExtensionPolicy,
+) -> PiJsRuntime<DeterministicClock> {
+    let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+        DeterministicClock::new(0),
+        PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        Some(policy),
+        "configuration.owner".to_string(),
+    )
+    .await
+    .expect("configuration runtime");
+    runtime.add_extension_root_with_id(workspace.to_path_buf(), Some("configuration.owner"));
+    runtime
+        .add_configuration_read_file(configuration.to_path_buf(), "configuration.owner")
+        .expect("host configuration grant");
+    runtime
+}
+
+#[test]
+fn fs_configuration_file_preserves_missing_errno_and_reads_current_host_bytes() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        std::fs::create_dir(&workspace).unwrap();
+        let runtime =
+            configuration_file_runtime(&workspace, &configuration, Default::default()).await;
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then(async (fs) => {{
+                const file = {file};
+                let sync, promise;
+                try {{ fs.readFileSync(file, 'utf-8'); }} catch (error) {{ sync = error.code; }}
+                try {{ await fs.promises.readFile(file, 'utf-8'); }} catch (error) {{ promise = error.code; }}
+                const callback = await new Promise(resolve => {{
+                    fs.readFile(file, 'utf-8', error => resolve(error && error.code));
+                }});
+                globalThis.missingConfiguration = {{ sync, promise, callback, exists: fs.existsSync(file) }};
+            }});
+        "#)).await.expect("missing configuration");
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("missingConfiguration")
+                .await
+                .unwrap(),
+            serde_json::json!({
+                "sync": "ENOENT", "promise": "ENOENT", "callback": "ENOENT", "exists": false,
+            })
+        );
+        assert!(
+            !base.join("home").exists(),
+            "a read grant must not create directories"
+        );
+
+        std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+        for enabled in [false, true] {
+            let expected = serde_json::json!({ "context-engineering": { "enabled": enabled } });
+            std::fs::write(&configuration, expected.to_string()).unwrap();
+            runtime.eval(&format!(r#"
+                import('node:fs').then(async (fs) => {{
+                    const file = {file};
+                    const fd = fs.openSync(file, 'r');
+                    const bytes = Buffer.alloc(256);
+                    const count = fs.readSync(fd, bytes, 0, bytes.length, 0);
+                    fs.closeSync(fd);
+                    const callback = await new Promise((resolve, reject) => {{
+                        fs.readFile(file, 'utf-8', (error, text) => error ? reject(error) : resolve(text));
+                    }});
+                    globalThis.currentConfiguration = {{
+                        sync: JSON.parse(fs.readFileSync(file, 'utf-8')),
+                        promise: JSON.parse(await fs.promises.readFile(file, 'utf-8')),
+                        callback: JSON.parse(callback),
+                        descriptor: JSON.parse(bytes.subarray(0, count).toString('utf-8')),
+                        exists: fs.existsSync(file), regular: fs.statSync(file).isFile(),
+                    }};
+                }});
+            "#)).await.expect("authorized configuration reads");
+            runtime.drain_microtasks().await.unwrap();
+            assert_eq!(
+                runtime
+                    .read_global_json("currentConfiguration")
+                    .await
+                    .unwrap(),
+                serde_json::json!({
+                    "sync": expected, "promise": expected, "callback": expected,
+                    "descriptor": expected, "exists": true, "regular": true,
+                })
+            );
+        }
+    });
+}
+
+#[test]
+fn fs_configuration_grant_denies_mutations_and_neighbouring_home_files() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        let namespace = configuration.parent().unwrap();
+        std::fs::create_dir_all(namespace).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            &configuration,
+            r#"{"context-engineering":{"enabled":false}}"#,
+        )
+        .unwrap();
+        std::fs::write(namespace.join("private.json"), "private configuration").unwrap();
+        std::fs::write(namespace.join("config.json.extra"), "prefix neighbour").unwrap();
+        std::fs::write(base.join("home/.pi/agent/auth.json"), "private auth").unwrap();
+        std::fs::write(base.join("home/private.txt"), "unrelated home file").unwrap();
+        std::fs::write(workspace.join("source.txt"), "source").unwrap();
+        let runtime =
+            configuration_file_runtime(&workspace, &configuration, Default::default()).await;
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        let root = serde_json::to_string(&namespace.display().to_string()).unwrap();
+        let home = serde_json::to_string(&base.join("home").display().to_string()).unwrap();
+        let work = serde_json::to_string(&workspace.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then(async (fs) => {{
+                const file = {file}, root = {root}, work = {work}, home = {home};
+                const actions = {{
+                    write: () => fs.writeFileSync(file, 'forbidden'),
+                    append: () => fs.appendFileSync(file, 'forbidden'),
+                    writableDescriptor: () => fs.openSync(file, 'w'),
+                    readWriteDescriptor: () => fs.openSync(file, 'r+'),
+                    copyInto: () => fs.copyFileSync(work + '/source.txt', file),
+                    renameInto: () => fs.renameSync(work + '/source.txt', file),
+                    renameOut: () => fs.renameSync(file, work + '/moved.json'),
+                    unlink: () => fs.unlinkSync(file),
+                    removeDirectory: () => fs.rmSync(root, {{ recursive: true }}),
+                    mkdir: () => fs.mkdirSync(root + '/new', {{ recursive: true }}),
+                    chmod: () => fs.chmodSync(file, 0o777),
+                    chown: () => fs.chownSync(file, 0, 0),
+                    utimes: () => fs.utimesSync(file, new Date(), new Date()),
+                    writableAccess: () => fs.accessSync(file, fs.constants.W_OK),
+                    directMutation: () => __pi_host_persistent_storage_mutate('write', file, '{{"data":"Zm9yYmlkZGVu"}}'),
+                    sibling: () => fs.readFileSync(root + '/private.json', 'utf8'),
+                    prefixSibling: () => fs.readFileSync(file + '.extra', 'utf8'),
+                    listNamespace: () => fs.readdirSync(root),
+                    authentication: () => fs.readFileSync(home + '/.pi/agent/auth.json', 'utf8'),
+                    unrelatedHome: () => fs.readFileSync(home + '/private.txt', 'utf8'),
+                }};
+                globalThis.configurationDenials = Object.fromEntries(Object.entries(actions).map(([name, action]) => {{
+                    try {{ action(); return [name, false]; }} catch (_) {{ return [name, true]; }}
+                }}));
+                let promiseDenied = false;
+                try {{ await fs.promises.writeFile(file, 'forbidden'); }} catch (_) {{ promiseDenied = true; }}
+                globalThis.configurationPromiseWriteDenied = promiseDenied;
+                const {{ Database }} = await import('bun:sqlite');
+                globalThis.configurationSqliteErrors = [{{}}, {{ readonly: true }}].map(options => {{
+                    try {{ const database = new Database(file, options); database.close(); return 'allowed'; }}
+                    catch (error) {{ return String(error.message || error); }}
+                }});
+            }});
+        "#)).await.expect("configuration mutation checks");
+        runtime.drain_microtasks().await.unwrap();
+        let denials = runtime
+            .read_global_json("configurationDenials")
+            .await
+            .unwrap();
+        assert_eq!(denials.as_object().unwrap().len(), 20);
+        for (operation, denied) in denials.as_object().unwrap() {
+            assert_eq!(
+                denied.as_bool(),
+                Some(true),
+                "configuration operation must be denied: {operation}"
+            );
+        }
+        assert_eq!(
+            runtime
+                .read_global_json("configurationPromiseWriteDenied")
+                .await
+                .unwrap(),
+            true
+        );
+        let sqlite_errors = runtime
+            .read_global_json("configurationSqliteErrors")
+            .await
+            .unwrap();
+        assert_eq!(sqlite_errors.as_array().unwrap().len(), 2);
+        for error in sqlite_errors.as_array().unwrap() {
+            assert!(
+                error
+                    .as_str()
+                    .unwrap()
+                    .contains("SQLite write access denied by the persistent storage grant"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&configuration).unwrap(),
+            r#"{"context-engineering":{"enabled":false}}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("source.txt")).unwrap(),
+            "source"
+        );
+        assert!(!workspace.join("moved.json").exists());
+        assert!(!namespace.join("new").exists());
+        for sidecar in ["config.json-journal", "config.json-wal", "config.json-shm"] {
+            assert!(
+                !namespace.join(sidecar).exists(),
+                "SQLite must not create a configuration sidecar"
+            );
+        }
+    });
+}
+
+#[test]
+fn fs_configuration_grant_does_not_bypass_read_policy_or_become_executable() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        let namespace = configuration.parent().unwrap();
+        std::fs::create_dir_all(namespace).unwrap();
+        std::fs::write(&configuration, "{}").unwrap();
+        std::fs::write(
+            namespace.join("payload.mjs"),
+            "globalThis.configurationCodeExecuted = true;",
+        )
+        .unwrap();
+        // Deliberately place HOME beneath the workspace: ordinary workspace
+        // authority must not override the protected configuration namespace.
+        let mut policy = pi::extensions::ExtensionPolicy::default();
+        policy.deny_caps.push("read".to_string());
+        let denied_runtime = configuration_file_runtime(&base, &configuration, policy).await;
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        denied_runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                try {{ fs.readFileSync({file}, 'utf8'); globalThis.configurationReadCode = 'allowed'; }}
+                catch (error) {{ globalThis.configurationReadCode = error.code; }}
+            }});
+        "#)).await.expect("denied read capability");
+        denied_runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            denied_runtime
+                .read_global_json("configurationReadCode")
+                .await
+                .unwrap(),
+            "EACCES"
+        );
+
+        let runtime = configuration_file_runtime(&base, &configuration, Default::default()).await;
+        let payload =
+            serde_json::to_string(&namespace.join("payload.mjs").display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then(async (fs) => {{
+                let readDenied = false, importDenied = false;
+                try {{ fs.readFileSync({payload}, 'utf8'); }} catch (_) {{ readDenied = true; }}
+                try {{ await import({payload}); }} catch (_) {{ importDenied = true; }}
+                globalThis.configurationDataOnly = {{ readDenied, importDenied, executed: !!globalThis.configurationCodeExecuted }};
+            }});
+        "#)).await.expect("configuration is data-only");
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("configurationDataOnly")
+                .await
+                .unwrap(),
+            serde_json::json!({
+                "readDenied": true, "importDenied": true, "executed": false,
+            })
+        );
+        assert!(
+            runtime
+                .add_configuration_read_file(configuration.clone(), "other.owner")
+                .is_err()
+        );
+        assert!(
+            runtime
+                .add_persistent_storage_root(namespace.to_path_buf(), "configuration.owner")
+                .is_err()
+        );
+        assert!(
+            runtime
+                .add_persistent_storage_root(base.join("home"), "configuration.owner")
+                .is_err()
+        );
+
+        let write_runtime = persistent_storage_runtime(&base, namespace, Default::default()).await;
+        assert!(
+            write_runtime
+                .add_configuration_read_file(configuration, "storage.owner")
+                .is_err()
+        );
+    });
+}
+
+#[test]
+fn fs_configuration_paths_reject_traversal_before_vfs_normalization() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        let namespace = configuration.parent().unwrap();
+        std::fs::create_dir_all(namespace.join("nested")).unwrap();
+        std::fs::create_dir_all(namespace.parent().unwrap().join("peer")).unwrap();
+        std::fs::write(&configuration, "authorized").unwrap();
+        std::fs::write(
+            namespace.parent().unwrap().join("peer/config.json"),
+            "peer secret",
+        )
+        .unwrap();
+        let runtime = configuration_file_runtime(&base, &configuration, Default::default()).await;
+        let root = serde_json::to_string(&namespace.display().to_string()).unwrap();
+        let work = serde_json::to_string(&base.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then(async (fs) => {{
+                const root = {root};
+                const paths = [root + '/nested/../config.json', root + '/../peer/config.json', root + '/../context-engineering/config.json'];
+                globalThis.configurationTraversalDenied = paths.map(path => {{
+                    try {{ fs.readFileSync(path, 'utf8'); return false; }} catch (_) {{ return true; }}
+                }});
+                fs.symlinkSync(paths[0], {work} + '/configuration-alias');
+                let aliasDenied = false;
+                try {{ await fs.promises.readFile({work} + '/configuration-alias', 'utf8'); }} catch (_) {{ aliasDenied = true; }}
+                globalThis.configurationVirtualLinkDenied = aliasDenied;
+                globalThis.configurationStillReadable = fs.readFileSync(root + '/config.json', 'utf8');
+            }});
+        "#)).await.expect("configuration traversal checks");
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("configurationTraversalDenied")
+                .await
+                .unwrap(),
+            serde_json::json!([true, true, true])
+        );
+        assert_eq!(
+            runtime
+                .read_global_json("configurationVirtualLinkDenied")
+                .await
+                .unwrap(),
+            true
+        );
+        assert_eq!(
+            runtime
+                .read_global_json("configurationStillReadable")
+                .await
+                .unwrap(),
+            "authorized"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_configuration_grant_rejects_existing_and_late_native_links() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        let namespace = configuration.parent().unwrap();
+        let secret = base.join("secret.json");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir_all(namespace).unwrap();
+        std::fs::write(&configuration, "authorized").unwrap();
+        std::fs::write(&secret, "must not be read").unwrap();
+        let runtime =
+            configuration_file_runtime(&workspace, &configuration, Default::default()).await;
+        std::fs::rename(&configuration, namespace.join("original.json")).unwrap();
+        std::os::unix::fs::symlink(&secret, &configuration).unwrap();
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                try {{ fs.readFileSync({file}, 'utf8'); globalThis.configurationLinkDenied = false; }}
+                catch (error) {{ globalThis.configurationLinkDenied = error.code; }}
+            }});
+        "#)).await.unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("configurationLinkDenied")
+                .await
+                .unwrap(),
+            "EACCES"
+        );
+
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("config.json"), "outside configuration").unwrap();
+        std::fs::rename(namespace, base.join("original-namespace")).unwrap();
+        std::os::unix::fs::symlink(&outside, namespace).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                try {{ fs.readFileSync({file}, 'utf8'); globalThis.configurationParentLinkDenied = false; }}
+                catch (error) {{ globalThis.configurationParentLinkDenied = error.code; }}
+            }});
+        "#)).await.unwrap();
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("configurationParentLinkDenied")
+                .await
+                .unwrap(),
+            "EACCES"
+        );
+
+        let linked_namespace = base.join("linked-namespace");
+        std::os::unix::fs::symlink(namespace, &linked_namespace).unwrap();
+        assert!(
+            runtime
+                .add_configuration_read_file(
+                    linked_namespace.join("original.json"),
+                    "configuration.owner"
+                )
+                .is_err()
+        );
+        let hardlink = base.join("hardlinked/config.json");
+        std::fs::create_dir(hardlink.parent().unwrap()).unwrap();
+        std::fs::hard_link(&secret, &hardlink).unwrap();
+        assert!(
+            runtime
+                .add_configuration_read_file(hardlink, "configuration.owner")
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(secret).unwrap(), "must not be read");
+    });
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn fs_configuration_grant_rejects_hardlinks_created_after_admission() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        let secret = base.join("private.json");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(&secret, "private configuration").unwrap();
+        let runtime =
+            configuration_file_runtime(&workspace, &configuration, Default::default()).await;
+        std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+        std::fs::hard_link(&secret, &configuration).unwrap();
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                try {{ fs.readFileSync({file}, 'utf8'); globalThis.configurationHardlinkDenied = false; }}
+                catch (error) {{ globalThis.configurationHardlinkDenied = error.code; }}
+            }});
+        "#)).await.expect("late hardlink rejection");
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("configurationHardlinkDenied")
+                .await
+                .unwrap(),
+            "EACCES"
+        );
+        assert_eq!(
+            std::fs::read_to_string(secret).unwrap(),
+            "private configuration"
+        );
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn fs_configuration_grant_rejects_native_windows_path_aliases() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+        std::fs::write(
+            configuration.parent().unwrap().join("Config.JSON"),
+            "authorized",
+        )
+        .unwrap();
+        let runtime = configuration_file_runtime(&base, &configuration, Default::default()).await;
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                const file = {file};
+                const native = file.replace(/\//g, '\\');
+                const root = native.slice(0, native.lastIndexOf('\\'));
+                const paths = [
+                    native + ':hidden', native + '.', native + ' ',
+                    '\\\\?\\' + native, '\\\\.\\' + native,
+                    root + '\\CONIN$', root + '\\CONOUT$', root + '\\NUL',
+                    root + '\\COM¹', root + '\\LPT²',
+                    root + '\\sub\\..\\config.json',
+                ];
+                globalThis.configurationWindowsDenied = paths.map(path => {{
+                    try {{ fs.readFileSync(path, 'utf8'); return 'allowed'; }} catch (error) {{ return error.code; }}
+                }});
+                globalThis.configurationWindowsCaseRead = fs.readFileSync(native.toUpperCase(), 'utf8');
+            }});
+        "#)).await.expect("native Windows configuration path checks");
+        runtime.drain_microtasks().await.unwrap();
+        let results = runtime
+            .read_global_json("configurationWindowsDenied")
+            .await
+            .unwrap();
+        assert_eq!(results.as_array().unwrap().len(), 11);
+        assert!(
+            results
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|code| code.as_str() == Some("EACCES"))
+        );
+        assert_eq!(
+            runtime
+                .read_global_json("configurationWindowsCaseRead")
+                .await
+                .unwrap(),
+            "authorized"
+        );
+        assert_eq!(
+            std::fs::read_to_string(configuration).unwrap(),
+            "authorized"
+        );
+
+        let missing = base.join("latehome/.pi/agent/extensions/context-engineering/config.json");
+        let late_runtime = configuration_file_runtime(&base, &missing, Default::default()).await;
+        let actual = base.join("LATEHOME/.PI/AGENT/EXTENSIONS/CONTEXT-ENGINEERING/Config.JSON");
+        std::fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        std::fs::write(&actual, "late configuration").unwrap();
+        let requested = serde_json::to_string(&missing.display().to_string()).unwrap();
+        late_runtime
+            .eval(&format!(
+                r#"
+            import('node:fs').then((fs) => {{
+                globalThis.lateWindowsConfiguration = fs.readFileSync({requested}, 'utf8');
+            }});
+        "#
+            ))
+            .await
+            .expect("late Windows case spelling");
+        late_runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            late_runtime
+                .read_global_json("lateWindowsConfiguration")
+                .await
+                .unwrap(),
+            "late configuration"
+        );
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn fs_configuration_grant_rejects_native_windows_junction_replacement() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        let configuration = base.join("home/.pi/agent/extensions/context-engineering/config.json");
+        let namespace = configuration.parent().unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir_all(namespace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(&configuration, "authorized").unwrap();
+        std::fs::write(outside.join("config.json"), "must not be read").unwrap();
+        let runtime =
+            configuration_file_runtime(&workspace, &configuration, Default::default()).await;
+        std::fs::rename(namespace, base.join("original-namespace")).unwrap();
+        // Native junctions do not require the symlink privilege; fail the test
+        // if the Windows filesystem cannot create the malicious fixture.
+        let created = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(namespace)
+            .arg(&outside)
+            .output()
+            .expect("create native Windows junction");
+        assert!(
+            created.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                try {{ fs.readFileSync({file}, 'utf8'); globalThis.configurationJunctionDenied = false; }}
+                catch (error) {{ globalThis.configurationJunctionDenied = error.code; }}
+            }});
+        "#)).await.expect("Windows junction rejection");
+        runtime.drain_microtasks().await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("configurationJunctionDenied")
+                .await
+                .unwrap(),
+            "EACCES"
+        );
+        assert!(
+            runtime
+                .add_configuration_read_file(configuration.clone(), "configuration.owner")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("config.json")).unwrap(),
+            "must not be read"
+        );
+    });
+}
+
 #[test]
 fn fs_persistent_namespace_survives_cold_runtime_restart() {
     futures::executor::block_on(async {
