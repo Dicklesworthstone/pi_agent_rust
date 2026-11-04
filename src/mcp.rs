@@ -769,6 +769,182 @@ pub async fn sync_extension_registrations(
 mod tests {
     use super::*;
 
+    fn catalog_publication_tool(
+        manager: &std::sync::Arc<McpManager>,
+        name: &str,
+        revision: u8,
+    ) -> Box<dyn Tool> {
+        Box::new(McpTool::new(
+            "catalog",
+            &McpToolMeta {
+                name: name.to_string(),
+                description: format!("{name} catalog revision {revision}"),
+                input_schema: serde_json::json!({
+                    "type":"object", "properties":{"revision":{"const":revision}}
+                }),
+                output_schema: None,
+                task_support: tasks::TaskSupport::Forbidden,
+            },
+            std::sync::Arc::clone(manager),
+        ))
+    }
+
+    fn catalog_discovery_text(registry: &crate::tools::ToolRegistry, input: Value) -> String {
+        let mut future = registry
+            .get("xdev")
+            .expect("generated discovery dispatcher")
+            .execute("mcp-catalog-discovery", input, None);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(Ok(output)) =
+            std::future::Future::poll(future.as_mut(), &mut context)
+        else {
+            panic!("catalog discovery must complete without transport work");
+        };
+        assert!(!output.is_error);
+        let [ContentBlock::Text(text)] = output.content.as_slice() else {
+            panic!("discovery must return one text result");
+        };
+        text.text.clone()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn catalog_load_modes_publish_discovery_atomically_and_preserve_manager_ownership() {
+        use crate::tools::{SharedToolRegistry, ToolRegistry};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("catalog workspace");
+        let new_manager = || {
+            Arc::new(McpManager::new(
+                dir.path(),
+                dir.path(),
+                McpDiscovery {
+                    servers: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            ))
+        };
+        let manager = new_manager();
+        let foreign = new_manager();
+        let config = serde_json::from_value(serde_json::json!({
+            "tools":{"loadMode":{
+                "mcp__catalog__disabled":"off",
+                "mcp__catalog__search":"discoverable",
+                "mcp__catalog__essential":"essential"
+            }}
+        }))
+        .expect("catalog load modes");
+        let shared = SharedToolRegistry::new(ToolRegistry::with_builtin_tool_policy(
+            &["read"],
+            dir.path(),
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        ));
+        assert!(shared.snapshot().get("xdev").is_none());
+        let catalog = |revision| {
+            ["disabled", "search", "essential", "default"]
+                .into_iter()
+                .map(|name| {
+                    catalog_publication_tool(
+                        &manager,
+                        name,
+                        if name == "search" { revision } else { 1 },
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(shared.reconcile_mcp_tools(&manager, catalog(1)), 3);
+        let original = shared.snapshot();
+        assert!(original.get("mcp__catalog__disabled").is_none());
+        assert!(original.get("mcp__catalog__search").is_some());
+        assert!(original.is_discoverable("mcp__catalog__search"));
+        for name in ["mcp__catalog__essential", "mcp__catalog__default"] {
+            assert!(original.get(name).is_some());
+            assert!(!original.is_discoverable(name));
+        }
+        let list = catalog_discovery_text(&original, serde_json::json!({"action":"list"}));
+        assert!(list.contains("- mcp__catalog__search: "));
+        for absent in ["disabled", "essential", "default"] {
+            assert!(!list.contains(&mounted_name("catalog", absent)));
+        }
+        let unchanged_version = shared.version();
+        assert_eq!(shared.reconcile_mcp_tools(&manager, catalog(1)), 0);
+        assert_eq!(shared.version(), unchanged_version);
+        assert!(Arc::ptr_eq(&original, &shared.snapshot()));
+
+        // A different manager may publish a new name, but cannot claim the
+        // original manager's identically named wrapper during that refresh.
+        assert_eq!(
+            shared.reconcile_mcp_tools(
+                &foreign,
+                vec![
+                    catalog_publication_tool(&foreign, "search", 99),
+                    catalog_publication_tool(&foreign, "foreign", 1),
+                ]
+            ),
+            1
+        );
+        assert!(Arc::ptr_eq(
+            shared
+                .snapshot()
+                .get("mcp__catalog__search")
+                .unwrap()
+                .mcp_manager()
+                .unwrap(),
+            &manager,
+        ));
+        let before_update = shared.version();
+        assert_eq!(shared.reconcile_mcp_tools(&manager, catalog(2)), 1);
+        assert_eq!(shared.version(), before_update + 1);
+        let updated = shared.snapshot();
+        for (snapshot, revision) in [(&original, 1), (&updated, 2)] {
+            let tool = snapshot
+                .get("mcp__catalog__search")
+                .expect("owned search wrapper");
+            let description: Value = serde_json::from_str(&catalog_discovery_text(
+                snapshot,
+                serde_json::json!({"action":"describe","name":"mcp__catalog__search"}),
+            ))
+            .expect("discovery description");
+            assert_eq!(
+                tool.parameters()["properties"]["revision"]["const"],
+                revision
+            );
+            assert_eq!(description["parameters"], tool.parameters());
+            assert_eq!(description["description"], tool.description());
+            assert_eq!(description["tier"], "discoverable");
+        }
+        assert_eq!(shared.reconcile_mcp_tools(&manager, Vec::new()), 3);
+        let withdrawn = shared.snapshot();
+        assert!(
+            withdrawn.get("xdev").is_none(),
+            "empty discovery must remove its derived dispatcher"
+        );
+        assert!(withdrawn.discoverable_index().is_empty());
+        for name in ["disabled", "search", "essential", "default"] {
+            assert!(withdrawn.get(&mounted_name("catalog", name)).is_none());
+        }
+        assert!(withdrawn.get("read").is_some());
+        assert!(Arc::ptr_eq(
+            withdrawn
+                .get("mcp__catalog__foreign")
+                .unwrap()
+                .mcp_manager()
+                .unwrap(),
+            &foreign,
+        ));
+        assert!(
+            original.get("xdev").is_some(),
+            "retained snapshots keep their catalog"
+        );
+        assert!(manager.list().is_empty() && foreign.list().is_empty());
+        assert!(!dir.path().join("mcp-trust.json").exists());
+    }
+
     #[test]
     fn template_action_requires_its_own_fields_and_preserves_exact_variables() {
         let action = serde_json::json!({

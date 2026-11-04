@@ -235,7 +235,7 @@ fn text_output(text: &str, is_error: bool) -> ToolOutput {
 }
 
 /// Snapshot of a discoverable tool for the xdev dispatcher's list/describe.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DiscoverableToolInfo {
     pub name: String,
     pub one_liner: String,

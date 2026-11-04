@@ -5731,6 +5731,40 @@ pub(crate) fn resize_image_if_needed(
 // Tool Registry
 // ============================================================================
 
+/// Retained exposure rules for tools mounted after the built-in registry exists.
+/// Dynamic tools keep their existing essential default unless configured.
+#[derive(Clone, Default)]
+struct ToolLoadPolicy {
+    modes: std::collections::HashMap<String, crate::xdev::LoadMode>,
+    selected: std::collections::HashSet<String>,
+    dispatcher_cwd: Option<PathBuf>,
+}
+
+impl ToolLoadPolicy {
+    fn new(enabled: &[&str], cwd: Option<&Path>, config: Option<&Config>) -> Self {
+        let modes = config
+            .and_then(|config| config.tools.as_ref())
+            .and_then(|tools| tools.load_mode.as_ref())
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, mode)| {
+                crate::xdev::LoadMode::from_name(mode).map(|mode| (name.clone(), mode))
+            })
+            .collect();
+        Self {
+            modes,
+            selected: enabled.iter().map(|name| (*name).to_string()).collect(),
+            dispatcher_cwd: cwd
+                .filter(|_| crate::xdev::tier_for("xdev", config) != crate::xdev::LoadMode::Off)
+                .map(Path::to_path_buf),
+        }
+    }
+
+    fn admits(&self, name: &str) -> bool {
+        self.selected.contains(name) || self.modes.get(name) != Some(&crate::xdev::LoadMode::Off)
+    }
+}
+
 /// Registry of enabled tools for a Pi run.
 ///
 /// The registry is constructed from configuration (enabled tool names + settings) and is used for:
@@ -5754,6 +5788,10 @@ pub struct ToolRegistry {
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
     discoverable: std::collections::HashSet<String>,
+    load_policy: Arc<ToolLoadPolicy>,
+    /// Exact ownership prevents catalog refresh from replacing an extension or
+    /// host tool that happens to use the dispatcher's name.
+    generated_dispatcher: Option<Arc<crate::xdev::XdevTool>>,
     /// Session undo recorder shared with write/edit/hashline_edit
     /// (bd-cv653.3.13); the interactive host reads it back for /undo //redo.
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
@@ -5825,6 +5863,7 @@ impl ToolRegistry {
     pub fn without_builtins(config: Option<&Config>) -> Self {
         let mut registry = Self::from_tools(Vec::new());
         registry.builtins_disabled = true;
+        registry.load_policy = Arc::new(ToolLoadPolicy::new(&[], None, config));
         registry.host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
             config.and_then(|config| config.ask_policy.as_deref()),
         ));
@@ -6320,31 +6359,13 @@ impl ToolRegistry {
                     != Some(crate::xdev::LoadMode::Off)
         });
 
-        // Tool load modes (bd-cv653.1.6): register the xdev dispatcher when
-        // the enabled set contains discoverable-tier tools and `xdev` itself
-        // is not turned off. The dispatcher's snapshot powers list/describe;
-        // run/promote are intercepted by the agent executor.
-        let discoverable_names;
-        {
-            let discoverable: Vec<crate::xdev::DiscoverableToolInfo> = tools
-                .iter()
-                .filter(|tool| {
-                    crate::xdev::tier_for(tool.name(), config)
-                        == crate::xdev::LoadMode::Discoverable
-                })
-                .map(|tool| crate::xdev::DiscoverableToolInfo {
-                    name: tool.name().to_string(),
-                    one_liner: crate::xdev::one_liner(tool.description()),
-                    description: tool.description().to_string(),
-                    parameters: tool.parameters(),
-                })
-                .collect();
-            discoverable_names = discoverable.iter().map(|info| info.name.clone()).collect();
-            let xdev_enabled = crate::xdev::tier_for("xdev", config) != crate::xdev::LoadMode::Off;
-            if !discoverable.is_empty() && xdev_enabled {
-                tools.push(Box::new(crate::xdev::XdevTool::new(cwd, discoverable)));
-            }
-        }
+        let discoverable_names = tools
+            .iter()
+            .filter(|tool| {
+                crate::xdev::tier_for(tool.name(), config) == crate::xdev::LoadMode::Discoverable
+            })
+            .map(|tool| tool.name().to_string())
+            .collect();
 
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
@@ -6355,7 +6376,8 @@ impl ToolRegistry {
             tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
 
-        Self {
+        let builtins_disabled = !allow_implicit_tools && enabled.is_empty();
+        let mut registry = Self {
             tools: tools.into_iter().map(Arc::from).collect(),
             inactive: Vec::new(),
             job_session_scope,
@@ -6365,11 +6387,19 @@ impl ToolRegistry {
             text_file_client_scope,
             terminal_client_scope,
             discoverable: discoverable_names,
+            load_policy: Arc::new(ToolLoadPolicy::new(
+                enabled,
+                (!builtins_disabled).then_some(cwd),
+                config,
+            )),
+            generated_dispatcher: None,
             mutation_recorder,
             host_ask,
-            builtins_disabled: !allow_implicit_tools && enabled.is_empty(),
+            builtins_disabled,
             shared: None,
-        }
+        };
+        registry.refresh_discovery();
+        registry
     }
 
     /// Host-owned interactive picker shared with permission-gated built-ins.
@@ -6409,6 +6439,8 @@ impl ToolRegistry {
             text_file_client_scope,
             terminal_client_scope,
             discoverable: std::collections::HashSet::new(),
+            load_policy: Arc::new(ToolLoadPolicy::default()),
+            generated_dispatcher: None,
             mutation_recorder: None,
             host_ask,
             builtins_disabled: false,
@@ -6431,6 +6463,8 @@ impl ToolRegistry {
             text_file_client_scope: self.text_file_client_scope.clone(),
             terminal_client_scope: self.terminal_client_scope.clone(),
             discoverable: self.discoverable.clone(),
+            load_policy: Arc::clone(&self.load_policy),
+            generated_dispatcher: self.generated_dispatcher.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
             host_ask: self.host_ask.clone(),
             builtins_disabled: self.builtins_disabled,
@@ -6467,6 +6501,7 @@ impl ToolRegistry {
         self.tools.extend(restore);
         self.inactive = shelve;
         self.inactive.extend(still_inactive);
+        self.refresh_discovery();
     }
 
     /// Extension tools currently shelved by `setActiveTools`.
@@ -6489,7 +6524,12 @@ impl ToolRegistry {
 
     /// Promote a discoverable tool into the live schema set.
     pub fn mark_promoted(&mut self, name: &str) {
-        self.discoverable.remove(name);
+        if self.discoverable.remove(name) {
+            Arc::make_mut(&mut self.load_policy)
+                .modes
+                .insert(name.to_string(), crate::xdev::LoadMode::Essential);
+            self.refresh_discovery();
+        }
     }
 
     /// Names + one-liners of currently discoverable tools (for the
@@ -6508,8 +6548,102 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Append a tool.
-    pub fn push(&mut self, mut tool: Box<dyn Tool>) {
+    /// Apply exposure and rebuild the generated discovery catalog in the same
+    /// registry snapshot as its targets. Old snapshots retain their own catalog.
+    fn refresh_discovery(&mut self) {
+        self.tools
+            .retain(|tool| self.load_policy.admits(tool.name()));
+        self.inactive
+            .retain(|tool| self.load_policy.admits(tool.name()));
+        let present: std::collections::HashSet<&str> = self
+            .tools
+            .iter()
+            .chain(&self.inactive)
+            .map(|tool| tool.name())
+            .collect();
+        self.discoverable
+            .retain(|name| present.contains(name.as_str()));
+        for tool in self.tools.iter().chain(&self.inactive) {
+            let name = tool.name();
+            // A dispatcher cannot discover itself. Its explicit Off setting
+            // controls generation separately from ordinary tool selection.
+            if name == "xdev" {
+                self.discoverable.remove(name);
+                continue;
+            }
+            match self.load_policy.modes.get(name) {
+                Some(crate::xdev::LoadMode::Discoverable) => {
+                    self.discoverable.insert(name.to_string());
+                }
+                Some(crate::xdev::LoadMode::Essential | crate::xdev::LoadMode::Off) => {
+                    self.discoverable.remove(name);
+                }
+                None => {}
+            }
+        }
+
+        let owned_index = self.generated_dispatcher.as_ref().and_then(|generated| {
+            let owned: Arc<dyn Tool> = generated.clone();
+            self.tools.iter().position(|tool| Arc::ptr_eq(tool, &owned))
+        });
+        if owned_index.is_none()
+            && self
+                .tools
+                .iter()
+                .chain(&self.inactive)
+                .any(|tool| tool.name() == "xdev")
+        {
+            self.generated_dispatcher = None;
+            return;
+        }
+        let catalog: Vec<crate::xdev::DiscoverableToolInfo> =
+            if self.load_policy.dispatcher_cwd.is_some() {
+                self.tools
+                    .iter()
+                    .filter(|tool| self.discoverable.contains(tool.name()))
+                    .map(|tool| crate::xdev::DiscoverableToolInfo {
+                        name: tool.name().to_string(),
+                        one_liner: crate::xdev::one_liner(tool.description()),
+                        description: tool.description().to_string(),
+                        parameters: tool.parameters(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let Some(cwd) = self
+            .load_policy
+            .dispatcher_cwd
+            .as_deref()
+            .filter(|_| !catalog.is_empty())
+        else {
+            if let Some(index) = owned_index {
+                self.tools.remove(index);
+            }
+            self.generated_dispatcher = None;
+            return;
+        };
+        if owned_index.is_some()
+            && self
+                .generated_dispatcher
+                .as_ref()
+                .is_some_and(|generated| generated.discoverable() == catalog.as_slice())
+        {
+            return;
+        }
+        let generated = Arc::new(crate::xdev::XdevTool::new(cwd, catalog));
+        if let Some(index) = owned_index {
+            self.tools[index] = generated.clone();
+        } else {
+            self.tools.push(generated.clone());
+        }
+        self.generated_dispatcher = Some(generated);
+    }
+
+    fn push_unpublished(&mut self, mut tool: Box<dyn Tool>) {
+        if !self.load_policy.admits(tool.name()) {
+            return;
+        }
         tool.bind_job_session_scope(self.job_session_scope.clone());
         tool.bind_model_scope(self.model_scope.clone());
         tool.bind_cost_scope(self.cost_scope.clone());
@@ -6517,6 +6651,9 @@ impl ToolRegistry {
         tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
         tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
         let name = tool.name();
+        // Replacement owns this name immediately, even if an older extension
+        // wrapper is shelved. setActiveTools must not restore a second handle.
+        self.inactive.retain(|previous| previous.name() != name);
         if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
             self.tools[pos] = Arc::from(tool);
         } else {
@@ -6524,25 +6661,21 @@ impl ToolRegistry {
         }
     }
 
+    /// Append or replace a tool while preserving configured exposure.
+    pub fn push(&mut self, tool: Box<dyn Tool>) {
+        self.push_unpublished(tool);
+        self.refresh_discovery();
+    }
+
     /// Extend the registry with additional tools.
     pub fn extend<I>(&mut self, tools: I)
     where
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
-        for mut tool in tools {
-            tool.bind_job_session_scope(self.job_session_scope.clone());
-            tool.bind_model_scope(self.model_scope.clone());
-            tool.bind_cost_scope(self.cost_scope.clone());
-            tool.bind_media_auth_scope(self.media_auth_scope.clone());
-            tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
-            tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
-            let name = tool.name();
-            if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
-                self.tools[pos] = Arc::from(tool);
-            } else {
-                self.tools.push(Arc::from(tool));
-            }
+        for tool in tools {
+            self.push_unpublished(tool);
         }
+        self.refresh_discovery();
     }
 
     /// Publish a complete extension catalog while retaining exact ownership.
@@ -6565,6 +6698,7 @@ impl ToolRegistry {
             .collect();
         let mut replacements: std::collections::BTreeMap<String, Arc<dyn Tool>> = replacements
             .into_iter()
+            .filter(|tool| self.load_policy.admits(tool.name()))
             .map(|mut tool| {
                 tool.bind_job_session_scope(self.job_session_scope.clone());
                 tool.bind_model_scope(self.model_scope.clone());
@@ -6628,6 +6762,7 @@ impl ToolRegistry {
                 self.inactive.push(next);
             }
         }
+        self.refresh_discovery();
         published
     }
 
@@ -6639,6 +6774,7 @@ impl ToolRegistry {
         manager: &Arc<crate::mcp::McpManager>,
         mut replacements: Vec<Box<dyn Tool>>,
     ) -> usize {
+        replacements.retain(|tool| self.load_policy.admits(tool.name()));
         let owned = |tool: &dyn Tool| {
             tool.mcp_manager()
                 .is_some_and(|owner| Arc::ptr_eq(owner, manager))
@@ -6685,6 +6821,9 @@ impl ToolRegistry {
             next.bind_terminal_client_scope(self.terminal_client_scope.clone());
             self.tools.push(Arc::from(next));
             changed += 1;
+        }
+        if changed > 0 {
+            self.refresh_discovery();
         }
         changed
     }
@@ -6879,7 +7018,8 @@ impl SharedToolRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next = guard.clone_shallow();
         let published = next.reconcile_extension_tools(previous, replacements, active, initial);
-        let schema_changed = guard.tools.len() != next.tools.len()
+        let schema_changed = guard.discoverable != next.discoverable
+            || guard.tools.len() != next.tools.len()
             || guard.tools.iter().zip(&next.tools).any(|(before, after)| {
                 before.name() != after.name()
                     || before.label() != after.label()
@@ -27190,6 +27330,302 @@ mod tests {
 #[cfg(test)]
 mod known_tool_name_tests {
     use super::*;
+
+    struct CatalogTool {
+        name: &'static str,
+        description: &'static str,
+        origin: ToolOrigin,
+    }
+
+    #[async_trait]
+    impl Tool for CatalogTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn label(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            self.description
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({
+                "type":"object", "properties":{"version":{"const":self.description}}
+            })
+        }
+
+        fn origin(&self) -> ToolOrigin {
+            self.origin
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(self.description))],
+                details: None,
+                is_error: false,
+            })
+        }
+    }
+
+    fn catalog_tool(
+        name: &'static str,
+        description: &'static str,
+        origin: ToolOrigin,
+    ) -> Box<dyn Tool> {
+        Box::new(CatalogTool {
+            name,
+            description,
+            origin,
+        })
+    }
+
+    fn describe_catalog_tool(registry: &ToolRegistry, name: &str) -> Value {
+        let output = futures::executor::block_on(
+            registry.get("xdev").expect("generated dispatcher").execute(
+                "describe-catalog",
+                serde_json::json!({"action":"describe", "name":name}),
+                None,
+            ),
+        )
+        .expect("describe current catalog");
+        assert!(!output.is_error);
+        let ContentBlock::Text(text) = &output.content[0] else {
+            panic!("discovery must return JSON text");
+        };
+        serde_json::from_str(&text.text).expect("discovery description")
+    }
+
+    #[test]
+    fn late_tool_modes_and_discovery_remain_coherent_across_snapshot_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools":{"loadMode":{"denied":"off", "late":"discoverable", "direct":"essential"}}
+        }))
+        .unwrap();
+        let shared = SharedToolRegistry::new(ToolRegistry::with_builtin_tool_policy(
+            &["read"],
+            root.path(),
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        ));
+        assert!(shared.snapshot().get("xdev").is_none());
+        shared.update(|registry| {
+            registry.extend(vec![
+                catalog_tool("denied", "Must stay excluded", ToolOrigin::BuiltIn),
+                catalog_tool("late", "First catalog version", ToolOrigin::BuiltIn),
+                catalog_tool("direct", "Directly available", ToolOrigin::BuiltIn),
+                catalog_tool(
+                    "unconfigured",
+                    "Existing essential default",
+                    ToolOrigin::BuiltIn,
+                ),
+            ])
+        });
+        let original = shared.snapshot();
+        assert!(original.get("denied").is_none());
+        assert!(original.get("late").is_some());
+        assert!(original.is_discoverable("late"));
+        for name in ["read", "direct", "unconfigured", "xdev"] {
+            assert!(original.get(name).is_some(), "{name}");
+            assert!(!original.is_discoverable(name), "{name}");
+        }
+        let first = describe_catalog_tool(&original, "late");
+        assert_eq!(first["description"], "First catalog version");
+        assert_eq!(
+            first["parameters"]["properties"]["version"]["const"],
+            "First catalog version"
+        );
+
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "late",
+                "Replacement catalog version",
+                ToolOrigin::BuiltIn,
+            ))
+        });
+        let replacement = shared.snapshot();
+        let second = describe_catalog_tool(&replacement, "late");
+        assert_eq!(second["description"], "Replacement catalog version");
+        assert_eq!(
+            second["parameters"]["properties"]["version"]["const"],
+            "Replacement catalog version"
+        );
+        assert_eq!(
+            describe_catalog_tool(&original, "late"),
+            first,
+            "retained readers must keep matching tool and discovery metadata"
+        );
+
+        shared.update(|registry| registry.mark_promoted("late"));
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "late",
+                "Refreshed promoted tool",
+                ToolOrigin::BuiltIn,
+            ))
+        });
+        let promoted = shared.snapshot();
+        assert!(promoted.get("late").is_some());
+        assert!(!promoted.is_discoverable("late"));
+        assert!(
+            promoted.get("xdev").is_none(),
+            "no ghost catalog after final promotion"
+        );
+        assert!(replacement.is_discoverable("late"));
+
+        // A host-controlled registry with no configured policy retains its
+        // existing essential exposure and never invents a dispatcher.
+        let mut host = ToolRegistry::from_tools(Vec::new());
+        host.push(catalog_tool(
+            "late",
+            "Host controls exposure",
+            ToolOrigin::BuiltIn,
+        ));
+        assert!(!host.is_discoverable("late"));
+        assert!(host.get("xdev").is_none());
+    }
+
+    #[test]
+    fn extension_mode_refresh_preserves_exact_owners_and_foreign_dispatchers() {
+        let root = tempfile::tempdir().unwrap();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools":{"load_mode":{"denied":"off", "late":"discoverable"}}
+        }))
+        .unwrap();
+        let shared = SharedToolRegistry::new(ToolRegistry::with_builtin_tool_policy(
+            &["read"],
+            root.path(),
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
+        ));
+        let tools = || {
+            vec![
+                catalog_tool("late", "Extension catalog", ToolOrigin::Extension),
+                catalog_tool("denied", "Excluded extension", ToolOrigin::Extension),
+            ]
+        };
+        let mut owned = shared.reconcile_extension_tools(&[], tools(), None, true);
+        assert_eq!(
+            owned.len(),
+            1,
+            "excluded tools cannot enter inactive ownership"
+        );
+        let original = shared.snapshot();
+        assert_eq!(
+            describe_catalog_tool(&original, "late")["description"],
+            "Extension catalog"
+        );
+        let version = shared.version();
+        owned = shared.reconcile_extension_tools(&owned, tools(), None, false);
+        assert_eq!(
+            shared.version(),
+            version,
+            "unchanged exposure keeps the provider cache"
+        );
+
+        shared.update(|registry| registry.set_active_extension_tools(&["denied".to_string()]));
+        let shelved = shared.snapshot();
+        assert!(shelved.get("late").is_none());
+        assert!(shelved.get("denied").is_none());
+        assert!(shelved.get("xdev").is_none());
+        assert!(shelved.discoverable_index().is_empty());
+        assert_eq!(shelved.inactive_tools().len(), 1);
+        owned = shared.reconcile_extension_tools(
+            &owned,
+            tools(),
+            Some(&["late".to_string(), "denied".to_string()]),
+            false,
+        );
+        assert!(shared.snapshot().get("denied").is_none());
+        assert_eq!(
+            describe_catalog_tool(&shared.snapshot(), "late")["description"],
+            "Extension catalog"
+        );
+
+        // Same-name replacements belong to the host immediately, including
+        // when setActiveTools runs before the old catalog refreshes again.
+        shared.update(|registry| {
+            registry.set_active_extension_tools(&[]);
+            registry.push(catalog_tool(
+                "late",
+                "Host replacement",
+                ToolOrigin::BuiltIn,
+            ));
+            registry.set_active_extension_tools(&["late".to_string()]);
+        });
+        assert!(shared.snapshot().inactive_tools().is_empty());
+        assert_eq!(
+            shared
+                .snapshot()
+                .tools()
+                .iter()
+                .filter(|tool| tool.name() == "late")
+                .count(),
+            1
+        );
+        let released = shared.reconcile_extension_tools(&owned, Vec::new(), None, false);
+        assert!(released.is_empty());
+        assert_eq!(
+            shared.snapshot().get("late").unwrap().origin(),
+            ToolOrigin::BuiltIn
+        );
+        assert_eq!(
+            describe_catalog_tool(&shared.snapshot(), "late")["description"],
+            "Host replacement"
+        );
+
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "xdev",
+                "Foreign dispatcher",
+                ToolOrigin::BuiltIn,
+            ))
+        });
+        let foreign = shared.snapshot();
+        shared.update(|registry| {
+            registry.push(catalog_tool(
+                "late",
+                "Changed after dispatcher replacement",
+                ToolOrigin::BuiltIn,
+            ))
+        });
+        let current = shared.snapshot();
+        let before = foreign
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "xdev")
+            .unwrap();
+        let after = current
+            .tools()
+            .iter()
+            .find(|tool| tool.name() == "xdev")
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(before, after),
+            "refresh must not replace a foreign dispatcher"
+        );
+        assert_eq!(after.description(), "Foreign dispatcher");
+        assert_eq!(
+            describe_catalog_tool(&original, "late")["description"],
+            "Extension catalog"
+        );
+    }
 
     #[test]
     fn builtin_tool_ceiling_keeps_only_declared_tools_and_their_dispatcher() {

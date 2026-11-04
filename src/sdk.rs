@@ -7740,7 +7740,7 @@ mod tests {
             name: "tts",
             endpoint,
         }));
-        let mut handle =
+        let handle =
             run_async(create_agent_session(options)).expect("native media SDK session");
         assert_eq!(
             handle.session().agent.stream_options().api_key.as_deref(),
@@ -10890,6 +10890,285 @@ export default function init(pi) {
             let shutdown = handle.shutdown_owned_resources().await;
             assert!(shutdown.completed_cleanly()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
         });
+    }
+
+    const SDK_DYNAMIC_TOOL_NAMES: [&str; 5] = [
+        "sdk_dynamic_default",
+        "sdk_dynamic_discoverable",
+        "sdk_dynamic_essential",
+        "sdk_dynamic_off",
+        "sdk_dynamic_project",
+    ];
+
+    fn sdk_dynamic_tool_text(output: &ToolOutput) -> &str {
+        let [ContentBlock::Text(text)] = output.content.as_slice() else {
+            panic!("expected one text result, got {output:?}");
+        };
+        &text.text
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_sdk_dynamic_tool_exposure(
+        handle: &mut AgentSessionHandle,
+        expected_registry: &[&str],
+        expected_schema: &[&str],
+        expected_discovery: &[&str],
+        explicit_builtins: Option<&[&str]>,
+    ) {
+        let sorted = |mut names: Vec<String>| {
+            names.sort_unstable();
+            names
+        };
+        let expected = |names: &[&str]| sorted(names.iter().map(ToString::to_string).collect());
+        let registry = handle.session().agent.shared_tools().snapshot();
+        assert_eq!(
+            sorted(
+                registry
+                    .tools()
+                    .iter()
+                    .map(|tool| tool.name())
+                    .filter(|name| name.starts_with("sdk_dynamic_"))
+                    .map(str::to_string)
+                    .collect()
+            ),
+            expected(expected_registry),
+            "the live registry must obey both configured modes and extension activation"
+        );
+        // This is the same filtered context used for the next provider request.
+        // Reading it also primes the cache before the next setActiveTools swap.
+        let context = handle.session_mut().agent.request_context_json();
+        assert_eq!(
+            sorted(
+                context["tools"]
+                    .as_array()
+                    .expect("provider tool schemas")
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .filter(|name| name.starts_with("sdk_dynamic_"))
+                    .map(str::to_string)
+                    .collect()
+            ),
+            expected(expected_schema),
+            "essential and unconfigured extension tools belong in the provider schema"
+        );
+        assert_eq!(
+            sorted(
+                registry
+                    .discoverable_index()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .filter(|name| name.starts_with("sdk_dynamic_"))
+                    .collect()
+            ),
+            expected(expected_discovery)
+        );
+        if let Some(names) = explicit_builtins {
+            assert_eq!(
+                sorted(
+                    registry
+                        .tools()
+                        .iter()
+                        .filter(|tool| {
+                            tool.origin() == crate::tools::ToolOrigin::BuiltIn
+                                && tool.name() != "xdev"
+                        })
+                        .map(|tool| tool.name().to_string())
+                        .collect()
+                ),
+                expected(names),
+                "extension changes cannot expand the explicit built-in selection"
+            );
+        }
+        if let Some(xdev) = registry.get("xdev") {
+            let list = xdev
+                .execute("dynamic-list", serde_json::json!({"action":"list"}), None)
+                .await
+                .expect("list currently discoverable tools");
+            assert!(!list.is_error);
+            for name in SDK_DYNAMIC_TOOL_NAMES {
+                let discoverable = expected_discovery.contains(&name);
+                assert_eq!(
+                    sdk_dynamic_tool_text(&list)
+                        .lines()
+                        .any(|line| line.starts_with(&format!("- {name}: "))),
+                    discoverable,
+                    "xdev list must reflect the current registration of {name}"
+                );
+                let description = xdev
+                    .execute(
+                        "dynamic-describe",
+                        serde_json::json!({"action":"describe","name":name}),
+                        None,
+                    )
+                    .await
+                    .expect("describe current discoverable tool");
+                assert_eq!(description.is_error, !discoverable, "xdev describe {name}");
+                if discoverable {
+                    let definition: Value =
+                        serde_json::from_str(sdk_dynamic_tool_text(&description))
+                            .expect("xdev description JSON");
+                    assert_eq!(definition["name"], name);
+                    assert_eq!(
+                        definition["description"],
+                        format!("{name} fixture description")
+                    );
+                    assert_eq!(
+                        definition["parameters"]["properties"]["value"]["type"],
+                        "string"
+                    );
+                    assert_eq!(definition["tier"], "discoverable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_extension_load_modes_survive_startup_and_active_tool_changes() {
+        let cases: &[(&str, bool, Option<&[&str]>, bool)] = &[
+            ("loadMode", true, Some(&["read"]), false),
+            ("load_mode", false, None, false),
+            ("loadMode", true, Some(&[]), false),
+            ("load_mode", true, Some(&["read"]), true),
+        ];
+        for &(setting, trusted, explicit_builtins, xdev_off) in cases {
+            let mut modes = serde_json::json!({
+                "sdk_dynamic_off":"off",
+                "sdk_dynamic_essential":"essential",
+                "sdk_dynamic_discoverable":"discoverable",
+                "sdk_dynamic_project":"essential"
+            });
+            if xdev_off {
+                modes["xdev"] = serde_json::json!("off");
+            }
+            let global = serde_json::json!({"tools":{(setting):modes}}).to_string();
+            let project_setting = if setting == "loadMode" {
+                "load_mode"
+            } else {
+                "loadMode"
+            };
+            let project = serde_json::json!({
+                "tools":{(project_setting):{"sdk_dynamic_project":"off"}}
+            })
+            .to_string();
+            let (directory, mut options) = guarded_settings_fixture(trusted, &global, &project);
+            // An explicit external extension does not alter the project resource
+            // bytes whose trust was captured by guarded_settings_fixture.
+            let extension_path = directory.path().join("dynamic-load-modes.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"export default function init(pi) {
+  for (const name of [
+    "sdk_dynamic_default", "sdk_dynamic_discoverable", "sdk_dynamic_essential",
+    "sdk_dynamic_off", "sdk_dynamic_project"
+  ]) {
+    pi.registerTool({
+      name, label: name, description: name + " fixture description",
+      parameters: {type: "object", properties: {value: {type: "string"}}},
+      execute: async (_callId, input) => ({
+        content: [{type: "text", text: name + ":" + input.value}], isError: false
+      })
+    });
+  }
+  pi.registerCommand("sdk-dynamic-active", {
+    description: "Change extension tool activation",
+    handler: async (args) => {
+      await pi.events("setActiveTools", {tools: JSON.parse(args)});
+      return {display: "updated"};
+    }
+  });
+}
+"#,
+            )
+            .expect("write explicit extension fixture");
+            options.enabled_tools =
+                explicit_builtins.map(|names| names.iter().map(ToString::to_string).collect());
+            if explicit_builtins.is_some() {
+                options.tool_factory = Some(Arc::new(ExplicitBuiltinTools));
+            }
+            options.extension_paths = vec![extension_path];
+            options.extension_policy = Some("safe".to_string());
+            options.persist_extension_permissions = false;
+            let dispatcher_allowed =
+                !xdev_off && explicit_builtins.is_none_or(|names| !names.is_empty());
+            let mut schema = vec!["sdk_dynamic_default", "sdk_dynamic_essential"];
+            if !trusted {
+                schema.push("sdk_dynamic_project");
+            }
+            let mut registered = schema.clone();
+            registered.push("sdk_dynamic_discoverable");
+            run_async(async {
+                let mut handle = create_agent_session(options)
+                    .await
+                    .expect("start extension SDK session");
+                let manager = handle
+                    .extension_manager()
+                    .expect("loaded extension manager")
+                    .clone();
+                assert_eq!(handle.has_tool("xdev"), dispatcher_allowed);
+                assert_sdk_dynamic_tool_exposure(
+                    &mut handle,
+                    &registered,
+                    &schema,
+                    &["sdk_dynamic_discoverable"],
+                    explicit_builtins,
+                )
+                .await;
+                {
+                    let registry = handle.session().agent.shared_tools().snapshot();
+                    let output = registry
+                        .get("sdk_dynamic_essential")
+                        .expect("essential extension tool")
+                        .execute(
+                            "dynamic-execute",
+                            serde_json::json!({"value":"ready"}),
+                            None,
+                        )
+                        .await
+                        .expect("execute essential extension tool");
+                    assert!(!output.is_error);
+                    assert_eq!(
+                        sdk_dynamic_tool_text(&output),
+                        "sdk_dynamic_essential:ready"
+                    );
+                }
+                let narrowed = serde_json::json!([
+                    "sdk_dynamic_default",
+                    "sdk_dynamic_essential",
+                    "sdk_dynamic_off"
+                ])
+                .to_string();
+                let result = manager
+                    .execute_command("sdk-dynamic-active", &narrowed, 5000)
+                    .await
+                    .expect("shelve discoverable extension tool");
+                assert_eq!(result["display"], "updated");
+                assert_sdk_dynamic_tool_exposure(
+                    &mut handle,
+                    &["sdk_dynamic_default", "sdk_dynamic_essential"],
+                    &["sdk_dynamic_default", "sdk_dynamic_essential"],
+                    &[],
+                    explicit_builtins,
+                )
+                .await;
+                let restored =
+                    serde_json::to_string(&SDK_DYNAMIC_TOOL_NAMES).expect("requested tools");
+                manager
+                    .execute_command("sdk-dynamic-active", &restored, 5000)
+                    .await
+                    .expect("restore admitted extension tools");
+                assert_eq!(handle.has_tool("xdev"), dispatcher_allowed);
+                assert_sdk_dynamic_tool_exposure(
+                    &mut handle,
+                    &registered,
+                    &schema,
+                    &["sdk_dynamic_discoverable"],
+                    explicit_builtins,
+                )
+                .await;
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            });
+        }
     }
 
     #[test]

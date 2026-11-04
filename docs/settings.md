@@ -246,7 +246,38 @@ string, such as `"disabled"` or `"discoverble"`, produces a startup warning
 naming the settings file, dotted entry, and rejected value. The invalid value
 is ignored and normal selection/default exposure applies: `"disabled"` does
 not turn a tool off. Use `"off"` to exclude it from implicit activation.
-Extension and MCP tool names are accepted as map keys.
+Extension and MCP tool names are accepted as map keys. These rules also apply
+when tools register after startup, an extension reloads, or an MCP server
+refreshes its catalog. Use the published MCP name, such as
+`mcp__docs__search`, rather than the server's unqualified `search` name.
+
+New extension and MCP tool names default to `essential`. Replacements preserve
+the existing exposure unless configured. Setting one to `discoverable` hides
+its schema and makes its current
+description and arguments available through `xdev`; setting it to `off`
+excludes it from lookup, schemas, and discovery. An extension's
+`setActiveTools` cannot reactivate a tool excluded by `off`. For example:
+
+```json
+{
+  "tools": {
+    "loadMode": {
+      "my_extension_tool": "discoverable",
+      "mcp__docs__search": "discoverable",
+      "mcp__docs__delete": "off"
+    }
+  }
+}
+```
+
+These settings do not load an extension, connect an MCP server, or grant
+permission to execute its tools. The existing admission and authorization
+checks still apply. A late discoverable tool can supply the generated `xdev`
+dispatcher, including alongside an explicit built-in selection such as
+`--tools read`. `--no-tools` and `loadMode.xdev: "off"` suppress that generated
+dispatcher; choose `essential` for mounted tools that should remain directly
+visible in those cases. Catalog refresh updates discovery together with the
+active tools, so shelved or removed tools no longer appear in `xdev list`.
 
 `subagent` remains activatable with `enableSubagent: true`: its built-in
 off-by-default tier is not an explicit `loadMode.subagent: "off"` setting.
