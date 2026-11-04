@@ -15815,36 +15815,27 @@ async fn maybe_auto_compact(
         return;
     }
     drop(state);
-    let (origin_session_id, path_entries, context_window, reserve_tokens, settings, reader) = {
+    let (source, prep, reader) = {
         let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
             return;
         };
         if guard.ensure_provider_reentry_allowed().is_err() {
             return;
         }
-        let (origin_session_id, path_entries, context_window) = {
-            let runtime_provider = guard.agent.provider().name().to_string();
-            let runtime_model_id = guard.agent.provider().model_id().to_string();
-            let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
-                return;
-            };
-            inner_session.ensure_entry_ids();
-            let Some(entry) = current_or_runtime_model_entry(
-                &inner_session,
-                &runtime_provider,
-                &runtime_model_id,
-                rpc_model_catalog(&guard, &options),
-            ) else {
-                return;
-            };
-            let origin_session_id = inner_session.header.id.clone();
-            let path_entries = inner_session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            (origin_session_id, path_entries, entry.model.context_window)
+        let reader = guard.agent.provider();
+        let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
+            return;
         };
+        inner_session.ensure_entry_ids();
+        let Some(entry) = current_or_runtime_model_entry(
+            &inner_session,
+            reader.name(),
+            reader.model_id(),
+            rpc_model_catalog(&guard, &options),
+        ) else {
+            return;
+        };
+        let context_window = entry.model.context_window;
 
         let reserve_tokens = options.config.compaction_reserve_tokens();
         // Carry the configured mode (shake-first/aggressive) and the real
@@ -15864,27 +15855,45 @@ async fn maybe_auto_compact(
             render_mode: options.config.compaction_render_mode(),
         };
 
-        (
-            origin_session_id,
-            path_entries,
-            context_window,
-            reserve_tokens,
-            settings,
-            guard.agent.provider(),
-        )
+        let prepare = |inner_session: &Session| {
+            let path_entries = inner_session
+                .entries_for_current_path()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            crate::compaction::prepare_compaction_for_model(
+                &path_entries,
+                settings.clone(),
+                reader.name(),
+                reader.model_id(),
+            )
+            .filter(|prep| should_auto_compact(prep.tokens_before, context_window, reserve_tokens))
+        };
+        let Some(mut prep) = prepare(&inner_session) else {
+            return;
+        };
+        // Keep the ordinary below-threshold path lazy. Only an eligible
+        // compaction needs the complete durable source snapshot. Hydration can
+        // reveal earlier selected-path context, so prepare it again before
+        // binding the summary to the hydrated source under this same lock.
+        if inner_session.has_partial_v2_hydration() {
+            if inner_session
+                .ensure_full_v2_hydration_before_save()
+                .is_err()
+            {
+                return;
+            }
+            inner_session.ensure_entry_ids();
+            let Some(hydrated_prep) = prepare(&inner_session) else {
+                return;
+            };
+            prep = hydrated_prep;
+        }
+        let Ok(source) = SessionEditSnapshot::capture(&inner_session) else {
+            return;
+        };
+        (source, prep, reader)
     };
-
-    let Some(prep) = crate::compaction::prepare_compaction_for_model(
-        &path_entries,
-        settings,
-        reader.name(),
-        reader.model_id(),
-    ) else {
-        return;
-    };
-    if !should_auto_compact(prep.tokens_before, context_window, reserve_tokens) {
-        return;
-    }
 
     let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionStart {
         reason: "threshold".to_string(),
@@ -15916,6 +15925,42 @@ async fn maybe_auto_compact(
         emit_auto_compaction_error(&out_tx, err.to_string());
         return;
     }
+    let session_actions = guard.session_action_admission_gate();
+    {
+        let Ok(_session_action) = session_actions.acquire(cx.cx()).await else {
+            emit_auto_compaction_error(
+                &out_tx,
+                "Session action lock failed before auto-compaction provider admission",
+            );
+            return;
+        };
+        let Ok(inner_session) = OwnedMutexGuard::lock(Arc::clone(&guard.session), cx.cx()).await
+        else {
+            emit_auto_compaction_error(
+                &out_tx,
+                "Inner session lock failed before auto-compaction provider admission",
+            );
+            return;
+        };
+        let current = match SessionEditSnapshot::capture(&inner_session) {
+            Ok(current) => current,
+            Err(error) => {
+                emit_auto_compaction_error(&out_tx, error.to_string());
+                return;
+            }
+        };
+        if current != source || !Arc::ptr_eq(&reader, &guard.agent.provider()) {
+            emit_auto_compaction_error(
+                &out_tx,
+                "Active session changed before auto-compaction provider admission; retry against the current session",
+            );
+            return;
+        }
+    }
+    // Provider callbacks may inspect or change the store. Release Session-action
+    // authority during generation, then reacquire it and validate the same source
+    // before installing the result. A shared session ID alone does not bind a
+    // summary to its branch, model selection, history, or persistence target.
     let stream_options = guard.agent.stream_options().clone();
     let provider = guard.agent.provider();
     let privacy = guard.agent.compaction_privacy();
@@ -15944,7 +15989,14 @@ async fn maybe_auto_compact(
             };
 
             let save_enabled = guard.save_enabled();
-            let (messages, tokens_after, pending_message_count) = {
+            let (tokens_after, pending_message_count) = {
+                let Ok(_session_action) = session_actions.acquire(cx.cx()).await else {
+                    emit_auto_compaction_error(
+                        &out_tx,
+                        "Session action lock failed while applying auto-compaction",
+                    );
+                    return;
+                };
                 let session_store = Arc::clone(&guard.session);
                 let Ok(mut inner_session) = OwnedMutexGuard::lock(session_store, cx.cx()).await
                 else {
@@ -15954,10 +16006,17 @@ async fn maybe_auto_compact(
                     );
                     return;
                 };
-                if inner_session.header.id != origin_session_id {
+                let current = match SessionEditSnapshot::capture(&inner_session) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        emit_auto_compaction_error(&out_tx, error.to_string());
+                        return;
+                    }
+                };
+                if current != source {
                     emit_auto_compaction_error(
                         &out_tx,
-                        "Active session changed while auto-compaction was running",
+                        "Active session changed while auto-compaction was running; the summary was not applied",
                     );
                     return;
                 }
@@ -15969,33 +16028,31 @@ async fn maybe_auto_compact(
                     Some(details_value.clone()),
                     None,
                 );
-                let messages = candidate.to_messages_for_current_path();
-                // Count the selected model's reading, not hidden archive data.
-                let tokens_after = guard.agent.estimate_message_context_tokens(&messages);
-                if save_enabled {
-                    provider_admission.block(
-                        "RPC auto-compaction persistence was interrupted before live installation completed"
-                            .to_string(),
-                    );
-                    if let Err(first_err) = candidate.save().await
-                        && let Err(retry_err) = candidate.save().await
-                    {
-                        let reason = format!(
-                            "RPC auto-compaction persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                        );
-                        provider_admission.block(reason.clone());
-                        emit_auto_compaction_error(&out_tx, reason);
-                        return;
-                    }
+                // The summary request bills the shared account after the
+                // original source was captured. The common transaction saves
+                // that bill with the summary, then projects the accepted saved
+                // candidate into the live Agent before reopening admission.
+                if let Err(error) = guard
+                    .install_context_candidate(
+                        &mut inner_session,
+                        candidate,
+                        true,
+                        &provider_admission,
+                        "RPC auto-compaction",
+                    )
+                    .await
+                {
+                    emit_auto_compaction_error(&out_tx, error.to_string());
+                    return;
                 }
-                let pending_message_count = json!(candidate.autosave_metrics().pending_mutations);
-                *inner_session = candidate;
-                (messages, tokens_after, pending_message_count)
+                // Count the selected model's reading, not hidden archive data.
+                let tokens_after = guard
+                    .agent
+                    .estimate_message_context_tokens(guard.agent.messages());
+                let pending_message_count =
+                    json!(inner_session.autosave_metrics().pending_mutations);
+                (tokens_after, pending_message_count)
             };
-            guard.agent.replace_messages(messages);
-            if save_enabled {
-                provider_admission.clear();
-            }
             drop(guard);
 
             let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
@@ -16032,7 +16089,7 @@ async fn maybe_auto_compact(
         Err(err) => {
             let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
                 result: None,
-                aborted: false,
+                aborted: matches!(err, Error::Aborted),
                 will_retry: false,
                 error_message: Some(err.to_string()),
             }));
@@ -26843,6 +26900,96 @@ export default function init(pi) {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
+    fn auto_compaction_persists_its_bill_before_reporting_success() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut stored = seed_auto_compaction_session(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            )));
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            budget.checkpoint(&mut stored).unwrap();
+            stored.save().await.unwrap();
+            let path = stored.path.clone().expect("saved source path");
+            let observed_keys = Arc::new(Mutex::new(Vec::new()));
+            let mut agent_session = handoff_agent_session(
+                stored,
+                true,
+                Arc::new(BilledCompactionProvider {
+                    observed_keys: Arc::clone(&observed_keys),
+                }),
+            );
+            agent_session.set_auto_compaction(true);
+            agent_session.agent.set_cost_budget(Some(budget.clone()));
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let mut model = dummy_entry("test-model", false);
+            model.model.provider = "test-provider".to_string();
+            options.available_models = vec![model];
+            options.config = serde_json::from_value(json!({
+                "compaction": {"enabled": true, "reserveTokens": 2, "keepRecentTokens": 1}
+            }))
+            .unwrap();
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &options.config,
+            )));
+            let agent_session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+            maybe_auto_compact(
+                Arc::clone(&agent_session),
+                shared_state,
+                options,
+                Arc::new(AtomicBool::new(false)),
+                out_tx,
+            )
+            .await;
+            let events = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 2, "one start and one end: {events:?}");
+            assert_eq!(events[0]["type"], "auto_compaction_start");
+            assert_eq!(events[1]["type"], "auto_compaction_end");
+            assert_eq!(events[1]["result"]["persisted"], true);
+            assert!(events[1].get("errorMessage").is_none());
+            assert_eq!(observed_keys.lock().unwrap().len(), 1);
+            assert_eq!(budget.spent(), 1.0);
+
+            // No RPC EOF cleanup or later turn may repair this checkpoint.
+            // The source must already carry the summary's bill when success
+            // is reported, even while the original session remains alive.
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            let restored = crate::cost::resolve_budget(&reopened, None, None, Some(1.0), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.spent(), 1.0);
+            assert!(matches!(
+                restored.admit(),
+                Err(Error::CostCap { spent, cap }) if spent == 1.0 && cap == 1.0
+            ));
+            assert!(reopened.entries.iter().any(|entry| matches!(
+                entry,
+                SessionEntry::Compaction(entry)
+                    if entry.summary == "billed manual compaction summary"
+            )));
+            let cx = AgentCx::for_request();
+            let live = agent_session.lock(&cx).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(live.agent.messages()).unwrap(),
+                serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+                "the live Agent must use the accepted durable context",
+            );
+        }));
+    }
+
+    #[test]
     fn auto_compaction_persistence_failure_preserves_live_session_and_quarantines_provider() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
             .blocking_threads(1, 1)
@@ -27096,7 +27243,93 @@ export default function init(pi) {
     }
 
     #[test]
-    fn auto_compaction_rejects_stale_session_snapshot_with_paired_end_event() {
+    fn auto_compaction_rechecks_its_source_after_waiting_for_provider_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let observed_keys = Arc::new(Mutex::new(Vec::new()));
+            let mut agent_session = handoff_agent_session(
+                seed_auto_compaction_session(Session::in_memory()),
+                false,
+                Arc::new(BilledCompactionProvider {
+                    observed_keys: Arc::clone(&observed_keys),
+                }),
+            );
+            agent_session.set_auto_compaction(true);
+            let inner = Arc::clone(&agent_session.session);
+            let admission = agent_session.provider_admission_gate();
+            let cx = AgentCx::for_request();
+            let held_provider = admission
+                .acquire(&cx)
+                .await
+                .expect("hold provider admission");
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let mut model = dummy_entry("test-model", false);
+            model.model.provider = "test-provider".to_string();
+            options.available_models = vec![model];
+            options.config = serde_json::from_value(json!({
+                "compaction": {"enabled": true, "reserveTokens": 2, "keepRecentTokens": 1}
+            }))
+            .unwrap();
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &options.config,
+            )));
+            let compacting = Arc::new(AtomicBool::new(false));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+            let mut compaction = Box::pin(maybe_auto_compact(
+                Arc::new(asupersync::sync::Mutex::new(agent_session)),
+                shared_state,
+                options,
+                Arc::clone(&compacting),
+                out_tx,
+            ));
+            assert!(futures::poll!(compaction.as_mut()).is_pending());
+            let start = parse_response(&out_rx.try_recv().expect("compaction started"));
+            assert_eq!(start["type"], "auto_compaction_start");
+            assert!(compacting.load(Ordering::SeqCst));
+            assert!(observed_keys.lock().unwrap().is_empty());
+            let changed_source = {
+                let mut stored = inner.lock(&cx).await.unwrap();
+                stored.header.model_id = Some("selected-while-waiting".to_string());
+                SessionEditSnapshot::capture(&stored).unwrap()
+            };
+            drop(held_provider);
+            compaction.await;
+
+            let events = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 1, "start must have one end: {events:?}");
+            assert_eq!(events[0]["type"], "auto_compaction_end");
+            assert!(events[0].get("result").is_none());
+            assert!(
+                events[0]["errorMessage"].as_str().is_some_and(
+                    |error| error.contains("before auto-compaction provider admission")
+                )
+            );
+            assert!(
+                observed_keys.lock().unwrap().is_empty(),
+                "a summary for a stale source must never reach the provider",
+            );
+            assert!(!compacting.load(Ordering::SeqCst));
+            let stored = inner.lock(&cx).await.unwrap();
+            assert!(SessionEditSnapshot::capture(&stored).unwrap() == changed_source);
+        }));
+    }
+
+    #[derive(Clone, Copy)]
+    enum AutoCompactionSourceChange {
+        Session,
+        Branch,
+        Model,
+    }
+
+    fn assert_auto_compaction_rejects_changed_source(change: AutoCompactionSourceChange) {
         // Watchdog: on 2026-09-01 this test hung forever (the session swap
         // below took the agent-session lock that auto-compaction holds across
         // the gated provider call) and stalled the whole lib test binary,
@@ -27175,12 +27408,30 @@ export default function init(pi) {
                 // provider call, so the swap must go through the shared inner
                 // session handle. Taking the agent-session lock here deadlocked
                 // against the gated provider (the cause of the 2026-09-01 hang).
-                let replacement_id = {
+                let changed_source = {
                     let mut inner = session.lock(&entered_cx).await.expect("session lock");
-                    let replacement = Session::in_memory();
-                    let replacement_id = replacement.header.id.clone();
-                    *inner = replacement;
-                    replacement_id
+                    match change {
+                        AutoCompactionSourceChange::Session => {
+                            *inner = Session::in_memory();
+                        }
+                        AutoCompactionSourceChange::Branch => {
+                            let previous_leaf = inner.leaf_id().map(str::to_string);
+                            let branch_root = inner
+                                .entries
+                                .first()
+                                .and_then(SessionEntry::base_id)
+                                .cloned()
+                                .expect("existing branch root");
+                            assert!(inner.navigate_to(&branch_root));
+                            assert_ne!(inner.leaf_id(), previous_leaf.as_deref());
+                        }
+                        AutoCompactionSourceChange::Model => {
+                            // Keep the same Session ID, leaf and transcript so
+                            // a leaf-only fence cannot hide a model change.
+                            inner.header.model_id = Some("replacement-model".to_string());
+                        }
+                    }
+                    SessionEditSnapshot::capture(&inner).expect("changed source snapshot")
                 };
                 release_compaction
                     .send(entered_cx.cx(), ())
@@ -27220,7 +27471,11 @@ export default function init(pi) {
                     .lock(&entered_cx)
                     .await
                     .expect("replacement session lock");
-                assert_eq!(inner.header.id, replacement_id);
+                assert!(
+                    SessionEditSnapshot::capture(&inner).expect("final source snapshot")
+                        == changed_source,
+                    "a stale summary must not mutate the replacement session, selected branch, or model",
+                );
                 assert_eq!(provider_compaction_count(&inner), 0);
             });
             let _ = done_tx.send(());
@@ -27237,6 +27492,21 @@ export default function init(pi) {
                  (see bd-x8mn7 cluster B)"
             ),
         }
+    }
+
+    #[test]
+    fn auto_compaction_rejects_stale_session_snapshot_with_paired_end_event() {
+        assert_auto_compaction_rejects_changed_source(AutoCompactionSourceChange::Session);
+    }
+
+    #[test]
+    fn auto_compaction_rejects_same_session_branch_change_with_paired_end_event() {
+        assert_auto_compaction_rejects_changed_source(AutoCompactionSourceChange::Branch);
+    }
+
+    #[test]
+    fn auto_compaction_rejects_same_session_model_change_with_paired_end_event() {
+        assert_auto_compaction_rejects_changed_source(AutoCompactionSourceChange::Model);
     }
 
     // -----------------------------------------------------------------------
