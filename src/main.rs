@@ -12502,6 +12502,177 @@ mod tests {
     }
 
     #[test]
+    fn supported_tool_load_mode_values_load_without_warnings() {
+        use pi::xdev::LoadMode;
+
+        for key in ["load_mode", "loadMode"] {
+            for (mode, expected) in [
+                ("  EsSeNtIaL  ", LoadMode::Essential),
+                ("\tDISCOVERABLE\n", LoadMode::Discoverable),
+                (" OFF ", LoadMode::Off),
+            ] {
+                let temp = TempDir::new().expect("temporary settings roots");
+                let global_dir = temp.path().join("global");
+                let cwd = temp.path().join("project");
+                std::fs::create_dir_all(&global_dir).expect("global settings directory");
+                std::fs::create_dir_all(&cwd).expect("project directory");
+                std::fs::write(
+                    global_dir.join("settings.json"),
+                    json!({
+                        "media": {"enable_tts": true},
+                        "tools": {(key): {
+                            "tts": mode,
+                            "my_extension_tool": mode,
+                            "mcp__fixture__query": mode
+                        }}
+                    })
+                    .to_string(),
+                )
+                .expect("write supported tool load modes");
+
+                let seen = logged_under(default_log_filter_for(None), || {
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("load supported tool load modes");
+                    for name in ["tts", "my_extension_tool", "mcp__fixture__query"] {
+                        assert_eq!(
+                            pi::xdev::configured_tier(name, Some(&config)),
+                            Some(expected),
+                            "{key}.{name}={mode:?}"
+                        );
+                    }
+                    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                    assert_eq!(
+                        tools.get("tts").is_some(),
+                        expected != LoadMode::Off,
+                        "{key}.tts={mode:?} must govern implicit activation"
+                    );
+                    let explicit = ToolRegistry::new(&["tts"], &cwd, Some(&config));
+                    assert!(
+                        explicit.get("tts").is_some(),
+                        "a load mode must not veto an explicitly selected tool"
+                    );
+                });
+
+                assert!(
+                    seen.is_empty(),
+                    "supported modes or user-defined tool names warned: {seen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn invalid_tool_load_modes_warn_without_changing_fallback_or_project_trust() {
+        for key in ["load_mode", "loadMode"] {
+            for mode in ["disabled", "discoverble", ""] {
+                for (project_setting, project_trusted) in
+                    [(false, false), (false, true), (true, true), (true, false)]
+                {
+                    let temp = TempDir::new().expect("temporary settings roots");
+                    let global_dir = temp.path().join("global");
+                    let cwd = temp.path().join("project");
+                    std::fs::create_dir_all(&global_dir).expect("global settings directory");
+                    std::fs::create_dir_all(cwd.join(".pi")).expect("project settings directory");
+                    let global_path = global_dir.join("settings.json");
+                    let settings_path = if project_setting {
+                        // A project override replaces the same global map entry,
+                        // including when its value cannot be interpreted.
+                        let global_key = if key == "loadMode" {
+                            "load_mode"
+                        } else {
+                            "loadMode"
+                        };
+                        std::fs::write(
+                            &global_path,
+                            json!({
+                                "media": {"enable_tts": true},
+                                "tools": {(global_key): {"tts": " OFF "}}
+                            })
+                            .to_string(),
+                        )
+                        .expect("write global TTS activation and load mode");
+                        cwd.join(".pi/settings.json")
+                    } else {
+                        global_path
+                    };
+                    std::fs::write(
+                        &settings_path,
+                        json!({
+                            "media": {"enable_tts": true},
+                            "tools": {(key): {"tts": mode}}
+                        })
+                        .to_string(),
+                    )
+                    .expect("write invalid tool load mode");
+
+                    let should_warn = !project_setting || project_trusted;
+                    let seen = logged_under(default_log_filter_for(None), || {
+                        // Startup loads settings repeatedly. One invalid value
+                        // should produce one warning, while leaving it intact
+                        // for the existing merge and runtime fallback rules.
+                        for _ in 0..2 {
+                            let config = Config::load_with_roots_and_project_trust(
+                                None,
+                                &global_dir,
+                                &cwd,
+                                project_trusted,
+                            )
+                            .expect("invalid strings warn without preventing startup");
+                            assert_eq!(
+                                pi::xdev::configured_tier("tts", Some(&config)),
+                                if should_warn {
+                                    None
+                                } else {
+                                    Some(pi::xdev::LoadMode::Off)
+                                }
+                            );
+                            let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                            assert_eq!(
+                                tools.get("tts").is_some(),
+                                should_warn,
+                                "an invalid mode keeps enabled TTS available; an unread project must retain global off"
+                            );
+                        }
+                    });
+
+                    if should_warn {
+                        let setting = format!("tools.{key}.tts");
+                        assert!(
+                            seen.contains(setting.as_str()),
+                            "missing setting path: {seen:?}"
+                        );
+                        let file = settings_path.display().to_string();
+                        let quoted_file = format!("{file:?}");
+                        assert!(
+                            seen.contains(file.as_str()) || seen.contains(quoted_file.as_str()),
+                            "diagnostic must identify the settings file: {seen:?}"
+                        );
+                        assert_eq!(
+                            seen.matches("Invalid tool load mode").count(),
+                            1,
+                            "repeated config loads must not repeat the warning: {seen:?}"
+                        );
+                        assert!(seen.contains(mode), "missing rejected value: {seen:?}");
+                        assert!(
+                            seen.contains("essential, discoverable, or off")
+                                && seen.contains("being ignored")
+                                && seen
+                                    .contains("normal tool selection and default load modes apply"),
+                            "diagnostic must explain accepted values and fallback: {seen:?}"
+                        );
+                    } else {
+                        assert!(
+                            seen.is_empty(),
+                            "untrusted project settings must not be read or diagnosed: {seen:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rust_log_replaces_the_default_filter_wholesale() {
         let silenced = logged_under(default_log_filter_for(Some("off")), || {
             tracing::warn!(target: pi::config::USER_DIAGNOSTIC_TARGET, "misspelled key");

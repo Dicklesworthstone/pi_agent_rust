@@ -241,6 +241,13 @@ bank still requires `memory.backend` to be `"local"` or `"cass"`. The generated
 `xdev` dispatcher still requires discoverable tools and is disabled by
 `loadMode.xdev: "off"`.
 
+Load-mode values ignore surrounding whitespace and letter case. Any other
+string, such as `"disabled"` or `"discoverble"`, produces a startup warning
+naming the settings file, dotted entry, and rejected value. The invalid value
+is ignored and normal selection/default exposure applies: `"disabled"` does
+not turn a tool off. Use `"off"` to exclude it from implicit activation.
+Extension and MCP tool names are accepted as map keys.
+
 `subagent` remains activatable with `enableSubagent: true`: its built-in
 off-by-default tier is not an explicit `loadMode.subagent: "off"` setting.
 
@@ -858,7 +865,12 @@ settings, followed by the corresponding `PI_VISION_*`, `PI_IMAGE_GEN_*`, or
 `generate_image` or `tts` to choose a new destination within the workspace.
 Without it, artifacts use `images/generated_<id>.<extension>` or
 `audio/speech_<id>.<extension>`. Existing files are not overwritten. Activating
-a tool does not supply the provider credentials needed to execute it.
+a tool does not supply the provider credentials needed to execute it. Native
+media tools use API-key credentials from the owning session's `auth.json`,
+after any configured provider key pool and singular environment variables.
+Only the requested provider's API key is resolved; chat-session OAuth tokens
+and chat-only CLI/SDK key overrides are not forwarded. See
+[media authentication](tools/media_tools.md#activation-and-credentials).
 
 ### Computer (desktop automation)
 

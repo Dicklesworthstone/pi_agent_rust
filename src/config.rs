@@ -943,6 +943,7 @@ impl Config {
             ))
         })?;
         warn_unrecognised_setting_keys(path, &content);
+        warn_invalid_tool_load_modes(path, &content);
         Ok(config)
     }
 
@@ -1933,6 +1934,42 @@ fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
                 file = file.as_str(),
                 "Unrecognised setting; it is being ignored"
             );
+        }
+    }
+}
+
+/// Validate mode values without restricting extension or MCP tool names.
+/// Use the runtime parser so whitespace and case normalization cannot drift.
+fn warn_invalid_tool_load_modes(path: &Path, content: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+    let Some(tools) = value.get("tools") else {
+        return;
+    };
+
+    let file = path.display().to_string();
+    for key in ["load_mode", "loadMode"] {
+        let Some(modes) = tools.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in modes {
+            let Some(mode) = value.as_str() else {
+                continue; // Wrong types are already rejected by Config deserialization.
+            };
+            if crate::xdev::LoadMode::from_name(mode).is_some() {
+                continue;
+            }
+            let setting = format!("tools.{key}.{name}");
+            if first_report_of(&file, &setting) {
+                tracing::warn!(
+                    target: USER_DIAGNOSTIC_TARGET,
+                    setting,
+                    file = file.as_str(),
+                    value = mode,
+                    "Invalid tool load mode; expected essential, discoverable, or off. This value is being ignored; normal tool selection and default load modes apply"
+                );
+            }
         }
     }
 }
