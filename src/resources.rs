@@ -4955,35 +4955,46 @@ still frontmatter",
         assert_eq!(result.skills[0].name, "my-skill");
     }
 
+    /// A directory first walked as a child of one native root and later
+    /// selected as another native root still contributes its root Markdown.
+    /// A universal `.agents/skills` alias of the same directory does not:
+    /// universal roots only accept `SKILL.md` files in subdirectories.
     #[cfg(unix)]
     #[test]
-    fn test_universal_root_nested_in_native_tree_loads_root_markdown() {
+    fn test_native_root_nested_in_native_tree_loads_root_markdown() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("project");
+        // Stop `.agents/skills` ancestor discovery at the project.
+        fs::create_dir_all(cwd.join(".git")).expect("create Git root marker");
         let nested_root = cwd.join(".pi/skills/shared");
         fs::create_dir_all(&nested_root).expect("create nested root");
-        fs::create_dir_all(cwd.join(".agents")).expect("create universal base");
         fs::write(
             nested_root.join("instructions.md"),
             "---\nname: skills\ndescription: Root Markdown skill\n---\nBody",
         )
         .expect("write root markdown");
+        fs::create_dir_all(cwd.join(".agents")).expect("create universal base");
         std::os::unix::fs::symlink(&nested_root, cwd.join(".agents/skills"))
-            .expect("alias nested root");
+            .expect("universal alias of the nested root");
+        let agent_dir = temp.path().join("agent");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::os::unix::fs::symlink(&nested_root, agent_dir.join("skills"))
+            .expect("user root alias of the nested root");
         let result = load_skills(LoadSkillsOptions {
-            cwd: cwd.clone(),
-            agent_dir: temp.path().join("agent"),
+            cwd,
+            agent_dir: agent_dir.clone(),
             home_dir: None,
             skill_paths: Vec::new(),
             include_defaults: true,
         });
-        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills.len(), 1, "{:?}", result.skills);
         assert_eq!(
             result.skills[0].file_path,
-            cwd.join(".agents/skills/instructions.md")
+            agent_dir.join("skills/instructions.md")
         );
         assert_eq!(result.skills[0].name, "skills");
-        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.skills[0].source, "user");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[cfg(unix)]

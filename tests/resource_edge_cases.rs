@@ -287,6 +287,9 @@ fn universal_skills_reject_invalid_files_without_hiding_valid_skills() {
 fn universal_skill_discovery_stays_within_selected_roots() {
     let harness = TestHarness::new("universal_skill_discovery_stays_within_selected_roots");
     let cwd = harness.temp_path("workspace/project");
+    // The project is a Git root, so `.agents/skills` ancestor discovery stops
+    // at it and `workspace/.agents/skills` below is out of bounds.
+    std::fs::create_dir_all(cwd.join(".git")).expect("create Git root marker");
     let home_dir = harness.temp_path("home");
     let visible = write_skill(
         &harness,

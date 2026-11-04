@@ -788,8 +788,14 @@ impl PackageManager {
             // 3) Auto-discovered resources from standard dirs (global and project)
             this.add_auto_discovered_resources(&mut accumulator, &global, &project, &roots);
 
-            let resolved = accumulator.clone().into_resolved_paths();
+            let mut resolved = accumulator.clone().into_resolved_paths();
             drop(accumulator);
+            if roots.project_settings_enabled {
+                order_project_universal_skills(
+                    &mut resolved.skills,
+                    &project_universal_skill_dirs(&this.cwd, roots.home_dir.as_deref()),
+                );
+            }
             maybe_emit_compat_ledgers(&resolved.extensions);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(resolved));
@@ -3090,6 +3096,40 @@ pub(crate) fn project_universal_skill_dirs(
         }
     }
     roots
+}
+
+/// Put project `.agents/skills` resources in nearest-root-first order (gh #278).
+///
+/// `into_resolved_paths` sorts every list by path, which puts
+/// `repo/.agents/skills/x` ahead of `repo/crates/app/.agents/skills/x`. Skill
+/// loading keeps the first definition of a name, so a farther ancestor's skill
+/// used to shadow the nearer one at startup. Only the project universal items
+/// move, and only among the slots they already occupy: by the rank of their
+/// root in `roots` (launch directory outward), then by path within a root.
+fn order_project_universal_skills(skills: &mut [ResolvedResource], roots: &[PathBuf]) {
+    let slots = skills
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.metadata.scope == PackageScope::Project
+                && item.metadata.origin == ResourceOrigin::Universal
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut ordered = slots
+        .iter()
+        .map(|&index| skills[index].clone())
+        .collect::<Vec<_>>();
+    // Stable: items under the same root keep their path order.
+    ordered.sort_by_key(|item| {
+        roots
+            .iter()
+            .position(|root| item.path.starts_with(root))
+            .unwrap_or(roots.len())
+    });
+    for (slot, item) in slots.into_iter().zip(ordered) {
+        skills[slot] = item;
+    }
 }
 
 #[derive(Default)]

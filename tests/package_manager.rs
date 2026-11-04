@@ -53,6 +53,9 @@ fn log_resolved(harness: &TestHarness, label: &str, items: &[ResolvedResource]) 
 
 fn isolated_skill_roots(harness: &TestHarness) -> (PackageManager, ResolveRoots) {
     let cwd = harness.create_dir("project");
+    // A Git root at the project stops `.agents/skills` ancestor discovery
+    // there, so skills above the project (or on the test host) stay out.
+    harness.create_dir("project/.git");
     let global_base_dir = harness.create_dir("custom-agent");
     let project_base_dir = cwd.join(".pi");
     let roots = ResolveRoots {
