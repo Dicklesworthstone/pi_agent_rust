@@ -1125,6 +1125,18 @@ From:
 
 ### Curl Installer (Recommended)
 
+As of November 3, 2026, the latest published stable release is **v0.8.0**. It does
+not include `/goal`; the [goal guide](docs/goal-mode.md#availability) describes
+the newer implementation on `main`. Fetching the installer from `main` still selects a published release
+binary, so it does not install every feature documented on `main`. Check the full
+`pi --version` output, including its commit hash, when comparing an installation
+with the current documentation.
+
+Use the current installer with `--version` to pin the **binary**. Installer fixes
+ship separately from binary releases: the installer on `main` includes fixes for
+stock macOS tar/xz support and older awk versions that are absent from the
+installer at the v0.8.0 tag.
+
 ```bash
 # Latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
@@ -1132,14 +1144,15 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 # Non-interactive + auto PATH update
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
 
-# Pin a release tag
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | bash -s -- --version v0.3.0
+# Pin the binary release while using the current installer
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.8.0
 
-# Install from explicit artifact URL + checksum URL
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | \
+# Install the Linux x86-64 artifact with its published checksum
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
   bash -s -- \
-    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz" \
-    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz.sha256"
+    --version v0.8.0 \
+    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.8.0/pi-linux-amd64.tar.xz" \
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.8.0/pi-linux-amd64.tar.xz.sha256"
 
 # Skip completion setup (CI/non-interactive minimal install)
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \

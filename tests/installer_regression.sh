@@ -573,6 +573,10 @@ run_installer() {
   local path_value="${dir}/fakebin:/usr/bin:/bin"
   local run_cwd="${PI_INSTALLER_TEST_CWD:-$PWD}"
 
+  # Keep installer state inside this case. An inherited CODEX_HOME otherwise
+  # overrides the sandbox HOME and installs/removes real host skills. Likewise,
+  # the production default lock is shared by every suite run. Lock-specific
+  # cases opt in through TEST variables without inheriting operator settings.
   (
     set +e
     cd "$run_cwd" || exit 1
@@ -582,7 +586,9 @@ run_installer() {
     XDG_CONFIG_HOME="${dir}/config" \
     PATH="${path_value}" \
     SHELL="/bin/bash" \
-    bash "${INSTALLER}" "$@" >"${out}" 2>&1
+    PI_INSTALLER_LOCK_DIR="${PI_INSTALLER_TEST_LOCK_DIR:-${dir}/installer.lock.d}" \
+    PI_INSTALLER_RETAIN_TEMP="${PI_INSTALLER_TEST_RETAIN_TEMP:-0}" \
+    env -u CODEX_HOME bash "${INSTALLER}" "$@" >"${out}" 2>&1
     echo "$?" > "${rc_file}"
   )
 }
@@ -594,6 +600,7 @@ run_uninstaller() {
   local rc_file="${dir}/exit_code"
   local path_value="${dir}/fakebin:/usr/bin:/bin"
 
+  # The uninstaller must resolve the same sandbox skill paths as the installer.
   (
     set +e
     HOME="${dir}/home" \
@@ -602,7 +609,7 @@ run_uninstaller() {
     XDG_CONFIG_HOME="${dir}/config" \
     PATH="${path_value}" \
     SHELL="/bin/bash" \
-    bash "${UNINSTALLER}" "$@" >"${out}" 2>&1
+    env -u CODEX_HOME bash "${UNINSTALLER}" "$@" >"${out}" 2>&1
     echo "$?" > "${rc_file}"
   )
 }
@@ -762,8 +769,8 @@ test_installer_retain_temp_mode_preserves_owned_scratch() {
   lock_dir="${dir}/retained-install.lock.d"
   mkdir -p "$retained_tmp"
 
-  PI_INSTALLER_RETAIN_TEMP=1 \
-  PI_INSTALLER_LOCK_DIR="$lock_dir" \
+  PI_INSTALLER_TEST_RETAIN_TEMP=1 \
+  PI_INSTALLER_TEST_LOCK_DIR="$lock_dir" \
   TMPDIR="$retained_tmp" \
   run_installer "$dir" \
     --yes --no-gum --offline \
@@ -806,8 +813,8 @@ test_stale_lock_recovery_preserves_the_old_lock_receipt() {
   mkdir -p "$retained_tmp" "$lock_dir"
   printf '99999999\n' > "$lock_dir/pid"
 
-  PI_INSTALLER_RETAIN_TEMP=1 \
-  PI_INSTALLER_LOCK_DIR="$lock_dir" \
+  PI_INSTALLER_TEST_RETAIN_TEMP=1 \
+  PI_INSTALLER_TEST_LOCK_DIR="$lock_dir" \
   TMPDIR="$retained_tmp" \
   run_installer "$dir" \
     --yes --no-gum --offline \
@@ -849,12 +856,106 @@ test_lock_override_rejects_ambiguous_lexical_paths() {
     "${dir}/install.lock.d/.." \
     "${dir}//install.lock.d" \
     "${dir}/install.lock.d/../other.lock.d"; do
-    PI_INSTALLER_LOCK_DIR="$unsafe_lock" \
+    PI_INSTALLER_TEST_LOCK_DIR="$unsafe_lock" \
     run_installer "$dir" --yes --no-gum
 
     assert_exit_code "$dir" 1
     assert_output_contains "$dir" "PI_INSTALLER_LOCK_DIR is unsafe"
   done
+}
+
+test_installer_harness_isolates_inherited_lock_settings() {
+  local dir artifact checksum ambient_lock
+  dir="$(case_dir "inherited-lock-isolation")"
+  write_existing_pi_stub "$dir"
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  checksum="$(sha256_file "$artifact")"
+  ambient_lock="${dir}/operator-install.lock.d"
+  mkdir -p "$ambient_lock"
+  printf '%s\n' "$$" > "$ambient_lock/pid"
+
+  PI_INSTALLER_LOCK_DIR="$ambient_lock" \
+  PI_INSTALLER_RETAIN_TEMP=1 \
+  run_installer "$dir" \
+    --yes --no-gum --offline --version v9.9.9 \
+    --dest "${dir}/dest" --artifact-url "file://${artifact}" \
+    --checksum "$checksum" --no-completions --no-agent-skills
+
+  assert_exit_code "$dir" 0
+  [ -x "${dir}/dest/pi" ]
+  [ "$(cat "$ambient_lock/pid")" = "$$" ]
+  [ ! -e "${dir}/installer.lock.d" ]
+}
+
+test_installer_harness_isolates_inherited_codex_home() {
+  local dir artifact checksum ambient_codex_home ambient_skill ambient_checksum
+  local sandbox_skill state_file
+  dir="$(case_dir "inherited-codex-home-isolation")"
+  write_existing_pi_stub "$dir"
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  checksum="$(sha256_file "$artifact")"
+  ambient_codex_home="${dir}/operator-codex"
+  ambient_skill="${ambient_codex_home}/skills/pi-agent-rust/SKILL.md"
+  sandbox_skill="${dir}/home/.codex/skills/pi-agent-rust/SKILL.md"
+  mkdir -p "$(dirname "$ambient_skill")"
+  # Use a managed marker so leaking CODEX_HOME would overwrite this sentinel
+  # on install and delete it on uninstall, rather than merely skip a custom skill.
+  cat > "$ambient_skill" <<'SKILL'
+<!-- pi_agent_rust installer managed skill -->
+# Operator skill sentinel: the regression harness must never touch this file.
+SKILL
+  ambient_checksum="$(sha256_file "$ambient_skill")"
+
+  CODEX_HOME="$ambient_codex_home" \
+  run_installer "$dir" \
+    --yes --no-gum --offline --version v9.9.9 \
+    --dest "${dir}/dest" --artifact-url "file://${artifact}" \
+    --checksum "$checksum" --no-completions
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skills:    installed (claude,codex)"
+  assert_file_contains "$sandbox_skill" "pi_agent_rust installer managed skill"
+  [ "$(sha256_file "$ambient_skill")" = "$ambient_checksum" ]
+  [ ! -e "${ambient_codex_home}/skills/pi-agent-rust/references" ]
+
+  # Exercise default skill discovery during uninstall too. A recorded skill
+  # path would hide a leaked CODEX_HOME even if run_uninstaller lost isolation.
+  # Retain the real binary/alias paths so all removal remains in this case.
+  state_file="${dir}/state/pi-agent-rust/install-state.env"
+  [ -f "$state_file" ]
+  printf "\nPIAR_AGENT_SKILL_CODEX_PATH=''\n" >> "$state_file"
+  CODEX_HOME="$ambient_codex_home" run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Removed installer-managed skill: ${dir}/home/.codex/skills/pi-agent-rust"
+  [ ! -e "${dir}/home/.codex/skills/pi-agent-rust" ]
+  [ "$(sha256_file "$ambient_skill")" = "$ambient_checksum" ]
+  [ ! -e "${ambient_codex_home}/skills/pi-agent-rust/references" ]
+}
+
+test_active_lock_is_not_recovered() {
+  local dir artifact checksum lock_dir
+  dir="$(case_dir "active-lock-preservation")"
+  write_existing_pi_stub "$dir"
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  checksum="$(sha256_file "$artifact")"
+  lock_dir="${dir}/active-install.lock.d"
+  mkdir -p "$lock_dir"
+  printf '%s\n' "$$" > "$lock_dir/pid"
+
+  PI_INSTALLER_TEST_LOCK_DIR="$lock_dir" \
+  run_installer "$dir" \
+    --yes --no-gum --offline --version v9.9.9 \
+    --dest "${dir}/dest" --artifact-url "file://${artifact}" \
+    --checksum "$checksum" --no-completions --no-agent-skills
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Another installer appears to be running: $lock_dir"
+  [ "$(cat "$lock_dir/pid")" = "$$" ]
+  [ ! -e "${dir}/dest/pi" ]
 }
 
 test_skill_smoke_script_passes() {
@@ -3014,6 +3115,9 @@ main() {
   run_test test_installer_retain_temp_mode_preserves_owned_scratch
   run_test test_stale_lock_recovery_preserves_the_old_lock_receipt
   run_test test_lock_override_rejects_ambiguous_lexical_paths
+  run_test test_installer_harness_isolates_inherited_lock_settings
+  run_test test_installer_harness_isolates_inherited_codex_home
+  run_test test_active_lock_is_not_recovered
   run_test test_skill_smoke_script_passes
   run_test test_invalid_completions_value_fails
   run_test test_unknown_option_fails
