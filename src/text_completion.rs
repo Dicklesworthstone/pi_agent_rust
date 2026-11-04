@@ -318,7 +318,7 @@ where
 
 /// Yield exactly once after real progress. An idle provider is never
 /// self-woken: its next() future continues to own readiness notification.
-pub(crate) async fn yield_ready_batch() {
+pub async fn yield_ready_batch() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {
         if yielded {

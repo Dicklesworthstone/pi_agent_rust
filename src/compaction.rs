@@ -4475,7 +4475,7 @@ mod tests {
     fn destination_estimate_does_not_depend_on_historical_model_identity() {
         let text = "お誕生日おめでとう source/path.rs <|endoftext|>";
         let mut assistant = make_assistant_text(text, 900_000, 100_000);
-        let messages = vec![
+        let messages = [
             make_user_text(text),
             assistant.clone(),
             make_tool_result(text),

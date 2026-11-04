@@ -1164,7 +1164,7 @@ fn retained_fallback_honors_error_filter_and_never_retries_policy_or_local_stops
                 details["judgments"]["attempts"].as_array().map(Vec::len),
                 Some(if fallback { 2 } else { 1 })
             );
-            Ok(())
+            Ok::<(), Error>(())
         })?;
     }
     Ok(())
