@@ -918,16 +918,16 @@ Native backends:
 ### Browser (headless Chromium automation)
 
 - `browser.enable_browser` (bool): Default `false`. When `true`, activates `browser` tool.
-- `browser.headless` (bool): Default `true`. Runs browser in headless mode.
-- `browser.remote_debugging_port` (integer): CDP debugging port (default `9222`).
-- `browser.domain_allowlist` (array of strings): Restricts browser navigation to approved hosts.
+- `browser.headless` (bool): Default `true`. Set `false` to show the browser window Pi launches. `PI_BROWSER_HEADLESS` overrides it. It has no effect when Pi attaches to an existing browser through `PI_BROWSER_CDP_URL`.
+- `browser.domain_allowlist` / `browser.domainAllowlist` (array of strings): Restricts browser navigation to approved hosts.
+
+The browser executable and user agent are set with the `PI_BROWSER_EXECUTABLE` and `PI_BROWSER_USER_AGENT` environment variables, not settings. Pi always asks the operating system for a free debugging port, so it has no port setting; to use a fixed port, start the browser yourself and attach with `PI_BROWSER_CDP_URL`. See [browser automation](tools/browser-cdp.md).
 
 ### Web Remote & Collab
 
-- `web.port` (integer): Port for `pi web` WebSocket server (default `8080`).
-- `web.bind_mode` (string): `"loopback"`, `"tailscale"`, `"lan"`.
-- `web.view_only` (bool): Restricts all remote clients to view-only mode.
-- `web.max_viewers` (integer): Max concurrent viewer connections (default `4`).
+Not available yet: this build has no web remote server, `pi web` exits with an
+error, and there are no `web.*` settings (Pi reports them as unrecognised). See
+[the web remote design notes](tools/web_remote.md).
 
 ## Full reference
 
