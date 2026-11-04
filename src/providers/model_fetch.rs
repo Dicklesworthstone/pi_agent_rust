@@ -537,7 +537,7 @@ fn provider_model_catalog_route_is_configured_at_path(
     let Some((base_url, api)) = model_catalog_provider_route_shape(provider, models_path)? else {
         return Ok(false);
     };
-    Ok(openai_compat_models_url(&base_url, &api).is_some())
+    Ok(catalog_models_url(&base_url, &api).is_some())
 }
 
 /// Resolve a provider's catalog route while leaving every unused credential
@@ -2403,6 +2403,10 @@ async fn fetch_live_models(
         ));
     }
 
+    if matches!(route.api.as_str(), "anthropic-messages" | "google-generative-ai") {
+        return fetch_native_models(provider, api_key, route).await;
+    }
+
     let url = openai_compat_models_url(&route.base_url, &route.api).ok_or_else(|| {
         Error::api(format!(
             "provider {provider:?} is not configured with an OpenAI-compatible model catalog endpoint"
@@ -2606,6 +2610,128 @@ fn model_catalog_error_body_is_credential_free(
         })
 }
 
+/// Locate a native provider model-list endpoint without assuming OpenAI transport.
+fn catalog_models_url(base_url: &str, api: &str) -> Option<String> {
+    match api {
+        "anthropic-messages" | "google-generative-ai" => {
+            let mut url = url::Url::parse(base_url).ok()?;
+            if !matches!(url.scheme(), "https" | "http") || !url.username().is_empty()
+                || url.password().is_some() || url.host_str().is_none() { return None; }
+            let path = url.path().trim_end_matches('/');
+            let models = if api == "anthropic-messages" {
+                if path.ends_with("/v1/messages") { format!("{}/models", path.trim_end_matches("/messages")) }
+                else if path.ends_with("/v1/models") { path.to_string() }
+                else { return None }
+            } else if path.ends_with("/v1beta") {
+                format!("{path}/models")
+            } else if path.ends_with("/v1beta/models") { path.to_string() }
+            else { return None };
+            url.set_path(&models);
+            url.set_fragment(None);
+            Some(url.to_string())
+        }
+        _ => openai_compat_models_url(base_url, api),
+    }
+}
+
+fn parse_native_models_page(api: &str, body: &[u8]) -> Result<(Vec<String>, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| Error::api("native provider returned invalid model-list JSON"))?;
+    if api == "anthropic-messages" {
+        let rows = value.get("data").and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::api("Anthropic model list lacks data array"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id = row.get("id").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::api("Anthropic model row lacks id"))?;
+            ids.push(id.to_string());
+        }
+        let next = if value.get("has_more").and_then(serde_json::Value::as_bool) == Some(true) {
+            Some(value.get("last_id").and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| Error::api("Anthropic model list missing pagination cursor"))?.to_string())
+        } else { None };
+        Ok((ids, next))
+    } else {
+        let rows = value.get("models").and_then(serde_json::Value::as_array)
+            .ok_or_else(|| Error::api("Gemini model list lacks models array"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let usable = row.get("supportedGenerationMethods")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|methods| methods.iter().any(|method| method.as_str() == Some("generateContent")));
+            if !usable { continue; }
+            if let Some(id) = row.get("name").and_then(serde_json::Value::as_str)
+                .and_then(|name| name.strip_prefix("models/")) {
+                ids.push(id.to_string());
+            }
+        }
+        let next = value.get("nextPageToken").and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty()).map(ToString::to_string);
+        Ok((ids, next))
+    }
+}
+
+async fn fetch_native_models(provider: &str, api_key: &str, route: &ModelCatalogProviderConfig) -> Result<DiscoveredModels> {
+    let endpoint = catalog_models_url(&route.base_url, &route.api)
+        .ok_or_else(|| Error::api("unsupported native model catalog endpoint"))?;
+    let custom_key = route.headers.keys().any(|name| name.eq_ignore_ascii_case(if route.api == "anthropic-messages" {
+        "x-api-key"
+    } else { "x-goog-api-key" }));
+    if !custom_key && api_key.trim().is_empty() {
+        return Err(Error::api("native model catalog requires an API key"));
+    }
+    let mut ids = Vec::new();
+    let mut after: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    for page in 0..16 {
+        let mut url = url::Url::parse(&endpoint)
+            .map_err(|_| Error::api("invalid native catalog URL"))?;
+        if let Some(cursor) = after.as_deref() {
+            url.query_pairs_mut().append_pair(if route.api == "anthropic-messages" {
+                "after_id"
+            } else { "pageToken" }, cursor);
+        }
+        let url_text = url.to_string();
+        let mut request = Client::new().get(&url_text).header("Accept", "application/json");
+        if !custom_key {
+            let name = if route.api == "anthropic-messages" { "x-api-key" } else { "x-goog-api-key" };
+            request = request.try_header(name, api_key.trim())?;
+        }
+        if route.api == "anthropic-messages" && !route.headers.keys().any(|name|
+            name.eq_ignore_ascii_case("anthropic-version")) {
+            request = request.try_header("anthropic-version", "2023-06-01")?;
+        }
+        for (name, value) in sorted_route_headers(route) {
+            request = request.try_header(name, value)?;
+        }
+        let operation = async move {
+            let response = request.send().await?;
+            let status = response.status();
+            let bytes = response.bytes_limited(MAX_FETCHED_CATALOG_BYTES).await?;
+            Ok::<_, Error>((status, bytes))
+        };
+        let (status, body) = if let Some(timeout) = effective_default_request_timeout(&url_text) {
+            asupersync::time::timeout(asupersync::time::wall_now(), timeout, Box::pin(operation))
+                .await.map_err(|_| Error::api("native model-list request timed out"))??
+        } else { operation.await? };
+        if !(200..300).contains(&status) {
+            return Err(Error::api(format!("native model catalog returned HTTP {status}")));
+        }
+        let (page_ids, cursor) = parse_native_models_page(&route.api, &body)?;
+        ids.extend(page_ids);
+        if ids.len() > MAX_FETCHED_MODELS_PER_PROVIDER {
+            return Err(Error::api("native model catalog exceeded the model count limit"));
+        }
+        let Some(cursor) = cursor else { return Ok(DiscoveredModels::from(normalize_model_ids(provider, ids)?)) };
+        if !seen_cursors.insert(cursor.clone()) || page == 15 {
+            return Err(Error::api("native model catalog pagination cycle or page limit"));
+        }
+        after = Some(cursor);
+    }
+    Err(Error::api("native model catalog page limit exceeded"))
+}
+
 /// Derive an OpenAI-compatible `/v1/models` URL from a provider's routing
 /// defaults.  Returns `None` for endpoints whose `base_url` does not look
 /// like an OpenAI-compatible root (e.g. Anthropic's `…/v1/messages` or
@@ -2646,6 +2772,36 @@ fn openai_compat_models_url(base_url: &str, api: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_catalog_routes_follow_each_providers_protocol() {
+        assert_eq!(
+            catalog_models_url("https://api.anthropic.com/v1/messages", "anthropic-messages").as_deref(),
+            Some("https://api.anthropic.com/v1/models")
+        );
+        assert_eq!(
+            catalog_models_url("https://generativelanguage.googleapis.com/v1beta", "google-generative-ai").as_deref(),
+            Some("https://generativelanguage.googleapis.com/v1beta/models")
+        );
+        assert!(catalog_models_url("https://api.example.com/v1/messages", "openai-completions").is_none());
+    }
+
+    #[test]
+    fn anthropic_model_catalog_parser_preserves_cursor() {
+        let response = br#"{"data":[{"id":"claude-a"},{"id":"claude-b"}],"has_more":true,"last_id":"claude-b"}"#;
+        let (ids, cursor) = parse_native_models_page("anthropic-messages", response).unwrap();
+        assert_eq!(ids, vec!["claude-a", "claude-b"]);
+        assert_eq!(cursor.as_deref(), Some("claude-b"));
+        assert!(parse_native_models_page("anthropic-messages", br#"{"data":{},"has_more":true}"#).is_err());
+    }
+
+    #[test]
+    fn gemini_catalog_excludes_non_generation_models_and_preserves_page_token() {
+        let response = br#"{"models":[{"name":"models/gemini-a","supportedGenerationMethods":["generateContent"]},{"name":"models/embedding-001","supportedGenerationMethods":["embedContent"]}],"nextPageToken":"page2"}"#;
+        let (ids, cursor) = parse_native_models_page("google-generative-ai", response).unwrap();
+        assert_eq!(ids, vec!["gemini-a"]);
+        assert_eq!(cursor.as_deref(), Some("page2"));
+    }
 
     fn built_in_route(provider: &str) -> ModelCatalogProviderConfig {
         let defaults = provider_routing_defaults(provider).expect("provider routing defaults");

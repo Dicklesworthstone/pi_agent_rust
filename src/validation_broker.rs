@@ -5,6 +5,9 @@
 //! validation state.
 
 mod doctor;
+mod freshness;
+
+pub use freshness::ValidationInputIdentity;
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -104,6 +107,8 @@ pub struct ValidationSlotLease {
     pub cwd: String,
     pub command_fingerprint: String,
     pub environment_fingerprint: String,
+    #[serde(default)]
+    pub input_identity: Option<ValidationInputIdentity>,
     pub git_head: String,
     pub feature_flags: Vec<String>,
     pub target_dir: String,
@@ -134,6 +139,8 @@ impl ValidationSlotLease {
         ensure_future_expiry(&started_at_utc, &expires_at_utc)?;
         let command_fingerprint = command_fingerprint(&request)?;
         let environment_fingerprint = environment_fingerprint(&request.environment)?;
+        // Missing local inputs never become reusable validation evidence.
+        let input_identity = ValidationInputIdentity::capture(&request).ok();
 
         Ok(Self {
             schema: VALIDATION_BROKER_SLOT_SCHEMA.to_string(),
@@ -143,6 +150,7 @@ impl ValidationSlotLease {
             bead_id: request.bead_id,
             command_fingerprint,
             environment_fingerprint,
+            input_identity,
             command: request.command,
             command_class: request.command_class,
             cwd: request.cwd,
@@ -203,6 +211,12 @@ impl ValidationSlotLease {
         }
         if artifacts.is_empty() {
             return Err(Error::validation("reusable slots require artifacts"));
+        }
+        let identity = self.input_identity.as_ref().ok_or_else(|| {
+            Error::validation("validation input identity unavailable; run fresh validation")
+        })?;
+        if !identity.is_current(self)? {
+            return Err(Error::validation("validation inputs changed during validation"));
         }
         self.heartbeat_at_utc = heartbeat_at_utc.into();
         parse_utc(&self.heartbeat_at_utc)?;
@@ -276,7 +290,18 @@ impl ValidationSlotLease {
     }
 
     pub fn matches_request_equivalence(&self, request: &ValidationSlotRequest) -> Result<bool> {
-        Ok(self.command_fingerprint == command_fingerprint(request)?
+        let current_identity = ValidationInputIdentity::capture(request).ok();
+        self.matches_request_identity(request, current_identity.as_ref())
+    }
+
+    fn matches_request_identity(
+        &self,
+        request: &ValidationSlotRequest,
+        current_identity: Option<&ValidationInputIdentity>,
+    ) -> Result<bool> {
+        Ok(self.input_identity.is_some()
+            && self.input_identity.as_ref() == current_identity
+            && self.command_fingerprint == command_fingerprint(request)?
             && self.environment_fingerprint == environment_fingerprint(&request.environment)?
             && self.cwd == request.cwd
             && self.git_head == request.git_head
@@ -1317,7 +1342,18 @@ pub fn decide_validation_admission(
     let rch_required = is_rch_required(&context.request);
     let age_priority_boosted =
         context.bead_priority <= 1 || request_age_seconds >= policy.request_age_boost_seconds;
-    let matching = matching_slots(&context.request, slot_store, now_utc, policy)?;
+    let input_identity = if slot_store.latest_by_slot_id.is_empty() {
+        None
+    } else {
+        ValidationInputIdentity::capture(&context.request).ok()
+    };
+    let matching = matching_slots(
+        &context.request,
+        slot_store,
+        now_utc,
+        policy,
+        input_identity.as_ref(),
+    )?;
     let active_broad_gates = active_broad_gate_count(slot_store, now_utc)?;
     let mut reasons = Vec::new();
     let mut required_actions = Vec::new();
@@ -1325,7 +1361,8 @@ pub fn decide_validation_admission(
     let mut coalesced_artifacts = Vec::new();
     let blocking_source_reasons = blocking_source_reasons(inputs, slot_store);
     let source_statuses = admission_source_statuses(inputs, slot_store);
-    let rejected_reusable_slots = rejected_reusable_slots(&context.request, slot_store)?;
+    let rejected_reusable_slots =
+        rejected_reusable_slots(&context.request, slot_store, input_identity.as_ref())?;
     let hard_rch_backpressure = inputs.rch.free_slots == Some(0)
         || inputs
             .rch
@@ -1507,6 +1544,7 @@ fn matching_slots<'a>(
     slot_store: &'a ValidationSlotStoreSnapshot,
     now_utc: &str,
     policy: &ValidationAdmissionPolicy,
+    identity: Option<&ValidationInputIdentity>,
 ) -> Result<MatchingValidationSlots<'a>> {
     let mut slots = MatchingValidationSlots {
         active: Vec::new(),
@@ -1515,7 +1553,7 @@ fn matching_slots<'a>(
     };
 
     for lease in slot_store.latest_by_slot_id.values() {
-        if lease.state.is_terminal() || !lease.matches_request_equivalence(request)? {
+        if lease.state.is_terminal() || !lease.matches_request_identity(request, identity)? {
             continue;
         }
         let stale_now = lease.is_stale_at(now_utc)?;
@@ -1582,6 +1620,7 @@ fn active_broad_gate_count(
 fn rejected_reusable_slots(
     request: &ValidationSlotRequest,
     slot_store: &ValidationSlotStoreSnapshot,
+    identity: Option<&ValidationInputIdentity>,
 ) -> Result<Vec<ValidationRejectedReusableSlot>> {
     let command_fingerprint = command_fingerprint(request)?;
     let environment_fingerprint = environment_fingerprint(&request.environment)?;
@@ -1596,6 +1635,7 @@ fn rejected_reusable_slots(
             request,
             &command_fingerprint,
             &environment_fingerprint,
+            identity,
         );
         if !reasons.is_empty() {
             rejected.push(ValidationRejectedReusableSlot {
@@ -1613,8 +1653,14 @@ fn reusable_slot_mismatch_reasons(
     request: &ValidationSlotRequest,
     request_command_fingerprint: &str,
     request_environment_fingerprint: &str,
+    request_input_identity: Option<&ValidationInputIdentity>,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    if lease.input_identity.is_none()
+        || lease.input_identity.as_ref() != request_input_identity
+    {
+        reasons.push("input_identity_unavailable_or_changed".to_string());
+    }
     push_mismatch(
         &mut reasons,
         "command_fingerprint",

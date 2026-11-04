@@ -528,7 +528,8 @@ pub struct SessionOptions {
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
     /// Undo history for the default registry's `write`, `edit` and
-    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
+    /// `hashline_edit` (bd-cv653.3.13). `None` opens the session's durable journal
+    /// when persistence is enabled, or an in-memory recorder otherwise. A host
     /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
     /// and `/fork`, passes the same recorder so `/undo` keeps working across
     /// the rebuild, as on the classic stack. [`ExplicitBuiltinTools`] uses it;
@@ -4329,8 +4330,16 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         secrets: config.secrets.clone(),
     };
 
+    let session_recorder = if let Some(recorder) = &options.mutation_recorder {
+        Arc::clone(recorder)
+    } else if options.no_session || cli.builtin_tools_disabled() {
+        Arc::default()
+    } else {
+        let roots = workspace.as_ref().map_or_else(|| vec![cwd.clone()], |workspace| workspace.roots());
+        Arc::new(crate::undo::FileMutationRecorder::for_session(&session.header.id, &roots)?)
+    };
     let factory_context = ToolFactoryContext {
-        mutation_recorder: options.mutation_recorder.as_ref(),
+        mutation_recorder: Some(&session_recorder),
         workspace: workspace.as_ref(),
         workspace_trusted,
         workspace_trust_guard: options.workspace_trust_guard.as_ref(),
@@ -4346,7 +4355,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
-                Some(options.mutation_recorder.clone().unwrap_or_default()),
+                Some(Arc::clone(&session_recorder)),
                 workspace.as_ref(),
                 workspace_trusted,
                 options.workspace_trust_guard.as_ref(),

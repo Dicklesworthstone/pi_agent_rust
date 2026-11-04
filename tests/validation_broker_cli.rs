@@ -176,7 +176,21 @@ fn write_jsonl(path: &Path, events: &[Value]) -> TestResult {
 }
 
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
+    static WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let workspace = WORKSPACE.get_or_init(|| {
+        let root = tempfile::tempdir().expect("fixture workspace").keep();
+        for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+            std::fs::write(root.join(name), b"validation fixture executable").expect("fixture tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)).expect("executable fixture tool");
+            }
+        }
+        root
+    });
     let mut environment = BTreeMap::new();
+    environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
     environment.insert(
         "CARGO_TARGET_DIR".to_string(),
         "/data/tmp/pi_agent_rust_cargo/codex/target".to_string(),
@@ -199,7 +213,7 @@ fn base_request(slot_id: &str) -> ValidationSlotRequest {
             "--all-targets".to_string(),
         ],
         command_class: "cargo_check".to_string(),
-        cwd: "/data/projects/pi_agent_rust".to_string(),
+        cwd: workspace.to_string_lossy().into_owned(),
         git_head: "3048e53f3".to_string(),
         feature_flags: vec!["default".to_string()],
         target_dir: "/data/tmp/pi_agent_rust_cargo/codex/target".to_string(),

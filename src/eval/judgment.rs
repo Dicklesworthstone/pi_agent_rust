@@ -26,6 +26,7 @@ mod completion;
 mod drain;
 mod fallback;
 mod images;
+mod search;
 
 use fallback::BoundModels;
 
@@ -364,6 +365,8 @@ impl<'p> Invocation<'p> {
             self.drain_batch(tool, input).await
         } else if let Some(operation) = background::Operation::for_bridge(name) {
             self.start_background(tool, operation, input).await
+        } else if name == search::BRIDGE_NAME {
+            self.search(&tool.cwd, input).await
         } else if name == BRIDGE_NAME {
             self.evaluate(&tool.cwd, input).await
         } else if name == batch::BRIDGE_NAME {

@@ -1114,6 +1114,75 @@ fn push_card_block(
     }
 }
 
+/// Install one OSC-8 destination on every displayed piece of a bare URL.
+///
+/// Terminals often auto-detect only the first visual row of a long URL. The
+/// conversation renderer hard-wraps lines, so the link must be attached to
+/// the *span* before wrapping: `Span::split_at_cell` then carries the same
+/// complete destination to every visual row. Preserve existing Markdown link
+/// spans and non-link formatting rather than reparsing the source message.
+fn linkify_visible_urls(line: &ftui::text::Line<'static>) -> ftui::text::Line<'static> {
+    fn fragment(
+        source: &ftui::text::Span<'static>,
+        content: &str,
+        destination: Option<&str>,
+    ) -> ftui::text::Span<'static> {
+        let mut span = source.clone();
+        span.content = content.to_owned().into();
+        span.link = destination.map(|url| url.to_owned().into());
+        if destination.is_some() {
+            span.style = Some(span.style.unwrap_or_else(ftui::Style::new).underline());
+        }
+        span
+    }
+
+    let mut out = Vec::new();
+    for span in line.spans() {
+        if span.link.is_some() {
+            out.push(span.clone());
+            continue;
+        }
+        let text = span.as_str();
+        let mut scan = 0;
+        let mut emitted = 0;
+        while let Some(relative) = text[scan..].find("http") {
+            let start = scan + relative;
+            if !text[start..].starts_with("https://") && !text[start..].starts_with("http://") {
+                scan = start + 4;
+                continue;
+            }
+            let raw_end = text[start..]
+                .find(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '<' | '>' | '"' | '\'' | '`' | '\\')
+                })
+                .map_or(text.len(), |offset| start + offset);
+            let candidate = text[start..raw_end]
+                .trim_end_matches(['.', ',', ';', '!', '?', ')', ']', '}']);
+            // Never let control bytes enter OSC-8 framing, even if the URL
+            // parser would percent-encode them during normalization.
+            let valid = candidate.chars().all(|ch| !ch.is_control())
+                && url::Url::parse(candidate).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                });
+            if !valid {
+                scan = raw_end;
+                continue;
+            }
+            if emitted < start {
+                out.push(fragment(span, &text[emitted..start], None));
+            }
+            out.push(fragment(span, candidate, Some(candidate)));
+            emitted = start + candidate.len();
+            scan = emitted;
+        }
+        if emitted < text.len() || text.is_empty() {
+            out.push(fragment(span, &text[emitted..], None));
+        }
+    }
+    ftui::text::Line::from_spans(out)
+}
+
 /// Render one role block: assistant content as markdown, everything else
 /// with the role prefix on the first line and role style throughout.
 fn push_role_block(
@@ -1125,7 +1194,7 @@ fn push_role_block(
 ) {
     if role == EntryRole::Assistant {
         let rendered = md.render(content);
-        lines.extend(rendered.lines().iter().cloned());
+        lines.extend(rendered.lines().iter().map(linkify_visible_urls));
         return;
     }
     let style = role.style(palette);
@@ -1136,7 +1205,8 @@ fn push_role_block(
         let mut rendered = String::with_capacity(lead.len() + line.len());
         rendered.push_str(lead);
         rendered.push_str(line);
-        lines.push(ftui::text::Line::styled(rendered, style));
+        let row = ftui::text::Line::styled(rendered, style);
+        lines.push(linkify_visible_urls(&row));
     }
     if content.is_empty() {
         lines.push(ftui::text::Line::styled(prefix.to_string(), style));
@@ -11206,6 +11276,8 @@ async fn resume_session_command(
         }
     };
     if same_file {
+        // Reuse this session's held journal only for a reload, never a new identity.
+        options.mutation_recorder = handle.session().agent.mutation_recorder();
         // Preflight wrote a prospective self-reference. Carry its authority
         // into construction so a reload can open that not-yet-retired source.
         options.cost_budget = prepared
@@ -11779,12 +11851,7 @@ pub fn run(
     // an SDK caller. Keep the surface default distinct from an explicit
     // override, so each session reload still honors its fresh configuration.
     session_options.out_default_enabled = true;
-    // One undo history for the process, as on the classic stack. `/new`,
-    // `/resume`, `/reload` and `/fork` rebuild the session from a template
-    // cloned from these options, so every handle shares this recorder.
-    session_options
-        .mutation_recorder
-        .get_or_insert_with(Default::default);
+    // Let the SDK bind the persistent journal to each session identity.
     let bash_cwd = driver_bash_cwd(&session_options);
     if let Some(guard) = &session_options.workspace_trust_guard {
         guard
@@ -23644,7 +23711,7 @@ mod tests {
             working_directory: Some(cwd.path().to_path_buf()),
             workspace_trusted: true,
             session_dir: Some(sessions.path().to_path_buf()),
-            enabled_tools: Some(Vec::new()),
+            enabled_tools: Some(vec!["write".to_string()]),
             no_context_files: true,
             max_cost: Some(2.0),
             ..crate::sdk::SessionOptions::default()
@@ -23658,6 +23725,13 @@ mod tests {
             ))
             .await
             .expect("source session");
+            let source_recorder = handle.session().agent.mutation_recorder().expect("source undo");
+            let edited = cwd.path().join("undo-scope.txt");
+            std::fs::write(&edited, "before").unwrap();
+            source_recorder.begin_file("scope-edit", "edit", &edited);
+            std::fs::write(&edited, "after").unwrap();
+            source_recorder.commit("scope-edit");
+            assert_eq!(source_recorder.stats().undo_depth, 1);
             let budget = handle.session().agent.cost_budget().unwrap().clone();
             budget.record(0.25).unwrap();
             let mut outstanding = budget.start_attempt().unwrap();
@@ -23688,6 +23762,8 @@ mod tests {
             )
             .await
             .expect("reload before fork");
+            assert!(Arc::ptr_eq(&source_recorder,
+                &handle.session().agent.mutation_recorder().expect("reload undo")));
             assert_eq!(
                 handle
                     .with_session(|session| session.header.id.clone())
@@ -23737,6 +23813,12 @@ mod tests {
                 .unwrap();
             assert_ne!(fork_id, source_id);
             assert_ne!(fork_path, source_path);
+            let fork_recorder = handle.session().agent.mutation_recorder().expect("fork undo");
+            assert!(!Arc::ptr_eq(&source_recorder, &fork_recorder));
+            assert_eq!(fork_recorder.stats().undo_depth, 0);
+            assert!(matches!(fork_recorder.undo(1, false).stopped, Some(crate::undo::UndoStop::Exhausted)));
+            assert_eq!(std::fs::read_to_string(&edited).unwrap(), "after");
+            drop(fork_recorder);
             assert!(
                 handle
                     .session()
@@ -29258,6 +29340,55 @@ mod tests {
                 "width {width}: hard break lost characters: {joined:?}"
             );
         }
+    }
+
+    #[test]
+    fn wrapped_oauth_url_keeps_full_link_target_on_every_visual_row() {
+        // No credentials or real authorization state: only public URL shape.
+        let url = format!(
+            "https://auth.example.test/oauth/authorize?response_type=code&state={}&code_challenge={}",
+            "a".repeat(70),
+            "b".repeat(75)
+        );
+        let line = linkify_visible_urls(&ftui::text::Line::styled(
+            url.clone(),
+            ftui::Style::new(),
+        ));
+        let wrapped = line.wrap(35, WrapMode::WordChar);
+        assert!(wrapped.len() > 2, "URL should span multiple visual rows");
+        let visible: String = wrapped
+            .iter()
+            .flat_map(|row| row.spans())
+            .map(ftui::text::Span::as_str)
+            .collect();
+        assert_eq!(visible, url, "wrapping must not truncate the URL");
+        for row in &wrapped {
+            for span in row.spans().iter().filter(|span| !span.as_str().is_empty()) {
+                assert_eq!(span.link.as_deref(), Some(url.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn linkifier_rejects_control_bytes_in_bare_url() {
+        let malicious = "https://example.test/query?state=good\x1b]8;;https://evil.test";
+        let line = ftui::text::Line::styled(malicious.to_string(), ftui::Style::new());
+        let linked = linkify_visible_urls(&line);
+        assert_eq!(linked.to_plain_text(), malicious);
+        assert!(linked.spans().iter().all(|span| span.link.is_none()));
+    }
+
+    #[test]
+    fn linkifier_keeps_existing_markdown_destination() {
+        let mut explicit = ftui::text::Span::styled("docs", ftui::Style::new());
+        explicit.link = Some("https://docs.example.test/real-target".into());
+        let line = ftui::text::Line::from_spans(vec![explicit]);
+        let linked = linkify_visible_urls(&line);
+        assert_eq!(linked.to_plain_text(), "docs");
+        assert_eq!(
+            linked.spans()[0].link.as_deref(),
+            Some("https://docs.example.test/real-target")
+        );
     }
 
     /// Double-width characters are measured in cells, so a CJK answer must

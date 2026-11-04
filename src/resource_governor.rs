@@ -1,8 +1,8 @@
 //! Host-scale resource admission control for swarm workloads.
 //!
-//! The governor is intentionally conservative and dependency-light: Linux hosts
-//! get live `/proc` sampling, while other platforms keep deterministic fallback
-//! budgets and only enforce request-local limits such as tool-output caps.
+//! Linux hosts use `/proc`; other supported hosts use `sysinfo` for memory and
+//! process sampling. Unavailable measurements remain unknown, with conservative
+//! fallback budgets and request-local limits such as tool-output caps.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -14,6 +14,7 @@ use crate::swarm_activity_ledger::{
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+#[cfg(target_os = "linux")]
 const PROC_PAGE_SIZE_BYTES: u64 = 4096;
 const DEFAULT_MEMORY_BYTES: u64 = 1_073_741_824;
 const DEFAULT_FD_LIMIT: u64 = 1024;
@@ -176,17 +177,44 @@ pub struct HostResourceSample {
 
 impl HostResourceSample {
     /// Sample the current process/host state.
-    // Const-eligible only where the probe functions are cfg'd to const stubs
-    // (non-Linux); on Linux they do real /proc IO, so `const fn` cannot apply
-    // uniformly.
-    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn current() -> Self {
-        Self {
-            load_avg_1m: read_load_avg_1m(),
-            rss_bytes: read_self_rss_bytes(),
-            process_count: count_proc_processes(),
-            fd_count: count_self_fds(),
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                load_avg_1m: read_load_avg_1m(),
+                rss_bytes: read_self_rss_bytes(),
+                process_count: count_proc_processes(),
+                fd_count: count_self_fds(),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut system = sysinfo::System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            let process_count = u64::try_from(system.processes().len())
+                .ok()
+                .filter(|count| *count > 0);
+            let pid = sysinfo::Pid::from_u32(std::process::id());
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing().with_memory(),
+            );
+            let rss_bytes = system
+                .process(pid)
+                .map(sysinfo::Process::memory)
+                .filter(|bytes| *bytes > 0);
+            Self {
+                load_avg_1m: read_load_avg_1m(),
+                rss_bytes,
+                process_count,
+                fd_count: count_self_fds(),
+            }
         }
     }
 }
@@ -1873,7 +1901,7 @@ pub struct AdmissionDecision {
     pub retry_after_ms: u64,
     /// Sample used by this decision.
     pub sample: HostResourceSample,
-    /// Budgets used by this decision.
+    /// Effective budgets used by this decision, including live host memory pressure.
     pub budgets: HostResourceBudgets,
     /// True when the decision used conservative fallback budgets.
     #[serde(skip_serializing_if = "is_false")]
@@ -1925,7 +1953,30 @@ impl ResourceGovernor {
     /// Evaluate a request against the live host sample.
     #[must_use]
     pub fn admit(&self, request: &ResourceRequest) -> AdmissionDecision {
-        self.admit_sample(request, HostResourceSample::current())
+        let sample = HostResourceSample::current();
+        #[cfg(target_os = "linux")]
+        {
+            self.admit_sample(request, sample)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (total, available) = read_host_memory_bytes();
+            let budgets = budgets_with_host_memory_pressure(
+                &self.budgets,
+                sample.rss_bytes,
+                total,
+                available,
+            );
+            let adjusted = budgets.max_rss_bytes < self.budgets.max_rss_bytes;
+            let mut decision =
+                Self::admit_sample_with_budgets(request, sample, budgets, false, Vec::new());
+            if adjusted {
+                decision
+                    .reason
+                    .push_str(" (effective RSS budget includes host memory pressure)");
+            }
+            decision
+        }
     }
 
     /// Evaluate a request against an injected sample.
@@ -3306,11 +3357,6 @@ fn read_self_rss_bytes() -> Option<u64> {
     resident_pages.checked_mul(PROC_PAGE_SIZE_BYTES)
 }
 
-#[cfg(not(target_os = "linux"))]
-const fn read_self_rss_bytes() -> Option<u64> {
-    None
-}
-
 #[cfg(target_os = "linux")]
 fn read_mem_total_bytes() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -3325,8 +3371,37 @@ fn read_mem_total_bytes() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-const fn read_mem_total_bytes() -> Option<u64> {
-    None
+fn read_mem_total_bytes() -> Option<u64> {
+    let (total, _) = read_host_memory_bytes();
+    (total > 0).then_some(total)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_host_memory_bytes() -> (u64, u64) {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    (system.total_memory(), system.available_memory())
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn budgets_with_host_memory_pressure(
+    budgets: &HostResourceBudgets,
+    rss_bytes: Option<u64>,
+    total: u64,
+    available: u64,
+) -> HostResourceBudgets {
+    let mut effective = budgets.clone();
+    if let (Some(rss), Some(used)) = (
+        rss_bytes.filter(|bytes| *bytes > 0),
+        total.checked_sub(available).filter(|bytes| *bytes > 0),
+    ) {
+        // Map host used-memory pressure into the existing RSS admission dimension.
+        let host_budget = (u128::from(rss) * u128::from(total)) / u128::from(used);
+        effective.max_rss_bytes = effective
+            .max_rss_bytes
+            .min(u64::try_from(host_budget).unwrap_or(u64::MAX));
+    }
+    effective
 }
 
 #[cfg(target_os = "linux")]
@@ -3341,11 +3416,6 @@ fn count_proc_processes() -> Option<u64> {
         }
     }
     Some(count)
-}
-
-#[cfg(not(target_os = "linux"))]
-const fn count_proc_processes() -> Option<u64> {
-    None
 }
 
 #[cfg(target_os = "linux")]
@@ -3741,6 +3811,87 @@ mod tests {
 
         assert_eq!(decision.action, AdmissionAction::Deny);
         assert_eq!(decision.dominant_dimension, ResourceDimension::ToolOutput);
+    }
+
+    #[test]
+    fn memory_and_process_samples_enforce_limits_without_load_or_fd_metrics() {
+        let governor = ResourceGovernor::with_budgets(budgets());
+        let request = ResourceRequest::new(ResourceOperationKind::Tool, "read");
+        let mut sample = HostResourceSample {
+            load_avg_1m: None,
+            rss_bytes: Some(900),
+            process_count: Some(20),
+            fd_count: None,
+        };
+
+        let decision = governor.admit_sample(&request, sample);
+        assert_eq!(decision.action, AdmissionAction::Backpressure);
+        assert_eq!(decision.dominant_dimension, ResourceDimension::Rss);
+
+        sample.rss_bytes = None;
+        sample.process_count = Some(200);
+        let decision = governor.admit_sample(&request, sample);
+        assert_eq!(decision.action, AdmissionAction::Deny);
+        assert_eq!(decision.dominant_dimension, ResourceDimension::Processes);
+    }
+
+    #[test]
+    fn competing_process_memory_pressure_backpressures_small_pi_process() {
+        let configured = budgets();
+        let sample = HostResourceSample {
+            load_avg_1m: None,
+            rss_bytes: Some(200),
+            process_count: None,
+            fd_count: None,
+        };
+        let request = ResourceRequest::new(ResourceOperationKind::Tool, "read");
+        let effective =
+            super::budgets_with_host_memory_pressure(&configured, sample.rss_bytes, 10_000, 1_000);
+        let decision = ResourceGovernor::with_budgets(effective).admit_sample(&request, sample);
+        assert_eq!(decision.action, AdmissionAction::Backpressure);
+        assert_eq!(decision.dominant_dimension, ResourceDimension::Rss);
+        assert_eq!(configured.max_rss_bytes, 1_000);
+
+        let mut strict = configured;
+        strict.max_rss_bytes = 100;
+        let effective =
+            super::budgets_with_host_memory_pressure(&strict, sample.rss_bytes, 10_000, 1_000);
+        assert_eq!(effective.max_rss_bytes, 100);
+        let decision = ResourceGovernor::with_budgets(effective).admit_sample(&request, sample);
+        assert_eq!(decision.action, AdmissionAction::Deny);
+    }
+
+    #[test]
+    fn unavailable_host_memory_preserves_configured_budgets() {
+        let configured = budgets();
+        for (rss, total, available) in [
+            (None, 10_000, 1_000),
+            (Some(0), 10_000, 1_000),
+            (Some(200), 0, 0),
+            (Some(200), 10_000, 20_000),
+            (Some(200), 10_000, 10_000),
+        ] {
+            assert_eq!(
+                super::budgets_with_host_memory_pressure(&configured, rss, total, available),
+                configured
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_samples_live_memory_and_processes_in_bytes() {
+        let sample = HostResourceSample::current();
+        let total = super::read_mem_total_bytes().expect("host RAM measurement");
+        let rss = sample.rss_bytes.expect("current process RSS measurement");
+        assert!(rss > 0 && rss <= total);
+        assert!(sample.process_count.is_some_and(|count| count > 0));
+        assert_eq!(sample.load_avg_1m, None);
+        assert_eq!(sample.fd_count, None);
+        assert_eq!(
+            HostResourceBudgets::from_host().max_rss_bytes,
+            (total / 2).clamp(512 * 1024 * 1024, 8 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]

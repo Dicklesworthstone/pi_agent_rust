@@ -1,5 +1,59 @@
 # Native typed judgments
 
+## Semantic source search and predicate audits
+
+An admitted eval cell can call `__pi_search` through the same native host as
+typed judgments. The cell must select `judge_model`, or its SDK host must bind
+a `Judge`. Source discovery and reads go through the owning Agent's enabled
+`find`/`read` tools, workspace rules and approval policy.
+
+```json
+{
+  "kernel": "js",
+  "judge_model": {"role": "smol"},
+  "code": "JSON.parse(await tool.call('__pi_search', {question: 'Where is account registration implemented?', path: 'src', pattern: '**/*.rs'}))"
+}
+```
+
+For an audit over known files, use explicit paths and `predicate: true`:
+
+```javascript
+const audit = JSON.parse(await tool.call('__pi_search', {
+  question: 'Does this handler validate the caller identity?',
+  paths: ['src/upload.rs', 'src/download.rs'],
+  predicate: true
+}));
+display(audit);
+```
+
+Python can use `json.loads(await tool.call('__pi_search', {...}))` with the same
+arguments. Paths are workspace-relative local source files; remote resources,
+archives, rendered documents, binary and incomplete reads are refused. The
+default discovery pattern is `**/*.rs`. Discovery admits at most eight files;
+a larger result set is explicitly partial and should be narrowed. Files must
+fit within 48 KiB of numbered read output and the read tool's complete window.
+
+Search screens declarations, verifies at most two leading files against full
+source, rechecks their evidence digest, then locates up to sixteen source
+regions. Predicate mode judges every admitted complete file directly. Both
+share the cell's existing sixteen model attempts, usage receipts, cost budget,
+cancellation and full-source privacy screening. No provider fallback is added.
+
+For supported languages, screening combines bounded AST declaration headers
+with textual declarations. Each file's `structure` exposes syntax nodes,
+one-based ranges and parent IDs (`contains`), tagged `EXTRACTED`. Model verdicts
+are tagged `judgment_provenance: "INFERRED"`. Outlines stop at 64 nodes and mark
+parse errors or omitted nodes as partial; unsupported or redacted line mappings
+use textual screening. These structures do not resolve calls or dependencies.
+
+Results have schema `pi.semantic_search.v1`, per-file status, evidence hashes,
+phase coverage, failures, and explicit `yes`/`no`/`unknown` answers. Scores are
+uncalibrated model estimates: the advisory thresholds are 0.7 for yes and 0.3
+for no, with the middle range unknown. Failed reads/judgments are reported as
+`failed`, never no. Unverified search candidates remain unknown and make the
+report partial. These are file-local judgments; callers or middleware can
+change whole-program behavior. They do not establish absence or certify safety.
+
 `pi::judgment::Judge` is an unstable library API for small, typed decisions.
 Bind a `Provider` and `StreamOptions`, validate a `JudgmentRequest`, then await
 `Judge::evaluate`. It makes one stateless, tool-free provider request. It does

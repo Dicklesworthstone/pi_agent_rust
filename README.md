@@ -2268,7 +2268,7 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/clear` (`/cls`), `/new` | Clear conversation; start a new session |
 | `/compact [shake\|aggressive]` | Manual compaction (shake drops oversized tool results with no LLM call) |
 | `/checkpoint`, `/rewind`, `/fresh`, `/retry` | Session restore points and turn control |
-| `/undo`, `/redo` | Revert/replay file mutations made by tools |
+| `/undo`, `/redo` | Revert/replay recorded tool edits; persistent sessions retain private restart-recoverable backups |
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
@@ -2280,6 +2280,12 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/template`, `/skill:<name>` | Expand a prompt template; invoke a skill |
 | `/reload` | Reload skills/prompts/themes/extensions from disk |
 | `/exit` (`/quit`, `/q`) or `Ctrl+C` | Exit Pi |
+
+In the FrankenTUI transcript, long HTTP(S) links retain the complete clickable
+destination across visual rows where OSC-8 is supported by the terminal. Use
+`/copy link` (or `/copy url`) to copy the latest **complete original URL**, even
+when the terminal captures mouse input. Launch `pi --no-mouse-capture` if you
+prefer native terminal selection and copying with the mouse instead.
 
 **Live stream rules:** `/rules` manages corrections enforced during generation
 on every native agent surface. Matching assistant text or thinking interrupts

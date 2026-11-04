@@ -4,8 +4,8 @@
 //! successful `write`/`edit`/`hashline_edit`/`ast_edit` tool call so agent
 //! edits can be rolled back without git. Snapshots live in an in-memory
 //! content-addressed store (dedup by SHA-256) bounded by a byte budget with
-//! oldest-unit eviction; history therefore dies with the process — git
-//! remains the durable layer. `lsp` workspace edits and subagent processes
+//! oldest-unit eviction. Session-backed recorders also persist a private journal.
+//! `lsp` workspace edits and subagent processes
 //! are not recorded yet.
 //!
 //! Recording contract: one mutation unit per tool call (`begin_file` before
@@ -21,10 +21,12 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use crate::file_identity::FileIdentity;
+
+mod journal;
 
 /// Schema tag for undo/redo session entries and tool-result details.
 pub const UNDO_SCHEMA: &str = "pi.undo.v1";
@@ -39,7 +41,7 @@ pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 type BlobId = [u8; 32];
 
 /// Recorded state of one file at one point in time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum FileState {
     Absent,
     Present(BlobId),
@@ -48,13 +50,13 @@ enum FileState {
     Unrecorded,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RecordedParent {
     path: PathBuf,
     identity: FileIdentity,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileMutation {
     path: PathBuf,
     parent: Option<RecordedParent>,
@@ -62,7 +64,7 @@ struct FileMutation {
     post: FileState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MutationUnit {
     tool_name: String,
     at_ms: i64,
@@ -129,6 +131,8 @@ pub struct RecorderStats {
     pub budget_bytes: u64,
     pub evicted_units: u64,
     pub unrecorded_files: u64,
+    pub durable: bool,
+    pub durability_error: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +179,7 @@ struct RecorderInner {
     pending: HashMap<String, MutationUnit>,
     evicted_units: u64,
     unrecorded_files: u64,
+    durability_error: Option<&'static str>,
 }
 
 /// Records tool-path file mutations and applies `/undo` / `/redo`.
@@ -187,6 +192,7 @@ struct RecorderInner {
 pub struct FileMutationRecorder {
     inner: Mutex<RecorderInner>,
     budget_bytes: u64,
+    journal: Option<journal::Journal>,
 }
 
 fn now_ms() -> i64 {
@@ -455,6 +461,7 @@ impl FileMutationRecorder {
         Self {
             inner: Mutex::new(RecorderInner::default()),
             budget_bytes,
+            journal: None,
         }
     }
 
@@ -463,6 +470,20 @@ impl FileMutationRecorder {
     /// unit (first snapshot per path wins).
     pub fn begin_file(&self, tool_call_id: &str, tool_name: &str, path: &Path) {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let parent = capture_parent(&path).ok();
+        let path = if self.journal.is_some() {
+            parent.as_ref().and_then(|parent| path.file_name().map(|name| parent.path.join(name)))
+                .unwrap_or_else(|| {
+                    // Missing nested parents still need the canonical workspace prefix (notably on Windows).
+                    path.ancestors().skip(1).find_map(|ancestor| {
+                        std::fs::canonicalize(ancestor).ok().and_then(|canonical| {
+                            path.strip_prefix(ancestor).ok().map(|suffix| canonical.join(suffix))
+                        })
+                    }).unwrap_or_else(|| path.clone())
+                })
+        } else {
+            path
+        };
         let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
         let inner = &mut *inner;
         let unit = inner
@@ -476,7 +497,6 @@ impl FileMutationRecorder {
         if unit.files.iter().any(|f| f.path == path) {
             return;
         }
-        let parent = capture_parent(&path).ok();
         let pre = capture_state(&mut inner.store, &path, &mut inner.unrecorded_files);
         unit.files.push(FileMutation {
             path,
@@ -484,6 +504,8 @@ impl FileMutationRecorder {
             pre,
             post: FileState::Unrecorded,
         });
+        enforce_budget(inner, self.budget_bytes);
+        self.persist(inner, false);
     }
 
     /// Finalize the unit for `tool_call_id` after a successful persist:
@@ -500,6 +522,12 @@ impl FileMutationRecorder {
             // Never replace an identity that was already recorded, however.
             if file.parent.is_none() {
                 file.parent = capture_parent(&file.path).ok();
+                if self.journal.is_some()
+                    && let Some(parent) = &file.parent
+                    && let Some(name) = file.path.file_name()
+                {
+                    file.path = parent.path.join(name);
+                }
             }
         }
         for old_unit in inner.redo_stack.drain(..) {
@@ -507,6 +535,7 @@ impl FileMutationRecorder {
         }
         inner.undo_stack.push(unit);
         enforce_budget(inner, self.budget_bytes);
+        self.persist(inner, false);
     }
 
     /// Drop the pending unit for a failed tool call.
@@ -516,6 +545,7 @@ impl FileMutationRecorder {
         if let Some(unit) = inner.pending.remove(tool_call_id) {
             release_unit(&mut inner.store, &unit);
         }
+        self.persist(inner, false);
     }
 
     /// Undo up to `n` mutation units, newest first.
@@ -531,6 +561,11 @@ impl FileMutationRecorder {
     #[allow(clippy::too_many_lines)]
     fn apply(&self, n: usize, force: bool, direction: Direction) -> UndoOutcome {
         let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
+        if let Some(error) = &inner.durability_error {
+            return UndoOutcome { applied: Vec::new(), stopped: Some(UndoStop::RestoreFailed {
+                path: "undo journal".into(), error: (*error).to_owned(),
+            }) };
+        }
         let inner = &mut *inner;
         let mut applied = Vec::new();
         let mut stopped = None;
@@ -540,7 +575,7 @@ impl FileMutationRecorder {
                 Direction::Undo => &inner.undo_stack,
                 Direction::Redo => &inner.redo_stack,
             };
-            let Some(unit) = source.last() else {
+            let Some(unit) = source.last().cloned() else {
                 if applied.is_empty() {
                     stopped = Some(UndoStop::Exhausted);
                 }
@@ -598,6 +633,11 @@ impl FileMutationRecorder {
                 }
             }
 
+            if !self.persist(inner, true) {
+                stopped = Some(UndoStop::RestoreFailed { path: "undo journal".into(),
+                    error: "Could not persist undo intent; no restore started".into() });
+                break;
+            }
             let mut restored = Vec::new();
             let mut failure = None;
             for file in &unit.files {
@@ -615,6 +655,9 @@ impl FileMutationRecorder {
             }
 
             if let Some(failure) = failure {
+                if self.journal.is_some() {
+                    inner.durability_error = Some("Interrupted restore; inspect the files before recovering the journal");
+                }
                 stopped = Some(failure);
                 break;
             }
@@ -629,6 +672,11 @@ impl FileMutationRecorder {
                 files: restored,
             });
             target.push(unit);
+            if !self.persist(inner, false) {
+                stopped = Some(UndoStop::RestoreFailed { path: "undo journal".into(),
+                    error: "Restore applied, but its journal update failed; inspect before retrying".into() });
+                break;
+            }
         }
 
         UndoOutcome { applied, stopped }
@@ -664,6 +712,8 @@ impl FileMutationRecorder {
             budget_bytes: self.budget_bytes,
             evicted_units: inner.evicted_units,
             unrecorded_files: inner.unrecorded_files,
+            durable: self.journal.is_some() && inner.durability_error.is_none(),
+            durability_error: inner.durability_error,
         }
     }
 }
@@ -725,13 +775,27 @@ fn release_unit(store: &mut BlobStore, unit: &MutationUnit) {
     }
 }
 
-/// Evict oldest undo units until the store fits the budget. Redo units were
-/// already cleared by the commit that grew the store.
+/// Keep both byte and durable-journal unit counts bounded, including pending
+/// edits. Evict unreachable history before a journal save can poison durability.
 fn enforce_budget(inner: &mut RecorderInner, budget_bytes: u64) {
-    while inner.store.bytes > budget_bytes && inner.undo_stack.len() > 1 {
-        let unit = inner.undo_stack.remove(0);
-        release_unit(&mut inner.store, &unit);
-        inner.evicted_units += 1;
+    loop {
+        let total_units = inner.undo_stack.len()
+            + inner.redo_stack.len() + inner.pending.len();
+        let over_units = total_units > journal::MAX_UNITS;
+        let over_bytes = inner.store.bytes > budget_bytes;
+        if !over_units && !over_bytes { break; }
+        if inner.undo_stack.len() > usize::from(over_bytes && !over_units) {
+            let unit = inner.undo_stack.remove(0);
+            release_unit(&mut inner.store, &unit);
+            inner.evicted_units += 1;
+        } else if !inner.redo_stack.is_empty() {
+            let unit = inner.redo_stack.remove(0);
+            release_unit(&mut inner.store, &unit);
+            inner.evicted_units += 1;
+        } else {
+            // One enormous pending unit is rejected by the journal itself.
+            break;
+        }
     }
 }
 
@@ -898,6 +962,22 @@ mod tests {
         }
         let stats = recorder.stats();
         assert!(stats.evicted_units > 0, "{stats:?}");
+    }
+
+    #[test]
+    fn unit_count_eviction_prevents_small_edit_journal_exhaustion() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("tiny.txt");
+        write(&file, "a");
+        let recorder = FileMutationRecorder::new(DEFAULT_STORE_BUDGET_BYTES);
+        for i in 0..=journal::MAX_UNITS {
+            let id = format!("tiny-{i}");
+            recorder.begin_file(&id, "edit", &file);
+            write(&file, if i % 2 == 0 { "b" } else { "a" });
+            recorder.commit(&id);
+        }
+        assert!(recorder.stats().undo_depth <= journal::MAX_UNITS);
+        assert!(recorder.stats().evicted_units > 0);
     }
 
     #[test]

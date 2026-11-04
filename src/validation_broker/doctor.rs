@@ -657,13 +657,26 @@ mod tests {
     }
 
     fn request() -> ValidationSlotRequest {
+        static WORKSPACE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let workspace = WORKSPACE.get_or_init(|| {
+            let root = tempfile::tempdir().expect("fixture workspace").keep();
+            for name in ["cargo", "cargo.exe"] {
+                std::fs::write(root.join(name), b"validation fixture executable").expect("fixture tool");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)).expect("executable fixture tool");
+                }
+            }
+            root
+        });
         ValidationSlotRequest {
             slot_id: "cached-validation".into(),
             owner_agent: "TestAgent".into(),
             bead_id: "bd-doctor".into(),
             command: vec!["cargo".into(), "check".into(), "--all-targets".into()],
             command_class: "cargo_check".into(),
-            cwd: "/workspace".into(),
+            cwd: workspace.to_string_lossy().into_owned(),
             git_head: "head".into(),
             feature_flags: vec!["default".into()],
             target_dir: "/data/tmp/pi_agent_rust_cargo/test/target".into(),
@@ -671,7 +684,7 @@ mod tests {
             runner: "rch_required".into(),
             rust_toolchain: Some("nightly".into()),
             rch_job_id: None,
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([("PATH".into(), workspace.to_string_lossy().into_owned())]),
             expected_artifacts: vec![],
             artifact_schema: Some("test_result.v1".into()),
             artifact_hash: Some("test-result-hash".into()),

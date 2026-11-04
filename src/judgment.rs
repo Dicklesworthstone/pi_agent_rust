@@ -341,7 +341,7 @@ impl Judge {
 
     /// One privacy projection covers every text field before either operation can
     /// admit a provider. The borrowed callback is never retained by this binding.
-    fn screen(
+    pub(crate) fn screen(
         &self,
         system: &str,
         prompt: &str,

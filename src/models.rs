@@ -885,7 +885,16 @@ pub(crate) struct PreparedModelCatalogProviderConfig {
 
 impl PreparedModelCatalogProviderConfig {
     pub(crate) fn requires_runtime_api_key(&self) -> bool {
-        self.route.auth_header && !has_complete_custom_authorization_header(&self.route.headers)
+        // Native model-list APIs do not use a Bearer Authorization header.
+        // Their separate credential channels still participate in the normal
+        // deferred credential resolver and models.json fallback.
+        match self.route.api.as_str() {
+            "anthropic-messages" => !self.route.headers.keys().any(|name|
+                name.eq_ignore_ascii_case("x-api-key")),
+            "google-generative-ai" => !self.route.headers.keys().any(|name|
+                name.eq_ignore_ascii_case("x-goog-api-key")),
+            _ => self.route.auth_header && !has_complete_custom_authorization_header(&self.route.headers),
+        }
     }
 
     pub(crate) fn into_route(

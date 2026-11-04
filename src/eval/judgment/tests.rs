@@ -16,6 +16,138 @@ use std::time::{Duration, Instant};
 
 const ANSWER: &str = r#"{"q":0.8}"#;
 
+struct SearchHost {
+    reads: Mutex<HashMap<String, String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::tools::ToolInvocationHost for SearchHost {
+    async fn call_tool(&self, call: crate::model::ToolCall, expected_session: &str) -> Result<ToolOutput> {
+        assert_eq!(expected_session, "search-owner");
+        if call.name != "read" { return Err(Error::tool("search", "unexpected tool")); }
+        let path = call.arguments["path"].as_str().unwrap();
+        let files = self.reads.lock().unwrap();
+        let source = files.get(path).ok_or_else(|| Error::tool("read", "denied"))?;
+        Ok(ToolOutput { content:vec![ContentBlock::Text(TextContent::new(source))], details:None,is_error:false })
+    }
+}
+
+#[test]
+fn semantic_search_reuses_bound_judge_and_host_with_explicit_partial_states() {
+    let provider = RecordedProvider::new([
+        Reply::Answer(r#"{"q":0.9}"#),
+        Reply::Answer(r#"{"q":0.8}"#),
+        Reply::Answer(r#"{"q0":0.9}"#),
+    ]);
+    let host = SearchHost { reads:Mutex::new(HashMap::from([
+        ("signup.rs".into(),"    1→pub fn signup() { create_account(); }".into()),
+    ])) };
+    let mut invocation = Invocation::new(Some(provider.judge()), &json!({}), None).unwrap().with_host(Some(&host));
+    invocation.bind_host_session("search-owner");
+    let tool = EvalTool::new(Path::new("."));
+    let report = runtime().block_on(invocation.dispatch(&tool, search::BRIDGE_NAME,
+        json!({"question":"where is account registration implemented?","paths":["signup.rs","denied.rs"]}))).unwrap();
+    let report:Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["status"],"partial");
+    assert_eq!(report["files"][0]["status"],"verified");
+    assert_eq!(report["files"][0]["start_line"],1);
+    assert_eq!(report["files"][0]["structure"]["symbols"][0]["name"], "signup");
+    assert_eq!(report["files"][0]["structure"]["symbols"][0]["provenance"], "EXTRACTED");
+    assert_eq!(report["files"][0]["judgment_provenance"], "INFERRED");
+    assert_eq!(report["failures"][0]["answer"],"failed");
+    assert_eq!(invocation.receipts.len(),3);
+    assert_eq!(provider.prompts.lock().unwrap().len(),3);
+}
+
+#[test]
+fn predicate_audit_preserves_unknown_and_failure_instead_of_claiming_clean() {
+    let provider = RecordedProvider::new([Reply::Answer(r#"{"q":0.5}"#)]);
+    let host = SearchHost { reads:Mutex::new(HashMap::from([
+        ("handler.rs".into(),"    1→pub fn handler() { middleware(); }".into()),
+    ])) };
+    let mut invocation = Invocation::new(Some(provider.judge()), &json!({}), None).unwrap().with_host(Some(&host));
+    invocation.bind_host_session("search-owner");
+    let report = runtime().block_on(invocation.dispatch(&EvalTool::new(Path::new(".")), search::BRIDGE_NAME,
+        json!({"question":"does the handler check identity?","paths":["handler.rs","denied.rs"],"predicate":true}))).unwrap();
+    let report:Value=serde_json::from_str(&report).unwrap();
+    assert_eq!(report["files"][0]["answer"],"unknown");
+    assert_eq!(report["failures"][0]["answer"],"failed");
+    assert_eq!(report["scores_calibrated"],false);
+    assert_eq!(invocation.receipts.len(),1);
+}
+
+#[test]
+fn search_checks_full_source_privacy_before_reducing_declarations() {
+    let provider = RecordedProvider::new([]);
+    let host = SearchHost { reads:Mutex::new(HashMap::from([
+        ("file.rs".into(),"    1→pub fn safe() {}\n    2→let secret = CANARY;".into()),
+    ])) };
+    let protect = |parts: &[&str]| -> Result<Vec<String>> {
+        if parts.iter().any(|part| part.contains("CANARY")) {
+            Err(Error::tool("judge", "blocked sensitive source"))
+        } else { Ok(parts.iter().map(|part| (*part).to_owned()).collect()) }
+    };
+    let mut invocation = Invocation::new(Some(provider.judge()), &json!({}), Some(&protect)).unwrap().with_host(Some(&host));
+    invocation.bind_host_session("search-owner");
+    let result = runtime().block_on(invocation.dispatch(&EvalTool::new(Path::new(".")), search::BRIDGE_NAME,
+        json!({"question":"find a safe function","paths":["file.rs"]})));
+    assert!(result.is_err());
+    assert!(provider.prompts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn search_without_explicit_model_admission_does_not_read_source() {
+    let mut invocation = Invocation::new(None, &json!({}), None).unwrap();
+    let result = runtime().block_on(invocation.dispatch(&EvalTool::new(Path::new(".")), search::BRIDGE_NAME,
+        json!({"question":"find registration","paths":["file.rs"]})));
+    assert!(result.unwrap_err().contains("PI_JUDGE_UNBOUND"));
+    assert!(invocation.tool_receipts.is_empty());
+}
+
+#[test]
+fn full_verification_overrides_the_screening_answer() {
+    let provider = RecordedProvider::new([
+        Reply::Answer(r#"{"q":0.9}"#), Reply::Answer(r#"{"q":0.1}"#),
+    ]);
+    let host = SearchHost { reads:Mutex::new(HashMap::from([
+        ("file.rs".into(),"    1→pub fn unrelated() {}".into()),
+    ])) };
+    let mut invocation = Invocation::new(Some(provider.judge()), &json!({}), None).unwrap().with_host(Some(&host));
+    invocation.bind_host_session("search-owner");
+    let report = runtime().block_on(invocation.dispatch(&EvalTool::new(Path::new(".")), search::BRIDGE_NAME,
+        json!({"question":"find registration","paths":["file.rs"]}))).unwrap();
+    let report:Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["files"][0]["answer"],"no");
+    assert_eq!(report["files"][0]["score"],0.1);
+    assert!(report["files"][0].get("start_line").is_none());
+    assert_eq!(invocation.receipts.len(),2);
+}
+
+#[test]
+fn one_file_search_can_use_the_last_three_shared_attempts() {
+    let provider = RecordedProvider::new(
+        std::iter::repeat_with(|| Reply::Answer(ANSWER)).take(15)
+            .chain(std::iter::once(Reply::Answer(r#"{"q0":0.8}"#))),
+    );
+    let host = SearchHost { reads:Mutex::new(HashMap::from([
+        ("file.rs".into(),"1→pub fn signup() {}".into()),
+    ])) };
+    let mut invocation = Invocation::new(Some(provider.judge()), &json!({}), None).unwrap().with_host(Some(&host));
+    invocation.bind_host_session("search-owner");
+    let report = runtime().block_on(async {
+        for _ in 0..13 {
+            invocation.evaluate(Path::new("."), json!({"state":"prior work",
+                "questions":{"q":{"type":"bool","instructions":"Is work complete?"}}})).await.unwrap();
+        }
+        invocation.dispatch(&EvalTool::new(Path::new(".")), search::BRIDGE_NAME,
+            json!({"question":"find registration","paths":["file.rs"]})).await.unwrap()
+    });
+    let report:Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(report["files"][0]["status"], "verified");
+    assert_eq!(report["files"][0]["start_line"], 1);
+    assert_eq!(invocation.receipts.len(), MAX_CALLS);
+}
+
 enum Reply {
     Answer(&'static str),
     Pending,

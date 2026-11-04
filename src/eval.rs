@@ -784,6 +784,11 @@ impl Tool for EvalTool {
          Native call receipts are included in result details. For typed judgments, \
          set judge_model={provider,model} or {role:'smol'} for this cell, then call \
          __pi_judge through tool.call with {state,questions,images?} and parse its JSON. \
+         For semantic code search call __pi_search with {question,paths:[workspace-relative files]} \
+         or {question,path:directory,pattern:glob}; predicate:true audits a question across full source. \
+         Search requires this cell's judge_model and the Agent's read/find tools, shares its \
+         16-attempt model budget, admits at most eight files of 48 KiB rendered text each, \
+         and reports phase coverage plus uncalibrated yes/no/unknown/failed outcomes. \
          Questions use bool/choice/score rubrics. images is an array of local paths \
          or {type:'image',data:base64,mimeType}; detail may only be omitted or auto. \
          PNG/JPEG/GIF/WebP require host/catalog-declared image support, at most \

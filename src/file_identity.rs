@@ -28,7 +28,7 @@ use std::path::Path;
 /// Compare identities only against identities read on the same machine and
 /// within the same process lifetime — an inode number, like a Windows file
 /// index, is reused after the file is deleted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     /// `st_dev` on Unix, the volume serial number on Windows.
     volume: u64,

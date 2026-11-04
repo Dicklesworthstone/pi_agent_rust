@@ -61,8 +61,118 @@ fn temp_root_create_error(err: &IoError) -> String {
     format!("create temp root: {err}")
 }
 
+#[test]
+fn reuse_binds_workspace_and_executable_bytes_before_and_after_validation() -> TestResult {
+    let root = temp_root("freshness")?;
+    let tool = temp_root("freshness_tool")?.join("validator.exe");
+    std::fs::write(&tool, b"validator v1").map_err(to_string)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).map_err(to_string)?;
+    }
+    let mut request = base_request("freshness");
+    request.cwd = root.to_string_lossy().into_owned();
+    request.command = vec![tool.to_string_lossy().into_owned()];
+    let artifacts = vec![ValidationSlotArtifact {
+        path: "result.json".into(),
+        sha256: Some("result".into()),
+        schema: Some("test.v1".into()),
+    }];
+    for path in ["source.rs", "Cargo.toml", "Cargo.lock"] {
+        let input = root.join(path);
+        std::fs::write(&input, b"original").map_err(to_string)?;
+        let mut lease =
+            ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone())
+            .map_err(to_string)?;
+        require(
+            lease.matches_request_equivalence(&request).map_err(to_string)?,
+            "unchanged bytes reuse",
+        )?;
+        std::fs::write(&input, b"modified").map_err(to_string)?;
+        require(
+            !lease.matches_request_equivalence(&request).map_err(to_string)?,
+            "same HEAD with changed bytes cannot reuse",
+        )?;
+        require(
+            lease.mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()).is_err(),
+            "changed during validation cannot become reusable",
+        )?;
+        std::fs::write(&input, b"original").map_err(to_string)?;
+    }
+    let lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    std::fs::create_dir(root.join("empty_input_directory")).map_err(to_string)?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "empty input directory creation invalidates validation",
+    )?;
+    let mut lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    std::fs::write(&tool, b"validator v2").map_err(to_string)?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "external executable changes cannot reuse",
+    )?;
+    require(
+        lease.mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()).is_err(),
+        "tool changed during validation",
+    )?;
+    let mut legacy = serde_json::to_value(&lease).map_err(to_string)?;
+    legacy
+        .as_object_mut()
+        .ok_or("lease object")?
+        .remove("input_identity");
+    lease = serde_json::from_value(legacy).map_err(to_string)?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "legacy identity cannot reuse",
+    )?;
+    require(
+        lease.mark_reusable("SilentReef", HEARTBEAT, artifacts).is_err(),
+        "legacy identity cannot become reusable",
+    )
+}
+
+#[test]
+fn unavailable_identity_is_never_reusable() -> TestResult {
+    let mut request = base_request("unavailable-identity");
+    request.command = vec!["unavailable-validator".into()];
+    let mut lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    require(
+        lease.input_identity.is_none(),
+        "unresolvable tool has no identity",
+    )?;
+    require(
+        !lease.matches_request_equivalence(&request).map_err(to_string)?,
+        "unavailable identity fails closed",
+    )?;
+    require(
+        lease.mark_reusable("SilentReef", HEARTBEAT, vec![ValidationSlotArtifact {
+            path: "result.json".into(),
+            sha256: None,
+            schema: None,
+        }]).is_err(),
+        "missing inputs cannot become reusable",
+    )
+}
+
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
+    static WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let workspace = WORKSPACE.get_or_init(|| {
+        let root = temp_root("fixture_workspace").expect("fixture workspace");
+        for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+            std::fs::write(root.join(name), b"validation fixture executable").expect("fixture tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)).expect("executable fixture tool");
+            }
+        }
+        root
+    });
     let mut environment = BTreeMap::new();
+    environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
     environment.insert(
         "CARGO_TARGET_DIR".to_string(),
         "/data/tmp/pi_agent_rust_cargo/silentreef/target".to_string(),
@@ -85,7 +195,7 @@ fn base_request(slot_id: &str) -> ValidationSlotRequest {
             "--all-targets".to_string(),
         ],
         command_class: "cargo_check".to_string(),
-        cwd: "/data/projects/pi_agent_rust".to_string(),
+        cwd: workspace.to_string_lossy().into_owned(),
         git_head: "cf653c29b5836afabf979bb44325d4712de7088d".to_string(),
         feature_flags: vec!["default".to_string()],
         target_dir: "/data/tmp/pi_agent_rust_cargo/silentreef/target".to_string(),
