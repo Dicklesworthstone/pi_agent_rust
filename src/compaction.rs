@@ -2368,27 +2368,47 @@ async fn complete_simple(
 
     while let Some(event) = stream.next().await {
         match event? {
-            crate::model::StreamEvent::Done { message, .. } => {
+            crate::model::StreamEvent::Done { reason, message } => {
+                if reason == StopReason::Aborted || message.stop_reason == StopReason::Aborted {
+                    return Err(Error::Aborted);
+                }
+                if reason == StopReason::Error || message.stop_reason == StopReason::Error {
+                    return Err(summary_response_error(message.error_message));
+                }
                 final_message = Some(message);
             }
-            crate::model::StreamEvent::Error { error, .. } => {
-                let msg = error
-                    .error_message
-                    .unwrap_or_else(|| "Summarization error".to_string());
-                return Err(Error::api(msg));
+            crate::model::StreamEvent::Error { reason, error } => {
+                if reason == StopReason::Aborted || error.stop_reason == StopReason::Aborted {
+                    return Err(Error::Aborted);
+                }
+                return Err(summary_response_error(error.error_message));
             }
             _ => {}
         }
     }
 
-    let message = final_message.ok_or_else(|| Error::api("Stream ended without Done event"))?;
-    if matches!(message.stop_reason, StopReason::Aborted | StopReason::Error) {
-        let msg = message
-            .error_message
-            .unwrap_or_else(|| "Summarization error".to_string());
-        return Err(Error::api(msg));
+    final_message.ok_or_else(|| Error::api("Stream ended without Done event"))
+}
+
+fn summary_response_error(message: Option<String>) -> Error {
+    let message = message.unwrap_or_else(|| "Summarization error".to_string());
+    if message.contains(Error::SESSION_PERSISTENCE_PREFIX) {
+        Error::session_persistence(message)
+    } else {
+        Error::api(message)
     }
-    Ok(message)
+}
+
+/// Only a failed provider response may degrade to a local summary. Refused
+/// admission, cancellation, accounting and durable-session errors must remain
+/// observable even when the history is far beyond the model's window.
+fn summary_fallback_allowed(error: &Error) -> bool {
+    match error {
+        Error::Api(message) | Error::Provider { message, .. } => {
+            !message.contains(Error::SESSION_PERSISTENCE_PREFIX)
+        }
+        _ => false,
+    }
 }
 
 fn summary_prompt_text(
@@ -3241,7 +3261,12 @@ pub async fn compact(
             // storing a degraded truncation summary, so propagate the error
             // and let the worker's cooldown/attempt-limit machinery (and
             // eventually the forced-local failsafe) govern.
-            if !requires_forced_local_compaction(preparation.tokens_before, &preparation.settings) {
+            if !summary_fallback_allowed(&error)
+                || !requires_forced_local_compaction(
+                    preparation.tokens_before,
+                    &preparation.settings,
+                )
+            {
                 return Err(error);
             }
             tracing::warn!(
@@ -6614,6 +6639,91 @@ mod tests {
             }
         }
 
+        struct RefusingProvider {
+            failure: fn() -> Error,
+            at_setup: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Provider for RefusingProvider {
+            fn name(&self) -> &str {
+                "test-refusing"
+            }
+
+            fn api(&self) -> &str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>,
+            > {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let error = (self.failure)();
+                if self.at_setup {
+                    Err(error)
+                } else {
+                    Ok(Box::pin(futures::stream::iter(vec![Err(error)])))
+                }
+            }
+        }
+
+        struct TerminalProvider {
+            done: bool,
+            reason: StopReason,
+            stop_reason: StopReason,
+        }
+
+        #[async_trait]
+        impl Provider for TerminalProvider {
+            fn name(&self) -> &str {
+                "test-terminal"
+            }
+
+            fn api(&self) -> &str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>,
+            > {
+                let message = AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("incomplete summary"))],
+                    stop_reason: self.stop_reason,
+                    error_message: Some("terminal summary failure".to_string()),
+                    ..AssistantMessage::default()
+                };
+                let event = if self.done {
+                    crate::model::StreamEvent::Done {
+                        reason: self.reason,
+                        message,
+                    }
+                } else {
+                    crate::model::StreamEvent::Error {
+                        reason: self.reason,
+                        error: message,
+                    }
+                };
+                Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+            }
+        }
+
         fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
@@ -6640,6 +6750,120 @@ mod tests {
                 file_ops,
                 settings: ResolvedCompactionSettings::default(),
             }
+        }
+
+        #[test]
+        fn oversized_compaction_preserves_admission_and_durability_refusals() {
+            let failures: [fn() -> Error; 8] = [
+                || Error::Aborted,
+                || Error::CostCap {
+                    spent: 2.0,
+                    cap: 1.0,
+                },
+                || Error::session("model cost accounting is unavailable"),
+                || Error::session_persistence("summary owner is quarantined"),
+                || Error::validation("summary privacy policy refused the request"),
+                || Error::auth("credentials are unavailable"),
+                || std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+                || {
+                    Error::api(format!(
+                        "{}lost durable accounting",
+                        Error::SESSION_PERSISTENCE_PREFIX
+                    ))
+                },
+            ];
+            run_async(async {
+                for failure in failures {
+                    for at_setup in [true, false] {
+                        let provider = Arc::new(RefusingProvider {
+                            failure,
+                            at_setup,
+                            calls: std::sync::atomic::AtomicUsize::new(0),
+                        });
+                        let mut preparation = make_preparation();
+                        preparation.is_split_turn = true;
+                        preparation.turn_prefix_messages = vec![make_user_text("retain this turn")];
+                        let error = compact(
+                            preparation,
+                            provider.clone(),
+                            &StreamOptions::default(),
+                            None,
+                            &CompactionPrivacy::default(),
+                        )
+                        .await
+                        .expect_err("a refusal must not authorize local history replacement");
+                        let expected = failure();
+                        assert_eq!(
+                            std::mem::discriminant(&error),
+                            std::mem::discriminant(&expected)
+                        );
+                        assert_eq!(error.to_string(), expected.to_string());
+                        assert_eq!(
+                            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                            1,
+                            "a refused history summary must not dispatch the split-turn summary"
+                        );
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn exhausted_real_cost_budget_never_produces_a_local_compaction() {
+            run_async(async {
+                let budget = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
+                let provider = Arc::new(RefusingProvider {
+                    failure: || Error::api("this provider must not be entered"),
+                    at_setup: true,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let guarded = crate::provider::guard_with_cost_budget(provider.clone(), budget);
+                let error = compact(
+                    make_preparation(),
+                    guarded,
+                    &StreamOptions::default(),
+                    None,
+                    &CompactionPrivacy::default(),
+                )
+                .await
+                .expect_err("a cost refusal must survive the oversized-session failsafe");
+                assert!(matches!(
+                    error,
+                    Error::CostCap {
+                        spent: 1.0,
+                        cap: 1.0
+                    }
+                ));
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            });
+        }
+
+        #[test]
+        fn aborted_terminal_frames_never_become_successful_local_summaries() {
+            run_async(async {
+                for done in [false, true] {
+                    for (reason, stop_reason) in [
+                        (StopReason::Aborted, StopReason::Stop),
+                        (StopReason::Stop, StopReason::Aborted),
+                        (StopReason::Aborted, StopReason::Aborted),
+                    ] {
+                        let error = compact(
+                            make_preparation(),
+                            Arc::new(TerminalProvider {
+                                done,
+                                reason,
+                                stop_reason,
+                            }),
+                            &StreamOptions::default(),
+                            None,
+                            &CompactionPrivacy::default(),
+                        )
+                        .await
+                        .expect_err("terminal cancellation must not truncate history");
+                        assert!(matches!(error, Error::Aborted));
+                    }
+                }
+            });
         }
 
         #[test]
