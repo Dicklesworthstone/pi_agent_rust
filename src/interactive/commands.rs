@@ -1719,6 +1719,10 @@ impl PiApp {
                 .handle
                 .session_mut()
                 .set_compaction_context_window(target_entry.model.context_window);
+        } else {
+            // A catalog refresh can retain the same provider/model identity
+            // while withdrawing its window metadata, without set_provider.
+            agent_guard.set_context_window_tokens(None);
         }
         agent_guard
             .handle

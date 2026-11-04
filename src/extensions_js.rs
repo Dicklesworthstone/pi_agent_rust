@@ -24167,6 +24167,28 @@ function __pi_make_extension_ctx(ctx_payload) {
     const modelCatalog =
         ctx_payload && Array.isArray(ctx_payload.models) ? ctx_payload.models : [];
 
+    // A native request snapshot, independent of the cached session entries.
+    // Copy only public numeric fields before handlers can mutate the payload.
+    // No previous-event fallback: missing data must not revive another model
+    // or session's usage. Each getter returns an independent value.
+    let contextUsage;
+    const usage = ctx_payload && ctx_payload.contextUsage;
+    if (usage && typeof usage === 'object' && !Array.isArray(usage)) {
+        const window = usage.contextWindow;
+        const tokens = usage.tokens;
+        if (
+            Number.isSafeInteger(window) && window > 0 &&
+            (tokens === null || (Number.isSafeInteger(tokens) && tokens >= 0))
+        ) {
+            contextUsage = {
+                tokens,
+                contextWindow: window,
+                // Percent means 0..100, not a fraction. Do not clamp overflow.
+                percent: tokens === null ? null : (tokens / window) * 100,
+            };
+        }
+    }
+
     const sessionManager = {
         getEntries: () => entries,
         getBranch: () => branch,
@@ -24183,6 +24205,7 @@ function __pi_make_extension_ctx(ctx_payload) {
         sessionManager: sessionManager,
         model: model,
         getSystemPrompt: () => __pi_current_system_prompt,
+        getContextUsage: () => contextUsage === undefined ? undefined : { ...contextUsage },
         modelRegistry: {
             // Synchronous catalog lookup (upstream ModelRegistry.find parity,
             // gh #167 / bd-t9n21). Consumers call it without await (e.g.
@@ -28130,11 +28153,16 @@ mod tests {
     /// this receipt: pre-config main already contained 64_141 bytes, and
     /// 7684b1a adds 470 for typed configuration errors, yielding 64_611.
     /// Other pre-existing module receipt drift is not re-pinned here.
+    ///
+    /// Request-scoped context usage for gh #279 adds 1_070 bytes to the
+    /// second bridge literal: 250_442 -> 251_512. It projects host usage
+    /// into a synchronous getter without caching it across dispatches.
+    /// Published compression and native snapshot regressions cover this edit.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            250_442,
-            "aa9bc50d0adfa31a2d2f8952cb168f8be6ca5a44414883e410d592299f4e9a9c",
+            251_512,
+            "5a06bb71e394e64638d9076539fe54320e9d92bf03e7aadc6fe4be56eb34f76b",
         ),
         (
             "node:fs",
@@ -28356,6 +28384,70 @@ mod tests {
             );
             clock.set(next_deadline);
         }
+    }
+
+    #[test]
+    fn extension_context_usage_is_a_fresh_request_snapshot() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.usage", {name: "ext.usage"});
+                    globalThis.usageProbe = { captures: [] };
+                    pi.on("context", (_event, ctx) => {
+                        const value = ctx.getContextUsage();
+                        globalThis.usageProbe.captures.push(value === undefined ? "unknown" : value);
+                        if (value !== undefined) {
+                            value.tokens = -1;
+                            value.contextWindow = 1;
+                            globalThis.usageProbe.captures.push(ctx.getContextUsage());
+                        }
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    const dispatch = (payload) => __pi_dispatch_extension_event(
+                        __pi_test_secret, "context", {messages: [], contextUsage: {tokens: 99}}, payload
+                    );
+                    dispatch({contextUsage: {tokens: 60000, contextWindow: 200000, percent: 999, secret: "hidden"}})
+                        .then(() => dispatch({contextUsage: {tokens: null, contextWindow: 100000}}))
+                        .then(() => dispatch({contextUsage: {tokens: 150, contextWindow: 100}}))
+                        .then(() => dispatch({contextUsage: {tokens: 1, contextWindow: 0}}))
+                        .then(() => dispatch({contextUsage: {tokens: -1, contextWindow: 100}}))
+                        .then(() => dispatch({contextUsage: {tokens: "1", contextWindow: 100}}))
+                        .then(() => dispatch({sessionState: {sessionId: "other-session"}}))
+                        .then(() => dispatch({}))
+                        .catch((error) => { globalThis.usageProbe.error = String(error); })
+                        .finally(() => { globalThis.usageProbe.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch context usage snapshots");
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "usageProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            let captures = probe["captures"].as_array().expect("usage captures");
+            assert_eq!(captures.len(), 11);
+            assert_eq!(
+                captures[1],
+                json!({"tokens": 60000, "contextWindow": 200000, "percent": 30})
+            );
+            assert_eq!(
+                captures[3],
+                json!({"tokens": null, "contextWindow": 100000, "percent": null})
+            );
+            assert_eq!(
+                captures[5],
+                json!({"tokens": 150, "contextWindow": 100, "percent": 150})
+            );
+            for value in &captures[6..] {
+                assert_eq!(value, "unknown");
+            }
+        });
     }
 
     // ── gh #167 extension-API parity: ctx.model / getSystemPrompt /

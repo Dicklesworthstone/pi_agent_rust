@@ -4621,6 +4621,7 @@ impl ExtensionManager {
         event: ExtensionEventName,
         data: Option<Value>,
         timeout_ms: u64,
+        context_usage: Option<ExtensionContextUsage>,
     ) -> Result<Option<Value>> {
         let started_at = Instant::now();
         let timeout_ms = self.effective_timeout(timeout_ms);
@@ -4676,7 +4677,15 @@ impl ExtensionManager {
         );
 
         // --- Use cached context when generation hasn't changed ---
-        let ctx_payload = self.get_or_build_ctx_payload().await;
+        let mut ctx_payload = self.get_or_build_ctx_payload().await;
+        if let Some(usage) = context_usage {
+            // This request's estimate must never enter the generation-cached
+            // base context: messages can advance without registry mutations,
+            // and other events must not inherit another request's usage.
+            if let Some(ctx) = Arc::make_mut(&mut ctx_payload).as_object_mut() {
+                ctx.insert("contextUsage".into(), json!(usage));
+            }
+        }
 
         let event_payload = match data {
             None => json!({ "type": event_name }),
@@ -4820,7 +4829,7 @@ impl ExtensionManager {
         data: Option<Value>,
     ) -> Result<()> {
         let _ = self
-            .dispatch_event_value(event, data, event.default_timeout_ms())
+            .dispatch_event_value(event, data, event.default_timeout_ms(), None)
             .await?;
         Ok(())
     }
@@ -4832,7 +4841,21 @@ impl ExtensionManager {
         data: Option<Value>,
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
-        self.dispatch_event_value(event, data, timeout_ms).await
+        self.dispatch_event_value(event, data, timeout_ms, None)
+            .await
+    }
+
+    /// Dispatch the active request's context with its fresh native estimate.
+    /// This is deliberately separate from arbitrary event data: extensions
+    /// cannot supply the host snapshot through a context transform result.
+    pub(crate) async fn dispatch_context_with_usage(
+        &self,
+        data: Value,
+        usage: Option<ExtensionContextUsage>,
+        timeout_ms: u64,
+    ) -> Result<Option<Value>> {
+        self.dispatch_event_value(ExtensionEventName::Context, Some(data), timeout_ms, usage)
+            .await
     }
 
     /// Dispatch `user_bash` for a `!command` the user typed. A hook that ran
@@ -4961,7 +4984,10 @@ impl ExtensionManager {
         data: Option<Value>,
         timeout_ms: u64,
     ) -> Result<bool> {
-        let Some(response) = self.dispatch_event_value(event, data, timeout_ms).await? else {
+        let Some(response) = self
+            .dispatch_event_value(event, data, timeout_ms, None)
+            .await?
+        else {
             return Ok(false);
         };
 
@@ -5318,13 +5344,26 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
-    /// Check whether any extension has registered a hook for the given event
-    /// name.  O(1) lookup via pre-computed bitmap.
-    ///
-    /// Lock-free: reads from the RCU snapshot.
+    /// Check whether any extension has registered a hook for the given event.
+    /// JavaScript hooks use the lock-free, O(1) registry bitmap. Optional WASM
+    /// registrations live outside that bitmap and are checked on a miss.
     pub fn has_hook_for(&self, event_name: &str) -> bool {
-        let snap = self.read_snapshot();
-        snap.hook_bitmap.contains(event_name)
+        if self.read_snapshot().hook_bitmap.contains(event_name) {
+            return true;
+        }
+        #[cfg(feature = "wasm-host")]
+        {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .wasm_extensions
+                .iter()
+                .any(|ext| ext.event_hooks().iter().any(|hook| hook == event_name))
+        }
+        #[cfg(not(feature = "wasm-host"))]
+        false
     }
 
     /// Returns `true` if at least one event hook is registered across all

@@ -13,10 +13,15 @@
  * Every source file consumed below is separately pinned by SHA-256. Package
  * source is only type-stripped in memory, never rewritten or vendored.
  *
- * This evaluates the actual published config loader and extension factory
- * with PiJS's verbatim fs/path/TypeBox JavaScript, controlled native callbacks,
- * and a small extension API fixture. Host ownership, native filesystem safety,
- * the Rust/QuickJS loader, and Windows execution are NOT tested by this probe.
+ * This evaluates the actual published config loader, extension factory and
+ * compression lifecycle with PiJS's verbatim fs/path/TypeBox/context JavaScript,
+ * controlled native callbacks, UI notifications and an extension API fixture.
+ * Host ownership, native filesystem safety, native token estimation, the
+ * Rust/QuickJS loader, and Windows execution are NOT tested by this probe.
+ * Context-usage values below are explicit host-payload fixtures. Published
+ * 0.2.0 treats its L2 threshold as a fraction but reads Pi's 0-100 percent
+ * directly; the L2 case records this separate package limitation and uses an
+ * explicit threshold of 90 when checking correctly scaled usage delivery.
  * --windows projects path/platform metadata in V8 on the current OS only.
  * V8 vm is not a security boundary for arbitrary untrusted packages. DSR
  * remains the authoritative gate: dsr quality --tool pi_agent_rust.
@@ -80,11 +85,16 @@ function embeddedModule(name) {
   return rustSource.slice(body, end);
 }
 const embedded = new Map(['node:fs', 'node:path', '@sinclair/typebox'].map(name => [name, embeddedModule(name)]));
+const contextStart = rustSource.indexOf('function __pi_make_extension_ctx(ctx_payload) {');
+const contextEnd = rustSource.indexOf('// Capture the JSON reader and native snapshotter', contextStart);
+assert(contextStart >= 0 && contextEnd > contextStart, 'Embedded context builder and model projection not found.');
+const embeddedContext = rustSource.slice(contextStart, contextEnd);
 console.log('# ' + JSON.stringify({
   package: `${manifest.name}@${manifest.version}`, runtime: process.version,
   platform: process.platform, projectedWindowsPaths: values.windows ?? false,
   source: sourcePath, embeddedSha256: Object.fromEntries([...embedded].map(([name, text]) => [name, sha256(text)])),
-  verification: 'V8 source diagnostic with fixture host callbacks; not native authorization or Windows execution',
+  embeddedContextSha256: sha256(embeddedContext),
+  verification: 'V8 source diagnostic with fixture host callbacks and usage payloads; not native authorization, token estimation or Windows execution',
 }));
 
 async function fixture({ raw, denied = false, ioError = null } = {}) {
@@ -92,7 +102,7 @@ async function fixture({ raw, denied = false, ioError = null } = {}) {
   const cwd = values.windows ? 'C:\\workspace' : '/fixture/workspace';
   const configPath = `${home.replaceAll('\\', '/')}/.pi/agent/extensions/context-engineering/config.json`;
   const virtualPath = `${cwd.replaceAll('\\', '/')}/extension-local.txt`;
-  const state = { raw, denied, ioError, reads: [], stats: [], writes: [], readChecks: [] };
+  const state = { raw, denied, ioError, reads: [], stats: [], writes: [], readChecks: [], notifications: [] };
   const normalize = input => String(input).replaceAll('\\', '/');
   const errno = (code, message) => Object.assign(new Error(message), { code });
   const authorize = input => {
@@ -105,6 +115,11 @@ async function fixture({ raw, denied = false, ioError = null } = {}) {
   const context = vm.createContext({
     Buffer, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
     process: { platform: values.windows ? 'win32' : 'linux', cwd: () => cwd, env: {} },
+    __pi_session_identity: { id: null, file: null, dir: null },
+    __pi_current_system_prompt: null,
+    __pi_make_extension_ui: () => ({
+      notify(message, level) { state.notifications.push({ message, level }); },
+    }),
     __pi_get_current_extension_id: () => 'context-engineering',
     __pi_host_temp_roots_json: () => '[]',
     __pi_host_check_read_access: authorize,
@@ -134,6 +149,10 @@ async function fixture({ raw, denied = false, ioError = null } = {}) {
       return JSON.stringify({ kind: 'file', size: Buffer.byteLength(state.raw) });
     },
   });
+  vm.runInContext(embeddedContext, context, { timeout: 2000, filename: `${sourcePath}#extension-context` });
+  function makeContext(payload = {}) {
+    return context.__pi_make_extension_ctx({ hasUI: true, cwd, ...payload });
+  }
   const modules = new Map();
   function synthetic(name, exports) {
     return new vm.SyntheticModule(Object.keys(exports), function () {
@@ -168,7 +187,35 @@ async function fixture({ raw, denied = false, ioError = null } = {}) {
     return module.namespace;
   }
   const config = await load('src/config.ts');
-  return { state, configPath, virtualPath, config, load };
+  return { state, configPath, virtualPath, config, load, makeContext };
+}
+
+async function publishedExtension(override) {
+  const f = await fixture({ raw: JSON.stringify({ 'context-engineering': override }) });
+  const events = new Map(), commands = new Map(), tools = new Map();
+  (await f.load('index.ts')).default({
+    on(name, handler) { assert(!events.has(name)); events.set(name, handler); },
+    registerTool(tool) { assert(!tools.has(tool.name)); tools.set(tool.name, tool); },
+    registerCommand(name, command) { assert(!commands.has(name)); commands.set(name, command); },
+  });
+  return { ...f, events, commands, tools };
+}
+
+function compressionConfig(level, options = {}) {
+  return {
+    mc: { enabled: false }, budget: { enabled: false }, l0: { enabled: false },
+    l1: { enabled: false }, l2: { enabled: false },
+    [level]: { enabled: true, ...options },
+  };
+}
+
+function toolMessages() {
+  const text = 'ORIGINAL_PAYLOAD_279_'.repeat(100);
+  return [
+    { role: 'user', content: 'Read the file', timestamp: 1 },
+    { role: 'assistant', content: [{ type: 'toolCall', id: 'read-279', name: 'read', arguments: { path: 'fixture.txt' } }], timestamp: 2 },
+    { role: 'toolResult', toolCallId: 'read-279', toolName: 'read', content: [{ type: 'text', text }], isError: false, timestamp: 3 },
+  ];
 }
 
 test('published loader reads its expected configuration layout and merges nested defaults', async () => {
@@ -277,4 +324,133 @@ test('ordinary extension-local virtual writes, appends and reads still work', as
   fs.appendFileSync(f.virtualPath, ' overlay');
   assert.equal(fs.readFileSync(f.virtualPath, 'utf8'), 'local overlay');
   assert.equal(f.state.raw, undefined, 'virtual writes must not change host configuration');
+});
+
+test('the actual context API synchronously returns a fresh usage projection in percentage units', async () => {
+  const f = await fixture();
+  const ctx = f.makeContext({ contextUsage: {
+    tokens: 60_000, contextWindow: 200_000, percent: 0.3,
+    privateMetadata: 'must not escape the usage projection',
+  } });
+  assert.equal(typeof ctx.getContextUsage, 'function');
+  const usage = ctx.getContextUsage();
+  assert.equal(usage?.then, undefined, 'getContextUsage must be synchronous');
+  assert.deepEqual(JSON.parse(JSON.stringify(usage)), { tokens: 60_000, contextWindow: 200_000, percent: 30 });
+  usage.tokens = 1;
+  usage.percent = 0.0005;
+  usage.added = 'extension mutation';
+  assert.deepEqual(JSON.parse(JSON.stringify(ctx.getContextUsage())), { tokens: 60_000, contextWindow: 200_000, percent: 30 });
+  const overWindow = f.makeContext({ contextUsage: { tokens: 220_000, contextWindow: 200_000, percent: 110 } });
+  assert(Math.abs(overWindow.getContextUsage().percent - 110) < 1e-10, 'over-capacity usage must not be clamped');
+});
+
+test('usage distinguishes unknown counts, zero tokens and absent authoritative snapshots', async () => {
+  const f = await fixture();
+  const unknown = f.makeContext({ contextUsage: { tokens: null, contextWindow: 200_000, percent: 30 } });
+  assert.deepEqual(JSON.parse(JSON.stringify(unknown.getContextUsage())), { tokens: null, contextWindow: 200_000, percent: null });
+  const known = f.makeContext({
+    sessionState: { sessionId: 'session-one' },
+    contextUsage: { tokens: 0, contextWindow: 200_000, percent: 0 },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(known.getContextUsage())), { tokens: 0, contextWindow: 200_000, percent: 0 });
+  assert.equal(f.makeContext({ sessionState: { sessionId: 'session-one' } }).getContextUsage(), undefined);
+  assert.equal(f.makeContext({ sessionState: { sessionId: 'session-two' } }).getContextUsage(), undefined);
+  assert.equal(f.makeContext().getContextUsage(), undefined, 'usage must not be carried over from another event or session');
+});
+
+test('malformed host usage does not become fabricated context data', async () => {
+  const f = await fixture();
+  for (const contextUsage of [
+    null, [], {},
+    { tokens: -1, contextWindow: 200_000, percent: -0.0005 },
+    { tokens: '60000', contextWindow: 200_000, percent: 30 },
+    { tokens: 60_000, contextWindow: 0, percent: 30 },
+    { tokens: 60_000, contextWindow: Infinity, percent: 30 },
+    { tokens: NaN, contextWindow: 200_000, percent: 30 },
+    { tokens: 1.5, contextWindow: 200_000 },
+    { tokens: Number.MAX_SAFE_INTEGER + 1, contextWindow: 200_000 },
+  ]) {
+    assert.equal(f.makeContext({ contextUsage }).getContextUsage(), undefined);
+  }
+});
+
+test('published context compression, frozen output, recall and statistics work with the actual context API', async () => {
+  const f = await publishedExtension(compressionConfig('budget', { maxToolResultCharsPerMessage: 80, previewSize: 12 }));
+  const ctx = f.makeContext();
+  const messages = toolMessages();
+  const original = messages[2].content[0].text;
+  const result = f.events.get('context')({ type: 'context', messages }, ctx);
+  assert(Array.isArray(result.messages), 'the published catch block must not silently discard compression because getContextUsage is missing');
+  const replacement = result.messages[2].content[0].text;
+  assert.match(replacement, /^\[Persisted output \(ID: ctx-[a-f0-9]{12}\)/);
+  assert(replacement.length < original.length);
+  assert.equal(messages[2].content[0].text, original, 'compression must leave the source message intact');
+  const id = /ctx-[a-f0-9]{12}/.exec(replacement)[0];
+  const recalled = await f.tools.get('recall_context').execute('recall-279', { id }, undefined, undefined, ctx);
+  assert.equal(recalled.details.found, true);
+  assert.equal(recalled.details.level, 'budget-persisted');
+  assert(recalled.content[0].text.endsWith(`\n\n${original}`));
+  const repeated = f.events.get('context')({ type: 'context', messages }, ctx);
+  assert.equal(repeated.messages[2].content[0].text, replacement, 'frozen output must reuse the same recall ID');
+  await f.commands.get('context-stats').handler('', ctx);
+  assert.match(f.state.notifications.at(-1).message, /Budget: persisted=1/);
+  assert.equal(f.state.notifications.at(-1).level, 'info');
+});
+
+test('published commands toggle subsequent context compression through the actual context object', async () => {
+  const f = await publishedExtension(compressionConfig('budget', { maxToolResultCharsPerMessage: 80, previewSize: 12 }));
+  const ctx = f.makeContext();
+  const messages = toolMessages();
+  await f.commands.get('context-engineering').handler('global off', ctx);
+  assert.equal(f.state.notifications.at(-1).message, 'Context engineering disabled.');
+  const disabled = f.events.get('context')({ type: 'context', messages }, ctx);
+  assert.equal(disabled.messages, messages);
+  await f.commands.get('context-engineering').handler('global on', ctx);
+  assert.equal(f.state.notifications.at(-1).message, 'Context engineering enabled.');
+  const enabled = f.events.get('context')({ type: 'context', messages }, ctx);
+  assert.match(enabled.messages[2].content[0].text, /^\[Persisted output/);
+});
+
+test('published session_start clears recall state and statistics while preserving configuration rereads', async () => {
+  const f = await publishedExtension(compressionConfig('budget', { maxToolResultCharsPerMessage: 80, previewSize: 12 }));
+  const ctx = f.makeContext({ sessionState: { sessionId: 'session-one' } });
+  const result = f.events.get('context')({ type: 'context', messages: toolMessages() }, ctx);
+  assert(Array.isArray(result.messages), 'context compression must complete before testing session reset');
+  const id = /ctx-[a-f0-9]{12}/.exec(result.messages[2].content[0].text)[0];
+  const next = f.makeContext({ sessionState: { sessionId: 'session-two' } });
+  f.events.get('session_start')({ type: 'session_start' }, next);
+  const recalled = await f.tools.get('recall_context').execute('after-reset', { id }, undefined, undefined, next);
+  assert.equal(recalled.details.found, false);
+  await f.commands.get('context-stats').handler('', next);
+  assert.match(f.state.notifications.at(-1).message, /Budget: persisted=0/);
+  assert.equal(f.state.reads.length, 2);
+  const fresh = f.events.get('context')({ type: 'context', messages: toolMessages() }, next);
+  assert.match(fresh.messages[2].content[0].text, /^\[Persisted output/);
+  await f.commands.get('context-stats').handler('', next);
+  assert.match(f.state.notifications.at(-1).message, /Budget: persisted=1/);
+});
+
+test('real percentage usage reaches published L2 with explicitly matching configuration', async t => {
+  const f = await publishedExtension(compressionConfig('l2', { emergencyThreshold: 90, protectRecentTurns: 0 }));
+  const messages = toolMessages();
+  const low = f.makeContext({ contextUsage: { tokens: 60_000, contextWindow: 200_000, percent: 30 } });
+  const lowResult = f.events.get('context')({ type: 'context', messages }, low);
+  assert(Array.isArray(lowResult.messages));
+  assert.equal(lowResult.messages[2].content[0].text, messages[2].content[0].text);
+  const high = f.makeContext({ contextUsage: { tokens: 190_000, contextWindow: 200_000, percent: 95 } });
+  const highResult = f.events.get('context')({ type: 'context', messages }, high);
+  assert.match(highResult.messages[2].content[0].text, /^\[Tool result expired/);
+
+  // Record the package's independent units mismatch without adapting Pi's API
+  // or presenting this observation as a successful default L2 behavior check.
+  const publishedDefault = await publishedExtension(compressionConfig('l2', { protectRecentTurns: 0 }));
+  const defaultContext = publishedDefault.makeContext({ contextUsage: { tokens: 60_000, contextWindow: 200_000, percent: 30 } });
+  const defaultResult = publishedDefault.events.get('context')({ type: 'context', messages }, defaultContext);
+  t.diagnostic(JSON.stringify({
+    knownPackageLimitation: '0.2.0 compares a fraction threshold directly with Pi percentage units',
+    configuredDefaultThreshold: publishedDefault.config.DEFAULT_CONFIG.l2.emergencyThreshold,
+    suppliedPercent: defaultContext.getContextUsage().percent,
+    expiredAtThirtyPercent: defaultResult.messages?.[2].content[0].text.startsWith('[Tool result expired'),
+    verification: 'observed package limitation; not default-L2 compatibility approval',
+  }));
 });

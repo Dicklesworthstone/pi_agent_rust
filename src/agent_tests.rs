@@ -4460,6 +4460,294 @@ mod tests {
         });
     }
 
+    async fn enable_context_usage_observer(session: &mut AgentSession, directory: &Path) {
+        let entry_path = directory.join("context-usage.mjs");
+        std::fs::write(
+            &entry_path,
+            r#"
+            export default function init(pi) {
+              pi.on("context", (event, ctx) => ({
+                messages: [...event.messages, {
+                  role: "user",
+                  content: JSON.stringify({ observedContextUsage: ctx.getContextUsage() ?? null }),
+                  timestamp: 17
+                }]
+              }));
+            }
+            "#,
+        )
+        .expect("write usage observer");
+        session
+            .enable_extensions(&[], directory, None, &[entry_path])
+            .await
+            .expect("enable usage observer");
+    }
+
+    fn observed_context_usage(messages: &[Message]) -> Value {
+        let Some(Message::User(UserMessage {
+            content: UserContent::Text(text),
+            ..
+        })) = messages.last()
+        else {
+            panic!("context hook must append its usage observation");
+        };
+        serde_json::from_str::<Value>(text)
+            .expect("usage observation JSON")
+            .get("observedContextUsage")
+            .expect("context hook must call getContextUsage")
+            .clone()
+    }
+
+    async fn observe_dispatched_context_usage(agent: &Agent, messages: &[Message]) -> Value {
+        let observed = agent
+            .dispatch_context_event(messages)
+            .await
+            .expect("context hook observation");
+        observed_context_usage(&observed)
+    }
+
+    #[test]
+    fn context_usage_is_fresh_across_requests_without_registry_invalidation() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("extension directory");
+            let provider = CapturingProvider::new("test-api");
+            let calls = provider.calls();
+            let mut session = AgentSession::new(
+                Agent::new(
+                    Arc::new(provider),
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig::default(),
+                ),
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    context_window_tokens: 32_768,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            enable_context_usage_observer(&mut session, directory.path()).await;
+            let manager = session.agent.extensions.clone().expect("extension manager");
+            let generation = manager.snapshot_version();
+            session
+                .run_text("short request".to_string(), |_| {})
+                .await
+                .expect("first request");
+            session
+                .run_text("substantially longer request ".repeat(512), |_| {})
+                .await
+                .expect("second request");
+            assert_eq!(manager.snapshot_version(), generation);
+
+            let captured = calls.lock().expect("captured contexts").clone();
+            assert_eq!(captured.len(), 2);
+            let first = observed_context_usage(&captured[0].messages);
+            let second = observed_context_usage(&captured[1].messages);
+            assert_eq!(first["contextWindow"], 32_768);
+            assert_eq!(second["contextWindow"], 32_768);
+            let first_tokens = first["tokens"].as_u64().expect("first tokens");
+            let second_tokens = second["tokens"].as_u64().expect("second tokens");
+            assert!(first_tokens > 0);
+            assert!(second_tokens > first_tokens);
+            assert!(
+                second["percent"].as_f64().expect("second percent")
+                    > first["percent"].as_f64().expect("first percent")
+            );
+            let second_base = &captured[1].messages[..captured[1].messages.len() - 1];
+            assert_eq!(
+                second["tokens"],
+                compaction::estimate_model_context_tokens_for_model(
+                    second_base,
+                    true,
+                    None,
+                    "capturing-provider",
+                    "capture-model",
+                ),
+                "usage must describe this request before the observer adds its message",
+            );
+        });
+    }
+
+    #[test]
+    fn context_usage_tracks_session_window_and_forgets_bare_provider_replacements() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("extension directory");
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            assert_eq!(agent.context_window_tokens, None);
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings {
+                    context_window_tokens: 32_768,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            enable_context_usage_observer(&mut session, directory.path()).await;
+            let messages = vec![user_message("the same request across model changes")];
+            let first = observe_dispatched_context_usage(&session.agent, &messages).await;
+            assert_eq!(first["contextWindow"], 32_768);
+
+            let manager = session
+                .agent
+                .extensions
+                .as_ref()
+                .expect("extension manager");
+            let unscoped = manager
+                .dispatch_event_with_response(
+                    ExtensionEventName::Context,
+                    Some(json!({ "messages": &messages })),
+                    EXTENSION_EVENT_TIMEOUT_MS,
+                )
+                .await
+                .expect("context dispatch without a usage snapshot")
+                .expect("unscoped context hook response");
+            let unscoped_messages =
+                deserialize_context_hook_messages(unscoped["messages"].clone(), &messages)
+                    .expect("unscoped hook messages");
+            assert!(
+                observed_context_usage(&unscoped_messages).is_null(),
+                "per-request usage must not contaminate the cached base context",
+            );
+
+            session.set_compaction_context_window(65_536);
+            let resized = observe_dispatched_context_usage(&session.agent, &messages).await;
+            assert_eq!(resized["contextWindow"], 65_536);
+            assert_eq!(resized["tokens"], first["tokens"]);
+            assert!(
+                (resized["percent"].as_f64().expect("resized percent")
+                    - first["percent"].as_f64().expect("first percent") / 2.0)
+                    .abs()
+                    < 1e-9
+            );
+
+            session.agent.set_provider(Arc::new(SilentProvider));
+            let unknown = observe_dispatched_context_usage(&session.agent, &messages).await;
+            assert!(unknown.is_null(), "the previous model window must not leak");
+            session.agent.set_context_window_tokens(Some(0));
+            assert_eq!(session.agent.context_window_tokens, None);
+            session.agent.set_context_window_tokens(Some(8_192));
+            let explicit = observe_dispatched_context_usage(&session.agent, &messages).await;
+            assert_eq!(explicit["contextWindow"], 8_192);
+        });
+    }
+
+    #[test]
+    fn context_usage_measures_supplied_replacement_messages_without_retained_history() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("extension directory");
+            let mut session = AgentSession::new(
+                Agent::new(
+                    Arc::new(SilentProvider),
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig::default(),
+                ),
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            enable_context_usage_observer(&mut session, directory.path()).await;
+            let mut historical = assistant_message("retained answer ".repeat(4_096).as_str());
+            historical.usage.input = 900_000;
+            historical.usage.total_tokens = 900_000;
+            let retained = vec![
+                user_message("retained source ".repeat(4_096).as_str()),
+                Message::Assistant(Arc::new(historical)),
+            ];
+            session.agent.replace_messages(retained.clone());
+            let before = observe_dispatched_context_usage(&session.agent, &retained).await;
+
+            // Supply a replacement slice directly; this verifies the context
+            // boundary after history reduction, without running compaction.
+            let replacement = vec![user_message("short summary for the next request")];
+            let after = observe_dispatched_context_usage(&session.agent, &replacement).await;
+            let after_tokens = after["tokens"].as_u64().expect("replacement tokens");
+            assert!(after_tokens > 0);
+            assert!(after_tokens < before["tokens"].as_u64().expect("retained tokens"));
+            assert_eq!(
+                after_tokens,
+                compaction::estimate_model_context_tokens_for_model(
+                    &replacement,
+                    true,
+                    None,
+                    "silent-provider",
+                    "test-model",
+                ),
+            );
+            assert_eq!(after["contextWindow"], before["contextWindow"]);
+            assert_eq!(
+                serde_json::to_value(session.agent.messages()).expect("retained messages"),
+                serde_json::to_value(&retained).expect("original history"),
+            );
+        });
+    }
+
+    #[test]
+    fn context_usage_counts_the_projected_request_not_retained_images() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("extension directory");
+            let provider = CapturingProvider::new("test-api");
+            let calls = provider.calls();
+            let mut session = AgentSession::new(
+                Agent::new(
+                    Arc::new(provider),
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig {
+                        model_accepts_images: false,
+                        ..AgentConfig::default()
+                    },
+                ),
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            enable_context_usage_observer(&mut session, directory.path()).await;
+            session
+                .run_with_content(
+                    vec![
+                        ContentBlock::Text(TextContent::new("describe the image")),
+                        sample_image_block(),
+                    ],
+                    |_| {},
+                )
+                .await
+                .expect("projected request");
+            assert!(session.agent.messages().iter().any(message_has_images));
+            let captured = calls.lock().expect("captured context").clone();
+            assert_eq!(captured.len(), 1);
+            let messages = &captured[0].messages;
+            assert!(!messages.iter().any(message_has_images));
+            let usage = observed_context_usage(messages);
+            let input = &messages[..messages.len() - 1];
+            assert_eq!(
+                usage["tokens"],
+                compaction::estimate_model_context_tokens_for_model(
+                    input,
+                    false,
+                    None,
+                    "capturing-provider",
+                    "capture-model",
+                ),
+            );
+            assert!(
+                usage["tokens"].as_u64().expect("projected tokens")
+                    < compaction::estimate_model_context_tokens(session.agent.messages()),
+                "retained image bytes must not inflate the text-only request estimate",
+            );
+        });
+    }
+
     #[test]
     fn manual_compaction_progress_pairs_interruption_and_ignores_late_results() {
         let events = Arc::new(StdTestMutex::new(Vec::new()));

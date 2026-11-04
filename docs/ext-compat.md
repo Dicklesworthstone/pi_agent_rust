@@ -732,6 +732,54 @@ remains the required native validation path; published-package PiJS startup,
 reload, MCP behavior, and Windows lifecycle remain unverified until that
 runner evidence is available.
 
+### Context usage for compression hooks
+
+`ctx.getContextUsage()` is synchronous and returns a fresh
+`{ tokens, contextWindow, percent }` snapshot when the host supplies usage.
+The native agent supplies it to each `context` dispatch, before extensions
+transform the request. It estimates the actual message list using the active
+model's token counter, archive projection, and image policy. Hidden history,
+sibling branches, and cumulative provider billing totals are not counted.
+System-prompt and tool-schema overhead are not included in this estimate.
+
+The snapshot belongs to that request; it never enters the cached session
+context or a JavaScript global mirror. A later request gets a new estimate
+even when the extension registry has not changed. Provider replacement clears
+the old window until the owning session installs the new model metadata.
+Standalone `Agent` embedders can supply that metadata through
+`set_context_window_tokens`. A missing or zero window yields `undefined`.
+Other events, commands, and minimal tool contexts currently return `undefined`
+because they have no authoritative request snapshot. An explicitly supplied
+snapshot with unknown tokens returns `tokens: null` and `percent: null`.
+
+Only the three public numeric fields are exposed. The getter copies them and
+calculates percent from tokens/window, so mutating one returned object cannot
+change subsequent reads. Percent uses percentage points: 60,000 tokens in a
+200,000-token window is `30`. Values over `100` remain visible as overflow.
+
+This restores a critical path in the published
+`@zhushanwen/pi-context-engineering@0.2.0`: its `context` handler calls
+`getContextUsage()` unconditionally inside a catch block. The previously absent
+method caused the handler to return `{}`, silently skipping all compression
+after configuration loaded successfully. The published-package diagnostic also
+exercises actual budget compression, recall, statistics, command toggles, and
+session reset with the verbatim PiJS context builder.
+
+Version `0.2.0` has a separate threshold-units defect: its emergency compression
+compares `contextUsage.percent` directly with the default `emergencyThreshold`
+of `0.9`. For a 90% threshold with the percentage API, configure that value as
+`90`; the host does not change percentage units to compensate. This package
+limitation is distinct from the missing-method failure.
+
+The supplementary diagnostic runs under Node with controlled native callbacks;
+all 20 checks pass with POSIX paths and Windows path/platform projection. The
+same expanded diagnostic against the source before the usage fix passes the
+original 13 checks and fails all seven new checks. It does not execute Rust,
+QuickJS, or native Windows. Native request-path and
+snapshot regressions cover fresh usage, window changes, unknown metadata,
+post-compaction inputs, and isolation from later events. They require the DSR
+native runner before their results can be claimed as executed verification.
+
 ### Grapheme segmentation for extension rendering
 
 PiJS supports locale-independent extended grapheme segmentation through

@@ -2047,6 +2047,10 @@ pub struct Agent {
     /// provider swap resets this until the owning session installs its window.
     snapcompact_text_tokens: u32,
 
+    /// Active model window supplied by the owning session or SDK embedder.
+    /// Bare providers carry no window metadata, so unknown stays explicit.
+    context_window_tokens: Option<u32>,
+
     /// Optional extension manager for tool/event hooks.
     extensions: Option<ExtensionManager>,
 
@@ -2325,6 +2329,7 @@ impl Agent {
             tools,
             config,
             snapcompact_text_tokens: crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
+            context_window_tokens: None,
             extensions: None,
             extension_tool_catalog: ExtensionToolCatalog::new(json!({})),
             messages: Vec::new(),
@@ -2830,6 +2835,17 @@ impl Agent {
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
         self.snapcompact_text_tokens = crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS;
+        self.context_window_tokens = None;
+    }
+
+    /// Set the active model's context window for extension usage snapshots.
+    /// A zero or absent window reports unknown usage. Provider replacement
+    /// clears this metadata; catalog-aware callers must install the new window.
+    pub const fn set_context_window_tokens(&mut self, context_window_tokens: Option<u32>) {
+        self.context_window_tokens = match context_window_tokens {
+            Some(window) if window > 0 => Some(window),
+            _ => None,
+        };
     }
 
     #[must_use]
@@ -4898,14 +4914,21 @@ impl Agent {
         let Some(extensions) = &self.extensions else {
             return None;
         };
+        // Do not count the request or serialize its messages when no extension
+        // consumes context. Observation events keep their existing cheap path.
+        if !extensions.has_hook_for("context") {
+            return None;
+        }
 
         let payload = json!({ "messages": messages });
-        let response = extensions
-            .dispatch_event_with_response(
-                ExtensionEventName::Context,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
+        let usage = self.context_window_tokens.and_then(|window| {
+            crate::extensions::ExtensionContextUsage::from_tokens(
+                self.estimate_message_context_tokens(messages),
+                window,
             )
+        });
+        let response = extensions
+            .dispatch_context_with_usage(payload, usage, EXTENSION_EVENT_TIMEOUT_MS)
             .await
             .ok()?;
 
@@ -17371,6 +17394,7 @@ impl AgentSession {
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
+        agent.set_context_window_tokens(Some(compaction_settings.context_window_tokens));
         agent.snapcompact_text_tokens = compaction_settings
             .context_window_tokens
             .saturating_sub(compaction_settings.reserve_tokens)
@@ -17858,6 +17882,8 @@ impl AgentSession {
 
     pub const fn set_compaction_context_window(&mut self, context_window_tokens: u32) {
         self.compaction_settings.context_window_tokens = context_window_tokens;
+        self.agent
+            .set_context_window_tokens(Some(context_window_tokens));
         self.agent.snapcompact_text_tokens =
             context_window_tokens.saturating_sub(self.compaction_settings.reserve_tokens) / 2;
     }

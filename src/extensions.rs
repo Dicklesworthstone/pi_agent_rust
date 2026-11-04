@@ -1027,6 +1027,36 @@ pub struct SessionActionOrigin {
     generation: u64,
 }
 
+/// Usage of the active request's model context before extension transforms.
+///
+/// Supplied by the agent for one dispatch, never retained in the session-context
+/// cache. Tokens are a model-aware estimate, not cumulative billing usage.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExtensionContextUsage {
+    tokens: u64,
+    context_window: u32,
+    percent: f64,
+}
+
+impl ExtensionContextUsage {
+    #[must_use]
+    pub(crate) fn from_tokens(tokens: u64, context_window: u32) -> Option<Self> {
+        if context_window == 0 {
+            return None;
+        }
+        // Usage is an estimate; floating-point precision is sufficient for the
+        // percentage. Preserve values above 100 to expose context overflow.
+        #[allow(clippy::cast_precision_loss)]
+        let percent = tokens as f64 / f64::from(context_window) * 100.0;
+        Some(Self {
+            tokens,
+            context_window,
+            percent,
+        })
+    }
+}
+
 /// Minimal session access for extensions (hostcalls).
 #[async_trait]
 pub trait ExtensionSession: Send + Sync {

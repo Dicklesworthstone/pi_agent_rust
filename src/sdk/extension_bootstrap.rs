@@ -215,6 +215,11 @@ async fn finish_selection_inner(
         } else {
             window
         });
+    } else {
+        // Provider replacement clears usage metadata. Preserve the embedder's
+        // explicit window and reinstall it for this provider's request snapshots.
+        let window = session.compaction_settings().context_window_tokens;
+        session.agent.set_context_window_tokens(Some(window));
     }
     app::update_session_for_selection(&mut stored, &selection, &candidate_registry);
     drop(stored);
