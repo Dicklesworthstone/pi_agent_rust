@@ -80,6 +80,66 @@ A relative override is resolved against Pi's launch directory and keeps that
 location when a session requests a different workspace. The startup skills
 block is omitted for a different or untrusted workspace.
 
+## Magic keywords
+
+Standalone lowercase words in **user-authored prose** can change how Pi handles
+a turn. Code spans, fenced or indented code, HTML/XML, paths, identifiers, and
+function-call spellings such as `chillax()` do not activate them. Generated
+attachment content, extension messages, and BTW injections are not new authored
+keyword requests. The original visible user message is preserved.
+
+| Word | Native behavior |
+| --- | --- |
+| `ultrathink` | Temporarily use the selected model's highest supported thinking tier for this turn. |
+| `chillax` | Add a brief-reasoning instruction. On supported adaptive Anthropic models, lower an enabled pinned thinking level to the lowest supported tier and keep that setting until changed. |
+| `orchestrate` | Add the parallel delegation and verification instruction for this turn. |
+| `workflowz` | Add the deterministic multi-agent workflow instruction for this turn. |
+| `jevify` | When `eval` is available, add a bulk-classification instruction using native `judgeBatch()` / `judge_batch()` with bounded batches and explicit coverage/error accounting. |
+
+For example, write `chillax, check this small fix` or `jevify this list of
+changes against the agreed rubric`. `jevify` does not enable eval, choose an
+unconfigured model, or expand a request or cost budget. Configure the native
+`judge_model` or a trusted model role as described by the eval tool.
+
+`chillax` wins over `ultrathink` within the same logical turn, including steering
+messages delivered before the next provider request. It never turns thinking on
+or raises the pinned effort. Numeric lowering is restricted to the
+`anthropic-messages` transport with verified adaptive thinking support; the
+catalog's `forceAdaptiveThinking` and disabled thinking tiers are respected.
+Unknown or inverted custom effort mappings are not guessed. Other models still
+receive the brief-reasoning instruction. Native Pi does not currently have OMP's
+automatic thinking classifier.
+
+The lowered effort is recorded in session history and survives resume. A later
+explicit thinking selection changes it normally. Hidden instructions remain
+turn-local: a follow-up starts a new instruction scope, and the next ordinary
+turn does not inherit a previous keyword's notice. Native notices currently
+append to the turn's system prompt, so there is no guarantee that injecting a
+notice mid-turn preserves a provider's prompt-cache prefix.
+
+All keyword switches default to enabled. Set the following in global or trusted
+project settings:
+
+```json
+{
+  "keywords": {
+    "enabled": true,
+    "ultrathink": true,
+    "chillax": true,
+    "orchestrate": true,
+    "workflowz": true,
+    "jevify": true
+  }
+}
+```
+
+Set `keywords.enabled` to `false` to disable all effects, including custom
+keywords, or disable individual words. These fields merge independently across
+settings scopes. OMP's `magicKeywords` object name (also `magic_keywords`) and
+its `workflow` setting for `workflowz` are accepted aliases; use one spelling
+per field in a file. Activations are recorded as `magic_keyword` session entries;
+actual pinned reductions also record a thinking-level change.
+
 ## Supported settings (snake_case JSON keys)
 
 ### Language servers (LSP)

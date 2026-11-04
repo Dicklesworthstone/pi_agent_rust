@@ -2159,6 +2159,23 @@ pub struct Agent {
     /// a raw unsupported `Max` request.
     keyword_max_thinking_level: crate::model::ThinkingLevel,
 
+    /// Catalog-verified adaptive effort target; absent for unknown providers
+    /// and transports whose thinking mode cannot be safely lowered in place.
+    keyword_chillax_thinking_level: Option<crate::model::ThinkingLevel>,
+    /// Baselines whose wire effort is known. Bare Agent callers may supply
+    /// an unclamped level, so a numeric ordering alone is insufficient.
+    keyword_chillax_levels: Vec<crate::model::ThinkingLevel>,
+    /// Baseline and reductions belong to the running settings guard. The
+    /// pinned reduction survives that guard, while temporary ultrathink and
+    /// hidden notices do not. A new logical follow-up resets precedence.
+    keyword_turn_baseline: Option<crate::model::ThinkingLevel>,
+    keyword_pinned_thinking: Option<crate::model::ThinkingLevel>,
+    keyword_turn_chillax: bool,
+    /// A reduction awaiting session persistence, including one re-applied
+    /// after a retry switches to a different model. The activation ledger is
+    /// intentionally not duplicated on retry.
+    keyword_thinking_change: Option<crate::model::ThinkingLevel>,
+
     /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
     /// memory and dies with the session — never persisted raw.
     secrets_vault: crate::secrets::SecretVault,
@@ -2180,6 +2197,9 @@ impl<'a> AgentTurnSettingsGuard<'a> {
     fn new(agent: &'a mut Agent) -> Self {
         let thinking_level = agent.config.stream_options.thinking_level;
         let system_prompt = agent.config.system_prompt.clone();
+        agent.keyword_turn_baseline = thinking_level;
+        agent.keyword_pinned_thinking = None;
+        agent.keyword_turn_chillax = false;
         Self {
             agent,
             thinking_level,
@@ -2190,7 +2210,13 @@ impl<'a> AgentTurnSettingsGuard<'a> {
 
 impl Drop for AgentTurnSettingsGuard<'_> {
     fn drop(&mut self) {
-        self.agent.config.stream_options.thinking_level = self.thinking_level;
+        self.agent.config.stream_options.thinking_level = self
+            .agent
+            .keyword_pinned_thinking
+            .take()
+            .or(self.thinking_level);
+        self.agent.keyword_turn_baseline = None;
+        self.agent.keyword_turn_chillax = false;
         self.agent.config.system_prompt = self.system_prompt.take();
     }
 }
@@ -2336,6 +2362,12 @@ impl Agent {
             retry_keyword_activations: Vec::new(),
             magic_keyword_scan_override: None,
             keyword_max_thinking_level,
+            keyword_chillax_thinking_level: None,
+            keyword_chillax_levels: Vec::new(),
+            keyword_turn_baseline: None,
+            keyword_pinned_thinking: None,
+            keyword_turn_chillax: false,
+            keyword_thinking_change: None,
             secrets_vault: crate::secrets::SecretVault::default(),
             compaction_privacy_state,
         }
@@ -2444,6 +2476,10 @@ impl Agent {
         self.prewalk = None;
         self.prewalk_budget = None;
         self.take_prewalk_evidence();
+        self.keyword_ledger.clear();
+        self.retry_keyword_activations.clear();
+        self.keyword_thinking_change = None;
+        self.magic_keyword_scan_override = None;
     }
 
     /// The destination armed for this live session, never restored from disk.
@@ -2788,6 +2824,9 @@ impl Agent {
         // carry capabilities from the previous model. Registry-aware switch
         // paths immediately install the target model's thinking and image caps.
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
+        self.keyword_chillax_thinking_level = None;
+        self.keyword_chillax_levels.clear();
+        self.keyword_thinking_change = None;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
         self.snapcompact_text_tokens = crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS;
@@ -2837,8 +2876,32 @@ impl Agent {
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
-    pub const fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
+    pub fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
         self.keyword_max_thinking_level = level;
+        self.keyword_chillax_thinking_level = None;
+        self.keyword_chillax_levels.clear();
+    }
+
+    /// Install both keyword effort bounds from the selected model. Provider
+    /// replacement clears them first, including across failover and prewalk.
+    pub fn set_keyword_model(&mut self, entry: &ModelEntry) {
+        self.keyword_max_thinking_level =
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max);
+        self.keyword_chillax_thinking_level = entry.chillax_thinking_level();
+        self.keyword_chillax_levels = if self.keyword_chillax_thinking_level.is_some() {
+            entry.available_thinking_levels()
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// An explicit operator effort selection supersedes retained effort
+    /// keywords from an incomplete turn. Call only after admitting that
+    /// selection; automatic retry/failover retains its original keywords.
+    pub fn clear_retry_keyword_effort(&mut self) {
+        self.retry_keyword_activations
+            .retain(|hit| !matches!(hit.action.as_str(), "chillax" | "ultrathink"));
+        self.keyword_thinking_change = None;
     }
 
     /// Override the prose scanned for magic keywords on the next non-resume
@@ -3870,10 +3933,8 @@ impl Agent {
         }
     }
 
-    /// The main agent loop. Magic keywords (bd-cv653.3.6) mutate the
-    /// thinking level and system prompt for *this turn only*; snapshot and
-    /// restore them here so a single `ultrathink` does not pin every later
-    /// turn at max thinking and directives do not accrete forever.
+    /// The main agent loop. Keyword notices and `ultrathink` are turn-local;
+    /// `chillax` may lower the pinned effort until the user changes it.
     async fn run_loop(
         &mut self,
         prompts: Vec<Message>,
@@ -3921,12 +3982,34 @@ impl Agent {
         result
     }
 
-    fn apply_magic_keyword_effects(&mut self, hits: &[crate::magic_keywords::KeywordActivation]) {
-        let keyword_max_thinking_level = self.keyword_max_thinking_level;
-        for hit in hits {
-            if hit.action == "ultrathink" {
-                self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
+    fn apply_magic_keyword_effects(
+        &mut self,
+        hits: &mut [crate::magic_keywords::KeywordActivation],
+    ) {
+        self.keyword_turn_chillax |= hits.iter().any(|hit| hit.action == "chillax");
+        if self.keyword_turn_chillax {
+            // Compare with the pinned baseline, not a preceding temporary
+            // ultrathink. In particular, `ultrathink chillax` with thinking
+            // off must not enable it. Delivery order cannot reverse precedence.
+            let baseline = self.keyword_pinned_thinking.or(self.keyword_turn_baseline);
+            let lowered = baseline
+                .filter(|level| self.keyword_chillax_levels.contains(level))
+                .zip(self.keyword_chillax_thinking_level)
+                .and_then(|(current, minimum)| {
+                    (current != crate::model::ThinkingLevel::Off
+                        && minimum.default_budget() < current.default_budget())
+                    .then_some(minimum)
+                });
+            if let Some(level) = lowered {
+                self.keyword_pinned_thinking = Some(level);
+                self.keyword_thinking_change = Some(level);
+                if let Some(hit) = hits.iter_mut().find(|hit| hit.action == "chillax") {
+                    hit.thinking_level = Some(level);
+                }
             }
+            self.config.stream_options.thinking_level = lowered.or(baseline);
+        } else if hits.iter().any(|hit| hit.action == "ultrathink") {
+            self.config.stream_options.thinking_level = Some(self.keyword_max_thinking_level);
         }
         let directives =
             crate::magic_keywords::directives_for(hits, self.config.keyword_settings.as_ref());
@@ -3998,16 +4081,20 @@ impl Agent {
         scan_text: &str,
         turn_keyword_words: &mut std::collections::HashSet<String>,
     ) {
-        let hits: Vec<_> =
+        let mut hits: Vec<_> =
             crate::magic_keywords::detect(scan_text, self.config.keyword_settings.as_ref())
                 .into_iter()
+                // The classification instruction must not promise a helper
+                // that this session cannot call. Re-check on delivery so an
+                // optional-tool change while input is queued takes effect.
+                .filter(|hit| hit.action != "jevify" || self.has_tool("eval"))
                 .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
                 .collect();
         if hits.is_empty() {
             return;
         }
 
-        self.apply_magic_keyword_effects(&hits);
+        self.apply_magic_keyword_effects(&mut hits);
         self.retry_keyword_activations.extend(hits.iter().cloned());
         self.keyword_ledger.extend(hits);
     }
@@ -4041,9 +4128,15 @@ impl Agent {
         let turn_baseline_system_prompt = self.config.system_prompt.clone();
 
         if prompts.is_empty() && !self.retry_keyword_activations.is_empty() {
-            let retry_hits = self.retry_keyword_activations.clone();
+            let mut retry_hits = self.retry_keyword_activations.clone();
             turn_keyword_words.extend(retry_hits.iter().map(|hit| hit.word.clone()));
-            self.apply_magic_keyword_effects(&retry_hits);
+            // A retry/failover may have changed model capabilities or the
+            // enabled tool set. Reapply behavior, never a stale numeric cap.
+            retry_hits.retain(|hit| hit.action != "jevify" || self.has_tool("eval"));
+            for hit in &mut retry_hits {
+                hit.thinking_level = None;
+            }
+            self.apply_magic_keyword_effects(&mut retry_hits);
         }
 
         // A resumed follow-up must fetch and validate the owning surface before
@@ -4080,9 +4173,8 @@ impl Agent {
         for prompt in prompts {
             // Magic keywords (bd-cv653.3.6): pre-send prose scan of the user
             // message. ultrathink raises the turn's thinking level to the
-            // active model's pre-clamped maximum; orchestrate/workflowz/custom words
-            // append their directive to the system prompt (appended, never
-            // inserted, so provider prompt caches stay valid).
+            // active model's pre-clamped maximum; chillax may lower a pinned
+            // adaptive effort; the other effects append turn-local notices.
             if matches!(prompt, Message::User(_))
                 && let Some(source) = keyword_scan_override.take()
             {
@@ -4192,11 +4284,15 @@ impl Agent {
                     // caller's baseline before scanning their keywords so
                     // steering-only effort and directives cannot leak across
                     // the boundary.
-                    self.config.stream_options.thinking_level = turn_baseline_thinking;
+                    self.config.stream_options.thinking_level =
+                        self.keyword_pinned_thinking.or(turn_baseline_thinking);
+                    self.keyword_turn_baseline = self.config.stream_options.thinking_level;
+                    self.keyword_turn_chillax = false;
                     self.config
                         .system_prompt
                         .clone_from(&turn_baseline_system_prompt);
                     turn_keyword_words.clear();
+                    self.retry_keyword_activations.clear();
                     pending_messages = current_follow_up;
                 }
 
@@ -17402,12 +17498,12 @@ impl AgentSession {
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
         let provider = self.agent.provider();
         let entry = registry.find(provider.name(), provider.model_id());
-        let keyword_max = entry
-            .as_ref()
-            .map_or(self.agent.keyword_max_thinking_level, |entry| {
-                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
-            });
-        self.agent.set_keyword_max_thinking_level(keyword_max);
+        if let Some(entry) = &entry {
+            self.agent.set_keyword_model(entry);
+        } else {
+            self.agent.keyword_chillax_thinking_level = None;
+            self.agent.keyword_chillax_levels.clear();
+        }
         self.agent.set_tool_call_dialect(entry.as_ref().map_or_else(
             || self.agent.tool_call_dialect(),
             ModelEntry::tool_call_dialect,
@@ -17893,9 +17989,7 @@ impl AgentSession {
         }
 
         if let Some(entry) = entry {
-            self.agent.set_keyword_max_thinking_level(
-                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-            );
+            self.agent.set_keyword_model(&entry);
             self.agent.set_tool_call_dialect(entry.tool_call_dialect());
             self.agent.set_model_accepts_images(
                 entry
@@ -18364,6 +18458,7 @@ impl AgentSession {
         }
         *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
+        self.agent.clear_retry_keyword_effort();
         self.agent.disarm_prewalk();
         self.refresh_extension_completion_host_state();
         if changed {
@@ -18524,6 +18619,13 @@ impl AgentSession {
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
+        if !runtime_model_changed
+            && parsed_session_thinking.is_some_and(|level| level != current_thinking)
+        {
+            // A frontend may have changed the durable selection while the
+            // Agent was locked. Honor it before resuming a retained turn.
+            self.agent.clear_retry_keyword_effort();
+        }
         if runtime_model_changed && let Some(policy) = &mut self.child_fallback_policy {
             policy.use_default_role();
         }
@@ -19044,9 +19146,7 @@ impl AgentSession {
         target_thinking: crate::model::ThinkingLevel,
     ) {
         self.agent.set_provider(provider_impl);
-        self.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
+        self.agent.set_keyword_model(entry);
         self.agent.set_tool_call_dialect(entry.tool_call_dialect());
         self.agent.set_model_accepts_images(
             entry
@@ -19398,9 +19498,7 @@ impl AgentSession {
         *inner = candidate;
         self.agent.replace_messages(restored_messages);
         self.agent.set_provider(Arc::clone(&request.provider));
-        self.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
+        self.agent.set_keyword_model(entry);
         self.agent.set_tool_call_dialect(entry.tool_call_dialect());
         self.agent.set_model_accepts_images(
             entry
@@ -22718,6 +22816,9 @@ impl AgentSession {
             self.agent.authored_queue_delivery_indices.clear();
             append_dialect_repair_telemetry(&mut session, &repairs);
             crate::magic_keywords::append_session_telemetry(&mut session, &activations);
+            if let Some(level) = self.agent.keyword_thinking_change.take() {
+                crate::magic_keywords::persist_thinking_change(&mut session, level);
+            }
             if let Some(message) = incomplete_assistant
                 && !(run_failed && is_synthetic_empty_error_assistant(&message))
             {

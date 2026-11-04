@@ -30,7 +30,7 @@ use pi::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingLevel,
     UserContent, UserMessage,
 };
-use pi::models::{ModelEntry, ModelRegistry};
+use pi::models::{CompatConfig, ModelEntry, ModelRegistry};
 use pi::provider::{Context, InputType, Model, ModelCost, StreamOptions};
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, run as run_rpc};
@@ -130,6 +130,7 @@ struct CaptureProvider {
     capture: Arc<Mutex<Capture>>,
     first_call_entered: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
     first_call_gate: Mutex<Option<asupersync::channel::oneshot::Receiver<()>>>,
+    fail_first: bool,
 }
 
 #[async_trait::async_trait]
@@ -154,13 +155,17 @@ impl pi::provider::Provider for CaptureProvider {
     ) -> pi::error::Result<
         Pin<Box<dyn futures::Stream<Item = pi::error::Result<StreamEvent>> + Send>>,
     > {
-        {
+        let first_call = {
             let mut capture = self.capture.lock().expect("capture");
             capture.thinking.push(options.thinking_level);
             capture
                 .system_prompts
                 .push(context.system_prompt.as_ref().map(ToString::to_string));
             capture.messages.push(context.messages.to_vec());
+            capture.thinking.len() == 1
+        };
+        if self.fail_first && first_call {
+            return Err(pi::error::Error::api("injected first-request failure"));
         }
         let first_call_entered = self
             .first_call_entered
@@ -204,13 +209,22 @@ fn build_agent(
     root: &Path,
     keywords: Option<pi::magic_keywords::KeywordSettings>,
 ) -> (Agent, Arc<Mutex<Capture>>) {
+    build_agent_with_tools(root, keywords, &[])
+}
+
+fn build_agent_with_tools(
+    root: &Path,
+    keywords: Option<pi::magic_keywords::KeywordSettings>,
+    enabled_tools: &[&str],
+) -> (Agent, Arc<Mutex<Capture>>) {
     let capture = Arc::new(Mutex::new(Capture::default()));
     let provider = Arc::new(CaptureProvider {
         capture: Arc::clone(&capture),
         first_call_entered: Mutex::new(None),
         first_call_gate: Mutex::new(None),
+        fail_first: false,
     });
-    let tools = ToolRegistry::new(&[], root, None::<&pi::config::Config>);
+    let tools = ToolRegistry::new(enabled_tools, root, None::<&pi::config::Config>);
     let config = AgentConfig {
         system_prompt: Some("base prompt".to_string()),
         keyword_settings: keywords,
@@ -229,6 +243,7 @@ fn build_gated_agent(
         capture: Arc::clone(&capture),
         first_call_entered: Mutex::new(Some(first_call_entered)),
         first_call_gate: Mutex::new(Some(first_call_gate)),
+        fail_first: false,
     });
     let tools = ToolRegistry::new(&[], root, None::<&pi::config::Config>);
     let config = AgentConfig {
@@ -280,6 +295,39 @@ fn capture_model_registry(auth: &AuthStorage) -> (ModelRegistry, ThinkingLevel) 
     (registry, expected_max)
 }
 
+fn adaptive_capture_model_entry() -> ModelEntry {
+    let mut entry = capture_model_entry();
+    entry.model.api = "anthropic-messages".to_string();
+    entry.compat = Some(CompatConfig {
+        force_adaptive_thinking: Some(true),
+        ..CompatConfig::default()
+    });
+    entry
+}
+
+fn build_failing_adaptive_agent(root: &Path) -> (Agent, Arc<Mutex<Capture>>) {
+    let capture = Arc::new(Mutex::new(Capture::default()));
+    let provider = Arc::new(CaptureProvider {
+        capture: Arc::clone(&capture),
+        first_call_entered: Mutex::new(None),
+        first_call_gate: Mutex::new(None),
+        fail_first: true,
+    });
+    let mut agent = Agent::new(
+        provider,
+        ToolRegistry::new(&[], root, None::<&Config>),
+        AgentConfig {
+            stream_options: StreamOptions {
+                thinking_level: Some(ThinkingLevel::High),
+                ..StreamOptions::default()
+            },
+            ..AgentConfig::default()
+        },
+    );
+    agent.set_keyword_model(&adaptive_capture_model_entry());
+    (agent, capture)
+}
+
 #[test]
 fn ultrathink_uses_model_clamped_max() {
     let case = "ultrathink_uses_model_clamped_max";
@@ -325,6 +373,307 @@ fn ultrathink_does_not_guess_capabilities_for_unknown_model() {
         capture.thinking.first(),
         Some(&Some(ThinkingLevel::Off)),
         "an unregistered provider must fail closed instead of receiving raw Max"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn chillax_persists_lowered_effort_across_resume_until_changed() {
+    let case = "chillax_persists_lowered_effort_across_resume_until_changed";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_model(&adaptive_capture_model_entry());
+    agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    let session = Arc::new(AsyncMutex::new(Session::create_with_dir(Some(
+        harness.temp_path("sessions"),
+    ))));
+    let mut agent_session = AgentSession::new(
+        agent,
+        Arc::clone(&session),
+        true,
+        ResolvedCompactionSettings::default(),
+    );
+    block_on_local(agent_session.run_text("chillax, check this change".to_string(), |_| {}))
+        .expect("initial turn");
+    assert_eq!(
+        agent_session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::Minimal)
+    );
+    assert_eq!(
+        capture.lock().expect("capture").thinking,
+        [Some(ThinkingLevel::Minimal)]
+    );
+    let path = session
+        .try_lock()
+        .expect("session")
+        .path
+        .clone()
+        .expect("saved session");
+    let reopened = block_on_local(Session::open(path.to_string_lossy().as_ref())).expect("reopen");
+    assert_eq!(
+        reopened
+            .effective_thinking_level_for_current_path()
+            .as_deref(),
+        Some("minimal")
+    );
+    let telemetry = reopened
+        .entries_for_current_path()
+        .into_iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Custom(custom) if custom.custom_type == "magic_keyword" => {
+                custom.data.as_ref()
+            }
+            _ => None,
+        })
+        .expect("activation telemetry");
+    assert_eq!(telemetry["thinkingLevel"], json!("minimal"));
+
+    let (mut resumed_agent, resumed_capture) = build_agent(&root, None);
+    resumed_agent.set_keyword_model(&adaptive_capture_model_entry());
+    resumed_agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    let mut resumed = AgentSession::new(
+        resumed_agent,
+        Arc::new(AsyncMutex::new(reopened)),
+        true,
+        ResolvedCompactionSettings::default(),
+    );
+    block_on_local(async {
+        resumed
+            .run_text("check the next change".to_string(), |_| {})
+            .await
+            .expect("resumed turn");
+        resumed
+            .set_thinking_level(ThinkingLevel::High)
+            .await
+            .expect("explicit thinking change");
+        resumed
+            .run_text("check another change".to_string(), |_| {})
+            .await
+            .expect("turn after manual change");
+    });
+    let captured = resumed_capture.lock().expect("capture");
+    assert_eq!(
+        captured.thinking,
+        [Some(ThinkingLevel::Minimal), Some(ThinkingLevel::High)]
+    );
+    assert!(captured.system_prompts.iter().all(|prompt| {
+        !prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invoked `chillax`")
+    }));
+    finish_case(&harness, case);
+}
+
+#[test]
+fn chillax_never_enables_thinking_or_guesses_transport_capabilities() {
+    let case = "chillax_never_enables_thinking_or_guesses_transport_capabilities";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    for baseline in [None, Some(ThinkingLevel::Off), Some(ThinkingLevel::Minimal)] {
+        for input in ["ultrathink then chillax", "chillax then ultrathink"] {
+            let (mut agent, capture) = build_agent(&root, None);
+            agent.set_keyword_model(&adaptive_capture_model_entry());
+            agent.stream_options_mut().thinking_level = baseline;
+            block_on_local(agent.run(input, |_| {})).expect("run");
+            assert_eq!(capture.lock().expect("capture").thinking, [baseline]);
+            assert_eq!(agent.stream_options().thinking_level, baseline);
+        }
+    }
+    let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_model(&capture_model_entry());
+    agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    block_on_local(agent.run("chillax this time", |_| {})).expect("run");
+    let captured = capture.lock().expect("capture");
+    assert_eq!(captured.thinking, [Some(ThinkingLevel::High)]);
+    assert!(
+        captured.system_prompts[0]
+            .as_deref()
+            .expect("prompt")
+            .contains("invoked `chillax`")
+    );
+
+    // Raw Agent callers can supply a disabled baseline that AgentSession
+    // would normally clamp. Do not turn an omitted wire effort into max.
+    let (mut raw, raw_capture) = build_agent(&root, None);
+    let mut entry = adaptive_capture_model_entry();
+    entry.compat.as_mut().expect("compat").thinking_level_map = Some(
+        ["minimal", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(|level| {
+                (
+                    level.to_string(),
+                    (level == "minimal").then(|| "max".to_string()),
+                )
+            })
+            .collect(),
+    );
+    raw.set_keyword_model(&entry);
+    raw.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    block_on_local(raw.run("chillax", |_| {})).expect("unclamped raw Agent");
+    assert_eq!(
+        raw_capture.lock().expect("capture").thinking,
+        [Some(ThinkingLevel::High)]
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn chillax_steering_wins_this_turn_and_follow_up_can_ultrathink() {
+    let case = "chillax_steering_wins_this_turn_and_follow_up_can_ultrathink";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_model(&adaptive_capture_model_entry());
+    agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    let message = |text: &str| {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    };
+    agent.queue_steering(message("chillax before continuing"));
+    agent.queue_follow_up(message("ultrathink on the next task"));
+    block_on_local(agent.run("ultrathink on the first task", |_| {})).expect("run");
+    let captured = capture.lock().expect("capture");
+    assert_eq!(
+        captured.thinking,
+        [Some(ThinkingLevel::Minimal), Some(ThinkingLevel::High)]
+    );
+    assert_eq!(
+        agent.stream_options().thinking_level,
+        Some(ThinkingLevel::Minimal)
+    );
+    assert!(
+        captured.system_prompts[0]
+            .as_deref()
+            .expect("prompt")
+            .contains("invoked `chillax`")
+    );
+    assert!(
+        !captured.system_prompts[1]
+            .as_deref()
+            .expect("prompt")
+            .contains("invoked `chillax`")
+    );
+    assert_eq!(
+        agent
+            .drain_keyword_ledger()
+            .iter()
+            .map(|hit| hit.word.as_str())
+            .collect::<Vec<_>>(),
+        ["ultrathink", "chillax", "ultrathink"]
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn jevify_requires_eval_and_does_not_rescan_generated_text() {
+    let case = "jevify_requires_eval_and_does_not_rescan_generated_text";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    block_on_local(agent.run("jevify this list", |_| {})).expect("run without eval");
+    assert!(agent.drain_keyword_ledger().is_empty());
+    assert_eq!(
+        capture.lock().expect("capture").system_prompts,
+        [Some("base prompt".to_string())]
+    );
+
+    let (mut agent, capture) = build_agent_with_tools(&root, None, &["eval"]);
+    agent.set_keyword_model(&adaptive_capture_model_entry());
+    agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    agent.set_magic_keyword_scan_override(Some(String::new()));
+    block_on_local(agent.run("chillax and jevify in generated content", |_| {}))
+        .expect("generated content");
+    assert!(agent.drain_keyword_ledger().is_empty());
+    block_on_local(agent.run("jevify the authored request", |_| {})).expect("authored content");
+    let captured = capture.lock().expect("capture");
+    assert_eq!(captured.thinking, [Some(ThinkingLevel::High); 2]);
+    assert_eq!(captured.system_prompts[0].as_deref(), Some("base prompt"));
+    let prompt = captured.system_prompts[1].as_deref().expect("prompt");
+    assert!(prompt.contains("judgeBatch()") && prompt.contains("judge_batch()"));
+    assert!(prompt.contains("bounded batches") && prompt.contains("unresolved failures"));
+    assert_eq!(agent.drain_keyword_ledger()[0].word, "jevify");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn chillax_retry_uses_refreshed_capabilities_without_duplicate_activation() {
+    let case = "chillax_retry_uses_refreshed_capabilities_without_duplicate_activation";
+    let harness = TestHarness::new(case);
+    let (mut agent, capture) = build_failing_adaptive_agent(&harness.temp_path("."));
+    let mut entry = adaptive_capture_model_entry();
+    entry.compat.as_mut().expect("compat").thinking_level_map = Some(HashMap::from([
+        ("minimal".to_string(), None),
+        ("low".to_string(), None),
+    ]));
+    agent.set_keyword_model(&entry);
+    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    let mut agent_session = AgentSession::new(
+        agent,
+        Arc::clone(&session),
+        false,
+        ResolvedCompactionSettings::default(),
+    );
+    let result =
+        block_on_local(agent_session.run_text("chillax for this task".to_string(), |_| {}));
+    assert!(result.is_err() || result.is_ok_and(|reply| reply.stop_reason == StopReason::Error));
+    block_on_local(agent_session.revert_incomplete_response()).expect("revert incomplete output");
+    agent_session
+        .agent
+        .set_keyword_model(&adaptive_capture_model_entry());
+    block_on_local(agent_session.run_continue_with_abort(None, |_| {})).expect("retry");
+    assert_eq!(
+        capture.lock().expect("capture").thinking,
+        [Some(ThinkingLevel::Medium), Some(ThinkingLevel::Minimal)]
+    );
+    let stored = session.try_lock().expect("session");
+    assert_eq!(
+        stored
+            .effective_thinking_level_for_current_path()
+            .as_deref(),
+        Some("minimal")
+    );
+    let activation_count = stored.entries_for_current_path().into_iter().filter(|entry| {
+        matches!(entry, SessionEntry::Custom(custom) if custom.custom_type == "magic_keyword")
+    }).count();
+    assert_eq!(
+        activation_count, 1,
+        "retry must not duplicate activation telemetry"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn explicit_thinking_change_supersedes_failed_turn_keywords_on_retry() {
+    let case = "explicit_thinking_change_supersedes_failed_turn_keywords_on_retry";
+    let harness = TestHarness::new(case);
+    let (agent, capture) = build_failing_adaptive_agent(&harness.temp_path("."));
+    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    let mut agent_session =
+        AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+    let result =
+        block_on_local(agent_session.run_text("ultrathink then chillax".to_string(), |_| {}));
+    assert!(result.is_err() || result.is_ok_and(|reply| reply.stop_reason == StopReason::Error));
+    block_on_local(async {
+        agent_session
+            .revert_incomplete_response()
+            .await
+            .expect("revert");
+        agent_session
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .expect("manual setting");
+        agent_session
+            .run_continue_with_abort(None, |_| {})
+            .await
+            .expect("retry");
+    });
+    assert_eq!(
+        capture.lock().expect("capture").thinking,
+        [Some(ThinkingLevel::Minimal), Some(ThinkingLevel::Low)]
     );
     finish_case(&harness, case);
 }

@@ -4157,9 +4157,7 @@ pub async fn run(
                         apply_model_change(&mut guard, &mut state, &entry, clamped_level).await?;
 
                     guard.agent.set_provider(provider_impl);
-                    guard.agent.set_keyword_max_thinking_level(
-                        entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-                    );
+                    guard.agent.set_keyword_model(&entry);
                     guard.agent.set_tool_call_dialect(entry.tool_call_dialect());
                     guard
                         .agent
@@ -5823,9 +5821,7 @@ pub async fn run(
                             guard.agent.reset_session_scoped_state(target_plan_mode);
 
                             guard.agent.set_provider(provider_impl);
-                            guard.agent.set_keyword_max_thinking_level(
-                                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-                            );
+                            guard.agent.set_keyword_model(&entry);
                             guard
                                 .agent
                                 .set_tool_call_dialect(entry.tool_call_dialect());
@@ -6124,9 +6120,7 @@ pub async fn run(
                         );
                         guard.agent.reset_session_scoped_state(target_plan_mode);
                         guard.agent.set_provider(provider_impl);
-                        guard.agent.set_keyword_max_thinking_level(
-                            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-                        );
+                        guard.agent.set_keyword_model(&entry);
                         guard
                             .agent
                             .set_tool_call_dialect(entry.tool_call_dialect());
@@ -17407,6 +17401,7 @@ async fn apply_thinking_level_for_session(
     }
     *inner_session = candidate;
     guard.agent.stream_options_mut().thinking_level = Some(level);
+    guard.agent.clear_retry_keyword_effort();
     guard.agent.disarm_prewalk();
     guard.refresh_extension_completion_host_state();
     if changed {
@@ -17622,9 +17617,7 @@ async fn cycle_model_for_rpc(
     let _provider_transition = apply_model_change(guard, state, &next_entry, next_thinking).await?;
 
     guard.agent.set_provider(provider_impl);
-    guard.agent.set_keyword_max_thinking_level(
-        next_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-    );
+    guard.agent.set_keyword_model(&next_entry);
     guard
         .agent
         .set_tool_call_dialect(next_entry.tool_call_dialect());

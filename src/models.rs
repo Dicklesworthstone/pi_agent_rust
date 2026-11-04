@@ -403,6 +403,59 @@ impl ModelEntry {
             .unwrap_or(ThinkingLevel::Off)
     }
 
+    /// Lowest enabled reasoning tier for `chillax`, only on the adaptive
+    /// Anthropic transport that can lower effort without switching between
+    /// fixed-budget and disabled thinking modes. Share the wire predicate so
+    /// an explicit `forceAdaptiveThinking: false` cannot be overridden here.
+    pub fn chillax_thinking_level(&self) -> Option<crate::model::ThinkingLevel> {
+        use crate::model::ThinkingLevel;
+
+        if !self.model.reasoning || self.model.api != "anthropic-messages" {
+            return None;
+        }
+        let adaptive = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.force_adaptive_thinking)
+            .or_else(|| {
+                crate::providers::anthropic::anthropic_model_uses_adaptive_thinking(&self.model.id)
+            })
+            .unwrap_or(false);
+        if !adaptive {
+            return None;
+        }
+        let mut minimum = None;
+        let mut previous_effort = 0;
+        for level in self
+            .available_thinking_levels()
+            .into_iter()
+            .filter(|level| *level != ThinkingLevel::Off)
+        {
+            // Catalog aliases may invert the apparent native tier order.
+            // Never lower to a tier that sends a higher effort on the wire,
+            // and never guess the ordering of provider-specific strings.
+            let effort = match crate::providers::anthropic::anthropic_effort_for_level(
+                level,
+                self.compat.as_ref(),
+            )
+            .as_deref()?
+            {
+                "low" => 1,
+                "medium" => 2,
+                "high" => 3,
+                "xhigh" => 4,
+                "max" => 5,
+                _ => return None,
+            };
+            if effort < previous_effort {
+                return None;
+            }
+            minimum.get_or_insert(level);
+            previous_effort = effort;
+        }
+        minimum
+    }
+
     fn advertised_effort_alias(
         &self,
         requested: crate::model::ThinkingLevel,
@@ -9112,6 +9165,73 @@ mod tests {
         use crate::model::ThinkingLevel;
         let entry = make_model_entry("gpt-4o-mini", false);
         assert_eq!(entry.available_thinking_levels(), vec![ThinkingLevel::Off]);
+    }
+
+    #[test]
+    fn chillax_requires_catalog_verified_adaptive_anthropic_effort() {
+        use crate::model::ThinkingLevel;
+
+        let mut entry = make_model_entry("claude-opus-4-7", true);
+        assert_eq!(entry.chillax_thinking_level(), None, "wrong transport");
+        entry.model.api = "anthropic-messages".to_string();
+        assert_eq!(entry.chillax_thinking_level(), Some(ThinkingLevel::Minimal));
+        entry.model.reasoning = false;
+        assert_eq!(entry.chillax_thinking_level(), None);
+        entry.model.reasoning = true;
+        entry.compat = Some(CompatConfig {
+            force_adaptive_thinking: Some(false),
+            ..CompatConfig::default()
+        });
+        assert_eq!(entry.chillax_thinking_level(), None, "explicit opt-out");
+        entry.model.id = "custom-adaptive-model".to_string();
+        entry
+            .compat
+            .as_mut()
+            .expect("compat")
+            .force_adaptive_thinking = Some(true);
+        assert_eq!(entry.chillax_thinking_level(), Some(ThinkingLevel::Minimal));
+        entry.compat = None;
+        assert_eq!(entry.chillax_thinking_level(), None, "unknown model");
+        entry.model.id = "claude-sonnet-4-5".to_string();
+        assert_eq!(entry.chillax_thinking_level(), None, "fixed-budget model");
+    }
+
+    #[test]
+    fn chillax_respects_disabled_tiers_and_does_not_invert_wire_effort() {
+        use crate::model::ThinkingLevel;
+
+        let mut entry = make_model_entry("claude-opus-4-7", true);
+        entry.model.api = "anthropic-messages".to_string();
+        entry.compat = Some(CompatConfig {
+            thinking_level_map: Some(HashMap::from([
+                ("minimal".to_string(), None),
+                ("low".to_string(), None),
+            ])),
+            ..CompatConfig::default()
+        });
+        assert_eq!(entry.chillax_thinking_level(), Some(ThinkingLevel::Medium));
+
+        let map = entry
+            .compat
+            .as_mut()
+            .expect("compat")
+            .thinking_level_map
+            .as_mut()
+            .expect("map");
+        map.insert("minimal".to_string(), Some("max".to_string()));
+        assert_eq!(entry.chillax_thinking_level(), None, "inverted effort map");
+        entry.compat.as_mut().expect("compat").thinking_level_map = Some(HashMap::from([(
+            "minimal".to_string(),
+            Some("custom-effort".to_string()),
+        )]));
+        assert_eq!(entry.chillax_thinking_level(), None, "unknown wire effort");
+        entry.compat.as_mut().expect("compat").thinking_level_map = Some(
+            ["minimal", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(|level| (level.to_string(), None))
+                .collect(),
+        );
+        assert_eq!(entry.chillax_thinking_level(), None, "no enabled tier");
     }
 
     #[test]

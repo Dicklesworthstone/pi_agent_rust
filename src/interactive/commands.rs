@@ -1526,9 +1526,7 @@ impl PiApp {
             .invalidate_background_compaction();
         agent_guard.set_provider(provider_impl);
         agent_guard.set_tool_call_dialect(next.tool_call_dialect());
-        agent_guard.set_keyword_max_thinking_level(
-            next.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
+        agent_guard.set_keyword_model(&next);
         agent_guard.set_model_accepts_images(
             next.model
                 .input
@@ -1707,9 +1705,7 @@ impl PiApp {
             // over the previous model's limit.
             stream_options.max_tokens = Some(target_entry.model.max_tokens);
         }
-        agent_guard.set_keyword_max_thinking_level(
-            target_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
+        agent_guard.set_keyword_model(&target_entry);
         agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
         agent_guard.set_model_accepts_images(
             target_entry
@@ -4352,6 +4348,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         if let Ok(mut agent_guard) = self.agent.try_lock() {
             agent_guard.stream_options_mut().thinking_level = Some(effective_level);
+            agent_guard.clear_retry_keyword_effort();
         }
 
         self.status_message = Some(format!("Thinking level: {effective_level}"));

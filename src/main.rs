@@ -3427,11 +3427,7 @@ async fn run(
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);
-        agent_session.agent.set_keyword_max_thinking_level(
-            selection
-                .model_entry
-                .clamp_thinking_level(pi::model::ThinkingLevel::Max),
-        );
+        agent_session.agent.set_keyword_model(&selection.model_entry);
         agent_session
             .agent
             .set_tool_call_dialect(selection.model_entry.tool_call_dialect());

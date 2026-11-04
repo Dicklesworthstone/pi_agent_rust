@@ -190,11 +190,7 @@ async fn finish_selection_inner(
     // installation of provider/options, stored identity and both registries.
     ensure_startup_active(&cx)?;
     session.agent.set_provider(provider);
-    session.agent.set_keyword_max_thinking_level(
-        selection
-            .model_entry
-            .clamp_thinking_level(crate::model::ThinkingLevel::Max),
-    );
+    session.agent.set_keyword_model(&selection.model_entry);
     session
         .agent
         .set_tool_call_dialect(selection.model_entry.tool_call_dialect());

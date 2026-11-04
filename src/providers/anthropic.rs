@@ -381,7 +381,7 @@ fn fast_mode_unsupported(status: u16, body: &str) -> bool {
 /// models (Opus/Sonnet 4.5 and earlier, Claude 3.x, all Haiku) require
 /// `budget_tokens`.
 /// Ref: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
+pub(crate) fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
     const ADAPTIVE_PREFIXES: [&str; 8] = [
         "claude-opus-4-6",
         "claude-opus-4-7",
@@ -411,7 +411,7 @@ fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
 /// `high -> "high"`, `xhigh -> "xhigh"`, `max -> "max"` (Anthropic has no
 /// `minimal` effort — it collapses to the nearest Anthropic tier). `off`
 /// yields `None` (no effort emitted; thinking is not enabled for `off`).
-fn anthropic_effort_for_level(
+pub(crate) fn anthropic_effort_for_level(
     level: ThinkingLevel,
     compat: Option<&CompatConfig>,
 ) -> Option<String> {

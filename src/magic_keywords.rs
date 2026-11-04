@@ -1,9 +1,10 @@
 //! Magic keywords (bd-cv653.3.6).
 //!
-//! Three standalone lowercase words opt a turn into specialized behavior:
+//! Standalone lowercase words opt a turn into specialized behavior:
 //! `ultrathink` (highest supported thinking effort), `orchestrate`
 //! (parallel subagents + per-phase verification), `workflowz`
-//! (deterministic multi-subagent workflow). They trigger ONLY in prose —
+//! (deterministic multi-subagent workflow), `chillax` (brief reasoning), and
+//! `jevify` (bounded bulk classification through eval). They trigger ONLY in prose —
 //! never inside code spans, fenced blocks, XML/HTML sections, identifiers,
 //! or paths.
 //!
@@ -19,26 +20,34 @@ use serde::{Deserialize, Serialize};
 pub enum KeywordAction {
     /// Set the turn's thinking level to the active model's pre-clamped max.
     Ultrathink,
+    /// Prefer brief reasoning and lower supported adaptive effort.
+    Chillax,
     /// Inject the parallel-orchestration directive.
     Orchestrate,
     /// Inject the deterministic-workflow directive.
     Workflowz,
+    /// Inject the eval bulk-classification contract when eval is enabled.
+    Jevify,
 }
 
 impl KeywordAction {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Ultrathink => "ultrathink",
+            Self::Chillax => "chillax",
             Self::Orchestrate => "orchestrate",
             Self::Workflowz => "workflowz",
+            Self::Jevify => "jevify",
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ultrathink => "ultrathink",
+            Self::Chillax => "chillax",
             Self::Orchestrate => "orchestrate",
             Self::Workflowz => "workflowz",
+            Self::Jevify => "jevify",
         }
     }
 }
@@ -54,12 +63,19 @@ pub struct CustomKeyword {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeywordSettings {
+    /// Enable hidden keyword instructions and effort changes (default true).
+    pub enabled: Option<bool>,
     /// Enable `ultrathink` (default true).
     pub ultrathink: Option<bool>,
+    /// Enable `chillax` (default true).
+    pub chillax: Option<bool>,
     /// Enable `orchestrate` (default true).
     pub orchestrate: Option<bool>,
     /// Enable `workflowz` (default true).
+    #[serde(alias = "workflow")]
     pub workflowz: Option<bool>,
+    /// Enable `jevify` when eval is active (default true).
+    pub jevify: Option<bool>,
     /// Future keywords: word + injected directive.
     pub extra: Option<Vec<CustomKeyword>>,
 }
@@ -68,8 +84,10 @@ impl KeywordSettings {
     fn enabled(&self, action: KeywordAction) -> bool {
         match action {
             KeywordAction::Ultrathink => self.ultrathink.unwrap_or(true),
+            KeywordAction::Chillax => self.chillax.unwrap_or(true),
             KeywordAction::Orchestrate => self.orchestrate.unwrap_or(true),
             KeywordAction::Workflowz => self.workflowz.unwrap_or(true),
+            KeywordAction::Jevify => self.jevify.unwrap_or(true),
         }
     }
 }
@@ -80,6 +98,11 @@ impl KeywordSettings {
 pub struct KeywordActivation {
     pub word: String,
     pub action: String,
+    /// An actual pinned-effort change, filled by the runtime rather than the
+    /// prose detector. Persisting it alongside the activation makes resume
+    /// retain the same effort without interpreting old user text again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<crate::model::ThinkingLevel>,
 }
 
 /// Stable schema carried by every session telemetry entry.
@@ -93,14 +116,34 @@ pub fn append_session_telemetry(
     activations: &[KeywordActivation],
 ) {
     for activation in activations {
-        session.append_custom_entry(
-            "magic_keyword".to_string(),
-            Some(serde_json::json!({
-                "schema": KEYWORD_TELEMETRY_SCHEMA_V1,
-                "word": activation.word,
-                "action": activation.action,
-            })),
-        );
+        let mut data = serde_json::json!({
+            "schema": KEYWORD_TELEMETRY_SCHEMA_V1,
+            "word": activation.word,
+            "action": activation.action,
+        });
+        if let Some(level) = activation.thinking_level {
+            data["thinkingLevel"] = serde_json::Value::String(level.to_string());
+            persist_thinking_change(session, level);
+        }
+        session.append_custom_entry("magic_keyword".to_string(), Some(data));
+    }
+}
+
+/// Keep the pinned level in the same durable session history as the turn.
+/// Retries can change the model's minimum without producing a second keyword
+/// activation, so the session wrapper also calls this for a pending reduction.
+pub(crate) fn persist_thinking_change(
+    session: &mut crate::session::Session,
+    level: crate::model::ThinkingLevel,
+) {
+    let level = level.to_string();
+    if session
+        .effective_thinking_level_for_current_path()
+        .as_deref()
+        != Some(level.as_str())
+    {
+        session.set_model_header(None, None, Some(level.clone()));
+        session.append_thinking_level_change(level);
     }
 }
 
@@ -111,6 +154,13 @@ pub const ORCHESTRATE_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `or
 /// Deterministic-workflow directive (omp parity: staged waves, named nodes,
 /// barrier semantics matching our subagent chain/parallel shapes).
 pub const WORKFLOWZ_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `workflowz` for this turn. Execute as a deterministic multi-subagent workflow: name each node, wire dependencies explicitly, run independent nodes as parallel waves with barriers between stages, and verify each wave before proceeding.\n</system-reminder>";
+
+/// Brief-reasoning instruction, useful even on models without adjustable effort.
+pub const CHILLAX_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `chillax` for this turn. Keep reasoning brief, take a direct path, and avoid unnecessary deliberation. Continue to verify changes and satisfy the full request.\n</system-reminder>";
+
+/// Native eval uses bounded judge batches; do not tell the model to exceed
+/// those limits or assume OMP's different helper defaults and result shapes.
+pub const JEVIFY_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `jevify` for this turn. For a homogeneous classification task, define the question, rubric, prefilter, and escalation threshold before loading the candidate data. Use eval's judgeBatch() in JavaScript or judge_batch() in Python to classify every candidate in bounded batches, respecting the native item, request, time, and cost limits. Keep item identities, inspect every verdict and error, then read the full details only for flagged or uncertain items. Report coverage and unresolved failures; never count an unprocessed or failed item as a negative result. Use the configured judge_model or an explicitly configured model role and the actual helper result schema.\n</system-reminder>";
 
 /// Tokenizer state: only prose tokens are keyword-eligible. Delimiter lengths
 /// are retained so a shorter or longer backtick run cannot escape a code span
@@ -309,6 +359,9 @@ fn boundary_enters_path_context(token: &str, boundary: char, next: Option<char>)
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordActivation> {
+    if settings.is_some_and(|settings| settings.enabled == Some(false)) {
+        return Vec::new();
+    }
     let mut activations = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut state = ScanState::Prose;
@@ -327,8 +380,10 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
         let word = token.as_str();
         for action in [
             KeywordAction::Ultrathink,
+            KeywordAction::Chillax,
             KeywordAction::Orchestrate,
             KeywordAction::Workflowz,
+            KeywordAction::Jevify,
         ] {
             if word == action.word()
                 && settings.is_none_or(|s| s.enabled(action))
@@ -337,6 +392,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                 activations.push(KeywordActivation {
                     word: action.word().to_string(),
                     action: action.as_str().to_string(),
+                    thinking_level: None,
                 });
             }
         }
@@ -351,6 +407,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                     activations.push(KeywordActivation {
                         word: custom.word.clone(),
                         action: "custom".to_string(),
+                        thinking_level: None,
                     });
                 }
             }
@@ -482,6 +539,14 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
         let next = message.get(index..).and_then(|tail| tail.chars().next());
+        // An immediately adjacent opening parenthesis is call syntax, not a
+        // prose boundary. Parenthesized prose such as `(chillax)` still works
+        // because the token is empty at its opening delimiter.
+        if ch == '(' && !token.is_empty() {
+            token.clear();
+            suppress_path_lexeme = true;
+            continue;
+        }
         if boundary_enters_path_context(&token, ch, next) {
             if matches!(ch, '?' | ';') {
                 flush_token(&mut token, &mut activations, &mut seen);
@@ -553,8 +618,10 @@ pub fn directives_for(
     let mut directives = Vec::new();
     for activation in activations {
         match activation.action.as_str() {
+            "chillax" => directives.push(CHILLAX_DIRECTIVE.to_string()),
             "orchestrate" => directives.push(ORCHESTRATE_DIRECTIVE.to_string()),
             "workflowz" => directives.push(WORKFLOWZ_DIRECTIVE.to_string()),
+            "jevify" => directives.push(JEVIFY_DIRECTIVE.to_string()),
             "custom" => {
                 if let Some(settings) = settings
                     && let Some(extra) = &settings.extra
@@ -585,6 +652,10 @@ mod tests {
         assert_eq!(words("please ultrathink this design"), ["ultrathink"]);
         assert_eq!(words("orchestrate the migration"), ["orchestrate"]);
         assert_eq!(words("workflowz please"), ["workflowz"]);
+        assert_eq!(
+            words("chillax, then jevify this list"),
+            ["chillax", "jevify"]
+        );
         // Idempotent per turn.
         assert_eq!(words("ultrathink then ultrathink again"), ["ultrathink"]);
     }
@@ -753,6 +824,48 @@ mod tests {
     }
 
     #[test]
+    fn new_keywords_require_lowercase_authored_prose() {
+        for input in [
+            "Chillax JEVIFY",
+            "chillax_mode prejevify chillax-fast",
+            "src/chillax.rs jevify.ts foo::chillax",
+            "chillax() jevify(items)",
+            "`chillax jevify`",
+            "~~~text\nchillax jevify\n~~~",
+            "<inject>chillax jevify</inject>",
+            "<!-- chillax jevify -->",
+        ] {
+            assert!(
+                words(input).is_empty(),
+                "unexpected activation in {input:?}"
+            );
+        }
+        assert_eq!(words("(chillax), then 'jevify'."), ["chillax", "jevify"]);
+        assert_eq!(words("chillax() then jevify the list"), ["jevify"]);
+    }
+
+    #[test]
+    fn global_switch_disables_custom_and_builtin_keywords() {
+        let settings = KeywordSettings {
+            enabled: Some(false),
+            chillax: Some(true),
+            jevify: Some(true),
+            extra: Some(vec![CustomKeyword {
+                word: "deepdive".to_string(),
+                directive: "go deep".to_string(),
+            }]),
+            ..Default::default()
+        };
+        assert!(
+            detect(
+                "ultrathink chillax orchestrate workflowz jevify deepdive",
+                Some(&settings),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn settings_disable_each_keyword() {
         let settings = KeywordSettings {
             ultrathink: Some(false),
@@ -762,9 +875,14 @@ mod tests {
         let settings = KeywordSettings {
             orchestrate: Some(false),
             workflowz: Some(false),
+            chillax: Some(false),
+            jevify: Some(false),
             ..Default::default()
         };
-        let found = detect("orchestrate and workflowz but ultrathink", Some(&settings));
+        let found = detect(
+            "orchestrate workflowz chillax jevify but ultrathink",
+            Some(&settings),
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].word, "ultrathink");
     }

@@ -111,6 +111,7 @@ pub struct Config {
     /// Secrets vault settings (bd-cv653.7.9).
     pub secrets: Option<crate::secrets::SecretsSettings>,
     /// Magic-keyword settings (bd-cv653.3.6).
+    #[serde(alias = "magicKeywords", alias = "magic_keywords")]
     pub keywords: Option<crate::magic_keywords::KeywordSettings>,
     /// Advisor settings (bd-cv653.3.3).
     pub advisor: Option<AdvisorSettings>,
@@ -2226,9 +2227,12 @@ fn merge_keywords(
 ) -> Option<crate::magic_keywords::KeywordSettings> {
     match (base, other) {
         (Some(base), Some(other)) => Some(crate::magic_keywords::KeywordSettings {
+            enabled: other.enabled.or(base.enabled),
             ultrathink: other.ultrathink.or(base.ultrathink),
+            chillax: other.chillax.or(base.chillax),
             orchestrate: other.orchestrate.or(base.orchestrate),
             workflowz: other.workflowz.or(base.workflowz),
+            jevify: other.jevify.or(base.jevify),
             extra: other.extra.or(base.extra),
         }),
         (None, Some(other)) => Some(other),
@@ -3599,23 +3603,29 @@ mod tests {
             &global_dir.join("settings.json"),
             r#"{
                 "keywords": {
+                    "enabled": true,
                     "ultrathink": true,
+                    "chillax": false,
                     "orchestrate": false,
                     "workflowz": false,
+                    "jevify": true,
                     "extra": [{"word": "deepdive", "directive": "go deep"}]
                 }
             }"#,
         );
         write_file(
             &cwd.join(".pi/settings.json"),
-            r#"{"keywords":{"ultrathink":false}}"#,
+            r#"{"magicKeywords":{"ultrathink":false,"jevify":false}}"#,
         );
 
         let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
         let keywords = config.keywords.expect("merged keyword settings");
+        assert_eq!(keywords.enabled, Some(true));
         assert_eq!(keywords.ultrathink, Some(false));
+        assert_eq!(keywords.chillax, Some(false));
         assert_eq!(keywords.orchestrate, Some(false));
         assert_eq!(keywords.workflowz, Some(false));
+        assert_eq!(keywords.jevify, Some(false));
         let extra = keywords.extra.expect("inherited custom keywords");
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].word, "deepdive");
@@ -3639,6 +3649,23 @@ mod tests {
                 .is_some_and(|extra| extra.is_empty()),
             "an explicit higher-precedence empty list must clear inherited custom words"
         );
+    }
+
+    #[test]
+    fn keyword_global_and_workflow_aliases_merge_without_resetting_other_flags() {
+        let base: Config = serde_json::from_str(
+            r#"{"keywords":{"enabled":true,"workflowz":true,"chillax":false}}"#,
+        )
+        .expect("base config");
+        let other: Config = serde_json::from_str(
+            r#"{"magic_keywords":{"enabled":false,"workflow":false,"jevify":true}}"#,
+        )
+        .expect("other config");
+        let keywords = Config::merge(base, other).keywords.expect("keywords");
+        assert_eq!(keywords.enabled, Some(false));
+        assert_eq!(keywords.workflowz, Some(false));
+        assert_eq!(keywords.chillax, Some(false));
+        assert_eq!(keywords.jevify, Some(true));
     }
 
     #[test]
