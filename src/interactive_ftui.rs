@@ -26878,6 +26878,15 @@ mod tests {
         assert!(handle.session().agent.messages().is_empty());
     }
 
+    /// A turn's lifecycle messages reach the channel inside the operation's
+    /// progress scope. Assertions about them look at the inner message.
+    fn lifecycle_message(event: &PiMsg) -> &PiMsg {
+        match event {
+            PiMsg::FtuiToolProgress(tool_progress::Event::Message { message, .. }) => message,
+            other => other,
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn capped_turn_returns_pending_input_and_reports_only_a_durable_pause() {
@@ -27000,9 +27009,10 @@ mod tests {
                 );
 
                 let events = rx.try_iter().collect::<Vec<_>>();
+                let lifecycle = events.iter().map(lifecycle_message).collect::<Vec<_>>();
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    events
+                    lifecycle
                         .iter()
                         .filter(|event| matches!(event, PiMsg::AgentStart))
                         .count(),
@@ -27010,7 +27020,7 @@ mod tests {
                 );
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    events
+                    lifecycle
                         .iter()
                         .filter(|event| matches!(event, PiMsg::AgentDone { .. }))
                         .count(),
@@ -27018,12 +27028,12 @@ mod tests {
                 );
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
-                    events
+                    lifecycle
                         .iter()
                         .any(|event| matches!(event, PiMsg::AgentError(_))),
                     fail_save
                 );
-                let restored = events
+                let restored = lifecycle
                     .iter()
                     .filter_map(|event| match event {
                         PiMsg::RestorePendingInput {
@@ -27485,22 +27495,23 @@ mod tests {
             drop(calls);
 
             let events = rx.try_iter().collect::<Vec<_>>();
+            let lifecycle = events.iter().map(lifecycle_message).collect::<Vec<_>>();
             assert_eq!(
-                events
+                lifecycle
                     .iter()
                     .filter(|event| matches!(event, PiMsg::UserInputSubmitted { .. }))
                     .count(),
                 1
             );
             assert_eq!(
-                events
+                lifecycle
                     .iter()
                     .filter(|event| matches!(event, PiMsg::AgentStart))
                     .count(),
                 1
             );
             assert!(
-                !events
+                !lifecycle
                     .iter()
                     .any(|event| matches!(event, PiMsg::AgentError(_)))
             );
