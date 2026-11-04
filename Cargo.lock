@@ -5873,6 +5873,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "unicode-segmentation",
  "unicode-width",
  "url",
  "uuid",

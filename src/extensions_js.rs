@@ -61,6 +61,7 @@ use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
 
 mod executable;
+mod intl;
 mod process_session;
 mod sqlite;
 #[path = "extensions_js_storage.rs"]
@@ -20051,6 +20052,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 let global = ctx.globals();
 
                 storage::install(&ctx, &module_state, &process_cwd)?;
+                intl::install(&ctx)?;
                 sqlite::install(
                     &ctx,
                     Rc::clone(&self.sqlite_state),
@@ -22191,20 +22193,82 @@ if (typeof globalThis.Intl === 'undefined') {
         resolvedOptions() { return { ...this._opts, locale: this._locale }; }
     }
 
-    class Segmenter {
-        constructor(locale, opts) {
-            this._locale = locale || 'en';
-            this._opts = opts || {};
+    // Locale-independent extended grapheme boundaries come from the host's
+    // Unicode implementation. Keep the original JS string here: its indices
+    // and slices use UTF-16, including any unpaired surrogate code units.
+    const __graphemeBoundaries = globalThis.__pi_intl_grapheme_boundaries;
+    const __segmenters = new WeakSet();
+    const __segmentStates = new WeakMap();
+
+    function __segmentState(receiver) {
+        const state = __segmentStates.get(receiver);
+        if (!state) throw new TypeError('Incompatible Segments receiver');
+        return state;
+    }
+
+    function __segmentRecord(state, index) {
+        const start = state.boundaries[index];
+        return {
+            segment: state.input.slice(start, state.boundaries[index + 1]),
+            index: start,
+            input: state.input,
+        };
+    }
+
+    class Segments {
+        constructor(input, boundaries) {
+            __segmentStates.set(this, { input, boundaries });
         }
-        segment(str) {
-            const s = String(str ?? '');
-            const segments = [];
-            // Approximate grapheme segmentation: split by codepoints
-            for (const ch of s) {
-                segments.push({ segment: ch, index: segments.length, input: s });
+
+        [Symbol.iterator]() {
+            const state = __segmentState(this);
+            // Each traversal owns its cursor and creates fresh records. Do
+            // not iterate this Segments object from inside its own iterator.
+            return (function*() {
+                for (let index = 0; index + 1 < state.boundaries.length; index++) {
+                    yield __segmentRecord(state, index);
+                }
+            })();
+        }
+
+        containing(index) {
+            const state = __segmentState(this);
+            const number = +index;
+            const position = Number.isNaN(number) ? 0 : Math.trunc(number);
+            if (position < 0 || position >= state.input.length) return undefined;
+            let low = 0;
+            let high = state.boundaries.length - 1;
+            while (low + 1 < high) {
+                const middle = Math.floor((low + high) / 2);
+                if (state.boundaries[middle] <= position) low = middle;
+                else high = middle;
             }
-            segments[Symbol.iterator] = function*() { for (const seg of segments) yield seg; };
-            return segments;
+            return __segmentRecord(state, low);
+        }
+    }
+
+    class Segmenter {
+        constructor(_locale, opts) {
+            if (opts === null) throw new TypeError('Intl.Segmenter options must not be null');
+            const requested = opts === undefined ? undefined : opts.granularity;
+            const granularity = requested === undefined ? 'grapheme' : `${requested}`;
+            if (granularity !== 'grapheme') {
+                throw new RangeError('PiJS Intl.Segmenter supports only grapheme granularity');
+            }
+            __segmenters.add(this);
+        }
+
+        segment(value) {
+            if (!__segmenters.has(this)) throw new TypeError('Incompatible Intl.Segmenter receiver');
+            const input = `${value}`;
+            // Rust strings require valid Unicode. Replacement is only for
+            // classifying boundaries; each unpaired surrogate still occupies
+            // one UTF-16 unit, and returned text always slices the original.
+            const boundaryInput = input.replace(
+                /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g,
+                units => units.length === 2 ? units : '\uFFFD',
+            );
+            return new Segments(input, __graphemeBoundaries(boundaryInput));
         }
     }
 
@@ -28058,16 +28122,24 @@ mod tests {
     /// accounted for by d9999a5f (+363, footer/header factories), 27e9d778
     /// (+1_177, environment/executable facade), and 70110103 (+5_689,
     /// context transforms and timer lifecycle): 245_152 -> 247_754 bytes.
+    ///
+    /// Grapheme rendering for gh #279 adds 2_688 bridge bytes: 247_754 ->
+    /// 250_442. The native boundary callback replaces recursive iteration
+    /// and code-point splitting; published-renderer regressions cover the
+    /// deliberate source change. The filesystem module is trimmed before
+    /// this receipt: pre-config main already contained 64_141 bytes, and
+    /// 7684b1a adds 470 for typed configuration errors, yielding 64_611.
+    /// Other pre-existing module receipt drift is not re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            247_754,
-            "29f10a474b23f3cda3ec56ce1f74781f2918cef375dd27ba5effa6a5b5b343ed",
+            250_442,
+            "aa9bc50d0adfa31a2d2f8952cb168f8be6ca5a44414883e410d592299f4e9a9c",
         ),
         (
             "node:fs",
-            57_930,
-            "9180ce100adb7cf8e951b1f4d2e712a6ae3b72bd2720f9ad65e7eb1d5250cdb0",
+            64_611,
+            "00009b3d960524a1c9d37f6fd8e2a014d29520a06fa3b1283f607db8dc068151",
         ),
         (
             "@mariozechner/pi-ai",

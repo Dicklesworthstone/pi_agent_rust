@@ -732,6 +732,45 @@ remains the required native validation path; published-package PiJS startup,
 reload, MCP behavior, and Windows lifecycle remain unverified until that
 runner evidence is available.
 
+### Grapheme segmentation for extension rendering
+
+PiJS supports locale-independent extended grapheme segmentation through
+`new Intl.Segmenter(undefined, { granularity: "grapheme" })`; the default
+granularity is also `grapheme`. The pure native helper uses the already-locked
+`unicode-segmentation` 1.13.3 Unicode tables and returns UTF-16 boundaries in
+one batch. It does not acquire filesystem, environment, process, or network
+capabilities. JavaScript retains the original input, creates records lazily,
+and gives each iterator its own cursor. `Segments.containing(index)` searches
+the same boundaries, including when the index falls within a surrogate pair.
+Unpaired surrogate code units remain intact in returned text.
+
+This fixes a concrete failure in the published `context-mode@1.0.169` tool
+renderer: the previous iterator recursively invoked itself and overflowed the
+stack on nonempty output. Removing that recursion alone still split flags,
+emoji modifiers, ZWJ families, Hangul Jamo, and Indic clusters during clipping.
+The new boundaries keep those clusters together and report UTF-16 indices
+rather than code-point counts.
+
+This is a focused grapheme implementation, not complete locale-aware Intl
+support. Word and sentence granularities are explicitly rejected with
+`RangeError` instead of silently returning graphemes. Locale negotiation,
+`supportedLocalesOf`, and `resolvedOptions` are not implemented for Segmenter.
+
+The supplementary diagnostic
+`scripts/test_published_extension_rendering.mjs` pins the unmodified published
+renderer and runs it with both Node's native Intl and the actual PiJS JavaScript
+facade in the same invocation. All 23 checks pass with the updated facade;
+the prior facade fails all 23. Cases include ANSI preservation, clipping at
+grapheme boundaries, multiline rendering, independent iterators, UTF-16
+indices, input coercion, and lone surrogates. Node supplies the boundary
+callback in this diagnostic, so this result verifies the JavaScript facade
+and published renderer, not the Rust segmentation implementation or QuickJS.
+
+Native boundary, QuickJS callback, and full PiJS facade regressions are in
+`src/extensions_js/intl.rs`. They remain unexecuted in this environment because
+the required DSR remote Rust runner is unavailable. Native Windows rendering
+and the complete published-package PiJS lifecycle remain unverified.
+
 ---
 
 ## 7. Preflight Analysis

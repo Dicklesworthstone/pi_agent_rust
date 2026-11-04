@@ -374,6 +374,8 @@ ast-grep-language = { version = "0.45", default-features = false, features = [
     "tree-sitter-go",
 ] }
 unicode-normalization = "0.1"
+# PiJS grapheme boundaries use the same Unicode tables already locked for the TUI.
+unicode-segmentation = "=1.13.3"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "3"
 sysinfo = "0.39.6"
