@@ -798,13 +798,67 @@ They remain outside project recall, reflection, and startup memory.
 
 ### Media (multimodal perception & speech)
 
-- `media.enable_media` (bool): Default `false`. When `true`, activates `inspect_image`, `generate_image`, and `tts`.
-- `media.tts_provider` (string): Default `"elevenlabs"`. Supported: `"openai"`, `"elevenlabs"`, `"system"`.
-- `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
-- `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
-- `media.output_dir` (string): Destination folder for generated media artifacts.
+| Setting | camelCase alias | Effect |
+| --- | --- | --- |
+| `media.enable_media` | `media.enableMedia` | Default activation for `inspect_image`, `generate_image`, and `tts` |
+| `media.enable_inspect_image` | `media.enableInspectImage` | Override activation of `inspect_image` |
+| `media.enable_generate_image` | `media.enableGenerateImage` | Override activation of `generate_image` |
+| `media.enable_tts` | `media.enableTts` | Override activation of `tts` |
+
+All four switches accept JSON booleans. Each individual switch, including an
+explicit `false`, takes precedence over the aggregate setting. If neither is
+set, the tool remains disabled. `read_media` has its own independent switch.
+For example, this enables image inspection and generation without speech:
+
+```json
+{
+  "media": {
+    "enableMedia": true,
+    "enableTts": false
+  }
+}
+```
+
+Global and trusted project settings first merge field by field, with project
+values overriding the same global field regardless of spelling. Missing and
+`null` values inherit. Individual switches then override the merged aggregate,
+even when the individual value was inherited: a global `enable_tts: false`
+survives a project `enable_media: true`, and a global `enable_tts: true`
+survives a project `enable_media: false`. Set the project's individual switch
+to change that choice.
+
+Untrusted project settings remain excluded. `--no-tools` and an explicit empty
+tool selection still disable built-ins. Explicitly naming a media tool retains
+its existing override behavior. Ordinary nonempty `--tools` selections retain
+automatic media additions; restricted child-agent and SDK tool allowlists
+exclude unlisted tools. Implicit activation respects
+`tools.loadMode.<name>: "off"`. Execution retains its existing approval
+requirements. See [Optional tools](#optional-tools).
+
+Use one spelling per field in each file; supplying both is a duplicate-field
+error. Strings such as `"true"` are invalid. Unknown media settings with non-null values
+produce a startup warning naming the file and dotted setting and explaining
+that it is ignored. An explicit `RUST_LOG` filter retains control over log
+visibility.
+
+- `media.vision_provider` / `media.visionProvider` (string): Default `"gemini"`. Supported: `"openai"`, `"anthropic"`, `"gemini"`.
+- `media.vision_model` / `media.visionModel` (string): Default inspection model; otherwise chosen for the selected provider.
+- `media.tts_provider` / `media.ttsProvider` (string): Default `"openai"`. Supported: `"openai"`, `"xai"`.
+- `media.tts_voice` / `media.ttsVoice` (string): Provider voice identifier; defaults to `"alloy"` for OpenAI or `"eve"` for xAI.
+- `media.image_gen_provider` / `media.imageGenProvider` (string): Default `"openai"`. Supported: `"openai"`, `"gemini"`, `"xai"`.
+- `media.image_gen_model` / `media.imageGenModel` (string): Default generation model; otherwise chosen for the selected provider.
 - `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as a native media block. Gemini-family models consume audio/video natively. OpenAI Chat Completions models declaring audio input and separate audio pricing consume WAV/MP3 natively and return text; `openai/gpt-audio-1.5` includes that configuration. Unsupported media produces `[media omitted: <name>, <mime>, <size>]`. See [native audio model configuration](models.md#native-audio-with-openai-chat-completions).
 - `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. Session media can be stored in sidecars and is restored for subsequent provider requests until compaction, so keep this small. Provider-specific per-request transport bounds also apply.
+
+For provider, model, and voice choices, explicit tool-call arguments win over
+settings, followed by the corresponding `PI_VISION_*`, `PI_IMAGE_GEN_*`, or
+`PI_TTS_*` environment fallback and then the built-in default.
+
+`media.output_dir` is not supported. Use the `output_path` argument of
+`generate_image` or `tts` to choose a new destination within the workspace.
+Without it, artifacts use `images/generated_<id>.<extension>` or
+`audio/speech_<id>.<extension>`. Existing files are not overwritten. Activating
+a tool does not supply the provider credentials needed to execute it.
 
 ### Computer (desktop automation)
 
