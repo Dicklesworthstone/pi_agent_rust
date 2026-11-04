@@ -1951,6 +1951,58 @@ impl AuthStorage {
         )
     }
 
+    /// Resolve credentials for native media APIs from this session's auth scope.
+    /// OAuth, bearer, and provider-specific credential chains are not API keys for
+    /// these endpoints. Do not import credentials from other applications here.
+    pub(crate) fn resolve_media_api_key_status(&self, provider: &str) -> CredentialResolution {
+        self.resolve_media_api_key_status_with_env_lookup(provider, |var| std::env::var(var).ok())
+    }
+
+    fn resolve_media_api_key_status_with_env_lookup<F>(
+        &self,
+        provider: &str,
+        mut env_lookup: F,
+    ) -> CredentialResolution
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let env_keys: &[&str] = match canonical_provider_id(provider) {
+            Some("openai") => &["OPENAI_API_KEY"],
+            Some("anthropic") => &["ANTHROPIC_API_KEY"],
+            // Preserve the existing native-media singular-variable precedence.
+            Some("google") => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+            Some("xai") => &["XAI_API_KEY"],
+            _ => return CredentialResolution::NotConfigured,
+        };
+
+        // A configured pool owns the decision, including refusal while every
+        // member is cooling down. Never escape it through a singular/stored key.
+        match resolve_rotated_key(provider, &self.path, &mut env_lookup) {
+            CredentialResolution::NotConfigured => {}
+            resolution => return resolution,
+        }
+        if let Some(key) = env_keys.iter().find_map(|var| {
+            env_lookup(var)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }) {
+            return CredentialResolution::Available(key);
+        }
+
+        let Some(credential @ AuthCredential::ApiKey { .. }) =
+            self.credential_for_provider(provider)
+        else {
+            return CredentialResolution::NotConfigured;
+        };
+        api_key_from_credential(credential, self.command_working_directory.as_deref())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .map_or(
+                CredentialResolution::NotConfigured,
+                CredentialResolution::Available,
+            )
+    }
+
     /// Prepare a same-provider fallback without admitting the credential that
     /// just failed. Only the eventual durable commit records the real cooldown.
     pub(crate) fn resolve_api_key_after_rate_limit(
@@ -7559,6 +7611,348 @@ mod tests {
         assert_eq!(
             resolve_rotated_key("openai", Path::new("/tmp/auth-d.json"), env),
             CredentialResolution::NotConfigured
+        );
+    }
+
+    #[test]
+    fn media_api_keys_match_provider_names_and_aliases_without_crossing_providers() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        for (stored_provider, requested_provider) in [
+            ("OpenAI", " openai "),
+            ("Anthropic", "ANTHROPIC"),
+            ("GeMiNi", "google"),
+            ("Google", "GEMINI"),
+            ("xAI", "XAI"),
+        ] {
+            let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                stored_provider,
+                AuthCredential::ApiKey {
+                    key: "  stored-media-key\n".to_string(),
+                },
+            );
+            assert_eq!(
+                auth.resolve_media_api_key_status_with_env_lookup(requested_provider, |_| None),
+                CredentialResolution::Available("stored-media-key".to_string()),
+                "stored {stored_provider}, requested {requested_provider}"
+            );
+            for other in ["openai", "anthropic", "gemini", "xai"] {
+                if !provider_ids_match(other, requested_provider) {
+                    assert_eq!(
+                        auth.resolve_media_api_key_status_with_env_lookup(other, |_| None),
+                        CredentialResolution::NotConfigured,
+                        "{stored_provider} credentials must not reach {other}"
+                    );
+                }
+            }
+        }
+        let mut auth = AuthStorage::empty_at(directory.path().join("empty-auth.json"));
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: " \n".to_string(),
+            },
+        );
+        assert_eq!(
+            auth.resolve_media_api_key_status_with_env_lookup("openai", |_| None),
+            CredentialResolution::NotConfigured
+        );
+        for unsupported in [
+            "openai-codex",
+            "google-gemini-cli",
+            "amazon-bedrock",
+            "other",
+        ] {
+            auth.set(
+                unsupported,
+                AuthCredential::ApiKey {
+                    key: "unrelated-provider-key".to_string(),
+                },
+            );
+            assert_eq!(
+                auth.resolve_media_api_key_status_with_env_lookup(unsupported, |_| {
+                    panic!("unsupported media provider must not probe credentials")
+                }),
+                CredentialResolution::NotConfigured
+            );
+        }
+    }
+
+    #[test]
+    fn media_api_keys_keep_environment_precedence_and_gemini_variable_order() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        for (provider, variable) in [
+            ("openai", "OPENAI_API_KEY"),
+            ("anthropic", "ANTHROPIC_API_KEY"),
+            ("google", "GEMINI_API_KEY"),
+            ("xai", "XAI_API_KEY"),
+        ] {
+            auth.set(
+                provider,
+                AuthCredential::ApiKey {
+                    key: "stored-fallback".to_string(),
+                },
+            );
+            assert_eq!(
+                auth.resolve_media_api_key_status_with_env_lookup(provider, |var| {
+                    (var == variable).then(|| "  environment-key\n".to_string())
+                }),
+                CredentialResolution::Available("environment-key".to_string())
+            );
+            assert_eq!(
+                auth.resolve_media_api_key_status_with_env_lookup(provider, |var| {
+                    (var == variable).then(|| " \n".to_string())
+                }),
+                CredentialResolution::Available("stored-fallback".to_string())
+            );
+        }
+        for provider in ["google", "gemini", "GeMiNi"] {
+            assert_eq!(
+                auth.resolve_media_api_key_status_with_env_lookup(provider, |var| match var {
+                    "GEMINI_API_KEY" => Some("gemini-first".to_string()),
+                    "GOOGLE_API_KEY" => Some("google-second".to_string()),
+                    _ => None,
+                }),
+                CredentialResolution::Available("gemini-first".to_string())
+            );
+            assert_eq!(
+                auth.resolve_media_api_key_status_with_env_lookup(provider, |var| match var {
+                    "GEMINI_API_KEY" => Some(" ".to_string()),
+                    "GOOGLE_API_KEY" => Some("google-second".to_string()),
+                    _ => None,
+                }),
+                CredentialResolution::Available("google-second".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn media_api_keys_reject_non_api_key_credentials() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        for credential in [
+            AuthCredential::OAuth {
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated media fixture.
+                access_token: "stored-oauth".to_string(),
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated media fixture.
+                refresh_token: "refresh-fixture".to_string(),
+                expires: i64::MAX,
+                token_url: None,
+                client_id: None,
+                extra: HashMap::new(),
+            },
+            AuthCredential::BearerToken {
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated media fixture.
+                token: "stored-bearer".to_string(),
+            },
+            AuthCredential::AwsCredentials {
+                access_key_id: "aws-fixture".to_string(),
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated media fixture.
+                secret_access_key: "aws-secret-fixture".to_string(),
+                session_token: None,
+                region: None,
+            },
+            AuthCredential::ServiceKey {
+                client_id: Some("service-client".to_string()),
+                // ubs:ignore[rust.security.hardcoded-secrets] Synthetic credential for an isolated media fixture.
+                client_secret: Some("service-secret".to_string()),
+                token_url: None,
+                service_url: None,
+            },
+            AuthCredential::Unknown(serde_json::json!({"key": "unknown-credential"})),
+        ] {
+            for (provider, variable) in [
+                ("openai", "OPENAI_API_KEY"),
+                ("anthropic", "ANTHROPIC_API_KEY"),
+                ("google", "GEMINI_API_KEY"),
+                ("xai", "XAI_API_KEY"),
+            ] {
+                auth.set(provider, credential.clone());
+                assert_eq!(
+                    auth.resolve_media_api_key_status_with_env_lookup(provider, |_| None),
+                    CredentialResolution::NotConfigured,
+                    "non-API-key credentials must not reach {provider} media endpoints"
+                );
+                assert_eq!(
+                    auth.resolve_media_api_key_status_with_env_lookup(provider, |var| {
+                        (var == variable).then(|| "valid-api-key".to_string())
+                    }),
+                    CredentialResolution::Available("valid-api-key".to_string()),
+                    "a stored login token must not shadow an explicit media environment key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn media_api_keys_use_the_supplied_auth_snapshot_without_rereading_files() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, r#"{"openai":{"type":"api_key","key":"scoped-key"}}"#)
+            .expect("initial scoped credentials");
+        let auth = AuthStorage::load(path.clone()).expect("load scoped auth snapshot");
+        std::fs::write(&path, r#"{"openai":{"type":"api_key","key":"later-key"}}"#)
+            .expect("later credentials");
+        assert_eq!(
+            auth.resolve_media_api_key_status_with_env_lookup("openai", |_| None),
+            CredentialResolution::Available("scoped-key".to_string())
+        );
+        assert_eq!(
+            AuthStorage::empty_at(path)
+                .resolve_media_api_key_status_with_env_lookup("openai", |_| None),
+            CredentialResolution::NotConfigured,
+            "an empty supplied scope must not reread even an existing auth file"
+        );
+    }
+
+    #[test]
+    fn media_api_keys_preserve_pool_exhaustion_across_provider_aliases() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let directory = tempfile::tempdir().expect("auth directory");
+        for (provider, alias, plural, singular) in [
+            ("openai", "OpenAI", "OPENAI_API_KEYS", "OPENAI_API_KEY"),
+            ("google", "GeMiNi", "GOOGLE_API_KEYS", "GEMINI_API_KEY"),
+        ] {
+            let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                provider,
+                AuthCredential::ApiKey {
+                    key: "stored-fallback".to_string(),
+                },
+            );
+            let env = |var: &str| {
+                if var == plural {
+                    Some("pool-one,pool-two".to_string())
+                } else if var == singular {
+                    Some("singular-fallback".to_string())
+                } else {
+                    None
+                }
+            };
+            let CredentialResolution::Available(first) =
+                auth.resolve_media_api_key_status_with_env_lookup(provider, env)
+            else {
+                panic!("healthy media pool must resolve");
+            };
+            assert!(["pool-one", "pool-two"].contains(&first.as_str()));
+            report_provider_rate_limit(alias, &first);
+            let CredentialResolution::Available(second) =
+                auth.resolve_media_api_key_status_with_env_lookup(alias, env)
+            else {
+                panic!("healthy pool sibling must resolve");
+            };
+            assert_ne!(first, second);
+            assert!(["pool-one", "pool-two"].contains(&second.as_str()));
+            report_provider_rate_limit(provider, &second);
+            let exhausted = auth.resolve_media_api_key_status_with_env_lookup(alias, env);
+            assert!(matches!(
+                &exhausted,
+                CredentialResolution::Exhausted { retry_after }
+                    if *retry_after > Duration::ZERO && *retry_after <= Duration::from_secs(15)
+            ));
+            let message = exhausted.into_result(alias).unwrap_err().to_string();
+            assert!(message.contains(CREDENTIAL_POOL_EXHAUSTED));
+            assert!(message.contains("retry after"));
+        }
+    }
+
+    #[test]
+    fn media_api_keys_resolve_stored_environment_references() {
+        const CHILD: &str = "PI_MEDIA_STORED_ENV_KEY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "auth::tests::media_api_keys_resolve_stored_environment_references",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("PI_TEST_MEDIA_STORED_KEY", "  reference-key\n")
+                    .env("PI_TEST_MEDIA_EMPTY_KEY", " \n")
+                    .env_remove("PI_TEST_MEDIA_MISSING_KEY")
+                    .env_remove("OPENAI_API_KEYS")
+                    .env_remove("OPENAI_API_KEY")
+                    .output()
+                    .expect("isolated media environment fixture");
+            assert!(
+                output.status.success(),
+                "media environment fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let directory = tempfile::tempdir().expect("auth directory");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        for (reference, expected) in [
+            (
+                "$ENV:PI_TEST_MEDIA_STORED_KEY",
+                CredentialResolution::Available("reference-key".to_string()),
+            ),
+            (
+                "$ENV:PI_TEST_MEDIA_EMPTY_KEY",
+                CredentialResolution::NotConfigured,
+            ),
+            (
+                "$ENV:PI_TEST_MEDIA_MISSING_KEY",
+                CredentialResolution::NotConfigured,
+            ),
+        ] {
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: reference.to_string(),
+                },
+            );
+            assert_eq!(auth.resolve_media_api_key_status("OpenAI"), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_api_keys_resolve_commands_in_the_captured_auth_workspace() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        for (directory, key) in [(&first, "first-key\n"), (&second, "second-key\n")] {
+            std::fs::create_dir(directory).expect("workspace directory");
+            std::fs::write(directory.join("credential.txt"), key).expect("credential");
+        }
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let mut auth = AuthStorage::empty_at(root.path().join("auth.json"));
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "$CMD:cat credential.txt".to_string(),
+            },
+        );
+        auth.set_command_working_directory(&first)
+            .expect("first scope");
+        let first_snapshot = auth.clone();
+        auth.set_command_working_directory(&second)
+            .expect("second scope");
+        assert_eq!(
+            auth.resolve_media_api_key_status_with_env_lookup("openai", |_| None),
+            CredentialResolution::Available("second-key".to_string())
+        );
+        assert_eq!(
+            first_snapshot.resolve_media_api_key_status_with_env_lookup("openai", |_| None),
+            CredentialResolution::Available("first-key".to_string())
+        );
+        auth.set_command_working_directory(&root.path().join("missing"))
+            .expect("missing workspace scope");
+        assert_eq!(
+            auth.resolve_media_api_key_status_with_env_lookup("openai", |_| None),
+            CredentialResolution::NotConfigured,
+            "a missing captured workspace must not fall back to process cwd"
+        );
+        assert_eq!(
+            std::env::current_dir().expect("process cwd after commands"),
+            process_cwd
         );
     }
 

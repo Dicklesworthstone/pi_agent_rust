@@ -25,15 +25,31 @@ Configure the existing opt-in flags in the application's settings:
 }
 ```
 
-Include the desired tools in the selected tool list, for example:
+`enableMedia` (alias `enable_media`) enables inspection, generation, and speech
+by default; individual flags override it, including an explicit `false`.
+`read_media` remains independent. See [settings precedence](../settings.md#media-multimodal-perception--speech).
+
+Explicit CLI selection can also enable the desired tools, for example:
 
 ```sh
 pi --tools read,write,edit,bash,inspect_image,generate_image,tts,read_media
 ```
 
-Native media requests use the selected provider's API key. They do not borrow
-chat-session OAuth credentials or switch providers merely because another
-provider has a key.
+Native media requests use the selected provider's API key. Tools inside an
+AgentSession use that session's auth store, including API-key entries saved in
+its `auth.json`. Provider aliases and mixed-case stored provider names follow
+the normal auth resolver. Media adapters resolve credentials only when the
+selected provider is invoked; binding media tools does not execute stored key
+sources. Login/logout changes apply to subsequent invocations through the
+existing tool instances.
+
+The precedence is an explicit tool-builder key, a configured provider API-key
+pool, a singular environment key, then a stored `type: "api_key"` credential.
+Stored `$ENV:` and bounded `$CMD:` / `$COMMAND:` sources retain the session's
+captured working directory. Stored OAuth, bearer, AWS, and service credentials
+are not admitted as media API keys. A chat-session `--api-key` or SDK
+`SessionOptions.api_key` is not forwarded to media endpoints; configure the
+chosen media provider's credentials separately.
 
 | Provider | Credential environment variables | Native media operations |
 |---|---|---|
@@ -43,7 +59,21 @@ provider has a key.
 | `xai` (`x-ai` alias) | `XAI_API_KEY` | Generation/editing, speech |
 
 SDK callers can supply `with_api_key(Some(key))`; an explicit empty key fails
-instead of falling back to the environment. `with_client` retains the caller's
+instead of falling back to saved or environment keys. Standalone tools that
+are not attached to an AgentSession retain explicit-key/environment lookup.
+A session's configured plural pool (for example `OPENAI_API_KEYS`) takes
+precedence over the singular variables above. When all keys are cooling, the
+call reports `[CREDENTIAL_POOL_EXHAUSTED]` without falling through to a saved
+key. A media HTTP 429 records cooldown for the next invocation; the adapter
+never automatically retries a potentially billable request.
+
+Custom SDK factories must create a fresh tool registry for each AgentSession.
+Shallow registry copies share native tool instances; assigning that scope to
+two sessions refuses implicit media authentication instead of exchanging their
+saved credentials. A custom wrapper around a native adapter should forward
+`Tool::bind_media_auth_scope` to the wrapped tool.
+
+`with_client` retains the caller's
 HTTP/VCR configuration. The endpoints can be overridden using `with_base_url`
 or `PI_MEDIA_OPENAI_BASE_URL`, `PI_MEDIA_ANTHROPIC_BASE_URL`,
 `PI_MEDIA_GEMINI_BASE_URL`, and `PI_MEDIA_XAI_BASE_URL`. An override receives the

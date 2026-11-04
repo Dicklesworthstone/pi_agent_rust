@@ -4397,6 +4397,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
+    // Native tools invoked by extension startup use the same scoped auth as
+    // later turns. Final model selection may refresh it again below.
+    agent_session.set_auth_storage(auth.clone());
     agent_session.set_memory_settings(config.memory.as_ref());
     agent_session.advisor = options.advisor.as_ref().map(|options| {
         options
@@ -7305,6 +7308,513 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn isolated_media_auth_test(name: &str, openai_pool: Option<&str>) -> bool {
+        const CHILD: &str = "PI_SDK_MEDIA_AUTH_TEST_CHILD";
+        if env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        // Native adapters must not borrow credentials or mock settings from
+        // the test runner. Isolate those variables without mutating the
+        // environment of other libtest threads. Own and bound the child too:
+        // an HTTP/runtime regression must not stall the whole test binary.
+        let _guard = crate::jobs::process_test_guard();
+        let directory = tempdir().expect("media auth subprocess logs");
+        let log_path = directory.path().join("output.log");
+        let log = std::fs::File::create(&log_path).expect("media auth subprocess log");
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let mut command = owner
+            .process()
+            .command(env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .env("no_proxy", "127.0.0.1,localhost,::1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
+            .stderr(Stdio::from(log));
+        for variable in [
+            "OPENAI_API_KEY",
+            "OPENAI_API_KEYS",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEYS",
+            "GOOGLE_API_KEY",
+            "GOOGLE_API_KEYS",
+            "GEMINI_API_KEY",
+            "GEMINI_API_KEYS",
+            "XAI_API_KEY",
+            "XAI_API_KEYS",
+            "PI_MEDIA_MOCK",
+            "PI_TEST_MODE",
+            "PI_CONFIG_PATH",
+            "PI_VISION_PROVIDER",
+            "PI_VISION_MODEL",
+            "PI_IMAGE_GEN_PROVIDER",
+            "PI_IMAGE_GEN_MODEL",
+            "PI_TTS_PROVIDER",
+            "PI_TTS_VOICE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env_remove(variable);
+        }
+        if let Some(keys) = openai_pool {
+            command.env("OPENAI_API_KEYS", keys);
+        }
+        let mut child = command.spawn().expect("isolated SDK media auth fixture");
+        drop(command);
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("observe media auth fixture") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child
+                    .kill()
+                    .expect("terminate timed-out media auth fixture");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = std::fs::read_to_string(&log_path).expect("read media auth fixture log");
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "SDK media auth fixture failed or timed out: {status:?}\n{output}"
+        );
+        assert!(output.contains("1 passed"), "fixture did not run: {output}");
+        true
+    }
+
+    struct NativeMediaAuthFactory {
+        name: &'static str,
+        endpoint: String,
+    }
+
+    impl ToolFactory for NativeMediaAuthFactory {
+        fn create_tool_registry(
+            &self,
+            enabled: &[&str],
+            cwd: &Path,
+            config: &Config,
+        ) -> ToolRegistry {
+            let mut registry = default_tool_registry(enabled, cwd, config);
+            assert!(registry.get(self.name).is_some(), "media tool is enabled");
+            // Override only the transport destination and mock switch. The
+            // normal SDK startup must supply auth.json through the registry;
+            // passing a key here would conceal the missing integration.
+            let tool: Box<dyn Tool> = match self.name {
+                "inspect_image" => Box::new(
+                    crate::media_tools::InspectImageTool::new(cwd)
+                        .with_base_url(&self.endpoint)
+                        .with_mock(false),
+                ),
+                "generate_image" => Box::new(
+                    crate::media_tools::GenerateImageTool::new(cwd)
+                        .with_base_url(&self.endpoint)
+                        .with_mock(false),
+                ),
+                "tts" => Box::new(
+                    crate::media_tools::TtsTool::new(cwd)
+                        .with_base_url(&self.endpoint)
+                        .with_mock(false),
+                ),
+                _ => panic!("unknown media fixture tool"),
+            };
+            registry.extend([tool]);
+            registry
+        }
+    }
+
+    const MEDIA_CHAT_KEY: &str = "sdk-chat-key-not-a-media-credential";
+
+    fn media_auth_fixture(name: &str) -> (tempfile::TempDir, SessionOptions, PathBuf) {
+        let (directory, mut options) =
+            guarded_settings_fixture(true, r#"{"media":{"enableMedia":true}}"#, "{}");
+        options.enabled_tools = Some(vec![name.to_string()]);
+        options.api_key = Some(MEDIA_CHAT_KEY.to_string());
+        let auth_path = options
+            .workspace_trust_guard
+            .as_ref()
+            .expect("fixture admission")
+            .global_dir()
+            .join("auth.json");
+        (directory, options, auth_path)
+    }
+
+    fn media_audio_fixture() -> Vec<u8> {
+        // PCM WAV with two real samples, rather than a header-only mock.
+        vec![
+            0x52, 0x49, 0x46, 0x46, 0x28, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d,
+            0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x44, 0xac, 0x00, 0x00,
+            0x88, 0x58, 0x01, 0x00, 0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x04, 0x00,
+            0x00, 0x00, 0x34, 0x12, 0xcd, 0xab,
+        ]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_native_media_uses_provider_scoped_saved_api_keys() {
+        use base64::Engine as _;
+
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_native_media_uses_provider_scoped_saved_api_keys",
+            None,
+        ) {
+            return;
+        }
+        let encoded_png = concat!(
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDA",
+            "xMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg=="
+        );
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(encoded_png)
+            .expect("PNG fixture");
+        let audio = media_audio_fixture();
+        for (name, provider, expected_header) in [
+            (
+                "inspect_image",
+                "anthropic",
+                "x-api-key: sdk-media-anthropic",
+            ),
+            (
+                "generate_image",
+                "gemini",
+                "x-goog-api-key: sdk-media-google",
+            ),
+            ("tts", "xai", "authorization: Bearer sdk-media-xai"),
+        ] {
+            let (_directory, mut options, auth_path) = media_auth_fixture(name);
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
+            let mut auth = AuthStorage::empty_at(auth_path);
+            for (provider, key) in [
+                ("openai", "sdk-media-openai"),
+                ("anthropic", "sdk-media-anthropic"),
+                ("google", "sdk-media-google"),
+                ("xai", "sdk-media-xai"),
+            ] {
+                auth.set(
+                    provider,
+                    crate::auth::AuthCredential::ApiKey {
+                        key: key.to_string(),
+                    },
+                );
+            }
+            auth.save().expect("persist media API keys");
+            std::fs::write(cwd.join("input.png"), &png).expect("vision input");
+            let (content_type, response, arguments) = match name {
+                "inspect_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({
+                        "stop_reason":"end_turn",
+                        "content":[{"type":"text","text":"The fixture image is red."}]
+                    }))
+                    .unwrap(),
+                    serde_json::json!({"path":"input.png","provider":provider,"timeout_ms":5000}),
+                ),
+                "generate_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({
+                        "candidates":[{"finishReason":"STOP","content":{"parts":[
+                            {"inlineData":{"mimeType":"image/png","data":encoded_png}}
+                        ]}}]
+                    }))
+                    .unwrap(),
+                    serde_json::json!({
+                        "prompt":"Draw a red square","provider":provider,
+                        "output_path":"generated.png","timeout_ms":5000
+                    }),
+                ),
+                "tts" => (
+                    "audio/wav",
+                    audio.clone(),
+                    serde_json::json!({
+                        "text":"Speak this fixture","provider":provider,
+                        "output_path":"spoken.wav","timeout_ms":5000
+                    }),
+                ),
+                _ => unreachable!(),
+            };
+            let (endpoint, peer) = crate::media_tools::test_peer(200, content_type, response);
+            options.tool_factory = Some(Arc::new(NativeMediaAuthFactory { name, endpoint }));
+            let handle = run_async(create_agent_session(options)).expect("start native media SDK");
+            assert_eq!(
+                handle.session().agent.stream_options().api_key.as_deref(),
+                Some(MEDIA_CHAT_KEY)
+            );
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let output = run_async(registry.get(name).expect("started media tool").execute(
+                "saved-media-auth",
+                arguments,
+                None,
+            ))
+            .expect("saved media API key authorizes the native request");
+            assert!(!output.is_error);
+            assert_eq!(output.details.as_ref().unwrap()["mock"], false);
+            assert_eq!(output.details.as_ref().unwrap()["provider"], provider);
+            match name {
+                "inspect_image" => assert!(
+                    matches!(&output.content[0], ContentBlock::Text(text) if text.text == "The fixture image is red.")
+                ),
+                "generate_image" => {
+                    assert_eq!(std::fs::read(cwd.join("generated.png")).unwrap(), png);
+                }
+                "tts" => assert_eq!(std::fs::read(cwd.join("spoken.wav")).unwrap(), audio),
+                _ => unreachable!(),
+            }
+            let request = peer.join().expect("native media HTTP peer");
+            assert!(
+                request
+                    .headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(expected_header)),
+                "the request must use the selected media provider's saved key"
+            );
+            assert!(!request.headers.contains(MEDIA_CHAT_KEY));
+            assert!(!request.body.to_string().contains(MEDIA_CHAT_KEY));
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_retained_media_tool_observes_auth_replacement_and_logout() {
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_retained_media_tool_observes_auth_replacement_and_logout",
+            None,
+        ) {
+            return;
+        }
+        let (_directory, mut options, auth_path) = media_auth_fixture("tts");
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
+        let mut auth = AuthStorage::empty_at(auth_path.clone());
+        auth.set(
+            "openai",
+            crate::auth::AuthCredential::ApiKey {
+                key: "sdk-media-before-login".to_string(),
+            },
+        );
+        auth.save().expect("initial saved API key");
+        let audio = media_audio_fixture();
+        let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
+            (200, "audio/wav", audio.clone()),
+            (200, "audio/wav", audio.clone()),
+        ]);
+        options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
+            name: "tts",
+            endpoint,
+        }));
+        let mut handle =
+            run_async(create_agent_session(options)).expect("native media SDK session");
+        let registry = handle.session().agent.shared_tools().snapshot();
+        let retained_tool = registry.get("tts").expect("retain original native tool");
+        for (index, filename) in ["before.wav", "after.wav"].into_iter().enumerate() {
+            if index == 1 {
+                auth.set(
+                    "openai",
+                    crate::auth::AuthCredential::ApiKey {
+                        key: "sdk-media-after-login".to_string(),
+                    },
+                );
+                auth.save().expect("persist changed API key");
+                handle.adopt_auth_storage(
+                    AuthStorage::load(auth_path.clone()).expect("reload changed credentials"),
+                );
+            }
+            let output = run_async(retained_tool.execute(
+                "retained-media-auth",
+                serde_json::json!({
+                    "text":"Speak with the current API key","provider":"openai",
+                    "output_path":filename,"timeout_ms":5000
+                }),
+                None,
+            ))
+            .expect("retained tool resolves the current session credential");
+            assert!(!output.is_error);
+            assert_eq!(std::fs::read(cwd.join(filename)).unwrap(), audio);
+        }
+        let requests = peer.join().expect("successive native media requests");
+        assert_eq!(requests.len(), 2);
+        for (request, key) in requests
+            .iter()
+            .zip(["sdk-media-before-login", "sdk-media-after-login"])
+        {
+            assert!(request.headers.lines().any(|line| {
+                line.eq_ignore_ascii_case(&format!("authorization: Bearer {key}"))
+            }));
+            assert!(!request.headers.contains(MEDIA_CHAT_KEY));
+        }
+
+        assert!(auth.remove("openai"));
+        for (oauth_only, filename) in [(false, "logged-out.wav"), (true, "oauth-only.wav")] {
+            if oauth_only {
+                auth.set(
+                    "openai",
+                    serde_json::from_value(serde_json::json!({
+                        "type":"oauth","access":"sdk-chat-oauth-not-a-media-key",
+                        "refresh":"unused-refresh-token","expires":i64::MAX
+                    }))
+                    .expect("chat OAuth credential"),
+                );
+            }
+            auth.save().expect("persist logout or chat-only OAuth");
+            handle.adopt_auth_storage(
+                AuthStorage::load(auth_path.clone()).expect("reload credentials after logout"),
+            );
+            assert_eq!(
+                handle.session().agent.stream_options().api_key.as_deref(),
+                Some(MEDIA_CHAT_KEY),
+                "the explicit chat credential remains available but is not a media credential"
+            );
+            let error = run_async(retained_tool.execute(
+                "media-auth-denied",
+                serde_json::json!({
+                    "text":"Must not use chat credentials","provider":"openai",
+                    "output_path":filename,"timeout_ms":5000
+                }),
+                None,
+            ))
+            .expect_err("removed API keys and chat OAuth must not authorize media");
+            assert!(
+                error.to_string().contains("missing API key"),
+                "must refuse before reaching the closed HTTP peer: {error}"
+            );
+            assert!(!error.to_string().contains(MEDIA_CHAT_KEY));
+            assert!(!error.to_string().contains("sdk-chat-oauth-not-a-media-key"));
+            assert!(
+                !cwd.join(filename).exists(),
+                "denied requests write no artifact"
+            );
+        }
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_native_media_pool_429s_do_not_retry_or_escape_exhaustion() {
+        const POOL: &str = "sdk-media-pool-first,sdk-media-pool-second";
+        const SAVED_KEY: &str = "sdk-media-saved-fallback";
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_native_media_pool_429s_do_not_retry_or_escape_exhaustion",
+            Some(POOL),
+        ) {
+            return;
+        }
+        let (_directory, mut options, auth_path) = media_auth_fixture("tts");
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
+        let mut auth = AuthStorage::empty_at(auth_path);
+        auth.set(
+            "openai",
+            crate::auth::AuthCredential::ApiKey {
+                key: SAVED_KEY.to_string(),
+            },
+        );
+        auth.save().expect("persist fallback API key");
+        let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
+            (
+                429,
+                "application/json",
+                br#"{"error":{"message":"first-explicit-call-rate-limited"}}"#.to_vec(),
+            ),
+            (
+                429,
+                "application/json",
+                br#"{"error":{"message":"second-explicit-call-rate-limited"}}"#.to_vec(),
+            ),
+        ]);
+        options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
+            name: "tts",
+            endpoint,
+        }));
+        let mut handle =
+            run_async(create_agent_session(options)).expect("native media SDK session");
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some(MEDIA_CHAT_KEY)
+        );
+        let registry = handle.session().agent.shared_tools().snapshot();
+        let retained_tool = registry.get("tts").expect("retain original native tool");
+        for (filename, response_marker) in [
+            ("first-limited.wav", "first-explicit-call-rate-limited"),
+            ("second-limited.wav", "second-explicit-call-rate-limited"),
+        ] {
+            let error = run_async(retained_tool.execute(
+                response_marker,
+                serde_json::json!({
+                    "text":"Speak once per explicit invocation","provider":"openai",
+                    "output_path":filename,"timeout_ms":5000
+                }),
+                None,
+            ))
+            .expect_err("a media 429 must return without replaying the request");
+            let message = error.to_string();
+            assert!(message.contains("HTTP 429"), "{message}");
+            assert!(
+                message.contains(response_marker),
+                "each explicit call must consume exactly its own response: {message}"
+            );
+            assert!(
+                !cwd.join(filename).exists(),
+                "failed requests write no artifact"
+            );
+        }
+        let requests = peer.join().expect("two explicit native media requests");
+        assert_eq!(requests.len(), 2);
+        // Pool affinity may select either key first. Each key must appear
+        // exactly once; a 429 rotates only the next explicit invocation.
+        for key in POOL.split(',') {
+            let expected = format!("authorization: Bearer {key}");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request
+                        .headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&expected)))
+                    .count(),
+                1,
+                "each pool credential must authorize exactly one request"
+            );
+        }
+        for request in &requests {
+            for forbidden in [SAVED_KEY, MEDIA_CHAT_KEY] {
+                assert!(!request.headers.contains(forbidden));
+                assert!(!request.body.to_string().contains(forbidden));
+            }
+        }
+        let error = run_async(retained_tool.execute(
+            "exhausted-media-pool",
+            serde_json::json!({
+                "text":"Must not escape the exhausted pool","provider":"openai",
+                "output_path":"pool-exhausted.wav","timeout_ms":5000
+            }),
+            None,
+        ))
+        .expect_err("an exhausted pool must refuse before another HTTP request");
+        let message = error.to_string();
+        assert!(
+            message.contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED),
+            "must refuse before reaching the closed HTTP peer: {message}"
+        );
+        for secret in POOL.split(',').chain([SAVED_KEY, MEDIA_CHAT_KEY]) {
+            assert!(!message.contains(secret));
+        }
+        assert!(!cwd.join("pool-exhausted.wav").exists());
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
     }
 
     #[test]

@@ -7711,6 +7711,8 @@ pub struct AgentSession {
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
+    /// Distinguishes this owner from sessions reusing the same registry snapshots.
+    media_auth_owner: Arc<()>,
     api_key_override: Option<String>,
     /// A CLI/API override belongs to the provider selected when it was set.
     /// Role switches must not forward that secret to a different provider.
@@ -17373,6 +17375,13 @@ impl AgentSession {
             .context_window_tokens
             .saturating_sub(compaction_settings.reserve_tokens)
             / 2;
+        // Claim before any auth is installed: an unauthenticated second owner
+        // must not inherit credentials already held by a shared registry.
+        let media_auth_owner = Arc::new(());
+        agent
+            .tools
+            .snapshot()
+            .claim_media_auth_owner(&media_auth_owner);
         // The job scope is shared by every snapshot of the registry, so
         // binding through the current one binds the live registry.
         agent
@@ -17409,6 +17418,7 @@ impl AgentSession {
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
+            media_auth_owner,
             api_key_override: None,
             api_key_override_provider: None,
             recovery_cli_api_key: None,
@@ -17522,6 +17532,10 @@ impl AgentSession {
     }
 
     pub fn set_auth_storage(&mut self, auth: AuthStorage) {
+        self.agent
+            .shared_tools()
+            .snapshot()
+            .set_media_auth_storage(&self.media_auth_owner, auth.clone());
         self.auth_storage = Some(auth);
         self.refresh_extension_compaction_models();
     }

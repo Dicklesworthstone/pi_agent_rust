@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 mod artifact;
 mod generation;
@@ -21,6 +22,82 @@ mod vision;
 pub use generation::GenerateImageTool;
 pub use speech::TtsTool;
 pub use vision::InspectImageTool;
+
+#[cfg(test)]
+pub(crate) use transport::tests::peer as test_peer;
+#[cfg(test)]
+pub(crate) use transport::tests::peer_responses as test_peer_responses;
+
+/// Session-owned credentials shared by native media tools and registry snapshots.
+/// Resolution stays private to the native adapters and happens only at invocation.
+#[derive(Clone, Default)]
+pub struct MediaAuthScope {
+    state: Arc<RwLock<MediaAuthState>>,
+}
+
+#[derive(Default)]
+enum MediaAuthState {
+    #[default]
+    Unclaimed,
+    Owned {
+        owner: Arc<()>,
+        auth: Option<Arc<crate::auth::AuthStorage>>,
+    },
+    Conflicted,
+}
+
+impl MediaAuthState {
+    fn claim(&mut self, incoming: &Arc<()>) {
+        match self {
+            Self::Unclaimed => {
+                *self = Self::Owned {
+                    owner: Arc::clone(incoming),
+                    auth: None,
+                };
+            }
+            Self::Owned { owner, .. } if Arc::ptr_eq(owner, incoming) => {}
+            // Keep this permanent, even after either AgentSession is dropped.
+            // Old registry snapshots must never acquire a different session's key.
+            _ => *self = Self::Conflicted,
+        }
+    }
+}
+
+impl MediaAuthScope {
+    pub(crate) fn claim_owner(&self, owner: &Arc<()>) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim(owner);
+    }
+
+    pub(crate) fn set(&self, owner: &Arc<()>, auth: crate::auth::AuthStorage) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.claim(owner);
+        if let MediaAuthState::Owned { auth: stored, .. } = &mut *state {
+            *stored = Some(Arc::new(auth));
+        }
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+    ) -> std::result::Result<Option<Arc<crate::auth::AuthStorage>>, &'static str> {
+        match &*self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            MediaAuthState::Unclaimed => Ok(None),
+            MediaAuthState::Owned { auth, .. } => Ok(auth.clone()),
+            MediaAuthState::Conflicted => Err(
+                "media credentials refused: this tool registry is shared by multiple AgentSessions; create a separate tool registry for each session",
+            ),
+        }
+    }
+}
 
 pub const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_TTS_TEXT_CHARS: usize = 4096;
@@ -241,5 +318,146 @@ impl Tool for ReadMediaTool {
             })),
             is_error: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod auth_scope_tests {
+    use super::*;
+    use crate::auth::{AuthCredential, AuthStorage};
+
+    fn stored_auth(path: &Path, key: &str) -> AuthStorage {
+        let mut auth = AuthStorage::empty_at(path.to_path_buf());
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: key.to_string(),
+            },
+        );
+        auth
+    }
+
+    #[test]
+    fn same_media_owner_can_replace_and_clear_auth_without_changing_other_scopes() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let path = directory.path().join("auth.json");
+        let scope = MediaAuthScope::default();
+        let owner = Arc::new(());
+        scope.claim_owner(&owner);
+        assert!(scope.snapshot().expect("claimed scope").is_none());
+        scope.set(&owner, stored_auth(&path, "first-key"));
+        let captured = scope.snapshot().unwrap().unwrap();
+        let earlier_view = scope.clone();
+
+        let separate = MediaAuthScope::default();
+        separate.set(&Arc::new(()), stored_auth(&path, "separate-key"));
+        scope.set(&owner, stored_auth(&path, "replacement-key"));
+        assert_eq!(
+            earlier_view
+                .snapshot()
+                .unwrap()
+                .unwrap()
+                .api_key("openai")
+                .as_deref(),
+            Some("replacement-key")
+        );
+        assert_eq!(captured.api_key("openai").as_deref(), Some("first-key"));
+
+        scope.set(&owner, AuthStorage::empty_at(path));
+        assert!(
+            earlier_view
+                .snapshot()
+                .unwrap()
+                .unwrap()
+                .api_key("openai")
+                .is_none()
+        );
+        assert_eq!(
+            separate
+                .snapshot()
+                .unwrap()
+                .unwrap()
+                .api_key("openai")
+                .as_deref(),
+            Some("separate-key"),
+            "even identical auth paths do not share the session's credential snapshot"
+        );
+    }
+
+    #[test]
+    fn media_scope_never_reassigns_credentials_after_the_original_owner_drops() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let path = directory.path().join("auth.json");
+        let scope = MediaAuthScope::default();
+        let original = Arc::new(());
+        scope.set(&original, stored_auth(&path, "first-key"));
+        let earlier_view = scope.clone();
+        drop(original);
+
+        let second = Arc::new(());
+        scope.claim_owner(&second);
+        assert!(
+            scope
+                .snapshot()
+                .unwrap_err()
+                .contains("multiple AgentSessions")
+        );
+        scope.set(&second, stored_auth(&path, "must-not-replace"));
+        assert!(earlier_view.snapshot().is_err());
+        drop(second);
+
+        scope.set(&Arc::new(()), AuthStorage::empty_at(path));
+        assert!(
+            scope.snapshot().is_err(),
+            "ownership conflict must remain permanent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflicting_media_scope_refuses_commands_but_preserves_explicit_builder_keys() {
+        let directory = tempfile::tempdir().expect("command workspace");
+        let mut auth = stored_auth(
+            &directory.path().join("auth.json"),
+            "$CMD:printf invoked > credential-invoked; printf command-key",
+        );
+        auth.set_command_working_directory(directory.path())
+            .unwrap();
+        let scope = MediaAuthScope::default();
+        scope.set(&Arc::new(()), auth);
+        scope.claim_owner(&Arc::new(()));
+        let mut transport =
+            transport::Transport::default().with_base_url("http://127.0.0.1:1/v1/".to_string());
+        transport.bind_auth_scope(scope);
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        futures::executor::block_on(owner.with_current(async {
+            let error = transport
+                .api("tts", "openai", None, std::time::Duration::from_secs(1))
+                .err()
+                .expect("shared session credentials must be refused");
+            assert!(error.to_string().contains("multiple AgentSessions"));
+            assert!(
+                transport
+                    .api(
+                        "tts",
+                        "openai",
+                        Some("builder-key"),
+                        std::time::Duration::from_secs(1),
+                    )
+                    .is_ok()
+            );
+            let empty_error = transport
+                .api(
+                    "tts",
+                    "openai",
+                    Some(" "),
+                    std::time::Duration::from_secs(1),
+                )
+                .err()
+                .expect("explicit empty key must still deny fallback");
+            assert!(empty_error.to_string().contains("missing API key"));
+            assert!(!empty_error.to_string().contains("multiple AgentSessions"));
+        }));
+        assert!(!directory.path().join("credential-invoked").exists());
     }
 }

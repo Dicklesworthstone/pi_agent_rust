@@ -6266,6 +6266,86 @@ mod tests {
         assert_eq!(standalone_scope.current(), Some(captured));
     }
 
+    #[test]
+    fn media_auth_refuses_distinct_sessions_reusing_shared_or_shallow_registries() {
+        let owner = AgentCx::for_testing_with_io();
+        futures::executor::block_on(owner.with_current(async {
+            for reuse in ["shared", "shallow", "from_arc"] {
+                let directory = tempfile::tempdir().expect("session workspace");
+                let shared = crate::tools::SharedToolRegistry::new(ToolRegistry::from_tools(vec![
+                    Box::new(
+                        crate::media_tools::TtsTool::new(directory.path())
+                            .with_mock(false)
+                            .with_base_url("http://127.0.0.1:1/v1/"),
+                    ),
+                ]));
+                let earlier_snapshot = shared.snapshot();
+                let make_session = |tools| {
+                    AgentSession::new(
+                        Agent::with_shared_tools(
+                            Arc::new(SilentProvider),
+                            tools,
+                            AgentConfig::default(),
+                        ),
+                        Arc::new(Mutex::new(Session::in_memory())),
+                        false,
+                        ResolvedCompactionSettings::default(),
+                    )
+                };
+                let auth = |key: &str| {
+                    let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+                    auth.set(
+                        "openai",
+                        AuthCredential::ApiKey {
+                            key: key.to_string(),
+                        },
+                    );
+                    auth
+                };
+                let mut first = make_session(shared.clone());
+                first.set_auth_storage(auth("first-owner-key"));
+                let reused = match reuse {
+                    "shared" => shared,
+                    "shallow" => {
+                        crate::tools::SharedToolRegistry::new(earlier_snapshot.clone_shallow())
+                    }
+                    _ => crate::tools::SharedToolRegistry::from_arc(Arc::clone(&earlier_snapshot)),
+                };
+                let mut second = make_session(reused);
+                assert!(second.auth_storage.is_none());
+
+                // Construction alone must revoke implicit access, before the
+                // second session is given any credentials of its own.
+                for after_update in [false, true] {
+                    if after_update {
+                        second.set_auth_storage(auth("second-owner-key"));
+                        first.set_auth_storage(auth("must-not-restore"));
+                    }
+                    for registry in [
+                        Arc::clone(&earlier_snapshot),
+                        first.agent.shared_tools().snapshot(),
+                        second.agent.shared_tools().snapshot(),
+                    ] {
+                        let error = registry
+                            .get("tts")
+                            .expect("native media tool")
+                            .execute(
+                                "ownership-probe",
+                                json!({"text": "hello", "provider": "openai", "voice": "alloy"}),
+                                None,
+                            )
+                            .await
+                            .expect_err("shared credentials must fail before a network request");
+                        assert!(
+                            error.to_string().contains("multiple AgentSessions"),
+                            "{reuse}, updated={after_update}: {error}"
+                        );
+                    }
+                }
+            }
+        }));
+    }
+
     struct ModelScopeProbeTool {
         name: &'static str,
         bindings: StdArc<StdTestMutex<Vec<crate::tools::ToolModelScope>>>,

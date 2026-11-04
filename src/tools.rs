@@ -455,6 +455,9 @@ pub trait Tool: Send + Sync {
     /// Attach the session-tree spend budget to tools that make model calls.
     fn bind_cost_scope(&mut self, _scope: crate::cost::CostScope) {}
 
+    /// Attach session credentials to native media adapters without exposing keys to tool input.
+    fn bind_media_auth_scope(&mut self, _scope: crate::media_tools::MediaAuthScope) {}
+
     /// Attach the owning host's editor filesystem without changing tool policy.
     fn bind_text_file_client_scope(&mut self, _scope: TextFileClientScope) {}
 
@@ -5744,6 +5747,7 @@ pub struct ToolRegistry {
     /// Shared by delegating tools and updated on every host provider switch.
     model_scope: ToolModelScope,
     cost_scope: crate::cost::CostScope,
+    media_auth_scope: crate::media_tools::MediaAuthScope,
     text_file_client_scope: TextFileClientScope,
     terminal_client_scope: TerminalClientScope,
     /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
@@ -5989,6 +5993,7 @@ impl ToolRegistry {
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
         let cost_scope = crate::cost::CostScope::default();
+        let media_auth_scope = crate::media_tools::MediaAuthScope::default();
         let text_file_client_scope = TextFileClientScope::default();
         let terminal_client_scope = TerminalClientScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
@@ -6345,6 +6350,7 @@ impl ToolRegistry {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
             tool.bind_cost_scope(cost_scope.clone());
+            tool.bind_media_auth_scope(media_auth_scope.clone());
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
             tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
@@ -6355,6 +6361,7 @@ impl ToolRegistry {
             job_session_scope,
             model_scope,
             cost_scope,
+            media_auth_scope,
             text_file_client_scope,
             terminal_client_scope,
             discoverable: discoverable_names,
@@ -6380,6 +6387,7 @@ impl ToolRegistry {
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let model_scope = ToolModelScope::default();
         let cost_scope = crate::cost::CostScope::default();
+        let media_auth_scope = crate::media_tools::MediaAuthScope::default();
         let text_file_client_scope = TextFileClientScope::default();
         let terminal_client_scope = TerminalClientScope::default();
         let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
@@ -6387,6 +6395,7 @@ impl ToolRegistry {
             tool.bind_job_session_scope(job_session_scope.clone());
             tool.bind_model_scope(model_scope.clone());
             tool.bind_cost_scope(cost_scope.clone());
+            tool.bind_media_auth_scope(media_auth_scope.clone());
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
             tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
@@ -6396,6 +6405,7 @@ impl ToolRegistry {
             job_session_scope,
             model_scope,
             cost_scope,
+            media_auth_scope,
             text_file_client_scope,
             terminal_client_scope,
             discoverable: std::collections::HashSet::new(),
@@ -6417,6 +6427,7 @@ impl ToolRegistry {
             job_session_scope: self.job_session_scope.clone(),
             model_scope: self.model_scope.clone(),
             cost_scope: self.cost_scope.clone(),
+            media_auth_scope: self.media_auth_scope.clone(),
             text_file_client_scope: self.text_file_client_scope.clone(),
             terminal_client_scope: self.terminal_client_scope.clone(),
             discoverable: self.discoverable.clone(),
@@ -6502,6 +6513,7 @@ impl ToolRegistry {
         tool.bind_job_session_scope(self.job_session_scope.clone());
         tool.bind_model_scope(self.model_scope.clone());
         tool.bind_cost_scope(self.cost_scope.clone());
+        tool.bind_media_auth_scope(self.media_auth_scope.clone());
         tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
         tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
         let name = tool.name();
@@ -6521,6 +6533,7 @@ impl ToolRegistry {
             tool.bind_job_session_scope(self.job_session_scope.clone());
             tool.bind_model_scope(self.model_scope.clone());
             tool.bind_cost_scope(self.cost_scope.clone());
+            tool.bind_media_auth_scope(self.media_auth_scope.clone());
             tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
             tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
             let name = tool.name();
@@ -6556,6 +6569,7 @@ impl ToolRegistry {
                 tool.bind_job_session_scope(self.job_session_scope.clone());
                 tool.bind_model_scope(self.model_scope.clone());
                 tool.bind_cost_scope(self.cost_scope.clone());
+                tool.bind_media_auth_scope(self.media_auth_scope.clone());
                 tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
                 tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
                 (tool.name().to_string(), Arc::from(tool))
@@ -6646,6 +6660,7 @@ impl ToolRegistry {
                 next.bind_job_session_scope(self.job_session_scope.clone());
                 next.bind_model_scope(self.model_scope.clone());
                 next.bind_cost_scope(self.cost_scope.clone());
+                next.bind_media_auth_scope(self.media_auth_scope.clone());
                 next.bind_text_file_client_scope(self.text_file_client_scope.clone());
                 next.bind_terminal_client_scope(self.terminal_client_scope.clone());
                 *tool = Arc::from(next);
@@ -6665,6 +6680,7 @@ impl ToolRegistry {
             next.bind_job_session_scope(self.job_session_scope.clone());
             next.bind_model_scope(self.model_scope.clone());
             next.bind_cost_scope(self.cost_scope.clone());
+            next.bind_media_auth_scope(self.media_auth_scope.clone());
             next.bind_text_file_client_scope(self.text_file_client_scope.clone());
             next.bind_terminal_client_scope(self.terminal_client_scope.clone());
             self.tools.push(Arc::from(next));
@@ -6695,6 +6711,14 @@ impl ToolRegistry {
     #[must_use]
     pub fn cost_scope(&self) -> crate::cost::CostScope {
         self.cost_scope.clone()
+    }
+
+    pub(crate) fn claim_media_auth_owner(&self, owner: &Arc<()>) {
+        self.media_auth_scope.claim_owner(owner);
+    }
+
+    pub(crate) fn set_media_auth_storage(&self, owner: &Arc<()>, auth: crate::auth::AuthStorage) {
+        self.media_auth_scope.set(owner, auth);
     }
 
     /// Get all tools.

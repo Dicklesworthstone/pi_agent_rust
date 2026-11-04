@@ -15,9 +15,14 @@ use url::Url;
 pub(super) struct Transport {
     client: Client,
     base_url: Option<String>,
+    auth: super::MediaAuthScope,
 }
 
 impl Transport {
+    pub(super) fn bind_auth_scope(&mut self, scope: super::MediaAuthScope) {
+        self.auth = scope;
+    }
+
     pub(super) fn with_client(mut self, client: Client) -> Self {
         self.client = client;
         self
@@ -35,9 +40,8 @@ impl Transport {
         explicit_key: Option<&str>,
         timeout: Duration,
     ) -> Result<Api<'_>> {
-        let key = resolve_key(tool, provider, explicit_key, |name| {
-            std::env::var(name).ok()
-        })?;
+        let owner = AgentCx::for_current_or_request();
+        check_owner(tool, &owner)?;
         let (default_url, env_name) = match provider {
             "openai" => ("https://api.openai.com/v1/", "PI_MEDIA_OPENAI_BASE_URL"),
             "anthropic" => (
@@ -59,13 +63,37 @@ impl Transport {
                 .or(env_url.as_deref())
                 .unwrap_or(default_url),
         )?;
-        let owner = AgentCx::for_current_or_request();
+        let auth = if explicit_key.is_some() {
+            None
+        } else {
+            self.auth
+                .snapshot()
+                .map_err(|message| Error::tool(tool, message))?
+        };
+        let track_rate_limits = explicit_key.is_none() && auth.is_some();
+        let key = if explicit_key.is_some() {
+            // Even an empty explicit key is authoritative: never replace a
+            // caller's deliberate denial with a saved or ambient credential.
+            resolve_key(tool, provider, explicit_key, |name| {
+                std::env::var(name).ok()
+            })?
+        } else if let Some(auth) = &auth {
+            auth.resolve_media_api_key_status(provider)
+                .into_result(provider)
+                .map_err(|error| Error::tool(tool, error.to_string()))?
+                .ok_or_else(|| missing_key(tool, provider))?
+        } else {
+            resolve_key(tool, provider, None, |name| std::env::var(name).ok())?
+        };
+        // Stored command-backed keys can take time to resolve. Recheck the
+        // invocation before constructing a request after that bounded work.
         check_owner(tool, &owner)?;
         Ok(Api {
             transport: self,
             tool,
             provider,
             key,
+            track_rate_limits,
             base,
             owner,
             timeout,
@@ -78,6 +106,7 @@ pub(super) struct Api<'a> {
     tool: &'static str,
     provider: &'static str,
     key: String,
+    track_rate_limits: bool,
     base: Url,
     pub(super) owner: AgentCx,
     timeout: Duration,
@@ -125,6 +154,7 @@ impl Api<'_> {
         }
         let operation = async {
             check_owner(self.tool, &self.owner)?;
+            let started_at = std::time::Instant::now();
             let client = self.owner.http().bind(&self.transport.client);
             let request = client
                 .post(url.as_str())
@@ -150,6 +180,11 @@ impl Api<'_> {
             })?;
             let status = response.status();
             if !(200..300).contains(&status) {
+                if status == 429 && self.track_rate_limits {
+                    // Record backoff for the next invocation; never replay a
+                    // potentially billable generation or synthesis request.
+                    crate::auth::report_provider_rate_limit(self.provider, &self.key);
+                }
                 let detail = response.text_limited(16 * 1024).await.map_or_else(
                     |_| "error body unavailable or too large".to_string(),
                     |body| self.scrub(&body, 2048),
@@ -188,6 +223,9 @@ impl Api<'_> {
                     self.tool,
                     "provider returned an empty response",
                 ));
+            }
+            if self.track_rate_limits {
+                crate::auth::report_provider_success(self.provider, &self.key, started_at);
             }
             Ok(Response {
                 bytes,
@@ -283,13 +321,7 @@ fn resolve_key(
     explicit: Option<&str>,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String> {
-    let vars: &[&str] = match provider {
-        "openai" => &["OPENAI_API_KEY"],
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        _ => &[],
-    };
+    let vars = key_environment_variables(provider);
     // An explicit empty key is a deliberate denial, not permission to fall back.
     let key = explicit.map_or_else(
         || {
@@ -300,20 +332,32 @@ fn resolve_key(
     );
     key.map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
-        .ok_or_else(|| {
-            let purpose = match tool {
-                "inspect_image" => "vision provider",
-                "generate_image" => "image generation provider",
-                _ => "TTS synthesis provider",
-            };
-            Error::tool(
-                tool,
-                format!(
-                    "missing API key for {purpose} {provider} (set {})",
-                    vars.join(" or ")
-                ),
-            )
-        })
+        .ok_or_else(|| missing_key(tool, provider))
+}
+
+fn key_environment_variables(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" => &["OPENAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn missing_key(tool: &str, provider: &str) -> Error {
+    let purpose = match tool {
+        "inspect_image" => "vision provider",
+        "generate_image" => "image generation provider",
+        _ => "TTS synthesis provider",
+    };
+    Error::tool(
+        tool,
+        format!(
+            "missing API key for {purpose} {provider} (save a provider API key in the session's auth.json or set {}; media tools do not use OAuth or subscription credentials)",
+            key_environment_variables(provider).join(" or ")
+        ),
+    )
 }
 
 pub(super) fn optional<'a>(args: &'a Value, tool: &str, field: &str) -> Result<Option<&'a str>> {
@@ -464,88 +508,114 @@ pub(super) mod tests {
     // A real TCP peer with a canned protocol response, not a replacement client.
     // Both accept and I/O are bounded so a failed assertion cannot hang the suite.
     pub fn peer(status: u16, content_type: &str, body: Vec<u8>) -> (String, JoinHandle<Captured>) {
+        let (endpoint, listener) = peer_listener();
+        let content_type = content_type.to_string();
+        let worker = thread::spawn(move || exchange(&listener, status, &content_type, &body));
+        (endpoint, worker)
+    }
+
+    pub fn peer_responses(
+        responses: Vec<(u16, &str, Vec<u8>)>,
+    ) -> (String, JoinHandle<Vec<Captured>>) {
+        let (endpoint, listener) = peer_listener();
+        let responses = responses
+            .into_iter()
+            .map(|(status, content_type, body)| (status, content_type.to_string(), body))
+            .collect::<Vec<_>>();
+        let worker = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|(status, content_type, body)| {
+                    exchange(&listener, status, &content_type, &body)
+                })
+                .collect()
+        });
+        (endpoint, worker)
+    }
+
+    fn peer_listener() -> (String, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let endpoint = format!("http://{}/v1/", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
-        let content_type = content_type.to_string();
-        let worker = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "adapter never connected");
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("accept: {error}"),
+        (endpoint, listener)
+    }
+
+    fn exchange(listener: &TcpListener, status: u16, content_type: &str, body: &[u8]) -> Captured {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "adapter never connected");
+                    thread::sleep(Duration::from_millis(5));
                 }
-            };
-            // 250ms is the POLLING interval; `deadline` is the budget for the
-            // whole exchange. A read timeout means "nothing yet", not "fail":
-            // macOS reports one as EAGAIN/WouldBlock, so panicking on it fails
-            // the test whenever the client has merely not been scheduled, which
-            // is common under a parallel suite (bd-eg6ng).
-            socket
-                .set_read_timeout(Some(Duration::from_millis(250)))
-                .unwrap();
-            socket
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let read_patiently = |socket: &mut std::net::TcpStream, chunk: &mut [u8]| loop {
-                match socket.read(chunk) {
-                    Ok(n) => return n,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "fixture timed out waiting for the request"
-                        );
-                    }
-                    // ubs:ignore an unexpected socket error in a fixture is an assertion failure
-                    Err(error) => panic!("fixture read failed: {error}"),
-                }
-            };
-            let mut request = Vec::new();
-            let header_end = loop {
-                let mut chunk = [0; 4096];
-                let n = read_patiently(&mut socket, &mut chunk);
-                assert!(n > 0, "request ended before headers");
-                request.extend_from_slice(&chunk[..n]);
-                assert!(request.len() < 2 * 1024 * 1024);
-                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break end + 4;
-                }
-            };
-            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .expect("content-length");
-            assert!(length < 2 * 1024 * 1024);
-            while request.len() - header_end < length {
-                let mut chunk = [0; 4096];
-                let n = read_patiently(&mut socket, &mut chunk);
-                assert!(n > 0, "request ended before body");
-                request.extend_from_slice(&chunk[..n]);
+                Err(error) => panic!("accept: {error}"),
             }
-            let captured = Captured {
-                headers,
-                body: serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
-            };
-            write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            socket.write_all(&body).unwrap();
-            captured
-        });
-        (endpoint, worker)
+        };
+        // 250ms is the POLLING interval; `deadline` is the budget for the
+        // whole exchange. A read timeout means "nothing yet", not "fail":
+        // macOS reports one as EAGAIN/WouldBlock, so panicking on it fails
+        // the test whenever the client has merely not been scheduled, which
+        // is common under a parallel suite (bd-eg6ng).
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let read_patiently = |socket: &mut std::net::TcpStream, chunk: &mut [u8]| loop {
+            match socket.read(chunk) {
+                Ok(n) => return n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture timed out waiting for the request"
+                    );
+                }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                Err(error) => panic!("fixture read failed: {error}"),
+            }
+        };
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 4096];
+            let n = read_patiently(&mut socket, &mut chunk);
+            assert!(n > 0, "request ended before headers");
+            request.extend_from_slice(&chunk[..n]);
+            assert!(request.len() < 2 * 1024 * 1024);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .expect("content-length");
+        assert!(length < 2 * 1024 * 1024);
+        while request.len() - header_end < length {
+            let mut chunk = [0; 4096];
+            let n = read_patiently(&mut socket, &mut chunk);
+            assert!(n > 0, "request ended before body");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let captured = Captured {
+            headers,
+            body: serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
+        };
+        write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        socket.write_all(body).unwrap();
+        captured
     }
 
     #[test]
