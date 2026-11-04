@@ -263,6 +263,11 @@ pub struct Config {
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
 
+    /// Shared deadline for awaited `before_agent_start` readiness hooks.
+    /// Resolved from trusted host settings, never from extension metadata.
+    #[serde(alias = "extensionStartupTimeoutMs")]
+    pub extension_startup_timeout_ms: Option<u64>,
+
     /// Auto-compaction mode (bd-cv653.3.18): "summary" (default) |
     /// "shake-first" | "aggressive".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1167,6 +1172,9 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            extension_startup_timeout_ms: other
+                .extension_startup_timeout_ms
+                .or(base.extension_startup_timeout_ms),
             compaction_mode: other.compaction_mode.or(base.compaction_mode),
             turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
@@ -1182,6 +1190,16 @@ impl Config {
     }
 
     // === Accessor methods with defaults ===
+
+    /// Await extension readiness for at most 120 seconds by default. A host
+    /// override is bounded to 1..=300_000 milliseconds; other event deadlines
+    /// and explicit runtime API timeout arguments remain independent.
+    #[must_use]
+    pub fn extension_startup_timeout_ms(&self) -> u64 {
+        self.extension_startup_timeout_ms
+            .unwrap_or(crate::extensions::EXTENSION_STARTUP_EVENT_TIMEOUT_MS)
+            .clamp(1, 300_000)
+    }
 
     /// Keep print mode alive for owned background work only when opted in.
     #[must_use]
@@ -2781,6 +2799,74 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn extension_startup_timeout_is_bounded_and_recognizes_settings_spellings() {
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(Config::default().extension_startup_timeout_ms(), 120_000);
+        let camel: Config = serde_json::from_str(r#"{"extensionStartupTimeoutMs":75000}"#)
+            .expect("camelCase startup setting");
+        let snake: Config = serde_json::from_str(r#"{"extension_startup_timeout_ms":90000}"#)
+            .expect("snake_case startup setting");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(camel.extension_startup_timeout_ms(), 75_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(snake.extension_startup_timeout_ms(), 90_000);
+        let merged = Config::merge(camel, snake);
+        let inherited = Config::merge(merged, Config::default());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(inherited.extension_startup_timeout_ms(), 90_000);
+        let zero = Config {
+            extension_startup_timeout_ms: Some(0),
+            ..Config::default()
+        };
+        let oversized = Config {
+            extension_startup_timeout_ms: Some(u64::MAX),
+            ..Config::default()
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(zero.extension_startup_timeout_ms(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(oversized.extension_startup_timeout_ms(), 300_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(unrecognised_setting_keys(r#"{"extensionStartupTimeoutMs":75000}"#).is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(unrecognised_setting_keys(r#"{"extension_startup_timeout_ms":90000}"#).is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(serde_json::from_str::<Config>(r#"{"extensionStartupTimeoutMs":-1}"#).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(serde_json::from_str::<Config>(r#"{"extensionStartupTimeoutMs":1.5}"#).is_err());
+    }
+
+    #[test]
+    fn extension_startup_timeout_uses_only_admitted_settings_sources() {
+        let temp = TempDir::new().expect("fixture directory");
+        let cwd = temp.path().join("workspace");
+        let global = temp.path().join("global");
+        let override_path = temp.path().join("explicit-settings.json");
+        write_file(
+            &global.join("settings.json"),
+            r#"{"extensionStartupTimeoutMs":20000}"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"extensionStartupTimeoutMs":240000}"#,
+        );
+        write_file(&override_path, r#"{"extensionStartupTimeoutMs":45000}"#);
+        let trusted = Config::load_with_roots_and_project_trust(None, &global, &cwd, true)
+            .expect("trusted project config");
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global, &cwd, false)
+            .expect("global config without project trust");
+        let explicit =
+            Config::load_with_roots_and_project_trust(Some(&override_path), &global, &cwd, false)
+                .expect("explicit user config path");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(trusted.extension_startup_timeout_ms(), 240_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(untrusted.extension_startup_timeout_ms(), 20_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(explicit.extension_startup_timeout_ms(), 45_000);
+    }
 
     #[test]
     fn prewalk_selectors_merge_independently_without_enabling_the_workflow()

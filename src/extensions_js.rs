@@ -4753,29 +4753,29 @@ impl InterruptBudget {
     }
 }
 
-struct ToolExecutionFence {
+struct JsExecutionFence {
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
     interrupted: Rc<std::cell::Cell<bool>>,
 }
 
-/// Bound synchronous guest execution as well as asynchronous tool waits. The
+/// Bound synchronous guest execution as well as asynchronous invocation waits. The
 /// caller's drop flag is atomic because cancellation originates on another
 /// thread while QuickJS may be executing an otherwise unbounded loop.
-#[must_use = "the tool execution fence ends when the guard is dropped"]
-pub(crate) struct ToolExecutionFenceGuard {
-    active: Rc<RefCell<Option<ToolExecutionFence>>>,
-    previous: Option<ToolExecutionFence>,
+#[must_use = "the JS execution fence ends when the guard is dropped"]
+pub(crate) struct JsExecutionFenceGuard {
+    active: Rc<RefCell<Option<JsExecutionFence>>>,
+    previous: Option<JsExecutionFence>,
     interrupted: Rc<std::cell::Cell<bool>>,
 }
 
-impl ToolExecutionFenceGuard {
+impl JsExecutionFenceGuard {
     pub(crate) fn was_interrupted(&self) -> bool {
         self.interrupted.get()
     }
 }
 
-impl Drop for ToolExecutionFenceGuard {
+impl Drop for JsExecutionFenceGuard {
     fn drop(&mut self) {
         self.active.replace(self.previous.take());
     }
@@ -18370,7 +18370,7 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     peak_memory_used_bytes: Arc<AtomicU64>,
     tick_counter: Arc<AtomicU64>,
     interrupt_budget: Rc<InterruptBudget>,
-    tool_execution_fence: Rc<RefCell<Option<ToolExecutionFence>>>,
+    execution_fence: Rc<RefCell<Option<JsExecutionFence>>>,
     config: PiJsRuntimeConfig,
     /// Additional filesystem roots that `readFileSync` may access (e.g.
     /// extension directories).  Populated lazily as extensions are loaded.
@@ -18611,11 +18611,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
 
         let interrupt_budget = Rc::new(InterruptBudget::new(config.limits.interrupt_budget));
-        let tool_execution_fence: Rc<RefCell<Option<ToolExecutionFence>>> =
-            Rc::new(RefCell::new(None));
+        let execution_fence: Rc<RefCell<Option<JsExecutionFence>>> = Rc::new(RefCell::new(None));
         {
             let budget = Rc::clone(&interrupt_budget);
-            let fence = Rc::clone(&tool_execution_fence);
+            let fence = Rc::clone(&execution_fence);
             runtime
                 .set_interrupt_handler(Some(Box::new(move || {
                     fence.borrow().as_ref().is_some_and(|active| {
@@ -18721,7 +18720,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             peak_memory_used_bytes,
             tick_counter,
             interrupt_budget,
-            tool_execution_fence,
+            execution_fence,
             config,
             allowed_read_roots: Arc::new(std::sync::Mutex::new(Vec::new())),
             repair_events,
@@ -19445,19 +19444,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
-    pub(crate) fn enter_tool_execution_fence(
+    pub(crate) fn enter_execution_fence(
         &self,
         cancelled: Arc<AtomicBool>,
         deadline: Instant,
-    ) -> ToolExecutionFenceGuard {
+    ) -> JsExecutionFenceGuard {
         let interrupted = Rc::new(std::cell::Cell::new(false));
-        let previous = self.tool_execution_fence.replace(Some(ToolExecutionFence {
+        let previous = self.execution_fence.replace(Some(JsExecutionFence {
             cancelled,
             deadline,
             interrupted: Rc::clone(&interrupted),
         }));
-        ToolExecutionFenceGuard {
-            active: Rc::clone(&self.tool_execution_fence),
+        JsExecutionFenceGuard {
+            active: Rc::clone(&self.execution_fence),
             previous,
             interrupted,
         }

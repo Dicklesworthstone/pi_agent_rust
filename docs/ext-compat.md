@@ -515,6 +515,83 @@ wrappers do not retain their own actor's application lifetime through the
 shared registry; explicitly retained public runtime handles keep their normal
 ownership semantics.
 
+### Startup readiness and event cancellation
+
+`before_agent_start` can await external-service readiness and register tools
+before the provider's tool schema is captured. The Agent gives each such
+dispatch a default budget of **120,000 ms**, shared across all its handlers.
+The runtime uses one deadline for queueing and the ordered handlers; moving
+to another owner does not restart it. This applies on every turn that fires
+the event, not only the first turn after opening a session.
+
+Set `extensionStartupTimeoutMs` in an admitted settings source to shorten or
+extend that budget:
+
+```json
+{
+  "extensionStartupTimeoutMs": 120000
+}
+```
+
+The setting accepts an unsigned integer in milliseconds and is clamped to
+`1`–`300000`; the default is `120000`. Existing settings precedence and project
+trust checks apply. It configures the Agent's `before_agent_start` dispatch,
+not every extension event. Ordinary actionable hooks retain their five-second
+default, informational hooks retain their shorter default, and compaction
+keeps its dedicated budget. An explicit SDK or runtime dispatch timeout is
+never enlarged by the startup default or this setting.
+
+The same setting applies when extensions are prewarmed, and an embedding
+manager's tighter budget still caps the wait. Cancellation in the Agent's
+text, structured-content, and custom prompt paths returns before provider
+invocation or admitting that prompt to conversation history.
+
+This addresses a concrete context-mode startup requirement. Published
+`context-mode@1.0.169` starts its MCP child lazily in `before_agent_start`,
+awaits `initialize` and `tools/list`, and only then registers its tools. Its
+handshake requests each allow 60 seconds, with bounded initialization retries.
+A healthy six-second initialization therefore exceeded the former generic
+five-second event budget. The dedicated startup budget permits that work while
+remaining bounded. It does not promise to accommodate the package's complete
+worst-case retry sequence, which can exceed 120 seconds.
+
+Dropping an admitted event future or reaching its deadline signals the busy
+actor directly. The currently executing extension owner is quarantined so a
+late Promise continuation cannot publish registrations, and retained native
+requests and subprocesses are retired. Other completed owners remain
+available, and handlers which have not started are skipped for that failed
+dispatch. A QuickJS interrupt fence also observes cancellation and deadlines
+during guest CPU loops. Quarantine retires owned resources through the
+existing cleanup paths and retains admission accounting until those resources
+finish. Native synchronous host operations retain their own bounds; a
+JavaScript interrupt cannot preempt Rust inside one of those operations.
+
+Event-batch context creation shares the request's cancellation and deadline.
+Batch cleanup skips already quarantined isolates and gives each remaining
+owner's context deletion its own 100 ms execution budget. A failed or
+over-budget cleanup quarantines that owner while cleanup continues for peers.
+
+The supplementary `scripts/test_published_extension_rendering.mjs` diagnostic
+now also pins and executes the complete published `extension.js` and
+`mcp-bridge.js` modules. With a controlled MCP response and real Linux Node
+timers, discovery and `session_start` spawned no child; the real startup hook
+was still pending with no tools at five seconds, then registered the controlled
+MCP tool after approximately six seconds. The package completed its actual
+`initialize` → `notifications/initialized` → `tools/list` sequence and requested
+`SIGTERM` on shutdown. All 24 checks pass with the current sources: 23 existing
+rendering checks and this readiness case. With
+`--startup-source /path/to/prior/extensions.rs` pointing to the prior
+five-second default, the rendering checks pass and the readiness assertion
+fails.
+
+The timeout constant read from Rust is applied by a fixture observer in that
+diagnostic. Imported dependencies, SQLite, the extension API and child I/O are
+controlled fixtures; no native process is launched. These results establish
+the published hook's readiness requirement, not native configuration loading,
+timeout enforcement, cancellation, quarantine, catalog publication or Windows
+behavior. Native event and settings regressions cover those request boundaries
+and owner isolation, but remain unexecuted here pending the DSR native runner.
+
 ### Context message transforms
 
 Context hooks receive the message array produced by earlier handlers, across
@@ -876,9 +953,9 @@ support. Word and sentence granularities are explicitly rejected with
 The supplementary diagnostic
 `scripts/test_published_extension_rendering.mjs` pins the unmodified published
 renderer and runs it with both Node's native Intl and the actual PiJS JavaScript
-facade in the same invocation. All 23 checks pass with the updated facade;
-the prior facade fails all 23. Cases include ANSI preservation, clipping at
-grapheme boundaries, multiline rendering, independent iterators, UTF-16
+facade in the same invocation. All 23 rendering checks pass with the updated
+facade; the prior facade fails all 23. Cases include ANSI preservation,
+clipping at grapheme boundaries, multiline rendering, independent iterators, UTF-16
 indices, input coercion, and lone surrogates. Node supplies the boundary
 callback in this diagnostic, so this result verifies the JavaScript facade
 and published renderer, not the Rust segmentation implementation or QuickJS.

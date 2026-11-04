@@ -26,9 +26,9 @@ use crate::extension_events::{
 };
 use crate::extension_tools::ExtensionToolCatalog;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionCompactionOptions,
-    ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec,
-    ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle,
+    EXTENSION_EVENT_TIMEOUT_MS, EXTENSION_STARTUP_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest,
+    ExtensionCompactionOptions, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
+    ExtensionLoadSpec, ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle,
     ExtensionSendMessage, ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
     NativeRustExtensionLoadSpec, NativeRustExtensionRuntimeHandle, RepairPolicyMode,
     SessionActionOrigin, SessionActionOriginSource, resolve_extension_load_spec,
@@ -7713,6 +7713,9 @@ pub struct AgentSession {
     /// Extension lifecycle region — ensures the JS runtime thread is shut
     /// down when the session ends.
     pub extensions: Option<ExtensionRegion>,
+    /// Host-configured shared deadline for awaited before-agent readiness.
+    /// Bound once when extensions are enabled, including pre-warmed runtimes.
+    extension_startup_timeout_ms: u64,
     /// MCP client registry serving this session, when MCP is enabled. Turn
     /// runners that own the session (RPC loop, classic TUI) use it to pick up
     /// servers extensions register after startup (`registerMcpServer`).
@@ -10804,9 +10807,10 @@ mod extensions_integration_tests {
                 export default function(pi) {
                     let generation = 0;
                     pi.on('before_agent_start', async () => {
-                        // Match context-mode's awaited tools/list registration,
-                        // including a real actor timer before tools are known.
-                        await new Promise(resolve => setTimeout(resolve, 1));
+                        // Cold readiness exceeds the ordinary five-second
+                        // hook budget, as a healthy MCP handshake can. Later
+                        // turns reuse initialization and register promptly.
+                        await new Promise(resolve => setTimeout(resolve, generation === 0 ? 5100 : 1));
                         const current = ++generation;
                         pi.registerTool({
                             name: 'ctx_search',
@@ -15412,6 +15416,56 @@ mod abort_tests {
         }
     }
 
+    struct StartupAbortTool {
+        abort: AbortHandle,
+        return_after_abort: bool,
+        entered: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for StartupAbortTool {
+        fn name(&self) -> &'static str {
+            "read"
+        }
+
+        fn label(&self) -> &'static str {
+            "Startup cancellation fixture"
+        }
+
+        fn description(&self) -> &'static str {
+            "Cancels the caller during an extension readiness hostcall"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read()
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<ToolOutput> {
+            let _drop_guard = BlockedToolDropGuard(Arc::clone(&self.dropped));
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.abort.abort();
+            if self.return_after_abort {
+                Ok(ToolOutput {
+                    content: Vec::new(),
+                    details: None,
+                    is_error: false,
+                })
+            } else {
+                futures::future::pending().await
+            }
+        }
+    }
+
     struct AbortAfterReadsTool {
         completed: Arc<AtomicUsize>,
         ready: Arc<Notify>,
@@ -15769,6 +15823,221 @@ mod abort_tests {
             assert_eq!(message.stop_reason, StopReason::Aborted);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         });
+    }
+
+    enum StartupAbortPrompt {
+        Text,
+        Content,
+        Custom,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn cancelled_startup_never_reaches_provider(
+        prompt: StartupAbortPrompt,
+        pre_warmed: bool,
+        return_after_abort: bool,
+    ) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let temp = tempfile::TempDir::new().expect("fixture directory");
+            let entry = temp.path().join("startup.js");
+            std::fs::write(
+                &entry,
+                r#"export default function(pi) {
+                    pi.on('before_agent_start', async () => {
+                        await pi.tool('read', {});
+                        return { systemPrompt: 'late readiness prompt' };
+                    });
+                }"#,
+            )
+            .expect("extension fixture");
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let tools = ToolRegistry::from_tools(vec![Box::new(StartupAbortTool {
+                abort: abort_handle,
+                return_after_abort,
+                entered: Arc::clone(&entered),
+                dropped: Arc::clone(&dropped),
+            })]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            });
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    system_prompt: Some("base-system".to_string()),
+                    ..AgentConfig::default()
+                },
+            );
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let mut policy = ExtensionPolicy::default();
+            policy.default_caps.push("tool".to_string());
+            let pre_warmed = if pre_warmed {
+                let manager = ExtensionManager::new();
+                manager.set_cwd(temp.path().display().to_string());
+                let tools = agent_session.agent.shared_tools();
+                let runtime = JsExtensionRuntimeHandle::start_with_policy(
+                    PiJsRuntimeConfig {
+                        cwd: temp.path().display().to_string(),
+                        disk_cache_dir: None,
+                        ..PiJsRuntimeConfig::default()
+                    },
+                    tools.clone(),
+                    manager.clone(),
+                    policy.clone(),
+                )
+                .await
+                .expect("pre-warmed native runtime");
+                Some(PreWarmedExtensionRuntime {
+                    manager,
+                    runtime: ExtensionRuntimeHandle::Js(runtime),
+                    tools,
+                })
+            } else {
+                None
+            };
+            let config = crate::config::Config {
+                extension_startup_timeout_ms: Some(75_000),
+                ..crate::config::Config::default()
+            };
+            agent_session
+                .enable_extensions_with_policy(
+                    &[],
+                    temp.path(),
+                    Some(&config),
+                    &[entry],
+                    Some(policy),
+                    Some(RepairPolicyMode::Off),
+                    pre_warmed,
+                    ExtensionHostConfiguration::default(),
+                )
+                .await
+                .expect("load readiness extension");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(agent_session.extension_startup_timeout_ms, 75_000);
+            let manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .manager()
+                .clone();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let previous_entries = session
+                .lock(cx.cx())
+                .await
+                .expect("session lock")
+                .entries
+                .len();
+            let run = async {
+                match prompt {
+                    StartupAbortPrompt::Text => {
+                        agent_session
+                            .run_text_with_abort("hello".to_string(), Some(abort_signal), |_| {})
+                            .await
+                    }
+                    StartupAbortPrompt::Content => {
+                        agent_session
+                            .run_with_content_with_abort(
+                                vec![ContentBlock::Text(TextContent::new("hello"))],
+                                Some(abort_signal),
+                                |_| {},
+                            )
+                            .await
+                    }
+                    StartupAbortPrompt::Custom => {
+                        agent_session
+                            .run_custom_message_with_abort(
+                                Message::Custom(CustomMessage {
+                                    custom_type: "startup-note".to_string(),
+                                    content: "hello".to_string(),
+                                    display: true,
+                                    details: None,
+                                    timestamp: 0,
+                                }),
+                                Some(abort_signal),
+                                |_| {},
+                            )
+                            .await
+                    }
+                }
+            };
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                run,
+            )
+            .await
+            .expect("caller cancellation must not wait for the 75-second startup budget");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(matches!(result, Err(Error::Aborted)));
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(agent_session.agent.messages().is_empty());
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock")
+                    .entries
+                    .len(),
+                previous_entries
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(agent_session.agent.system_prompt(), Some("base-system"));
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(!agent_session.extensions_turn_active.load(Ordering::SeqCst));
+            let handle = manager.js_runtime().expect("native JS runtime");
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                handle.get_registered_tools(),
+            )
+            .await
+            .expect("cancelled owner must release the actor")
+            .expect("actor barrier");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "cancelled initialization must release its hostcall"
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn text_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Text, false, false);
+    }
+
+    #[test]
+    fn content_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Content, false, false);
+    }
+
+    #[test]
+    fn custom_message_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Custom, false, false);
+    }
+
+    #[test]
+    fn prewarmed_startup_cancellation_wins_when_hostcall_returns_after_abort() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Text, true, true);
     }
 
     #[test]
@@ -17426,6 +17695,7 @@ impl AgentSession {
             save_enabled,
             input_source: InputSource::Interactive,
             extensions: None,
+            extension_startup_timeout_ms: EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
             mcp_manager: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
             extensions_is_compacting: Arc::new(AtomicBool::new(false)),
@@ -20888,6 +21158,10 @@ impl AgentSession {
         pre_warmed: Option<PreWarmedExtensionRuntime>,
         host: ExtensionHostConfiguration,
     ) -> Result<()> {
+        let extension_startup_timeout_ms = config.map_or(
+            EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
+            crate::config::Config::extension_startup_timeout_ms,
+        );
         let mut js_specs: Vec<JsExtensionLoadSpec> = Vec::new();
         let mut native_specs: Vec<NativeRustExtensionLoadSpec> = Vec::new();
         #[cfg(feature = "wasm-host")]
@@ -21264,6 +21538,7 @@ impl AgentSession {
         self.agent.extension_tool_catalog = catalog;
         self.agent.extensions = Some(manager.clone());
         self.extensions = Some(ExtensionRegion::new(manager));
+        self.extension_startup_timeout_ms = extension_startup_timeout_ms;
         self.refresh_extension_compaction_models();
         Ok(())
     }
@@ -21582,8 +21857,9 @@ impl AgentSession {
                     &text,
                     &images,
                     base_system_prompt.as_deref().unwrap_or(""),
+                    abort.as_ref(),
                 )
-                .await;
+                .await?;
             *turn_system_prompt = system_prompt.or(base_system_prompt);
             let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
             prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
@@ -21671,8 +21947,9 @@ impl AgentSession {
                     &text,
                     &images,
                     base_system_prompt.as_deref().unwrap_or(""),
+                    abort.as_ref(),
                 )
-                .await;
+                .await?;
             *turn_system_prompt = system_prompt.or(base_system_prompt);
             let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
             prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
@@ -21763,13 +22040,26 @@ impl AgentSession {
         prompt: &str,
         images: &[ImageContent],
         system_prompt: &str,
-    ) -> BeforeAgentStartOutcome {
+        abort: Option<&AbortSignal>,
+    ) -> Result<BeforeAgentStartOutcome> {
         let Some(region) = &self.extensions else {
-            return BeforeAgentStartOutcome {
+            return Ok(BeforeAgentStartOutcome {
                 messages: Vec::new(),
                 system_prompt: None,
-            };
+            });
         };
+        if !region
+            .manager()
+            .has_hook_for(ExtensionEventName::BeforeAgentStart.as_str())
+        {
+            return Ok(BeforeAgentStartOutcome {
+                messages: Vec::new(),
+                system_prompt: None,
+            });
+        }
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
         let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
         let payload = json!({
@@ -21778,23 +22068,42 @@ impl AgentSession {
             "systemPrompt": system_prompt,
         });
 
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::BeforeAgentStart,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await;
+        let response = region.manager().dispatch_event_with_response(
+            ExtensionEventName::BeforeAgentStart,
+            Some(payload),
+            self.extension_startup_timeout_ms,
+        );
+        let response = if let Some(abort) = abort {
+            let cancelled = abort.wait();
+            futures::pin_mut!(response, cancelled);
+            match futures::future::select(cancelled, response).await {
+                // Dropping the event future signals the native actor out of
+                // band, so pending or CPU-bound initialization is quarantined.
+                futures::future::Either::Left(_) => return Err(Error::Aborted),
+                futures::future::Either::Right((result, _)) => {
+                    // Cancellation wins when readiness and abort become ready
+                    // together. No provider request may use the late response.
+                    if abort.is_aborted() {
+                        return Err(Error::Aborted);
+                    }
+                    result
+                }
+            }
+        } else {
+            response.await
+        };
 
         match response {
-            Ok(value) => apply_before_agent_start_response(value, Utc::now().timestamp_millis()),
+            Ok(value) => Ok(apply_before_agent_start_response(
+                value,
+                Utc::now().timestamp_millis(),
+            )),
             Err(err) => {
                 tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
-                BeforeAgentStartOutcome {
+                Ok(BeforeAgentStartOutcome {
                     messages: Vec::new(),
                     system_prompt: None,
-                }
+                })
             }
         }
     }
@@ -22194,8 +22503,13 @@ impl AgentSession {
             messages: custom_messages,
             system_prompt,
         } = self
-            .dispatch_before_agent_start("", &[], base_system_prompt.as_deref().unwrap_or(""))
-            .await;
+            .dispatch_before_agent_start(
+                "",
+                &[],
+                base_system_prompt.as_deref().unwrap_or(""),
+                abort.as_ref(),
+            )
+            .await?;
         let prompt_scope = SessionTurnPromptGuard::new(self, system_prompt.or(base_system_prompt));
         prompt_scope
             .session

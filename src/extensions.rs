@@ -10034,6 +10034,12 @@ impl WasmExtensionHost {
 /// Default cancellation budget for extension event handlers (ms).
 pub const EXTENSION_EVENT_TIMEOUT_MS: u64 = 5_000;
 
+/// Shared deadline for `before_agent_start`, whose handlers may initialize
+/// external services and register tools before the first provider request.
+/// Settings can shorten this or raise it up to five minutes; explicit runtime
+/// dispatch deadlines are never enlarged. Other events keep their own budgets.
+pub const EXTENSION_STARTUP_EVENT_TIMEOUT_MS: u64 = 120_000;
+
 /// Tight cancellation budget for informational (fire-and-forget) event handlers.
 ///
 /// This covers lifecycle notifications, telemetry pokes, and post-hoc updates.
@@ -10336,7 +10342,9 @@ impl ExtensionEventName {
     /// caller-provided timeout is in play. See [`Self::is_informational`].
     #[must_use]
     pub const fn default_timeout_ms(self) -> u64 {
-        if matches!(self, Self::SessionBeforeCompact) {
+        if matches!(self, Self::BeforeAgentStart) {
+            EXTENSION_STARTUP_EVENT_TIMEOUT_MS
+        } else if matches!(self, Self::SessionBeforeCompact) {
             // gh #178: the one hook whose contract includes awaiting a real
             // LLM request (`ctx.compact()`); see
             // [`EXTENSION_COMPACT_EVENT_TIMEOUT_MS`].
@@ -11320,6 +11328,17 @@ impl Drop for JsToolInvocationGuard {
     }
 }
 
+/// An event caller can abandon its future while the actor is executing guest
+/// code. The out-of-band flag reaches both the async pump and the JS interrupt
+/// fence without queueing a command behind the work it needs to cancel.
+struct JsEventInvocationGuard(Arc<AtomicBool>);
+
+impl Drop for JsEventInvocationGuard {
+    fn drop(&mut self) {
+        self.0.store(true, StdOrdering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tool_progress_tests {
     use super::*;
@@ -11434,6 +11453,7 @@ enum JsRuntimeCommand {
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
+        cancelled: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<Value>>,
     },
     /// Dispatch multiple events in a single JS bridge call with shared context.
@@ -11443,6 +11463,7 @@ enum JsRuntimeCommand {
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
+        cancelled: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<Vec<Result<Value>>>>,
     },
     ExecuteTool {
@@ -11541,9 +11562,9 @@ struct JsRuntimeShard {
     /// preserves its admission lease, provenance and eventual completion while
     /// the actor receives commands or advances another extension's timers.
     pending_idle_dispatch: Option<PendingIdleHostcall>,
-    /// Tool execution admits a bounded set of independent hostcalls so a
+    /// Tool and event execution admit a bounded set of independent hostcalls so a
     /// blocked earlier request cannot prevent a later request from releasing
-    /// it. Unfinished dispatches remain owned by the shard after the tool ends.
+    /// it. Unfinished dispatches remain owned by the shard after the task ends.
     pending_tool_dispatches: VecDeque<PendingIdleHostcall>,
     /// Terminal pump failure retained so unrelated shards can continue while
     /// future calls targeting this shard still receive the original failure.
@@ -12377,9 +12398,10 @@ impl JsExtensionRuntimeHandle {
                             origin,
                             timeout_ms: _,
                             deadline,
+                            cancelled,
                             reply,
                         } => {
-                            if reply.is_closed() {
+                            if reply.is_closed() || cancelled.load(StdOrdering::Acquire) {
                                 continue;
                             }
                             if let Err(err) = js_runtime_remaining_timeout_ms(deadline, "event") {
@@ -12394,6 +12416,7 @@ impl JsExtensionRuntimeHandle {
                                 ctx_payload.as_ref(),
                                 origin.as_ref(),
                                 deadline,
+                                &cancelled,
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -12404,9 +12427,10 @@ impl JsExtensionRuntimeHandle {
                             origin,
                             timeout_ms: _,
                             deadline,
+                            cancelled,
                             reply,
                         } => {
-                            if reply.is_closed() {
+                            if reply.is_closed() || cancelled.load(StdOrdering::Acquire) {
                                 continue;
                             }
                             if let Err(err) =
@@ -12422,6 +12446,7 @@ impl JsExtensionRuntimeHandle {
                                 ctx_payload.as_ref(),
                                 origin.as_ref(),
                                 deadline,
+                                &cancelled,
                             )
                             .await;
                             let _ = reply.send(&cx, result);
@@ -13242,6 +13267,8 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = JsEventInvocationGuard(Arc::clone(&cancelled));
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::DispatchEvent {
             event_name,
@@ -13250,6 +13277,7 @@ impl JsExtensionRuntimeHandle {
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            cancelled,
             reply: reply_tx,
         };
         let fut = async move {
@@ -13288,6 +13316,8 @@ impl JsExtensionRuntimeHandle {
         }
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = JsEventInvocationGuard(Arc::clone(&cancelled));
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::DispatchEventBatch {
             events,
@@ -13295,6 +13325,7 @@ impl JsExtensionRuntimeHandle {
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            cancelled,
             reply: reply_tx,
         };
         let fut = async move {
@@ -15560,6 +15591,7 @@ struct JsEventPhaseDispatch<'a> {
     batch_id: Option<&'a str>,
     origin: Option<&'a SessionActionOrigin>,
     deadline: Instant,
+    cancelled: &'a Arc<AtomicBool>,
 }
 
 #[allow(clippy::future_not_send)]
@@ -15577,57 +15609,101 @@ async fn dispatch_extension_event_phase_sharded(
         batch_id,
         origin,
         deadline,
+        cancelled,
     } = dispatch;
     shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "event")?;
+    let _ = remaining_js_task_timeout(deadline, "event")?;
+    if cancelled.load(StdOrdering::Acquire) {
+        return Err(Error::extension(
+            "JS extension event cancelled before execution",
+        ));
+    }
     let task_id = next_runtime_task_id("task-event-phase");
-    let origin_guard = {
-        let runtime = &shards
+    let runtime = Rc::clone(
+        &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let event_js = json_to_js(&ctx, &event_payload)?;
-                let promise: rquickjs::Value<'_> = if let Some(batch_id) = batch_id {
-                    let dispatch_fn: rquickjs::Function<'_> =
-                        global.get("__pi_dispatch_extension_event_phase_in_batch")?;
-                    dispatch_fn.call((
-                        bridge_secret.as_str(),
-                        event_name,
-                        event_js,
-                        batch_id,
-                        phase,
-                    ))?
-                } else {
-                    let dispatch_fn: rquickjs::Function<'_> =
-                        global.get("__pi_dispatch_extension_event_phase")?;
-                    let ctx_js = json_to_js(&ctx, ctx_payload)?;
-                    dispatch_fn.call((
-                        bridge_secret.as_str(),
-                        event_name,
-                        event_js,
-                        ctx_js,
-                        phase,
-                    ))?
-                };
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
+            .runtime,
+    );
+    let origin_guard = runtime.enter_session_action_origin(origin.cloned());
+    let fence = runtime.enter_execution_fence(Arc::clone(cancelled), deadline);
+    let bridge_secret = runtime.bridge_secret().to_string();
+    let started = runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let event_js = json_to_js(&ctx, &event_payload)?;
+            let promise: rquickjs::Value<'_> = if let Some(batch_id) = batch_id {
+                let dispatch_fn: rquickjs::Function<'_> =
+                    global.get("__pi_dispatch_extension_event_phase_in_batch")?;
+                dispatch_fn.call((
+                    bridge_secret.as_str(),
+                    event_name,
+                    event_js,
+                    batch_id,
+                    phase,
+                ))?
+            } else {
+                let dispatch_fn: rquickjs::Function<'_> =
+                    global.get("__pi_dispatch_extension_event_phase")?;
+                let ctx_js = json_to_js(&ctx, ctx_payload)?;
+                dispatch_fn.call((bridge_secret.as_str(), event_name, event_js, ctx_js, phase))?
+            };
+            let _task: String =
+                task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+            Ok(())
+        })
+        .await;
+    let outcome = match started {
+        Ok(()) => {
+            await_js_cancellable_task(shards, host, shard_index, &task_id, cancelled, deadline)
+                .await
+        }
+        Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
-
-    let raw =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await?;
+    // An async handler can catch an engine interruption and settle its promise.
+    // That does not make the interrupted realm safe to reuse. Event hooks have
+    // no public AbortSignal contract, so quarantine an abandoned active owner
+    // instead of letting retries or descendants continue after caller exit.
+    let result = if fence.was_interrupted() {
+        Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            "event cancellation or deadline interrupted JavaScript execution",
+        ))
+    } else {
+        match outcome {
+            JsCancellableTaskOutcome::Finished(result) => {
+                let refreshed = refresh_runtime_shard_snapshot(shards, shard_index).await;
+                if fence.was_interrupted()
+                    || cancelled.load(StdOrdering::Acquire)
+                    || Instant::now() >= deadline
+                {
+                    Err(quarantine_runtime_shard(
+                        shards,
+                        shard_index,
+                        "event cancelled or deadline elapsed during registry publication",
+                    ))
+                } else {
+                    refreshed.and(result)
+                }
+            }
+            JsCancellableTaskOutcome::Stopped { .. } => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                "event cancelled or timed out with unresolved JavaScript state",
+            )),
+            JsCancellableTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("event execution or runtime pump failed: {err}"),
+            )),
+        }
+    };
+    drop(fence);
     drop(origin_guard);
+    let raw = result?;
     let envelope: JsEventPhaseEnvelope = serde_json::from_value(raw)
         .map_err(|err| Error::extension(format!("event phase envelope: {err}")))?;
     Ok(envelope.present.then_some(envelope.value))
@@ -15694,6 +15770,7 @@ async fn dispatch_extension_event_across_shards_until(
     batch_id: Option<&str>,
     origin: Option<&SessionActionOrigin>,
     deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Value> {
     let owners = shards
         .event_owners
@@ -15746,6 +15823,7 @@ async fn dispatch_extension_event_across_shards_until(
                         batch_id,
                         origin,
                         deadline,
+                        cancelled,
                     },
                 )
                 .await?
@@ -15814,6 +15892,7 @@ async fn dispatch_extension_event_across_shards_until(
                         batch_id,
                         origin,
                         deadline,
+                        cancelled,
                     },
                 )
                 .await?
@@ -15867,6 +15946,7 @@ async fn dispatch_extension_event_across_shards_until(
                         batch_id,
                         origin,
                         deadline,
+                        cancelled,
                     },
                 )
                 .await?
@@ -15916,6 +15996,7 @@ async fn dispatch_extension_event_across_shards_until(
                         batch_id,
                         origin,
                         deadline,
+                        cancelled,
                     },
                 )
                 .await?
@@ -15968,6 +16049,7 @@ async fn dispatch_extension_event_across_shards_until(
                         batch_id,
                         origin,
                         deadline,
+                        cancelled,
                     },
                 )
                 .await?
@@ -16023,6 +16105,7 @@ async fn dispatch_extension_event_across_shards_until(
                         batch_id,
                         origin,
                         deadline,
+                        cancelled,
                     },
                 )
                 .await?
@@ -16061,6 +16144,7 @@ async fn dispatch_extension_event_across_shards_until(
                     batch_id,
                     origin,
                     deadline,
+                    cancelled,
                 },
             )
             .await?
@@ -16083,7 +16167,7 @@ async fn dispatch_extension_event_across_shards_until(
     Ok(last.unwrap_or(Value::Null))
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn dispatch_extension_event_across_shards(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -16092,6 +16176,7 @@ async fn dispatch_extension_event_across_shards(
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
     deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Value> {
     dispatch_extension_event_across_shards_until(
         shards,
@@ -16102,13 +16187,14 @@ async fn dispatch_extension_event_across_shards(
         None,
         origin,
         deadline,
+        cancelled,
     )
     .await
 }
 
 #[allow(clippy::future_not_send)]
 async fn delete_event_batch_contexts(
-    shards: &JsRuntimeShardSet,
+    shards: &mut JsRuntimeShardSet,
     shard_indexes: &[usize],
     batch_id: &str,
 ) -> Result<()> {
@@ -16120,9 +16206,18 @@ async fn delete_event_batch_contexts(
             }
             continue;
         };
-        let bridge_secret = shard.runtime.bridge_secret().to_string();
-        let result = shard
-            .runtime
+        // Cleanup must never re-enter an abandoned realm. Even bridge helpers
+        // can reach guest-modified prototypes, so fence each healthy owner
+        // independently instead of allowing one cleanup to pin all its peers.
+        if shard.pump_fault.is_some() {
+            continue;
+        }
+        let runtime = Rc::clone(&shard.runtime);
+        let bridge_secret = runtime.bridge_secret().to_string();
+        let cleanup_deadline = Instant::now() + Duration::from_millis(100);
+        let fence =
+            runtime.enter_execution_fence(Arc::new(AtomicBool::new(false)), cleanup_deadline);
+        let result = runtime
             .with_ctx(|ctx| {
                 let global = ctx.globals();
                 let delete_fn: rquickjs::Function<'_> =
@@ -16131,6 +16226,23 @@ async fn delete_event_batch_contexts(
                 Ok(())
             })
             .await;
+        let interrupted = fence.was_interrupted();
+        drop(fence);
+        let result = if interrupted || Instant::now() >= cleanup_deadline {
+            Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                "event batch cleanup exceeded its 100ms budget",
+            ))
+        } else if let Err(err) = result {
+            Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("event batch cleanup failed: {err}"),
+            ))
+        } else {
+            Ok(())
+        };
         if let Err(err) = result
             && first_error.is_none()
         {
@@ -16142,18 +16254,28 @@ async fn delete_event_batch_contexts(
 
 #[allow(clippy::future_not_send)]
 async fn create_event_batch_contexts(
-    shards: &JsRuntimeShardSet,
+    shards: &mut JsRuntimeShardSet,
     batch_id: &str,
     ctx_payload: &Value,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<usize>> {
     let mut created = Vec::with_capacity(shards.shards.len());
-    for (shard_index, shard) in shards.shards.iter().enumerate() {
-        if shard.pump_fault.is_some() {
+    let mut failure = None;
+    for shard_index in 0..shards.shards.len() {
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            failure = Some(Error::extension(
+                "event batch cancelled or expired before setup",
+            ));
+            break;
+        }
+        if shards.shards[shard_index].pump_fault.is_some() {
             continue;
         }
-        let bridge_secret = shard.runtime.bridge_secret().to_string();
-        let result = shard
-            .runtime
+        let runtime = Rc::clone(&shards.shards[shard_index].runtime);
+        let bridge_secret = runtime.bridge_secret().to_string();
+        let fence = runtime.enter_execution_fence(Arc::clone(cancelled), deadline);
+        let result = runtime
             .with_ctx(|ctx| {
                 let global = ctx.globals();
                 let create_fn: rquickjs::Function<'_> =
@@ -16164,19 +16286,36 @@ async fn create_event_batch_contexts(
                 Ok(())
             })
             .await;
+        let interrupted = fence.was_interrupted();
+        drop(fence);
+        if interrupted || cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            failure = Some(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                "event batch cancelled or deadline elapsed during setup",
+            ));
+            break;
+        }
         if let Err(err) = result {
-            if let Err(cleanup_err) = delete_event_batch_contexts(shards, &created, batch_id).await
-            {
-                tracing::warn!(
-                    event = "extension_runtime.event_batch.setup_cleanup_failed",
-                    batch_id,
-                    error = %cleanup_err,
-                    "Failed to clean up partial extension event batch contexts"
-                );
-            }
-            return Err(err);
+            failure = Some(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("event batch setup failed: {err}"),
+            ));
+            break;
         }
         created.push(shard_index);
+    }
+    if let Some(err) = failure {
+        if let Err(cleanup_err) = delete_event_batch_contexts(shards, &created, batch_id).await {
+            tracing::warn!(
+                event = "extension_runtime.event_batch.setup_cleanup_failed",
+                batch_id,
+                error = %cleanup_err,
+                "Failed to clean up partial extension event batch contexts"
+            );
+        }
+        return Err(err);
     }
     Ok(created)
 }
@@ -16189,13 +16328,15 @@ async fn dispatch_extension_event_batch_across_shards(
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
     deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<Result<Value>>> {
     let batch_id = next_runtime_task_id("event-batch-context");
-    let created_contexts = create_event_batch_contexts(shards, &batch_id, ctx_payload).await?;
+    let created_contexts =
+        create_event_batch_contexts(shards, &batch_id, ctx_payload, deadline, cancelled).await?;
     let mut results = Vec::with_capacity(events.len());
     for (event_name, event_payload) in events {
-        if Instant::now() >= deadline {
-            let err = Error::extension("JS extension event batch deadline elapsed");
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            let err = Error::extension("JS extension event batch cancelled or deadline elapsed");
             if let Err(cleanup_err) =
                 delete_event_batch_contexts(shards, &created_contexts, &batch_id).await
             {
@@ -16217,10 +16358,11 @@ async fn dispatch_extension_event_batch_across_shards(
             Some(batch_id.as_str()),
             origin,
             deadline,
+            cancelled,
         )
         .await;
         match result {
-            Err(err) if Instant::now() >= deadline => {
+            Err(err) if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline => {
                 if let Err(cleanup_err) =
                     delete_event_batch_contexts(shards, &created_contexts, &batch_id).await
                 {
@@ -16297,7 +16439,7 @@ async fn execute_extension_tool_sharded(
     );
     let origin_guard = runtime.enter_session_action_origin(origin.cloned());
     let execution_fence =
-        runtime.enter_tool_execution_fence(Arc::clone(&invocation.cancelled), deadline);
+        runtime.enter_execution_fence(Arc::clone(&invocation.cancelled), deadline);
     let bridge_secret = runtime.bridge_secret().to_string();
     let started = runtime
         .with_ctx(|ctx| {
@@ -16336,31 +16478,39 @@ async fn execute_extension_tool_sharded(
         .await;
     let mut outcome = match started {
         Ok(()) => {
-            await_js_tool_task(shards, host, shard_index, &task_id, &invocation, deadline).await
+            await_js_cancellable_task(
+                shards,
+                host,
+                shard_index,
+                &task_id,
+                &invocation.cancelled,
+                deadline,
+            )
+            .await
         }
-        Err(err) => JsToolTaskOutcome::Fault(err),
+        Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
     if execution_fence.was_interrupted() {
         // An async function can turn an engine interruption into a rejected
         // promise. It is still unsafe to reuse that interrupted isolate.
-        outcome = JsToolTaskOutcome::Fault(Error::extension(
+        outcome = JsCancellableTaskOutcome::Fault(Error::extension(
             "tool cancellation or deadline interrupted JavaScript execution",
         ));
     }
     // Abort listeners need their own small budget; the original deadline or
     // already-set drop flag must not interrupt them before they can clean up.
     drop(execution_fence);
-    if matches!(&outcome, JsToolTaskOutcome::Finished(_)) {
+    if matches!(&outcome, JsCancellableTaskOutcome::Finished(_)) {
         invocation.close_progress();
     } else {
         invocation.cancel();
     }
     let cleanup_deadline = Instant::now() + Duration::from_millis(100);
     let cleanup_fence =
-        runtime.enter_tool_execution_fence(Arc::new(AtomicBool::new(false)), cleanup_deadline);
+        runtime.enter_execution_fence(Arc::new(AtomicBool::new(false)), cleanup_deadline);
     let result = match outcome {
-        JsToolTaskOutcome::Finished(result) => result,
-        JsToolTaskOutcome::Stopped { settled } => {
+        JsCancellableTaskOutcome::Finished(result) => result,
+        JsCancellableTaskOutcome::Stopped { settled } => {
             let cancellation = if Instant::now() >= deadline {
                 format!("JS extension tool timed out after {timeout_ms}ms")
             } else {
@@ -16385,7 +16535,7 @@ async fn execute_extension_tool_sharded(
                 )),
             }
         }
-        JsToolTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
+        JsCancellableTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
             shards,
             shard_index,
             &format!("tool execution interrupted or runtime pump failed: {err}"),
@@ -16434,7 +16584,7 @@ async fn execute_extension_tool_sharded(
     result
 }
 
-enum JsToolTaskOutcome {
+enum JsCancellableTaskOutcome {
     Finished(Result<Value>),
     Stopped { settled: bool },
     Fault(Error),
@@ -16444,31 +16594,31 @@ enum JsToolTaskOutcome {
 /// cancellation or starve a second hostcall needed to complete the first. The
 /// dispatches retain their admission leases, origin and process drop guards.
 #[allow(clippy::future_not_send)]
-async fn await_js_tool_task(
+async fn await_js_cancellable_task(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     shard_index: usize,
     task_id: &str,
-    invocation: &JsToolInvocation,
+    cancelled: &AtomicBool,
     deadline: Instant,
-) -> JsToolTaskOutcome {
+) -> JsCancellableTaskOutcome {
     loop {
-        if invocation.is_cancelled() || Instant::now() >= deadline {
-            return JsToolTaskOutcome::Stopped { settled: false };
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            return JsCancellableTaskOutcome::Stopped { settled: false };
         }
         let shard = &mut shards.shards[shard_index];
-        if let Err(err) = pump_tool_runtime_shard(shard, host).await {
-            return JsToolTaskOutcome::Fault(err);
+        if let Err(err) = pump_active_runtime_shard(shard, host).await {
+            return JsCancellableTaskOutcome::Fault(err);
         }
-        if invocation.is_cancelled() || Instant::now() >= deadline {
-            return JsToolTaskOutcome::Stopped { settled: false };
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            return JsCancellableTaskOutcome::Stopped { settled: false };
         }
         let state = match take_js_task_state(&shard.runtime, task_id).await {
             Ok(state) => state,
-            Err(err) => return JsToolTaskOutcome::Fault(err),
+            Err(err) => return JsCancellableTaskOutcome::Fault(err),
         };
-        if invocation.is_cancelled() || Instant::now() >= deadline {
-            return JsToolTaskOutcome::Stopped {
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            return JsCancellableTaskOutcome::Stopped {
                 settled: matches!(
                     state,
                     JsTaskTakeResult::Resolved(_) | JsTaskTakeResult::Rejected { .. }
@@ -16476,8 +16626,8 @@ async fn await_js_tool_task(
             };
         }
         match finish_js_task_take(state) {
-            Ok(Some(value)) => return JsToolTaskOutcome::Finished(Ok(value)),
-            Err(err) => return JsToolTaskOutcome::Finished(Err(err)),
+            Ok(Some(value)) => return JsCancellableTaskOutcome::Finished(Ok(value)),
+            Err(err) => return JsCancellableTaskOutcome::Finished(Err(err)),
             Ok(None) => extension_wait_cooperate(deadline).await,
         }
     }
@@ -16515,7 +16665,7 @@ async fn abort_js_tool_task(
                 "tool did not settle within 100ms after abort",
             ));
         }
-        pump_tool_runtime_shard(shard, host).await?;
+        pump_active_runtime_shard(shard, host).await?;
         match take_js_task_state(&shard.runtime, task_id).await? {
             JsTaskTakeResult::Pending => extension_wait_cooperate(deadline).await,
             // A rejection is also successful cancellation cleanup. Its value
@@ -17282,14 +17432,17 @@ struct IdleRuntimeProgress {
     ran_javascript: bool,
 }
 
-const MAX_RETAINED_TOOL_HOSTCALLS: usize = 16;
+const MAX_RETAINED_ACTIVE_HOSTCALLS: usize = 16;
 
 /// Admit independent requests in FIFO order, then poll each retained future
 /// once without awaiting arbitrary I/O. The bound includes any older idle
 /// dispatch. Ownership, capability checks and admission remain in the common
 /// dispatcher, and unfinished work stays on the shard for later idle turns.
+/// Tool and event waits share this path so either can observe cancellation
+/// while a native dispatch is pending. Native synchronous calls retain their
+/// own timeout: polling cannot interrupt Rust code that does not yield.
 #[allow(clippy::future_not_send)]
-async fn pump_tool_runtime_shard(
+async fn pump_active_runtime_shard(
     shard: &mut JsRuntimeShard,
     host: &JsRuntimeHost,
 ) -> Result<IdleRuntimeProgress> {
@@ -17303,7 +17456,7 @@ async fn pump_tool_runtime_shard(
     {
         1
     } else {
-        MAX_RETAINED_TOOL_HOSTCALLS
+        MAX_RETAINED_ACTIVE_HOSTCALLS
     };
     while shard.pending_tool_dispatches.len() + usize::from(shard.pending_idle_dispatch.is_some())
         < admission_limit
@@ -17343,7 +17496,7 @@ async fn pump_idle_runtime_shard(
     host: &JsRuntimeHost,
 ) -> Result<IdleRuntimeProgress> {
     if !shard.pending_tool_dispatches.is_empty() {
-        return pump_tool_runtime_shard(shard, host).await;
+        return pump_active_runtime_shard(shard, host).await;
     }
     let jobs_drained = shard.runtime.drain_microtasks().await?;
     if shard.pending_idle_dispatch.is_none()
@@ -17428,7 +17581,7 @@ async fn pump_runtime_shard_for_command(
     root_deadline: Option<Instant>,
 ) -> Result<bool> {
     if !shard.pending_tool_dispatches.is_empty() {
-        pump_tool_runtime_shard(shard, host)
+        pump_active_runtime_shard(shard, host)
             .await
             .map(|progress| progress.has_pending)
     } else if shard.pending_idle_dispatch.is_some() {
@@ -17603,7 +17756,7 @@ mod idle_runtime_tests {
             fixture.shard.pending_idle_dispatch =
                 Some(held_hostcall(request, &gate, &polls, &drops));
 
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("poll blocked request and its successor");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17618,7 +17771,7 @@ mod idle_runtime_tests {
                     .unwrap_or_else(PoisonError::into_inner),
                 ["release"]
             );
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("complete released earlier request");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17648,7 +17801,7 @@ mod idle_runtime_tests {
                 )
                 .await
                 .expect("queue more than one admission window");
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("bounded first admission window");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17658,9 +17811,9 @@ mod idle_runtime_tests {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .len(),
-                1 + MAX_RETAINED_TOOL_HOSTCALLS
+                1 + MAX_RETAINED_ACTIVE_HOSTCALLS
             );
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("admit remaining queued request");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17702,7 +17855,7 @@ mod idle_runtime_tests {
                 .shard
                 .pending_tool_dispatches
                 .push_back(held_hostcall(request, &gate, &polls, &drops));
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("initial tool poll");
             pump_idle_runtime_shard(&mut fixture.shard, &fixture.host)
@@ -17747,7 +17900,7 @@ mod idle_runtime_tests {
                 .shard
                 .pending_tool_dispatches
                 .push_back(held_hostcall(request, &gate, &polls, &drops));
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("start retained native resource guard");
             let runtime = Rc::clone(&fixture.shard.runtime);
@@ -17918,7 +18071,7 @@ mod idle_runtime_tests {
                 .shard
                 .pending_tool_dispatches
                 .push_back(held_hostcall(second, &second_gate, &polls, &drops));
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("start both retained dispatch guards");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17951,7 +18104,7 @@ mod idle_runtime_tests {
                 .eval("pi.tool('after-veto-one', {}); pi.tool('after-veto-two', {});")
                 .await
                 .expect("queue requests after the safety transition");
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("poll existing work while admission is vetoed");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17968,10 +18121,10 @@ mod idle_runtime_tests {
             );
 
             first_gate.store(true, StdOrdering::SeqCst);
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("drain the older idle dispatch");
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("one live dispatch still fills the conservative window");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -17986,12 +18139,12 @@ mod idle_runtime_tests {
             );
 
             second_gate.store(true, StdOrdering::SeqCst);
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("drain the older tool dispatch");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert_eq!(drops.get(), 2);
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("admit exactly one request under the veto");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18002,7 +18155,7 @@ mod idle_runtime_tests {
                     .unwrap_or_else(PoisonError::into_inner),
                 ["after-veto-one"]
             );
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("admit the next request on its own turn");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18023,7 +18176,7 @@ mod idle_runtime_tests {
                 .eval("pi.tool('recovered-one', {}); pi.tool('recovered-two', {});")
                 .await
                 .expect("queue work after safety recovery");
-            pump_tool_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
                 .await
                 .expect("restore the bounded parallel window");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
