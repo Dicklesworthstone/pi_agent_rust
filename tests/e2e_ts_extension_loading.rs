@@ -878,10 +878,426 @@ export default function init(pi: any): void {
     write_jsonl_artifacts(&harness);
 }
 
+/// Fixture for the published 0.2.0 package layout and its configuration-read
+/// contract. This is a loader/security regression, not a published-package run.
+fn context_engineering_configuration_fixture(base: &std::path::Path) -> JsExtensionLoadSpec {
+    let package = base.join("npm/node_modules/@zhushanwen/pi-context-engineering");
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{
+        "name": "@zhushanwen/pi-context-engineering", "version": "0.2.0", "type": "module",
+        "main": "src/index.ts", "pi": { "extensions": ["./index.ts"] }
+    }"#,
+    )
+    .unwrap();
+    let entry = package.join("index.ts");
+    std::fs::write(&entry, "export { default } from './src/index.ts';").unwrap();
+    std::fs::write(package.join("src/config.ts"), r"
+        import { readFileSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        export function loadConfig(): { enabled: boolean } {
+            const file = join(homedir(), '.pi', 'agent', 'extensions', 'context-engineering', 'config.json');
+            let raw: string;
+            try { raw = readFileSync(file, 'utf-8'); }
+            catch (error) {
+                if ((error as { code?: string }).code === 'ENOENT') return { enabled: true };
+                throw error;
+            }
+            return { enabled: true, ...JSON.parse(raw)['context-engineering'] };
+        }
+    ").unwrap();
+    std::fs::write(package.join("src/index.ts"), r"
+        import { readFileSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        import { loadConfig } from './config.ts';
+        export default function configurationExtension(pi: any): void {
+            const factory = loadConfig();
+            let session = null;
+            let contextModeDenied = false;
+            try { readFileSync(join(homedir(), '.pi', 'context-mode', 'sessions', 'project-fixture.db')); }
+            catch (error) { contextModeDenied = error.code === 'EACCES'; }
+            pi.on('session_start', () => { session = loadConfig(); });
+            pi.registerCommand('configuration-fixture', {
+                handler: async () => ({ display: JSON.stringify({ factory, session, contextModeDenied }) }),
+            });
+        }
+    ").unwrap();
+    JsExtensionLoadSpec::from_entry_path(entry).unwrap()
+}
+
+fn configuration_fixture_result(manager: &ExtensionManager) -> Value {
+    let manager = manager.clone();
+    let result = common::run_async(async move {
+        manager
+            .execute_command("configuration-fixture", "", 5000)
+            .await
+    })
+    .unwrap();
+    serde_json::from_str(result["display"].as_str().unwrap()).unwrap()
+}
+
+fn configuration_fixture_manager(
+    workspace: &std::path::Path,
+    home: &std::path::Path,
+    policy: pi::extensions::ExtensionPolicy,
+) -> ExtensionManager {
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], workspace, None));
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "HOME".to_string(),
+                home.display().to_string(),
+            )]),
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("configuration loader runtime");
+    manager.set_js_runtime(runtime);
+    manager
+}
+
+#[allow(clippy::too_many_lines)]
+fn configuration_owner_reads_defaults_and_reload_without_granting_peers_access(
+    present: bool,
+    peer_first: bool,
+) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = workspace.join("configured-home");
+    let configuration = home.join(".pi/agent/extensions/context-engineering/config.json");
+    std::fs::create_dir(&workspace).unwrap();
+    if present {
+        std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+        std::fs::write(
+            &configuration,
+            r#"{"context-engineering":{"enabled":false}}"#,
+        )
+        .unwrap();
+    }
+    std::fs::write(workspace.join("ordinary.txt"), "workspace readable").unwrap();
+    let owner_spec = context_engineering_configuration_fixture(&base);
+    let peer_package = base.join("npm/node_modules/configuration-peer");
+    std::fs::create_dir_all(&peer_package).unwrap();
+    std::fs::write(
+        peer_package.join("package.json"),
+        r#"{
+            "name": "configuration-peer", "type": "module", "pi": {"extensions":["./peer.js"]}
+        }"#,
+    )
+    .unwrap();
+    let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+    let ordinary =
+        serde_json::to_string(&workspace.join("ordinary.txt").display().to_string()).unwrap();
+    let peer_entry = peer_package.join("peer.js");
+    std::fs::write(&peer_entry, format!(r"
+            import {{ readFileSync, writeFileSync }} from 'node:fs';
+            export default function(pi) {{
+                const file = {file};
+                const checks = {{}};
+                for (const [name, operation] of [
+                    ['read', () => readFileSync(file, 'utf8')],
+                    ['nativeRead', () => __pi_host_read_file_sync(file)],
+                    ['readCheck', () => __pi_host_check_read_access(file)],
+                ]) {{
+                    try {{ operation(); checks[name] = 'allowed'; }}
+                    catch (error) {{ checks[name] = error.code; }}
+                }}
+                let writeDenied = false;
+                try {{ writeFileSync(file, 'peer corruption'); }} catch (_) {{ writeDenied = true; }}
+                pi.registerCommand('configuration-peer-check', {{ handler: async () => ({{ display: JSON.stringify({{
+                    checks, writeDenied, ordinary: readFileSync({ordinary}, 'utf8'),
+                    homeHidden: process.env.HOME === undefined && pi.env.get('HOME') === undefined,
+                }}) }}) }});
+            }}
+        ")).unwrap();
+    let peer_spec = JsExtensionLoadSpec::from_entry_path(peer_entry).unwrap();
+    let mut policy = pi::extensions::ExtensionPolicy {
+        mode: pi::extensions::ExtensionPolicyMode::Strict,
+        deny_caps: Vec::new(),
+        default_caps: vec!["read".to_string(), "write".to_string()],
+        ..Default::default()
+    };
+    policy.per_extension.insert(
+        owner_spec.extension_id.clone(),
+        pi::extensions::ExtensionOverride {
+            allow: vec!["env".to_string()],
+            ..Default::default()
+        },
+    );
+    policy.per_extension.insert(
+        peer_spec.extension_id.clone(),
+        pi::extensions::ExtensionOverride {
+            deny: vec!["env".to_string()],
+            ..Default::default()
+        },
+    );
+    let manager = configuration_fixture_manager(&workspace, &home, policy);
+    let specs = if peer_first {
+        vec![peer_spec, owner_spec]
+    } else {
+        vec![owner_spec, peer_spec]
+    };
+    let loading_manager = manager.clone();
+    common::run_async(async move { loading_manager.load_js_extensions(specs).await })
+        .expect("both factories load with complete configuration boundaries");
+    assert_eq!(
+        configuration_fixture_result(&manager)["factory"]["enabled"],
+        !present
+    );
+    assert_eq!(
+        configuration.exists(),
+        present,
+        "factory defaults must not create configuration"
+    );
+    let peer_manager = manager.clone();
+    let result = common::run_async(async move {
+        peer_manager
+            .execute_command("configuration-peer-check", "", 5000)
+            .await
+    })
+    .unwrap();
+    let checks: Value = serde_json::from_str(result["display"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        checks,
+        serde_json::json!({
+            "checks": {"read": "EACCES", "nativeRead": "EACCES", "readCheck": "EACCES"},
+            "writeDenied": true, "ordinary": "workspace readable", "homeHidden": true,
+        })
+    );
+    let dispatch_manager = manager.clone();
+    common::run_async(async move {
+        dispatch_manager
+            .dispatch_event(pi::extensions::ExtensionEventName::SessionStart, None)
+            .await
+    })
+    .unwrap();
+    assert_eq!(
+        configuration_fixture_result(&manager)["session"]["enabled"],
+        !present
+    );
+    std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+    std::fs::write(
+        &configuration,
+        serde_json::json!({"context-engineering":{"enabled":present}}).to_string(),
+    )
+    .unwrap();
+    let dispatch_manager = manager.clone();
+    common::run_async(async move {
+        dispatch_manager
+            .dispatch_event(pi::extensions::ExtensionEventName::SessionStart, None)
+            .await
+    })
+    .unwrap();
+    let reloaded = configuration_fixture_result(&manager);
+    assert_eq!(reloaded["factory"]["enabled"], !present);
+    assert_eq!(
+        reloaded["session"]["enabled"], present,
+        "session_start must read the updated host configuration"
+    );
+    common::run_async(async move {
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+}
+
+#[test]
+fn npm_configuration_present_peer_first_preserves_owner_access_and_peer_isolation() {
+    configuration_owner_reads_defaults_and_reload_without_granting_peers_access(true, true);
+}
+
+#[test]
+fn npm_configuration_present_owner_first_preserves_owner_access_and_peer_isolation() {
+    configuration_owner_reads_defaults_and_reload_without_granting_peers_access(true, false);
+}
+
+#[test]
+fn npm_configuration_missing_peer_first_preserves_owner_access_and_peer_isolation() {
+    configuration_owner_reads_defaults_and_reload_without_granting_peers_access(false, true);
+}
+
+#[test]
+fn npm_configuration_missing_owner_first_preserves_owner_access_and_peer_isolation() {
+    configuration_owner_reads_defaults_and_reload_without_granting_peers_access(false, false);
+}
+
+fn configuration_grant_requires_installed_name_scope_and_declared_entry(invalid: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = base.join("home");
+    let configuration = home.join(".pi/agent/extensions/context-engineering/config.json");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+    std::fs::write(
+        &configuration,
+        r#"{"context-engineering":{"enabled":false}}"#,
+    )
+    .unwrap();
+    let mut spec = context_engineering_configuration_fixture(&base);
+    let package = spec.entry_path.parent().unwrap().to_path_buf();
+    match invalid {
+        "name" => {
+            std::fs::write(
+                package.join("package.json"),
+                r#"{
+                    "name":"@someone-else/pi-context-engineering", "type":"module",
+                    "pi":{"extensions":["./index.ts"]}
+                }"#,
+            )
+            .unwrap();
+        }
+        "scope" => {
+            let other_scope = package.parent().unwrap().with_file_name("@someone-else");
+            std::fs::rename(package.parent().unwrap(), &other_scope).unwrap();
+            let moved = other_scope.join("pi-context-engineering");
+            std::fs::write(
+                moved.join("package.json"),
+                r#"{
+                    "name":"@someone-else/pi-context-engineering", "type":"module",
+                    "pi":{"extensions":["./index.ts"]}
+                }"#,
+            )
+            .unwrap();
+            spec = JsExtensionLoadSpec::from_entry_path(moved.join("index.ts")).unwrap();
+        }
+        "entry" => {
+            // The declared root index.ts imports this implementation, but
+            // loading the undeclared source directly does not admit a package.
+            spec = JsExtensionLoadSpec::from_entry_path(package.join("src/index.ts")).unwrap();
+        }
+        "loose" => {
+            let file = serde_json::to_string(&configuration.display().to_string()).unwrap();
+            let entry = workspace.join("loose.ts");
+            std::fs::write(&entry, format!(r"
+                    import {{ readFileSync }} from 'node:fs';
+                    export default function(pi) {{
+                        readFileSync({file}, 'utf8');
+                        pi.registerCommand('configuration-fixture', {{handler: async () => ({{}})}});
+                    }}
+                ")).unwrap();
+            spec = JsExtensionLoadSpec::from_entry_path(entry).unwrap();
+            spec.extension_id = "pi-context-engineering".to_string();
+            spec.name = "@zhushanwen/pi-context-engineering".to_string();
+        }
+        _ => unreachable!("listed invalid provenance fixture"),
+    }
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "env");
+    policy.default_caps.push("env".to_string());
+    let manager = configuration_fixture_manager(&workspace, &home, policy);
+    let loading_manager = manager.clone();
+    let error =
+        common::run_async(async move { loading_manager.load_js_extensions(vec![spec]).await })
+            .expect_err("unverified package must not receive a configuration read grant");
+    assert!(error.to_string().contains("EACCES"), "{invalid}: {error}");
+    assert!(!manager.has_command("configuration-fixture"));
+    common::run_async(async move {
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+}
+
+#[test]
+fn npm_configuration_grant_rejects_wrong_manifest_name() {
+    configuration_grant_requires_installed_name_scope_and_declared_entry("name");
+}
+
+#[test]
+fn npm_configuration_grant_rejects_wrong_installed_scope() {
+    configuration_grant_requires_installed_name_scope_and_declared_entry("scope");
+}
+
+#[test]
+fn npm_configuration_grant_rejects_undeclared_source_entry() {
+    configuration_grant_requires_installed_name_scope_and_declared_entry("entry");
+}
+
+#[test]
+fn npm_configuration_grant_rejects_loose_extension_identity_spoofing() {
+    configuration_grant_requires_installed_name_scope_and_declared_entry("loose");
+}
+
+#[test]
+fn npm_configuration_collision_with_local_extension_rejects_before_factories() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = base.join("home");
+    let namespace = home.join(".pi/agent/extensions/context-engineering");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir_all(&namespace).unwrap();
+    std::fs::write(namespace.join("config.json"), "{}").unwrap();
+    let owner = context_engineering_configuration_fixture(&base);
+    let local_entry = namespace.join("index.ts");
+    std::fs::write(&local_entry, "export default function(pi) { pi.registerCommand('local-collision', {handler: async () => ({})}); }").unwrap();
+    let local = JsExtensionLoadSpec::from_entry_path(local_entry).unwrap();
+
+    // A factory placed first would persist a marker if admission happened
+    // after guest execution instead of validating the entire load plan first.
+    let sentinel = base.join("npm/node_modules/factory-sentinel");
+    std::fs::create_dir_all(&sentinel).unwrap();
+    std::fs::write(
+        sentinel.join("package.json"),
+        r#"{
+        "name":"factory-sentinel", "type":"module", "pi":{"extensions":["./sentinel.js"]}
+    }"#,
+    )
+    .unwrap();
+    let sentinel_entry = sentinel.join("sentinel.js");
+    std::fs::write(
+        &sentinel_entry,
+        r"
+        import { mkdirSync, writeFileSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        export default function(pi) {
+            const dir = join(homedir(), '.pi', 'factory-sentinel');
+            mkdirSync(dir, {recursive:true});
+            writeFileSync(join(dir, 'executed'), 'factory ran');
+        }
+    ",
+    )
+    .unwrap();
+    let sentinel = JsExtensionLoadSpec::from_entry_path(sentinel_entry).unwrap();
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "env");
+    policy.default_caps.push("env".to_string());
+    let manager = configuration_fixture_manager(&workspace, &home, policy);
+    let loading_manager = manager.clone();
+    let error = common::run_async(async move {
+        loading_manager
+            .load_js_extensions(vec![sentinel, local, owner])
+            .await
+    })
+    .expect_err("configuration cannot overlap another extension's executable namespace");
+    assert!(
+        error.to_string().contains("Configuration namespace"),
+        "{error}"
+    );
+    assert!(
+        !home.join(".pi/factory-sentinel").exists(),
+        "no factory may execute before collision rejection"
+    );
+    assert!(!manager.has_command("configuration-fixture"));
+    assert!(!manager.has_command("local-collision"));
+    common::run_async(async move {
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+}
+
 /// Reproduces the package, storage and SQLite initialization sequence used by
 /// context-mode 1.0.169 (build/adapters/base.js, build/db-base.js and
 /// build/session/db.js). This is a real database across two cold `PiJS` realms;
-/// no hostcall interceptor or database stub participates in this test.
+/// no hostcall interceptor or database stub participates in this test. The
+/// configuration owner coexists without sharing either owner's data authority.
 #[test]
 fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -893,6 +1309,14 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    let configuration = home.join(".pi/agent/extensions/context-engineering/config.json");
+    std::fs::create_dir_all(configuration.parent().unwrap()).unwrap();
+    std::fs::write(
+        &configuration,
+        r#"{"context-engineering":{"enabled":false}}"#,
+    )
+    .unwrap();
+    let configuration_spec = context_engineering_configuration_fixture(&base);
     std::fs::write(
         package.join("package.json"),
         r#"{
@@ -932,7 +1356,7 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
         }
     ").unwrap();
     std::fs::write(&entry, r"
-        import { mkdirSync } from 'node:fs';
+        import { mkdirSync, readFileSync } from 'node:fs';
         import { createHash } from 'node:crypto';
         import { homedir } from 'node:os';
         import { join } from 'node:path';
@@ -943,6 +1367,9 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             const { db, write } = openSessionDB(join(directory, 'project-fixture.db'));
             let sessionId = '';
             let sessionFile = null;
+            let configurationDenied = false;
+            try { readFileSync(join(homedir(), '.pi', 'agent', 'extensions', 'context-engineering', 'config.json'), 'utf8'); }
+            catch (error) { configurationDenied = error.code === 'EACCES'; }
             pi.on('session_start', (_event, ctx) => {
                 // context-mode 1.0.169 derives its database key from this path.
                 // A constant fixture ID masks loss of history on cold resume.
@@ -961,7 +1388,7 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             pi.registerCommand('ctx-storage-stats', {
                 description: 'Only registers after persistent SQLite initialization',
                 handler: async () => ({ display: JSON.stringify({
-                    sessionFile, sessionId,
+                    sessionFile, sessionId, configurationDenied,
                     count: db.prepare('SELECT count(*) AS count FROM session_events WHERE session_id = ?').get(sessionId).count,
                     rows: db.prepare('SELECT type, data FROM session_events WHERE session_id = ? ORDER BY id').all(sessionId),
                     sessionCount: db.prepare('SELECT count(DISTINCT session_id) AS count FROM session_events').get().count,
@@ -996,10 +1423,16 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
         .expect("start runtime");
         manager.set_js_runtime(runtime);
         let spec = JsExtensionLoadSpec::from_entry_path(&entry).unwrap();
+        let configuration_spec = configuration_spec.clone();
         let loading_manager = manager.clone();
-        common::run_async(async move { loading_manager.load_js_extensions(vec![spec]).await })
-            .expect("load npm-style extension through production loader");
+        common::run_async(async move {
+            loading_manager
+                .load_js_extensions(vec![configuration_spec, spec])
+                .await
+        })
+        .expect("load npm-style storage and configuration owners through production loader");
         assert!(manager.has_command("ctx-storage-stats"));
+        assert!(manager.has_command("configuration-fixture"));
         manager
     };
     let stats = |manager: &ExtensionManager| {
@@ -1042,12 +1475,25 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     let shared = Arc::new(asupersync::sync::Mutex::new(fresh_session));
     let manager = load(Arc::clone(&shared));
     assert_eq!(stats(&manager)["count"], 0);
+    assert_eq!(stats(&manager)["configurationDenied"], true);
+    assert_eq!(
+        configuration_fixture_result(&manager)["contextModeDenied"],
+        true
+    );
+    assert_eq!(
+        configuration_fixture_result(&manager)["factory"]["enabled"],
+        false
+    );
     dispatch(
         &manager,
         pi::extensions::ExtensionEventName::SessionStart,
         None,
     );
     let initial = stats(&manager);
+    assert_eq!(
+        configuration_fixture_result(&manager)["session"]["enabled"],
+        false
+    );
     assert_eq!(initial["count"], 1);
     assert_eq!(initial["sessionFile"], session_file.display().to_string());
     assert!(!initial["sessionId"].as_str().unwrap().starts_with("pi-"));
@@ -1077,6 +1523,15 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
         None,
     );
     let resumed = stats(&manager);
+    assert_eq!(resumed["configurationDenied"], true);
+    assert_eq!(
+        configuration_fixture_result(&manager)["contextModeDenied"],
+        true
+    );
+    assert_eq!(
+        configuration_fixture_result(&manager)["session"]["enabled"],
+        false
+    );
     assert_eq!(resumed["sessionId"], initial["sessionId"]);
     assert_eq!(resumed["sessionFile"], initial["sessionFile"]);
     assert_eq!(

@@ -663,6 +663,75 @@ Writable descriptors,
 symlink creation, recursive directory deletion, and cross-filesystem rename
 are explicitly unsupported within a persistent grant.
 
+### Read-only extension configuration
+
+Configuration is a separate, exact-file capability in the host data registry.
+The host API `PiJsRuntime::add_configuration_read_file` grants one owner a
+read-only file and protects its parent namespace from other owners and ordinary
+workspace fallback. It does not authorize directory listings, neighboring files,
+JavaScript imports, or writes, even when the extension has a `write` capability.
+Registration creates neither the configuration file nor its directories.
+
+The npm loader currently declares this compatibility mapping:
+
+| Admitted package identity | File relative to the owner's home |
+|---|---|
+| `@zhushanwen/pi-context-engineering` | `.pi/agent/extensions/context-engineering/config.json` |
+
+The identity comes from the existing admitted package provenance: installed
+`node_modules` layout, manifest name, and declared `pi.extensions` entry must
+agree. Aliases are explicit host policy; arbitrary scopes and `pi-` prefixes
+are never stripped to infer ownership. Guest package fields and changes to
+`process.env` cannot add grants. Each path is resolved once in its owner's
+runtime configuration, and all realms receive its protected boundary before
+factories run. A collision with a different extension's code directory rejects
+the proposed load before executing factories.
+
+Configuration reads, stat, and realpath use the same pinned, no-follow file
+handles and link checks as persistent data. Windows case aliases must identify
+the actual granted file; case folding alone cannot authorize a distinct sibling
+in a case-sensitive directory. Read-only configuration never satisfies SQLite's
+write-authority requirement. Context-mode's existing writable
+`~/.pi/context-mode` namespace remains separate.
+
+An authorized absent configuration is reported with `error.code === "ENOENT"`.
+Permission, unsafe-link, and I/O failures remain errors and cannot silently
+become missing-file defaults. This matters for the published
+`@zhushanwen/pi-context-engineering@0.2.0`, which reads configuration during
+initialization and again on `session_start`, and checks `error.code` to select
+its defaults.
+
+#### Issue #279 verification scope (2026-11-04)
+
+The supplementary diagnostic in
+`scripts/test_published_extension_config.mjs` pins the published
+`@zhushanwen/pi-context-engineering@0.2.0` source files and evaluates its actual
+configuration loader and factory with the embedded PiJS JavaScript filesystem
+facade. All 13 checks passed under Linux Node 24.22.1, both with POSIX paths and
+with Windows path/platform projection. The same diagnostic against the prior
+facade passed 6 checks and failed 7. Native host callbacks are fixtures in this
+diagnostic: these results do not verify Rust authorization, QuickJS execution,
+or a native Windows filesystem.
+
+An independent Linux Node reference exercise of the unmodified
+`context-mode@1.0.169` package completed initialization, session events,
+compaction state, shutdown, and a cold-process SQLite reopen with the same
+session identity. Its actual MCP server registered 11 tools and completed an
+index/search round trip while the other package's configuration remained
+readable and unchanged. This establishes the published package behavior to
+exercise in PiJS; it is not evidence of a complete PiJS lifecycle.
+
+Native regressions in `tests/extensions_fs_shim.rs` and
+`tests/e2e_ts_extension_loading.rs` cover the exact reported configuration
+layout, owner/provenance checks, missing files, policy denial, peer isolation,
+read-only access, traversal, links, Windows aliases/junctions, and coexistence
+with the existing context-mode SQLite/session reload fixture. The authoring
+environment has no configured RCH worker or native Windows runner, so those
+Rust tests have not been executed here. The unchanged DSR quality recipe
+remains the required native validation path; published-package PiJS startup,
+reload, MCP behavior, and Windows lifecycle remain unverified until that
+runner evidence is available.
+
 ---
 
 ## 7. Preflight Analysis

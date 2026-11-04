@@ -14216,6 +14216,19 @@ fn npm_application_storage_namespace(package_dir: &Path, name: &str) -> Option<P
     Some(PathBuf::from(name))
 }
 
+/// Compatibility declarations are host policy, not package-supplied paths.
+/// Consume only identities admitted by application storage discovery: stripping
+/// scopes or a `pi-` prefix would let unrelated packages claim the same config.
+fn npm_configuration_read_files(namespace: &Path) -> impl Iterator<Item = &'static Path> + '_ {
+    const FILES: &[(&str, &str)] = &[(
+        "@zhushanwen/pi-context-engineering",
+        "agent/extensions/context-engineering/config.json",
+    )];
+    FILES.iter().filter_map(move |&(package, file)| {
+        (namespace == Path::new(package)).then_some(Path::new(file))
+    })
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct JsApplicationStorageNamespaces {
     owned: Vec<(String, Vec<PathBuf>)>,
@@ -14614,6 +14627,7 @@ async fn build_js_runtime_shards(
 
     let mut prepared = Vec::with_capacity(shard_count);
     let mut application_roots_by_id = Vec::with_capacity(shard_count);
+    let mut configuration_files_by_id = Vec::with_capacity(shard_count);
     let mut denied_application_roots = BTreeSet::new();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
         let mut shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
@@ -14659,6 +14673,7 @@ async fn build_js_runtime_shards(
         // recomputing the owner's path there would leave its real files
         // unprotected when they happen to be below the shared workspace.
         let mut roots = Vec::new();
+        let mut configuration_files = Vec::new();
         if let Some((_, namespaces)) = application_namespaces
             .owned
             .iter()
@@ -14669,8 +14684,15 @@ async fn build_js_runtime_shards(
                     .iter()
                     .filter_map(|namespace| runtime.application_storage_root(namespace)),
             );
+            configuration_files.extend(
+                namespaces
+                    .iter()
+                    .flat_map(|namespace| npm_configuration_read_files(namespace))
+                    .filter_map(|file| runtime.application_storage_root(file)),
+            );
         }
         application_roots_by_id.push((extension_id.clone(), roots));
+        configuration_files_by_id.push((extension_id.clone(), configuration_files));
         // Ambiguous namespaces have no owner. Protect every realm's possible
         // base, so no peer can recover authority through workspace access.
         denied_application_roots.extend(
@@ -14679,7 +14701,40 @@ async fn build_js_runtime_shards(
                 .iter()
                 .filter_map(|namespace| runtime.application_storage_root(namespace)),
         );
+        denied_application_roots.extend(
+            application_namespaces
+                .denied
+                .iter()
+                .flat_map(|namespace| npm_configuration_read_files(namespace))
+                .filter_map(|file| runtime.application_storage_root(file))
+                .filter_map(|file| file.parent().map(Path::to_path_buf)),
+        );
         prepared.push((extension_id, extension_specs, runtime));
+    }
+
+    // Configuration cannot claim a namespace already belonging to a different
+    // extension's executable files (for example a local extension installed in
+    // the legacy configuration directory). Reject before running any factory,
+    // preserving the previous runtime on a conflicting reload.
+    for (owner, files) in &configuration_files_by_id {
+        for file in files {
+            let Some(namespace) = file.parent() else {
+                continue;
+            };
+            let checked_namespace = safe_canonicalize(namespace);
+            for (other, roots) in &extension_roots_by_id {
+                if other != owner
+                    && roots.iter().any(|root| {
+                        checked_namespace.starts_with(root) || root.starts_with(&checked_namespace)
+                    })
+                {
+                    return Err(Error::extension(format!(
+                        "Configuration namespace '{}' for '{owner}' overlaps extension '{other}'",
+                        namespace.display(),
+                    )));
+                }
+            }
+        }
     }
 
     // Establish the same complete boundaries in every realm before running
@@ -14699,6 +14754,30 @@ async fn build_js_runtime_shards(
                     }
                 } else {
                     runtime.register_foreign_persistent_storage_root(root.clone(), owner)?;
+                }
+            }
+        }
+        for (owner, files) in &configuration_files_by_id {
+            for file in files {
+                let Some(namespace) = file.parent() else {
+                    continue;
+                };
+                if owner == extension_id {
+                    if let Err(error) = runtime.add_configuration_read_file(file.clone(), owner) {
+                        tracing::warn!(
+                            extension_id = %owner,
+                            file = %file.display(),
+                            %error,
+                            "Automatic configuration access disabled because its file is unsafe or inaccessible"
+                        );
+                        runtime.register_foreign_persistent_storage_root(
+                            namespace.to_path_buf(),
+                            owner,
+                        )?;
+                    }
+                } else {
+                    runtime
+                        .register_foreign_persistent_storage_root(namespace.to_path_buf(), owner)?;
                 }
             }
         }
