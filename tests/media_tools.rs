@@ -376,6 +376,7 @@ fn test_media_tools_opt_in_activation() {
     let harness = TestHarness::new("media_tools_opt_in");
     let config = Config {
         media: Some(MediaSettings {
+            enable_media: None,
             enable_inspect_image: Some(true),
             enable_generate_image: Some(true),
             enable_tts: Some(true),
@@ -406,6 +407,85 @@ fn test_media_tools_opt_in_activation() {
     assert!(enabled_registry.get("tts").is_some());
 
     finish_case(&harness, "media_tools_opt_in");
+}
+
+#[test]
+fn test_media_aggregate_respects_load_mode_and_explicit_selection() {
+    let harness = TestHarness::new("media_aggregate_load_mode");
+    let names = ["inspect_image", "generate_image", "tts"];
+    for key in ["enable_media", "enableMedia"] {
+        for disabled in names {
+            let config: Config = serde_json::from_value(json!({
+                "media": {(key): true},
+                "tools": {"loadMode": {(disabled): "off"}}
+            }))
+            .expect("aggregate media activation with a disabled load mode");
+            let registry = ToolRegistry::new(&["read"], harness.temp_dir(), Some(&config));
+            for name in names {
+                assert_eq!(
+                    registry.get(name).is_some(),
+                    name != disabled,
+                    "{key}: {name}"
+                );
+            }
+            assert!(
+                registry
+                    .discoverable_index()
+                    .iter()
+                    .all(|(name, _)| name != disabled),
+                "disabled media must not appear through xdev discovery"
+            );
+            let explicit =
+                ToolRegistry::new(&["read", disabled], harness.temp_dir(), Some(&config));
+            assert!(explicit.get(disabled).is_some(), "explicit {disabled}");
+            assert!(explicit.get("read_media").is_none());
+        }
+    }
+    finish_case(&harness, "media_aggregate_load_mode");
+}
+
+#[test]
+fn test_media_aggregate_preserves_strict_tool_ceilings_and_explicit_opt_ins() {
+    let harness = TestHarness::new("media_aggregate_tool_ceiling");
+    for key in ["enable_media", "enableMedia"] {
+        for enabled in [false, true] {
+            let config: Config = serde_json::from_value(json!({
+                "media": {
+                    (key): enabled,
+                    "enableInspectImage": false,
+                    "enableGenerateImage": false,
+                    "enableTts": false
+                }
+            }))
+            .expect("explicit media opt-outs");
+            for selected in [&[][..], &["read"][..], &["tts"][..]] {
+                let registry = ToolRegistry::with_builtin_tool_policy(
+                    selected,
+                    harness.temp_dir(),
+                    Some(&config),
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                );
+                for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+                    assert_eq!(
+                        registry.get(name).is_some(),
+                        selected.contains(&name),
+                        "{key}={enabled}, {name}, selected={selected:?}"
+                    );
+                }
+                assert!(
+                    registry
+                        .discoverable_index()
+                        .iter()
+                        .all(|(name, _)| selected.contains(&name.as_str()))
+                );
+            }
+        }
+    }
+    finish_case(&harness, "media_aggregate_tool_ceiling");
 }
 
 #[test]

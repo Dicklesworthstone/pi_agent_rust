@@ -47,6 +47,10 @@ const MIN_VALID_WAV: &[u8] = &[
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MediaSettings {
+    /// Default activation for `inspect_image`, `generate_image`, and `tts`.
+    /// Individual switches override this after settings scopes are merged.
+    #[serde(alias = "enableMedia")]
+    pub enable_media: Option<bool>,
     #[serde(alias = "enableInspectImage")]
     pub enable_inspect_image: Option<bool>,
     #[serde(alias = "enableGenerateImage")]

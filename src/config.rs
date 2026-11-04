@@ -2293,13 +2293,15 @@ fn merge_memory(
     }
 }
 
-/// Merge media trio settings field-wise (bd-cv653.2.7).
+/// Merge media settings field-wise before resolving individual activation
+/// overrides against the aggregate default.
 fn merge_media(
     base: Option<crate::media_tools::MediaSettings>,
     other: Option<crate::media_tools::MediaSettings>,
 ) -> Option<crate::media_tools::MediaSettings> {
     match (base, other) {
         (Some(base), Some(other)) => Some(crate::media_tools::MediaSettings {
+            enable_media: other.enable_media.or(base.enable_media),
             enable_inspect_image: other.enable_inspect_image.or(base.enable_inspect_image),
             enable_generate_image: other.enable_generate_image.or(base.enable_generate_image),
             enable_tts: other.enable_tts.or(base.enable_tts),
@@ -3233,6 +3235,253 @@ mod tests {
                 expected.contains(&name),
                 "optional tool {name} in {enabled:?}"
             );
+        }
+    }
+
+    const MEDIA_TOOL_SETTINGS: [(&str, &str, &str); 3] = [
+        (
+            "inspect_image",
+            "enableInspectImage",
+            "enable_inspect_image",
+        ),
+        (
+            "generate_image",
+            "enableGenerateImage",
+            "enable_generate_image",
+        ),
+        ("tts", "enableTts", "enable_tts"),
+    ];
+
+    fn assert_media_tool_selection(config: &Config, cwd: &std::path::Path, expected: &[&str]) {
+        let registry = crate::tools::ToolRegistry::new(&["read"], cwd, Some(config));
+        for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+            assert_eq!(
+                registry.get(name).is_some(),
+                expected.contains(&name),
+                "media tool {name}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_aggregate_aliases_and_individual_switches_select_tools() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for aggregate_key in ["enable_media", "enableMedia"] {
+            for value in [json!(true), json!(false), Value::Null] {
+                let content = json!({"media": {(aggregate_key): value}}).to_string();
+                assert!(unrecognised_setting_keys(&content).is_empty());
+                write_file(&path, &content);
+                let config = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("load aggregate media activation");
+                assert_media_tool_selection(
+                    &config,
+                    &cwd,
+                    if value == json!(true) { &names } else { &[] },
+                );
+            }
+            for (name, camel, snake) in MEDIA_TOOL_SETTINGS {
+                for individual_key in [camel, snake] {
+                    for aggregate in [false, true] {
+                        let individual = !aggregate;
+                        let content = json!({"media": {
+                            (aggregate_key): aggregate,
+                            (individual_key): individual
+                        }})
+                        .to_string();
+                        assert!(unrecognised_setting_keys(&content).is_empty());
+                        write_file(&path, &content);
+                        let config = Config::load_with_roots(None, &global_dir, &cwd)
+                            .expect("load individual media override");
+                        let expected: Vec<&str> = names
+                            .iter()
+                            .copied()
+                            .filter(|candidate| (*candidate == name) == individual)
+                            .collect();
+                        assert_media_tool_selection(&config, &cwd, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_aggregate_merges_across_aliases_and_respects_project_trust() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for global_key in ["enable_media", "enableMedia"] {
+            for project_key in ["enable_media", "enableMedia"] {
+                for global_enabled in [false, true] {
+                    write_file(
+                        &global_path,
+                        &json!({"media": {(global_key): global_enabled}}).to_string(),
+                    );
+                    write_file(
+                        &project_path,
+                        &json!({"media": {(project_key): !global_enabled}}).to_string(),
+                    );
+                    for trusted in [false, true] {
+                        let config = Config::load_with_roots_and_project_trust(
+                            None,
+                            &global_dir,
+                            &cwd,
+                            trusted,
+                        )
+                        .expect("load media settings with project trust");
+                        let enabled = global_enabled != trusted;
+                        assert_eq!(
+                            config.media.as_ref().expect("media settings").enable_media,
+                            Some(enabled)
+                        );
+                        assert_media_tool_selection(
+                            &config,
+                            &cwd,
+                            if enabled { &names } else { &[] },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_individual_choices_survive_aggregate_overrides_in_another_scope() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for (name, camel, snake) in MEDIA_TOOL_SETTINGS {
+            for (global_key, project_key) in [(camel, snake), (snake, camel)] {
+                for individual in [false, true] {
+                    write_file(
+                        &global_path,
+                        &json!({"media": {
+                            (global_key): individual,
+                            "enableMedia": individual,
+                            "visionProvider": "gemini"
+                        }})
+                        .to_string(),
+                    );
+                    write_file(
+                        &project_path,
+                        &json!({"media": {"enable_media": !individual}}).to_string(),
+                    );
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("inherit explicit individual choice");
+                    let expected: Vec<&str> = names
+                        .iter()
+                        .copied()
+                        .filter(|candidate| (*candidate == name) == individual)
+                        .collect();
+                    assert_media_tool_selection(&config, &cwd, &expected);
+                    assert_eq!(
+                        config
+                            .media
+                            .as_ref()
+                            .and_then(|m| m.vision_provider.as_deref()),
+                        Some("gemini")
+                    );
+
+                    write_file(
+                        &project_path,
+                        &json!({"media": {
+                            "enable_media": !individual,
+                            (project_key): !individual
+                        }})
+                        .to_string(),
+                    );
+                    let overridden = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("project overrides the same individual field");
+                    assert_media_tool_selection(
+                        &overridden,
+                        &cwd,
+                        if individual { &[] } else { &names },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_unset_fields_inherit_without_expanding_the_aggregate() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"media":{"enableMedia":true,"enableTts":false,"enableReadMedia":true,"ttsVoice":"alloy"}}"#,
+        );
+        for project in [
+            r"{}",
+            r#"{"media":{}}"#,
+            r#"{"media":{"enable_media":null,"enable_tts":null,"enable_read_media":null,"tts_voice":null}}"#,
+        ] {
+            write_file(&cwd.join(".pi/settings.json"), project);
+            let config = Config::load_with_roots(None, &global_dir, &cwd)
+                .expect("inherit unset media fields");
+            let media = config.media.as_ref().expect("merged media settings");
+            assert_eq!(media.enable_media, Some(true));
+            assert_eq!(media.enable_inspect_image, None);
+            assert_eq!(media.enable_generate_image, None);
+            assert_eq!(media.enable_tts, Some(false));
+            assert_eq!(media.enable_read_media, Some(true));
+            assert_eq!(media.tts_voice.as_deref(), Some("alloy"));
+            assert_media_tool_selection(
+                &config,
+                &cwd,
+                &["inspect_image", "generate_image", "read_media"],
+            );
+        }
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"media":{"enable_media":false}}"#,
+        );
+        let config = Config::load_with_roots(None, &global_dir, &cwd)
+            .expect("disable aggregate independently of read_media");
+        assert_media_tool_selection(&config, &cwd, &["read_media"]);
+    }
+
+    #[test]
+    fn invalid_media_aggregate_values_and_duplicate_aliases_name_the_settings_file() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        for key in ["enable_media", "enableMedia"] {
+            for value in [json!("true"), json!(1), json!([]), json!({})] {
+                write_file(&path, &json!({"media": {(key): value}}).to_string());
+                let error = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect_err("aggregate activation must be a JSON boolean");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(path.to_str().expect("UTF-8 path"))
+                );
+                assert!(error.to_string().contains("boolean"), "{error}");
+            }
+        }
+        for content in [
+            r#"{"media":{"enable_media":true,"enableMedia":true}}"#,
+            r#"{"media":{"enableMedia":false,"enable_media":true}}"#,
+        ] {
+            write_file(&path, content);
+            let error = Config::load_with_roots(None, &global_dir, &cwd)
+                .expect_err("duplicate spellings must not silently pick a value");
+            assert!(
+                error
+                    .to_string()
+                    .contains(path.to_str().expect("UTF-8 path"))
+            );
+            assert!(error.to_string().contains("duplicate field"), "{error}");
         }
     }
 

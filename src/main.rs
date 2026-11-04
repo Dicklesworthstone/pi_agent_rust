@@ -12415,6 +12415,93 @@ mod tests {
     }
 
     #[test]
+    fn supported_media_activation_settings_load_without_warnings() {
+        for key in ["enable_media", "enableMedia"] {
+            for enabled in [false, true] {
+                let temp = TempDir::new().expect("temporary settings roots");
+                let global_dir = temp.path().join("global");
+                let cwd = temp.path().join("project");
+                std::fs::create_dir_all(&global_dir).expect("global settings directory");
+                std::fs::create_dir_all(&cwd).expect("project directory");
+                std::fs::write(
+                    global_dir.join("settings.json"),
+                    json!({"media": {(key): enabled}}).to_string(),
+                )
+                .expect("write media activation setting");
+
+                let seen = logged_under(default_log_filter_for(None), || {
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("load supported media activation setting");
+                    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                    for name in ["inspect_image", "generate_image", "tts"] {
+                        assert_eq!(
+                            tools.get(name).is_some(),
+                            enabled,
+                            "{key}={enabled} must select {name}"
+                        );
+                    }
+                    assert!(
+                        tools.get("read_media").is_none(),
+                        "aggregate media activation must leave read_media independent"
+                    );
+                });
+
+                assert!(
+                    seen.is_empty(),
+                    "supported setting {key}={enabled} emitted a warning: {seen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_media_settings_name_the_file_and_key_without_activating_tools() {
+        for project_setting in [false, true] {
+            let temp = TempDir::new().expect("temporary settings roots");
+            let global_dir = temp.path().join("global");
+            let cwd = temp.path().join("project");
+            std::fs::create_dir_all(&global_dir).expect("global settings directory");
+            std::fs::create_dir_all(cwd.join(".pi")).expect("project settings directory");
+            let settings_path = if project_setting {
+                cwd.join(".pi/settings.json")
+            } else {
+                global_dir.join("settings.json")
+            };
+            std::fs::write(
+                &settings_path,
+                r#"{"media":{"enableMedai":true,"output_dir":"generated"}}"#,
+            )
+            .expect("write unsupported media settings");
+
+            let seen = logged_under(default_log_filter_for(None), || {
+                let config = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("unknown settings warn without preventing startup");
+                let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+                    assert!(
+                        tools.get(name).is_none(),
+                        "ignored settings must not activate {name}"
+                    );
+                }
+            });
+
+            for key in ["media.enableMedai", "media.output_dir"] {
+                assert!(seen.contains(key), "missing diagnostic for {key}: {seen:?}");
+            }
+            let file = settings_path.display().to_string();
+            let quoted_file = format!("{file:?}");
+            assert!(
+                seen.contains(file.as_str()) || seen.contains(quoted_file.as_str()),
+                "diagnostic must identify the settings file: {seen:?}"
+            );
+            assert!(
+                seen.contains("Unrecognised setting; it is being ignored"),
+                "diagnostic must explain that activation was ignored: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rust_log_replaces_the_default_filter_wholesale() {
         let silenced = logged_under(default_log_filter_for(Some("off")), || {
             tracing::warn!(target: pi::config::USER_DIAGNOSTIC_TARGET, "misspelled key");

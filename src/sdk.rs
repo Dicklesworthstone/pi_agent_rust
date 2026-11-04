@@ -7288,6 +7288,196 @@ mod tests {
         }
     }
 
+    fn assert_session_media_tools(handle: &AgentSessionHandle, expected: &[&str]) {
+        let registry = handle.session().agent.shared_tools().snapshot();
+        let discoverable = registry.discoverable_index();
+        for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+            let enabled = expected.contains(&name);
+            assert_eq!(
+                handle.has_tool(name),
+                enabled,
+                "{name}, expected={expected:?}"
+            );
+            if !enabled {
+                assert!(
+                    !discoverable.iter().any(|(candidate, _)| candidate == name),
+                    "disabled {name} must not enter discovery"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_media_aggregate_aliases_respect_global_project_merge_and_trust() {
+        for (global_key, project_key) in [
+            ("enable_media", "enableMedia"),
+            ("enableMedia", "enable_media"),
+        ] {
+            for global_enabled in [false, true] {
+                for trusted in [false, true] {
+                    let global = serde_json::json!({
+                        "media": { (global_key): global_enabled }
+                    })
+                    .to_string();
+                    let project = serde_json::json!({
+                        "media": { (project_key): !global_enabled }
+                    })
+                    .to_string();
+                    let (_tmp, options) = guarded_settings_fixture(trusted, &global, &project);
+                    let handle = run_async(create_agent_session(options))
+                        .expect("start session with admitted media settings");
+                    let enabled = if trusted {
+                        !global_enabled
+                    } else {
+                        global_enabled
+                    };
+                    let expected: &[&str] = if enabled {
+                        &["inspect_image", "generate_image", "tts"]
+                    } else {
+                        &[]
+                    };
+                    assert_session_media_tools(&handle, expected);
+                    assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_media_individual_overrides_are_applied_after_layer_merging() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                r#"{"media":{"enable_media":true,"enable_tts":false}}"#,
+                r#"{"media":{"enableMedia":true,"enableInspectImage":false}}"#,
+                &["generate_image"],
+            ),
+            (
+                r#"{"media":{"enableMedia":true,"enableGenerateImage":false}}"#,
+                r#"{"media":{"enable_media":true,"enable_tts":false}}"#,
+                &["inspect_image"],
+            ),
+            (
+                r#"{"media":{"enableMedia":false,"enableInspectImage":true}}"#,
+                r#"{"media":{"enable_media":false,"enable_generate_image":true}}"#,
+                &["inspect_image", "generate_image"],
+            ),
+            (
+                r#"{"media":{"enable_media":true,"enable_tts":false}}"#,
+                r#"{"media":{"enableTts":true,"enableReadMedia":true}}"#,
+                &["inspect_image", "generate_image", "tts", "read_media"],
+            ),
+        ];
+        for &(global, project, expected) in cases {
+            let (_tmp, options) = guarded_settings_fixture(true, global, project);
+            let handle = run_async(create_agent_session(options))
+                .expect("start session with merged media settings");
+            assert_session_media_tools(&handle, expected);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_media_aggregate_preserves_explicit_and_strict_tool_selections() {
+        let cases: &[(bool, Option<&[&str]>, &[&str])] = &[
+            (
+                false,
+                Some(&["read"]),
+                &["inspect_image", "generate_image", "tts"],
+            ),
+            (true, Some(&["read"]), &[]),
+            (true, Some(&["read", "inspect_image"]), &["inspect_image"]),
+            (true, None, &[]),
+        ];
+        for &(strict, selected, expected) in cases {
+            let (_tmp, mut options) =
+                guarded_settings_fixture(true, r#"{"media":{"enableMedia":true}}"#, "{}");
+            options.tool_factory =
+                strict.then(|| Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>);
+            options.enabled_tools =
+                selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            let handle = run_async(create_agent_session(options))
+                .expect("start session with a selected tool list");
+            assert_session_media_tools(&handle, expected);
+            if let Some(selected) = selected {
+                for name in selected {
+                    assert!(handle.has_tool(name), "explicit {name}");
+                }
+            }
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_media_aggregate_cannot_restore_disabled_builtins() {
+        for strict in [false, true] {
+            for selected in [Vec::new(), vec![String::new()], vec![" , ".to_string()]] {
+                let (_tmp, mut options) = guarded_settings_fixture(
+                    true,
+                    r#"{"media":{"enable_media":true,"enable_read_media":true}}"#,
+                    "{}",
+                );
+                options.tool_factory =
+                    strict.then(|| Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>);
+                options.enabled_tools = Some(selected);
+                let handle = run_async(create_agent_session(options))
+                    .expect("start session with builtins disabled");
+                assert_session_media_tools(&handle, &[]);
+                let registry = handle.session().agent.shared_tools().snapshot();
+                assert!(registry.tools().is_empty());
+                assert!(registry.discoverable_index().is_empty());
+                assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_media_load_modes_and_explicit_names_keep_their_precedence() {
+        let cases: &[(&str, Option<&[&str]>, &[&str])] = &[
+            (
+                r#"{
+                    "media":{"enableMedia":true},
+                    "tools":{"loadMode":{
+                        "inspect_image":"off","generate_image":"off","tts":"off"
+                    }}
+                }"#,
+                None,
+                &[],
+            ),
+            (
+                r#"{
+                    "media":{"enable_media":true},
+                    "tools":{"load_mode":{
+                        "inspect_image":"off","generate_image":"off","tts":"off"
+                    }}
+                }"#,
+                Some(&["tts"]),
+                &["tts"],
+            ),
+            (
+                r#"{
+                    "media":{
+                        "enableMedia":false,"enableInspectImage":false,
+                        "enableGenerateImage":false,"enableTts":false
+                    },
+                    "tools":{"loadMode":{
+                        "inspect_image":"off","generate_image":"off","tts":"off"
+                    }}
+                }"#,
+                Some(&["inspect_image", "generate_image", "tts"]),
+                &["inspect_image", "generate_image", "tts"],
+            ),
+        ];
+        for &(global, selected, expected) in cases {
+            let (_tmp, mut options) = guarded_settings_fixture(true, global, "{}");
+            options.enabled_tools =
+                selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            let handle = run_async(create_agent_session(options))
+                .expect("start session with media exposure settings");
+            assert_session_media_tools(&handle, expected);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn sdk_builtin_ceiling_survives_settings_driven_registry_construction() {
@@ -7396,13 +7586,6 @@ mod tests {
     }
 
     fn guarded_optional_tool_fixture(trusted: bool) -> (tempfile::TempDir, SessionOptions) {
-        use crate::workspace_trust::{TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish};
-
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        let global_dir = tmp.path().join("global");
-        std::fs::create_dir_all(cwd.join(".pi/extensions")).expect("project resources");
-        std::fs::create_dir_all(&global_dir).expect("global directory");
         let settings = |enabled| {
             serde_json::json!({
                 "tools": {
@@ -7414,10 +7597,25 @@ mod tests {
             })
             .to_string()
         };
-        std::fs::write(global_dir.join("settings.json"), settings(false))
-            .expect("global optional tools disabled");
-        std::fs::write(cwd.join(".pi/settings.json"), settings(true))
-            .expect("project optional tools enabled");
+        guarded_settings_fixture(trusted, &settings(false), &settings(true))
+    }
+
+    fn guarded_settings_fixture(
+        trusted: bool,
+        global_settings: &str,
+        project_settings: &str,
+    ) -> (tempfile::TempDir, SessionOptions) {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi/extensions")).expect("project resources");
+        std::fs::create_dir_all(&global_dir).expect("global directory");
+        std::fs::write(global_dir.join("settings.json"), global_settings).expect("global settings");
+        std::fs::write(cwd.join(".pi/settings.json"), project_settings).expect("project settings");
         std::fs::write(
             cwd.join(".pi/extensions/trust_guard.js"),
             "export default function init() {}\n",

@@ -6210,9 +6210,14 @@ impl ToolRegistry {
         }
 
         // Media tools (bd-cv653.2.7): opt-in via config.media
+        // Preserve explicit per-tool choices, including false, before using
+        // the aggregate default. read_media has a separate opt-in.
         if let Some(media_cfg) = config.and_then(|c| c.media.as_ref()) {
             if automatic_allowed("inspect_image")
-                && media_cfg.enable_inspect_image.unwrap_or(false)
+                && media_cfg
+                    .enable_inspect_image
+                    .or(media_cfg.enable_media)
+                    .unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "inspect_image")
             {
                 tools.push(Box::new(
@@ -6232,7 +6237,10 @@ impl ToolRegistry {
                 ));
             }
             if automatic_allowed("generate_image")
-                && media_cfg.enable_generate_image.unwrap_or(false)
+                && media_cfg
+                    .enable_generate_image
+                    .or(media_cfg.enable_media)
+                    .unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "generate_image")
             {
                 tools.push(Box::new(
@@ -6244,7 +6252,10 @@ impl ToolRegistry {
                 ));
             }
             if automatic_allowed("tts")
-                && media_cfg.enable_tts.unwrap_or(false)
+                && media_cfg
+                    .enable_tts
+                    .or(media_cfg.enable_media)
+                    .unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "tts")
             {
                 tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
