@@ -3810,6 +3810,28 @@ fn e2e_cli_doctor_invalid_only_value_is_usage_error() {
     );
 }
 
+/// gh #182: `pi web` printed "server listening", a client URL and a pairing
+/// token, then exited with nothing serving the port.
+#[test]
+fn e2e_cli_web_fails_instead_of_reporting_a_server() {
+    let harness = CliTestHarness::new("e2e_cli_web_fails_instead_of_reporting_a_server");
+    let result = harness.run(&["web", "--port", "18080"]);
+
+    assert_ne!(result.exit_code, 0, "stdout: {}", result.stdout);
+    for claim in ["listening", "Pairing token", "Web client interface"] {
+        assert!(
+            !result.stdout.contains(claim),
+            "pi web must not claim a server: {}",
+            result.stdout
+        );
+    }
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        "`pi web` is not available",
+    );
+}
+
 #[test]
 fn e2e_cli_theme_flag_valid_file() {
     let harness = CliTestHarness::new("e2e_cli_theme_flag_valid_file");

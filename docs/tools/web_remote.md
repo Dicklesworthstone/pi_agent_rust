@@ -1,5 +1,11 @@
 # Web-Remote Access: `pi web`
 
+> **Status: not available.** This build has no web remote server. `pi web`
+> exits with an error and nothing listens on the requested port. Earlier
+> releases printed a "listening" line, a client URL and a pairing token before
+> exiting, without serving anything. The design below describes planned
+> behavior, not current behavior.
+
 > **Feature:** WASM Web Remote & QR Console Pairing  
 > **Bead IDs:** `bd-cv653.10.1`, `bd-cv653.10.2`, `bd-cv653.10.3`  
 > **Module:** `src/web_remote.rs`

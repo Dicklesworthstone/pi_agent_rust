@@ -3991,33 +3991,15 @@ async fn handle_subcommand(
                 println!("{}", pi::usage::render_usage_text(&rows));
             }
         }
-        cli::Commands::Web {
-            port,
-            bind,
-            view_only,
-            max_viewers,
-        } => {
-            let bind_mode: pi::web_remote::BindMode = bind
-                .parse()
-                .map_err(|e| pi::Error::Config(format!("invalid bind mode '{bind}': {e}")))?;
-            let settings = pi::web_remote::WebRemoteSettings {
-                port,
-                bind_mode,
-                view_only,
-                max_viewers,
-                require_auth_token: true,
-                enable_audit_log: true,
-            };
-            let manager = pi::web_remote::WebRemoteManager::new(settings);
-            let token = manager.issue_token(
-                format!("tok-{}", uuid::Uuid::new_v4().simple()),
-                pi::web_remote::TokenKind::Steer,
+        cli::Commands::Web { .. } => {
+            // There is no web remote server behind this command yet. It used
+            // to print a "listening" line, a client URL and a pairing token,
+            // then exit with nothing serving that port (gh #182). Say so and
+            // fail instead of reporting a server that does not exist.
+            bail!(
+                "`pi web` is not available: this build has no web remote server, \
+                 so nothing would listen on the requested port"
             );
-            println!(
-                "Pi Agent Web Remote server listening on {bind}:{port} (view_only={view_only})"
-            );
-            println!("Web client interface: http://127.0.0.1:{port}");
-            println!("Pairing token: {}", token.token);
         }
         cli::Commands::Gallery { format } => {
             let matrix = pi::gallery::GalleryMatrix::new();

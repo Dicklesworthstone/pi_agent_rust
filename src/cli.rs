@@ -3304,7 +3304,7 @@ pub enum Commands {
         refresh: bool,
     },
 
-    /// Serve the agent session over a Web interface via WebSocket frame diffs (bd-cv653.10.1)
+    /// Web remote access (not available yet: this build has no web remote server)
     Web {
         /// Port to bind web server (default: 8080)
         #[arg(long, default_value_t = 8080)]
