@@ -71,7 +71,7 @@ Custom SDK factories must create a fresh tool registry for each AgentSession.
 Shallow registry copies share native tool instances; assigning that scope to
 two sessions refuses implicit media authentication instead of exchanging their
 saved credentials. A custom wrapper around a native adapter should forward
-`Tool::bind_media_auth_scope` to the wrapped tool.
+`Tool::bind_media_auth_scope` and `Tool::bind_cost_scope` to the wrapped tool.
 
 `with_client` retains the caller's
 HTTP/VCR configuration. The endpoints can be overridden using `with_base_url`
@@ -94,6 +94,23 @@ arguments still take precedence, followed by these configured defaults and then
 the environment variables documented above. Invalid configured selections fail
 through the same adapter validation as explicit arguments instead of being
 silently ignored.
+
+### Spend admission
+
+Native inspection, generation, and speech requests consult the session's shared
+cost budget before credential helpers run and again immediately before HTTP
+dispatch. Requests are refused when known spend reaches `--max-cost` /
+`session.maxCost`, or when the account is quarantined because its spend cannot
+be established. An explicit media API key does not bypass this check. Each
+invocation retains the account it started with; a retained tool uses the
+current account on its next invocation.
+
+The adapters do not yet add their own inspection, image, or speech charges to
+the session ledger. They enforce admission against spend already recorded by
+the rest of the session, so `--warn-cost` and `--max-cost` totals do not include
+media charges and do not cap cumulative media spending. No media USD price is
+inferred from token counts or image/audio sizes. An admitted request is never
+automatically replayed.
 
 ## Image inspection
 

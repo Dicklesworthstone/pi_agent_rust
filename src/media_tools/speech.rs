@@ -76,6 +76,10 @@ impl TtsTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for TtsTool {
+    fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.transport.bind_cost_scope(scope);
+    }
+
     fn bind_media_auth_scope(&mut self, scope: super::MediaAuthScope) {
         self.transport.bind_auth_scope(scope);
     }

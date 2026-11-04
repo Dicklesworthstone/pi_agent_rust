@@ -16,11 +16,16 @@ pub(super) struct Transport {
     client: Client,
     base_url: Option<String>,
     auth: super::MediaAuthScope,
+    cost_scope: crate::cost::CostScope,
 }
 
 impl Transport {
     pub(super) fn bind_auth_scope(&mut self, scope: super::MediaAuthScope) {
         self.auth = scope;
+    }
+
+    pub(super) fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.cost_scope = scope;
     }
 
     pub(super) fn with_client(mut self, client: Client) -> Self {
@@ -42,6 +47,12 @@ impl Transport {
     ) -> Result<Api<'_>> {
         let owner = AgentCx::for_current_or_request();
         check_owner(tool, &owner)?;
+        // Capture the invocation's account before resolving a command-backed
+        // credential. A later session switch must not move this call's authority.
+        let cost_budget = self.cost_scope.current();
+        if let Some(budget) = &cost_budget {
+            budget.admit()?;
+        }
         let (default_url, env_name) = match provider {
             "openai" => ("https://api.openai.com/v1/", "PI_MEDIA_OPENAI_BASE_URL"),
             "anthropic" => (
@@ -94,6 +105,7 @@ impl Transport {
             provider,
             key,
             track_rate_limits,
+            cost_budget,
             base,
             owner,
             timeout,
@@ -107,6 +119,7 @@ pub(super) struct Api<'a> {
     provider: &'static str,
     key: String,
     track_rate_limits: bool,
+    cost_budget: Option<crate::cost::CostBudget>,
     base: Url,
     pub(super) owner: AgentCx,
     timeout: Duration,
@@ -154,7 +167,6 @@ impl Api<'_> {
         }
         let operation = async {
             check_owner(self.tool, &self.owner)?;
-            let started_at = std::time::Instant::now();
             let client = self.owner.http().bind(&self.transport.client);
             let request = client
                 .post(url.as_str())
@@ -168,6 +180,12 @@ impl Api<'_> {
                 _ => request.try_header("Authorization", format!("Bearer {}", self.key)),
             }
             .map_err(|_| Error::tool(self.tool, "invalid media authentication header"))?;
+            // Sibling work may exhaust or quarantine the captured account
+            // while credentials and input payloads are being prepared.
+            if let Some(budget) = &self.cost_budget {
+                budget.admit()?;
+            }
+            let started_at = std::time::Instant::now();
             let response = request.send().await.map_err(|error| {
                 Error::tool(
                     self.tool,
@@ -639,6 +657,221 @@ pub(super) mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_media_tools_obey_the_live_registry_spend_scope() {
+        use crate::cost::CostBudget;
+        use crate::media_tools::{GenerateImageTool, InspectImageTool, TtsTool};
+        use crate::tools::{Tool, ToolRegistry};
+        use base64::Engine as _;
+
+        for name in ["inspect_image", "generate_image", "tts"] {
+            let directory = tempfile::tempdir().expect("media workspace");
+            let png = super::super::MIN_VALID_PNG;
+            std::fs::write(directory.path().join("input.png"), png).unwrap();
+            let (mime, response, arguments) = match name {
+                "inspect_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({"choices":[{
+                        "finish_reason":"stop", "message":{"content":"A fixture image."}
+                    }]}))
+                    .unwrap(),
+                    serde_json::json!({"path":"input.png", "provider":"openai",
+                        "model":"gpt-4.1-mini", "timeout_ms":2000}),
+                ),
+                "generate_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({"data":[{
+                        "b64_json":base64::engine::general_purpose::STANDARD.encode(png)
+                    }]}))
+                    .unwrap(),
+                    serde_json::json!({"prompt":"Draw a square", "provider":"openai",
+                        "model":"gpt-image-1.5", "output_path":"output.png", "timeout_ms":2000}),
+                ),
+                _ => {
+                    let mut audio = super::super::MIN_VALID_WAV.to_vec();
+                    audio[4..8].copy_from_slice(&40_u32.to_le_bytes());
+                    audio[40..44].copy_from_slice(&4_u32.to_le_bytes());
+                    audio.extend_from_slice(&[0x34, 0x12, 0xcd, 0xab]);
+                    (
+                        "audio/wav",
+                        audio,
+                        serde_json::json!({"text":"Hello", "provider":"openai",
+                            "voice":"alloy", "output_path":"output.wav", "timeout_ms":2000}),
+                    )
+                }
+            };
+            let (endpoint, worker) = peer(200, mime, response);
+            let native: Box<dyn Tool> = match name {
+                "inspect_image" => Box::new(
+                    InspectImageTool::new(directory.path())
+                        .with_mock(false)
+                        .with_api_key(Some("media-cost-key".to_string()))
+                        .with_base_url(endpoint),
+                ),
+                "generate_image" => Box::new(
+                    GenerateImageTool::new(directory.path())
+                        .with_mock(false)
+                        .with_api_key(Some("media-cost-key".to_string()))
+                        .with_base_url(endpoint),
+                ),
+                _ => Box::new(
+                    TtsTool::new(directory.path())
+                        .with_mock(false)
+                        .with_api_key(Some("media-cost-key".to_string()))
+                        .with_base_url(endpoint),
+                ),
+            };
+            let registry = ToolRegistry::from_tools(vec![native]);
+            let tool = registry.get(name).expect("native adapter");
+            let scope = registry.cost_scope();
+            scope.set(Some(CostBudget::new(None, Some(1.0), 1.0).unwrap()));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let refused = runtime.block_on(tool.execute("refused", arguments.clone(), None));
+            assert!(
+                matches!(refused, Err(Error::CostCap { .. })),
+                "{name}: {refused:?}"
+            );
+
+            let available = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            scope.set(Some(available.clone()));
+            let output = runtime
+                .block_on(tool.execute("admitted", arguments.clone(), None))
+                .expect("the retained native tool must observe the replacement scope");
+            assert!(!output.is_error);
+            assert!(
+                available.spent().abs() < f64::EPSILON,
+                "media responses must not invent USD charges"
+            );
+            available.record(1.0).unwrap();
+            let refused = runtime.block_on(tool.execute("spent", arguments, None));
+            assert!(
+                matches!(refused, Err(Error::CostCap { .. })),
+                "{name}: {refused:?}"
+            );
+            let captured = worker.join().expect("one admitted native request");
+            assert!(captured.headers.contains("Bearer media-cost-key"));
+        }
+    }
+
+    #[test]
+    fn media_request_rechecks_its_captured_account_without_migrating_to_a_new_scope() {
+        use crate::cost::{CostBudget, CostScope};
+
+        for quarantine in [false, true] {
+            let original = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let replacement = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let scope = CostScope::default();
+            scope.set(Some(original.clone()));
+            let (endpoint, listener) = peer_listener();
+            let mut transport = Transport::default().with_base_url(endpoint);
+            transport.bind_cost_scope(scope.clone());
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let api = transport
+                    .api(
+                        "tts",
+                        "openai",
+                        Some("captured-key"),
+                        Duration::from_secs(2),
+                    )
+                    .expect("initial account permits preparation");
+                scope.set(Some(replacement));
+                if quarantine {
+                    assert!(original.record(f64::NAN).is_err());
+                } else {
+                    original.record(1.0).unwrap();
+                }
+                let error = api
+                    .post("audio/speech", &serde_json::json!({}), 1024)
+                    .await
+                    .err()
+                    .expect("captured account must be checked immediately before HTTP");
+                if quarantine {
+                    assert!(matches!(error, Error::Session(ref message)
+                        if message.contains("model cost accounting unavailable")));
+                } else {
+                    assert!(matches!(error, Error::CostCap { .. }));
+                }
+                assert!(matches!(listener.accept(), Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock));
+
+                let api = transport
+                    .api(
+                        "tts",
+                        "openai",
+                        Some("replacement-key"),
+                        Duration::from_secs(2),
+                    )
+                    .expect("next invocation captures the healthy replacement account");
+                scope.set(Some(CostBudget::new(None, Some(1.0), 1.0).unwrap()));
+                let worker =
+                    thread::spawn(move || exchange(&listener, 200, "application/json", b"{}"));
+                let response = api
+                    .post("audio/speech", &serde_json::json!({}), 1024)
+                    .await
+                    .expect("a later scope change must not migrate an admitted invocation");
+                assert_eq!(response.bytes, b"{}");
+                let captured = worker.join().unwrap();
+                assert!(captured.headers.contains("Bearer replacement-key"));
+                assert!(matches!(
+                    transport.api("tts", "openai", Some("next-key"), Duration::from_secs(2)),
+                    Err(Error::CostCap { .. })
+                ));
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_and_quarantined_media_budgets_refuse_before_stored_key_commands() {
+        use crate::auth::{AuthCredential, AuthStorage};
+        use crate::cost::{CostBudget, CostScope};
+
+        let directory = tempfile::tempdir().expect("command workspace");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "$CMD:printf invoked > credential-invoked; printf command-key".to_string(),
+            },
+        );
+        auth.set_command_working_directory(directory.path())
+            .unwrap();
+        let auth_scope = super::super::MediaAuthScope::default();
+        auth_scope.set(&std::sync::Arc::new(()), auth);
+        let scope = CostScope::default();
+        let mut transport =
+            Transport::default().with_base_url("http://127.0.0.1:1/v1/".to_string());
+        transport.bind_auth_scope(auth_scope);
+        transport.bind_cost_scope(scope.clone());
+        let owner = AgentCx::for_testing_with_io();
+        futures::executor::block_on(owner.with_current(async {
+            for quarantine in [false, true] {
+                let budget = CostBudget::new(None, Some(1.0), 1.0).unwrap();
+                if quarantine {
+                    assert!(budget.record(f64::NAN).is_err());
+                }
+                scope.set(Some(budget));
+                let error = transport
+                    .api("tts", "openai", None, Duration::from_secs(1))
+                    .err()
+                    .expect("refuse before stored credential resolution");
+                if quarantine {
+                    assert!(matches!(error, Error::Session(ref message)
+                        if message.contains("model cost accounting unavailable")));
+                } else {
+                    assert!(matches!(error, Error::CostCap { .. }));
+                }
+                assert!(!directory.path().join("credential-invoked").exists());
+            }
+        }));
     }
 
     #[test]
