@@ -5,8 +5,7 @@
 
 use super::{
     EntryRole, PiFtuiModel, PiMsg, Sender, TurnAbortSlot, TurnControlSlot, UiCommand,
-    agent_event_to_pi_msgs, run_controlled_turn_with_pending, send_conversation_reset,
-    strip_command,
+    run_controlled_turn_with_pending, send_conversation_reset, strip_command,
 };
 use crate::agent::AbortHandle;
 use crate::session_control::{PendingInput, SessionControlHandle, YieldBarrierId};
@@ -252,11 +251,11 @@ pub(super) async fn run(
     // separately until compaction's transaction has fully settled.
     let _ = agent_tx.send(PiMsg::AgentStart);
     let tx = agent_tx.clone();
-    let on_event = move |event| {
-        for message in agent_event_to_pi_msgs(&event) {
+    let progress =
+        super::tool_progress::Bridge::new(Some(request.owner_session_id.clone()), move |message| {
             let _ = tx.send(message);
-        }
-    };
+        });
+    let on_event = progress.callback();
     let result = if request.shake {
         handle
             .shake_with_abort(request.abort.signal(), on_event)
@@ -270,6 +269,7 @@ pub(super) async fn run(
             )
             .await
     };
+    drop(progress);
     match result {
         Ok(true) => {
             send_conversation_reset(handle, agent_tx, "Queued compaction complete").await;

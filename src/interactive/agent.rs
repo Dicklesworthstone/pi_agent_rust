@@ -1037,7 +1037,7 @@ impl PiApp {
             | PiMsg::UserInputSubmitted { .. }
             | PiMsg::MessagePicker { .. } => {}
             #[cfg(feature = "ftui")]
-            PiMsg::Settings { .. } => {}
+            PiMsg::Settings { .. } | PiMsg::FtuiToolProgress(_) => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();

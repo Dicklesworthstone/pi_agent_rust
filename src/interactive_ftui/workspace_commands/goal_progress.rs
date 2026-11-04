@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent::AgentEvent;
 use crate::goal::GoalControl;
 use crate::interactive::PiMsg;
+use crate::interactive_ftui::tool_progress::{Bridge, Event as ProgressEvent};
 use crate::sdk::{EventListeners, SubscriptionId};
 
 #[derive(Default)]
@@ -27,6 +28,9 @@ struct DisplayState {
 struct Display {
     sender: Output,
     state: Mutex<DisplayState>,
+    /// The session subscription cannot attribute a late update to one native
+    /// prompt. Keep one scope and its seen-ID history for this goal invocation.
+    progress: Mutex<Option<Bridge>>,
 }
 
 enum Output {
@@ -64,22 +68,83 @@ impl Display {
         }
     }
 
-    fn observe(&self, event: &AgentEvent) {
+    fn observe(self: &Arc<Self>, event: &AgentEvent) {
+        match event {
+            AgentEvent::AgentStart { session_id } => {
+                let mut progress = self
+                    .progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let closed = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .closed;
+                if !closed && progress.is_none() {
+                    let observed = Arc::downgrade(self);
+                    *progress = Some(Bridge::new(Some(session_id.to_string()), move |message| {
+                        if let Some(display) = observed.upgrade() {
+                            // Bridge serializes sends under its own mutex. Stage
+                            // output loss here; native pause runs after observe
+                            // releases both the bridge and progress locks.
+                            display.stage_messages(vec![message]);
+                        }
+                    }));
+                }
+                drop(progress);
+                if closed {
+                    self.pause_after_delivery_failure();
+                    return;
+                }
+            }
+            AgentEvent::ToolExecutionStart { .. }
+            | AgentEvent::ToolExecutionUpdate { .. }
+            | AgentEvent::ToolExecutionEnd { .. } => {
+                {
+                    let progress = self
+                        .progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(progress) = progress.as_ref() {
+                        progress.observe(event);
+                    }
+                }
+                self.pause_after_delivery_failure();
+                return;
+            }
+            _ => {}
+        }
+        // The goal owns the surrounding lifecycle: its native prompt ends
+        // remain deferred until the command has settled its journal/report.
         self.messages(crate::interactive_ftui::agent_event_to_pi_msgs(event));
     }
 
     fn messages(&self, messages: Vec<PiMsg>) {
+        self.stage_messages(messages);
+        self.pause_after_delivery_failure();
+    }
+
+    fn stage_messages(&self, messages: Vec<PiMsg>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return;
+        }
+        if self.forward(&mut state, messages).is_err() {
+            state.closed = true;
+            state.last_end = None;
+        }
+    }
+
+    fn pause_after_delivery_failure(&self) {
         let pause = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed {
-                return;
-            }
-            if self.forward(&mut state, messages).is_err() {
-                state.closed = true;
-                state.last_end = None;
                 state.control.take()
             } else {
                 None
@@ -116,6 +181,9 @@ impl Display {
                         Some(PiMsg::AgentStart)
                     }
                 }
+                // The invocation's Bridge installs its scope before AgentStart.
+                // Keep that ordering even for the first prompt in a goal.
+                message @ PiMsg::FtuiToolProgress(ProgressEvent::Begin { .. }) => Some(message),
                 // Lifecycle commands have no native prompt. Do not turn
                 // unrelated non-turn notifications into execution evidence.
                 _ if !state.started => None,
@@ -158,6 +226,12 @@ impl Display {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.closed {
+                let pause = state.control.take();
+                drop(state);
+                self.retire_progress();
+                if let Some(control) = pause {
+                    control.pause();
+                }
                 return;
             }
             // Close under the same lock used for delivery. An SDK callback may
@@ -178,9 +252,19 @@ impl Display {
             }
             if completed { None } else { control }
         };
+        self.retire_progress();
         if let Some(control) = pause {
             control.pause();
         }
+    }
+
+    fn retire_progress(&self) {
+        let progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(progress);
     }
 }
 
@@ -208,6 +292,7 @@ impl Observation {
         let display = Arc::new(Display {
             sender,
             state: Mutex::new(DisplayState::default()),
+            progress: Mutex::new(None),
         });
         let observed = Arc::clone(&display);
         let subscription = listeners.subscribe(Arc::new(move |event| observed.observe(&event)));
@@ -262,6 +347,158 @@ mod tests {
             },
             error_message: error.map(str::to_owned),
         }
+    }
+
+    fn progress_result(text: &str) -> crate::tools::ToolOutput {
+        crate::tools::ToolOutput {
+            content: vec![crate::model::ContentBlock::Text(
+                crate::model::TextContent::new(text),
+            )],
+            details: None,
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn goal_progress_retains_scope_and_reuse_history_across_native_prompts() {
+        let listeners = EventListeners::default();
+        let (sender, receiver) = mpsc::channel();
+        let observation = Observation::attach(&listeners, &sender);
+        let late = Arc::clone(&observation.display);
+        let (_unused, input) = mpsc::channel();
+        let mut model = PiFtuiModel::new(input);
+        model.displayed_session_id = Some("goal-session".to_string());
+        let start = AgentEvent::AgentStart {
+            session_id: Arc::from("goal-session"),
+        };
+        let end = AgentEvent::AgentEnd {
+            session_id: Arc::from("goal-session"),
+            messages: Vec::new(),
+            error: None,
+        };
+        listeners.notify(&start);
+        listeners.notify(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "reused".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+        });
+        listeners.notify(&AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "reused".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+            partial_result: progress_result("first prompt progress"),
+        });
+        for message in receiver.try_iter() {
+            let _ = model.handle_agent(message);
+        }
+        model.drain_tool_progress();
+        let scope = Arc::clone(model.active_tool_scope.as_ref().expect("goal scope"));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) actual SDK subscription delivers live goal progress.
+        assert_eq!(
+            model.transcript[0].detail.as_deref(),
+            Some("first prompt progress")
+        );
+
+        listeners.notify(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "reused".to_string(),
+            tool_name: "subagent".to_string(),
+            result: progress_result("first prompt final"),
+            is_error: false,
+        });
+        listeners.notify(&end);
+        listeners.notify(&start);
+        listeners.notify(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "reused".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+        });
+        // The global session subscription cannot tell which prompt emitted a
+        // late update. Reusing an ID must not grant the update a fresh slot.
+        listeners.notify(&AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "reused".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+            partial_result: progress_result("ambiguous old callback"),
+        });
+        listeners.notify(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "fresh".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+        });
+        listeners.notify(&AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "fresh".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+            partial_result: progress_result("second prompt progress"),
+        });
+        for message in receiver.try_iter() {
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) inner prompt completion cannot unlock goal UI.
+            assert!(!matches!(message, PiMsg::AgentDone { .. }));
+            let _ = model.handle_agent(message);
+        }
+        model.drain_tool_progress();
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) one bounded identity history covers the whole goal.
+        assert!(
+            model
+                .active_tool_scope
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &scope))
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) prompt transitions retain their ordered tool cards.
+        assert_eq!(model.transcript.len(), 3);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) already completed calls remain terminal.
+        assert_eq!(
+            model.transcript[0].card,
+            Some(crate::interactive_ftui::CardState::Ok)
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) reused public IDs cannot receive ambiguous progress.
+        assert!(model.transcript[1].progress.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) stale callbacks cannot populate the repeated call.
+        assert!(model.transcript[1].detail.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) unique second-prompt calls still receive progress.
+        assert_eq!(
+            model.transcript[2].detail.as_deref(),
+            Some("second prompt progress")
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) the outer goal remains active across prompts.
+        assert_eq!(model.state, AgentUiState::Working);
+
+        listeners.notify(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "reused".to_string(),
+            tool_name: "subagent".to_string(),
+            result: progress_result("repeated call final"),
+            is_error: false,
+        });
+        listeners.notify(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "fresh".to_string(),
+            tool_name: "subagent".to_string(),
+            result: progress_result("fresh call final"),
+            is_error: false,
+        });
+        listeners.notify(&end);
+        for message in receiver.try_iter() {
+            let _ = model.handle_agent(message);
+        }
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) reuse fallback retains the second call's final result.
+        assert_eq!(
+            model.transcript[1].detail.as_deref(),
+            Some("repeated call final")
+        );
+        observation.finish();
+        let terminal = receiver.try_recv().expect("outer goal completion");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) only settled goal completion releases the UI.
+        assert!(matches!(terminal, PiMsg::AgentDone { .. }));
+        let _ = model.handle_agent(terminal);
+        late.observe(&AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "fresh".to_string(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({}),
+            partial_result: progress_result("retired goal callback"),
+        });
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) retired observation cannot reopen progress delivery.
+        assert!(receiver.try_recv().is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) settled goal leaves the model ready.
+        assert_eq!(model.state, AgentUiState::Ready);
     }
 
     #[test]
@@ -455,6 +692,39 @@ mod tests {
                 "pause is not proof of completed cleanup"
             );
             assert!(observation.display.state.lock().unwrap().control.is_none());
+        });
+    }
+
+    #[test]
+    fn progress_receiver_loss_pauses_after_releasing_bridge_and_display_locks() {
+        with_unpolled_control(|control| {
+            let listeners = EventListeners::default();
+            let (sender, receiver) = mpsc::channel();
+            let observation = Observation::attach(&listeners, &sender);
+            observation.control_publisher()(control.clone());
+            listeners.notify(&AgentEvent::AgentStart {
+                session_id: Arc::from("goal-session"),
+            });
+            drop(receiver);
+            listeners.notify(&AgentEvent::ToolExecutionStart {
+                tool_call_id: "lost-progress".to_string(),
+                tool_name: "subagent".to_string(),
+                args: serde_json::json!({}),
+            });
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) progress output loss pauses the explicitly bound run.
+            assert!(!control.pause());
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) abort request does not claim native cleanup completed.
+            assert!(!control.is_finished());
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) pause consumes only this observer's control binding.
+            assert!(
+                observation
+                    .display
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .control
+                    .is_none()
+            );
         });
     }
 

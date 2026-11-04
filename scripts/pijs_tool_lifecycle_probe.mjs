@@ -18,6 +18,8 @@
  * host-secret validation, update sinks, timers, Event/EventTarget and UI are
  * controlled fixtures. Other imported modules are unused stubs. Small tool callbacks
  * exercise lifecycle edges which the real example cannot intentionally cause.
+ * The example's replacement snapshots and distinct parallel final summary are
+ * observed at the bridge sink; terminal rendering and UI delivery are not run.
  *
  * This does NOT execute Rust/QuickJS, native mailbox/backpressure, deadline/drop
  * handling, native capability/ownership enforcement, real child termination or
@@ -207,15 +209,54 @@ test('unchanged subagent callback streams detached snapshots before its final re
   child.send('first partial');
   assert.equal(op.settled, false);
   assert.equal(op.updates.length, 1, 'onUpdate must reach the native sink before completion');
-  child.send('second partial');
+  child.send('short');
   assert.equal(op.updates.length, 2);
   assert.equal(op.updates[0].content[0].text, 'first partial');
+  assert.equal(op.updates[1].content[0].text, 'short', 'updates replace earlier text rather than append to it');
   assert.equal(op.updates[0].details.results[0].messages.length, 1, 'earlier progress remains a detached snapshot');
   assert.equal(op.updates[1].details.results[0].messages.length, 2);
   child.close();
-  assert.equal((await op.promise).content[0].text, 'second partial');
+  assert.equal((await op.promise).content[0].text, 'short');
   child.send('late partial');
   assert.equal(op.updates.length, 2, 'held example callback cannot publish after completion');
+  assert.equal(f.cancel(op.token), false);
+  assert.equal(f.api.count(), 0);
+});
+
+test('unchanged parallel subagent reports detached progress and a distinct final summary', async () => {
+  const f = await fixture({ loadExample: true });
+  const op = f.start('subagent', { tasks: [
+    { agent: 'probe', task: 'first task' },
+    { agent: 'probe', task: 'second task' },
+  ] });
+  assert.equal(f.children.length, 2, 'the real example starts both controlled tasks');
+  const [first, second] = f.children;
+  first.send('first result');
+  assert.equal(op.settled, false);
+  assert.equal(op.updates.length, 1);
+  assert.equal(op.updates[0].content[0].text, 'Parallel: 1/2 done, 1 running...');
+  assert.equal(op.updates[0].details.mode, 'parallel');
+  assert.equal(op.updates[0].details.results.length, 2);
+  assert.equal(op.updates[0].details.results[1].messages.length, 0);
+  const firstSnapshot = JSON.stringify(op.updates[0]);
+  first.close();
+  await turn();
+  assert.equal(op.settled, false, 'progress from a completed child is not the parent tool result');
+  second.send('second result');
+  assert.equal(op.settled, false);
+  assert.equal(op.updates.at(-1).content[0].text, 'Parallel: 2/2 done, 0 running...');
+  assert.equal(op.updates.at(-1).details.results[1].messages.length, 1);
+  assert.equal(JSON.stringify(op.updates[0]), firstSnapshot, 'later child progress cannot mutate an earlier snapshot');
+  second.close();
+  const result = await op.promise;
+  assert.equal(result.content[0].text,
+    'Parallel: 2/2 succeeded\n\n[probe] completed: first result\n\n[probe] completed: second result');
+  assert.notEqual(result.content[0].text, op.updates.at(-1).content[0].text,
+    'the terminal result is authoritative and is not a replay of the last progress snapshot');
+  const countAtCompletion = op.updates.length;
+  first.send('late first result');
+  second.send('late second result');
+  assert.equal(op.updates.length, countAtCompletion);
   assert.equal(f.cancel(op.token), false);
   assert.equal(f.api.count(), 0);
 });

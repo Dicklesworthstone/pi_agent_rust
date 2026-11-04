@@ -70,6 +70,7 @@ mod queued_compaction;
 pub mod session_pins;
 mod settings;
 mod textarea;
+pub mod tool_progress;
 mod workspace_commands;
 
 pub use queued_compaction::QueuedCompaction;
@@ -1386,11 +1387,14 @@ struct TranscriptEntry {
     /// uniqueness makes index shifts from entry removal self-invalidating.
     revision: u64,
     /// Set for tool-execution cards; `None` renders as a plain role block.
-    /// Pairing key: the sanitized tool_id that ties ToolStart/ToolEnd/
+    /// Pairing key: the opaque tool_id that ties ToolStart/ToolEnd/
     /// ToolInvocation events to this card (stable even when the head text
     /// is later replaced by an invocation summary).
     card: Option<CardState>,
     pair_key: Option<String>,
+    /// Native presentation identity for a live progress card. The public
+    /// tool-call id is never sufficient to authorize a mailbox delivery.
+    progress: Option<Arc<tool_progress::Slot>>,
     /// Folded result preview for tool cards (sanitized, size-capped).
     detail: Option<String>,
     /// Detail lines are diff content (edit/hashline_edit): style added and
@@ -2036,6 +2040,12 @@ pub struct PiFtuiModel {
     /// Session identity represented by the transcript. Owner-tagged async
     /// notes are accepted only when they match this reset-installed value.
     displayed_session_id: Option<String>,
+    /// A driver operation owns its tool cards independently of public call
+    /// ids. Reset and terminal delivery retire this presentation authority.
+    active_tool_scope: Option<Arc<tool_progress::Scope>>,
+    /// Bounded by the producer's active-slot cap; ticks inspect only these
+    /// mailboxes rather than scanning completed transcript entries.
+    progress_slots: Vec<Arc<tool_progress::Slot>>,
     /// Where `/pin` keeps pinned session ids (the agent dir).
     pins_dir: std::path::PathBuf,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
@@ -2060,6 +2070,9 @@ pub struct PiFtuiModel {
     thinking: String,
     /// Spinner animation state; advanced by `Event::Tick` while working.
     spinner: SpinnerState,
+    /// A tick stopped during a terminal handoff. Completion rearms it once;
+    /// if no tick was consumed, the already-pending chain remains sufficient.
+    heartbeat_parked: bool,
     /// Usage summary from the last completed turn, shown in the footer.
     usage_line: Option<String>,
     /// Theme-derived colors for chrome and role styling.
@@ -2503,6 +2516,8 @@ impl PiFtuiModel {
             state: AgentUiState::Ready,
             transcript: Vec::new(),
             displayed_session_id: None,
+            active_tool_scope: None,
+            progress_slots: Vec::new(),
             pins_dir: crate::config::Config::global_dir(),
             deferred_notes: Vec::new(),
             streaming: String::new(),
@@ -2514,6 +2529,7 @@ impl PiFtuiModel {
             status_snapshot: None,
             thinking: String::new(),
             spinner: SpinnerState::default(),
+            heartbeat_parked: false,
             usage_line: None,
             palette: FtuiPalette::default(),
             picker: None,
@@ -3080,6 +3096,7 @@ impl PiFtuiModel {
             revision,
             card: None,
             pair_key: None,
+            progress: None,
             detail: None,
             diff_styled: false,
             tool_name: None,
@@ -3283,7 +3300,7 @@ impl PiFtuiModel {
         }
     }
 
-    /// Push a pending tool-execution card keyed by the sanitized tool_id
+    /// Push a pending tool-execution card keyed by the opaque tool_id
     /// (stable across head-text replacement by invocation summaries);
     /// `display` is the sanitized initial head (the tool name).
     fn push_tool_card(&mut self, pair_id: &str, display: &str, sanitized_name: &str) {
@@ -3294,12 +3311,173 @@ impl PiFtuiModel {
             revision,
             card: Some(CardState::Pending),
             pair_key: Some(pair_id.to_string()),
+            progress: None,
             detail: None,
             diff_styled: false,
             tool_name: Some(sanitized_name.to_string()),
             group_count: 1,
         });
     }
+
+    fn tool_scope_is_current(&self, scope: &Arc<tool_progress::Scope>) -> bool {
+        scope.matches_session(self.displayed_session_id.as_deref())
+            && self
+                .active_tool_scope
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, scope))
+    }
+
+    fn retire_tool_progress(&mut self) {
+        if let Some(scope) = self.active_tool_scope.take() {
+            scope.close();
+        }
+        for slot in self.progress_slots.drain(..) {
+            slot.close();
+        }
+    }
+
+    fn refresh_current_tool(&mut self) {
+        self.current_tool = self
+            .transcript
+            .iter()
+            .rev()
+            .find(|entry| entry.card == Some(CardState::Pending))
+            .and_then(|entry| entry.tool_name.clone());
+    }
+
+    /// Read at most one replacement from each active mailbox on the existing
+    /// heartbeat. Progress never queues UI messages, so a fast producer cannot
+    /// grow the driver queue or make layout run at its update frequency.
+    fn drain_tool_progress(&mut self) {
+        for index in 0..self.progress_slots.len() {
+            let slot = Arc::clone(&self.progress_slots[index]);
+            if !self.tool_scope_is_current(slot.scope()) {
+                continue;
+            }
+            let Some(snapshot) = slot.take() else {
+                continue;
+            };
+            let Some(entry_index) = self.transcript.iter().rposition(|entry| {
+                entry.card == Some(CardState::Pending)
+                    && entry
+                        .progress
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(owner, &slot))
+            }) else {
+                continue;
+            };
+            let preview = snapshot.preview.map(|text| sanitize(&text).into_owned());
+            if self.transcript[entry_index].detail != preview {
+                let revision = self.next_revision();
+                let entry = &mut self.transcript[entry_index];
+                entry.detail = preview;
+                entry.diff_styled =
+                    matches!(entry.tool_name.as_deref(), Some("edit" | "hashline_edit"));
+                entry.revision = revision;
+            }
+        }
+    }
+
+    /// Scope ownership is independent of the slot's producer-closed flag:
+    /// a fast tool may finish before its ordered Start/End reach the UI.
+    fn handle_tool_progress(&mut self, event: tool_progress::Event) -> Cmd<PiFtuiMsg> {
+        use tool_progress::Event as E;
+
+        match event {
+            E::Begin { scope } => {
+                if !scope.matches_session(self.displayed_session_id.as_deref()) {
+                    scope.close();
+                    return Cmd::none();
+                }
+                if self
+                    .active_tool_scope
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &scope))
+                {
+                    return Cmd::none();
+                }
+                if self.active_tool_scope.is_some() {
+                    self.settle_pending_cards();
+                    self.refresh_current_tool();
+                }
+                self.active_tool_scope = Some(scope);
+            }
+            E::Message { scope, message } => {
+                if self.tool_scope_is_current(&scope) {
+                    return self.handle_agent(*message);
+                }
+            }
+            E::Start {
+                slot,
+                name,
+                summary,
+            } => {
+                if !self.tool_scope_is_current(slot.scope())
+                    || self
+                        .progress_slots
+                        .iter()
+                        .any(|owner| Arc::ptr_eq(owner, &slot))
+                {
+                    return Cmd::none();
+                }
+                let start_heartbeat = self.state != AgentUiState::Working
+                    && self.busy.is_none()
+                    && !self.has_pending_cards();
+                let tool_id = slot.id().to_string();
+                let _ = self.handle_agent(PiMsg::ToolStart {
+                    name,
+                    tool_id: tool_id.clone(),
+                });
+                if let Some(entry) = self.transcript.last_mut() {
+                    entry.progress = Some(Arc::clone(&slot));
+                }
+                self.progress_slots.push(slot);
+                if let Some(summary) = summary {
+                    let _ = self.handle_agent(PiMsg::ToolInvocation { tool_id, summary });
+                }
+                if start_heartbeat {
+                    return self.arm_heartbeat();
+                }
+            }
+            E::End {
+                slot,
+                name,
+                is_error,
+                output,
+                interim,
+            } => {
+                if !self.tool_scope_is_current(slot.scope())
+                    || !self.transcript.iter().any(|entry| {
+                        entry.card == Some(CardState::Pending)
+                            && entry
+                                .progress
+                                .as_ref()
+                                .is_some_and(|owner| Arc::ptr_eq(owner, &slot))
+                    })
+                {
+                    return Cmd::none();
+                }
+                slot.close();
+                self.progress_slots
+                    .retain(|owner| !Arc::ptr_eq(owner, &slot));
+                let tool_id = slot.id().to_string();
+                return self.handle_agent(if let Some(text) = interim {
+                    PiMsg::InterimResponse { tool_id, text }
+                } else {
+                    PiMsg::ToolEnd {
+                        name,
+                        tool_id,
+                        is_error,
+                        // An empty final result clears partial output. Only
+                        // the manual BashResult fold uses ToolEnd(None).
+                        output: Some(output.unwrap_or_default()),
+                    }
+                });
+            }
+        }
+        Cmd::none()
+    }
+
     /// Close the last pending tool card named `sanitized_name`, falling
     /// back to a plain trace line when no matching open card exists.
     /// A turn that ends (or dies) between ToolStart and ToolEnd leaves a
@@ -3307,9 +3485,13 @@ impl PiFtuiModel {
     /// leftover pending cards as errors so the transcript never shows a
     /// tool that is "still running" after the turn is over.
     fn settle_pending_cards(&mut self) {
+        self.retire_tool_progress();
         let mut revision = self.transcript_revision;
         for entry in &mut self.transcript {
             if entry.card == Some(CardState::Pending) {
+                if let Some(slot) = entry.progress.take() {
+                    slot.close();
+                }
                 entry.card = Some(CardState::Err);
                 revision += 1;
                 entry.revision = revision;
@@ -3320,14 +3502,14 @@ impl PiFtuiModel {
 
     fn finish_tool_card(
         &mut self,
-        sanitized_pair_id: &str,
+        pair_id: &str,
         display_name: &str,
         ok: bool,
         sanitized_output: Option<String>,
         diff_styled: bool,
     ) {
         let pending_idx = self.transcript.iter().rposition(|e| {
-            e.card == Some(CardState::Pending) && e.pair_key.as_deref() == Some(sanitized_pair_id)
+            e.card == Some(CardState::Pending) && e.pair_key.as_deref() == Some(pair_id)
         });
         let Some(idx) = pending_idx else {
             let mark = if ok { "✓" } else { "✗" };
@@ -3337,8 +3519,13 @@ impl PiFtuiModel {
         let revision = self.next_revision();
         self.transcript[idx].card = Some(if ok { CardState::Ok } else { CardState::Err });
         self.transcript[idx].revision = revision;
+        if let Some(slot) = self.transcript[idx].progress.take() {
+            slot.close();
+            self.progress_slots
+                .retain(|owner| !Arc::ptr_eq(owner, &slot));
+        }
         if let Some(output) = sanitized_output {
-            self.transcript[idx].detail = Some(output);
+            self.transcript[idx].detail = (!output.is_empty()).then_some(output);
             self.transcript[idx].diff_styled = diff_styled;
         }
         // Read-call grouping (bd-cv653.9.2, read-tool-group parity): a
@@ -3473,6 +3660,9 @@ impl PiFtuiModel {
             self.drain_deferred_notes();
             return command;
         }
+        if let PiMsg::FtuiToolProgress(event) = msg {
+            return self.handle_tool_progress(event);
+        }
         // A busy out-of-turn operation (issue #203) is over once the
         // sequential driver replies with anything of substance. Background
         // ticks don't count, and neither does the in-progress chatter of an
@@ -3496,7 +3686,9 @@ impl PiFtuiModel {
             self.busy = None;
         }
         match msg {
-            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return Cmd::none(),
+            PiMsg::HandoffFinished { .. }
+            | PiMsg::McpAuthFinished { .. }
+            | PiMsg::FtuiToolProgress(_) => return Cmd::none(),
             PiMsg::AgentError(message)
                 if self.handoff_in_progress() || self.mcp_auth_request.is_some() =>
             {
@@ -3518,7 +3710,7 @@ impl PiFtuiModel {
                 // Start the spinner tick chain; it dies naturally once the
                 // agent goes idle (Tick reschedules only while Working —
                 // same self-limiting pattern as the bubbletea spinner gate).
-                return Cmd::tick(SPINNER_INTERVAL);
+                return self.arm_heartbeat();
             }
             PiMsg::TextDelta(delta) => {
                 // Adversarial-content safety: agent/tool text is sanitized
@@ -3533,23 +3725,21 @@ impl PiFtuiModel {
                 // comes before the tool's card, not after the whole turn.
                 self.flush_stream();
                 let name = sanitize(&name).into_owned();
-                // The card pairs on the sanitized tool_id; the head starts
+                // The card pairs on the opaque tool_id; the head starts
                 // as the tool name and is later replaced by the invocation
                 // summary when one arrives.
-                let pair = sanitize(&tool_id).into_owned();
                 self.current_tool = Some(name.clone());
-                self.push_tool_card(&pair, &name, &name);
+                self.push_tool_card(&tool_id, &name, &name);
             }
             PiMsg::ToolInvocation { tool_id, summary } => {
                 // The invocation summary REPLACES the card head (omp
                 // renderCall description): pairing by tool_id is immune to
                 // the text change.
-                let pair = sanitize(&tool_id).into_owned();
                 let summary = sanitize(&summary).into_owned();
                 let revision = self.next_revision();
                 if let Some(entry) = self.transcript.iter_mut().rev().find(|e| {
                     e.card == Some(CardState::Pending)
-                        && e.pair_key.as_deref() == Some(pair.as_str())
+                        && e.pair_key.as_deref() == Some(tool_id.as_str())
                 }) {
                     entry.text = summary;
                     entry.revision = revision;
@@ -3563,25 +3753,23 @@ impl PiFtuiModel {
                 ..
             } => {
                 // The tool card flips to its terminal state in place
-                // (bd-cv653.9.2 card framework). Sanitize ONCE per field,
-                // matching ToolStart, so start/end always pair.
+                // (bd-cv653.9.2 card framework). Sanitize displayed fields
+                // only: distinct opaque ids must never alias after escaping.
                 let name = sanitize(&name).into_owned();
-                let pair = sanitize(&tool_id).into_owned();
                 let output = output.map(|o| sanitize(&o).into_owned());
                 let diff_styled = matches!(name.as_str(), "edit" | "hashline_edit");
-                self.finish_tool_card(&pair, &name, !is_error, output, diff_styled);
-                self.current_tool = None;
+                self.finish_tool_card(&tool_id, &name, !is_error, output, diff_styled);
+                self.refresh_current_tool();
             }
             PiMsg::InterimResponse { tool_id, text } => {
                 self.flush_stream();
-                let pair = sanitize(&tool_id).into_owned();
                 let text = sanitize(&text).into_owned();
                 let revision = self.next_revision();
                 if let Some(entry) = self
                     .transcript
                     .iter_mut()
                     .rev()
-                    .find(|entry| entry.pair_key.as_deref() == Some(pair.as_str()))
+                    .find(|entry| entry.pair_key.as_deref() == Some(tool_id.as_str()))
                 {
                     // Replace the pending write card in place. Keeping its
                     // identity also makes a repeated terminal delivery idempotent.
@@ -3593,13 +3781,18 @@ impl PiFtuiModel {
                     entry.diff_styled = false;
                     entry.tool_name = None;
                     entry.group_count = 1;
+                    if let Some(slot) = entry.progress.take() {
+                        slot.close();
+                        self.progress_slots
+                            .retain(|owner| !Arc::ptr_eq(owner, &slot));
+                    }
                 } else {
                     self.push_entry(EntryRole::Assistant, text);
                     if let Some(entry) = self.transcript.last_mut() {
-                        entry.pair_key = Some(pair);
+                        entry.pair_key = Some(tool_id);
                     }
                 }
-                self.current_tool = None;
+                self.refresh_current_tool();
             }
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary.map(|s| sanitize(&s).into_owned());
@@ -6166,7 +6359,7 @@ impl PiFtuiModel {
         if let Some(op) = &mut self.busy
             && std::mem::take(&mut op.tick_pending)
         {
-            Cmd::tick(SPINNER_INTERVAL)
+            self.arm_heartbeat()
         } else {
             Cmd::none()
         }
@@ -6182,6 +6375,15 @@ impl PiFtuiModel {
             .any(|entry| entry.card == Some(CardState::Pending))
     }
 
+    fn heartbeat_needed(&self) -> bool {
+        self.state == AgentUiState::Working || self.busy.is_some() || self.has_pending_cards()
+    }
+
+    fn arm_heartbeat(&mut self) -> Cmd<PiFtuiMsg> {
+        self.heartbeat_parked = false;
+        Cmd::tick(SPINNER_INTERVAL)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
         // The shell owns terminal input between release and completion.
@@ -6192,22 +6394,21 @@ impl PiFtuiModel {
         }
         match event {
             Event::Tick => {
-                // While a ctrl+z stop is in flight the model must not
+                // While a ctrl+z stop is in flight visible state must not
                 // change: byte-identical frames keep the diff engine silent
                 // in the window between terminal restore and SIGTSTP.
                 if self.suspending {
+                    self.heartbeat_parked = true;
                     return Cmd::none();
                 }
+                self.drain_tool_progress();
                 // Spinner heartbeat: advance and reschedule only while
                 // something animated needs it — a working turn, an
                 // out-of-turn busy operation (issue #203), or a pending
                 // tool card — so idle sessions stay fully parked.
-                if self.state == AgentUiState::Working
-                    || self.busy.is_some()
-                    || self.has_pending_cards()
-                {
+                if self.heartbeat_needed() {
                     self.spinner.tick();
-                    return Cmd::tick(SPINNER_INTERVAL);
+                    return self.arm_heartbeat();
                 }
                 return Cmd::none();
             }
@@ -6850,6 +7051,8 @@ impl PiFtuiModel {
         messages: Vec<crate::interactive::ConversationMessage>,
         status: Option<String>,
     ) {
+        self.retire_tool_progress();
+        self.current_tool = None;
         self.transcript.clear();
         self.render_cache.borrow_mut().clear();
         self.streaming.clear();
@@ -7118,6 +7321,7 @@ impl PiFtuiModel {
 
 impl Drop for PiFtuiModel {
     fn drop(&mut self) {
+        self.retire_tool_progress();
         // Startup and runtime errors can drop the app without delivering a
         // model message. The independent handoff lane belongs to this model;
         // close the driver control lane before its channels disappear too.
@@ -7170,7 +7374,7 @@ impl Model for PiFtuiModel {
             PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(request))
                 if request.method == "set_editor_text"
         );
-        let cmd = match msg {
+        let mut cmd = match msg {
             PiFtuiMsg::Term(event) => self.handle_term(&event),
             PiFtuiMsg::Edited {
                 text,
@@ -7246,6 +7450,13 @@ impl Model for PiFtuiModel {
         // closes without receiving a mouse event between those updates.
         if !self.editor_mouse_active() {
             self.input.reset_mouse_interaction();
+        }
+        // A tick consumed during Ctrl+Z or external editing parks its chain.
+        // Resume it only in that case: an outstanding timer already suffices
+        // when the handoff completed before its next tick arrived.
+        if !self.suspending && std::mem::take(&mut self.heartbeat_parked) && self.heartbeat_needed()
+        {
+            cmd = Cmd::batch(vec![cmd, self.arm_heartbeat()]);
         }
         self.watchdog.finish(phase, probe);
         cmd
@@ -7614,31 +7825,70 @@ fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
     const MAX_DETAIL_LINES: usize = KEPT_DETAIL_LINES;
     const MAX_LINE_CHARS: usize = 300;
 
-    let mut text = String::new();
-    for block in &result.content {
-        if let crate::model::ContentBlock::Text(t) = block {
-            if !text.is_empty() {
-                text.push('\n');
+    // Borrow the input blocks. Concatenating the whole result before clipping
+    // duplicates unbounded text on every cumulative progress update; images
+    // and arbitrary extension details must never enter this presentation lane.
+    let mut nonempty_prefix = false;
+    let mut chars = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .flat_map(|text| {
+            let separator = nonempty_prefix.then_some('\n');
+            nonempty_prefix |= !text.is_empty();
+            separator.into_iter().chain(text.chars())
+        })
+        .peekable();
+    let mut preview = String::new();
+    let mut line = String::new();
+    let mut line_chars = 0;
+    let mut line_open = false;
+    let mut has_visible_text = false;
+    let mut total = 0;
+    while let Some(ch) = chars.next() {
+        // Match str::lines for CRLF, including a CR at a text-block boundary.
+        if ch == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        if ch == '\n' {
+            if total < MAX_DETAIL_LINES {
+                if total > 0 {
+                    preview.push('\n');
+                }
+                preview.push_str(&line);
             }
-            text.push_str(&t.text);
+            total += 1;
+            line.clear();
+            line_chars = 0;
+            line_open = false;
+        } else {
+            line_open = true;
+            has_visible_text |= !ch.is_whitespace();
+            if total < MAX_DETAIL_LINES {
+                if line_chars < MAX_LINE_CHARS {
+                    line.push(ch);
+                } else if line_chars == MAX_LINE_CHARS {
+                    line.push('…');
+                }
+                line_chars += 1;
+            }
         }
     }
-    if text.trim().is_empty() {
+    if line_open {
+        if total < MAX_DETAIL_LINES {
+            if total > 0 {
+                preview.push('\n');
+            }
+            preview.push_str(&line);
+        }
+        total += 1;
+    }
+    if !has_visible_text {
         return None;
     }
-    let total = text.lines().count();
-    // Byte-cap each kept line too: a multi-megabyte single-line result
-    // (minified JSON, long grep hit) must not land whole in the transcript
-    // and be re-laid-out every frame.
-    let mut preview = text
-        .lines()
-        .take(MAX_DETAIL_LINES)
-        .map(|line| match line.char_indices().nth(MAX_LINE_CHARS) {
-            Some((cut, _)) => format!("{}…", &line[..cut]),
-            None => line.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     if total > MAX_DETAIL_LINES {
         let _ = write!(preview, "\n… +{} more lines", total - MAX_DETAIL_LINES);
     }
@@ -7739,7 +7989,9 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
                     name: tool_name.clone(),
                     tool_id: tool_call_id.clone(),
                     is_error: *is_error,
-                    output: tool_output_preview(result),
+                    // Final emptiness is authoritative; None is reserved
+                    // for manual flows which folded their output separately.
+                    output: Some(tool_output_preview(result).unwrap_or_default()),
                 }]
             }
         }
@@ -8575,11 +8827,11 @@ async fn run_controlled_turn_with_pending(
     }
     // ubs:ignore Sender clone per turn — the event callback must own its sender
     let tx = agent_tx.clone();
-    let turn = handle.prompt_controlled_input(content, move |event| {
-        for msg in agent_event_to_pi_msgs(&event) {
+    let progress =
+        tool_progress::Bridge::new(origin.as_ref().map(|(id, _)| id.clone()), move |msg| {
             let _ = tx.send(msg);
-        }
-    });
+        });
+    let turn = handle.prompt_controlled_input(content, progress.callback());
     let control = turn.control();
     if let Err(error) = control.restore_pending(&mut pending) {
         // Admission is all-or-nothing. The prompt has not been polled, so
@@ -8619,6 +8871,7 @@ async fn run_controlled_turn_with_pending(
     } else {
         turn.await
     };
+    drop(progress);
     turn_control
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -9504,16 +9757,20 @@ async fn run_compact_command(
 ) {
     // ubs:ignore Sender clone per command — the event callback must own its sender
     let tx = agent_tx.clone();
-    let on_event = move |event| {
-        for msg in agent_event_to_pi_msgs(&event) {
-            let _ = tx.send(msg);
-        }
-    };
+    let owner_session_id = handle
+        .with_session(|session| session.header.id.clone())
+        .await
+        .ok();
+    let progress = tool_progress::Bridge::new(owner_session_id, move |msg| {
+        let _ = tx.send(msg);
+    });
+    let on_event = progress.callback();
     let result = if shake {
         handle.shake(on_event).await
     } else {
         handle.compact(instructions, on_event).await
     };
+    drop(progress);
     let (label, done) = if shake {
         ("shake", "conversation shaken: bulky tool output dropped")
     } else {
@@ -19731,6 +19988,686 @@ mod tests {
             1,
             "an emitted advisor note must reach the visible transcript once"
         );
+    }
+
+    fn progress_ui_fixture(
+        owner: Option<&str>,
+    ) -> (
+        tool_progress::Bridge,
+        mpsc::Receiver<PiMsg>,
+        ProgramSimulator<PiFtuiModel>,
+    ) {
+        let (_input, mut model) = new_model();
+        model.displayed_session_id = owner.map(str::to_string);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let (sender, receiver) = mpsc::channel();
+        let bridge = tool_progress::Bridge::new(owner.map(str::to_string), move |message| {
+            let _ = sender.send(message);
+        });
+        bridge.observe(&crate::agent::AgentEvent::AgentStart {
+            session_id: Arc::from(owner.unwrap_or("progress-session")),
+        });
+        drain_progress_ui(&receiver, &mut sim);
+        (bridge, receiver, sim)
+    }
+
+    fn drain_progress_ui(
+        receiver: &mpsc::Receiver<PiMsg>,
+        sim: &mut ProgramSimulator<PiFtuiModel>,
+    ) {
+        while let Ok(message) = receiver.try_recv() {
+            sim.send(PiFtuiMsg::Agent(message));
+        }
+    }
+
+    fn progress_text(text: &str) -> crate::tools::ToolOutput {
+        crate::tools::ToolOutput {
+            content: vec![crate::model::ContentBlock::Text(
+                crate::model::TextContent::new(text),
+            )],
+            details: None,
+            is_error: false,
+        }
+    }
+
+    fn progress_start(id: &str, name: &str) -> crate::agent::AgentEvent {
+        crate::agent::AgentEvent::ToolExecutionStart {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            args: serde_json::json!({}),
+        }
+    }
+
+    fn progress_update(
+        id: &str,
+        name: &str,
+        partial_result: crate::tools::ToolOutput,
+    ) -> crate::agent::AgentEvent {
+        crate::agent::AgentEvent::ToolExecutionUpdate {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            args: serde_json::json!({}),
+            partial_result,
+        }
+    }
+
+    fn progress_end(
+        id: &str,
+        name: &str,
+        result: crate::tools::ToolOutput,
+    ) -> crate::agent::AgentEvent {
+        crate::agent::AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            is_error: result.is_error,
+            result,
+        }
+    }
+
+    #[test]
+    fn ftui_progress_replaces_pending_card_and_redraws_before_completion() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_start("child", "subagent"));
+        drain_progress_ui(&receiver, &mut sim);
+        let initial_revision = sim.model().transcript[0].revision;
+        let _ = sim.capture_frame(80, 20);
+
+        // Completion stays withheld while the mailbox, heartbeat and real
+        // frame path display progress. A final result alone cannot pass this.
+        bridge.observe(&progress_update(
+            "child",
+            "subagent",
+            progress_text("Long first child preview\nsecond line"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) heartbeat presentation invariant.
+        assert!(sim.model().transcript[0].detail.is_none());
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) live progress must precede completion.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Pending));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) progress must not finish the turn.
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) progress invalidates cached rendering.
+        assert!(sim.model().transcript[0].revision > initial_revision);
+        let frame = buffer_text(sim.capture_frame(80, 20), 80, 20);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) live frame regression invariant.
+        assert!(frame.contains("Long first child preview"), "{frame}");
+        let long_revision = sim.model().transcript[0].revision;
+
+        bridge.observe(&progress_update(
+            "child",
+            "subagent",
+            progress_text("short"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) updates are replacement snapshots.
+        assert_eq!(sim.model().transcript[0].detail.as_deref(), Some("short"));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) shrinking output invalidates the cache.
+        assert!(sim.model().transcript[0].revision > long_revision);
+        let frame = buffer_text(sim.capture_frame(80, 20), 80, 20);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) new snapshot is visible in a frame.
+        assert!(frame.contains("short"), "{frame}");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) stale cumulative output must disappear.
+        assert!(!frame.contains("Long first child preview"), "{frame}");
+
+        bridge.observe(&progress_update("child", "subagent", progress_text("")));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) empty progress is a replacement snapshot.
+        assert!(sim.model().transcript[0].detail.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) empty progress remains nonterminal.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Pending));
+        bridge.observe(&progress_end(
+            "child",
+            "subagent",
+            progress_text("Final child result"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) final output replaces partial output.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("Final child result")
+        );
+    }
+
+    #[test]
+    fn ftui_progress_keeps_interleaved_opaque_ids_distinct_and_terminal_output_authoritative() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        let first = "call";
+        let second = "ca\u{7}ll";
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) reproduce a sanitization collision.
+        assert_eq!(sanitize(first), sanitize(second));
+        bridge.observe(&progress_start(first, "subagent"));
+        bridge.observe(&progress_start(second, "subagent"));
+        bridge.observe(&progress_update(
+            second,
+            "subagent",
+            progress_text("second child"),
+        ));
+        bridge.observe(&progress_update(
+            first,
+            "subagent",
+            progress_text("first child"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) concurrent invocations retain separate cards.
+        assert_eq!(sim.model().transcript.len(), 2);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) opaque source IDs must not collapse.
+        assert_ne!(
+            sim.model().transcript[0].pair_key,
+            sim.model().transcript[1].pair_key
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) interleaved progress targets its own card.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("first child")
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) interleaved progress targets its own card.
+        assert_eq!(
+            sim.model().transcript[1].detail.as_deref(),
+            Some("second child")
+        );
+        bridge.observe(&progress_end(first, "subagent", progress_text("")));
+        drain_progress_ui(&receiver, &mut sim);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) an empty authoritative final clears progress.
+        assert!(sim.model().transcript[0].detail.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) completing one child does not complete another.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Ok));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) completing one child does not complete another.
+        assert_eq!(sim.model().transcript[1].card, Some(CardState::Pending));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) a sibling remains the current running tool.
+        assert_eq!(sim.model().current_tool.as_deref(), Some("subagent"));
+        bridge.observe(&progress_update(
+            first,
+            "subagent",
+            progress_text("late first child"),
+        ));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) terminal invocations no longer publish progress.
+        assert!(receiver.try_recv().is_err());
+    }
+
+    fn assert_progress_heartbeat_handoff(case: &str, handoff: fn() -> PiFtuiMsg) {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_start("handoff", "subagent"));
+        bridge.observe(&progress_update(
+            "handoff",
+            "subagent",
+            progress_text("before terminal handoff"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        let revision = sim.model().transcript[0].revision;
+        let ticks = |sim: &ProgramSimulator<PiFtuiModel>| {
+            sim.command_log()
+                .iter()
+                .filter(|record| matches!(record, CmdRecord::Tick(_)))
+                .count()
+        };
+        let before_park = ticks(&sim);
+        sim.model_mut().suspending = true;
+        bridge.observe(&progress_update(
+            "handoff",
+            "subagent",
+            progress_text("not rendered while suspended"),
+        ));
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) terminal handoff parks the existing heartbeat.
+        assert!(sim.model().heartbeat_parked, "{case}");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) suspended ticks must not restart their own chain.
+        assert_eq!(ticks(&sim), before_park, "{case}");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) suspended ticks must not mutate rendered progress.
+        assert_eq!(sim.model().transcript[0].revision, revision, "{case}");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) terminal ownership preserves the pre-handoff preview.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("before terminal handoff"),
+            "{case}"
+        );
+
+        bridge.observe(&progress_update(
+            "handoff",
+            "subagent",
+            progress_text("latest resumed preview"),
+        ));
+        sim.send(handoff());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) all terminal handoff completions unfreeze progress.
+        assert!(!sim.model().suspending, "{case}");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) resuming consumes the parked-heartbeat latch.
+        assert!(!sim.model().heartbeat_parked, "{case}");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) handoff completion arms exactly one replacement tick.
+        assert_eq!(ticks(&sim), before_park + 1, "{case}");
+        sim.send(handoff());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) duplicate completion must not create another tick chain.
+        assert_eq!(ticks(&sim), before_park + 1, "{case}");
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) resumed heartbeat consumes the latest replacement.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("latest resumed preview"),
+            "{case}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) progress resumes before the tool completes.
+        assert_eq!(
+            sim.model().transcript[0].card,
+            Some(CardState::Pending),
+            "{case}"
+        );
+        let frame = buffer_text(sim.capture_frame(80, 20), 80, 20);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) the resumed preview reaches the visible frame.
+        assert!(frame.contains("latest resumed preview"), "{case}: {frame}");
+
+        // A fast handoff may return before its already-scheduled tick arrives.
+        // Its completion must preserve that chain instead of adding another.
+        let already_armed = ticks(&sim);
+        sim.model_mut().suspending = true;
+        bridge.observe(&progress_update(
+            "handoff",
+            "subagent",
+            progress_text("existing heartbeat preview"),
+        ));
+        sim.send(handoff());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) a handoff without a parked tick cannot duplicate it.
+        assert_eq!(ticks(&sim), already_armed, "{case}");
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) the previously armed tick still drains progress.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("existing heartbeat preview"),
+            "{case}"
+        );
+    }
+
+    #[test]
+    fn ftui_progress_heartbeat_resumes_once_after_terminal_handoff() {
+        assert_progress_heartbeat_handoff("resumed", || PiFtuiMsg::Resumed);
+        assert_progress_heartbeat_handoff("successful suspend", || {
+            PiFtuiMsg::SuspendFinished(Ok((80, 20)))
+        });
+        assert_progress_heartbeat_handoff("failed suspend", || {
+            PiFtuiMsg::SuspendFinished(Err("terminal handoff failed".to_string()))
+        });
+        assert_progress_heartbeat_handoff("external editor", || PiFtuiMsg::Edited {
+            text: Ok("retained draft".to_string()),
+            width: 80,
+            height: 20,
+        });
+    }
+
+    #[test]
+    fn ftui_progress_final_empty_clears_partial_but_manual_bash_fold_survives_none() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_start("native", "subagent"));
+        bridge.observe(&progress_update(
+            "native",
+            "subagent",
+            progress_text("temporary"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        bridge.observe(&progress_end("native", "subagent", progress_text("")));
+        drain_progress_ui(&receiver, &mut sim);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) final-empty result must erase stale partial text.
+        assert!(sim.model().transcript[0].detail.is_none());
+        let legacy = agent_event_to_pi_msgs(&progress_end("legacy", "subagent", progress_text("")));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) direct mapper must distinguish authoritative empty.
+        assert!(
+            matches!(legacy.as_slice(), [PiMsg::ToolEnd { output: Some(text), .. }] if text.is_empty())
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "manual".to_string(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
+            display: "Ran `printf hello`\nhello".to_string(),
+        }));
+        let folded = sim.model().transcript[1].detail.clone();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "manual".to_string(),
+            is_error: false,
+            output: None,
+        }));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) manual bash has already supplied its final preview.
+        assert!(folded.as_deref().is_some_and(|text| text.contains("hello")));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) manual ToolEnd(None) preserves the BashResult fold.
+        assert_eq!(sim.model().transcript[1].detail, folded);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) manual bash still reaches its terminal card state.
+        assert_eq!(sim.model().transcript[1].card, Some(CardState::Ok));
+    }
+
+    #[test]
+    fn ftui_progress_ignores_unknown_updates_and_retired_slots_when_public_id_is_reused() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_update(
+            "unknown",
+            "subagent",
+            progress_text("no execution"),
+        ));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) updates cannot invent an invocation.
+        assert!(receiver.try_recv().is_err());
+        bridge.observe(&progress_start("reused", "subagent"));
+        drain_progress_ui(&receiver, &mut sim);
+        let old_slot = Arc::clone(
+            sim.model().transcript[0]
+                .progress
+                .as_ref()
+                .expect("native slot"),
+        );
+        bridge.observe(&progress_update(
+            "reused",
+            "subagent",
+            progress_text("old partial"),
+        ));
+        bridge.observe(&progress_end(
+            "reused",
+            "subagent",
+            progress_text("old final"),
+        ));
+        bridge.observe(&progress_start("reused", "subagent"));
+        bridge.observe(&progress_update(
+            "reused",
+            "subagent",
+            progress_text("new partial"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        let revision = sim.model().transcript[1].revision;
+        sim.send(PiFtuiMsg::Agent(PiMsg::FtuiToolProgress(
+            tool_progress::Event::End {
+                slot: old_slot,
+                name: "subagent".to_string(),
+                is_error: true,
+                output: Some("stale terminal".to_string()),
+                interim: None,
+            },
+        )));
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) ambiguous same-operation ID reuse disables progress.
+        assert!(sim.model().transcript[1].progress.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) retired slot events cannot mutate a new invocation.
+        assert_eq!(sim.model().transcript[1].revision, revision);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) neither new nor late ambiguous progress is admitted.
+        assert!(sim.model().transcript[1].detail.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) a stale terminal cannot complete the current invocation.
+        assert_eq!(sim.model().transcript[1].card, Some(CardState::Pending));
+        bridge.observe(&progress_end(
+            "reused",
+            "subagent",
+            progress_text("new final"),
+        ));
+        drain_progress_ui(&receiver, &mut sim);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) safe fallback still completes the repeated call's card.
+        assert_eq!(sim.model().transcript[1].card, Some(CardState::Ok));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) safe fallback preserves authoritative terminal output.
+        assert_eq!(
+            sim.model().transcript[1].detail.as_deref(),
+            Some("new final")
+        );
+    }
+
+    #[test]
+    fn ftui_progress_fast_queued_lifecycle_survives_closed_slot_and_scope() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_start("fast", "subagent"));
+        bridge.observe(&progress_update(
+            "fast",
+            "subagent",
+            progress_text("undrawn partial"),
+        ));
+        bridge.observe(&progress_end(
+            "fast",
+            "subagent",
+            progress_text("fast final"),
+        ));
+        bridge.observe(&crate::agent::AgentEvent::AgentEnd {
+            session_id: Arc::from("progress-session"),
+            messages: Vec::new(),
+            error: None,
+        });
+        // Completion closes producer ownership before the UI consumes any
+        // tool event. Ordered Start/End still carries the authoritative result.
+        drop(bridge);
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) queued lifecycle is not discarded with its mailbox.
+        assert_eq!(sim.model().transcript.len(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) closed producer scope retains ordered terminal state.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Ok));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) final result wins over undrawn provisional state.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("fast final")
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) queued AgentEnd still completes the surrounding turn.
+        assert_eq!(sim.model().state, AgentUiState::Ready);
+    }
+
+    #[test]
+    fn ftui_progress_agent_error_retires_callbacks_and_queued_progress() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_start("cancelled", "subagent"));
+        drain_progress_ui(&receiver, &mut sim);
+        bridge.observe(&progress_update(
+            "cancelled",
+            "subagent",
+            progress_text("queued before failure"),
+        ));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(
+            "provider failed".to_string(),
+        )));
+        let revision = sim.model().transcript[0].revision;
+        drain_progress_ui(&receiver, &mut sim);
+        bridge.observe(&progress_update(
+            "cancelled",
+            "subagent",
+            progress_text("late after failure"),
+        ));
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) UI terminal retirement closes retained producer callbacks.
+        assert!(receiver.try_recv().is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) undrawn snapshots cannot revive a terminal card.
+        assert_eq!(sim.model().transcript[0].revision, revision);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) failed operations retain no provisional pending state.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Err));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) terminal retirement discards undrawn output.
+        assert!(sim.model().transcript[0].detail.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) late progress cannot make a failed operation active again.
+        assert_eq!(sim.model().state, AgentUiState::Ready);
+    }
+
+    #[test]
+    fn ftui_progress_retired_callback_cannot_target_a_fresh_scope_reusing_the_public_id() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(Some("session"));
+        bridge.observe(&progress_start("call", "subagent"));
+        drain_progress_ui(&receiver, &mut sim);
+        let old_scope = Arc::clone(
+            sim.model().transcript[0]
+                .progress
+                .as_ref()
+                .expect("slot")
+                .scope(),
+        );
+        let late = bridge.callback();
+        drop(bridge);
+        late(progress_update(
+            "call",
+            "subagent",
+            progress_text("abandoned callback"),
+        ));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) dropped producer ownership retires cloned callbacks.
+        assert!(receiver.try_recv().is_err());
+        let (sender, current) = mpsc::channel();
+        let bridge = tool_progress::Bridge::new(Some("session".to_string()), move |message| {
+            let _ = sender.send(message);
+        });
+        bridge.observe(&crate::agent::AgentEvent::AgentStart {
+            session_id: Arc::from("session"),
+        });
+        bridge.observe(&progress_start("call", "subagent"));
+        bridge.observe(&progress_update(
+            "call",
+            "subagent",
+            progress_text("current callback"),
+        ));
+        drain_progress_ui(&current, &mut sim);
+        sim.inject_event(Event::Tick);
+        late(progress_update(
+            "call",
+            "subagent",
+            progress_text("stale callback"),
+        ));
+        sim.send(PiFtuiMsg::Agent(PiMsg::FtuiToolProgress(
+            tool_progress::Event::Message {
+                scope: old_scope,
+                message: Box::new(PiMsg::TextDelta("stale scoped text".to_string())),
+            },
+        )));
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) closed callbacks remain inert after ID reuse.
+        assert!(receiver.try_recv().is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) a new operation retires old pending cards.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Err));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) current scope owns its own output.
+        assert_eq!(
+            sim.model().transcript[1].detail.as_deref(),
+            Some("current callback")
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) stale scope messages cannot enter current assistant text.
+        assert!(sim.model().streaming.is_empty());
+    }
+
+    #[test]
+    fn ftui_progress_reset_and_foreign_scope_do_not_mutate_the_replacement_session() {
+        let (old_bridge, old_events, mut sim) = progress_ui_fixture(Some("old-session"));
+        old_bridge.observe(&progress_start("call", "subagent"));
+        drain_progress_ui(&old_events, &mut sim);
+        old_bridge.observe(&progress_update(
+            "call",
+            "subagent",
+            progress_text("old session"),
+        ));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "new-session".to_string(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        let (sender, current) = mpsc::channel();
+        let bridge = tool_progress::Bridge::new(Some("new-session".to_string()), move |message| {
+            let _ = sender.send(message);
+        });
+        bridge.observe(&crate::agent::AgentEvent::AgentStart {
+            session_id: Arc::from("new-session"),
+        });
+        bridge.observe(&progress_start("call", "subagent"));
+        bridge.observe(&progress_update(
+            "call",
+            "subagent",
+            progress_text("replacement output"),
+        ));
+        drain_progress_ui(&current, &mut sim);
+        drain_progress_ui(&old_events, &mut sim);
+        let (sender, foreign) = mpsc::channel();
+        let foreign_bridge =
+            tool_progress::Bridge::new(Some("old-session".to_string()), move |message| {
+                let _ = sender.send(message);
+            });
+        foreign_bridge.observe(&crate::agent::AgentEvent::AgentStart {
+            session_id: Arc::from("old-session"),
+        });
+        foreign_bridge.observe(&progress_start("call", "subagent"));
+        foreign_bridge.observe(&progress_update(
+            "call",
+            "subagent",
+            progress_text("foreign output"),
+        ));
+        drain_progress_ui(&foreign, &mut sim);
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) replaced session progress must not create cards.
+        assert_eq!(sim.model().transcript.len(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) foreign Begin must not retire the current scope.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Pending));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) only the displayed session can replace its preview.
+        assert_eq!(
+            sim.model().transcript[0].detail.as_deref(),
+            Some("replacement output")
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) foreign lifecycle messages cannot end current work.
+        assert_eq!(sim.model().state, AgentUiState::Working);
+    }
+
+    #[test]
+    fn ftui_progress_does_not_promote_interim_reply_before_successful_terminal_result() {
+        let (bridge, receiver, mut sim) = progress_ui_fixture(None);
+        bridge.observe(&progress_start("reply", "write"));
+        let mut result = progress_text("write result preview");
+        result.details = Some(serde_json::json!({
+            "schema": "pi.interim_response.v1", "text": "Accepted interim response",
+        }));
+        bridge.observe(&progress_update("reply", "write", result.clone()));
+        drain_progress_ui(&receiver, &mut sim);
+        sim.inject_event(Event::Tick);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) partial write metadata is not accepted assistant prose.
+        assert_eq!(sim.model().transcript[0].card, Some(CardState::Pending));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) interim updates must stay out of tool previews too.
+        assert!(sim.model().transcript[0].detail.is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) only terminal acceptance promotes interim output.
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .all(|entry| entry.role != EntryRole::Assistant)
+        );
+        bridge.observe(&progress_end("reply", "write", result));
+        drain_progress_ui(&receiver, &mut sim);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) successful interim output replaces its own card once.
+        assert_eq!(sim.model().transcript.len(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) terminal acceptance reaches assistant prose.
+        assert_eq!(sim.model().transcript[0].role, EntryRole::Assistant);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) accepted interim prose retains its final content.
+        assert_eq!(sim.model().transcript[0].text, "Accepted interim response");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) interim reply does not finish the surrounding turn.
+        assert_eq!(sim.model().state, AgentUiState::Working);
+    }
+
+    #[test]
+    fn ftui_tool_preview_bounds_unicode_and_preserves_multiblock_crlf_semantics() {
+        let mut result = progress_text("one\r");
+        result.content.push(crate::model::ContentBlock::Text(
+            crate::model::TextContent::new("two\r\n"),
+        ));
+        result.content.push(crate::model::ContentBlock::Text(
+            crate::model::TextContent::new("three"),
+        ));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) borrowed preview matches the prior joined-text line semantics.
+        assert_eq!(
+            tool_output_preview(&result).as_deref(),
+            Some("one\ntwo\n\nthree")
+        );
+        let long = progress_text(&format!("{}\r\nend", "é".repeat(301)));
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) clipping is bounded at Unicode character boundaries.
+        assert_eq!(
+            tool_output_preview(&long),
+            Some(format!("{}…\nend", "é".repeat(300)))
+        );
+        let hidden = crate::tools::ToolOutput {
+            content: vec![crate::model::ContentBlock::Image(
+                crate::model::ImageContent {
+                    data: "not-preview-text".repeat(100),
+                    mime_type: "image/png".to_string(),
+                },
+            )],
+            details: Some(serde_json::json!({"private": "not-preview-details"})),
+            is_error: false,
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) binary content and arbitrary details never enter preview text.
+        assert!(tool_output_preview(&hidden).is_none());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) whitespace-only output is an empty preview.
+        assert!(tool_output_preview(&progress_text(" \r\n\t")).is_none());
     }
 
     #[test]

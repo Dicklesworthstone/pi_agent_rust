@@ -674,11 +674,13 @@ pub(super) async fn run_restored(
         .agent
         .set_magic_keyword_scan_override(Some(first.text.clone()));
     let tx = agent_tx.clone();
-    let turn = handle.prompt_controlled_input(first.content.clone(), move |event| {
-        for message in super::agent_event_to_pi_msgs(&event) {
+    let progress = super::tool_progress::Bridge::new(
+        Some(recovery.request.owner_session_id.clone()),
+        move |message| {
             let _ = tx.send(message);
-        }
-    });
+        },
+    );
+    let turn = handle.prompt_controlled_input(first.content.clone(), progress.callback());
     let control = turn.control();
     if let Err(error) = control.restore_pending(&mut pending) {
         drop(turn);
@@ -701,6 +703,7 @@ pub(super) async fn run_restored(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .publish(control.clone());
     let result = turn.await;
+    drop(progress);
     controls
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

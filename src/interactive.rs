@@ -2212,13 +2212,18 @@ pub enum PiMsg {
         content: Vec<ContentBlock>,
         details: Option<Value>,
     },
+    /// FTUI's operation-owned lifecycle and bounded progress mailbox.
+    /// Progress replaces a mailbox snapshot without entering the driver
+    /// queue. The classic interface uses its own stream batcher.
+    #[cfg(feature = "ftui")]
+    FtuiToolProgress(crate::interactive_ftui::tool_progress::Event),
     /// An accepted out:// write. It is assistant prose within the current
     /// turn, not a task completion or a tool-output preview.
     InterimResponse { tool_id: String, text: String },
     /// Tool execution ended. `output` carries an OPTIONAL size-capped text
     /// preview of the tool result (bd-cv653.9.2 diff cards); `None` when
-    /// the surface folds output elsewhere (e.g. the ftui bash flow) or the
-    /// result had no text content.
+    /// the surface folds output elsewhere (e.g. the ftui bash flow).
+    /// `Some("")` is an authoritative empty result that clears a live preview.
     ToolEnd {
         name: String,
         tool_id: String,

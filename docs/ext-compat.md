@@ -909,20 +909,78 @@ session provenance, but not automatic task-local attribution across every
 Promise continuation. A tool that settles while abandoning unrelated-looking
 background work therefore does not cause that work to be cancelled implicitly.
 
+#### FTUI live previews
+
+FTUI displays an extension tool's text progress in its existing pending card.
+Each accepted snapshot replaces the previous preview, including a shorter or
+empty snapshot, and changes the card's render revision when its visible detail
+changes. Progress leaves the card pending until the tool finishes.
+
+The FTUI forwarder owns an operation scope tied to the displayed session.
+Each tracked invocation gets a private presentation identity and a replaceable
+mailbox. Public tool-call IDs remain opaque lookup keys; only displayed names,
+summaries, and output are terminal-sanitized. The UI checks both operation
+identity and session ownership before accepting a card or its progress.
+Completion, operation retirement, and conversation reset close the relevant
+mailboxes, so retained callbacks and queued messages cannot revive their
+progress in a later operation.
+
+Progress tracking admits at most **128 active tools** and remembers at most
+**1,024 distinct call IDs per operation**. Call IDs and tool names used by that
+tracker are limited to **4,096 bytes** each. Reused IDs, oversized keys, and
+capacity exhaustion suppress live progress for the affected invocation while
+preserving the existing lifecycle and terminal-result path.
+
+Each mailbox keeps only its latest bounded text preview: up to **200 lines**,
+with up to **300 Unicode characters per line**, plus truncation markers. The
+preview is built directly from borrowed text blocks. Images and arbitrary
+`details` objects are not copied into this presentation channel. Progress
+updates enqueue no notifications or result payloads; ordered lifecycle messages
+establish and finish the card. FTUI polls active mailboxes on its existing
+**120 ms spinner heartbeat**, so updates between polls coalesce. This is a poll
+cadence, not a guarantee that every intermediate snapshot appears on screen.
+If terminal suspension or an external editor consumes and parks a tick,
+returning terminal ownership rearms that heartbeat without adding another
+chain when a timer is already pending.
+
+The terminal result closes progress before its final preview is delivered and
+replaces any partial text. A final result without text clears the partial
+preview. Manual shell cards keep their existing behavior: a `BashResult` can
+fold output into the card before a `ToolEnd` without a replacement preview.
+The classic terminal and RPC retain their existing update consumers. Interim
+`out://` replies become assistant prose only after successful completion;
+provisional updates do not publish those replies.
+
+These are generic text previews. Full JavaScript `renderCall` and
+`renderResult` callbacks, custom tool components, and rich `details` rendering
+remain unsupported in the FTUI tool-card path. Presentation buffering does
+not change the tool result supplied to the model or persisted in the session.
+
+#### Verification
+
 The supplementary `scripts/pijs_tool_lifecycle_probe.mjs` diagnostic pins the
 unchanged repository subagent example and runs the actual PiJS JavaScript
-registration, dispatch, signal, and lifetime code in Node. Its 15 checks pass;
-the previous bridge fails all 15. The real example receives partial results
-and invokes its child `SIGTERM` handler on abort. Child processes, native sinks,
-and other host facilities are controlled fixtures: this verifies JavaScript
-behavior, not native child termination, actor cancellation, or Windows.
+registration, dispatch, signal, and lifetime code in Node. Its **16 checks
+pass**; the pre-lifecycle bridge at `152c13d` fails all 16. The real example
+emits a shorter replacement snapshot in single mode, detached aggregate
+snapshots in parallel mode, and a parallel terminal summary distinct from its
+last progress message. It also invokes its child `SIGTERM` handler on abort.
+Child processes, native sinks, and other host facilities are controlled
+fixtures: this verifies JavaScript behavior at the bridge sink, not native
+child termination, actor cancellation, FTUI delivery, or Windows. The bridge
+at `c15db1a`, before the FTUI delivery change, also passes these 16 checks;
+the source diagnostic does not establish the native UI fix.
 
 Native regressions cover wrapper progress delivery, caller abandonment,
 deadlines, late callbacks, mailbox bounds, hostcall scheduling, and isolation
-after unresponsive tools. They require the DSR native runner before their
-results can be claimed as executed verification. The published
+after unresponsive tools. FTUI regressions cover bounded preview transport,
+pending-card updates, replacement and final-output handling, and operation
+and session isolation. They require the DSR native runner before their results
+can be claimed as executed verification; native FTUI and Windows behavior
+remain unexecuted here. The published
 `context-mode@1.0.169` tool callback ignores Pi's signal and progress callback;
-this host feature alone does not establish cancellation of that package.
+these host features alone do not establish cancellation or streamed progress
+for that package.
 The existing owner-scoped configuration, persistent-storage, SQLite, session
 identity, and grapheme mechanisms are independent of invocation lifetime.
 
