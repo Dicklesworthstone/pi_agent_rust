@@ -419,8 +419,13 @@ and drops the request. Process cleanup uses synchronous OS kill/reap operations,
 so this is not a hard real-time guarantee. Cancellation cannot reverse work or
 charges already accepted by a provider. Requests are not automatically retried.
 
-Artifacts are staged beside their destination, synced, and published with
-no-clobber persistence. Existing files and symlinks at the destination are
+Artifact destinations are prepared before credential helpers or provider calls.
+The same prepared target is retained until publication, including when an
+automatic filename receives its extension from the provider's actual format.
+On Unix, this preserves the pinned workspace descriptor across the request;
+replacing the workspace before publication is rejected. Artifacts are staged
+beside their destination, synced, and published with no-clobber persistence.
+Existing files and symlinks at the destination are
 rejected, including a destination created concurrently. A failed request does
 not publish a success artifact. Image checks are basic container checks, not a
 full decoder or decompression-bomb guard. No claim of decoded visual or acoustic

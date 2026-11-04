@@ -24,6 +24,30 @@ impl OutputTarget {
     pub fn path(&self) -> &Path {
         &self.absolute
     }
+
+    /// Choose a format after remote work without reopening the workspace.
+    /// The retained root descriptor and relative parent stay unchanged;
+    /// publication checks the final filename atomically for no-clobber.
+    pub(crate) fn with_extension(&self, extension: &str, tool: &str) -> Result<Self> {
+        if extension.is_empty()
+            || extension.len() > 32
+            || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(error(
+                tool,
+                "artifact extension must contain 1..=32 ASCII letters or digits",
+            ));
+        }
+        let relative = self.relative.with_extension(extension);
+        if relative.as_os_str().len() > 4096 {
+            return Err(error(tool, "artifact path exceeds 4096 bytes"));
+        }
+        Ok(Self {
+            absolute: self.root.join(&relative),
+            relative,
+            ..self.clone()
+        })
+    }
 }
 
 fn error(tool: &str, message: impl Into<String>) -> Error {
@@ -600,6 +624,60 @@ mod tests {
         assert_eq!(std::fs::read(target.path()).unwrap(), b"first");
         assert!(publish(&target, b"second", "test").is_err());
         assert_eq!(std::fs::read(target.path()).unwrap(), b"first");
+    }
+
+    #[test]
+    fn format_selection_cannot_change_the_parent_or_create_files() {
+        let root = tempfile::tempdir().unwrap();
+        let target = resolve_new(root.path(), "nested/result", "test").unwrap();
+        for extension in ["", "../png", "a/png", "a\\png", ".png", "pn\ng"] {
+            assert!(
+                target.with_extension(extension, "test").is_err(),
+                "{extension:?}"
+            );
+        }
+        let selected = target.with_extension("jpg", "test").unwrap();
+        assert_eq!(
+            selected.path(),
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("nested/result.jpg")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn format_selection_retains_identity_across_root_and_ancestor_swaps() {
+        use std::os::unix::fs::symlink;
+
+        for replace_ancestor in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let ancestor = parent.path().join("ancestor");
+            let root = ancestor.join("workspace");
+            let moved = parent.path().join("original");
+            std::fs::create_dir_all(&root).unwrap();
+            let target = resolve_new(&root, "nested/result", "test").unwrap();
+            let original_root = if replace_ancestor {
+                std::fs::create_dir(outside.path().join("workspace")).unwrap();
+                std::fs::rename(&ancestor, &moved).unwrap();
+                symlink(outside.path(), &ancestor).unwrap();
+                moved.join("workspace")
+            } else {
+                std::fs::rename(&root, &moved).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                moved
+            };
+
+            // Format selection must not resolve the now-replaced pathname.
+            let selected = target.with_extension("webp", "test").unwrap();
+            let failure = publish(&selected, b"private payload", "test").unwrap_err();
+            assert!(failure.to_string().contains("workspace root changed"));
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(&original_root).unwrap().count(), 0);
+        }
     }
 
     #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]

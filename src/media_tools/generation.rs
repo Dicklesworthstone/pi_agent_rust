@@ -173,6 +173,10 @@ impl Tool for GenerateImageTool {
         let is_mock = self
             .mock_mode
             .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
+        if !is_mock {
+            self.transport.check_admission(NAME)?;
+        }
+        let artifact = artifact::preflight(&self.cwd, requested, "images/generated", NAME)?;
         let api = if is_mock {
             None
         } else {
@@ -182,7 +186,6 @@ impl Tool for GenerateImageTool {
                     .await?,
             )
         };
-        artifact::preflight(&self.cwd, requested, NAME)?;
         let reference_count = inputs::attach(
             &self.cwd,
             provider,
@@ -214,9 +217,7 @@ impl Tool for GenerateImageTool {
             }
         };
         let path = artifact::publish(
-            &self.cwd,
-            requested,
-            "images/generated",
+            &artifact,
             extension,
             &bytes,
             api.as_ref().map(|api| &api.owner),

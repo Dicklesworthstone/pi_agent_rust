@@ -38,6 +38,17 @@ impl Transport {
         self
     }
 
+    /// Refuse native work before output preflight touches the filesystem.
+    /// `api` still captures and checks the invocation account before helpers;
+    /// this early check must not replace either request admission boundary.
+    pub(super) fn check_admission(&self, tool: &str) -> Result<()> {
+        check_owner(tool, &AgentCx::for_current_or_request())?;
+        if let Some(budget) = self.cost_scope.current() {
+            budget.admit()?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn api(
         &self,
         tool: &'static str,

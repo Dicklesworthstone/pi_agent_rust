@@ -170,16 +170,10 @@ impl Tool for TtsTool {
         let requested = transport::optional(&args, NAME, "output_path")?;
         let duration = transport::timeout(&args, NAME, 120_000)?;
         let (endpoint, body) = request(provider, voice, text, format, &args)?;
-        let api = if is_mock {
-            None
-        } else {
-            Some(
-                self.transport
-                    .api(NAME, provider, self.api_key.as_deref(), duration)
-                    .await?,
-            )
-        };
-        artifact::preflight(&self.cwd, requested, NAME)?;
+        if !is_mock {
+            self.transport.check_admission(NAME)?;
+        }
+        let artifact = artifact::preflight(&self.cwd, requested, "audio/speech", NAME)?;
         if let Some(path) = requested {
             let extension = Path::new(path)
                 .extension()
@@ -192,6 +186,15 @@ impl Tool for TtsTool {
                 ));
             }
         }
+        let api = if is_mock {
+            None
+        } else {
+            Some(
+                self.transport
+                    .api(NAME, provider, self.api_key.as_deref(), duration)
+                    .await?,
+            )
+        };
         let (bytes, mime) = if let Some(api) = api.as_ref() {
             let response = api.post(endpoint, &body, MAX_AUDIO_BYTES).await?;
             let mime = validate_audio(&response.bytes, format, &response.content_type)?;
@@ -206,9 +209,7 @@ impl Tool for TtsTool {
             (super::MIN_VALID_WAV.to_vec(), "audio/wav")
         };
         let path = artifact::publish(
-            &self.cwd,
-            requested,
-            "audio/speech",
+            &artifact,
             format,
             &bytes,
             api.as_ref().map(|api| &api.owner),
