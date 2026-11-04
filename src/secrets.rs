@@ -76,6 +76,7 @@ pub struct SecretsSettings {
     /// off | obfuscate | block (default obfuscate).
     pub mode: Option<String>,
     /// User-added regex patterns (each nonempty match becomes a placeholder).
+    #[serde(alias = "extraPatterns")]
     pub extra_patterns: Option<Vec<String>>,
 }
 

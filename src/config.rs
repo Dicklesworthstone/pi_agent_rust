@@ -270,12 +270,20 @@ pub struct Config {
 
     /// Auto-compaction mode (bd-cv653.3.18): "summary" (default) |
     /// "shake-first" | "aggressive".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "compactionMode",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub compaction_mode: Option<crate::compaction::AutoCompactionMode>,
 
     /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15):
     /// "off" | "conservative" (default) | "aggressive".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "turnRecovery",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub turn_recovery: Option<crate::turn_recovery::TurnRecoveryMode>,
 
     // Extension Policy
@@ -2926,6 +2934,35 @@ mod tests {
             let source = format!(r#"{{"title":{{"refreshAfterPrompts":{invalid}}}}}"#);
             assert!(serde_json::from_str::<Config>(&source).is_err());
         }
+    }
+
+    /// gh #281: the remaining snake_case-only settings accept camelCase too,
+    /// like every other multi-word key.
+    #[test]
+    fn camel_case_spellings_reach_the_last_snake_case_only_settings() {
+        let source = r#"{
+            "compactionMode": "shake-first",
+            "turnRecovery": "off",
+            "secrets": { "extraPatterns": ["sk-[a-z]+"] }
+        }"#;
+        assert!(
+            unrecognised_setting_keys(source).is_empty(),
+            "{:?}",
+            unrecognised_setting_keys(source)
+        );
+        let config: Config = serde_json::from_str(source).expect("camelCase settings");
+        assert_eq!(
+            config.compaction_mode,
+            Some(crate::compaction::AutoCompactionMode::ShakeFirst)
+        );
+        assert!(matches!(
+            config.turn_recovery,
+            Some(crate::turn_recovery::TurnRecoveryMode::Off)
+        ));
+        assert_eq!(
+            config.secrets.and_then(|secrets| secrets.extra_patterns),
+            Some(vec![String::from("sk-[a-z]+")])
+        );
     }
 
     #[test]
