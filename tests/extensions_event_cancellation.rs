@@ -489,7 +489,7 @@ mod runtime_lifetime {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
-    const COMPLETED_OWNER: &str = r#"
+    const COMPLETED_OWNER: &str = r"
         export default function(pi) {
             let starts = 0;
             pi.on('session_start', () => { starts++; });
@@ -499,9 +499,9 @@ mod runtime_lifetime {
                 execute() { return { content: [], details: { starts } }; }
             });
         }
-    "#;
+    ";
 
-    const ACTIVE_OWNER: &str = r#"
+    const ACTIVE_OWNER: &str = r"
         export default function(pi) {
             let starts = 0;
             pi.registerTool({
@@ -554,9 +554,9 @@ mod runtime_lifetime {
                 return null;
             });
         }
-    "#;
+    ";
 
-    const UNTOUCHED_PEER: &str = r#"
+    const UNTOUCHED_PEER: &str = r"
         export default function(pi) {
             let starts = 0;
             let queued = 0;
@@ -568,7 +568,7 @@ mod runtime_lifetime {
                 execute() { return { content: [], details: { starts, queued } }; }
             });
         }
-    "#;
+    ";
 
     #[derive(Default)]
     struct NativeCalls {

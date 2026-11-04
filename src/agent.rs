@@ -15845,12 +15845,12 @@ mod abort_tests {
             let entry = temp.path().join("startup.js");
             std::fs::write(
                 &entry,
-                r#"export default function(pi) {
+                r"export default function(pi) {
                     pi.on('before_agent_start', async () => {
                         await pi.tool('read', {});
                         return { systemPrompt: 'late readiness prompt' };
                     });
-                }"#,
+                }",
             )
             .expect("extension fixture");
             let (abort_handle, abort_signal) = AbortHandle::new();

@@ -1526,7 +1526,7 @@ impl PiApp {
             .invalidate_background_compaction();
         agent_guard.set_provider(provider_impl);
         agent_guard.set_tool_call_dialect(next.tool_call_dialect());
-        agent_guard.set_keyword_model(&next);
+        agent_guard.set_keyword_model(next);
         agent_guard.set_model_accepts_images(
             next.model
                 .input

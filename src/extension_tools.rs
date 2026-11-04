@@ -413,7 +413,7 @@ mod tests {
         (temp_dir, manager, js_runtime, def)
     }
 
-    const TOOL_INVOCATION_FIXTURE: &str = r#"
+    const TOOL_INVOCATION_FIXTURE: &str = r"
         export default function init(pi) {
           let abortCount = 0;
           let savedUpdate;
@@ -465,7 +465,7 @@ mod tests {
             }
           });
         }
-    "#;
+    ";
 
     struct ProgressGateTool {
         release: StdMutex<Option<futures::channel::oneshot::Receiver<()>>>,
@@ -741,7 +741,7 @@ mod tests {
             let healthy_path = healthy_directory.join("index.mjs");
             std::fs::write(
                 &cpu_path,
-                r#"
+                r"
                 export default function init(pi) {
                   pi.registerTool({
                     name: 'cpu_tool', description: 'Never yields to the event loop',
@@ -749,12 +749,12 @@ mod tests {
                     execute() { while (true) {} }
                   });
                 }
-                "#,
+                ",
             )
             .expect("cpu extension");
             std::fs::write(
                 &healthy_path,
-                r#"
+                r"
                 export default function init(pi) {
                   pi.registerTool({
                     name: 'healthy_tool', description: 'Independent extension',
@@ -770,7 +770,7 @@ mod tests {
                     }
                   });
                 }
-                "#,
+                ",
             )
             .expect("healthy extension");
             let manager = ExtensionManager::new();

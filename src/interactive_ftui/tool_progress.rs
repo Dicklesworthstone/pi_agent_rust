@@ -271,10 +271,10 @@ impl Shared {
                 result,
                 is_error,
             } => {
-                if !state
+                if state
                     .active
                     .get(tool_call_id)
-                    .is_some_and(|active| active.name == *tool_name)
+                    .is_none_or(|active| active.name != *tool_name)
                 {
                     let fallback = if let Some(pending) = state.seen.get_mut(tool_call_id) {
                         let expected = *pending > 0;
@@ -791,7 +791,7 @@ mod tests {
         bridge.observe(&start_event(&id, "subagent"));
         // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
         assert!(
-            matches!(next(&receiver), Event::Message { message, .. } if matches!(*message, PiMsg::ToolStart { tool_id, .. } if tool_id == id))
+            matches!(next(&receiver), Event::Message { message, .. } if matches!(&*message, PiMsg::ToolStart { tool_id, .. } if *tool_id == id))
         );
         bridge.observe(&update(&id, "subagent", "suppressed"));
         // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.

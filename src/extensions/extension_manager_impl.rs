@@ -5348,11 +5348,12 @@ impl ExtensionManager {
     /// JavaScript hooks use the lock-free, O(1) registry bitmap. Optional WASM
     /// registrations live outside that bitmap and are checked on a miss.
     pub fn has_hook_for(&self, event_name: &str) -> bool {
-        if self.read_snapshot().hook_bitmap.contains(event_name) {
-            return true;
-        }
+        let in_bitmap = self.read_snapshot().hook_bitmap.contains(event_name);
         #[cfg(feature = "wasm-host")]
         {
+            if in_bitmap {
+                return true;
+            }
             let guard = self
                 .inner
                 .lock()
@@ -5363,7 +5364,7 @@ impl ExtensionManager {
                 .any(|ext| ext.event_hooks().iter().any(|hook| hook == event_name))
         }
         #[cfg(not(feature = "wasm-host"))]
-        false
+        in_bitmap
     }
 
     /// Returns `true` if at least one event hook is registered across all

@@ -27332,6 +27332,7 @@ mod tests {
 #[cfg(test)]
 mod known_tool_name_tests {
     use super::*;
+    use serde_json::Value;
 
     struct CatalogTool {
         name: &'static str,
@@ -27433,7 +27434,7 @@ mod known_tool_name_tests {
                     "Existing essential default",
                     ToolOrigin::BuiltIn,
                 ),
-            ])
+            ]);
         });
         let original = shared.snapshot();
         assert!(original.get("denied").is_none());
@@ -27455,7 +27456,7 @@ mod known_tool_name_tests {
                 "late",
                 "Replacement catalog version",
                 ToolOrigin::BuiltIn,
-            ))
+            ));
         });
         let replacement = shared.snapshot();
         let second = describe_catalog_tool(&replacement, "late");
@@ -27476,7 +27477,7 @@ mod known_tool_name_tests {
                 "late",
                 "Refreshed promoted tool",
                 ToolOrigin::BuiltIn,
-            ))
+            ));
         });
         let promoted = shared.snapshot();
         assert!(promoted.get("late").is_some());
@@ -27597,7 +27598,7 @@ mod known_tool_name_tests {
                 "xdev",
                 "Foreign dispatcher",
                 ToolOrigin::BuiltIn,
-            ))
+            ));
         });
         let foreign = shared.snapshot();
         shared.update(|registry| {
@@ -27605,7 +27606,7 @@ mod known_tool_name_tests {
                 "late",
                 "Changed after dispatcher replacement",
                 ToolOrigin::BuiltIn,
-            ))
+            ));
         });
         let current = shared.snapshot();
         let before = foreign

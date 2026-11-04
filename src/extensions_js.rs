@@ -21055,7 +21055,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let checked_path = if allowed {
                                 crate::extensions::safe_canonicalize(&requested_abs)
                             } else {
-                                requested_abs.clone()
+                                requested_abs
                             };
                             log_host_fs_decision(
                                 "read",
@@ -21128,7 +21128,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let checked_path = if allowed {
                                 crate::extensions::safe_canonicalize(&requested_abs)
                             } else {
-                                requested_abs.clone()
+                                requested_abs
                             };
                             log_host_fs_decision(
                                 "write",

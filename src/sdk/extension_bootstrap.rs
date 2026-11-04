@@ -208,18 +208,18 @@ async fn finish_selection_inner(
         options.thinking_level = Some(selection.thinking_level);
         options.max_tokens = Some(selection.model_entry.model.max_tokens);
     }
-    if !inputs.preserve_compaction_window {
+    if inputs.preserve_compaction_window {
+        // Provider replacement clears usage metadata. Preserve the embedder's
+        // explicit window and reinstall it for this provider's request snapshots.
+        let window = session.compaction_settings().context_window_tokens;
+        session.agent.set_context_window_tokens(Some(window));
+    } else {
         let window = selection.model_entry.model.context_window;
         session.set_compaction_context_window(if window == 0 {
             crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
         } else {
             window
         });
-    } else {
-        // Provider replacement clears usage metadata. Preserve the embedder's
-        // explicit window and reinstall it for this provider's request snapshots.
-        let window = session.compaction_settings().context_window_tokens;
-        session.agent.set_context_window_tokens(Some(window));
     }
     app::update_session_for_selection(&mut stored, &selection, &candidate_registry);
     drop(stored);

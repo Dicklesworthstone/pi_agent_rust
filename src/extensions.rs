@@ -11266,7 +11266,7 @@ impl JsToolInvocation {
         if !self
             .progress
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .open
         {
             return Ok(());
@@ -11282,7 +11282,10 @@ impl JsToolInvocation {
             rquickjs::Error::new_into_js_message("tool update", "ToolUpdate", err.to_string())
         })?;
         {
-            let mut progress = self.progress.lock().unwrap_or_else(|err| err.into_inner());
+            let mut progress = self
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !progress.open || self.is_cancelled() {
                 return Ok(());
             }
@@ -11298,7 +11301,7 @@ impl JsToolInvocation {
     fn take_update(&self) -> Option<ToolUpdate> {
         self.progress
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .latest
             .take()
     }
@@ -11306,13 +11309,16 @@ impl JsToolInvocation {
     fn close_progress(&self) {
         self.progress
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .open = false;
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, StdOrdering::Release);
-        let mut progress = self.progress.lock().unwrap_or_else(|err| err.into_inner());
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         progress.open = false;
         progress.latest = None;
     }
@@ -16451,7 +16457,7 @@ async fn execute_extension_tool_sharded(
             let on_update = if invocation
                 .progress
                 .lock()
-                .unwrap_or_else(|err| err.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .open
             {
                 let sink = Arc::clone(&invocation);
