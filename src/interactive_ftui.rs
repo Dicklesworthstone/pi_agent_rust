@@ -3831,7 +3831,14 @@ impl PiFtuiModel {
                     selection.focus = point;
                 }
                 if !selection.is_empty() {
-                    let transcript = self.conversation_text(self.term.0);
+                    let areas = layout_regions(
+                        Rect::new(0, 0, self.term.0, self.rendered_frame_height.get()),
+                        self.input_rows_at_width(self.term.0),
+                        u16::from(self.error_banner.is_some()),
+                        self.widget_rows(),
+                        self.completion_rows(),
+                    );
+                    let transcript = self.conversation_text(areas.body.width);
                     match transcript_selection::selected_text(
                         transcript.lines(), selection, 256 * 1024
                     ) {
@@ -5521,6 +5528,7 @@ impl PiFtuiModel {
                 // mid-turn — the editor gate (`input_active`) already blocks
                 // input while the agent works.
                 self.transcript.clear();
+        self.transcript_selection = None;
                 self.render_cache.borrow_mut().clear();
                 self.streaming.clear();
                 self.thinking.clear();
@@ -7311,6 +7319,7 @@ impl PiFtuiModel {
         self.retire_tool_progress();
         self.current_tool = None;
         self.transcript.clear();
+        self.transcript_selection = None;
         self.render_cache.borrow_mut().clear();
         self.streaming.clear();
         // A resumed conversation's prompts become recallable (up arrow) when

@@ -57,7 +57,17 @@ pub(super) fn selected_text(
     let mut output = String::new();
     for row in start.row..=end.row {
         if row > start.row {
-            output.push('\n');
+            // A single OSC-8 link split across visual rows is one
+            // continuous destination, not text containing newlines.
+            let prior = lines[row - 1].spans().iter().rev()
+                .find(|span| !span.is_empty())
+                .and_then(|span| span.link.as_deref());
+            let next = lines[row].spans().iter()
+                .find(|span| !span.is_empty())
+                .and_then(|span| span.link.as_deref());
+            if prior.is_none() || prior != next {
+                output.push('\n');
+            }
         }
         let line = &lines[row];
         let begin = if row == start.row { start.cell } else { 0 };
@@ -136,7 +146,7 @@ mod tests {
             focus: Point { row: last, cell: rows[last].width() },
         };
         let extracted = selected_text(&rows, selection, 1024).expect("selected link");
-        assert_eq!(extracted.replace('\n', ""), target);
+        assert_eq!(extracted, target);
         let mut marked = rows;
         highlight(&mut marked, selection, ftui::PackedRgba::rgb(70, 100, 130));
         for row in &marked {
@@ -148,7 +158,7 @@ mod tests {
 
     #[test]
     fn selection_supports_reverse_drag_and_bounded_output() {
-        let lines = vec![Line::raw("before".to_string()), Line::raw("after".to_string())];
+        let lines = vec![Line::styled("before", ftui::Style::new()), Line::styled("after", ftui::Style::new())];
         let selection = Selection {
             anchor: Point { row: 1, cell: 3 },
             focus: Point { row: 0, cell: 2 },
@@ -159,7 +169,7 @@ mod tests {
 
     #[test]
     fn identical_endpoints_are_not_a_selection() {
-        let lines = vec![Line::raw("hello".to_string())];
+        let lines = vec![Line::styled("hello", ftui::Style::new())];
         let point = Point { row: 0, cell: 2 };
         assert!(selected_text(&lines, Selection::new(point), 100).is_none());
     }
