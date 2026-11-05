@@ -29,15 +29,18 @@ printf '%s\n' "$$" >> launches
 provider=
 model=
 thinking=
+fallback=
 while [ "$#" -gt 0 ]; do
     case "$1" in
       --provider) shift; provider="$1" ;;
       --model) shift; model="$1" ;;
       --thinking) shift; thinking="$1" ;;
+      --subagent-fallback-policy) shift; fallback="$1" ;;
     esac
     shift
 done
 printf '%s|%s|%s\n' "$provider" "$model" "$thinking" >> model-selections
+printf '%s\n' "$fallback" >> model-policies
 count=0
 busy=0
 while IFS= read -r line; do
@@ -394,7 +397,47 @@ async fn finish_pool(fixture: &Fixture, pool: &str, job: &str) -> crate::jobs::J
 #[test]
 fn worker_and_pool_models_freeze_at_launch_and_cannot_change_on_send() -> TestResult {
     let _guard = crate::jobs::process_test_guard();
-    let fixture = Fixture::new(Some(&schema()));
+    exercise_model_freeze(
+        json!("worker-selection-local/worker-selected:high"),
+        json!("worker-selection-local/worker-selected:low"),
+        crate::config::Config::default(),
+    )
+}
+
+#[test]
+fn worker_and_pool_role_destinations_and_recovery_roles_freeze_at_launch() -> TestResult {
+    let _guard = crate::jobs::process_test_guard();
+    exercise_model_freeze(
+        json!({"role":"slow"}),
+        json!({"role":"smol"}),
+        crate::config::Config {
+            model_roles: Some(crate::config::ModelRoleSettings {
+                slow: Some("worker-selection-local/worker-selected:high".to_string()),
+                smol: Some("worker-selection-local/worker-selected:low".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+fn exercise_model_freeze(
+    worker_model: Value,
+    pool_model: Value,
+    config: crate::config::Config,
+) -> TestResult {
+    let worker_role = worker_model
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    let pool_role = pool_model
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    let mut fixture = Fixture::new(Some(&schema()));
+    fixture.tool.model_config = Some(config);
     std::fs::write(
         fixture.root.path().join("global/models.json"),
         json!({"providers": {
@@ -409,7 +452,7 @@ fn worker_and_pool_models_freeze_at_launch_and_cannot_change_on_send() -> TestRe
         let started = fixture
             .call(
                 json!({"operation":"worker_start", "agent":"typed", "task":"valid",
-            "model":"worker-selection-local/worker-selected:high"}),
+            "model":worker_model}),
             )
             .await?;
         let id = started["workerId"].as_str().unwrap();
@@ -417,7 +460,7 @@ fn worker_and_pool_models_freeze_at_launch_and_cannot_change_on_send() -> TestRe
         let pooled = fixture
             .call(
                 json!({"operation":"pool_start", "agent":"typed", "concurrency":2,
-            "tasks":["valid", "valid"], "model":"worker-selection-local/worker-selected:low"}),
+            "tasks":["valid", "valid"], "model":pool_model}),
             )
             .await?;
         let pool = pooled["poolId"].as_str().unwrap();
@@ -431,12 +474,27 @@ fn worker_and_pool_models_freeze_at_launch_and_cannot_change_on_send() -> TestRe
             fixture.root.path().join("global/models.json"),
             "{\"providers\":{}}",
         )?;
+        fixture.tool.model_config = Some(crate::config::Config::default());
         assert!(
             fixture
                 .call(
                     json!({"operation":"worker_send", "workerId":id, "task":"valid",
             "model":"another/model"})
                 )
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .call(json!({"operation":"worker_send", "workerId":id, "task":"valid",
+                    "model":{"role":"tiny"}}))
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .call(json!({"operation":"pool_push", "poolId":pool, "tasks":["valid"],
+                    "model":{"role":"tiny"}}))
                 .await
                 .is_err()
         );
@@ -480,6 +538,35 @@ fn worker_and_pool_models_freeze_at_launch_and_cannot_change_on_send() -> TestRe
                 "worker-selection-local|worker-selected|low",
             ]
         );
+        let mut policies = std::fs::read_to_string(fixture.root.path().join("model-policies"))?
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line)
+                    .map(|policy| policy["role"].as_str().unwrap().to_string())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        policies.sort();
+        let mut expected = vec![worker_role, pool_role.clone(), pool_role];
+        expected.sort();
+        assert_eq!(policies, expected);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+#[test]
+fn missing_roles_never_start_a_retained_child_or_publish_a_job() -> TestResult {
+    let _guard = crate::jobs::process_test_guard();
+    let fixture = Fixture::new(None);
+    run(async {
+        for input in [
+            json!({"operation":"worker_start", "agent":"typed", "task":"valid", "model":{"role":"smol"}}),
+            json!({"operation":"pool_start", "agent":"typed", "tasks":["valid"], "model":{"role":"slow"}}),
+        ] {
+            let error = fixture.call(input).await.unwrap_err().to_string();
+            assert!(error.contains("PI_SUBAGENT_MODEL"), "{error}");
+            assert!(!fixture.root.path().join("launches").exists());
+            assert!(crate::jobs::list(&fixture.owner)?.is_empty());
+        }
         Ok::<_, Box<dyn std::error::Error>>(())
     })
 }

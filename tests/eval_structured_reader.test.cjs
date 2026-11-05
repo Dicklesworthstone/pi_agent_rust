@@ -102,7 +102,7 @@ test('agent handles survive a cell boundary while each operation reenters the ho
     await assert.rejects(denied,/PI_JOBS_UNKNOWN_ID/);
 });
 test('agent options cannot override the operation or remove explicit backgrounding', async () => {
-    for (const option of ['async','task','op','operation','model','__proto__']) {
+    for (const option of ['async','task','op','operation','__proto__']) {
         const h = host();
         const expression = `agent('inspect',JSON.parse(${JSON.stringify(JSON.stringify({[option]:'override'}))}))`;
         await assert.rejects(vm.runInContext(expression,h.context),/unknown option/);
@@ -577,6 +577,29 @@ const workerSnapshot = (workerId, turnId = 1, status = 'running', result = null)
     status:status === 'completed' ? 'idle' : status === 'cancelled' ? 'closed' : 'running',
     turnId, turn:{id:turnId,status,result},
 });
+test('agent factories forward exact and structured role selections to native admission', async () => {
+    for (const model of ['smol', {role:'smol'}]) {
+        for (const keepAlive of [false, true]) {
+            const h = host();
+            const pending = vm.runInContext(
+                `agent('inspect',{agent:'scout',model:${JSON.stringify(model)},keepAlive:${keepAlive}})`,
+                h.context);
+            const request = h.requests.at(-1);
+            assert.deepEqual(request.args,{name:'subagent',args:{agent:'scout',model,task:'inspect',
+                ...(keepAlive ? {operation:'worker_start'} : {async:true})}});
+            answer(h,request,keepAlive ? workerSnapshot('worker-native')
+                : {schema:'pi.subagent.background.v1',jobId:'job-native'});
+            await pending;
+            assert.equal(h.requests.length,1);
+        }
+    }
+    const h = host();
+    const pending = vm.runInContext("agent('inspect',{model:{role:'smol'}})",h.context);
+    const request = h.requests.at(-1);
+    h.dispatch.dispatch(request.id,false,false,'PI_SUBAGENT_MODEL: role is not configured');
+    await assert.rejects(pending,/PI_SUBAGENT_MODEL/);
+    assert.equal(h.requests.length,1,'native admission refusal cannot retry with another model');
+});
 const turnResult = turn => ({content:[{type:'text',text:`turn ${turn}`}],details:{turn}});
 const answer = (h, request, details) => h.dispatch.dispatch(request.id,false,true,JSON.stringify(envelope(details)));
 async function launchWorker(h, variable = 'worker', workerId = 'worker-native') {
@@ -1009,10 +1032,10 @@ test('workpool validates every task and option before dispatch and admits 32 ite
 });
 test('workpool forwards native launch options while keeping its display name local', async () => {
     const h = host(); const native = poolHost(h);
-    await createPool(h,{agent:'scout',concurrency:3,name:'review',cwd:'.',scope:'project',isolation:'none',timeoutSeconds:120});
+    await createPool(h,{agent:'scout',concurrency:3,name:'review',cwd:'.',scope:'project',isolation:'none',model:{role:'tiny'},timeoutSeconds:120});
     await runPool(h,"pool.push(['inspect'])",native.reply);
     assert.deepEqual(h.requests[0].args.args,{agent:'scout',cwd:'.',scope:'project',isolation:'none',timeoutSeconds:120,
-        operation:'pool_start',concurrency:3,tasks:['inspect']});
+        operation:'pool_start',concurrency:3,tasks:['inspect'],model:{role:'tiny'}});
     assert.equal(vm.runInContext('pool.name',h.context),'review');
 });
 test('a lost batch acknowledgment preserves handles and reconciles native admission without replay', async () => {

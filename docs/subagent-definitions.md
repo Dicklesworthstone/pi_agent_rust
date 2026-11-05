@@ -113,13 +113,46 @@ are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; the selected
 model must support the requested level. A registered literal model ID wins
 before suffix parsing, preserving local IDs such as `vendor/model:1`.
 
+For intent-based routing, use an explicit object instead of a model string:
+
+```json
+{
+  "tasks": [
+    {"agent": "sonic", "task": "Update the named references.", "model": {"role": "smol"}},
+    {"agent": "reviewer", "task": "Inspect the parser for correctness defects.", "model": {"role": "slow"}}
+  ]
+}
+```
+
+Each requested role must have its own assignment in the host's trusted
+`modelRoles` settings. For example:
+
+```json
+{
+  "modelRoles": {
+    "smol": "openai/gpt-5-mini:low",
+    "slow": "anthropic/claude-sonnet-4-6:high"
+  }
+}
+```
+
+Canonical role names are `default`, `smol`, `slow`, `plan`, `commit`, `vision`,
+`designer`, `task`, `advisor`, and `tiny`. Missing assignments, including a
+missing `modelRoles.default`, are errors; delegation never substitutes another
+role, the current conversation model, or a default model. The object must
+contain only `role`, using its exact lowercase name. Configure the effort in
+the role's model selector. A bare `"smol"` remains an exact catalog model ID,
+so adding a role cannot change how an existing literal selector is interpreted.
+
 Precedence is **per-call model → definition model → task role → smol role →
 captured parent → ordinary child configuration**. An explicit thinking suffix
-overrides the definition's `thinking`; omitting it preserves existing effort
-selection. Unknown or ambiguous models, missing configured credentials,
+in a string or configured role overrides the definition's `thinking`; omitting
+it preserves existing effort selection. Unknown or ambiguous models, missing configured credentials,
 disabled providers and unsupported effort fail before any child, isolated
 worktree, or background acknowledgment. Batch-wide `model` is rejected: put it
-on each task. Null, arrays, patterns and role aliases are rejected too.
+on each task. Null, arrays, patterns and string role aliases such as `@smol`
+are rejected too. Saved-session `seance` accepts only the exact-model string
+form and otherwise continues to use its saved branch model.
 
 Admission uses the host's effective provider policy and the longest matching
 workspace scope at both host and task directories. As with explicit CLI model
@@ -132,6 +165,10 @@ provider during admission; child startup still loads its own model metadata and
 credentials. The frozen model selection carries only provider, model ID, and optional
 thinking level, so changing the parent's model cannot reroute queued work,
 schema retries, workflow descendants, or explicit hub revival.
+An explicit role also captures that role's configured retry/fallback policy;
+it does not infer a role from the selected model ID. Later settings changes
+cannot redirect admitted work or replace its recovery policy. An invalid
+primary role assignment fails admission instead of selecting a fallback.
 
 `worker_start` and `pool_start` accept the same `model` field and freeze it for
 the entire retained conversation or pool. `worker_send` and `pool_push` cannot
@@ -139,15 +176,15 @@ change it. Eval factories forward it in both languages:
 
 ```javascript
 const reviewer = await agent('Review the parser.', {
-  agent: 'reviewer', model: 'anthropic/claude-sonnet-4-6:high', keepAlive: true
+  agent: 'reviewer', model: {role: 'slow'}, keepAlive: true
 });
-const pool = await workpool({agent: 'sonic', model: 'openai/gpt-5-mini:low'});
+const pool = await workpool({agent: 'sonic', model: {role: 'smol'}});
 ```
 
 ```python
 reviewer = await agent('Review the parser.', agent='reviewer',
-                       model='anthropic/claude-sonnet-4-6:high', keep_alive=True)
-pool = await workpool(agent='sonic', model='openai/gpt-5-mini:low')
+                       model={'role': 'slow'}, keep_alive=True)
+pool = await workpool(agent='sonic', model={'role': 'smol'})
 ```
 
 Saved-session `seance` consultations retain their separate saved-branch model
@@ -160,7 +197,8 @@ When the `task` role selects a child model, that child uses
 `retry.fallbackChains.smol`. An absent role chain inherits the `default` chain;
 an explicitly empty role chain (`[]`) disables fallback for that role. Role
 ownership stays attached after automatic model changes, including prewalk and
-earlier fallback hops. A per-call `model` or definition `model:` uses the default
+earlier fallback hops. An explicit `model: {"role": "slow"}` captures the
+`slow` policy. A per-call model string or definition `model:` uses the default
 policy even if it happens to name the same model as a configured role.
 
 ```json

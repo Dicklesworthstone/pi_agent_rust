@@ -1019,7 +1019,7 @@ captured
         self.assertIn("PI_JOBS_UNKNOWN_ID", response["error"])
 
     def test_agent_options_cannot_override_operation_or_select_foreground(self):
-        for option in ("op", "operation", "async", "task", "model"):
+        for option in ("op", "operation", "async", "task"):
             with self.subTest(option=option):
                 response = self.kernel.cell(f"await agent('inspect', **{{{option!r}: 'override'}})")
                 self.assertFalse(response["ok"])
@@ -1060,6 +1060,31 @@ captured
             "name": "subagent", "args": {"agent": "scout", "isolation": "none",
                 "task": "inspect the code", "operation": "worker_start"},
         })
+
+    def test_agent_factories_forward_exact_and_structured_roles_to_native_admission(self):
+        for model in ("smol", {"role": "smol"}):
+            for keep_alive in (False, True):
+                with self.subTest(model=model, keep_alive=keep_alive):
+                    reply = worker_snapshot() if keep_alive else {
+                        "schema": "pi.subagent.background.v1", "jobId": "job-native",
+                    }
+                    response = self.kernel.cell(
+                        f"await agent('inspect', agent='scout', model={model!r}, keep_alive={keep_alive!r})",
+                        self.reply_with(envelope(reply)),
+                    )
+                    self.assertTrue(response["ok"], response)
+                    self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+                        "name": "subagent", "args": {"agent": "scout", "model": model, "task": "inspect",
+                            **({"operation": "worker_start"} if keep_alive else {"async": True})},
+                    })
+        before = len(self.kernel.calls)
+        response = self.kernel.cell(
+            "await agent('inspect', model={'role': 'smol'})",
+            lambda frame: self.kernel.reply(frame, error="PI_SUBAGENT_MODEL: role is not configured"),
+        )
+        self.assertFalse(response["ok"])
+        self.assertIn("PI_SUBAGENT_MODEL", response["error"])
+        self.assertEqual(len(self.kernel.calls), before + 1)
 
     def test_warm_worker_reuses_identity_across_cells_and_turns_keep_their_selection(self):
         self.launch_worker()
@@ -1520,13 +1545,13 @@ await pool.close()
 
     def test_pool_launch_options_use_native_fields_and_keep_name_local(self):
         response = self.kernel.cell("pool = await workpool(agent='scout', concurrency=3, name='review', cwd='.', "
-                                    "scope='project', isolation='none', timeout_seconds=120); pool.name")
+                                    "scope='project', isolation='none', model={'role': 'tiny'}, timeout_seconds=120); pool.name")
         self.assertEqual(self.value(response), "review")
         native = PoolHost(self.kernel)
         self.value(self.kernel.cell("await pool.push(['inspect']); pool.id", native))
         self.assertEqual(self.kernel.calls[0]["bridge"]["input"]["args"], {
             "agent": "scout", "cwd": ".", "scope": "project", "isolation": "none", "timeoutSeconds": 120,
-            "operation": "pool_start", "concurrency": 3, "tasks": ["inspect"],
+            "operation": "pool_start", "concurrency": 3, "tasks": ["inspect"], "model": {"role": "tiny"},
         })
 
     def test_pool_lost_batch_acknowledgment_recovers_native_admission_without_replay(self):
