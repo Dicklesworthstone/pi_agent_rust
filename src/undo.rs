@@ -781,7 +781,11 @@ fn enforce_budget(inner: &mut RecorderInner, budget_bytes: u64) {
     loop {
         let total_units = inner.undo_stack.len()
             + inner.redo_stack.len() + inner.pending.len();
-        let over_units = total_units > journal::MAX_UNITS;
+        // Each history unit can contain multiple file mutations. The journal
+        // bounds both unit count and total file entries, so eviction must too.
+        let total_files: usize = inner.undo_stack.iter().chain(&inner.redo_stack)
+            .chain(inner.pending.values()).map(|unit| unit.files.len()).sum();
+        let over_units = total_units > journal::MAX_UNITS || total_files > journal::MAX_UNITS;
         let over_bytes = inner.store.bytes > budget_bytes;
         if !over_units && !over_bytes { break; }
         if inner.undo_stack.len() > usize::from(over_bytes && !over_units) {
