@@ -1775,6 +1775,8 @@ pub enum UiCommand {
     InitialPrompt,
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
+    /// Refresh provider model catalogs without restarting the session.
+    RefreshModels,
     /// Read effective settings from the live session for `/settings` or F2.
     Settings,
     /// Save one preference, then apply it to the existing live session.
@@ -2157,6 +2159,7 @@ pub struct PiFtuiModel {
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
+    live_model_catalog: Option<Arc<Mutex<Vec<String>>>>,
     /// Display names (`models.json`/catalog `name`) by `provider/model-id`,
     /// shown beside the identity in the `/model` picker (GH #214).
     model_names: HashMap<String, String>,
@@ -2649,6 +2652,7 @@ impl PiFtuiModel {
             settings_snapshot: None,
             settings_pending: false,
             available_models: Vec::new(),
+            live_model_catalog: None,
             model_names: HashMap::new(),
             pending_quit: false,
             restart_request: None,
@@ -2935,6 +2939,12 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    #[must_use]
+    pub fn with_live_model_catalog(mut self, catalog: Arc<Mutex<Vec<String>>>) -> Self {
+        self.live_model_catalog = Some(catalog);
         self
     }
 
@@ -5046,6 +5056,15 @@ impl PiFtuiModel {
 
     /// `/model` handling: bare opens the picker, `provider/model` switches.
     fn route_model_command(&mut self, spec: &str) {
+        if spec.eq_ignore_ascii_case("refresh") {
+            self.begin_busy("refreshing model catalogs ...");
+            self.send_command(UiCommand::RefreshModels);
+            return;
+        }
+        if let Some(catalog) = &self.live_model_catalog {
+            self.available_models = catalog.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        }
         {
             if spec.is_empty() {
                 // Bare /model opens the picker over the registry list.
@@ -9950,6 +9969,40 @@ fn adopt_stored_credentials(
     }
 }
 
+/// Reload provider membership without disturbing the active selection.
+async fn refresh_live_model_registry(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    models: &Arc<Mutex<Vec<String>>>,
+    force: bool,
+) -> crate::error::Result<usize> {
+    let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path())?;
+    let path = crate::models::default_models_path(&crate::config::Config::global_dir());
+    let initial = crate::models::ModelRegistry::load(&auth, Some(path.clone()));
+    if let Some(error) = initial.error() {
+        return Err(crate::error::Error::config(error.to_string()));
+    }
+    let refreshed = crate::providers::model_fetch::sync_ready_model_catalogs(
+        &auth, &initial, &path, force
+    ).await;
+    if refreshed == 0 { return Ok(0); }
+    let mut registry = crate::models::ModelRegistry::load(&auth, Some(path));
+    if let Some(error) = registry.error() {
+        return Err(crate::error::Error::config(error.to_string()));
+    }
+    if let Some(manager) = handle.extension_manager() {
+        let bindings = crate::models::extension_provider_bindings(&manager.extension_providers())?;
+        registry.merge_extension_registry(&bindings, manager.extension_model_entries())?;
+    }
+    let mut available = registry.available_models().into_iter()
+        .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+        .collect::<Vec<_>>();
+    available.sort();
+    available.dedup();
+    handle.session_mut().set_model_registry(registry);
+    *models.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = available;
+    Ok(refreshed)
+}
+
 /// Handle a model switch in the driver, reporting the outcome to the UI.
 async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -12014,7 +12067,9 @@ pub fn run(
     } else {
         cycle_models
     };
-    let driver_available_models = available_models.clone();
+    let mut driver_available_models = available_models.clone();
+    let live_model_catalog = Arc::new(Mutex::new(available_models.clone()));
+    let driver_live_model_catalog = Arc::clone(&live_model_catalog);
     // `/restart`: the UI raises the flag and quits; the driver, once it has
     // saved and shut the session down, records the session file to reopen.
     let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -12171,6 +12226,7 @@ pub fn run(
                 // The `/login` waiting for input, if any (boxed: the driver
                 // future sits near clippy's large_futures threshold).
                 let mut login: Option<Box<DriverLogin>> = None;
+                let mut next_model_sync = Instant::now() + Duration::from_secs(15 * 60);
                 loop {
                     let received = submit_rx.try_recv();
                     if let Ok(command) = &received {
@@ -12225,6 +12281,27 @@ pub fn run(
                                 &driver_turn_control,
                             )
                             .await;
+                        }
+                        Ok(UiCommand::RefreshModels) => {
+                            let result = Box::pin(refresh_live_model_registry(
+                                &mut handle, &driver_live_model_catalog, true,
+                            )).await;
+                            let message = match result {
+                                Ok(count) => PiMsg::System(format!(
+                                    "model catalogs refreshed: {count} provider(s)"
+                                )),
+                                Err(error) => PiMsg::AgentError(format!(
+                                    "model catalog refresh: {error}"
+                                )),
+                            };
+                            let _ = agent_tx.send(message);
+                            let previous_models = std::mem::take(&mut driver_available_models);
+                            driver_available_models = driver_live_model_catalog.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if cycle_models == previous_models {
+                                cycle_models.clone_from(&driver_available_models);
+                            }
+                            next_model_sync = Instant::now() + Duration::from_secs(15 * 60);
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             if run_set_model_command(&mut handle, &provider, &model, &agent_tx).await {
@@ -12781,6 +12858,30 @@ pub fn run(
                             }
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Refresh at most every 15 minutes, only when the
+                            // driver is idle and no credential flow is active.
+                            if Instant::now() >= next_model_sync && login.is_none() {
+                                next_model_sync = Instant::now() + Duration::from_secs(15 * 60);
+                                match Box::pin(refresh_live_model_registry(
+                                    &mut handle, &driver_live_model_catalog, false,
+                                )).await {
+                                    Ok(count) if count > 0 => {
+                            let previous_models = std::mem::take(&mut driver_available_models);
+                            driver_available_models = driver_live_model_catalog.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                            if cycle_models == previous_models {
+                                cycle_models.clone_from(&driver_available_models);
+                            }
+                                        let _ = agent_tx.send(PiMsg::SystemNote(format!(
+                                            "model catalog updated for {count} provider(s)"
+                                        )));
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => tracing::warn!(
+                                        error = %error, "background model catalog refresh skipped"
+                                    ),
+                                }
+                            }
                             // A browser redirect caught by the login's
                             // localhost callback server completes it without
                             // the user pasting anything.
@@ -12905,6 +13006,7 @@ pub fn run(
         .with_current_ask(current_ask)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
+        .with_live_model_catalog(live_model_catalog)
         .with_model_names(model_names)
         .with_restart_request(Arc::clone(&restart_requested))
         .with_available_sessions(available_sessions)
@@ -13135,6 +13237,18 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
         Event::Mouse(MouseEvent::new(kind, x, y))
+    }
+
+    #[test]
+    fn model_picker_reloads_catalog_during_running_session() {
+        let (_tx, model) = new_model();
+        let shared = Arc::new(Mutex::new(vec!["openai/old-model".to_string()]));
+        let mut model = model.with_live_model_catalog(Arc::clone(&shared));
+        *shared.lock().unwrap() = vec!["openai/new-model".to_string()];
+        model.route_model_command("");
+        let picker = model.picker.as_ref().expect("model picker");
+        assert_eq!(picker.values, vec!["openai/new-model".to_string()]);
+        assert_eq!(model.available_models, vec!["openai/new-model".to_string()]);
     }
 
     fn new_model() -> (mpsc::Sender<PiMsg>, PiFtuiModel) {
