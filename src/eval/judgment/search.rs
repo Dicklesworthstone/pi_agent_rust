@@ -168,7 +168,11 @@ impl Invocation<'_> {
         paths.sort();
         paths.dedup();
         if paths.len() > 8 { discovery_partial = true; paths.truncate(8); }
-        // Initial read + post-judgment freshness read for every candidate, plus\n        // the two extra passes used to verify and locate leading find results.\n        let needed = paths.len().saturating_mul(2)\n            + if search.predicate { 0 } else { paths.len().min(2) * 2 };
+        // Reserve one model judgment per candidate, plus the optional
+        // verification and location judgments for the two leading results.
+        let needed = paths.len().saturating_add(
+            if search.predicate { 0 } else { paths.len().min(2) * 2 },
+        );
         if needed > super::MAX_CALLS.saturating_sub(self.receipts.len()) {
             return Err("PI_JUDGE_LIMIT: search needs more of this cell's 16 shared attempts; narrow the scope".into());
         }
