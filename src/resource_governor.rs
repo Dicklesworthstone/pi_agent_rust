@@ -3426,6 +3426,12 @@ fn budgets_with_host_memory_pressure(
         effective.max_rss_bytes = effective
             .max_rss_bytes
             .min(u64::try_from(host_budget).unwrap_or(u64::MAX));
+        // At near-zero free RAM, the pressure-only ratio otherwise tops
+        // out at 1.0 and can never reach the default 1.10 deny threshold.
+        // Reduce the effective RSS budget so new hostcalls may be denied.
+        if available <= total / 100 {
+            effective.max_rss_bytes = effective.max_rss_bytes.min(rss.saturating_mul(3).saturating_div(4).max(1));
+        }
     }
     effective
 }
@@ -3885,6 +3891,22 @@ mod tests {
         assert_eq!(effective.max_rss_bytes, 100);
         let decision = ResourceGovernor::with_budgets(effective).admit_sample(&request, sample);
         assert_eq!(decision.action, AdmissionAction::Deny);
+    }
+
+    #[test]
+    fn exhausted_host_ram_rejects_new_hostcalls() {
+        let configured = budgets();
+        let sample = HostResourceSample {
+            load_avg_1m: None, rss_bytes: Some(200),
+            process_count: None, fd_count: None,
+        };
+        let effective = super::budgets_with_host_memory_pressure(
+            &configured, sample.rss_bytes, 10_000, 0,
+        );
+        let request = ResourceRequest::new(ResourceOperationKind::Tool, "read");
+        let decision = ResourceGovernor::with_budgets(effective).admit_sample(&request, sample);
+        assert_eq!(decision.action, AdmissionAction::Deny);
+        assert_eq!(decision.dominant_dimension, ResourceDimension::Rss);
     }
 
     #[test]
