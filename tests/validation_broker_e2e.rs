@@ -376,7 +376,23 @@ fn fault_event_scenario_ids(event_log_path: &str) -> TestResult<BTreeSet<String>
 }
 
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
+    static WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let workspace = WORKSPACE.get_or_init(|| {
+        let root = tempfile::tempdir().expect("fixture workspace").keep();
+        for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+            std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the six literal fixture filenames above enter this join.
+                .expect("fixture tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)) // ubs:ignore[rust.security.path-traversal] The same six literal fixture filenames are chmodded inside their test directory.
+                    .expect("executable fixture tool");
+            }
+        }
+        root
+    });
     let mut environment = BTreeMap::new();
+    environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
     environment.insert(
         "CARGO_TARGET_DIR".to_string(),
         "/data/tmp/pi_agent_rust_cargo/e2e/target".to_string(),
@@ -399,7 +415,7 @@ fn base_request(slot_id: &str) -> ValidationSlotRequest {
             "--all-targets".to_string(),
         ],
         command_class: "cargo_check".to_string(),
-        cwd: "/data/projects/pi_agent_rust".to_string(),
+        cwd: workspace.to_string_lossy().into_owned(),
         git_head: "validation-broker-e2e-head".to_string(),
         feature_flags: vec!["default".to_string()],
         target_dir: "/data/tmp/pi_agent_rust_cargo/e2e/target".to_string(),
@@ -702,7 +718,26 @@ fn materialize_slot_store(
         match slot.state.as_str() {
             "active" => {}
             "reusable" => {
+                #[cfg(unix)]
                 lease.mark_reusable(&request.owner_agent, HEARTBEAT, reusable_artifacts())?;
+                #[cfg(not(unix))]
+                {
+                    require(
+                        lease.input_identity.is_none(),
+                        "native capture is unavailable",
+                    )?;
+                    require(
+                        lease
+                            .mark_reusable(&request.owner_agent, HEARTBEAT, reusable_artifacts())
+                            .is_err(),
+                        "unsupported native capture cannot publish reusable evidence",
+                    )?;
+                    // Exercise rejection of a persisted historical result on
+                    // platforms that cannot capture new reusable evidence.
+                    lease.state = pi::validation_broker::ValidationSlotState::Reusable;
+                    lease.heartbeat_at_utc = HEARTBEAT.into();
+                    lease.artifacts = reusable_artifacts();
+                }
                 store.append_lease("mark_reusable", HEARTBEAT, &lease)?;
             }
             other => return Err(test_error(format!("unknown fault slot state: {other}"))),
@@ -809,6 +844,34 @@ fn assert_plan_matches_fault_expectation(plan: &Value, scenario: &FaultScenario)
             == Some(0),
         format!("{} plan should not mutate live state", scenario.scenario_id),
     )?;
+    #[cfg(not(unix))]
+    if scenario.expected.decision == "coalesce" {
+        require_eq_str(
+            plan.pointer("/decision/decision").and_then(Value::as_str),
+            "allow",
+            &scenario.scenario_id,
+            "fresh work required without native capture",
+        )?;
+        require(
+            plan.pointer("/decision/reusable_slot")
+                .is_some_and(Value::is_null),
+            "unsupported capture supplies no reusable slot",
+        )?;
+        require(
+            plan.pointer("/decision/coalesced_artifacts")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "unsupported capture supplies no coalesced artifacts",
+        )?;
+        require(
+            plan.pointer("/decision/policy/reusable_equivalent_slots")
+                .and_then(Value::as_u64)
+                == Some(0),
+            "unsupported capture has no reusable candidates",
+        )?;
+        assert_expected_source_statuses(plan, scenario)?;
+        return Ok(());
+    }
     require_eq_str(
         plan.pointer("/decision/decision").and_then(Value::as_str),
         &scenario.expected.decision,
@@ -1274,12 +1337,16 @@ fn validation_broker_fault_corpus_runs_through_cli_doctor_and_runpack() -> TestR
         scenario_artifacts.push(artifacts);
     }
 
-    for required_decision in ["allow", "wait", "coalesce", "narrow", "stale_recover"] {
+    for required_decision in ["allow", "wait", "narrow", "stale_recover"] {
         require(
             seen_decisions.contains(required_decision),
             format!("E2E corpus missing decision {required_decision}"),
         )?;
     }
+    require(
+        seen_decisions.contains("coalesce") == cfg!(unix),
+        "coalescing is observed exactly when native capture is supported",
+    )?;
 
     let events_path = temp.path().join("validation-broker-e2e-events.jsonl");
     write_event_log(&events_path, &e2e_events)?;

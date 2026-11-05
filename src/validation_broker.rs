@@ -5,6 +5,9 @@
 //! validation state.
 
 mod doctor;
+mod freshness;
+
+pub use freshness::ValidationInputIdentity;
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -104,6 +107,8 @@ pub struct ValidationSlotLease {
     pub cwd: String,
     pub command_fingerprint: String,
     pub environment_fingerprint: String,
+    #[serde(default)]
+    pub input_identity: Option<ValidationInputIdentity>,
     pub git_head: String,
     pub feature_flags: Vec<String>,
     pub target_dir: String,
@@ -134,6 +139,9 @@ impl ValidationSlotLease {
         ensure_future_expiry(&started_at_utc, &expires_at_utc)?;
         let command_fingerprint = command_fingerprint(&request)?;
         let environment_fingerprint = environment_fingerprint(&request.environment)?;
+        // An unavailable snapshot still permits ownership of a running gate,
+        // but can never authorize reuse of its result.
+        let input_identity = ValidationInputIdentity::capture(&request).ok();
 
         Ok(Self {
             schema: VALIDATION_BROKER_SLOT_SCHEMA.to_string(),
@@ -143,6 +151,7 @@ impl ValidationSlotLease {
             bead_id: request.bead_id,
             command_fingerprint,
             environment_fingerprint,
+            input_identity,
             command: request.command,
             command_class: request.command_class,
             cwd: request.cwd,
@@ -208,6 +217,14 @@ impl ValidationSlotLease {
         let heartbeat_at_utc = heartbeat_at_utc.into();
         self.validate_next_heartbeat(&heartbeat_at_utc)?;
         ensure_future_expiry(&heartbeat_at_utc, &self.expires_at_utc)?;
+        let identity = self.input_identity.as_ref().ok_or_else(|| {
+            Error::validation("validation input identity unavailable; run fresh validation")
+        })?;
+        if !identity.is_current(self)? {
+            return Err(Error::validation(
+                "validation inputs changed during validation",
+            ));
+        }
         self.heartbeat_at_utc = heartbeat_at_utc;
         self.artifacts = artifacts;
         self.state = ValidationSlotState::Reusable;
@@ -281,6 +298,15 @@ impl ValidationSlotLease {
     }
 
     pub fn matches_request_equivalence(&self, request: &ValidationSlotRequest) -> Result<bool> {
+        if self.input_identity.is_none() || !self.matches_request_metadata(request)? {
+            return Ok(false);
+        }
+        Ok(self.input_identity == ValidationInputIdentity::capture(request).ok())
+    }
+
+    // Ownership and freshness are separate: even a legacy lease or a gate
+    // whose inputs cannot be captured must prevent equivalent duplicate work.
+    fn matches_request_metadata(&self, request: &ValidationSlotRequest) -> Result<bool> {
         Ok(self.command_fingerprint == command_fingerprint(request)?
             && self.environment_fingerprint == environment_fingerprint(&request.environment)?
             && self.cwd == request.cwd
@@ -1344,7 +1370,7 @@ pub fn decide_validation_admission(
     let rch_required = is_rch_required(&context.request);
     let age_priority_boosted =
         context.bead_priority <= 1 || request_age_seconds >= policy.request_age_boost_seconds;
-    let matching = matching_slots(&context.request, slot_store, now_utc, policy)?;
+    let mut matching = matching_slots(&context.request, slot_store, now_utc, policy)?;
     let active_broad_gates = active_broad_gate_count(slot_store, now_utc)?;
     let mut reasons = Vec::new();
     let mut required_actions = Vec::new();
@@ -1352,7 +1378,31 @@ pub fn decide_validation_admission(
     let mut coalesced_artifacts = Vec::new();
     let blocking_source_reasons = blocking_source_reasons(inputs, slot_store);
     let source_statuses = admission_source_statuses(inputs, slot_store);
-    let rejected_reusable_slots = rejected_reusable_slots(&context.request, slot_store)?;
+    // Hash inputs once, and only when a candidate could actually be reused.
+    // Known authority failures, stores containing only active/terminal leases,
+    // unrelated leases, and expired history do not need a workspace scan. A
+    // reusable result still takes precedence over an equivalent active lease.
+    let identity_checked = !(rch_required && inputs.rch.local_fallback)
+        && blocking_source_reasons.is_empty()
+        && !inputs.doctor.has_failures
+        && matching
+            .reusable
+            .iter()
+            .any(|lease| lease.input_identity.is_some());
+    let input_identity = if identity_checked {
+        ValidationInputIdentity::capture(&context.request).ok()
+    } else {
+        None
+    };
+    matching
+        .reusable
+        .retain(|lease| lease.input_identity.is_some() && lease.input_identity == input_identity);
+    let rejected_reusable_slots = rejected_reusable_slots(
+        &context.request,
+        slot_store,
+        input_identity.as_ref(),
+        identity_checked,
+    )?;
     let hard_rch_backpressure = inputs.rch.free_slots == Some(0)
         || inputs
             .rch
@@ -1542,7 +1592,7 @@ fn matching_slots<'a>(
     };
 
     for lease in slot_store.latest_by_slot_id.values() {
-        if lease.state.is_terminal() || !lease.matches_request_equivalence(request)? {
+        if lease.state.is_terminal() || !lease.matches_request_metadata(request)? {
             continue;
         }
         let stale_now = lease.is_stale_at(now_utc)?;
@@ -1613,6 +1663,8 @@ fn active_broad_gate_count(
 fn rejected_reusable_slots(
     request: &ValidationSlotRequest,
     slot_store: &ValidationSlotStoreSnapshot,
+    identity: Option<&ValidationInputIdentity>,
+    identity_checked: bool,
 ) -> Result<Vec<ValidationRejectedReusableSlot>> {
     let command_fingerprint = command_fingerprint(request)?;
     let environment_fingerprint = environment_fingerprint(&request.environment)?;
@@ -1627,6 +1679,8 @@ fn rejected_reusable_slots(
             request,
             &command_fingerprint,
             &environment_fingerprint,
+            identity,
+            identity_checked,
         );
         if !reasons.is_empty() {
             rejected.push(ValidationRejectedReusableSlot {
@@ -1644,8 +1698,15 @@ fn reusable_slot_mismatch_reasons(
     request: &ValidationSlotRequest,
     request_command_fingerprint: &str,
     request_environment_fingerprint: &str,
+    request_input_identity: Option<&ValidationInputIdentity>,
+    identity_checked: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
+    if lease.input_identity.is_none()
+        || (identity_checked && lease.input_identity.as_ref() != request_input_identity)
+    {
+        reasons.push("input_identity_unavailable_or_changed".to_string());
+    }
     push_mismatch(
         &mut reasons,
         "command_fingerprint",

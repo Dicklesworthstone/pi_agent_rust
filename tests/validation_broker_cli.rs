@@ -176,7 +176,23 @@ fn write_jsonl(path: &Path, events: &[Value]) -> TestResult {
 }
 
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
+    static WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let workspace = WORKSPACE.get_or_init(|| {
+        let root = tempfile::tempdir().expect("fixture workspace").keep();
+        for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+            std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the six literal fixture filenames above enter this join.
+                .expect("fixture tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)) // ubs:ignore[rust.security.path-traversal] The same six literal fixture filenames are chmodded inside their test directory.
+                    .expect("executable fixture tool");
+            }
+        }
+        root
+    });
     let mut environment = BTreeMap::new();
+    environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
     environment.insert(
         "CARGO_TARGET_DIR".to_string(),
         "/data/tmp/pi_agent_rust_cargo/codex/target".to_string(),
@@ -199,7 +215,7 @@ fn base_request(slot_id: &str) -> ValidationSlotRequest {
             "--all-targets".to_string(),
         ],
         command_class: "cargo_check".to_string(),
-        cwd: "/data/projects/pi_agent_rust".to_string(),
+        cwd: workspace.to_string_lossy().into_owned(),
         git_head: "3048e53f3".to_string(),
         feature_flags: vec!["default".to_string()],
         target_dir: "/data/tmp/pi_agent_rust_cargo/codex/target".to_string(),
@@ -368,15 +384,32 @@ fn seed_equivalent_slot(store_path: &Path, seed: E2eSlotSeed, slot_id: &str) -> 
     match seed {
         E2eSlotSeed::Active => {}
         E2eSlotSeed::Reusable => {
-            lease.mark_reusable(
-                "Codex",
-                HEARTBEAT,
-                vec![ValidationSlotArtifact {
-                    path: "target/debug/deps/pi.fixture.d".to_string(),
-                    sha256: Some("a".repeat(64)),
-                    schema: Some("cargo_check_result.v1".to_string()),
-                }],
-            )?;
+            let artifacts = vec![ValidationSlotArtifact {
+                path: "target/debug/deps/pi.fixture.d".to_string(),
+                sha256: Some("a".repeat(64)),
+                schema: Some("cargo_check_result.v1".to_string()),
+            }];
+            #[cfg(unix)]
+            lease.mark_reusable("Codex", HEARTBEAT, artifacts)?;
+            #[cfg(not(unix))]
+            {
+                if lease.input_identity.is_some() {
+                    return Err(test_error("unsupported native capture must be unavailable"));
+                }
+                if lease
+                    .mark_reusable("Codex", HEARTBEAT, artifacts.clone())
+                    .is_ok()
+                {
+                    return Err(test_error(
+                        "unsupported native capture must refuse result reuse",
+                    ));
+                }
+                // Preserve the historical-state/status fixture, while planning
+                // must refuse to reuse its unavailable native input identity.
+                lease.state = pi::validation_broker::ValidationSlotState::Reusable;
+                lease.heartbeat_at_utc = HEARTBEAT.into();
+                lease.artifacts = artifacts;
+            }
             store.append_lease("fixture_reusable", HEARTBEAT, &lease)?;
         }
         E2eSlotSeed::Stale => {
@@ -852,15 +885,25 @@ fn validation_broker_no_mock_e2e_harness_emits_decisions_and_runpack_projection(
         "coalesce_reusable",
         &coalesce_plan,
         &coalesce_plan_path,
-        "coalesce",
-        "coalesce_with_reusable_slot",
+        if cfg!(unix) { "coalesce" } else { "allow" },
+        if cfg!(unix) {
+            "coalesce_with_reusable_slot"
+        } else {
+            "run_now"
+        },
     )?;
     assert_eq!(
         coalesce_plan
             .pointer("/decision/coalesced_artifacts")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(1)
+        Some(usize::from(cfg!(unix)))
+    );
+    #[cfg(not(unix))]
+    assert!(
+        coalesce_plan
+            .pointer("/decision/reusable_slot")
+            .is_some_and(Value::is_null)
     );
     artifact_entries.push(json!({
         "id": "plan_coalesce_reusable",
@@ -934,12 +977,17 @@ fn validation_broker_no_mock_e2e_harness_emits_decisions_and_runpack_projection(
         "evidence_kind": "broker_decision",
     }));
 
-    for required in ["allow", "wait", "coalesce", "narrow", "stale_recover"] {
+    for required in ["allow", "wait", "narrow", "stale_recover"] {
         assert!(
             decisions.contains(required),
             "missing required e2e decision {required}; saw {decisions:?}"
         );
     }
+    assert_eq!(
+        decisions.contains("coalesce"),
+        cfg!(unix),
+        "coalescing requires supported native capture"
+    );
 
     let status_store_path = temp.path().join("combined-status-slots.jsonl");
     seed_equivalent_slot(

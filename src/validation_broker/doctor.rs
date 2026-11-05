@@ -657,13 +657,31 @@ mod tests {
     }
 
     fn request() -> ValidationSlotRequest {
+        static WORKSPACE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let workspace = WORKSPACE.get_or_init(|| {
+            let root = tempfile::tempdir().expect("fixture workspace").keep();
+            for name in ["cargo", "cargo.exe"] {
+                std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the two literal fixture filenames above enter this join.
+                    .expect("fixture tool");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(
+                        root.join(name), // ubs:ignore[rust.security.path-traversal] The same two literal fixture filenames are chmodded inside their test directory.
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .expect("executable fixture tool");
+                }
+            }
+            root
+        });
         ValidationSlotRequest {
             slot_id: "cached-validation".into(),
             owner_agent: "TestAgent".into(),
             bead_id: "bd-doctor".into(),
             command: vec!["cargo".into(), "check".into(), "--all-targets".into()],
             command_class: "cargo_check".into(),
-            cwd: "/workspace".into(),
+            cwd: workspace.to_string_lossy().into_owned(),
             git_head: "head".into(),
             feature_flags: vec!["default".into()],
             target_dir: "/data/tmp/pi_agent_rust_cargo/test/target".into(),
@@ -671,7 +689,10 @@ mod tests {
             runner: "rch_required".into(),
             rust_toolchain: Some("nightly".into()),
             rch_job_id: None,
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([(
+                "PATH".into(),
+                workspace.to_string_lossy().into_owned(),
+            )]),
             expected_artifacts: vec![],
             artifact_schema: Some("test_result.v1".into()),
             artifact_hash: Some("test-result-hash".into()),
@@ -681,6 +702,7 @@ mod tests {
     fn reusable_store() -> ValidationSlotStoreSnapshot {
         let mut lease =
             ValidationSlotLease::acquire(request(), START, EXPIRES).expect("acquire test lease");
+        #[cfg(unix)]
         lease
             .mark_reusable(
                 "TestAgent",
@@ -692,6 +714,25 @@ mod tests {
                 }],
             )
             .expect("reusable test lease");
+        #[cfg(not(unix))]
+        {
+            assert!(lease.input_identity.is_none());
+            let artifacts = vec![ValidationSlotArtifact {
+                path: "result.json".into(),
+                sha256: Some("test-result-hash".into()),
+                schema: Some("test_result.v1".into()),
+            }];
+            assert!(
+                lease
+                    .mark_reusable("TestAgent", NOW, artifacts.clone())
+                    .is_err()
+            );
+            // An old cached record is still loadable, but never reusable without
+            // native input identity. Keep authority-rejection tests platform-wide.
+            lease.state = crate::validation_broker::ValidationSlotState::Reusable;
+            lease.heartbeat_at_utc = NOW.into();
+            lease.artifacts = artifacts;
+        }
         ValidationSlotStoreSnapshot {
             schema: VALIDATION_BROKER_SLOT_STORE_SCHEMA.into(),
             status: ValidationSlotStoreStatus::Available,
@@ -791,6 +832,7 @@ mod tests {
         assert_blocked_without_reuse(&decide(&inputs(), &store));
     }
 
+    #[cfg(unix)]
     #[test]
     fn valid_cached_results_still_coalesce_under_capacity_pressure() {
         let mut inputs = inputs();
@@ -802,6 +844,7 @@ mod tests {
         assert_eq!(decision.reusable_slot.as_deref(), Some("cached-validation"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn agent_mail_outage_remains_advisory_for_valid_reuse() {
         let mut inputs = inputs();
@@ -815,6 +858,22 @@ mod tests {
                 .iter()
                 .any(|claim| { claim == "not_permission_to_skip_required_gates" })
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn healthy_doctor_cannot_authorize_legacy_reuse_without_native_capture() {
+        let store = reusable_store();
+        assert!(store.leases[0].input_identity.is_none());
+        let decision = decide(&inputs(), &store);
+        assert_ne!(decision.decision, ValidationAdmissionDecision::Coalesce);
+        assert!(decision.reusable_slot.is_none());
+        assert!(decision.coalesced_artifacts.is_empty());
+        assert!(decision.rejected_reusable_slots.iter().any(|slot| {
+            slot.reasons
+                .iter()
+                .any(|reason| reason == "input_identity_unavailable_or_changed")
+        }));
     }
 
     fn normalize_resource(data: Value) -> ValidationDoctorInput {

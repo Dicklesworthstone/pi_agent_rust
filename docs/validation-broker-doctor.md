@@ -86,8 +86,57 @@ all required diagnostic findings. Structural validation is not cryptographic
 artifact authentication, a hostile-input sandbox, native quality acceptance, or
 permission to skip DSR and the repository's required validation.
 
+## Workspace and executable identity for reusable results
+
+On Unix, a newly acquired lease captures a bounded digest of workspace file
+contents, directory names, permission modes and ownership, plus the immediate
+executable's canonical path, bytes, mode and ownership. Completion checks those
+inputs again before marking the lease reusable. A later admission request must
+match both the declared request metadata and the captured inputs. Old leases
+without input identity remain valid ownership records but cannot supply reusable
+results. Unavailable inputs likewise preserve the active owner's slot and require
+fresh validation instead of enabling duplicate work.
+
+Capture uses directory handles and relative nofollow opens, verifies file and
+directory identity while reading, and refuses symlinks, special files, unreadable
+inputs, non-UTF-8 input names and observed concurrent changes. Limits are 100,000
+workspace entries, 512 MiB of workspace bytes, 128 directory levels and 256 MiB
+for the executable. Only the workspace's root `.git` entry and the exact declared
+target/tmp subtrees are excluded. In-workspace output paths must be under a
+recognized output root such as `target`, `tmp`, `build`, `dist`, `out` or
+`.pi-validation`; ordinary source trees cannot be excluded. Nested directories
+merely named `target` are still inputs unless explicitly declared as an allowed
+output path. Store files and generated logs should live in excluded output
+directories or outside the workspace.
+
+Executable resolution checks effective execute access and honors an explicit
+request `PATH`. When the request inherits `PATH`, completion also checks the
+current inherited value; switching tools during a validation run cannot be hidden
+by replaying the previous search path. The request's environment fingerprint
+continues to cover the explicitly supplied environment only. Capture does not
+attest shell interpreters, dynamically loaded libraries, remote workers, external
+dependencies, ACLs, extended attributes or other inherited environment values.
+Callers must supply the relevant environment and retain the actual DSR evidence.
+
+The scans bracket a validation run; they do not freeze a filesystem transaction
+or prove that a transient change was never made and restored between captures.
+Freshness therefore remains one condition for advisory reuse, alongside the
+authoritative gate result and provenance. Windows and other non-Unix platforms
+currently fail closed for input capture pending an equivalent qualified native
+implementation; their lease ownership and admission safeguards still operate.
+
+Planning scans inputs only when a temporally eligible reusable result has matching
+declared metadata and the required authorities permit reuse. Known authority
+failures and stores containing only unrelated, active, terminal or expired leases
+do not trigger a workspace scan. A valid cached result retains its existing
+precedence over an equivalent active lease. This avoids unnecessary reads without
+introducing a metadata-only digest cache or claiming a measured performance gain.
+
 Regression tests live beside the adapter in `src/validation_broker/doctor.rs`.
 They cover native serialization, scope separation, structured stop signals,
 malformed reports, corrupt JSONL slot stores, and guarded cache reuse.
+Workspace, executable, persisted timestamp, legacy ownership and scan-scope
+regressions live in `tests/validation_broker_store.rs`, including subprocess
+completion after a changed inherited `PATH`.
 `tests/doctor_broker_native.rs` additionally passes real CLI JSON from isolated
 consumer and explicitly requested swarm runs through the public normalizer.

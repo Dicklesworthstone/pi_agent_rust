@@ -61,8 +61,655 @@ fn temp_root_create_error(err: &IoError) -> String {
     format!("create temp root: {err}")
 }
 
+#[cfg(unix)]
+#[test]
+fn reuse_binds_workspace_and_executable_bytes_before_and_after_validation() -> TestResult {
+    let root = temp_root("freshness")?;
+    let tool = temp_root("freshness_tool")?.join("validator.exe");
+    std::fs::write(&tool, b"validator v1").map_err(to_string)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .map_err(to_string)?;
+    }
+    let mut request = base_request("freshness");
+    request.cwd = root.to_string_lossy().into_owned();
+    request.command = vec![tool.to_string_lossy().into_owned()];
+    let artifacts = vec![ValidationSlotArtifact {
+        path: "result.json".into(),
+        sha256: Some("result".into()),
+        schema: Some("test.v1".into()),
+    }];
+    for path in ["source.rs", "Cargo.toml", "Cargo.lock"] {
+        let input = root.join(path); // ubs:ignore[rust.security.path-traversal] Only the three literal fixture filenames above enter this join.
+        std::fs::write(&input, b"original").map_err(to_string)?;
+        let mut lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES) // ubs:ignore[rust.collections.clone-in-loop] Each of three fixed regression cases needs independently owned lease input.
+            .map_err(to_string)?;
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()) // ubs:ignore[rust.collections.clone-in-loop] A one-item artifact fixture is consumed independently by each fixed case.
+            .map_err(to_string)?;
+        require(
+            lease
+                .matches_request_equivalence(&request)
+                .map_err(to_string)?,
+            "unchanged bytes reuse",
+        )?;
+        std::fs::write(&input, b"modified").map_err(to_string)?;
+        require(
+            !lease
+                .matches_request_equivalence(&request)
+                .map_err(to_string)?,
+            "same HEAD with changed bytes cannot reuse",
+        )?;
+        require(
+            lease
+                .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()) // ubs:ignore[rust.collections.clone-in-loop] The ownership-taking failure path needs the same one-item fixture in each fixed case.
+                .is_err(),
+            "changed during validation cannot become reusable",
+        )?;
+        std::fs::write(&input, b"original").map_err(to_string)?;
+    }
+    let lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    std::fs::create_dir(root.join("empty_input_directory")).map_err(to_string)?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "empty input directory creation invalidates validation",
+    )?;
+    let mut lease =
+        ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    std::fs::write(&tool, b"validator v2").map_err(to_string)?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "external executable changes cannot reuse",
+    )?;
+    require(
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone())
+            .is_err(),
+        "tool changed during validation",
+    )?;
+    let mut legacy = serde_json::to_value(&lease).map_err(to_string)?;
+    legacy
+        .as_object_mut()
+        .ok_or("lease object")?
+        .remove("input_identity");
+    lease = serde_json::from_value(legacy).map_err(to_string)?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "legacy identity cannot reuse",
+    )?;
+    require(
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, artifacts)
+            .is_err(),
+        "legacy identity cannot become reusable",
+    )
+}
+
+#[test]
+fn unavailable_identity_is_never_reusable() -> TestResult {
+    let mut request = base_request("unavailable-identity");
+    request.command = vec!["unavailable-validator".into()];
+    let mut lease =
+        ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    require(
+        lease.input_identity.is_none(),
+        "unresolvable tool has no identity",
+    )?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "unavailable identity fails closed",
+    )?;
+    require(
+        lease
+            .mark_reusable(
+                "SilentReef",
+                HEARTBEAT,
+                vec![ValidationSlotArtifact {
+                    path: "result.json".into(),
+                    sha256: None,
+                    schema: None,
+                }],
+            )
+            .is_err(),
+        "missing inputs cannot become reusable",
+    )
+}
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_native_capture_refuses_reuse_and_preserves_active_ownership() -> TestResult {
+    let root = temp_root("unsupported_capture")?;
+    let mut request = base_request("unsupported-native");
+    request.cwd = root.to_string_lossy().into_owned();
+    // This is an existing native executable, not an unresolvable-command case.
+    request.command = vec![
+        std::env::current_exe()
+            .map_err(to_string)?
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    request.command_class = "custom_validation".into();
+    let mut lease =
+        ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    require(
+        lease.input_identity.is_none(),
+        "unsupported capture remains explicitly unavailable",
+    )?;
+    let before = lease.clone();
+    require(
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+            .is_err(),
+        "native executable presence does not invent input identity",
+    )?;
+    require(lease == before, "failed reuse preserves active lease")?;
+    let store = ValidationSlotStore::new(temp_root("unsupported_store")?.join("slots.jsonl"));
+    store
+        .append_lease("active", START, &lease)
+        .map_err(to_string)?;
+    let decision = decide_validation_admission(
+        admission_context_for("unsupported-native-active", request, START, 4),
+        &healthy_inputs()?,
+        &store.load_snapshot(),
+        &ValidationAdmissionPolicy::default(),
+        HEARTBEAT,
+    )
+    .map_err(to_string)?;
+    require(
+        decision.decision == ValidationAdmissionDecision::Wait,
+        "unsupported capture still preserves active ownership",
+    )?;
+    require(
+        decision.reusable_slot.is_none() && decision.coalesced_artifacts.is_empty(),
+        "unsupported capture cannot supply reused artifacts",
+    )
+}
+
+#[cfg(unix)]
+fn freshness_fixture(label: &str) -> Result<(PathBuf, PathBuf, ValidationSlotRequest), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = temp_root(label)?;
+    let tool = temp_root(&format!("{label}_tool"))?.join("validator");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").map_err(to_string)?;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).map_err(to_string)?;
+    let mut request = base_request(label);
+    request.cwd = root.to_string_lossy().into_owned();
+    request.command = vec![
+        tool.to_string_lossy().into_owned(),
+        "--test".into(),
+        "focused".into(),
+    ];
+    request.command_class = "custom_validation".into();
+    request.target_dir = root.join("target").to_string_lossy().into_owned();
+    request.tmpdir = root.join("tmp").to_string_lossy().into_owned();
+    Ok((root, tool, request))
+}
+
+#[cfg(unix)]
+fn persisted_freshness_lease(
+    request: &ValidationSlotRequest,
+) -> Result<ValidationSlotLease, String> {
+    let mut lease =
+        ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    lease
+        .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+        .map_err(to_string)?;
+    let store = ValidationSlotStore::new(temp_root("freshness_store")?.join("slots.jsonl"));
+    store
+        .append_lease("reusable", HEARTBEAT, &lease)
+        .map_err(to_string)?;
+    let mut snapshot = ValidationSlotStore::new(store.path()).load_snapshot();
+    require(
+        !snapshot.is_degraded(),
+        "freshness lease reloads without degradation",
+    )?;
+    snapshot
+        .latest_by_slot_id
+        .remove(&request.slot_id)
+        .ok_or_else(|| "reloaded lease missing".into())
+}
+
+#[cfg(unix)]
+#[test]
+fn persisted_freshness_tracks_renames_permissions_and_external_executable_identity() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (root, tool, request) = freshness_fixture("identity_changes")?;
+    let source = root.join("src");
+    std::fs::create_dir(&source).map_err(to_string)?;
+    std::fs::write(source.join("input.rs"), "original input").map_err(to_string)?;
+    let lease = persisted_freshness_lease(&request)?;
+    require(
+        lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "unchanged recovered evidence matches",
+    )?;
+
+    let renamed = root.join("renamed");
+    std::fs::rename(&source, &renamed).map_err(to_string)?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "directory rename invalidates recovered evidence",
+    )?;
+    std::fs::rename(&renamed, &source).map_err(to_string)?;
+    require(
+        lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "identical restored names and contents match",
+    )?;
+
+    for path in [source.clone(), source.join("input.rs"), tool.clone()] {
+        let permissions = std::fs::metadata(&path).map_err(to_string)?.permissions();
+        let changed = permissions.mode() ^ 0o010;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(changed))
+            .map_err(to_string)?;
+        require(
+            !lease
+                .matches_request_equivalence(&request)
+                .map_err(to_string)?,
+            "mode-only changes invalidate evidence",
+        )?;
+        std::fs::set_permissions(&path, permissions).map_err(to_string)?;
+        require(
+            lease
+                .matches_request_equivalence(&request)
+                .map_err(to_string)?,
+            "restored permissions match",
+        )?;
+    }
+
+    let old_tool = tool.with_extension("saved");
+    std::fs::rename(&tool, &old_tool).map_err(to_string)?;
+    std::fs::write(&tool, b"#!/bin/sh\nexit 1\n").map_err(to_string)?;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).map_err(to_string)?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "atomic external executable replacement invalidates evidence",
+    )?;
+    let mut recovered = lease;
+    require(
+        recovered
+            .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+            .is_err(),
+        "changed executable cannot republish recovered evidence",
+    )?;
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).map_err(to_string)?;
+    let unavailable = ValidationSlotLease::acquire(request, START, EXPIRES).map_err(to_string)?;
+    require(
+        unavailable.input_identity.is_none(),
+        "non-executable candidate cannot establish identity",
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_substitutions_and_oversized_inputs_fail_closed_after_restart() -> TestResult {
+    let (root, _tool, request) = freshness_fixture("symlink_inputs")?;
+    let source = root.join("src");
+    std::fs::create_dir(&source).map_err(to_string)?;
+    std::fs::write(source.join("input.rs"), "same contents").map_err(to_string)?;
+    let mut lease = persisted_freshness_lease(&request)?;
+    let outside = temp_root("outside_input")?;
+    std::fs::write(outside.join("input.rs"), "same contents").map_err(to_string)?;
+    std::fs::rename(&source, root.join("original_src")).map_err(to_string)?;
+    std::os::unix::fs::symlink(&outside, &source).map_err(to_string)?;
+    require(
+        !lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "ancestor symlink never reuses identical outside bytes",
+    )?;
+    let before = lease.clone();
+    require(
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+            .is_err(),
+        "symlink capture cannot become reusable",
+    )?;
+    require(
+        lease == before,
+        "failed freshness check leaves recovered lease unchanged",
+    )?;
+    require(
+        std::fs::read_to_string(outside.join("input.rs")).map_err(to_string)? == "same contents",
+        "outside source remains unchanged",
+    )?;
+
+    let (large_root, _, large_request) = freshness_fixture("bounded_inputs")?;
+    std::fs::File::create(large_root.join("large.input"))
+        .map_err(to_string)?
+        .set_len(512 * 1024 * 1024 + 1)
+        .map_err(to_string)?;
+    let mut bounded =
+        ValidationSlotLease::acquire(large_request, START, EXPIRES).map_err(to_string)?;
+    require(
+        bounded.input_identity.is_none(),
+        "oversized sparse input cannot establish identity",
+    )?;
+    require(
+        bounded
+            .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+            .is_err(),
+        "oversized capture cannot publish reusable evidence",
+    )
+}
+
+#[test]
+fn unavailable_and_legacy_identity_preserve_active_ownership_but_never_reuse() -> TestResult {
+    let mut request = base_request("unavailable_active");
+    request.command = vec![
+        "unavailable-validator".into(),
+        "--test".into(),
+        "focused".into(),
+    ];
+    request.command_class = "custom_validation".into();
+    let active =
+        ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
+    require(
+        active.input_identity.is_none(),
+        "fixture has unavailable executable identity",
+    )?;
+    for legacy in [false, true] {
+        let mut value = serde_json::to_value(&active).map_err(to_string)?;
+        if legacy {
+            value
+                .as_object_mut()
+                .ok_or("lease object")?
+                .remove("input_identity");
+        }
+        let lease: ValidationSlotLease = serde_json::from_value(value).map_err(to_string)?;
+        let store = ValidationSlotStore::new(temp_root("active_identity")?.join("slots.jsonl"));
+        store
+            .append_lease("active", START, &lease)
+            .map_err(to_string)?;
+        let snapshot = ValidationSlotStore::new(store.path()).load_snapshot();
+        let decision = decide_validation_admission(
+            admission_context_for("active_without_identity", request.clone(), START, 4), // ubs:ignore[rust.collections.clone-in-loop] Two current/legacy fixtures each consume an independently owned admission request.
+            &healthy_inputs()?,
+            &snapshot,
+            &ValidationAdmissionPolicy::default(),
+            HEARTBEAT,
+        )
+        .map_err(to_string)?;
+        require(
+            decision.decision == ValidationAdmissionDecision::Wait,
+            "unknown input identity never authorizes duplicate active work",
+        )?;
+        require(
+            decision.policy.active_equivalent_slots == 1,
+            "active owner remains visible",
+        )?;
+
+        let mut legacy_result = lease;
+        legacy_result.state = ValidationSlotState::Reusable;
+        legacy_result.artifacts = reusable_fault_artifacts();
+        store
+            .append_lease("legacy_result", HEARTBEAT, &legacy_result)
+            .map_err(to_string)?;
+        let policy = ValidationAdmissionPolicy {
+            reuse_required: true,
+            ..ValidationAdmissionPolicy::default()
+        };
+        let decision = decide_validation_admission(
+            admission_context_for("result_without_identity", request.clone(), START, 4), // ubs:ignore[rust.collections.clone-in-loop] Each of two persisted-result cases consumes an independent fixture request.
+            &healthy_inputs()?,
+            &store.load_snapshot(),
+            &policy,
+            HEARTBEAT,
+        )
+        .map_err(to_string)?;
+        require(
+            decision.decision == ValidationAdmissionDecision::DegradedBlock,
+            "legacy result is never reusable evidence",
+        )?;
+        require(
+            decision.rejected_reusable_slots.iter().any(|slot| {
+                slot.reasons
+                    .iter()
+                    .any(|reason| reason == "input_identity_unavailable_or_changed")
+            }),
+            "unavailable provenance is explicit",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn source_paths_cannot_be_excluded_as_validation_outputs() -> TestResult {
+    let (root, _, mut request) = freshness_fixture("output_exclusions")?;
+    std::fs::create_dir(root.join("src")).map_err(to_string)?;
+    std::fs::write(root.join("src/input.rs"), "source").map_err(to_string)?;
+    for invalid in [root.clone(), root.join("src"), root.join("src/input.rs")] {
+        request.target_dir = invalid.to_string_lossy().into_owned();
+        let lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES) // ubs:ignore[rust.collections.clone-in-loop] Three invalid-output cases each need an independently owned fixture request.
+            .map_err(to_string)?;
+        require(
+            lease.input_identity.is_none(),
+            "untrusted output exclusion refuses input capture",
+        )?;
+    }
+    request.target_dir = root.join("target").to_string_lossy().into_owned();
+    let lease = persisted_freshness_lease(&request)?;
+    std::fs::create_dir(root.join("target")).map_err(to_string)?;
+    std::fs::write(root.join("target/result.json"), "generated output").map_err(to_string)?;
+    require(
+        lease
+            .matches_request_equivalence(&request)
+            .map_err(to_string)?,
+        "declared generated outputs do not invalidate source bytes",
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_scans_only_eligible_reuse_after_authority_checks() -> TestResult {
+    use rustix::fs::inotify;
+    use std::mem::MaybeUninit;
+    let (root, _, request) = freshness_fixture("scan_scope")?;
+    std::fs::write(root.join("input.rs"), "validation input").map_err(to_string)?;
+    let reusable = persisted_freshness_lease(&request)?;
+    for scenario in [
+        "active",
+        "terminal",
+        "unrelated",
+        "doctor_failed",
+        "store_degraded",
+        "local_fallback",
+        "eligible",
+    ] {
+        let mut lease = reusable.clone(); // ubs:ignore[rust.collections.clone-in-loop] Seven scan-admission cases mutate independent copies of the baseline lease.
+        let mut inputs = healthy_inputs()?;
+        match scenario {
+            "active" => lease.state = ValidationSlotState::Active,
+            "terminal" => lease.state = ValidationSlotState::Released,
+            "unrelated" => lease.git_head = "different-head".into(),
+            "doctor_failed" => inputs.doctor.has_failures = true,
+            "local_fallback" => inputs.rch.local_fallback = true,
+            _ => {}
+        }
+        let mut snapshot = slot_snapshot(vec![lease]);
+        if scenario == "store_degraded" {
+            snapshot.status = ValidationSlotStoreStatus::Degraded;
+        }
+        let events = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)
+            .map_err(to_string)?;
+        inotify::add_watch(
+            &events,
+            &root,
+            inotify::WatchFlags::OPEN | inotify::WatchFlags::ACCESS,
+        )
+        .map_err(to_string)?;
+        let decision = decide_validation_admission(
+            admission_context_for(scenario, request.clone(), START, 4), // ubs:ignore[rust.collections.clone-in-loop] Each of seven scan-admission cases consumes its own fixture request.
+            &inputs,
+            &snapshot,
+            &ValidationAdmissionPolicy::default(),
+            HEARTBEAT,
+        )
+        .map_err(to_string)?;
+        let mut buffer = [MaybeUninit::uninit(); 512];
+        let mut reader = inotify::Reader::new(&events, &mut buffer);
+        if scenario == "eligible" {
+            require(
+                decision.decision == ValidationAdmissionDecision::Coalesce,
+                "eligible evidence coalesces",
+            )?;
+            require(
+                reader.next().is_ok(),
+                "positive control observed actual workspace read",
+            )?;
+        } else {
+            require(
+                matches!(reader.next(), Err(rustix::io::Errno::WOULDBLOCK)),
+                "irrelevant or blocked plans do not read workspace inputs",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn inherited_path_changes_are_checked_at_completion() -> TestResult {
+    const CHILD: &str = "PI_VALIDATION_PATH_CHILD";
+    const REQUEST: &str = "PI_VALIDATION_PATH_REQUEST";
+    const STORE: &str = "PI_VALIDATION_PATH_STORE";
+    if let Ok(stage) = std::env::var(CHILD) {
+        let request: ValidationSlotRequest = serde_json::from_slice(
+            &std::fs::read(std::env::var(REQUEST).map_err(to_string)?).map_err(to_string)?,
+        )
+        .map_err(to_string)?;
+        let store = ValidationSlotStore::new(std::env::var(STORE).map_err(to_string)?);
+        let inherited = !request.environment.contains_key("PATH");
+        if stage == "acquire" {
+            let lease = ValidationSlotLease::acquire(request, START, EXPIRES).map_err(to_string)?;
+            require(
+                lease
+                    .input_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.executable_search_path_inherited == inherited),
+                "capture records explicit versus inherited PATH",
+            )?;
+            return store
+                .append_lease("active", START, &lease)
+                .map_err(to_string);
+        }
+        let mut lease = store
+            .load_snapshot()
+            .latest_by_slot_id
+            .remove(&request.slot_id)
+            .ok_or("persisted PATH lease missing")?;
+        let before = lease.clone();
+        let result = lease.mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts());
+        if stage == "changed" && inherited {
+            require(
+                result.is_err(),
+                "inherited PATH drift must block completion",
+            )?;
+            require(lease == before, "PATH drift leaves lease unchanged")
+        } else {
+            result.map_err(to_string)
+        }
+    } else {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (root, tool, mut request) = freshness_fixture("path_provenance")?;
+        std::fs::write(root.join("input.rs"), "source").map_err(to_string)?;
+        let first_path = tool.parent().ok_or("tool parent")?;
+        let second_path = temp_root("path_alternative")?;
+        std::fs::write(second_path.join("validator"), b"#!/bin/sh\nexit 1\n").map_err(to_string)?;
+        std::fs::set_permissions(
+            second_path.join("validator"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .map_err(to_string)?;
+        request.command[0] = "validator".into();
+        let evidence = temp_root("path_evidence")?;
+        let request_path = evidence.join("request.json");
+        for inherited in [false, true] {
+            if inherited {
+                request.environment.remove("PATH");
+            } else {
+                request
+                    .environment
+                    .insert("PATH".into(), first_path.to_string_lossy().into_owned());
+            }
+            std::fs::write(
+                &request_path,
+                serde_json::to_vec(&request).map_err(to_string)?,
+            )
+            .map_err(to_string)?;
+            let store_path = evidence.join(if inherited {
+                "inherited.jsonl"
+            } else {
+                "explicit.jsonl"
+            });
+            for (stage, path) in [
+                ("acquire", first_path),
+                ("changed", second_path.as_path()),
+                ("unchanged", first_path),
+            ] {
+                let output =
+                    std::process::Command::new(std::env::current_exe().map_err(to_string)?)
+                        .args([
+                            "--exact",
+                            "inherited_path_changes_are_checked_at_completion",
+                            "--nocapture",
+                        ])
+                        .env(CHILD, stage)
+                        .env(REQUEST, &request_path)
+                        .env(STORE, &store_path)
+                        .env("PATH", path)
+                        .output()
+                        .map_err(to_string)?;
+                require(
+                    output.status.success(),
+                    format!(
+                        // ubs:ignore[rust.perf.string-alloc-in-loop] At most six focused subprocess cases allocate their failure diagnostics.
+                        "PATH subprocess {stage} failed: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn base_request(slot_id: &str) -> ValidationSlotRequest {
+    static WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let workspace = WORKSPACE.get_or_init(|| {
+        let root = temp_root("fixture_workspace").expect("fixture workspace");
+        for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+            std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the six literal fixture filenames above enter this join.
+                .expect("fixture tool");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)) // ubs:ignore[rust.security.path-traversal] The same six literal fixture filenames are chmodded inside their test directory.
+                    .expect("executable fixture tool");
+            }
+        }
+        root
+    });
     let mut environment = BTreeMap::new();
+    environment.insert("PATH".into(), workspace.to_string_lossy().into_owned());
     environment.insert(
         "CARGO_TARGET_DIR".to_string(),
         "/data/tmp/pi_agent_rust_cargo/silentreef/target".to_string(),
@@ -85,7 +732,7 @@ fn base_request(slot_id: &str) -> ValidationSlotRequest {
             "--all-targets".to_string(),
         ],
         command_class: "cargo_check".to_string(),
-        cwd: "/data/projects/pi_agent_rust".to_string(),
+        cwd: workspace.to_string_lossy().into_owned(),
         git_head: "cf653c29b5836afabf979bb44325d4712de7088d".to_string(),
         feature_flags: vec!["default".to_string()],
         target_dir: "/data/tmp/pi_agent_rust_cargo/silentreef/target".to_string(),
@@ -540,9 +1187,32 @@ fn fault_slot_snapshot(
         match slot.state.as_str() {
             "active" => {}
             "reusable" => {
+                #[cfg(unix)]
                 lease
                     .mark_reusable(&request.owner_agent, HEARTBEAT, reusable_fault_artifacts())
                     .map_err(to_string)?;
+                #[cfg(not(unix))]
+                {
+                    require(
+                        lease.input_identity.is_none(),
+                        "unsupported fixture capture is unavailable",
+                    )?;
+                    require(
+                        lease
+                            .mark_reusable(
+                                &request.owner_agent,
+                                HEARTBEAT,
+                                reusable_fault_artifacts(),
+                            )
+                            .is_err(),
+                        "unsupported fixture cannot publish new reusable evidence",
+                    )?;
+                    // Model a historical record so rejection and provenance
+                    // tests remain active even without native capture support.
+                    lease.state = ValidationSlotState::Reusable;
+                    lease.heartbeat_at_utc = HEARTBEAT.into();
+                    lease.artifacts = reusable_fault_artifacts();
+                }
             }
             other => return Err(unknown_fault_slot_state(other)),
         }
@@ -792,6 +1462,30 @@ fn validation_broker_fault_corpus_covers_build_storm_and_stale_recovery() -> Tes
 
         let decision_key = decision_key_for_test(&decision.decision);
         seen_decisions.insert(decision_key);
+        #[cfg(not(unix))]
+        if scenario.expected.decision == "coalesce" {
+            require(
+                decision.decision == ValidationAdmissionDecision::Allow,
+                "legacy result requires fresh work on an unsupported platform",
+            )?;
+            require(
+                decision.reusable_slot.is_none() && decision.coalesced_artifacts.is_empty(),
+                "legacy result never supplies artifacts without native identity",
+            )?;
+            require(
+                decision.policy.reusable_equivalent_slots == 0,
+                "unsupported capture has no reusable candidate",
+            )?;
+            require(
+                decision.rejected_reusable_slots.iter().any(|slot| {
+                    slot.reasons
+                        .iter()
+                        .any(|reason| reason == "input_identity_unavailable_or_changed")
+                }),
+                "unsupported reuse refusal retains provenance diagnostic",
+            )?;
+            continue;
+        }
         if decision_key != scenario.expected.decision {
             return Err(scenario_decision_mismatch(&scenario.scenario_id));
         }
@@ -849,7 +1543,6 @@ fn validation_broker_fault_corpus_covers_build_storm_and_stale_recovery() -> Tes
 
     for required_decision in [
         "wait",
-        "coalesce",
         "narrow",
         "deny_local_fallback",
         "stale_recover",
@@ -859,6 +1552,16 @@ fn validation_broker_fault_corpus_covers_build_storm_and_stale_recovery() -> Tes
             return Err(fault_corpus_missing_decision(required_decision));
         }
     }
+    #[cfg(unix)]
+    require(
+        seen_decisions.contains("coalesce"),
+        "supported corpus covers coalescing",
+    )?;
+    #[cfg(not(unix))]
+    require(
+        !seen_decisions.contains("coalesce"),
+        "unsupported corpus never claims coalescing",
+    )?;
 
     Ok(())
 }
@@ -1013,7 +1716,7 @@ fn rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence() -> Tes
         .renew("SilentReef", HEARTBEAT, EXPIRES)
         .map_err(to_string)?;
     for invalid in ["invalid", "2026-05-14T06:59:59Z", START] {
-        let mut lease = original.clone();
+        let mut lease = original.clone(); // ubs:ignore[rust.collections.clone-in-loop] Three invalid timestamps must be applied to fresh copies of the baseline lease.
         require(
             lease.renew("SilentReef", invalid, EXPIRES).is_err(),
             "invalid renewal heartbeat rejected",
@@ -1086,12 +1789,9 @@ fn invalid_lease_timestamp_order_degrades_persisted_history() -> TestResult {
     ] {
         let root = temp_root("invalid_lease_time")?;
         let store = ValidationSlotStore::new(root.join("slots.jsonl"));
-        let mut lease = acquire("slot-time-history")?;
-        lease
-            .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
-            .map_err(to_string)?;
+        let lease = acquire("slot-time-history")?;
         store
-            .append_lease("reusable", HEARTBEAT, &lease)
+            .append_lease("active", START, &lease)
             .map_err(to_string)?;
         let mut raw = std::fs::read_to_string(store.path()).map_err(to_string)?;
         let mut corrupted: Value = serde_json::from_str(raw.trim()).map_err(to_string)?;
@@ -1116,12 +1816,13 @@ fn invalid_lease_timestamp_order_degrades_persisted_history() -> TestResult {
         .map_err(to_string)?;
         require(
             decision.decision == ValidationAdmissionDecision::DegradedBlock,
-            "invalid later timestamp cannot revive earlier reusable evidence",
+            "invalid later timestamp blocks admission from earlier history",
         )?;
     }
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn persisted_reusable_evidence_obeys_exact_freshness_boundaries() -> TestResult {
     let root = temp_root("freshness_time")?;
@@ -1225,6 +1926,7 @@ fn unavailable_store_loads_as_read_only_degraded_snapshot() -> TestResult {
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn reusable_slots_require_matching_provenance_for_coalescing() -> TestResult {
     let mut lease = acquire("slot-reusable")?;
@@ -1644,8 +2346,9 @@ fn admission_allows_when_capacity_and_sources_are_healthy() -> TestResult {
     )
 }
 
+#[cfg(unix)]
 #[test]
-fn admission_coalesces_reusable_and_waits_for_active_slots() -> TestResult {
+fn admission_coalesces_reusable_slots() -> TestResult {
     let mut reusable = acquire("slot-reusable-decision")?;
     reusable
         .mark_reusable(
@@ -1681,7 +2384,11 @@ fn admission_coalesces_reusable_and_waits_for_active_slots() -> TestResult {
         reusable_decision.coalesced_artifacts.len() == 1,
         "reusable artifacts carried",
     )?;
+    Ok(())
+}
 
+#[test]
+fn admission_waits_for_equivalent_active_slots() -> TestResult {
     let active = acquire("slot-active-decision")?;
     let active_decision = decide_validation_admission(
         admission_context("request-active"),
