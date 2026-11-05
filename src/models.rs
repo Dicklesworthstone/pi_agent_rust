@@ -2542,7 +2542,7 @@ fn custom_provider_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
 fn provider_has_catalog_route(provider: &str, config: &ProviderConfig) -> bool {
     // Bedrock discovery uses its regional AWS control-plane endpoint rather
     // than an inference baseUrl; authentication resolves at request time.
-    if canonical_provider_id(provider).unwrap_or(provider) == "amazon-bedrock" {
+    if matches!(canonical_provider_id(provider).unwrap_or(provider), "amazon-bedrock" | "google-vertex") {
         return true;
     }
     config
