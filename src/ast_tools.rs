@@ -1021,15 +1021,16 @@ impl AstEditTool {
         let recorder = self.mutation_recorder.as_deref();
         for file in &proposal.files {
             if let Some(recorder) = recorder {
-                recorder.begin_file(tool_call_id, "ast_edit", &file.path);
+                recorder
+                    .begin_file(tool_call_id, "ast_edit", &file.path)
+                    .map_err(|error| {
+                        Error::tool("ast_edit", format!("Cannot record undo intent: {error}"))
+                    })?;
             }
         }
         let mut written = 0_usize;
         for file in &proposal.files {
             if let Err(error) = write_file_atomic(&file.path, &file.new_content) {
-                if let Some(recorder) = recorder {
-                    recorder.abort(tool_call_id);
-                }
                 let mut rollback_errors = Vec::new();
                 for previous in &proposal.files[..written] {
                     if let Err(rollback_error) =
@@ -1037,6 +1038,11 @@ impl AstEditTool {
                     {
                         rollback_errors.push(format!("{}: {rollback_error}", previous.display));
                     }
+                }
+                // Keep the pending intent durable throughout compensation. An
+                // interrupted or failed rollback must remain an undo gap.
+                if let Some(recorder) = recorder {
+                    recorder.abort(tool_call_id);
                 }
                 let mut message = format!(
                     "[AST_APPLY_FAILED] failed to write '{}': {error}; rolled back {written} previously-written file(s)",

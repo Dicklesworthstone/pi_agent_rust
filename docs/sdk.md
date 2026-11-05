@@ -365,6 +365,86 @@ guard before resolving packages or executing cached project paths. Both
 terminal UIs validate before resource loading; the default UI also validates
 before session replacement side effects.
 
+### Durable file undo for SDK hosts
+
+SDK hosts can opt into persisted file undo by supplying a
+`FileMutationRecorder` through `SessionOptions::mutation_recorder`. The
+ordinary recorder remains in memory. Durable journals currently require Unix;
+non-Unix construction fails closed until native ownership and persistence
+protections are qualified. Linux restart tests exercise the journal engine;
+this does not establish macOS or full application lifecycle qualification.
+Use a stable, host-owned identifier for
+one conversation and the same canonical workspace roots when reopening its
+journal:
+
+```rust
+use pi::sdk::SessionOptions;
+use pi::undo::FileMutationRecorder;
+use std::{io, path::PathBuf, sync::Arc};
+
+fn options_with_durable_undo(
+    session_id: &str,
+    cwd: PathBuf,
+) -> io::Result<SessionOptions> {
+    let cwd = std::fs::canonicalize(cwd)?;
+    let recorder = Arc::new(FileMutationRecorder::for_session(
+        session_id,
+        std::slice::from_ref(&cwd),
+    )?);
+    if let Some(error) = recorder.stats().durability_error {
+        return Err(io::Error::other(error));
+    }
+    Ok(SessionOptions {
+        working_directory: Some(cwd),
+        mutation_recorder: Some(recorder),
+        ..SessionOptions::default()
+    })
+}
+```
+
+`for_session` uses a private directory under the configured agent directory.
+Hosts that own a separate private state directory can call `open_journal`
+with an explicit path, session identifier, roots, and byte budget. Keep the
+journal outside imported or shared source trees. Retain the same `Arc` when
+rebuilding the same live session; a new session or fork needs a different
+identifier and recorder. A journal holds its exclusive lease until the last
+recorder reference is dropped.
+
+The recorder's allowed root set is fixed for its lifetime. SDK workspace-root
+changes do not retarget an existing recorder. Hosts must keep those roots fixed
+while the recorder is attached; to change the set, rebuild with a new recorder
+and identifier for the new canonical roots. Do not retain an old recorder as an
+undo path after revoking a root. Reopening the old identifier with different roots
+fails closed and preserves the original journal for inspection.
+
+Custom mutators must check the result of `begin_file` before touching a file.
+It returns an error when a durable pre-write intent cannot be saved or the
+journal has lost authority. The built-in mutators propagate that error before
+their write. Call `commit` after successful persistence, or `abort` after any
+rollback has finished. A failure while saving the completed state leaves the
+already-persisted pending intent available for conservative restart recovery.
+
+The journal preserves the bounded content-addressed history, verifies saved
+hashes and workspace scope, and refuses ambiguous recovery. An edit that was
+pending when the process stopped becomes a gap that blocks replay through it;
+old redo history is discarded. An interrupted restore requires manual
+reconciliation. Corrupt, busy, replaced, or unsafe journals are preserved for
+inspection. `for_session` returns a recorder with undo disabled in that case;
+`open_journal` returns the error directly. Hosts should surface
+`RecorderStats::durability_error` instead of claiming recovery succeeded.
+Recorded mutators also refuse writes through an unavailable durable recorder;
+opening a conversation does not silently downgrade its persistence contract.
+
+External content changes still require explicit force. Force cannot override
+missing snapshots, unsafe paths, pending mutations, or failed journal
+authority. Multi-file restore is a sequence of atomic file replacements, so a
+failure can leave a partially restored unit requiring inspection. Separate
+session journals do not serialize all writers to the workspace.
+An uncoordinated writer can still change an existing file between its final
+content check and replacement; hosts must coordinate concurrent writers.
+Automatic CLI and terminal-session restart wiring requires separate lifecycle
+qualification.
+
 ### Stream rules
 
 SDK sessions load global stream rules from the configured agent directory and

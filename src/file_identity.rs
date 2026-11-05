@@ -25,10 +25,10 @@ use std::path::Path;
 /// A file's identity on this platform: equal iff two references name the same
 /// file, and stable across a rename of the path that reached it.
 ///
-/// Compare identities only against identities read on the same machine and
-/// within the same process lifetime — an inode number, like a Windows file
-/// index, is reused after the file is deleted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// An identity pinned by an open handle cannot be reused. Persisted identities
+/// can detect ordinary replacement after a restart, but are not authentication:
+/// an inode number, like a Windows file index, may be reused after deletion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileIdentity {
     /// `st_dev` on Unix, the volume serial number on Windows.
     volume: u64,
@@ -62,6 +62,35 @@ impl FileIdentity {
         Ok(Self {
             volume: metadata.dev(),
             index: metadata.ino(),
+        })
+    }
+
+    /// Identity of one entry in a held directory, without following a symlink.
+    /// The caller supplies a single filename; ancestor renames cannot redirect
+    /// the lookup to a replacement directory.
+    #[cfg(unix)]
+    pub(crate) fn of_directory_member_nofollow(
+        directory: &std::fs::File,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Self> {
+        if Path::new(name).file_name() != Some(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file identity requires one directory entry name",
+            ));
+        }
+        let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        fn identifier<T>(value: T) -> std::io::Result<u64>
+        where
+            u64: TryFrom<T>,
+        {
+            u64::try_from(value).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "file identity overflow")
+            })
+        }
+        Ok(Self {
+            volume: identifier(metadata.st_dev)?,
+            index: identifier(metadata.st_ino)?,
         })
     }
 

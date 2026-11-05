@@ -528,10 +528,13 @@ pub struct SessionOptions {
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
     /// Undo history for the default registry's `write`, `edit` and
-    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
-    /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
-    /// and `/fork`, passes the same recorder so `/undo` keeps working across
-    /// the rebuild, as on the classic stack. [`ExplicitBuiltinTools`] uses it;
+    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty in-memory recorder.
+    /// Supply [`crate::undo::FileMutationRecorder::for_session`] or
+    /// [`crate::undo::FileMutationRecorder::open_journal`] for durable history.
+    /// A host rebuilding the same live conversation passes the same recorder
+    /// so `/undo` keeps working across the rebuild. Durable hosts use a distinct
+    /// recorder and session identifier for a new conversation or fork.
+    /// [`ExplicitBuiltinTools`] uses it;
     /// custom factories can opt in through [`ToolFactoryContext`].
     pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 

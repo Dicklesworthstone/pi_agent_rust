@@ -12868,7 +12868,11 @@ impl Tool for EditTool {
         let final_content_bytes = final_content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
         if let Some(recorder) = &self.mutation_recorder {
-            recorder.begin_file(tool_call_id, "edit", &absolute_path);
+            recorder
+                .begin_file(tool_call_id, "edit", &absolute_path)
+                .map_err(|error| {
+                    Error::tool("edit", format!("Cannot record undo intent: {error}"))
+                })?;
         }
         let persisted = asupersync::runtime::spawn_blocking_io(move || {
             before_persist_hook.map_or_else(
@@ -13044,7 +13048,11 @@ impl WriteTool {
         }
         if let Some(recorder) = &self.mutation_recorder {
             for path in &paths {
-                recorder.begin_file(tool_call_id, "write", path);
+                recorder
+                    .begin_file(tool_call_id, "write", path)
+                    .map_err(|error| {
+                        Error::tool("write", format!("Cannot record undo intent: {error}"))
+                    })?;
             }
         }
         let resolved = prepared.apply();
@@ -13394,7 +13402,11 @@ impl Tool for WriteTool {
         let content_bytes = input.content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
         if let Some(recorder) = &self.mutation_recorder {
-            recorder.begin_file(tool_call_id, "write", &path);
+            recorder
+                .begin_file(tool_call_id, "write", &path)
+                .map_err(|error| {
+                    Error::tool("write", format!("Cannot record undo intent: {error}"))
+                })?;
         }
         let persisted = asupersync::runtime::spawn_blocking_io(move || {
             let changed = write_content_changed(&path_clone, &cwd_clone, &content_bytes);
@@ -18795,7 +18807,11 @@ impl Tool for HashlineEditTool {
         let final_content_bytes = final_content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
         if let Some(recorder) = &self.mutation_recorder {
-            recorder.begin_file(tool_call_id, "hashline_edit", &absolute_path);
+            recorder
+                .begin_file(tool_call_id, "hashline_edit", &absolute_path)
+                .map_err(|error| {
+                    Error::tool("hashline_edit", format!("Cannot record undo intent: {error}"))
+                })?;
         }
         let persisted = asupersync::runtime::spawn_blocking_io(move || {
             before_persist_hook.map_or_else(
