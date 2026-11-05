@@ -3430,7 +3430,7 @@ fn budgets_with_host_memory_pressure(
         // out at 1.0 and can never reach the default 1.10 deny threshold.
         // Reduce the effective RSS budget so new hostcalls may be denied.
         if available <= total / 100 {
-            effective.max_rss_bytes = effective.max_rss_bytes.min(rss.saturating_mul(3).saturating_div(4).max(1));
+            effective.max_rss_bytes = effective.max_rss_bytes.min(rss.saturating_mul(3).checked_div(4).unwrap_or(1).max(1));
         }
     }
     effective
