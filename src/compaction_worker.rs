@@ -846,6 +846,7 @@ mod tests {
             turn_prefix_messages: Vec::new(),
             is_split_turn: false,
             tokens_before,
+            retained_tokens: Some(0),
             previous_summary: None,
             file_ops: compaction::FileOperations::default(),
             settings: compaction::ResolvedCompactionSettings::default(),

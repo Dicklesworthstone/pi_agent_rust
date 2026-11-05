@@ -1384,7 +1384,9 @@ is parsed as-is and is never rewritten to snake_case:
   "compaction": {
     "enabled": true,
     "reserve_tokens": 8192,
-    "keep_recent_tokens": 20000
+    "keep_recent_tokens": 20000,
+    "thresholdPercent": 75,
+    "methodOrder": ["shake", "soft"]
   },
 
   "retry": {

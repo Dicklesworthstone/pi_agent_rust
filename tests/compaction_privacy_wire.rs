@@ -82,6 +82,7 @@ fn preparation(arguments: Value) -> CompactionPreparation {
         }],
         is_split_turn: true,
         tokens_before: 600,
+        retained_tokens: None,
         previous_summary: Some(format!("previous summary: {NUMERIC_KEY}")),
         file_ops: FileOperations::default(),
         settings: ResolvedCompactionSettings::default(),

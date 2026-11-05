@@ -426,6 +426,13 @@ pub struct CompactionSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub threshold_percent: Option<f64>,
+    /// Optional ordered automatic methods; absent keeps the legacy mode policy.
+    #[serde(
+        alias = "methodOrder",
+        deserialize_with = "deserialize_compaction_method_order",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub method_order: Option<Vec<crate::compaction::AutoCompactionMethod>>,
     /// Compaction output rendering: "text" (default) | "snapcompact"
     /// (bd-cv653.7.6).
     #[serde(alias = "mode")]
@@ -458,6 +465,20 @@ where
         return Err(serde::de::Error::custom(
             "compaction thresholdPercent must be greater than 0 and at most 100",
         ));
+    }
+    Ok(value)
+}
+
+fn deserialize_compaction_method_order<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<crate::compaction::AutoCompactionMethod>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Vec<crate::compaction::AutoCompactionMethod>>::deserialize(deserializer)?;
+    if let Some(order) = value.as_ref() {
+        crate::compaction::validate_compaction_method_order(order)
+            .map_err(serde::de::Error::custom)?;
     }
     Ok(value)
 }
@@ -1464,6 +1485,7 @@ impl Config {
             keep_recent_tokens: self.compaction_keep_recent_tokens(),
             threshold_tokens: self.compaction.as_ref().and_then(|c| c.threshold_tokens),
             threshold_percent: self.compaction.as_ref().and_then(|c| c.threshold_percent),
+            method_order: self.compaction.as_ref().and_then(|c| c.method_order.clone()),
             mode: self.compaction_mode(),
             render_mode: self.compaction_render_mode(),
         }
@@ -2216,6 +2238,7 @@ fn merge_compaction(
             keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
             threshold_tokens: other.threshold_tokens.or(base.threshold_tokens),
             threshold_percent: other.threshold_percent.or(base.threshold_percent),
+            method_order: other.method_order.or(base.method_order),
             mode: other.mode.or(base.mode),
         }),
         (None, Some(other)) => Some(other),
@@ -3032,6 +3055,80 @@ mod tests {
             config.secrets.and_then(|secrets| secrets.extra_patterns),
             Some(vec![String::from("sk-[a-z]+")])
         );
+    }
+
+    #[test]
+    fn compaction_method_order_validates_aliases_and_replaces_the_sequence() {
+        use crate::compaction::AutoCompactionMethod::{Remote, Shake, Soft};
+
+        for content in [
+            r#"{"compaction":{"methodOrder":["remote","shake","soft"]}}"#,
+            r#"{"compaction":{"method_order":["remote","shake","soft"]}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("ordered policy");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let encoded = serde_json::to_value(&config).expect("serialize policy");
+            let restored: Config = serde_json::from_value(encoded).expect("restore policy");
+            assert_eq!(
+                restored.resolved_compaction_settings(100_000).method_order,
+                Some(vec![Remote, Shake, Soft])
+            );
+            let inherited = Config::merge(
+                restored,
+                serde_json::from_str(r#"{"compaction":{"methodOrder":null}}"#)
+                    .expect("unset override"),
+            );
+            assert_eq!(
+                inherited.resolved_compaction_settings(100_000).method_order,
+                Some(vec![Remote, Shake, Soft])
+            );
+            let replaced = Config::merge(
+                inherited,
+                serde_json::from_str(r#"{"compaction":{"methodOrder":["soft","shake"]}}"#)
+                    .expect("project order"),
+            );
+            assert_eq!(
+                replaced.resolved_compaction_settings(100_000).method_order,
+                Some(vec![Soft, Shake])
+            );
+        }
+        for value in [
+            r#"[]"#,
+            r#"["shake","shake"]"#,
+            r#"["remote","soft","shake","remote"]"#,
+            r#"["unknown"]"#,
+            r#""soft""#,
+            r#"[false]"#,
+        ] {
+            let content = format!(r#"{{"compaction":{{"methodOrder":{value}}}}}"#);
+            assert!(
+                serde_json::from_str::<Config>(&content).is_err(),
+                "accepted {content}"
+            );
+        }
+        let legacy = Config::default().resolved_compaction_settings(100_000);
+        assert!(legacy.method_order.is_none());
+    }
+
+    #[test]
+    fn explicit_compaction_order_preserves_configured_retention_and_thresholds() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "compactionMode":"aggressive",
+                "compaction":{
+                    "reserveTokens":10000,"keepRecentTokens":4000,
+                    "thresholdTokens":60000,"thresholdPercent":40,
+                    "methodOrder":["shake","soft"]
+                }
+            }"#,
+        )
+        .expect("ordered policy with legacy mode");
+        let resolved = config
+            .resolved_compaction_settings(100_000)
+            .with_mode_applied();
+        assert_eq!(resolved.keep_recent_tokens, 4_000);
+        assert_eq!(resolved.reserve_tokens, 10_000);
+        assert_eq!(resolved.trigger_tokens(), 40_000);
     }
 
     #[test]

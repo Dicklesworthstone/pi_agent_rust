@@ -613,6 +613,62 @@ does not force compaction when no older prefix can be safely summarized.
 Explicit `/compact`, `/shake`, and their SDK operations continue to bypass the
 automatic thresholds and enable switch.
 
+#### Ordered automatic methods
+
+`compaction.method_order` (alias `methodOrder`) selects the order in which
+automatic compaction tries native methods:
+
+```json
+{
+  "compaction": {
+    "methodOrder": ["shake", "soft"],
+    "thresholdPercent": 75
+  }
+}
+```
+
+| Method | Behavior |
+|--------|----------|
+| `shake` | Builds a local checkpoint that preserves conversation text and replaces bulky tool output with references. Makes no model request. |
+| `soft` | Requests a model-written summary through the session's existing provider and spending guard. |
+| `remote` | Unavailable in the native policy because encrypted remote windows do not yet have a supported replay path. Advances to the next configured method without sending a request. |
+
+The list must contain one to three distinct methods. Unknown methods, empty
+lists, and duplicates are configuration errors. A project list replaces the
+global list in full. An omitted or `null` list supplies no override; with no
+list in any layer, the existing `compactionMode` policy remains in effect.
+An explicit list overrides that legacy policy, including its aggressive
+keep-recent adjustment, and preserves the configured retention budget.
+
+Each attempt reads the same source snapshot. A candidate is accepted only if
+its projected context, including the actual retained tail, is smaller than
+the original context and below the automatic trigger. An unavailable method,
+an ordinary provider failure, or insufficient reclamation advances to the
+next method. Cancellation, privacy refusals, authentication failures, cost
+limits, and persistence failures stop the operation. Provider requests remain
+billable even when their candidate is insufficient; fallback does not reset
+the session's spending limit.
+
+Only the accepted candidate is installed through the existing session
+transaction. Exhausting the list leaves the session history unchanged and
+reports an error; it does not append an ineffective summary or silently choose
+an unconfigured local truncation. Model changes recalculate both the trigger
+and retained-tail estimate using the active reader.
+
+Explicit method ordering currently requires `compaction.mode: "text"`.
+Combining it with `"snapcompact"` is rejected before model work because the
+ordered policy cannot yet prove the resulting archive's reader-specific
+budget. Snapcompact rendering remains available with the existing policy.
+Manual `/compact`, `/shake`, and handoff commands retain their explicit
+operation semantics and do not run the automatic method list.
+
+With an explicit method list, `session_before_compact` hooks may cancel
+automatic or overflow compaction, but returning a replacement compaction is
+rejected without installing it. Replacement summaries can change the retained
+cut or rendering outside the configured method policy. Extension replacements
+remain supported for ordinary manual compaction and the legacy automatic
+policy without a method list.
+
 ### Branch summary
 
 - `branch_summary.reserve_tokens` (u32): Defaults to `compaction.reserve_tokens`.

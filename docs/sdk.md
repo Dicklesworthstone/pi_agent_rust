@@ -591,7 +591,7 @@ fn main() -> pi::sdk::Result<()> {
 
 ```rust
 use futures::executor::block_on;
-use pi::sdk::{ResolvedCompactionSettings, SessionOptions, create_agent_session};
+use pi::sdk::{AutoCompactionMethod, ResolvedCompactionSettings, SessionOptions, create_agent_session};
 
 fn main() -> pi::sdk::Result<()> {
     let session = block_on(create_agent_session(SessionOptions {
@@ -603,6 +603,7 @@ fn main() -> pi::sdk::Result<()> {
             keep_recent_tokens: 40_000,
             threshold_tokens: Some(60_000),
             threshold_percent: Some(75.0),
+            method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
             ..Default::default()
         }),
         ..SessionOptions::default()
@@ -633,6 +634,22 @@ values; direct Rust settings ignore invalid optional thresholds defensively.
 The keep-recent budget and safe-cut rules remain in force, so a threshold
 cannot force an unsafe cut. Explicit `compact` and `shake` operations bypass
 the automatic thresholds and enable switch.
+
+`method_order` is an optional ordered list of `AutoCompactionMethod` values.
+The example tries a provider-free shake before requesting a soft summary.
+Each candidate must reclaim space and fit below the trigger with the actual
+retained tail included. Only one successful candidate is installed. Ordinary
+provider failures and insufficient candidates may advance; cancellation,
+privacy, authentication, persistence, and cost failures remain terminal.
+`Remote` is an unavailable choice until native remote-window replay exists;
+it can precede a supported fallback but never issues a remote request.
+
+Leave the list as `None` to keep the legacy automatic mode. Explicit lists
+must be nonempty, contain no duplicate methods, and use text rendering. Native
+preparation records the active reader's retained-tail estimate; a manually
+constructed `CompactionPreparation` must supply `retained_tokens` before it
+can run an explicit automatic policy. See the
+[ordered-method settings](settings.md#ordered-automatic-methods) for details.
 
 ## Recipe 6: Use RPC Transport Client
 

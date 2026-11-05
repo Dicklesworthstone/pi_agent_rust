@@ -15942,7 +15942,11 @@ async fn maybe_auto_compact(
     // before installing the result. A shared session ID alone does not bind a
     // summary to its branch, model selection, history, or persistence target.
     let stream_options = guard.agent.stream_options().clone();
-    let provider = guard.agent.provider();
+    let provider = if prep.settings.method_order.is_some() {
+        guard.automatic_compaction_provider()
+    } else {
+        guard.agent.provider()
+    };
     let privacy = guard.agent.compaction_privacy();
     let result = compact_auto(prep, provider, &stream_options, None, &privacy).await;
 
@@ -17910,6 +17914,75 @@ mod tests {
                 Ok(crate::model::StreamEvent::TextEnd {
                     content_index: 0,
                     content: summary,
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
+    struct OrderedCompactionProvider {
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        summary: Option<String>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for OrderedCompactionProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            self.requests
+                .lock()
+                .expect("record compaction request")
+                .push(context.messages.to_vec());
+            let summary = self
+                .summary
+                .as_ref()
+                .ok_or_else(|| Error::api("summary service unavailable"))?;
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(summary.clone()))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: summary.clone(),
+                }),
+                Ok(crate::model::StreamEvent::TextEnd {
+                    content_index: 0,
+                    content: summary.clone(),
                 }),
                 Ok(crate::model::StreamEvent::Done {
                     reason: StopReason::Stop,
@@ -26728,6 +26801,300 @@ export default function init(pi) {
                     serde_json::to_value(&live.agent.messages()[1..]).unwrap(),
                     serde_json::to_value(&original_messages[2..]).unwrap(),
                     "{case} must preserve the configured recent turn",
+                );
+                let (live_context, stored_context) =
+                    stored.current_path_comparison_values(live.agent.messages());
+                assert_eq!(live_context, stored_context, "{case}");
+            }
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn auto_compaction_ordered_methods_install_only_the_accepted_original_snapshot() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(Box::pin(async move {
+            let prose = "Archived decisions require preserving the reasoning and evidence.\n"
+                .repeat(2_000);
+            let summary = Some("causal auto-compaction summary".to_string());
+            for (case, methods, bulky_tool_output, reply, expected_calls, expected_mode) in [
+                (
+                    "unavailable remote then local shake",
+                    vec!["remote", "shake", "soft"],
+                    true,
+                    summary.clone(),
+                    0,
+                    Some("shake"),
+                ),
+                (
+                    "soft precedes available shake",
+                    vec!["soft", "shake"],
+                    true,
+                    summary.clone(),
+                    1,
+                    Some("soft"),
+                ),
+                (
+                    "provider failure advances to shake",
+                    vec!["soft", "shake"],
+                    true,
+                    None,
+                    1,
+                    Some("shake"),
+                ),
+                (
+                    "insufficient shake advances to soft",
+                    vec!["shake", "soft"],
+                    false,
+                    summary,
+                    1,
+                    Some("soft"),
+                ),
+                (
+                    "all candidates retain too much context",
+                    vec!["soft", "shake"],
+                    false,
+                    Some(prose.clone()),
+                    1,
+                    None,
+                ),
+                (
+                    "unavailable remote does not imply soft",
+                    vec!["remote"],
+                    true,
+                    None,
+                    0,
+                    None,
+                ),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::in_memory();
+                stored.header.provider = Some("test-provider".to_string());
+                stored.header.model_id = Some("test-model".to_string());
+                let source_text = if bulky_tool_output {
+                    "original source fact: preserve the sequence".to_string()
+                } else {
+                    format!("original source fact: preserve the sequence\n{prose}")
+                };
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text(source_text),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::ToolCall(ToolCall {
+                            id: "archive-read".to_string(),
+                            name: "read".to_string(),
+                            arguments: json!({"path": "notes.txt"}),
+                            thought_signature: None,
+                        })],
+                        api: "test-api".to_string(),
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::ToolUse,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: 0,
+                    },
+                });
+                stored.append_message(crate::session::SessionMessage::ToolResult {
+                    tool_call_id: "archive-read".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new(if bulky_tool_output {
+                        "source evidence row\n".repeat(4_000)
+                    } else {
+                        "source evidence row".to_string()
+                    }))],
+                    details: None,
+                    is_error: false,
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("archive reviewed"))],
+                        api: "test-api".to_string(),
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: 0,
+                    },
+                });
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("retained recent turn".to_string()),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("retained answer"))],
+                        api: "test-api".to_string(),
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage {
+                            total_tokens: 80_000,
+                            ..Usage::default()
+                        },
+                        stop_reason: StopReason::Stop,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: 0,
+                    },
+                });
+                let first_kept_entry_id = stored.entries[4]
+                    .base_id()
+                    .expect("retained user entry ID")
+                    .clone();
+                let original_messages = stored.to_messages_for_current_path();
+                let original_entry_count = stored.entries.len();
+                let table = crate::token_count::table_for_model("test-provider", "test-model");
+                let counter = crate::token_count::active_counter();
+                let keep_recent_tokens = u32::try_from(
+                    counter.count("retained recent turn", table)
+                        + counter.count("retained answer\n", table),
+                )
+                .expect("small retained turn");
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let agent_session = Arc::new(asupersync::sync::Mutex::new(handoff_agent_session(
+                    stored,
+                    false,
+                    Arc::new(OrderedCompactionProvider {
+                        requests: Arc::clone(&requests),
+                        summary: reply,
+                    }),
+                )));
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                options.available_models = vec![model];
+                options.config = serde_json::from_value(json!({
+                    "compaction": {
+                        "enabled": true,
+                        "reserveTokens": 40_000,
+                        "keepRecentTokens": keep_recent_tokens,
+                        "thresholdTokens": 2_000,
+                        "methodOrder": methods
+                    }
+                }))
+                .expect("ordered compaction config");
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &options.config,
+                )));
+                let cx = AgentCx::for_request();
+                let (source, metrics_before) = {
+                    let live = agent_session.lock(&cx).await.expect("live session");
+                    let stored = live.session.lock(&cx).await.expect("stored session");
+                    (
+                        SessionEditSnapshot::capture(&stored).expect("source snapshot"),
+                        stored.autosave_metrics(),
+                    )
+                };
+                let is_compacting = Arc::new(AtomicBool::new(false));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                maybe_auto_compact(
+                    Arc::clone(&agent_session),
+                    shared_state,
+                    options,
+                    Arc::clone(&is_compacting),
+                    out_tx,
+                )
+                .await;
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert!(!is_compacting.load(Ordering::SeqCst), "{case}");
+                assert_eq!(events.len(), 2, "{case}: {events:?}");
+                assert_eq!(events[0]["type"], "auto_compaction_start", "{case}");
+                assert_eq!(events[1]["type"], "auto_compaction_end", "{case}");
+                {
+                    let requests = requests.lock().expect("recorded requests");
+                    assert_eq!(requests.len(), expected_calls, "{case}");
+                    for request in requests.iter() {
+                        let text = serde_json::to_string(request).expect("request JSON");
+                        assert!(text.contains("original source fact"), "{case}");
+                        assert!(text.contains("source evidence row"), "{case}");
+                        assert!(
+                            !text.contains("Context Checkpoint (shake)"),
+                            "{case}: a rejected candidate must not replace the summary source",
+                        );
+                    }
+                }
+                let live = agent_session.lock(&cx).await.expect("live session");
+                let stored = live.session.lock(&cx).await.expect("stored session");
+                let metrics_after = stored.autosave_metrics();
+                assert_eq!(
+                    metrics_after.flush_started, metrics_before.flush_started,
+                    "{case}: save-disabled sessions must not flush",
+                );
+                let compaction_count = stored
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_)))
+                    .count();
+                let Some(expected_mode) = expected_mode else {
+                    assert!(events[1].get("result").is_none(), "{case}: {events:?}");
+                    assert!(events[1]["errorMessage"].is_string(), "{case}: {events:?}");
+                    assert_eq!(compaction_count, 0, "{case}");
+                    assert!(
+                        source == SessionEditSnapshot::capture(&stored).expect("final snapshot"),
+                        "{case}: an exhausted policy must not mutate the session",
+                    );
+                    assert_eq!(
+                        serde_json::to_value(live.agent.messages()).unwrap(),
+                        serde_json::to_value(&original_messages).unwrap(),
+                        "{case}",
+                    );
+                    assert_eq!(
+                        metrics_after.coalesced_mutations, metrics_before.coalesced_mutations,
+                        "{case}",
+                    );
+                    assert_eq!(
+                        metrics_after.pending_mutations, metrics_before.pending_mutations,
+                        "{case}",
+                    );
+                    continue;
+                };
+                assert!(events[1].get("errorMessage").is_none(), "{case}: {events:?}");
+                assert_eq!(events[1]["result"]["details"]["mode"], expected_mode, "{case}");
+                assert_eq!(events[1]["result"]["tokensBefore"], 80_000, "{case}");
+                assert!(
+                    events[1]["result"]["tokensAfter"].as_u64().unwrap() < 2_000,
+                    "{case}",
+                );
+                assert_eq!(
+                    events[1]["result"]["firstKeptEntryId"],
+                    first_kept_entry_id,
+                    "{case}",
+                );
+                assert_eq!(compaction_count, 1, "{case}");
+                assert_eq!(stored.entries.len(), original_entry_count + 1, "{case}");
+                assert_eq!(
+                    metrics_after.coalesced_mutations,
+                    metrics_before.coalesced_mutations + 1,
+                    "{case}: attempts must install exactly one compaction mutation",
+                );
+                assert_eq!(
+                    metrics_after.pending_mutations,
+                    metrics_before
+                        .pending_mutations
+                        .saturating_add(1)
+                        .min(metrics_before.max_pending_mutations),
+                    "{case}",
+                );
+                assert_eq!(live.agent.messages().len(), 3, "{case}");
+                assert_eq!(
+                    serde_json::to_value(&live.agent.messages()[1..]).unwrap(),
+                    serde_json::to_value(&original_messages[4..]).unwrap(),
+                    "{case}: retain the complete recent turn, including its original usage",
                 );
                 let (live_context, stored_context) =
                     stored.current_path_comparison_values(live.agent.messages());

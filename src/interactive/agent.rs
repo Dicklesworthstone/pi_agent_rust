@@ -7830,6 +7830,7 @@ mod stream_delta_batcher_tests {
             reserve_tokens: Some(128_000),
             keep_recent_tokens: Some(1),
             mode: None,
+            ..Default::default()
         });
         let temp = tempfile::TempDir::new().expect("tempdir");
         let blocked_path = temp.path().join("blocked.jsonl");

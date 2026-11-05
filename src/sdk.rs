@@ -44,7 +44,7 @@ use std::time::Duration;
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
-pub use crate::compaction::ResolvedCompactionSettings;
+pub use crate::compaction::{AutoCompactionMethod, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
 pub use crate::extension_dispatcher::ExtensionUiHandler;
@@ -10299,6 +10299,7 @@ printf sdk-owned-command-key
             keep_recent_tokens: 4_321,
             threshold_tokens: Some(20_000),
             threshold_percent: Some(50.0),
+            method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
             mode: crate::compaction::AutoCompactionMode::default(),
             render_mode: crate::compaction::CompactionRenderMode::default(),
         };
@@ -10315,6 +10316,7 @@ printf sdk-owned-command-key
         assert_eq!(resolved.keep_recent_tokens, custom.keep_recent_tokens);
         assert_eq!(resolved.threshold_tokens, custom.threshold_tokens);
         assert_eq!(resolved.threshold_percent, custom.threshold_percent);
+        assert_eq!(resolved.method_order, custom.method_order);
         assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
@@ -10326,7 +10328,8 @@ printf sdk-owned-command-key
             tmp.path().join(".pi/settings.json"),
             r#"{"compaction":{
                 "enabled":true,"reserveTokens":1234,"keepRecentTokens":4321,
-                "thresholdTokens":20000,"thresholdPercent":50
+                "thresholdTokens":20000,"thresholdPercent":50,
+                "methodOrder":["remote","shake","soft"]
             }}"#,
         )
         .expect("project compaction settings");
@@ -10346,6 +10349,14 @@ printf sdk-owned-command-key
         assert_eq!(resolved.keep_recent_tokens, 4_321);
         assert_eq!(resolved.threshold_tokens, Some(20_000));
         assert_eq!(resolved.threshold_percent, Some(50.0));
+        assert_eq!(
+            resolved.method_order,
+            Some(vec![
+                AutoCompactionMethod::Remote,
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ])
+        );
         assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 

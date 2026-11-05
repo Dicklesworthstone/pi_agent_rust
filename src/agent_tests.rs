@@ -8038,6 +8038,7 @@ mod tests {
                 keep_recent_tokens: 30,
                 threshold_tokens: None,
                 threshold_percent: None,
+                method_order: None,
                 mode: compaction::AutoCompactionMode::default(),
                 render_mode: compaction::CompactionRenderMode::default(),
             };
@@ -8143,6 +8144,7 @@ mod tests {
                 keep_recent_tokens: 30,
                 threshold_tokens: None,
                 threshold_percent: None,
+                method_order: None,
                 mode: compaction::AutoCompactionMode::default(),
                 render_mode: compaction::CompactionRenderMode::default(),
             };

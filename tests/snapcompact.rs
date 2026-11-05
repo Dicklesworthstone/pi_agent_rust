@@ -52,6 +52,7 @@ fn preparation(source: &str) -> CompactionPreparation {
         turn_prefix_messages: Vec::new(),
         is_split_turn: false,
         tokens_before: 12_000,
+        retained_tokens: None,
         previous_summary: None,
         file_ops: FileOperations::default(),
         settings: ResolvedCompactionSettings {

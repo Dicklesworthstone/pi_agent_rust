@@ -5,10 +5,10 @@ mod common;
 
 use common::{TestHarness, run_async};
 use pi::compaction::{
-    CompactionPreparation, CompactionPrivacy, CompactionResult, SEMANTIC_COMPACTION_QUALITY_SCHEMA,
-    SemanticCompactionLossClass, SemanticCompactionMarker, SemanticCompactionMarkerKind,
-    SemanticCompactionMarkerObservation, SemanticCompactionMarkerSeverity,
-    SemanticCompactionQualityVerdict, SemanticCompactionQualityView, compact,
+    AutoCompactionMethod, CompactionPreparation, CompactionPrivacy, CompactionResult,
+    SEMANTIC_COMPACTION_QUALITY_SCHEMA, SemanticCompactionLossClass, SemanticCompactionMarker,
+    SemanticCompactionMarkerKind, SemanticCompactionMarkerObservation, SemanticCompactionMarkerSeverity,
+    SemanticCompactionQualityVerdict, SemanticCompactionQualityView, compact, compact_auto,
     evaluate_semantic_compaction_quality, prepare_compaction,
     semantic_compaction_quality_report_to_jsonl, semantic_compaction_quality_report_to_value,
 };
@@ -39,6 +39,7 @@ fn test_options(api_key: &str) -> StreamOptions {
 struct ScriptedProvider {
     responses: Mutex<VecDeque<String>>,
     prompts: Mutex<Vec<String>>,
+    native_calls: Mutex<usize>,
 }
 
 impl ScriptedProvider {
@@ -46,11 +47,16 @@ impl ScriptedProvider {
         Self {
             responses: Mutex::new(responses.into_iter().map(Into::into).collect()),
             prompts: Mutex::new(Vec::new()),
+            native_calls: Mutex::new(0),
         }
     }
 
     fn prompts(&self) -> Vec<String> {
         self.prompts.lock().expect("lock prompts").clone()
+    }
+
+    fn native_calls(&self) -> usize {
+        *self.native_calls.lock().expect("lock native calls")
     }
 }
 
@@ -106,6 +112,17 @@ impl Provider for ScriptedProvider {
                 message,
             },
         )])))
+    }
+
+    async fn compact_native(
+        &self,
+        _request_body: &Value,
+        _options: &StreamOptions,
+    ) -> pi::error::Result<Value> {
+        *self.native_calls.lock().expect("lock native calls") += 1;
+        Ok(json!({
+            "output": [{"type": "compaction", "encrypted_content": "opaque-native-window"}]
+        }))
     }
 }
 
@@ -845,6 +862,7 @@ const fn make_settings(keep_recent_tokens: u32) -> pi::compaction::ResolvedCompa
         keep_recent_tokens,
         threshold_tokens: None,
         threshold_percent: None,
+        method_order: None,
         mode: pi::compaction::AutoCompactionMode::Summary,
         render_mode: pi::compaction::CompactionRenderMode::Text,
     }
@@ -1093,6 +1111,7 @@ fn privacy_preparation() -> CompactionPreparation {
         // Even beyond the local-fallback threshold, a privacy refusal must
         // remain a refusal rather than dispatching or silently summarizing.
         tokens_before: 600_000,
+        retained_tokens: Some(500),
         previous_summary: None,
         file_ops: pi::compaction::FileOperations::default(),
         settings: pi::compaction::ResolvedCompactionSettings::default(),
@@ -1116,6 +1135,108 @@ fn read_file_ops(path: &str) -> pi::compaction::FileOperations {
 }
 
 #[test]
+fn automatic_method_guardrails_precede_provider_admission() {
+    run_async(async {
+        for invalid_case in 0..5 {
+            let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
+            let mut prep = privacy_preparation();
+            prep.settings.method_order = Some(vec![
+                AutoCompactionMethod::Remote,
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ]);
+            let expected = match invalid_case {
+                0 => {
+                    prep.retained_tokens = None;
+                    "requires retainedTokens"
+                }
+                1 => {
+                    prep.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
+                    "requires text rendering"
+                }
+                2 => {
+                    prep.settings.method_order = Some(Vec::new());
+                    "between one and three"
+                }
+                3 => {
+                    prep.settings.method_order =
+                        Some(vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Soft]);
+                    "duplicate methods"
+                }
+                _ => {
+                    prep.settings.method_order = Some(vec![AutoCompactionMethod::Remote]);
+                    "remote compaction is unavailable"
+                }
+            };
+            let error = compact_auto(
+                prep,
+                provider.clone(),
+                &test_options("auth-kept"),
+                None,
+                &CompactionPrivacy::default(),
+            )
+            .await
+            .expect_err("unsupported policies must not produce a replacement window");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(provider.prompts().is_empty(), "case {invalid_case}");
+            assert_eq!(provider.native_calls(), 0, "case {invalid_case}");
+        }
+    });
+}
+
+#[test]
+fn automatic_remote_is_skipped_and_first_sufficient_method_stops() {
+    run_async(async {
+        let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
+        let mut prep = privacy_preparation();
+        prep.settings.method_order = Some(vec![
+            AutoCompactionMethod::Remote,
+            AutoCompactionMethod::Shake,
+            AutoCompactionMethod::Soft,
+        ]);
+        let result = compact_auto(
+            prep,
+            provider.clone(),
+            &test_options("auth-kept"),
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+        .expect("a usable shake ends the ordered attempt");
+        assert_eq!(result.details.mode.as_deref(), Some("shake"));
+        assert_eq!(result.first_kept_entry_id, "ACME-654321");
+        assert!(result.summary.contains("completed history"));
+        assert!(result.summary.contains("ongoing turn"));
+        assert!(provider.prompts().is_empty());
+        assert_eq!(provider.native_calls(), 0);
+    });
+}
+
+#[test]
+fn automatic_summary_cannot_hide_an_oversized_retained_turn() {
+    run_async(async {
+        let provider = Arc::new(ScriptedProvider::new(["tiny summary"]));
+        let mut prep = privacy_preparation();
+        prep.is_split_turn = false;
+        prep.turn_prefix_messages.clear();
+        prep.retained_tokens = Some(200_000);
+        prep.settings.method_order = Some(vec![AutoCompactionMethod::Soft]);
+        let error = compact_auto(
+            prep,
+            provider.clone(),
+            &test_options("auth-kept"),
+            None,
+            &CompactionPrivacy::default(),
+        )
+        .await
+        .expect_err("the actual retained tail still exceeds the context threshold");
+        assert!(error.to_string().contains("reclaimed insufficient context"));
+        assert_eq!(provider.prompts().len(), 1);
+        assert_eq!(provider.native_calls(), 0);
+    });
+}
+
+#[test]
 fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
     run_async(async {
         let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
@@ -1123,49 +1244,55 @@ fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
             extra_patterns: Some(vec![r"^ACME-[0-9]{6}(?:x{4096})?$".to_string()]),
         }));
         for location in 0..7 {
-            let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
-            let mut prep = privacy_preparation();
-            let mut custom = None;
-            match location {
-                0 => prep.messages_to_summarize = vec![user_text("ACME-123456")],
-                1 => prep.turn_prefix_messages = vec![user_text("ACME-123456")],
-                2 => prep.previous_summary = Some("ACME-123456".to_string()),
-                3 => custom = Some("ACME-123456"),
-                4 => {
-                    prep.turn_prefix_messages = vec![assistant_message(
-                        vec![ContentBlock::ToolCall(ToolCall {
-                            id: "call-kept".to_string(),
-                            name: "inspect".to_string(),
-                            arguments: json!({"project_token": "ACME-123456"}),
-                            thought_signature: None,
-                        })],
-                        Usage::default(),
-                        StopReason::ToolUse,
-                    )];
+            for ordered in [false, true] {
+                let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
+                let mut prep = privacy_preparation();
+                prep.settings.method_order = ordered.then(|| {
+                    vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]
+                });
+                let mut custom = None;
+                match location {
+                    0 => prep.messages_to_summarize = vec![user_text("ACME-123456")],
+                    1 => prep.turn_prefix_messages = vec![user_text("ACME-123456")],
+                    2 => prep.previous_summary = Some("ACME-123456".to_string()),
+                    3 => custom = Some("ACME-123456"),
+                    4 => {
+                        prep.turn_prefix_messages = vec![assistant_message(
+                            vec![ContentBlock::ToolCall(ToolCall {
+                                id: "call-kept".to_string(),
+                                name: "inspect".to_string(),
+                                arguments: json!({"project_token": "ACME-123456"}),
+                                thought_signature: None,
+                            })],
+                            Usage::default(),
+                            StopReason::ToolUse,
+                        )];
+                    }
+                    5 => {
+                        prep.turn_prefix_messages =
+                            vec![user_text(format!("ACME-123456{}", "x".repeat(4096)))];
+                    }
+                    _ => {
+                        prep.file_ops = read_file_ops("ACME-123456");
+                    }
                 }
-                5 => {
-                    prep.turn_prefix_messages =
-                        vec![user_text(format!("ACME-123456{}", "x".repeat(4096)))];
-                }
-                _ => {
-                    prep.file_ops = read_file_ops("ACME-123456");
-                }
+                let error = compact_auto(
+                    prep,
+                    provider.clone(),
+                    &test_options("auth-kept"),
+                    custom,
+                    &privacy,
+                )
+                .await
+                .expect_err("block mode must reject the full unsliced field");
+                assert!(error.to_string().contains("PI_SECRET_BLOCK"));
+                assert!(!error.to_string().contains("ACME-123456"));
+                assert!(
+                    provider.prompts().is_empty(),
+                    "location {location}, ordered={ordered} dispatched"
+                );
+                assert_eq!(provider.native_calls(), 0);
             }
-            let error = compact(
-                prep,
-                provider.clone(),
-                &test_options("auth-kept"),
-                custom,
-                &privacy,
-            )
-            .await
-            .expect_err("block mode must reject the full unsliced field");
-            assert!(error.to_string().contains("PI_SECRET_BLOCK"));
-            assert!(!error.to_string().contains("ACME-123456"));
-            assert!(
-                provider.prompts().is_empty(),
-                "location {location} dispatched"
-            );
         }
     });
 }
