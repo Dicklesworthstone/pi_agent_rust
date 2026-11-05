@@ -888,11 +888,13 @@ impl PreparedModelCatalogProviderConfig {
         // Native model-list APIs do not use a Bearer Authorization header.
         // Their separate credential channels still participate in the normal
         // deferred credential resolver and models.json fallback.
+        let has_header = |wanted: &str| {
+            self.route.headers.keys().chain(self.deferred_headers.keys())
+                .any(|name| name.eq_ignore_ascii_case(wanted))
+        };
         match self.route.api.as_str() {
-            "anthropic-messages" => !self.route.headers.keys().any(|name|
-                name.eq_ignore_ascii_case("x-api-key")),
-            "google-generative-ai" => !self.route.headers.keys().any(|name|
-                name.eq_ignore_ascii_case("x-goog-api-key")),
+            "anthropic-messages" => !has_header("x-api-key"),
+            "google-generative-ai" => !has_header("x-goog-api-key"),
             _ => self.route.auth_header && !has_complete_custom_authorization_header(&self.route.headers),
         }
     }
