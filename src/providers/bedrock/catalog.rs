@@ -245,7 +245,7 @@ mod tests {
         let url = Url::parse("https://bedrock.us-east-1.amazonaws.com/foundation-models").unwrap();
         let now = Utc::now();
         let get = build_sigv4_headers_for_method("GET", &url, b"", "TESTKEY", "TESTSECRET", None, "us-east-1", now).unwrap();
-        let post = super::build_sigv4_headers(&url, b"", "TESTKEY", "TESTSECRET", None, "us-east-1", now).unwrap();
+        let post = super::super::build_sigv4_headers(&url, b"", "TESTKEY", "TESTSECRET", None, "us-east-1", now).unwrap();
         assert_ne!(get.authorization, post.authorization);
         assert!(get.authorization.contains("us-east-1/bedrock/aws4_request"));
     }
