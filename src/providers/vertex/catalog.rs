@@ -169,6 +169,9 @@ pub(super) async fn discover_model_ids(
             let url_text = url.to_string();
             let request = client.get(&url_text)
                 .header("Accept", "application/json")
+                // Make the explicitly selected project the quota/billing
+                // context. The listing still does not establish entitlement.
+                .try_header("x-goog-user-project", scope.project.as_str())?
                 .try_header("Authorization", authorization.as_str())?;
             let operation = async move {
                 let response = request.send().await?;
