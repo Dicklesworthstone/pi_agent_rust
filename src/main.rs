@@ -2545,7 +2545,7 @@ async fn run(
     // Existing user catalog loads immediately. Refresh provider membership
     // only when stale, then rebuild the registry before creating the picker.
     if startup_is_interactive
-        && auto_refresh_ready_model_catalogs(&auth, &model_registry, &models_path).await > 0
+        && pi::providers::model_fetch::sync_ready_model_catalogs(&auth, &model_registry, &models_path, false).await > 0
     {
         model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
     }
@@ -8593,66 +8593,6 @@ fn save_list_models_cache(models_path: &Path, payload: &ListModelsCachePayload) 
     } else {
         let _ = fs::remove_file(&temp_path);
     }
-}
-
-/// Refresh provider catalogs before interactive model selection, without
-/// turning a network failure into an unusable session. Verified persisted
-/// catalogs retain route provenance; user models.json always wins on reload.
-fn provider_catalog_refresh_due(models_path: &Path, provider: &str) -> bool {
-    let path = fetched_models_path(models_path);
-    let Ok(metadata) = fs::metadata(&path) else { return true };
-    if metadata.len() > 4 * 1024 * 1024 { return true; }
-    let Ok(content) = fs::read_to_string(path) else { return true };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else { return true };
-    let fetched = value.get("providers")
-        .and_then(|providers| providers.get(provider))
-        .and_then(|row| row.get("fetchedAtUnixMs"))
-        .and_then(serde_json::Value::as_u64);
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .ok().and_then(|duration| u64::try_from(duration.as_millis()).ok());
-    match (now_ms, fetched) {
-        (Some(now), Some(last)) if now >= last =>
-            now - last >= 6 * 60 * 60 * 1000,
-        _ => true,
-    }
-}
-
-/// Runs at interactive startup so the model picker sees discovered models.
-/// Only actually authenticated/configured providers are contacted.
-async fn auto_refresh_ready_model_catalogs(
-    auth: &AuthStorage,
-    registry: &ModelRegistry,
-    models_path: &Path,
-) -> usize {
-    if std::env::var("PI_DISABLE_AUTO_MODEL_SYNC").is_ok_and(|value|
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")) {
-        return 0;
-    }
-    let providers = registry.available_models().into_iter()
-        .map(|entry| entry.model.provider.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut updated = 0;
-    for provider in providers {
-        if !provider_catalog_refresh_due(models_path, &provider) { continue; }
-        if !pi::providers::model_fetch::provider_model_catalog_route_is_configured(&provider)
-            .unwrap_or(false) { continue; }
-        let Ok(plan) = pi::providers::prepare_provider_model_catalog_fetch(&provider) else { continue };
-        let key = if plan.requires_runtime_api_key() {
-            auth.resolve_api_key(&provider, None).unwrap_or_default()
-        } else { String::new() };
-        if plan.requires_runtime_api_key() && key.is_empty() { continue; }
-        // Force a real response. A static fallback must never become "fresh".
-        match plan.fetch(&key, true).await {
-            Ok(catalog) => match pi::providers::persist_provider_model_catalog(models_path, &catalog) {
-                Ok(_) => updated += 1,
-                Err(error) => tracing::warn!(provider, error = %error,
-                    "model sync could not persist live membership"),
-            },
-            Err(error) => tracing::warn!(provider, error = %error,
-                "model sync unavailable; retaining previously verified catalog"),
-        }
-    }
-    updated
 }
 
 async fn handle_fetch_models(

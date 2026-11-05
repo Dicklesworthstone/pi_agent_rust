@@ -79,6 +79,9 @@ use crate::provider::ServiceTier;
 use crate::provider_metadata::{canonical_provider_id, provider_routing_defaults};
 use crate::providers::normalize_openai_base;
 
+mod sync;
+pub use sync::{provider_catalog_refresh_due, sync_ready_model_catalogs};
+
 /// TTL applied to every cache entry.  Five minutes balances staleness against
 /// rate-limit pressure on provider model catalogs.
 pub const MODEL_CACHE_TTL: Duration = Duration::from_mins(5);
