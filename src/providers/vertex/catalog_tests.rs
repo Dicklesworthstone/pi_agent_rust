@@ -2,7 +2,7 @@
 //!
 //! These IDs are *not* evidence that the project has access to invoke a model.
 
-use super::catalog::{
+use super::{
     catalog_endpoint, catalog_scope_with_env, parse_publisher_page,
 };
 
