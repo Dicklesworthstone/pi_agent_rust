@@ -38,7 +38,12 @@ pub fn provider_catalog_refresh_due(models_path: &Path, provider: &str) -> bool 
     let Ok(catalog) = crate::models::parse_persisted_fetched_catalog(&contents) else {
         return true;
     };
-    let last = catalog.providers.get(provider).map(|record| record.fetched_at_unix_ms);
+    // Generated catalog keys are canonical even if the live registry carries
+    // an alias or case-variant provider name.
+    let wanted = super::canonical_provider_key(provider);
+    let last = catalog.providers.iter()
+        .find(|(name, _)| super::canonical_provider_key(name) == wanted)
+        .map(|(_, record)| record.fetched_at_unix_ms);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok());
     stale_timestamp(last, now)
@@ -113,6 +118,12 @@ mod tests {
     fn missing_catalog_is_due() {
         let dir = tempfile::tempdir().unwrap();
         assert!(provider_catalog_refresh_due(&dir.path().join("models.json"), "openai"));
+    }
+
+    #[test]
+    fn provider_aliases_use_same_canonical_catalog_key() {
+        assert_eq!(super::super::canonical_provider_key("gemini"), "google");
+        assert_eq!(super::super::canonical_provider_key("Acme"), "acme");
     }
 
     #[test]
