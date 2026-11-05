@@ -3156,16 +3156,67 @@ impl Agent {
         self.config.system_prompt = system_prompt;
     }
 
+    /// Snapshot the effective reader, including an explicit image-input ban.
+    pub(crate) const fn compaction_reader(&self) -> compaction::CompactionReader {
+        compaction::CompactionReader {
+            accepts_images: self.config.model_accepts_images && !self.config.block_images,
+            source_text_budget: Some(self.snapcompact_text_tokens),
+        }
+    }
+
+    /// Apply the same exclusion and user-image policy for request construction
+    /// and compaction budgeting. Text-only contexts keep their borrowed view.
+    fn input_messages<'a>(&self, messages: &'a [Message]) -> Cow<'a, [Message]> {
+        let has_excluded = messages.iter().any(|message| {
+            matches!(message, Message::Custom(custom) if context_excluded_custom_message(custom))
+                || crate::turn_recovery::context_excludes_empty_response(message)
+        });
+        let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
+            && messages.iter().any(message_has_images);
+        if !has_excluded && !needs_image_filter {
+            return Cow::Borrowed(messages);
+        }
+        let mut messages = messages.to_vec();
+        messages.retain(|message| match message {
+            Message::Custom(custom) => !context_excluded_custom_message(custom),
+            Message::Assistant(_) => !crate::turn_recovery::context_excludes_empty_response(message),
+            _ => true,
+        });
+        apply_image_input_policy(
+            &mut messages,
+            self.config.block_images,
+            self.config.model_accepts_images,
+        );
+        Cow::Owned(messages)
+    }
+
     /// Estimate a session candidate using the same archive reading and budget
     /// as this agent's next request, without changing its durable messages.
     pub(crate) fn estimate_message_context_tokens(&self, messages: &[Message]) -> u64 {
+        let messages = self.input_messages(messages);
+        let reader = self.compaction_reader();
         compaction::estimate_model_context_tokens_for_model(
-            messages,
-            self.config.model_accepts_images && !self.config.block_images,
-            Some(self.snapcompact_text_tokens),
+            &messages,
+            reader.accepts_images,
+            reader.source_text_budget,
             self.provider.name(),
             self.provider.model_id(),
         )
+    }
+
+    /// Include reminders and rewind projection outside the raw kept slice.
+    /// Session replay owns those rules; estimates must not reimplement them.
+    pub(crate) fn refresh_compaction_retained_tokens(
+        &self,
+        preparation: &mut compaction::CompactionPreparation,
+        path_entries: &[crate::session::SessionEntry],
+    ) -> Result<()> {
+        let retained = Session::messages_retained_after_compaction(
+            path_entries,
+            &preparation.first_kept_entry_id,
+        )?;
+        preparation.retained_tokens = Some(self.estimate_message_context_tokens(&retained));
+        Ok(())
     }
 
     /// What the next completion request would carry: the system prompt,
@@ -3215,28 +3266,7 @@ impl Agent {
         // would only spend context budget. Until 2026-09-02 every hidden
         // custom message was dropped here, which silently discarded hidden
         // hook injections.
-        let has_excluded = self.messages.iter().any(|m| {
-            matches!(m, Message::Custom(c) if context_excluded_custom_message(c))
-                || crate::turn_recovery::context_excludes_empty_response(m)
-        });
-        let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
-            && self.messages.iter().any(message_has_images);
-        let messages: Cow<'_, [Message]> = if needs_image_filter || has_excluded {
-            let mut msgs = self.messages.clone();
-            msgs.retain(|m| match m {
-                Message::Custom(c) => !context_excluded_custom_message(c),
-                Message::Assistant(_) => !crate::turn_recovery::context_excludes_empty_response(m),
-                _ => true,
-            });
-            apply_image_input_policy(
-                &mut msgs,
-                self.config.block_images,
-                self.config.model_accepts_images,
-            );
-            Cow::Owned(msgs)
-        } else {
-            Cow::Borrowed(self.messages.as_slice())
-        };
+        let messages = self.input_messages(&self.messages);
 
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
         // Load modes (bd-cv653.1.6): discoverable-tier tools are excluded
@@ -7703,6 +7733,13 @@ impl SessionEditSnapshot {
             content: serde_json::to_vec(&(&session.header, &session.entries))?,
         })
     }
+}
+
+/// Recheck an automatic result against the selected live branch after all
+/// admission waits. Background generation may retain newly appended turns.
+struct CompactionInstallGuard {
+    origin: Option<CompactionOrigin>,
+    require_policy_fit: bool,
 }
 
 pub struct AgentSession {
@@ -12306,6 +12343,10 @@ mod extensions_integration_tests {
             &cached,
             None,
             &compaction::CompactionPrivacy::default(),
+            compaction::CompactionReader {
+                accepts_images: false,
+                source_text_budget: None,
+            },
         ))
         .expect("local reclamation must not resolve an exhausted credential pool");
         assert_eq!(result.details.mode.as_deref(), Some("shake"));
@@ -20156,39 +20197,22 @@ impl AgentSession {
         Ok((target_thinking, source))
     }
 
-    async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
+    fn compaction_origin_for_session(&self, session: &Session) -> CompactionOrigin {
         let provider = self.agent.provider();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let session = self
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        Ok(CompactionOrigin {
+        CompactionOrigin {
             session_id: session.header.id.clone(),
             provider_id: provider.name().to_string(),
             model_id: provider.model_id().to_string(),
             snapshot_leaf_id: session.leaf_id().map(str::to_string),
-        })
+        }
     }
 
-    async fn compaction_origin_matches_current(
+    fn compaction_origin_matches_session(
         &self,
         origin: &CompactionOrigin,
-    ) -> Result<(bool, CompactionOrigin)> {
-        let provider = self.agent.provider();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let session = self
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        let current = CompactionOrigin {
-            session_id: session.header.id.clone(),
-            provider_id: provider.name().to_string(),
-            model_id: provider.model_id().to_string(),
-            snapshot_leaf_id: session.leaf_id().map(str::to_string),
-        };
+        session: &Session,
+    ) -> (bool, CompactionOrigin) {
+        let current = self.compaction_origin_for_session(session);
         let snapshot_is_ancestor = origin.snapshot_leaf_id.as_ref().map_or_else(
             || session.leaf_id().is_none(),
             |snapshot_leaf_id| {
@@ -20203,7 +20227,63 @@ impl AgentSession {
             && origin.provider_id == current.provider_id
             && origin.model_id == current.model_id
             && snapshot_is_ancestor;
-        Ok((matches, current))
+        (matches, current)
+    }
+
+    async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(self.compaction_origin_for_session(&session))
+    }
+
+    async fn compaction_origin_matches_current(
+        &self,
+        origin: &CompactionOrigin,
+    ) -> Result<(bool, CompactionOrigin)> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(self.compaction_origin_matches_session(origin, &session))
+    }
+
+    /// Validate the complete replay context under the caller's live Session
+    /// lock, including descendants appended after background preparation.
+    /// Both views must be fully hydrated before this pre-persistence check.
+    pub(crate) fn validate_automatic_compaction_candidate(
+        &self,
+        current: &Session,
+        candidate: &Session,
+        trigger: u64,
+    ) -> Result<u64> {
+        if current.has_partial_v2_hydration() || candidate.has_partial_v2_hydration() {
+            return Err(Error::session(
+                "Automatic compaction requires a fully hydrated source before installation",
+            ));
+        }
+        let tokens_before = self
+            .agent
+            .estimate_message_context_tokens(&current.to_messages_for_current_path());
+        let tokens_after = self
+            .agent
+            .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
+        if tokens_after >= tokens_before {
+            return Err(Error::api(
+                "Automatic compaction made no progress; the candidate did not reduce the live context",
+            ));
+        }
+        if tokens_after >= trigger {
+            return Err(Error::api(format!(
+                "Automatic compaction candidate still reaches the live trigger ({tokens_after} >= {trigger}); the result was not applied",
+            )));
+        }
+        Ok(tokens_after)
     }
 
     /// Persist a private session candidate before installing its live context.
@@ -20576,6 +20656,10 @@ impl AgentSession {
                         None,
                         None,
                         None,
+                        Some(CompactionInstallGuard {
+                            origin: Some(origin),
+                            require_policy_fit: self.compaction_settings.method_order.is_some(),
+                        }),
                     )
                     .await?;
                     self.compaction_worker.mark_applied_success();
@@ -20609,17 +20693,34 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.ensure_entry_ids();
-            let entries = session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction_for_model(
-                &entries,
-                self.compaction_settings.clone(),
-                &origin_provider_id,
-                &origin_model_id,
-            );
+            let prepare = |session: &Session| {
+                let entries = session
+                    .entries_for_current_path()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let prep = compaction::prepare_compaction_for_model(
+                    &entries,
+                    self.compaction_settings.clone(),
+                    &origin_provider_id,
+                    &origin_model_id,
+                );
+                (entries, prep)
+            };
+            let (mut entries, mut prep) = prepare(&session);
+            // Fast-resume sessions stay lazy until eligible. Hydrate before
+            // binding the archive and retained projection, since a later save
+            // can restore older reminders and branches into the same path.
+            if prep.is_some() && session.has_partial_v2_hydration() {
+                session.ensure_full_v2_hydration_before_save()?;
+                session.ensure_entry_ids();
+                (entries, prep) = prepare(&session);
+            }
+            if let Some(prep) = prep.as_mut()
+                && prep.settings.method_order.is_some()
+            {
+                self.agent.refresh_compaction_retained_tokens(prep, &entries)?;
+            }
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
                 provider_id: origin_provider_id,
@@ -20720,6 +20821,10 @@ impl AgentSession {
                         false,
                         None,
                         None,
+                        Some(CompactionInstallGuard {
+                            origin: Some(origin),
+                            require_policy_fit: false,
+                        }),
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -20813,6 +20918,7 @@ impl AgentSession {
                 stream_options,
                 None,
                 self.agent.compaction_privacy(),
+                self.agent.compaction_reader(),
             ) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -20853,7 +20959,7 @@ impl AgentSession {
             return Ok(());
         }
 
-        let preparation = {
+        let (preparation, origin) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
@@ -20867,12 +20973,13 @@ impl AgentSession {
                 .cloned()
                 .collect::<Vec<_>>();
             let provider = self.agent.provider();
-            compaction::prepare_compaction_for_model(
+            let preparation = compaction::prepare_compaction_for_model(
                 &entries,
                 self.compaction_settings.clone(),
                 provider.name(),
                 provider.model_id(),
-            )
+            );
+            (preparation, self.compaction_origin_for_session(&session))
         };
 
         let Some(prep) = preparation else {
@@ -20915,6 +21022,10 @@ impl AgentSession {
             None,
             None,
             None,
+            Some(CompactionInstallGuard {
+                origin: Some(origin),
+                require_policy_fit: false,
+            }),
         )
         .await
     }
@@ -20971,11 +21082,12 @@ impl AgentSession {
         require_reduction: bool,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
         manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        install_guard: Option<CompactionInstallGuard>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let source = handoff_source.or(manual_source);
         let abort = source.map(|(_, abort)| abort);
-        let session_action_permit = if source.is_some() {
+        let session_action_permit = if source.is_some() || install_guard.is_some() {
             Some(
                 await_compaction_admission(abort, self.session_action_admission.acquire(cx.cx()))
                     .await?,
@@ -21001,6 +21113,30 @@ impl AgentSession {
                     "Compaction source changed during generation; the result was not applied"
                 }));
             }
+        }
+        if install_guard.is_some() || require_reduction {
+            // Save may fully hydrate a V2 snapshot. Project the same complete
+            // source now so a successful size check cannot grow during save.
+            session.ensure_full_v2_hydration_before_save()?;
+            session.ensure_entry_ids();
+        }
+        if let Some(origin) = install_guard.as_ref().and_then(|guard| guard.origin.as_ref())
+            && !self.compaction_origin_matches_session(origin, &session).0
+        {
+            return Err(Error::session(
+                "Automatic compaction source changed while awaiting installation; the result was not applied",
+            ));
+        }
+        if install_guard.is_some()
+            && !session.entries_for_current_path().iter().any(|entry| {
+                entry
+                    .base_id()
+                    .is_some_and(|entry_id| entry_id == first_kept_entry_id.as_str())
+            })
+        {
+            return Err(Error::session(
+                "Automatic compaction retained boundary is no longer on the selected path",
+            ));
         }
         if handoff_source.is_some()
             && (summary.trim().is_empty()
@@ -21037,19 +21173,31 @@ impl AgentSession {
         // Count the context actually sent next, not the archived tree entries
         // or pre-compaction usage. Refuse a no-progress overflow recovery
         // before writing or installing its candidate.
-        let tokens_after = self
-            .agent
-            .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
-        if require_reduction
-            && tokens_after
-                >= self
-                    .agent
-                    .estimate_message_context_tokens(&session.to_messages_for_current_path())
+        let tokens_after = if install_guard
+            .as_ref()
+            .is_some_and(|guard| guard.require_policy_fit)
         {
-            return Err(Error::api(
-                "Context overflow recovery made no progress; compaction did not reduce the active context",
-            ));
-        }
+            self.validate_automatic_compaction_candidate(
+                &session,
+                &candidate,
+                self.compaction_settings.trigger_tokens(),
+            )?
+        } else {
+            let tokens_after = self
+                .agent
+                .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
+            if require_reduction
+                && tokens_after
+                    >= self
+                        .agent
+                        .estimate_message_context_tokens(&session.to_messages_for_current_path())
+            {
+                return Err(Error::api(
+                    "Context overflow recovery made no progress; compaction did not reduce the active context",
+                ));
+            }
+            tokens_after
+        };
 
         if let Some(budget) = self.agent.cost_budget() {
             budget.checkpoint(&mut candidate)?;
@@ -21125,6 +21273,7 @@ impl AgentSession {
     }
 
     /// Apply a completed compaction result to the session.
+    #[allow(clippy::too_many_arguments)] // one durable append transaction
     async fn apply_compaction_result(
         &self,
         result: compaction::CompactionResult,
@@ -21133,6 +21282,7 @@ impl AgentSession {
         overflow_abort: Option<&AbortSignal>,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
         manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        install_guard: Option<CompactionInstallGuard>,
     ) -> Result<()> {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
@@ -21163,6 +21313,7 @@ impl AgentSession {
                 overflow,
                 handoff_source,
                 manual_source,
+                install_guard,
             )
             .await
         {
@@ -21222,7 +21373,7 @@ impl AgentSession {
         }
         let overflow = overflow_abort.is_some();
 
-        let (entries, preparation, source_snapshot) = {
+        let (entries, preparation, source_snapshot, install_guard) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = await_compaction_admission(abort, async {
                 self.session
@@ -21231,7 +21382,10 @@ impl AgentSession {
                     .map_err(|e| Error::session(e.to_string()))
             })
             .await?;
-            if handoff.is_some() || manual_abort.is_some() {
+            if handoff.is_some()
+                || manual_abort.is_some()
+                || (overflow && self.compaction_settings.method_order.is_some())
+            {
                 session.ensure_full_v2_hydration_before_save()?;
             }
             session.ensure_entry_ids();
@@ -21244,7 +21398,7 @@ impl AgentSession {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut settings = self.compaction_settings.clone();
-            let prep = if handoff.is_some() {
+            let mut prep = if handoff.is_some() {
                 compaction::prepare_handoff_compaction(&entries, settings)
             } else if overflow {
                 // A provider may reject a request smaller than the configured
@@ -21268,7 +21422,16 @@ impl AgentSession {
                 // `/compact` and `/shake`; automatic compaction does not run here.
                 compaction::prepare_manual_compaction(&entries, settings)
             };
-            (entries, prep, source_snapshot)
+            if let Some(prep) = prep.as_mut()
+                && prep.settings.method_order.is_some()
+            {
+                self.agent.refresh_compaction_retained_tokens(prep, &entries)?;
+            }
+            let install_guard = overflow.then(|| CompactionInstallGuard {
+                origin: Some(self.compaction_origin_for_session(&session)),
+                require_policy_fit: self.compaction_settings.method_order.is_some(),
+            });
+            (entries, prep, source_snapshot, install_guard)
         };
 
         if abort.is_some_and(AbortSignal::is_aborted) {
@@ -21363,6 +21526,7 @@ impl AgentSession {
                         overflow,
                         None,
                         source_snapshot.as_ref().zip(manual_abort),
+                        install_guard,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -21449,6 +21613,7 @@ impl AgentSession {
                             &stream_options,
                             instructions,
                             &privacy,
+                            self.agent.compaction_reader(),
                         )
                         .await
                     } else {
@@ -21479,6 +21644,7 @@ impl AgentSession {
                             .as_ref()
                             .zip(handoff.map(|(_, abort)| abort)),
                         source_snapshot.as_ref().zip(manual_abort),
+                        install_guard,
                     )
                     .await?;
                 }

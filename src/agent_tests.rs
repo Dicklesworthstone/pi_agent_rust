@@ -7466,7 +7466,7 @@ mod tests {
                 .expect("provider admission");
 
             agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None, None)
+                .apply_compaction_result(result, on_event, provider_admission, None, None, None, None)
                 .await
                 .expect("apply compaction result");
 
@@ -7883,6 +7883,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 ),
             )
             .await
@@ -7965,7 +7966,7 @@ mod tests {
                 .expect("provider admission");
 
             let err = agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None, None)
+                .apply_compaction_result(result, on_event, provider_admission, None, None, None, None)
                 .await
                 .expect_err("blocked persistence must fail");
             assert!(
@@ -8014,6 +8015,227 @@ mod tests {
                     error_message: Some(message),
                 } if message.contains("compaction persistence remained indeterminate")
             ));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn automatic_compaction_rechecks_descendant_budget_before_persistence() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            for oversized_tail in [false, true] {
+                let directory = tempfile::tempdir().expect("tempdir");
+                let mut original = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                original.append_message(user_message("historical request").into());
+                original.append_message(crate::session::SessionMessage::Assistant {
+                    message: assistant_message(&"historical completed work ".repeat(1_024)),
+                });
+                let kept = original.append_message(user_message("retained recent turn").into());
+                let agent = Agent::new(
+                    Arc::new(SilentProvider),
+                    ToolRegistry::new(&[], directory.path(), None),
+                    AgentConfig::default(),
+                );
+                let tokens_before =
+                    agent.estimate_message_context_tokens(&original.to_messages_for_current_path());
+                let mut initial_candidate = original.clone();
+                initial_candidate.append_compaction(
+                    "Completed the historical request".to_string(),
+                    kept.clone(),
+                    tokens_before,
+                    None,
+                    None,
+                );
+                assert!(
+                    agent.estimate_message_context_tokens(
+                        &initial_candidate.to_messages_for_current_path(),
+                    ) < 1_000,
+                    "the generated candidate fits its original retained tail"
+                );
+                assert!(tokens_before > 1_000);
+                let session = Arc::new(Mutex::new(original));
+                let agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    true,
+                    ResolvedCompactionSettings {
+                        context_window_tokens: 16_000,
+                        reserve_tokens: 512,
+                        threshold_tokens: Some(1_000),
+                        method_order: Some(vec![compaction::AutoCompactionMethod::Shake]),
+                        ..ResolvedCompactionSettings::default()
+                    },
+                );
+                let origin = agent_session.current_compaction_origin().await.expect("origin");
+                let (path, before_install) = {
+                    let cx = AgentCx::for_request();
+                    let mut live = session.lock(cx.cx()).await.expect("session lock");
+                    let tail = if oversized_tail {
+                        "newly completed descendant work ".repeat(1_024)
+                    } else {
+                        "short descendant turn".to_string()
+                    };
+                    live.append_message(user_message(&tail).into());
+                    live.save().await.expect("persist descendant before installation");
+                    (
+                        live.path.clone().expect("saved path"),
+                        SessionEditSnapshot::capture(&live).expect("live snapshot"),
+                    )
+                };
+                let saved_before = std::fs::read(&path).expect("read saved descendant");
+                let events = Arc::new(StdTestMutex::new(Vec::new()));
+                let sink = Arc::clone(&events);
+                let on_event: AgentEventHandler = Arc::new(move |event| {
+                    sink.lock().expect("events").push(event);
+                });
+                let provider_admission = agent_session
+                    .provider_admission
+                    .acquire(&asupersync::Cx::for_testing())
+                    .await
+                    .expect("provider admission");
+                let outcome = agent_session
+                    .apply_compaction_result(
+                        compaction::CompactionResult {
+                            summary: "Completed the historical request".to_string(),
+                            first_kept_entry_id: kept,
+                            tokens_before,
+                            details: compaction::CompactionDetails {
+                                read_files: Vec::new(),
+                                modified_files: Vec::new(),
+                                mode: Some("shake".to_string()),
+                            },
+                            snap_payload: None,
+                        },
+                        on_event,
+                        provider_admission,
+                        None,
+                        None,
+                        None,
+                        Some(CompactionInstallGuard {
+                            origin: Some(origin),
+                            require_policy_fit: true,
+                        }),
+                    )
+                    .await;
+
+                if oversized_tail {
+                    let error = outcome.expect_err("the enlarged tail no longer fits");
+                    assert!(error.to_string().contains("still reaches the live trigger"));
+                    assert_eq!(std::fs::read(&path).expect("read rejected store"), saved_before);
+                    let cx = AgentCx::for_request();
+                    let live = session.lock(cx.cx()).await.expect("session lock");
+                    assert!(
+                        SessionEditSnapshot::capture(&live).expect("unchanged snapshot")
+                            == before_install,
+                        "rejecting a candidate must preserve the selected source"
+                    );
+                } else {
+                    outcome.expect("a fitting descendant must remain eligible");
+                }
+                assert!(agent_session.ensure_provider_reentry_allowed().is_ok());
+                {
+                    let events = events.lock().expect("terminal events");
+                    assert_eq!(events.len(), 1);
+                    assert!(matches!(
+                        &events[0],
+                        AgentEvent::AutoCompactionEnd { result, will_retry: false, .. }
+                            if result.is_some() != oversized_tail
+                    ));
+                }
+                let reopened = Session::open(path.to_str().expect("UTF-8 path"))
+                    .await
+                    .expect("reopen accepted store");
+                let installed = reopened.entries_for_current_path().into_iter().any(|entry| {
+                    matches!(entry, crate::session::SessionEntry::Compaction(_))
+                });
+                assert_eq!(installed, !oversized_tail);
+                let history = serde_json::to_string(&reopened.to_messages_for_current_path())
+                    .expect("reopened history");
+                assert!(history.contains("retained recent turn"));
+                assert!(history.contains(if oversized_tail {
+                    "newly completed descendant work"
+                } else {
+                    "short descendant turn"
+                }));
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // hold the source lock across the first poll
+    fn automatic_compaction_rechecks_origin_after_waiting_for_the_session_lock() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let mut original = Session::in_memory();
+            let root = original.append_message(user_message("shared branch root").into());
+            original.append_message(user_message("old branch work").into());
+            let kept = original.append_message(user_message("old retained turn").into());
+            let session = Arc::new(Mutex::new(original));
+            let agent_session = AgentSession::new(
+                Agent::new(
+                    Arc::new(SilentProvider),
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig::default(),
+                ),
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let origin = agent_session.current_compaction_origin().await.expect("origin");
+            assert!(
+                agent_session
+                    .compaction_origin_matches_current(&origin)
+                    .await
+                    .expect("initial origin check")
+                    .0
+            );
+            let cx = AgentCx::for_request();
+            let mut live = session.lock(cx.cx()).await.expect("hold source lock");
+            let provider_admission = agent_session
+                .provider_admission
+                .acquire(cx.cx())
+                .await
+                .expect("provider admission");
+            let install = agent_session.apply_compaction_result(
+                compaction::CompactionResult {
+                    summary: "Summary from the old branch".to_string(),
+                    first_kept_entry_id: kept,
+                    tokens_before: 10_000,
+                    details: compaction::CompactionDetails {
+                        read_files: Vec::new(),
+                        modified_files: Vec::new(),
+                        mode: None,
+                    },
+                    snap_payload: None,
+                },
+                Arc::new(|_| {}),
+                provider_admission,
+                None,
+                None,
+                None,
+                Some(CompactionInstallGuard {
+                    origin: Some(origin),
+                    require_policy_fit: false,
+                }),
+            );
+            futures::pin_mut!(install);
+            assert!(futures::poll!(install.as_mut()).is_pending());
+            assert!(live.create_branch_from(&root));
+            live.append_message(user_message("new selected branch").into());
+            let selected = SessionEditSnapshot::capture(&live).expect("selected branch");
+            drop(live);
+
+            let error = install.await.expect_err("the old origin must be rejected");
+            assert!(error.to_string().contains("source changed while awaiting installation"));
+            assert!(agent_session.ensure_provider_reentry_allowed().is_ok());
+            let live = session.lock(cx.cx()).await.expect("unchanged branch");
+            assert!(SessionEditSnapshot::capture(&live).expect("live snapshot") == selected);
         });
     }
 

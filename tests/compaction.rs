@@ -5,7 +5,7 @@ mod common;
 
 use common::{TestHarness, run_async};
 use pi::compaction::{
-    AutoCompactionMethod, CompactionPreparation, CompactionPrivacy, CompactionResult,
+    AutoCompactionMethod, CompactionPreparation, CompactionPrivacy, CompactionReader, CompactionResult,
     SEMANTIC_COMPACTION_QUALITY_SCHEMA, SemanticCompactionLossClass, SemanticCompactionMarker,
     SemanticCompactionMarkerKind, SemanticCompactionMarkerObservation, SemanticCompactionMarkerSeverity,
     SemanticCompactionQualityVerdict, SemanticCompactionQualityView, compact, compact_auto,
@@ -28,6 +28,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 const TS: &str = "2026-02-03T00:00:00.000Z";
+const TEXT_READER: CompactionReader = CompactionReader {
+    accepts_images: false,
+    source_text_budget: Some(8_192),
+};
 
 fn test_options(api_key: &str) -> StreamOptions {
     StreamOptions {
@@ -1137,7 +1141,7 @@ fn read_file_ops(path: &str) -> pi::compaction::FileOperations {
 #[test]
 fn automatic_method_guardrails_precede_provider_admission() {
     run_async(async {
-        for invalid_case in 0..5 {
+        for invalid_case in 0..4 {
             let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
             let mut prep = privacy_preparation();
             prep.settings.method_order = Some(vec![
@@ -1151,14 +1155,10 @@ fn automatic_method_guardrails_precede_provider_admission() {
                     "requires retainedTokens"
                 }
                 1 => {
-                    prep.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
-                    "requires text rendering"
-                }
-                2 => {
                     prep.settings.method_order = Some(Vec::new());
                     "between one and three"
                 }
-                3 => {
+                2 => {
                     prep.settings.method_order =
                         Some(vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Soft]);
                     "duplicate methods"
@@ -1174,6 +1174,7 @@ fn automatic_method_guardrails_precede_provider_admission() {
                 &test_options("auth-kept"),
                 None,
                 &CompactionPrivacy::default(),
+                TEXT_READER,
             )
             .await
             .expect_err("unsupported policies must not produce a replacement window");
@@ -1200,6 +1201,7 @@ fn automatic_remote_is_skipped_and_first_sufficient_method_stops() {
             &test_options("auth-kept"),
             None,
             &CompactionPrivacy::default(),
+            TEXT_READER,
         )
         .await
         .expect("a usable shake ends the ordered attempt");
@@ -1227,12 +1229,164 @@ fn automatic_summary_cannot_hide_an_oversized_retained_turn() {
             &test_options("auth-kept"),
             None,
             &CompactionPrivacy::default(),
+            TEXT_READER,
         )
         .await
         .expect_err("the actual retained tail still exceeds the context threshold");
         assert!(error.to_string().contains("reclaimed insufficient context"));
         assert_eq!(provider.prompts().len(), 1);
         assert_eq!(provider.native_calls(), 0);
+    });
+}
+
+#[test]
+fn automatic_snapcompact_acceptance_uses_the_active_readers_archive_budget() {
+    run_async(async {
+        let source = "archive source evidence for retention.\n".repeat(200);
+        for reader in [
+            CompactionReader {
+                accepts_images: false,
+                source_text_budget: Some(64),
+            },
+            CompactionReader {
+                accepts_images: true,
+                source_text_budget: Some(64),
+            },
+            CompactionReader {
+                accepts_images: false,
+                source_text_budget: None,
+            },
+        ] {
+            let provider = Arc::new(ScriptedProvider::new(["short checkpoint"]));
+            let mut session = Session::in_memory();
+            session.append_message(user_text("inspect the archived evidence"));
+            session.append_message(assistant_message(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "read-archive".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({"path": "evidence.txt"}),
+                    thought_signature: None,
+                })],
+                Usage::default(),
+                StopReason::ToolUse,
+            ));
+            session.append_message(tool_result("read-archive", "read", &source));
+            session.append_message(assistant_text("reviewed the evidence", 0));
+            let kept = session.append_message(user_text("continue the investigation"));
+            let entries = session
+                .entries_for_current_path()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let before = serde_json::to_value(&entries).expect("source entries");
+            let settings = pi::compaction::ResolvedCompactionSettings {
+                keep_recent_tokens: 1,
+                threshold_tokens: Some(1000),
+                render_mode: pi::compaction::CompactionRenderMode::SnapCompact,
+                method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
+                ..Default::default()
+            };
+            let preparation = pi::compaction::prepare_compaction_for_model(
+                &entries,
+                settings,
+                provider.name(),
+                provider.model_id(),
+            )
+            .expect("archive exceeds the automatic threshold");
+            assert_eq!(preparation.first_kept_entry_id, kept);
+            assert!(preparation.tokens_before > 1000);
+            let result = compact_auto(
+                preparation,
+                provider.clone(),
+                &test_options("auth-kept"),
+                None,
+                &CompactionPrivacy::default(),
+                reader,
+            )
+            .await;
+            assert_eq!(
+                serde_json::to_value(session.entries_for_current_path()).expect("current entries"),
+                before,
+                "candidate selection cannot install or alter session history",
+            );
+            assert_eq!(provider.native_calls(), 0);
+            if reader.accepts_images || reader.source_text_budget.is_none() {
+                let error = result.expect_err("the actual archive still exceeds the trigger");
+                assert!(error.to_string().contains("reclaimed insufficient context"));
+                assert_eq!(provider.prompts().len(), 1, "Soft must be attempted after Shake");
+                continue;
+            }
+
+            let result = result.expect("a bounded text reading permits local compaction");
+            assert_eq!(result.details.mode.as_deref(), Some("shake"));
+            assert!(provider.prompts().is_empty());
+            let payload = result.snap_payload.as_ref().expect("retained source archive");
+            assert!(!payload.frames.is_empty());
+            assert!(payload.source_text.as_deref().expect("source").contains(&source));
+            let details = pi::compaction_snap::payload_to_details(
+                Some(pi::compaction::compaction_details_to_value(&result.details).expect("details")),
+                payload,
+            );
+            session.append_compaction(
+                result.summary,
+                result.first_kept_entry_id,
+                result.tokens_before,
+                Some(details),
+                None,
+            );
+            let installed_tokens = pi::compaction::estimate_model_context_tokens_for_model(
+                &session.to_messages_for_current_path(),
+                reader.accepts_images,
+                reader.source_text_budget,
+                provider.name(),
+                provider.model_id(),
+            );
+            assert!(installed_tokens < 1000, "installed {installed_tokens} tokens");
+        }
+    });
+}
+
+#[test]
+fn automatic_snapcompact_rescreens_cached_archive_after_a_rejected_summary() {
+    run_async(async {
+        let discovered = "laterAssignmentCredential987654321";
+        let provider = Arc::new(ScriptedProvider::new([format!(
+            "API_KEY={discovered}\n{}",
+            "unhelpful generated prose ".repeat(2000),
+        )]));
+        let privacy = CompactionPrivacy::from_settings(Some(&pi::secrets::SecretsSettings {
+            mode: Some("obfuscate".to_string()),
+            extra_patterns: None,
+        }));
+        let mut preparation = privacy_preparation();
+        preparation.messages_to_summarize = vec![user_text(format!("earlier bare echo: {discovered}"))];
+        preparation.is_split_turn = false;
+        preparation.turn_prefix_messages.clear();
+        preparation.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
+        preparation.settings.threshold_tokens = Some(2000);
+        preparation.settings.method_order =
+            Some(vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Shake]);
+        let before = pi::compaction::compaction_preparation_to_value(&preparation);
+        let result = compact_auto(
+            preparation.clone(),
+            provider.clone(),
+            &test_options("auth-kept"),
+            None,
+            &privacy,
+            TEXT_READER,
+        )
+        .await
+        .expect("Shake must replace an oversized Soft candidate");
+        assert_eq!(result.details.mode.as_deref(), Some("shake"));
+        assert_eq!(provider.prompts().len(), 1);
+        assert!(provider.prompts()[0].contains(discovered));
+        assert!(!result.summary.contains(discovered));
+        let payload = result.snap_payload.expect("screened archive");
+        let source = payload.source_text.as_deref().expect("durable source");
+        assert!(!source.contains(discovered));
+        assert!(source.contains("<pi-secret:redacted>"));
+        assert_eq!(payload.frames, pi::compaction_snap::render_frames(source));
+        assert_eq!(pi::compaction::compaction_preparation_to_value(&preparation), before);
     });
 }
 
@@ -1282,6 +1436,7 @@ fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
                     &test_options("auth-kept"),
                     custom,
                     &privacy,
+                    TEXT_READER,
                 )
                 .await
                 .expect_err("block mode must reject the full unsliced field");

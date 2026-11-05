@@ -21,7 +21,8 @@ use crate::auth::AuthStorage;
 #[cfg(test)]
 use crate::compaction::prepare_compaction;
 use crate::compaction::{
-    ResolvedCompactionSettings, compact, compact_auto, compaction_details_to_value,
+    CompactionPreparation, ResolvedCompactionSettings, compact, compact_auto,
+    compaction_details_to_value,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -15809,7 +15810,7 @@ async fn maybe_auto_compact(
         return;
     }
     drop(state);
-    let (source, prep, reader) = {
+    let (source, prep, reader, projection) = {
         let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
             return;
         };
@@ -15836,20 +15837,28 @@ async fn maybe_auto_compact(
         // enable compaction even when startup settings disabled it.
         settings.enabled = true;
 
-        let prepare = |inner_session: &Session| {
+        let prepare = |inner_session: &Session| -> Result<Option<CompactionPreparation>> {
             let path_entries = inner_session
                 .entries_for_current_path()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            crate::compaction::prepare_compaction_for_model(
+            let mut prep = crate::compaction::prepare_compaction_for_model(
                 &path_entries,
                 settings.clone(),
                 reader.name(),
                 reader.model_id(),
-            )
+            );
+            if let Some(prep) = prep.as_mut()
+                && prep.settings.method_order.is_some()
+            {
+                guard
+                    .agent
+                    .refresh_compaction_retained_tokens(prep, &path_entries)?;
+            }
+            Ok(prep)
         };
-        let Some(mut prep) = prepare(&inner_session) else {
+        let Ok(Some(mut prep)) = prepare(&inner_session) else {
             return;
         };
         // Keep the ordinary below-threshold path lazy. Only an eligible
@@ -15864,7 +15873,7 @@ async fn maybe_auto_compact(
                 return;
             }
             inner_session.ensure_entry_ids();
-            let Some(hydrated_prep) = prepare(&inner_session) else {
+            let Ok(Some(hydrated_prep)) = prepare(&inner_session) else {
                 return;
             };
             prep = hydrated_prep;
@@ -15872,7 +15881,7 @@ async fn maybe_auto_compact(
         let Ok(source) = SessionEditSnapshot::capture(&inner_session) else {
             return;
         };
-        (source, prep, reader)
+        (source, prep, reader, guard.agent.compaction_reader())
     };
 
     let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionStart {
@@ -15929,7 +15938,10 @@ async fn maybe_auto_compact(
                 return;
             }
         };
-        if current != source || !Arc::ptr_eq(&reader, &guard.agent.provider()) {
+        if current != source
+            || !Arc::ptr_eq(&reader, &guard.agent.provider())
+            || projection != guard.agent.compaction_reader()
+        {
             emit_auto_compaction_error(
                 &out_tx,
                 "Active session changed before auto-compaction provider admission; retry against the current session",
@@ -15942,13 +15954,18 @@ async fn maybe_auto_compact(
     // before installing the result. A shared session ID alone does not bind a
     // summary to its branch, model selection, history, or persistence target.
     let stream_options = guard.agent.stream_options().clone();
+    let automatic_trigger = prep
+        .settings
+        .method_order
+        .as_ref()
+        .map(|_| prep.settings.trigger_tokens());
     let provider = if prep.settings.method_order.is_some() {
         guard.automatic_compaction_provider()
     } else {
         guard.agent.provider()
     };
     let privacy = guard.agent.compaction_privacy();
-    let result = compact_auto(prep, provider, &stream_options, None, &privacy).await;
+    let result = compact_auto(prep, provider, &stream_options, None, &privacy, projection).await;
 
     match result {
         Ok(result) => {
@@ -16012,6 +16029,16 @@ async fn maybe_auto_compact(
                     Some(details_value.clone()),
                     None,
                 );
+                if let Some(trigger) = automatic_trigger
+                    && let Err(error) = guard.validate_automatic_compaction_candidate(
+                        &inner_session,
+                        &candidate,
+                        trigger,
+                    )
+                {
+                    emit_auto_compaction_error(&out_tx, error.to_string());
+                    return;
+                }
                 // The summary request bills the shared account after the
                 // original source was captured. The common transaction saves
                 // that bill with the summary, then projects the accepted saved
@@ -27099,6 +27126,172 @@ export default function init(pi) {
                 let (live_context, stored_context) =
                     stored.current_path_comparison_values(live.agent.messages());
                 assert_eq!(live_context, stored_context, "{case}");
+            }
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn auto_compaction_snapcompact_budgets_the_active_reader_and_reopens_the_archive() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for (vision, blocked, threshold, accepted) in [
+                (true, false, 10_000, true),
+                (false, false, 10_000, true),
+                (true, true, 10_000, true),
+                (true, false, 1_000, false),
+                (false, false, 1_000, false),
+            ] {
+                let directory = tempfile::tempdir().expect("workspace");
+                let archive_source = format!(
+                    "ARCHIVE-READER-PROBE {}",
+                    "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6".repeat(800),
+                );
+                let mut stored = Session::create_with_dir(Some(directory.path().join("sessions")));
+                stored.header.provider = Some("test-provider".to_string());
+                stored.header.model_id = Some("test-model".to_string());
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text(archive_source),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("old answer"))],
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage {
+                            total_tokens: 80_000,
+                            ..Usage::default()
+                        },
+                        ..AssistantMessage::default()
+                    },
+                });
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("retained recent turn".to_string()),
+                    timestamp: Some(0),
+                });
+                stored.save().await.expect("initial durable session");
+                let path = stored.path.clone().expect("session path");
+                let before = std::fs::read(&path).expect("initial bytes");
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let mut options = build_test_rpc_options(&handle, directory.path().join("auth.json"));
+                options.config = serde_json::from_value(json!({
+                    "compaction": {
+                        "enabled": true, "mode": "snapcompact", "methodOrder": ["soft"],
+                        "reserveTokens": 8_000, "keepRecentTokens": 1,
+                        "thresholdTokens": threshold
+                    }
+                }))
+                .expect("archive policy");
+                let settings = options.config.resolved_compaction_settings(20_000);
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                model.model.context_window = 20_000;
+                // The effective Agent reader, including a local image ban,
+                // remains authoritative even if catalog metadata says vision.
+                model.model.input = vec![InputType::Text, InputType::Image];
+                options.available_models = vec![model];
+                let mut agent = Agent::new(
+                    Arc::new(OrderedCompactionProvider {
+                        requests: Arc::clone(&requests),
+                        summary: Some("short portable checkpoint".to_string()),
+                    }),
+                    ToolRegistry::new(&[], directory.path(), None),
+                    AgentConfig {
+                        model_accepts_images: vision,
+                        block_images: blocked,
+                        ..AgentConfig::default()
+                    },
+                );
+                agent.replace_messages(stored.to_messages_for_current_path());
+                let session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                    agent,
+                    Arc::new(asupersync::sync::Mutex::new(stored)),
+                    true,
+                    settings,
+                )));
+                let shared = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &options.config,
+                )));
+                let compacting = Arc::new(AtomicBool::new(false));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                maybe_auto_compact(
+                    Arc::clone(&session),
+                    shared,
+                    options,
+                    Arc::clone(&compacting),
+                    out_tx,
+                )
+                .await;
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "vision={vision}, blocked={blocked}, threshold={threshold}: {events:?}",
+                );
+                assert!(!compacting.load(Ordering::SeqCst));
+                assert_eq!(requests.lock().expect("requests").len(), 1);
+                if !accepted {
+                    assert!(events[1]["errorMessage"].is_string(), "{events:?}");
+                    assert!(events[1].get("result").is_none());
+                    assert_eq!(std::fs::read(&path).expect("unchanged history"), before);
+                    continue;
+                }
+                assert!(events[1].get("errorMessage").is_none(), "{events:?}");
+                assert!(events[1]["result"]["tokensAfter"].as_u64().unwrap() < threshold);
+                let reopened = Session::open(path.to_str().expect("UTF-8 path"))
+                    .await
+                    .expect("reopen archive");
+                let installed = reopened
+                    .entries_for_current_path()
+                    .into_iter()
+                    .find_map(|entry| {
+                        if let crate::session::SessionEntry::Compaction(entry) = entry {
+                            Some(entry)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("one durable compaction");
+                let payload =
+                    crate::compaction_snap::frames_from_details(installed.details.as_ref())
+                        .expect("persisted archive");
+                assert!(
+                    payload
+                        .source_text
+                        .as_deref()
+                        .unwrap()
+                        .contains("ARCHIVE-READER-PROBE"),
+                );
+                assert!(!payload.frames.is_empty());
+                let cx = AgentCx::for_request();
+                let mut live = session.lock(&cx).await.expect("live session");
+                let live_tokens = live
+                    .agent
+                    .estimate_message_context_tokens(live.agent.messages());
+                assert_eq!(events[1]["result"]["tokensAfter"], live_tokens);
+                live.agent
+                    .replace_messages(reopened.to_messages_for_current_path());
+                for next_vision in [true, false] {
+                    live.agent.set_model_accepts_images(next_vision);
+                    let request = live.agent.request_context_json();
+                    let wire = serde_json::to_string(&request["messages"]).expect("request context");
+                    assert_eq!(wire.contains("image/png"), next_vision && !blocked);
+                    assert_eq!(
+                        wire.contains("ARCHIVE-READER-PROBE"),
+                        !next_vision || blocked,
+                    );
+                    assert!(wire.contains("retained recent turn"));
+                    assert!(!wire.contains("pi.snapcompact"));
+                    assert!(!wire.contains("sourceText"));
+                }
             }
         }));
     }

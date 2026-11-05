@@ -6645,6 +6645,53 @@ impl Session {
         self.rebuild_current_path().messages
     }
 
+    /// Preview exactly what would survive after appending a compaction at this
+    /// cut, excluding its new summary/archive message. The virtual entry never
+    /// changes IDs, autosave state, or durable history. Reusing the normal
+    /// rebuild preserves historical stream-rule reminders and checkpoint
+    /// rewinds that a raw suffix of entries cannot represent.
+    pub(crate) fn messages_retained_after_compaction(
+        path_entries: &[SessionEntry],
+        first_kept_entry_id: &str,
+    ) -> Result<Vec<Message>> {
+        if !path_entries.iter().any(|entry| {
+            entry
+                .base_id()
+                .is_some_and(|id| id == first_kept_entry_id)
+        }) {
+            return Err(Error::session(
+                "Compaction retained-context projection references an unknown cut point",
+            ));
+        }
+        let virtual_entry = SessionEntry::Compaction(CompactionEntry {
+            base: EntryBase {
+                id: None,
+                parent_id: path_entries.last().and_then(SessionEntry::base_id).cloned(),
+                timestamp: String::new(),
+            },
+            summary: String::new(),
+            first_kept_entry_id: first_kept_entry_id.to_string(),
+            tokens_before: 0,
+            details: None,
+            from_hook: None,
+        });
+        let rebuilt = Self::rebuild_from_path(path_entries.len() + 1, |index| {
+            if index == path_entries.len() {
+                &virtual_entry
+            } else {
+                &path_entries[index]
+            }
+        });
+        // The most recent compaction always contributes the first message;
+        // only that placeholder is removed. Preserved reminders follow it.
+        Ok(rebuilt
+            .messages
+            .into_iter()
+            .skip(1)
+            .map(|(message, _)| message)
+            .collect())
+    }
+
     /// Test comparison of a `live` context installed from this session's
     /// current path, as `(live, projected)` JSON. Summary entries and
     /// timestamp-less rows read the clock on every rebuild, so only the
@@ -14291,6 +14338,77 @@ mod tests {
         assert_eq!(
             stream_reminder_bodies(&session),
             ["Shared instruction.", "Right branch instruction."]
+        );
+    }
+
+    #[test]
+    fn retained_compaction_projection_matches_installed_branch_and_rewind_context() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("original request"));
+        session.append_message(make_stream_reminder("ownership", "Keep ownership scoped."));
+        let branch_point = session.append_message(make_test_message("choose a direction"));
+        session.append_message(make_stream_reminder("left", "Left-only instruction."));
+        session.append_message(make_test_message("left branch finish"));
+        assert!(session.create_branch_from(&branch_point));
+        session.append_message(make_stream_reminder("right", "Right branch instruction."));
+        let first_kept = session.append_message(make_test_message("retained request"));
+        let checkpoint = session.append_custom_entry("checkpoint".to_string(), None);
+        session.append_message(make_test_message("discarded exploration"));
+        session.append_message(make_stream_reminder("discarded", "Discarded instruction."));
+        session.append_custom_entry(
+            "rewind".to_string(),
+            Some(serde_json::json!({
+                "checkpointEntryId": checkpoint,
+                "summary": "Abandoned the exploration."
+            })),
+        );
+        session.append_message(make_test_message("continue after rewind"));
+        let entries_before = serde_json::to_value(&session.entries).expect("serialize entries");
+        let leaf_before = session.leaf_id.clone();
+        let mutations_before = session.autosave_metrics().pending_mutations;
+        let path = session
+            .entries_for_current_path()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let retained = Session::messages_retained_after_compaction(&path, &first_kept)
+            .expect("project retained context");
+        let retained_json = serde_json::to_value(&retained).expect("serialize retained context");
+        let retained_text = retained_json.to_string();
+        for expected in [
+            "Keep ownership scoped.",
+            "Right branch instruction.",
+            "retained request",
+            "Abandoned the exploration.",
+            "continue after rewind",
+        ] {
+            assert!(retained_text.contains(expected), "missing {expected}");
+        }
+        for excluded in [
+            "original request",
+            "Left-only instruction.",
+            "left branch finish",
+            "discarded exploration",
+            "Discarded instruction.",
+        ] {
+            assert!(!retained_text.contains(excluded), "retained {excluded}");
+        }
+        assert_eq!(
+            serde_json::to_value(&session.entries).expect("serialize entries"),
+            entries_before,
+        );
+        assert_eq!(session.leaf_id, leaf_before);
+        assert_eq!(session.autosave_metrics().pending_mutations, mutations_before);
+        assert!(Session::messages_retained_after_compaction(&path, "missing").is_err());
+        assert!(Session::messages_retained_after_compaction(&[], &first_kept).is_err());
+
+        session.append_compaction("installed summary".to_string(), first_kept, 1000, None, None);
+        let installed = session.to_messages_for_current_path();
+        assert_eq!(
+            serde_json::to_value(&installed[1..]).expect("serialize installed tail"),
+            retained_json,
+            "the estimate must use exactly the messages installed by replay",
         );
     }
 

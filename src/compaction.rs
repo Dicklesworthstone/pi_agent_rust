@@ -203,6 +203,16 @@ pub struct ResolvedCompactionSettings {
     pub render_mode: CompactionRenderMode,
 }
 
+/// Effective reading of a compaction candidate by the next provider request.
+/// The session owner supplies this snapshot rather than inferring capabilities
+/// from a provider or model name. Text budgets affect the outbound archive
+/// reading only; the complete screened source remains durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReader {
+    pub accepts_images: bool,
+    pub source_text_budget: Option<u32>,
+}
+
 impl ResolvedCompactionSettings {
     /// Recompute the automatic trigger against the active model's capacity.
     /// Explicit thresholds may compact earlier, but never consume reserved
@@ -1980,9 +1990,7 @@ pub fn estimate_model_context_tokens_for_model(
     let estimate = |messages: &[Message]| {
         messages
             .iter()
-            .cloned()
-            .map(SessionMessage::from)
-            .map(|message| estimate_tokens_with_table(&message, table))
+            .map(|message| estimate_model_message_with_table(message, table))
             .fold(0u64, u64::saturating_add)
     };
     if accepts_images
@@ -2112,6 +2120,44 @@ fn estimate_tokens_with_table(
         | SessionMessage::CompactionSummary { summary, .. } => text.push_str(summary),
     }
 
+    flat_tokens.saturating_add(crate::token_count::active_counter().count(&text, table))
+}
+
+/// Count borrowed provider messages without cloning their image/media payloads.
+/// All roles share the selected reader's table, and historical assistant usage
+/// is deliberately ignored when evaluating a replacement context.
+fn estimate_model_message_with_table(
+    message: &Message,
+    table: crate::token_count::TokenTable,
+) -> u64 {
+    let mut text = String::new();
+    let mut flat_tokens = 0;
+    match message {
+        Message::User(user) => match &user.content {
+            UserContent::Text(value) => text.push_str(value),
+            UserContent::Blocks(blocks) => {
+                for block in blocks {
+                    accumulate_block_estimate(block, &mut text, &mut flat_tokens);
+                }
+            }
+        },
+        Message::Assistant(assistant) => {
+            for block in &assistant.content {
+                accumulate_block_estimate(block, &mut text, &mut flat_tokens);
+            }
+        }
+        Message::ToolResult(result) => {
+            for block in &result.content {
+                accumulate_block_estimate(block, &mut text, &mut flat_tokens);
+            }
+        }
+        Message::Custom(custom) => {
+            text.push_str(&custom.content);
+            if let Some(source) = crate::compaction_snap::source_for_custom(custom) {
+                text.push_str(source);
+            }
+        }
+    }
     flat_tokens.saturating_add(crate::token_count::active_counter().count(&text, table))
 }
 
@@ -3197,6 +3243,7 @@ pub async fn summarize_entries(
         custom_instructions.as_deref(),
         &prompts,
         &mut privacy,
+        true,
     )?;
     let mut summary =
         generate_llm_summary(&preparation.settings, provider, stream_options, requests).await?;
@@ -3223,6 +3270,7 @@ fn prepare_summary_requests(
     custom_instructions: Option<&str>,
     prompts: &SummaryPrompts,
     privacy: &mut CompactionPrivacy,
+    include_archive: bool,
 ) -> Result<PreparedSummaryRequests> {
     let split = preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty();
     let mut requests = PreparedSummaryRequests {
@@ -3237,19 +3285,9 @@ fn prepare_summary_requests(
         }),
         turn_prefix: split
             .then(|| turn_prefix_prompt_text(&preparation.turn_prefix_messages, prompts)),
-        snap_transcript: matches!(
-            preparation.settings.render_mode,
-            CompactionRenderMode::SnapCompact
-        )
-        .then(|| {
-            let messages = preparation
-                .messages_to_summarize
-                .iter()
-                .chain(&preparation.turn_prefix_messages)
-                .filter_map(session_message_to_model)
-                .collect::<Vec<_>>();
-            serialize_conversation(&messages)
-        }),
+        snap_transcript: include_archive
+            .then(|| snap_transcript(preparation))
+            .flatten(),
     };
     let mut fields = SummaryFields::default();
     fields.text(&mut requests.system)?;
@@ -3265,6 +3303,40 @@ fn prepare_summary_requests(
     }
     fields.screen(privacy)?;
     Ok(requests)
+}
+
+fn snap_transcript(preparation: &CompactionPreparation) -> Option<String> {
+    (preparation.settings.render_mode == CompactionRenderMode::SnapCompact).then(|| {
+        let messages = preparation
+            .messages_to_summarize
+            .iter()
+            .chain(&preparation.turn_prefix_messages)
+            .filter_map(session_message_to_model)
+            .collect::<Vec<_>>();
+        serialize_conversation(&messages)
+    })
+}
+
+/// Render only a complete admitted source. The caller screens this transcript
+/// before entering here; all fallback methods share the resulting archive.
+fn render_snap_payload(transcript: String) -> Option<crate::compaction_snap::SnapPayload> {
+    if transcript.len() > crate::compaction_snap::MAX_SOURCE_TEXT_BYTES {
+        tracing::warn!(
+            target: "snapcompact",
+            reason_code = "snapcompact_source_text_limit",
+            "Archive source exceeds its retention budget; retaining the compaction summary"
+        );
+        return None;
+    }
+    let frames = crate::compaction_snap::render_frames(&transcript);
+    tracing::info!(
+        target: "snapcompact",
+        frame_count = frames.len(),
+        source_chars = transcript.chars().count(),
+        reason_code = "snapcompact_archive_generated",
+        "Retained compacted source with its available visual reading"
+    );
+    Some(crate::compaction_snap::SnapPayload::new(frames).with_source_text(transcript))
 }
 
 /// Provider failures and empty replies remain eligible for local fallback.
@@ -3310,13 +3382,16 @@ async fn generate_llm_summary(
 fn finish_compaction(
     preparation: &CompactionPreparation,
     mut summary: String,
-    screened_snap_transcript: Option<String>,
+    mut screened_snap_transcript: Option<String>,
     privacy: &mut CompactionPrivacy,
 ) -> Result<CompactionResult> {
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
     summary.push_str(&format_file_operations(&read_files, &modified_files));
     let mut fields = SummaryFields::default();
     fields.text(&mut summary)?;
+    if let Some(transcript) = screened_snap_transcript.as_mut() {
+        fields.text(transcript)?;
+    }
     fields.screen(privacy)?;
     let details = CompactionDetails {
         read_files,
@@ -3328,25 +3403,7 @@ fn finish_compaction(
         preparation.settings.render_mode,
         CompactionRenderMode::SnapCompact
     ) {
-        screened_snap_transcript.and_then(|transcript| {
-            if transcript.len() > crate::compaction_snap::MAX_SOURCE_TEXT_BYTES {
-                tracing::warn!(
-                    target: "snapcompact",
-                    reason_code = "snapcompact_source_text_limit",
-                    "Archive source exceeds its retention budget; retaining the compaction summary"
-                );
-                return None;
-            }
-            let frames = crate::compaction_snap::render_frames(&transcript);
-            tracing::info!(
-                target: "snapcompact",
-                frame_count = frames.len(),
-                source_chars = transcript.chars().count(),
-                reason_code = "snapcompact_archive_generated",
-                "Retained compacted source with its available visual reading"
-            );
-            Some(crate::compaction_snap::SnapPayload::new(frames).with_source_text(transcript))
-        })
+        screened_snap_transcript.and_then(render_snap_payload)
     } else {
         None
     };
@@ -3387,6 +3444,7 @@ pub(crate) async fn compact_handoff(
         instructions.as_deref(),
         &prompts,
         &mut privacy,
+        true,
     )?;
     if requests.turn_prefix.is_some() {
         return Err(Error::validation(
@@ -3455,6 +3513,7 @@ pub async fn compact(
         custom_instructions.as_deref(),
         &prompts,
         &mut privacy,
+        true,
     )?;
     let snap_transcript = requests.snap_transcript.take();
     let summary = match generate_llm_summary(
@@ -3715,6 +3774,7 @@ pub async fn compact_auto(
     stream_options: &StreamOptions,
     custom_instructions: Option<&str>,
     privacy: &CompactionPrivacy,
+    reader: CompactionReader,
 ) -> Result<CompactionResult> {
     if let Some(method_order) = preparation.settings.method_order.clone() {
         return compact_ordered_auto(
@@ -3724,6 +3784,7 @@ pub async fn compact_auto(
             stream_options,
             custom_instructions,
             privacy,
+            reader,
         )
         .await;
     }
@@ -3755,13 +3816,9 @@ async fn compact_ordered_auto(
     stream_options: &StreamOptions,
     custom_instructions: Option<&str>,
     privacy: &CompactionPrivacy,
+    reader: CompactionReader,
 ) -> Result<CompactionResult> {
     validate_compaction_method_order(methods)?;
-    if preparation.settings.render_mode != CompactionRenderMode::Text {
-        return Err(Error::validation(
-            "Explicit compaction methodOrder currently requires text rendering; snapcompact needs a reader-aware archive budget",
-        ));
-    }
     let retained_tokens = preparation.retained_tokens.ok_or_else(|| {
         Error::validation(
             "Explicit compaction methodOrder requires retainedTokens from native preparation",
@@ -3772,6 +3829,14 @@ async fn compact_ordered_auto(
     // A local method must not turn a privacy refusal into permission to
     // replace history. Every candidate reads this same screened source.
     let prompts = privacy.screen(&mut preparation, &mut instructions)?;
+    // Build the reader's archive projection once. Rejected methods change only
+    // the text summary; they do not re-render or clone the encoded frames.
+    let mut projection = CompactionSummaryProjection::new(
+        prepare_ordered_archive(&preparation, methods, &mut privacy)?,
+        reader,
+        provider.name(),
+        provider.model_id(),
+    )?;
     let mut last_failure = None;
     for method in methods {
         let outcome = match method {
@@ -3791,6 +3856,7 @@ async fn compact_ordered_auto(
                     instructions.as_deref(),
                     &prompts,
                     &mut privacy,
+                    false,
                 )?;
                 // Explicit methods own the fallback decision. The emergency
                 // local truncation used by legacy `compact` must not replace
@@ -3813,16 +3879,12 @@ async fn compact_ordered_auto(
             }
             Err(error) => return Err(error),
         };
-        let projected_tokens = projected_text_compaction_tokens(
-            &result.summary,
-            retained_tokens,
-            provider.name(),
-            provider.model_id(),
-        );
+        let projected_tokens = projection.tokens(&result.summary, retained_tokens, &mut privacy)?;
         if projected_tokens < preparation.tokens_before
             && projected_tokens < preparation.settings.trigger_tokens()
         {
             result.details.mode = Some(method.as_str().to_string());
+            result.snap_payload = projection.payload.take();
             return Ok(result);
         }
         last_failure = Some(Error::session(format!(
@@ -3837,24 +3899,137 @@ async fn compact_ordered_auto(
     }))
 }
 
-/// Count the actual text summary envelope plus the complete retained tail.
-/// Retained assistant usage belongs to the old request and is never reused.
-fn projected_text_compaction_tokens(
-    summary: &str,
-    retained_tokens: u64,
-    provider: &str,
-    model_id: &str,
-) -> u64 {
-    let summary = SessionMessage::User {
-        content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(format!(
-            "{}{summary}{}",
+fn prepare_ordered_archive(
+    preparation: &CompactionPreparation,
+    methods: &[AutoCompactionMethod],
+    privacy: &mut CompactionPrivacy,
+) -> Result<Option<crate::compaction_snap::SnapPayload>> {
+    if methods.iter().all(|method| *method == AutoCompactionMethod::Remote) {
+        return Ok(None);
+    }
+    let mut transcript = snap_transcript(preparation);
+    if let Some(transcript) = transcript.as_mut() {
+        let mut fields = SummaryFields::default();
+        fields.text(transcript)?;
+        fields.screen(privacy)?;
+    }
+    Ok(transcript.and_then(render_snap_payload))
+}
+
+/// One actual provider-visible summary/archive message. Archive projection is
+/// shared by the bounded fallback sequence; only its summary text is replaced.
+struct CompactionSummaryProjection<'a> {
+    payload: Option<crate::compaction_snap::SnapPayload>,
+    message: Message,
+    source_reading: String,
+    table: crate::token_count::TokenTable,
+    reader: CompactionReader,
+    provider: &'a str,
+    model_id: &'a str,
+}
+
+impl<'a> CompactionSummaryProjection<'a> {
+    fn new(
+        payload: Option<crate::compaction_snap::SnapPayload>,
+        reader: CompactionReader,
+        provider: &'a str,
+        model_id: &'a str,
+    ) -> Result<Self> {
+        let empty_summary = format!(
+            "{}{}",
             crate::compaction_snap::COMPACTION_SUMMARY_PREFIX,
             crate::compaction_snap::COMPACTION_SUMMARY_SUFFIX,
-        )))]),
-        timestamp: Some(0),
-    };
-    let table = crate::token_count::table_for_model(provider, model_id);
-    retained_tokens.saturating_add(estimate_tokens_with_table(&summary, table))
+        );
+        let message = session_message_to_model(&SessionMessage::CompactionSummary {
+            summary: String::new(),
+            tokens_before: 0,
+        })
+        .ok_or_else(|| Error::session("Compaction summary has no model message"))?;
+        let mut messages = [crate::compaction_snap::attach_frames(message, payload.as_ref())];
+        crate::compaction_snap::project_for_model(
+            &mut messages,
+            reader.accepts_images,
+            reader.source_text_budget,
+            provider,
+            model_id,
+        );
+        let [mut message] = messages;
+        let text = std::mem::take(Self::summary_text(&mut message)?);
+        let source_reading = text
+            .strip_prefix(&empty_summary)
+            .ok_or_else(|| Error::session("Compaction projection changed its summary envelope"))?
+            .to_string();
+        Ok(Self {
+            payload,
+            message,
+            source_reading,
+            table: crate::token_count::table_for_model(provider, model_id),
+            reader,
+            provider,
+            model_id,
+        })
+    }
+
+    fn summary_text(message: &mut Message) -> Result<&mut String> {
+        if let Message::User(user) = message {
+            match &mut user.content {
+                UserContent::Text(text) => return Ok(text),
+                UserContent::Blocks(blocks) => {
+                    if let Some(ContentBlock::Text(text)) = blocks.first_mut() {
+                        return Ok(&mut text.text);
+                    }
+                }
+            }
+        }
+        Err(Error::session("Compaction projection has no summary message"))
+    }
+
+    fn tokens(
+        &mut self,
+        summary: &str,
+        retained_tokens: u64,
+        privacy: &mut CompactionPrivacy,
+    ) -> Result<u64> {
+        self.refresh_archive(privacy)?;
+        let text = Self::summary_text(&mut self.message)?;
+        text.clear();
+        text.push_str(crate::compaction_snap::COMPACTION_SUMMARY_PREFIX);
+        text.push_str(summary);
+        text.push_str(crate::compaction_snap::COMPACTION_SUMMARY_SUFFIX);
+        text.push_str(&self.source_reading);
+        Ok(retained_tokens.saturating_add(estimate_model_message_with_table(
+            &self.message,
+            self.table,
+        )))
+    }
+
+    fn refresh_archive(&mut self, privacy: &mut CompactionPrivacy) -> Result<()> {
+        // A summary can reveal an assignment for a value that appeared only
+        // as a bare echo in the source. Refresh only when screening discovers
+        // a new redaction; ordinary fallback does not re-render the archive.
+        let changed = if let Some(source) = self
+            .payload
+            .as_mut()
+            .and_then(|payload| payload.source_text.as_mut())
+        {
+            let previous = source.clone();
+            let mut fields = SummaryFields::default();
+            fields.text(source)?;
+            fields.screen(privacy)?;
+            *source != previous
+        } else {
+            false
+        };
+        if changed {
+            let payload = self
+                .payload
+                .take()
+                .and_then(|payload| payload.source_text)
+                .and_then(render_snap_payload);
+            *self = Self::new(payload, self.reader, self.provider, self.model_id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Estimate what the compacted span would shrink to under a shake.
@@ -4970,6 +5145,69 @@ mod tests {
                 estimate_model_context_tokens_for_model(&renamed, true, None, provider, model_id),
                 expected,
             );
+        }
+    }
+
+    #[test]
+    fn cached_summary_projection_matches_the_installed_archive_reading() {
+        let source = format!("HEAD café 日本\n{}TAIL", "archived evidence.\n".repeat(30));
+        let payload = render_snap_payload(source).expect("bounded archive");
+        assert!(!payload.frames.is_empty());
+        let provider = "gateway";
+        let model_id = "openai/gpt-4-turbo";
+        for archive in [None, Some(payload)] {
+            for reader in [
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: Some(0),
+                },
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: Some(32),
+                },
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: None,
+                },
+                CompactionReader {
+                    accepts_images: true,
+                    source_text_budget: Some(32),
+                },
+            ] {
+                let mut projection =
+                    CompactionSummaryProjection::new(archive.clone(), reader, provider, model_id)
+                        .expect("reader projection");
+                let mut privacy = CompactionPrivacy::default();
+                for summary in ["first checkpoint", "revised checkpoint with café 日本 evidence"] {
+                    let mut session = crate::session::Session::in_memory();
+                    session.append_message(make_user_text("old source"));
+                    let kept = session.append_message(make_user_text("current request café 日本"));
+                    session.append_message(make_assistant_text("retained response", 900_000, 1000));
+                    let retained_tokens = estimate_model_context_tokens_for_model(
+                        &session.to_messages_for_current_path()[1..],
+                        reader.accepts_images,
+                        reader.source_text_budget,
+                        provider,
+                        model_id,
+                    );
+                    let projected = projection
+                        .tokens(summary, retained_tokens, &mut privacy)
+                        .expect("project candidate");
+                    let details = archive
+                        .as_ref()
+                        .map(|payload| crate::compaction_snap::payload_to_details(None, payload));
+                    session.append_compaction(summary.to_string(), kept, 100_000, details, None);
+                    let installed = estimate_model_context_tokens_for_model(
+                        &session.to_messages_for_current_path(),
+                        reader.accepts_images,
+                        reader.source_text_budget,
+                        provider,
+                        model_id,
+                    );
+                    assert_eq!(projected, installed, "reader={reader:?}, summary={summary}");
+                }
+                assert_eq!(projection.payload, archive, "budgeting cannot mutate durable source");
+            }
         }
     }
 
@@ -6486,6 +6724,10 @@ mod tests {
                 &StreamOptions::default(),
                 None,
                 &CompactionPrivacy::default(),
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: Some(8_192),
+                },
             ))
             .expect("compact_auto");
         assert_eq!(result.details.mode.as_deref(), Some("shake"));
@@ -6714,7 +6956,7 @@ mod tests {
         let mut privacy = CompactionPrivacy::default();
         let prompts = privacy.screen(&mut preparation, &mut None).unwrap();
         let requests =
-            prepare_summary_requests(&preparation, None, &prompts, &mut privacy).unwrap();
+            prepare_summary_requests(&preparation, None, &prompts, &mut privacy, true).unwrap();
         let history = requests.history.expect("summary request");
         assert!(history.contains("previous summary") && history.contains("NEW-FACT"));
         assert!(!history.contains("ARCHIVED-FACT") && !history.contains("SPLIT-TURN-FACT"));
@@ -7428,6 +7670,10 @@ mod tests {
                                 &StreamOptions::default(),
                                 None,
                                 &CompactionPrivacy::default(),
+                                CompactionReader {
+                                    accepts_images: false,
+                                    source_text_budget: Some(8_192),
+                                },
                             )
                             .await
                             .expect_err("a refusal must not authorize local history replacement");
@@ -7470,6 +7716,10 @@ mod tests {
                     &StreamOptions::default(),
                     None,
                     &CompactionPrivacy::default(),
+                    CompactionReader {
+                        accepts_images: false,
+                        source_text_budget: Some(8_192),
+                    },
                 )
                 .await
                 .expect("eligible provider failure advances to shake");
@@ -7502,6 +7752,10 @@ mod tests {
                         &StreamOptions::default(),
                         None,
                         &CompactionPrivacy::default(),
+                        CompactionReader {
+                            accepts_images: false,
+                            source_text_budget: Some(8_192),
+                        },
                     )
                     .await
                     .expect_err("a cost refusal must survive every automatic fallback policy");

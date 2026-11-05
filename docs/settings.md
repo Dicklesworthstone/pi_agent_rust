@@ -641,8 +641,9 @@ An explicit list overrides that legacy policy, including its aggressive
 keep-recent adjustment, and preserves the configured retention budget.
 
 Each attempt reads the same source snapshot. A candidate is accepted only if
-its projected context, including the actual retained tail, is smaller than
-the original context and below the automatic trigger. An unavailable method,
+its projected context, including the actual retained tail and preserved rule
+reminders, is smaller than the original context and below the automatic trigger.
+An unavailable method,
 an ordinary provider failure, or insufficient reclamation advances to the
 next method. Cancellation, privacy refusals, authentication failures, cost
 limits, and persistence failures stop the operation. Provider requests remain
@@ -650,15 +651,24 @@ billable even when their candidate is insufficient; fallback does not reset
 the session's spending limit.
 
 Only the accepted candidate is installed through the existing session
-transaction. Exhausting the list leaves the session history unchanged and
+transaction. The complete candidate is checked again under the installation
+lock, using the current reader and any new retained turns; a background result
+that no longer fits is discarded before saving. Exhausting the list leaves
+the session history unchanged and
 reports an error; it does not append an ineffective summary or silently choose
 an unconfigured local truncation. Model changes recalculate both the trigger
 and retained-tail estimate using the active reader.
 
-Explicit method ordering currently requires `compaction.mode: "text"`.
-Combining it with `"snapcompact"` is rejected before model work because the
-ordered policy cannot yet prove the resulting archive's reader-specific
-budget. Snapcompact rendering remains available with the existing policy.
+Both `compaction.mode: "text"` and `"snapcompact"` work with explicit method
+ordering. Snapcompact constructs one privacy-screened archive per operation
+and budgets the same reading that the selected model will receive. Vision
+models use the archive images; text-only models and sessions with images
+blocked use retained source text within the session's source-token allowance.
+If image rendering exceeds its archive limits, the text reading is budgeted
+instead. A small summary does not hide a large archive: the archive reading,
+summary envelope, retained turns, and preserved reminders must fit together.
+The stored archive remains independent of the model and is reprojected after
+resume or a model switch.
 Manual `/compact`, `/shake`, and handoff commands retain their explicit
 operation semantics and do not run the automatic method list.
 

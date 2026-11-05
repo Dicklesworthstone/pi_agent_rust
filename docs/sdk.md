@@ -645,10 +645,17 @@ privacy, authentication, persistence, and cost failures remain terminal.
 it can precede a supported fallback but never issues a remote request.
 
 Leave the list as `None` to keep the legacy automatic mode. Explicit lists
-must be nonempty, contain no duplicate methods, and use text rendering. Native
-preparation records the active reader's retained-tail estimate; a manually
-constructed `CompactionPreparation` must supply `retained_tokens` before it
-can run an explicit automatic policy. See the
+must be nonempty and contain no duplicate methods. Text and SnapCompact
+rendering are supported; archive acceptance uses the effective image policy
+and the same source-text allowance as the next provider request. Native
+preparation includes the projected retained turns and preserved rule reminders,
+and installation rechecks the complete candidate before saving it.
+
+Low-level `compact_auto` calls also take an explicit `CompactionReader` with
+`accepts_images` and `source_text_budget`; a manually constructed
+`CompactionPreparation` must supply `retained_tokens` for the context that
+will actually remain after session replay. Session-owned SDK operations bind
+these values automatically. See the
 [ordered-method settings](settings.md#ordered-automatic-methods) for details.
 
 ## Recipe 6: Use RPC Transport Client

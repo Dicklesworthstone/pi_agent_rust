@@ -3,7 +3,9 @@
 //! This keeps LLM compaction off the foreground turn path by running compaction
 //! on the existing runtime and applying results on subsequent turns.
 
-use crate::compaction::{self, CompactionPreparation, CompactionPrivacy, CompactionResult};
+use crate::compaction::{
+    self, CompactionPreparation, CompactionPrivacy, CompactionReader, CompactionResult,
+};
 use crate::error::{Error, Result};
 use crate::provider::{Provider, StreamOptions};
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
@@ -368,6 +370,7 @@ impl CompactionWorkerState {
         stream_options: StreamOptions,
         custom_instructions: Option<String>,
         privacy: CompactionPrivacy,
+        reader: CompactionReader,
     ) -> Result<()> {
         self.start_inner(
             Some(origin),
@@ -378,6 +381,7 @@ impl CompactionWorkerState {
             stream_options,
             custom_instructions,
             privacy,
+            reader,
         )
     }
 
@@ -399,6 +403,10 @@ impl CompactionWorkerState {
             stream_options,
             custom_instructions,
             CompactionPrivacy::default(),
+            CompactionReader {
+                accepts_images: true,
+                source_text_budget: None,
+            },
         )
         .expect("test compaction runtime must admit the task");
     }
@@ -414,6 +422,7 @@ impl CompactionWorkerState {
         stream_options: StreamOptions,
         custom_instructions: Option<String>,
         privacy: CompactionPrivacy,
+        reader: CompactionReader,
     ) -> Result<()> {
         debug_assert!(
             self.can_start(),
@@ -433,6 +442,7 @@ impl CompactionWorkerState {
                 abort_rx,
                 timeout,
                 privacy,
+                reader,
             )
             .await
         };
@@ -531,7 +541,7 @@ impl Drop for CompactionWorkerState {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 async fn run_compaction_task(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
@@ -540,6 +550,7 @@ async fn run_compaction_task(
     abort_rx: oneshot::Receiver<()>,
     timeout: Duration,
     privacy: CompactionPrivacy,
+    reader: CompactionReader,
 ) -> CompactionOutcome {
     let abort_fut = async move {
         if abort_rx.await.is_err() {
@@ -558,6 +569,7 @@ async fn run_compaction_task(
             &stream_options,
             custom_instructions.as_deref(),
             &privacy,
+            reader,
         ))
         .catch_unwind(),
     );
@@ -820,6 +832,10 @@ mod tests {
                     },
                     None,
                     privacy,
+                    CompactionReader {
+                        accepts_images: true,
+                        source_text_budget: None,
+                    },
                 )
                 .expect("worker starts its owned request");
             let pending = worker.pending.take().expect("owned background task");

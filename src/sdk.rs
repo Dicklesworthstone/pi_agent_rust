@@ -44,7 +44,7 @@ use std::time::Duration;
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
-pub use crate::compaction::{AutoCompactionMethod, ResolvedCompactionSettings};
+pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
 pub use crate::extension_dispatcher::ExtensionUiHandler;
