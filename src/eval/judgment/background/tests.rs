@@ -1680,6 +1680,70 @@ fn minimum_success_is_separate_from_all_items_succeeding() -> Result<()> {
             assert_eq!(details["result"]["meetsMinimum"], minimum <= 1); // ubs:ignore -- The threshold is truthful and independent of allOk.
             assert_eq!(details["result"]["failed"], 1); // ubs:ignore -- Threshold success preserves failed evidence.
             assert_eq!(harness.provider.calls.load(Ordering::Acquire), 2); // ubs:ignore -- Reaching minOk never skips remaining original items.
+
+            let id = serde_json::to_string(ack["jobId"].as_str().ok_or_else(stopped)?)?;
+            let status = serde_json::to_string(expected)?;
+            for kernel in ["js", "python"] {
+                if kernel == "python" && !crate::eval::judgment::tests::python_available() {
+                    continue;
+                }
+                let code = if kernel == "js" {
+                    format!(
+                        r#"const batch = await judgeBatch.attach({id});
+const page = await batch.drain({{timeout: 0}});
+if (page.jobStatus !== {status} || page.jobFailed !== ({minimum} === 2)
+    || !page.complete || page.items.length !== 2
+    || page.items[0].key !== 0 || !page.items[0].ok
+    || page.items[0].verdict.answers.q.bool !== 0.7
+    || page.items[1].key !== 1 || page.items[1].ok
+    || typeof page.items[1].error !== 'string' || !page.items[1].error
+    || 'verdict' in page.items[1]) throw new Error('mixed batch evidence was lost');
+const replay = await batch.drain({{timeout: 0}});
+if (replay.items.length !== 2 || replay.items[1].error !== page.items[1].error)
+    throw new Error('unacknowledged failures were consumed');
+const acknowledged = await batch.drain({{cursor: page.cursor, timeout: 0}});
+if (acknowledged.items.length !== 0 || !acknowledged.complete
+    || acknowledged.jobStatus !== {status}
+    || acknowledged.cursor.seen.join(',') !== '0,1')
+    throw new Error('acknowledged results were redelivered');"#
+                    )
+                } else {
+                    format!(
+                        r#"batch = await judge_batch.attach({id})
+page = await batch.drain(timeout=0)
+assert page['jobStatus'] == {status} and page['jobFailed'] is ({minimum} == 2)
+assert page['complete'] and len(page['items']) == 2
+assert page['items'][0]['key'] == 0 and page['items'][0]['ok']
+assert page['items'][0]['verdict']['answers']['q']['bool'] == 0.7
+assert page['items'][1]['key'] == 1 and page['items'][1]['ok'] is False
+assert isinstance(page['items'][1]['error'], str) and page['items'][1]['error']
+assert 'verdict' not in page['items'][1]
+replay = await batch.drain(timeout=0)
+assert len(replay['items']) == 2 and replay['items'][1]['error'] == page['items'][1]['error']
+acknowledged = await batch.drain(cursor=page['cursor'], timeout=0)
+assert acknowledged['items'] == [] and acknowledged['complete']
+assert acknowledged['jobStatus'] == {status} and acknowledged['cursor']['seen'] == [0, 1]"#
+                    )
+                };
+                let privacy = privacy();
+                let protect = |parts: &[&str]| privacy.project_inputs(parts);
+                let snapshot = || privacy.clone();
+                let output = harness
+                    .tool
+                    .execute_with_invocation(
+                        "minimum-drain",
+                        json!({"kernel":kernel,"code":code}),
+                        None,
+                        ToolInvocationContext {
+                            protect: &protect,
+                            host: Some(&harness.host),
+                            snapshot_privacy: &snapshot,
+                        },
+                    )
+                    .await?;
+                assert!(!output.is_error, "{kernel}: {:?}", output.content);
+            }
+            assert_eq!(harness.provider.calls.load(Ordering::Acquire), 2);
             Ok::<(), Error>(())
         })?;
     }

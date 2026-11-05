@@ -1284,6 +1284,8 @@ def _model_check_drain(page, job_id, previous):
         last_index, key_type = item["index"], type(item["key"])
         keys.add(item["key"])
         added.add(item["index"])
+        # Native admission validates min_ok. An exited batch can still
+        # contain failed items, which remain evidence for the caller.
         if item["ok"]:
             if "error" in item:
                 raise _model_drain_protocol()
@@ -1291,8 +1293,7 @@ def _model_check_drain(page, job_id, previous):
                 _model_payload("judgment", item.get("verdict"))
             except ToolBridgeError:
                 raise _model_drain_protocol() from None
-        elif ("verdict" in item or type(item.get("error")) is not str or not item["error"]
-              or page["jobStatus"] == "exited"):
+        elif "verdict" in item or type(item.get("error")) is not str or not item["error"]:
             raise _model_drain_protocol()
     if len(before) + len(added) != page["settled"] or set(cursor["seen"]) != before | added:
         raise _model_drain_protocol()

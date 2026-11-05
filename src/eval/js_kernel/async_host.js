@@ -391,11 +391,14 @@
             keyType = typeof item.key;
             itemKeys.push(item.key);
             added.push(item.index);
+            // Native admission validates minOk. An exited batch can still
+            // contain failed items, which remain evidence for the caller.
             if (item.ok) {
                 if (hasOwn(item,'error')) throw drainProtocol();
                 try { modelPayload('judgment',item.verdict); } catch (_) { throw drainProtocol(); }
-            } else if (hasOwn(item,'verdict') || typeof item.error !== 'string' || !item.error
-                || page.jobStatus === 'exited') throw drainProtocol();
+            } else if (hasOwn(item,'verdict') || typeof item.error !== 'string' || !item.error) {
+                throw drainProtocol();
+            }
         }
         if (before.length + added.length !== page.settled || cursor.seen.length !== page.settled) throw drainProtocol();
         for (let index = 0; index < before.length; index++) if (!drainHas(cursor.seen,before[index])) throw drainProtocol();
