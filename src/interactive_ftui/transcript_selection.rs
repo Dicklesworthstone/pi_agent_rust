@@ -78,8 +78,10 @@ pub(super) fn selected_text(
             let from = begin.saturating_sub(consumed).min(width);
             let until = finish.saturating_sub(consumed).min(width);
             if from < until {
-                let (_, rest) = span.split_at_cell(from);
-                let (piece, _) = rest.split_at_cell(until - from);
+                let (before, rest) = span.split_at_cell(from);
+                // Wide graphemes may round the split left of `from`.
+                // Measure the real first piece to avoid dropping cells.
+                let (piece, _) = rest.split_at_cell(until.saturating_sub(before.width()));
                 output.push_str(piece.as_str());
                 if output.len() > max_bytes {
                     return None;
@@ -115,7 +117,7 @@ pub(super) fn highlight(
             let from = begin.saturating_sub(consumed).min(width);
             let until = finish.saturating_sub(consumed).min(width);
             let (before, rest) = span.split_at_cell(from);
-            let (mut middle, after) = rest.split_at_cell(until - from);
+            let (mut middle, after) = rest.split_at_cell(until.saturating_sub(before.width()));
             if !before.is_empty() { pieces.push(before); }
             if !middle.is_empty() {
                 middle.style = Some(middle.style.unwrap_or_else(ftui::Style::new).bg(accent));
@@ -165,6 +167,19 @@ mod tests {
         };
         assert_eq!(selected_text(&lines, selection, 100).as_deref(), Some("fore\naft"));
         assert!(selected_text(&lines, selection, 3).is_none());
+    }
+
+    #[test]
+    fn wide_grapheme_selection_uses_actual_split_boundary() {
+        let lines = vec![Line::styled("a界bc", ftui::Style::new())];
+        let selection = Selection {
+            anchor: Point { row: 0, cell: 2 },
+            focus: Point { row: 0, cell: 4 },
+        };
+        assert_eq!(selected_text(&lines, selection, 1024).as_deref(), Some("界b"));
+        let mut marked = lines;
+        highlight(&mut marked, selection, ftui::PackedRgba::rgb(60, 90, 120));
+        assert_eq!(marked[0].spans().iter().map(|span| span.as_str()).collect::<String>(), "a界bc");
     }
 
     #[test]
