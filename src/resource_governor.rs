@@ -76,12 +76,20 @@ impl HostResourceBudgets {
         let max_rss_bytes = (mem_total / 2).clamp(512 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
         let fd_soft_limit = read_open_files_soft_limit().unwrap_or(DEFAULT_FD_LIMIT);
         let max_queue_depth = queue_depth_budget(cpu_cores);
+        let max_processes = cpu_cores.saturating_mul(128).max(MIN_PROCESS_BUDGET);
+        // On non-Linux hosts, the sample counts every host process rather
+        // than just agent children. Calibrate against the baseline host load.
+        #[cfg(not(target_os = "linux"))]
+        let max_processes = {
+            let baseline = cached_non_linux_process_count().unwrap_or(0);
+            max_processes.max(baseline.saturating_add(baseline.max(128) / 2))
+        };
 
         Self {
             cpu_cores,
             max_load_avg_1m: ((cpu_cores as f64) * 4.0).max(MIN_LOAD_BUDGET),
             max_rss_bytes,
-            max_processes: cpu_cores.saturating_mul(128).max(MIN_PROCESS_BUDGET),
+            max_processes,
             max_fds: ((fd_soft_limit.saturating_mul(4)) / 5).max(MIN_FD_BUDGET),
             max_tool_output_bytes: DEFAULT_TOOL_OUTPUT_BYTES,
             max_queue_depth,
@@ -190,15 +198,8 @@ impl HostResourceSample {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let process_count = cached_non_linux_process_count();
             let mut system = sysinfo::System::new();
-            system.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::All,
-                true,
-                sysinfo::ProcessRefreshKind::nothing(),
-            );
-            let process_count = u64::try_from(system.processes().len())
-                .ok()
-                .filter(|count| *count > 0);
             let pid = sysinfo::Pid::from_u32(std::process::id());
             system.refresh_processes_specifics(
                 sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -217,6 +218,31 @@ impl HostResourceSample {
             }
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cached_non_linux_process_count() -> Option<u64> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    // Host-wide enumeration is significantly more expensive than sampling
+    // the current PID. Cache it briefly across high-frequency hostcalls.
+    static SAMPLE: OnceLock<Mutex<Option<(Instant, u64)>>> = OnceLock::new();
+    let mut sample = SAMPLE.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if let Some((at, count)) = *sample
+        && at.elapsed() < Duration::from_secs(5)
+    {
+        return Some(count);
+    }
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    let count = u64::try_from(system.processes().len()).ok().filter(|count| *count > 0)?;
+    *sample = Some((Instant::now(), count));
+    Some(count)
 }
 
 /// Hostcall class submitted to the resource governor.
