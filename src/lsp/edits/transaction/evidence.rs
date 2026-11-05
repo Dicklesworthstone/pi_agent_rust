@@ -72,6 +72,14 @@ fn prepare_checked(
 pub(in crate::lsp) struct PreparedEdit(Transaction, Annotations);
 
 impl PreparedEdit {
+    pub(in crate::lsp) fn with_recording(
+        mut self,
+        recording: Option<std::sync::Arc<crate::lsp::recording::Invocation>>,
+    ) -> Self {
+        self.0 = self.0.with_recording(recording);
+        self
+    }
+
     #[allow(clippy::implicit_hasher)]
     pub(in crate::lsp) fn new(
         plan: &WorkspaceEditPlan,

@@ -262,7 +262,7 @@ fn validate_sequence(plan: &WorkspaceEditPlan, sequence: &[Step]) -> Result<()> 
 }
 
 pub(super) fn stage(plan: &WorkspaceEditPlan) -> Result<Transaction> {
-    let mut transaction = Transaction::default();
+    let mut transaction = Transaction::default().with_recording(plan.recording.clone());
     if let Some(sequence) = &plan.sequence {
         validate_sequence(plan, sequence)?;
         for step in sequence {

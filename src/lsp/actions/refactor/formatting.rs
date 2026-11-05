@@ -316,7 +316,9 @@ impl LspTool {
         let apply = input.apply.unwrap_or(false);
         let mut changed_paths = Vec::new();
         if apply && changed {
-            let result = prepared.commit(|| budget.verify(&entry, &snapshot));
+            let result = prepared
+                .with_recording(self.recording.current())
+                .commit(|| budget.verify(&entry, &snapshot));
             self.invalidate_refactor(&entry);
             changed_paths = result?.changed_paths(&self.cwd);
         } else if apply {

@@ -13,6 +13,7 @@ pub mod edits;
 mod hierarchy;
 pub mod jsonrpc;
 mod project_diagnostics;
+mod recording;
 mod refactor_preview;
 pub mod registry;
 mod semantic;
@@ -97,6 +98,7 @@ pub struct LspTool {
     completions: completion::CompletionCache,
     refactors: refactor_preview::RefactorCache,
     operations: Arc<asupersync::sync::Mutex<()>>,
+    recording: recording::Recorder,
 }
 
 impl LspTool {
@@ -110,7 +112,18 @@ impl LspTool {
             completions: completion::CompletionCache::default(),
             refactors: refactor_preview::RefactorCache::default(),
             operations: Arc::new(asupersync::sync::Mutex::new(())),
+            recording: recording::Recorder::default(),
         }
+    }
+
+    /// Share the session's bounded undo/redo history with native workspace edits.
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.recording = recording::Recorder::new(recorder);
+        self
     }
 
     fn language_id_for(path: &Path, spec: &registry::ServerSpec) -> String {
@@ -734,7 +747,7 @@ impl Tool for LspTool {
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -802,14 +815,17 @@ impl Tool for LspTool {
             asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.operations), owner.cx())
                 .await
                 .map_err(|_| tool_err("LSP_CANCELLED", "LSP workflow cancelled while queued"))?;
+        let recording = self.recording.enter(tool_call_id)?;
         if input.refactor_id.is_some() {
-            return self.select_refactor(&input, &owner);
+            let result = self.select_refactor(&input, &owner);
+            recording.finish(result.as_ref().is_ok_and(|output| !output.is_error));
+            return result;
         }
         if matches!(input.action.as_str(), "rename" | "rename_file") {
             refactor_preview::check_owner(&owner)?;
             self.refactors.clear();
         }
-        match input.action.as_str() {
+        let result = match input.action.as_str() {
             "completion" => self.run_completion(&input).await,
             "signature_help" => self.run_signature_help(&input).await,
             "inlay_hints" => self.run_inlay_hints(&input).await,
@@ -890,7 +906,9 @@ impl Tool for LspTool {
             other => Ok(usage_error(format!(
                 "unknown lsp action {other:?}; expected diagnostics|definition|references|hover|symbols|incoming_calls|outgoing_calls|supertypes|subtypes|rename|rename_file|prepare_rename|code_actions|format|type_definition|implementation|status|reload|capabilities|request|workspace_diagnostics|completion|signature_help|inlay_hints|project_diagnostics|selection_ranges|configure"
             ))),
-        }
+        };
+        recording.finish(result.as_ref().is_ok_and(|output| !output.is_error));
+        result
     }
 }
 

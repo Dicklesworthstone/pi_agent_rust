@@ -34,7 +34,10 @@ fn every_commit_failure_restores_deleted_overwritten_and_renamed_bytes() {
         for (name, bytes) in originals {
             std::fs::write(root.join(name), bytes).expect("original");
         }
-        let mut transaction = Transaction::default();
+        let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+        let recording = crate::lsp::recording::Recorder::new(Some(Arc::clone(&recorder)));
+        let scope = recording.enter("failed-batch").unwrap();
+        let mut transaction = Transaction::default().with_recording(recording.current());
         transaction
             .edit(&root.join("a"), &[replace_first("Z")])
             .unwrap();
@@ -103,6 +106,12 @@ fn every_commit_failure_restores_deleted_overwritten_and_renamed_bytes() {
             "owned parent directories must roll back"
         );
         assert_eq!(std::fs::read_dir(root).unwrap().count(), originals.len());
+        scope.finish(false);
+        assert_eq!(
+            recorder.stats().undo_depth,
+            0,
+            "rollback restored every preimage"
+        );
     }
 }
 
@@ -142,7 +151,10 @@ fn mutation_receipts_exclude_text_operations_that_leave_the_same_final_image() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("source");
     std::fs::write(&path, "abc").unwrap();
-    let mut transaction = Transaction::default();
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let recording = crate::lsp::recording::Recorder::new(Some(Arc::clone(&recorder)));
+    let scope = recording.enter("no-op").unwrap();
+    let mut transaction = Transaction::default().with_recording(recording.current());
     transaction.edit(&path, &[replace_first("a")]).unwrap();
     let outcome = transaction.commit().unwrap();
     assert_eq!(outcome.files_changed, vec![path]);
@@ -150,6 +162,8 @@ fn mutation_receipts_exclude_text_operations_that_leave_the_same_final_image() {
         outcome.changed_paths.is_empty(),
         "requested edit paths are not mutation evidence"
     );
+    scope.finish(true);
+    assert_eq!(recorder.stats().undo_depth, 0);
 }
 
 #[test]
@@ -171,7 +185,10 @@ fn rollback_conflict_retains_the_preimage_and_reports_incomplete_recovery() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("source");
     std::fs::write(&path, "original").unwrap();
-    let mut transaction = Transaction::default();
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let recording = crate::lsp::recording::Recorder::new(Some(Arc::clone(&recorder)));
+    let scope = recording.enter("partial-batch").unwrap();
+    let mut transaction = Transaction::default().with_recording(recording.current());
     transaction.edit(&path, &[replace_first("Z")]).unwrap();
     let error = transaction
         .commit_with(|_, changed| {
@@ -197,6 +214,54 @@ fn rollback_conflict_retains_the_preimage_and_reports_incomplete_recovery() {
         .collect();
     assert_eq!(backups.len(), 1);
     assert_eq!(std::fs::read(&backups[0]).unwrap(), b"original");
+    scope.finish(false);
+    assert_eq!(recorder.stats().undo_depth, 1);
+    let outcome = recorder.undo(1, true);
+    assert!(outcome.applied.is_empty());
+    assert!(matches!(
+        outcome.stopped,
+        Some(crate::undo::UndoStop::SnapshotOmitted { .. })
+    ));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
+}
+
+#[test]
+fn a_late_transaction_cannot_join_a_subsequent_tool_calls_undo_unit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    std::fs::write(&path, "original").unwrap();
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let recording = crate::lsp::recording::Recorder::new(Some(Arc::clone(&recorder)));
+    let first = recording.enter("first").unwrap();
+    let mut transaction = Transaction::default().with_recording(recording.current());
+    transaction.edit(&path, &[replace_first("Z")]).unwrap();
+    first.finish(true);
+    let second = recording.enter("second").unwrap();
+    let error = transaction.commit().unwrap_err();
+    assert!(error.to_string().contains("LSP_UNDO_CLOSED"), "{error}");
+    second.finish(true);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    assert_eq!(recorder.stats().undo_depth, 0);
+}
+
+#[test]
+fn dropping_an_invocation_after_a_committed_batch_preserves_an_undo_barrier() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("source");
+    std::fs::write(&path, "original").unwrap();
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let recording = crate::lsp::recording::Recorder::new(Some(Arc::clone(&recorder)));
+    let scope = recording.enter("cancelled").unwrap();
+    let mut transaction = Transaction::default().with_recording(recording.current());
+    transaction.edit(&path, &[replace_first("Z")]).unwrap();
+    transaction.commit().unwrap();
+    drop(scope);
+    assert!(recording.current().is_none());
+    assert!(matches!(
+        recorder.undo(1, true).stopped,
+        Some(crate::undo::UndoStop::SnapshotOmitted { .. })
+    ));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "Zriginal");
 }
 
 #[test]

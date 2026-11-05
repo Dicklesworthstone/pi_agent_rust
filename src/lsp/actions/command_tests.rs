@@ -11,6 +11,8 @@ fn command_results(root: &Path) -> Vec<Value> {
 fn command_callbacks_accept_current_versions_then_continue_with_guarded_unversioned_edits() {
     let temp = tempfile::tempdir().unwrap();
     let Some(tool) = fixture(temp.path(), "command-versions") else { return; };
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
     let runtime = runtime();
     let output = run(&tool, &runtime, command_request()).unwrap();
     assert!(!output.is_error);
@@ -23,6 +25,11 @@ fn command_callbacks_accept_current_versions_then_continue_with_guarded_unversio
     assert_eq!(tool.actions.admission.load(Ordering::Acquire), 0);
     let late = run(&tool, &runtime, json!({"action":"request","file":"source.lspfixture","method":"test/lateEdit"})).unwrap();
     assert_eq!(late.details.unwrap()["payload"]["result"]["applied"], false);
+    assert_eq!(recorder.stats().undo_depth, 1, "callbacks share one tool-call unit");
+    assert_eq!(recorder.undo(1, false).applied.len(), 1);
+    assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "old\n");
+    assert_eq!(recorder.redo(1, false).applied.len(), 1);
+    assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "two\n");
 }
 
 #[test]
@@ -50,6 +57,8 @@ fn stale_or_unknown_callback_versions_revoke_the_whole_command_edit_window() {
 fn inline_edits_preserve_untouched_sibling_version_evidence_for_commands() {
     let temp = tempfile::tempdir().unwrap();
     let Some(tool) = fixture(temp.path(), "command-inline-sibling") else { return; };
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
     let runtime = runtime();
     let sibling = temp.path().join("sibling.lspfixture").canonicalize().unwrap();
     runtime.block_on(tool.synced(&sibling)).unwrap();
@@ -59,6 +68,14 @@ fn inline_edits_preserve_untouched_sibling_version_evidence_for_commands() {
     assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "fixed\n");
     assert_eq!(std::fs::read_to_string(sibling).unwrap(), "one\n");
     assert_eq!(command_results(temp.path())[0]["applied"], true);
+    assert_eq!(recorder.stats().undo_depth, 1);
+    assert_eq!(recorder.undo(1, false).applied[0].files.len(), 2);
+    for file in ["source.lspfixture", "sibling.lspfixture"] {
+        assert_eq!(std::fs::read_to_string(temp.path().join(file)).unwrap(), "old\n");
+    }
+    assert_eq!(recorder.redo(1, false).applied.len(), 1);
+    assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "fixed\n");
+    assert_eq!(std::fs::read_to_string(temp.path().join("sibling.lspfixture")).unwrap(), "one\n");
 }
 
 #[test]
@@ -115,10 +132,19 @@ fn external_edits_between_accepted_callbacks_are_not_blessed_by_resnapshotting()
 fn ordered_moves_carry_evidence_to_followup_command_callbacks() {
     let temp = tempfile::tempdir().unwrap();
     let Some(tool) = fixture(temp.path(), "command-move") else { return; };
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
     let output = run(&tool, &runtime(), command_request()).unwrap();
     assert!(!output.is_error);
     assert_eq!(output.details.unwrap()["fileOps"].as_array().unwrap().len(), 1);
     assert!(command_results(temp.path()).iter().all(|result| result["applied"] == true));
+    assert!(!temp.path().join("source.lspfixture").exists());
+    assert_eq!(std::fs::read_to_string(temp.path().join("moved.lspfixture")).unwrap(), "two\n");
+    assert_eq!(recorder.stats().undo_depth, 1);
+    assert_eq!(recorder.undo(1, false).applied[0].files.len(), 2);
+    assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "old\n");
+    assert!(!temp.path().join("moved.lspfixture").exists());
+    assert_eq!(recorder.redo(1, false).applied.len(), 1);
     assert!(!temp.path().join("source.lspfixture").exists());
     assert_eq!(std::fs::read_to_string(temp.path().join("moved.lspfixture")).unwrap(), "two\n");
 }

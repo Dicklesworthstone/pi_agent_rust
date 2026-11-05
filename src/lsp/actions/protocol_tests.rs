@@ -92,6 +92,8 @@ fn disabled_changed_and_malformed_actions_never_modify_files_or_execute_commands
 fn command_failure_reports_partial_edits_and_is_not_retried_as_content_modified() {
     let temp = tempfile::tempdir().unwrap();
     let Some(tool) = fixture(temp.path(), "error") else { return; };
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
     let output = run(&tool, &runtime(), json!({"action":"code_actions","file":"source.lspfixture","apply":true,"query":"1"})).unwrap();
     assert!(output.is_error);
     let details = output.details.unwrap();
@@ -99,6 +101,13 @@ fn command_failure_reports_partial_edits_and_is_not_retried_as_content_modified(
     assert_eq!(details["applied"], false);
     assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "fixed\n");
     assert_eq!(methods(temp.path()).iter().filter(|method| *method == "workspace/executeCommand").count(), 1);
+    assert_eq!(recorder.stats().undo_depth, 1, "partial publication must retain a gap");
+    for force in [false, true] {
+        let outcome = recorder.undo(1, force);
+        assert!(outcome.applied.is_empty());
+        assert!(matches!(outcome.stopped, Some(crate::undo::UndoStop::SnapshotOmitted { .. })));
+    }
+    assert_eq!(std::fs::read_to_string(temp.path().join("source.lspfixture")).unwrap(), "fixed\n");
 }
 
 #[test]

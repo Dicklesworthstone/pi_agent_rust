@@ -6119,7 +6119,10 @@ impl ToolRegistry {
                     crate::ast_tools::AstEditTool::new(cwd)
                         .with_mutation_recorder(mutation_recorder.clone()),
                 )),
-                "lsp" => tools.push(Box::new(crate::lsp::LspTool::new(cwd, config))),
+                "lsp" => tools.push(Box::new(
+                    crate::lsp::LspTool::new(cwd, config)
+                        .with_mutation_recorder(mutation_recorder.clone()),
+                )),
                 "debug" => tools.push(Box::new(crate::debug::DebugTool::new(cwd, config))),
                 "inspect_image" => {
                     let vision_model = config

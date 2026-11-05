@@ -250,19 +250,21 @@ impl LspTool {
         // The complete bounded preview includes every referenced annotation.
         // apply:true confirms that exact batch, never an unseen callback.
         let confirmed_annotations = prepared.required_annotations();
-        let result = prepared.commit_reviewed(|| {
-            check_owner(owner)?;
-            if started.elapsed() >= timeout {
-                return Err(tool_err(
-                    "LSP_TIMEOUT",
-                    "refactor approval timed out before commit",
-                ));
-            }
-            if created.elapsed() >= PREVIEW_AGE {
-                return Err(stale());
-            }
-            group.verify().map(|_| ())
-        });
+        let result = prepared
+            .with_recording(self.recording.current())
+            .commit_reviewed(|| {
+                check_owner(owner)?;
+                if started.elapsed() >= timeout {
+                    return Err(tool_err(
+                        "LSP_TIMEOUT",
+                        "refactor approval timed out before commit",
+                    ));
+                }
+                if created.elapsed() >= PREVIEW_AGE {
+                    return Err(stale());
+                }
+                group.verify().map(|_| ())
+            });
         for entry in &entries {
             self.invalidate_refactor(entry);
         }

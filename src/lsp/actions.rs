@@ -418,11 +418,12 @@ fn apply_scoped(
     entry: &ServerEntry,
     edit: &Value,
     hashes: Option<&HashMap<PathBuf, u64>>,
+    recording: Option<Arc<super::recording::Invocation>>,
 ) -> Result<ApplyOutcome> {
     if serde_json::to_vec(edit)?.len() > MAX_ACTION_BYTES {
         return Err(tool_err("LSP_EDIT_LIMIT", "workspace edit exceeds 2 MiB"));
     }
-    let plan = parse_workspace_edit(edit)?;
+    let plan = parse_workspace_edit(edit)?.with_recording(recording);
     let root = entry.client.root().canonicalize()?;
     for path in plan.text_edits.keys() {
         inside_root(path, &root)?;
@@ -829,7 +830,12 @@ impl LspTool {
         if let Some(params) = &command {
             // Reserve the lineage before inline writes, but do not authorize
             // server callbacks until those writes and activation checks pass.
-            let lease = self.actions.grant(&entry, snapshot.command_edits(owner))?;
+            let lease = self.actions.grant(
+                &entry,
+                snapshot
+                    .command_edits(owner)
+                    .with_recording(self.recording.current()),
+            )?;
             if let Some(edit) = edit {
                 lease.apply_inline(&entry, edit)?;
             }

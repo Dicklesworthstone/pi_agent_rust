@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{
@@ -26,6 +27,7 @@ pub(super) struct CommandEdits {
     // remain guards, even when the next batch only edits another file.
     anchors: HashSet<PathBuf>,
     deadline: Option<(Instant, Duration)>,
+    recording: Option<Arc<crate::lsp::recording::Invocation>>,
 }
 
 impl CommandEdits {
@@ -46,7 +48,16 @@ impl CommandEdits {
             documents,
             anchors: HashSet::from([source]),
             deadline: None,
+            recording: None,
         }
+    }
+
+    pub(super) fn with_recording(
+        mut self,
+        recording: Option<Arc<crate::lsp::recording::Invocation>>,
+    ) -> Self {
+        self.recording = recording;
+        self
     }
 
     pub(super) fn activate(&mut self, entry: &ServerEntry, timeout: Duration) -> Result<()> {
@@ -93,7 +104,7 @@ impl CommandEdits {
         permission()?;
         self.checkpoint(entry)?;
         refactor::check_response_size(raw)?;
-        let plan = parse_workspace_edit(raw)?;
+        let plan = parse_workspace_edit(raw)?.with_recording(self.recording.clone());
         let mut touched: HashSet<_> = plan.text_edits.keys().cloned().collect();
         for operation in &plan.file_ops {
             match operation {

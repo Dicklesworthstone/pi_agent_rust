@@ -1,12 +1,14 @@
 //! File-mutation recording with `/undo` and `/redo` (bd-cv653.3.13).
 //!
 //! The [`FileMutationRecorder`] snapshots file content around every
-//! successful `write`/`edit`/`hashline_edit`/`ast_edit` tool call so agent
+//! successful `write`/`edit`/`hashline_edit`/`ast_edit`/`lsp` tool call so agent
 //! edits can be rolled back without git. Snapshots live in an in-memory
 //! content-addressed store (dedup by SHA-256) bounded by a byte budget with
 //! oldest-unit eviction. Session-backed recorders also persist a private journal.
-//! `lsp` workspace edits and subagent processes
-//! are not recorded yet.
+//! Native LSP file edits, including admitted command callbacks, share one unit
+//! per call. Directory moves create a blocking omission marker because this
+//! recorder restores files, not directory topology. Subagent processes and
+//! language-server writes outside native workspace edits are not recorded.
 //!
 //! Recording contract: one mutation unit per tool call (`begin_file` before
 //! persisting, `commit` after success, `abort` on failure). Only tool-path
@@ -16,7 +18,7 @@
 //! types or a replaced parent directory. Restores replace individual files
 //! atomically; a multi-file unit is not a filesystem transaction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -787,28 +789,28 @@ impl FileMutationRecorder {
     /// Returns an error when durable intent cannot be persisted or recovery is
     /// unavailable. The caller must not perform the file mutation in that case.
     pub fn begin_file(&self, tool_call_id: &str, tool_name: &str, path: &Path) -> io::Result<()> {
-        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let parent = capture_parent(&path).ok();
-        let path = if self.journal.is_some() {
-            parent
-                .as_ref()
-                .and_then(|parent| path.file_name().map(|name| parent.path.join(name))) // ubs:ignore file_name is one component under the canonical captured parent; journal save independently enforces workspace roots
-                .unwrap_or_else(|| {
-                    // Missing nested parents still need the canonical workspace prefix (notably on Windows).
-                    path.ancestors()
-                        .skip(1)
-                        .find_map(|ancestor| {
-                            std::fs::canonicalize(ancestor).ok().and_then(|canonical| {
-                                path.strip_prefix(ancestor)
-                                    .ok()
-                                    .map(|suffix| canonical.join(suffix))
-                            })
-                        })
-                        .unwrap_or_else(|| path.clone())
-                })
-        } else {
-            path
-        };
+        self.begin_files(tool_call_id, tool_name, std::slice::from_ref(&path))
+    }
+
+    /// Snapshot a complete batch before authorizing any of its file mutations.
+    /// First preimages win across duplicates and earlier batches of the same
+    /// call. Capture runs under one recorder lock, then the complete pending
+    /// intent is persisted once, avoiding one journal rewrite per target.
+    /// Empty batches do not create history or write a journal checkpoint.
+    ///
+    /// # Errors
+    /// Returns an error when durable intent cannot be persisted or recovery is
+    /// unavailable. The caller must not mutate any path in the batch on error;
+    /// retained pending intent must be finalized with `abort` as usual.
+    pub fn begin_files<P: AsRef<Path>>(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        paths: &[P],
+    ) -> io::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
         let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
         let inner = &mut *inner;
         if let Some(error) = inner.durability_error {
@@ -822,27 +824,47 @@ impl FileMutationRecorder {
                 at_ms: now_ms(),
                 files: Vec::new(),
             });
-        if unit.files.iter().any(|f| f.path == path) {
-            return if self.persist(inner, false) {
-                Ok(())
+        let mut recorded: HashSet<_> = unit.files.iter().map(|file| file.path.clone()).collect();
+        for path in paths {
+            let path = path.as_ref();
+            let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            let parent = capture_parent(&path).ok();
+            let path = if self.journal.is_some() {
+                parent
+                    .as_ref()
+                    .and_then(|parent| path.file_name().map(|name| parent.path.join(name))) // ubs:ignore file_name is one component under the canonical captured parent; journal save independently enforces workspace roots
+                    .unwrap_or_else(|| {
+                        // Missing parents still require the canonical workspace prefix.
+                        path.ancestors()
+                            .skip(1)
+                            .find_map(|ancestor| {
+                                std::fs::canonicalize(ancestor).ok().and_then(|canonical| {
+                                    path.strip_prefix(ancestor)
+                                        .ok()
+                                        .map(|suffix| canonical.join(suffix))
+                                })
+                            })
+                            .unwrap_or_else(|| path.clone())
+                    })
             } else {
-                Err(io::Error::other(
-                    "Undo intent could not be saved; file mutation was not authorized",
-                ))
+                path
             };
+            if !recorded.insert(path.clone()) {
+                continue;
+            }
+            let pre = capture_state(
+                &mut inner.store,
+                &path,
+                parent.as_ref(),
+                &mut inner.unrecorded_files,
+            );
+            unit.files.push(FileMutation {
+                path,
+                parent,
+                pre,
+                post: FileState::Unrecorded,
+            });
         }
-        let pre = capture_state(
-            &mut inner.store,
-            &path,
-            parent.as_ref(),
-            &mut inner.unrecorded_files,
-        );
-        unit.files.push(FileMutation {
-            path,
-            parent,
-            pre,
-            post: FileState::Unrecorded,
-        });
         enforce_budget(inner, self.budget_bytes);
         if self.persist(inner, false) {
             Ok(())
@@ -1239,6 +1261,40 @@ mod tests {
         let outcome = recorder.redo(1, false);
         assert_eq!(outcome.applied.len(), 1, "{outcome:?}");
         assert_eq!(read(&file), "two\n");
+    }
+
+    #[test]
+    fn batch_admission_keeps_first_preimages_across_duplicates_and_later_batches() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let created = dir.path().join("created.txt");
+        write(&first, "original first");
+        write(&second, "original second");
+        let recorder = FileMutationRecorder::default();
+        recorder
+            .begin_files("batch", "lsp", &[&first, &second, &first, &created])
+            .unwrap();
+        write(&first, "intermediate first");
+        recorder
+            .begin_files("batch", "lsp", &[&first, &second])
+            .unwrap();
+        write(&first, "final first");
+        write(&second, "final second");
+        write(&created, "created content");
+        recorder.commit("batch");
+
+        assert_eq!(recorder.stats().undo_depth, 1);
+        let undone = recorder.undo(1, false);
+        assert_eq!(undone.applied.len(), 1);
+        assert_eq!(undone.applied[0].files.len(), 3);
+        assert_eq!(read(&first), "original first");
+        assert_eq!(read(&second), "original second");
+        assert!(!created.exists());
+        assert_eq!(recorder.redo(1, false).applied.len(), 1);
+        assert_eq!(read(&first), "final first");
+        assert_eq!(read(&second), "final second");
+        assert_eq!(read(&created), "created content");
     }
 
     #[test]

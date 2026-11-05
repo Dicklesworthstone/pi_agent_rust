@@ -636,6 +636,68 @@ mod tests {
     }
 
     #[test]
+    fn batch_intent_contains_all_preimages_before_mutation_and_survives_restart() {
+        let dir = private_tempdir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let journal = root.join("journal.json");
+        let files: Vec<_> = (0..32)
+            .map(|index| root.join(format!("{index}.txt")))
+            .collect();
+        for (index, path) in files.iter().enumerate() {
+            std::fs::write(path, format!("before {index}")).unwrap();
+        }
+        let recorder =
+            FileMutationRecorder::open_journal(&journal, "s", std::slice::from_ref(&root), 4096)
+                .unwrap();
+        recorder.begin_files::<PathBuf>("empty", "lsp", &[]).unwrap();
+        recorder.commit("empty");
+        assert!(!journal.exists(), "empty batches must not checkpoint");
+        assert_eq!(recorder.stats().undo_depth, 0);
+
+        recorder.begin_files("batch", "lsp", &files).unwrap();
+        let envelope: Envelope = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        let document: Document = serde_json::from_str(&envelope.payload).unwrap();
+        assert_eq!(document.pending.len(), 1);
+        let pending = &document.pending["batch"];
+        assert_eq!(pending.files.len(), files.len());
+        for (index, file) in pending.files.iter().enumerate() {
+            assert_eq!(file.path, files[index]);
+            assert_eq!(file.post, FileState::Unrecorded);
+            let FileState::Present(blob) = &file.pre else {
+                panic!("missing batch preimage");
+            };
+            let encoded = &document.blobs.iter().find(|(id, _)| id == blob).unwrap().1;
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap(),
+                format!("before {index}").as_bytes()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file.path).unwrap(),
+                format!("before {index}")
+            );
+        }
+        for (index, path) in files.iter().enumerate() {
+            std::fs::write(path, format!("after {index}")).unwrap();
+        }
+        recorder.commit("batch");
+        drop(recorder);
+
+        let recorder =
+            reopen_after_drop(&journal, "s", std::slice::from_ref(&root), 4096).unwrap();
+        let undone = recorder.undo(1, false);
+        assert_eq!(undone.applied.len(), 1);
+        assert_eq!(undone.applied[0].files.len(), files.len());
+        for (index, path) in files.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                format!("before {index}")
+            );
+        }
+    }
+
+    #[test]
     fn pending_edits_and_corrupt_journals_never_replay() {
         let dir = private_tempdir();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -845,12 +907,18 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let path = root.join("journal.json");
         let file = root.join("file");
+        let sibling = root.join("sibling");
         std::fs::write(&file, "before").unwrap();
+        std::fs::write(&sibling, "sibling before").unwrap();
         let mut recorder =
             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
                 .unwrap();
         recorder.journal.as_mut().unwrap().path = root.join("missing").join("journal.json");
-        assert!(recorder.begin_file("edit", "write", &file).is_err());
+        assert!(
+            recorder
+                .begin_files("edit", "write", &[&file, &sibling])
+                .is_err()
+        );
         assert!(recorder.stats().durability_error.is_some());
         assert!(!recorder.stats().durable);
         assert!(matches!(
@@ -858,6 +926,7 @@ mod tests {
             Some(UndoStop::RestoreFailed { .. })
         ));
         assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+        assert_eq!(std::fs::read_to_string(sibling).unwrap(), "sibling before");
     }
 
     #[cfg(unix)]

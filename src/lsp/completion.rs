@@ -588,7 +588,8 @@ impl LspTool {
         }
         let mut changes = serde_json::Map::new();
         changes.insert(source.uri.clone(), json!(edits));
-        let plan = parse_workspace_edit(&json!({"changes":changes}))?;
+        let plan = parse_workspace_edit(&json!({"changes":changes}))?
+            .with_recording(self.recording.current());
         let documentation = selected.item.get("documentation").and_then(|value| {
             if value.is_string() {
                 Some(value)

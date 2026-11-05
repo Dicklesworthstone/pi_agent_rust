@@ -200,6 +200,8 @@ fn exact_cursor_is_preserved_and_review_approval_never_prepares_or_renames_again
     let Some(tool) = fixture(temp.path(), "normal") else {
         return;
     };
+    let recorder = Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
     let rt = runtime();
     let mut raw = input("rename");
     raw["apply"] = json!(false);
@@ -210,6 +212,11 @@ fn exact_cursor_is_preserved_and_review_approval_never_prepares_or_renames_again
     let mut selection = json!({"action":"rename","refactorId":preview["refactorId"]});
     let inspected = run(&tool, &rt, selection.clone()).unwrap().details.unwrap();
     assert_eq!(inspected["workspaceEdit"], preview["workspaceEdit"]);
+    assert_eq!(
+        recorder.stats().undo_depth,
+        0,
+        "inspection must not record edits"
+    );
     selection["apply"] = json!(true);
     assert_eq!(
         run(&tool, &rt, selection.clone()).unwrap().details.unwrap()["applied"],
@@ -237,6 +244,58 @@ fn exact_cursor_is_preserved_and_review_approval_never_prepares_or_renames_again
         );
     }
     assert_eq!(count(temp.path(), "workspace/executeCommand"), 0);
+    assert_eq!(recorder.stats().undo_depth, 1);
+    let undone = recorder.undo(1, false);
+    assert_eq!(undone.applied.len(), 1);
+    assert_eq!(undone.applied[0].tool_name, "lsp");
+    assert_eq!(undone.applied[0].files.len(), 2);
+    unchanged(temp.path());
+    assert_eq!(recorder.redo(1, false).applied.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("source.target")).unwrap(),
+        RENAMED
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("sibling.target")).unwrap(),
+        "omega\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_undo_journal_refuses_native_rename_before_any_file_changes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let Some(tool) = fixture(temp.path(), "normal") else {
+        return;
+    };
+    let private = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let journal = private.path().join("undo.json");
+    let recorder = Arc::new(
+        crate::undo::FileMutationRecorder::open_journal(
+            &journal,
+            "lsp-rename-refusal",
+            &[temp.path().to_path_buf()],
+            1024 * 1024,
+        )
+        .unwrap(),
+    );
+    // Replacing the lease revokes this writer without altering the workspace.
+    std::fs::rename(
+        journal.with_extension("lock"),
+        private.path().join("retired.lock"),
+    )
+    .unwrap();
+    let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
+    let error = run(&tool, &runtime(), input("rename")).unwrap_err();
+    assert!(error.to_string().contains("LSP_UNDO_UNAVAILABLE"), "{error}");
+    assert_eq!(count(temp.path(), "textDocument/rename"), 1);
+    unchanged(temp.path());
+    assert!(recorder.stats().durability_error.is_some());
 }
 
 #[test]

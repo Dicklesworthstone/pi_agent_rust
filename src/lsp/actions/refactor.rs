@@ -344,7 +344,7 @@ impl LspTool {
                 "refactoring connection closed before applying",
             ));
         }
-        let result = apply_scoped(entry, raw, Some(&hashes));
+        let result = apply_scoped(entry, raw, Some(&hashes), self.recording.current());
         // Also discard stale handles after an incomplete rollback. Do not let
         // cached diagnostics or selected actions claim the old files still exist.
         self.invalidate_refactor(entry);
@@ -397,7 +397,9 @@ impl LspTool {
         }
         // Recheck the same source, owner and budget after staging, at the
         // boundary into the existing finish-or-rollback commit discipline.
-        let result = prepared.commit(|| request.verify());
+        let result = prepared
+            .with_recording(self.recording.current())
+            .commit(|| request.verify());
         self.invalidate_refactor(&request.entry);
         let outcome = result?;
         let files: Vec<_> = outcome
@@ -491,7 +493,9 @@ impl LspTool {
         }
         // One transaction computes import updates AND the move before any
         // target changes. A late destination conflict cannot strand imports.
-        let result = prepared.commit(|| budget.verify(&entry, &snapshot));
+        let result = prepared
+            .with_recording(self.recording.current())
+            .commit(|| budget.verify(&entry, &snapshot));
         self.invalidate_refactor(&entry);
         let outcome = result?;
         let warning = Self::notify_refactor_move(&entry, did.then_some(params));

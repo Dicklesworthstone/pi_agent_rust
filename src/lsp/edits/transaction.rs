@@ -42,6 +42,7 @@ pub(super) struct Transaction {
     operations: Vec<String>,
     bytes: usize,
     directory: Option<directory::DirectoryMove>,
+    recording: Option<Arc<crate::lsp::recording::Invocation>>,
 }
 
 fn conflict(message: impl Into<String>) -> crate::error::Error {
@@ -136,6 +137,14 @@ fn read_image(path: &Path) -> io::Result<Option<Image>> {
 }
 
 impl Transaction {
+    pub(super) fn with_recording(
+        mut self,
+        recording: Option<Arc<crate::lsp::recording::Invocation>>,
+    ) -> Self {
+        self.recording = recording;
+        self
+    }
+
     fn spend(&mut self, bytes: usize) -> Result<()> {
         self.bytes = self
             .bytes
@@ -374,13 +383,35 @@ impl Transaction {
     // tests. Production uses the same commit path with a no-op callback.
     fn commit_with(
         mut self,
-        mut after_change: impl FnMut(usize, &Path) -> io::Result<()>,
+        after_change: impl FnMut(usize, &Path) -> io::Result<()>,
     ) -> Result<ApplyOutcome> {
         self.verify_directory()?;
         // Validate ALL read preimages, including no-op targets, before commit.
         for (path, staged) in &self.files {
             verify_image(path, staged.before.as_ref()).map_err(|error| io_context(path, &error))?;
         }
+        if let Some(recording) = self.recording.take() {
+            let mut paths: Vec<_> = self
+                .files
+                .iter()
+                .filter(|(_, staged)| staged.before != staged.after)
+                .map(|(path, _)| path.clone())
+                .collect();
+            if let Some(moving) = &self.directory {
+                // File snapshots cannot restore directory topology. Recording
+                // both ends creates an explicit omission barrier for this unit.
+                paths.push(moving.old.clone());
+                paths.push(moving.new.clone());
+            }
+            return recording.apply(&paths, || self.commit_validated(after_change));
+        }
+        self.commit_validated(after_change)
+    }
+
+    fn commit_validated(
+        mut self,
+        mut after_change: impl FnMut(usize, &Path) -> io::Result<()>,
+    ) -> Result<ApplyOutcome> {
         // Retain the expected final images of every moved file, including
         // unedited binary data, for the boundary immediately before the move.
         let moved_images: Vec<_> = self

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -49,6 +50,18 @@ pub struct WorkspaceEditPlan {
     // Confirmation requirements are private so editing the public operation
     // collections cannot accidentally discard the server's approval boundary.
     annotations: annotations::Annotations,
+    // Captured locally at application, never supplied by server JSON.
+    recording: Option<Arc<super::recording::Invocation>>,
+}
+
+impl WorkspaceEditPlan {
+    pub(in crate::lsp) fn with_recording(
+        mut self,
+        recording: Option<Arc<super::recording::Invocation>>,
+    ) -> Self {
+        self.recording = recording;
+        self
+    }
 }
 
 /// Errors carry a machine-readable taxonomy prefix.

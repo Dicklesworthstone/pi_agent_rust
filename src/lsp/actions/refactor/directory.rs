@@ -387,14 +387,16 @@ impl LspTool {
             return self.cache_refactor_group(group, prepared, combined, metadata, &owner);
         }
         let entries = group.verify()?;
-        let result = prepared.commit(|| {
-            remaining()?;
-            evidence(&contributors, &responses, &plan)?;
-            before.verify()?;
-            group.verify()?;
-            remaining()?;
-            Ok(())
-        });
+        let result = prepared
+            .with_recording(self.recording.current())
+            .commit(|| {
+                remaining()?;
+                evidence(&contributors, &responses, &plan)?;
+                before.verify()?;
+                group.verify()?;
+                remaining()?;
+                Ok(())
+            });
         for entry in &entries {
             self.invalidate_refactor(entry);
         }

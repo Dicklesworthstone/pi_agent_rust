@@ -80,7 +80,14 @@ fn staged(raw: &Value) -> Transaction {
 #[test]
 fn moves_the_original_tree_after_imports_and_leaves_no_scratch() {
     let fixture = Fixture::new("directory_imports");
-    let outcome = staged(&fixture.plan(true)).commit().unwrap();
+    let recorder = std::sync::Arc::new(crate::undo::FileMutationRecorder::new(1024 * 1024));
+    let recording = crate::lsp::recording::Recorder::new(Some(std::sync::Arc::clone(&recorder)));
+    let scope = recording.enter("directory-move").unwrap();
+    let outcome = staged(&fixture.plan(true))
+        .with_recording(recording.current())
+        .commit()
+        .unwrap();
+    scope.finish(true);
     assert!(!fixture.old.exists());
     assert_eq!(std::fs::read(fixture.new.join("lib.rs")).unwrap(), b"new\n");
     assert_eq!(
@@ -103,6 +110,22 @@ fn moves_the_original_tree_after_imports_and_leaves_no_scratch() {
                 .starts_with(".pi-lsp-")
         }));
     }
+    assert_eq!(recorder.stats().undo_depth, 1);
+    // The shared recorder restores files, not directory identity and topology.
+    for force in [false, true] {
+        let outcome = recorder.undo(1, force);
+        assert!(outcome.applied.is_empty());
+        assert!(matches!(
+            outcome.stopped,
+            Some(crate::undo::UndoStop::SnapshotOmitted { .. })
+        ));
+    }
+    assert!(!fixture.old.exists());
+    assert_eq!(std::fs::read(fixture.new.join("lib.rs")).unwrap(), b"new\n");
+    assert_eq!(
+        std::fs::read(fixture.root.join("imports.rs")).unwrap(),
+        b"new\n"
+    );
 }
 
 #[test]
