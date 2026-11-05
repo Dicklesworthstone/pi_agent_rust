@@ -177,7 +177,7 @@ impl FileMutationRecorder {
                         if let Some(parent) = &file.parent {
                             // Historical identifiers detect ordinary replacement, not hostile inode reuse.
                             if file.path.parent() != Some(parent.path.as_path())
-                                || capture_parent(&file.path).is_err_or(|current| current != *parent)
+                                || capture_parent(&file.path).map_or(true, |current| current != *parent)
                             {
                                 // A missing/replaced parent invalidates only this file's
                                 // historical snapshot. Never re-trust a recreated parent.
