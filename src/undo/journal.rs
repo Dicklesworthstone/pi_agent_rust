@@ -125,7 +125,7 @@ impl FileMutationRecorder {
         roots.sort(); roots.dedup();
         if roots.is_empty() { return Err(snapshot_error("undo journal requires a workspace")); }
         let lease = open_private(&path.with_extension("lock"), true)?;
-        fs4::FileExt::try_lock_exclusive(&lease)?;
+        fs4::FileExt::try_lock(&lease)?;
         let journal = Journal { path, session_id:session_id.into(), roots, _lease:lease };
         let mut inner = RecorderInner::default();
         match open_private(&journal.path, false) {
