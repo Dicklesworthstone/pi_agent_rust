@@ -985,6 +985,29 @@ mod tests {
     }
 
     #[test]
+    fn multi_file_units_evict_before_journal_file_count_limit() {
+        let dir = tempdir().unwrap();
+        let mut inner = RecorderInner::default();
+        for unit_id in 0..3 {
+            inner.undo_stack.push(MutationUnit {
+                tool_name: "workspace_edit".to_string(),
+                at_ms: i64::from(unit_id),
+                files: (0..(journal::MAX_UNITS / 2)).map(|file_id| FileMutation {
+                    path: dir.path().join(format!("{unit_id}-{file_id}.txt")),
+                    parent: None,
+                    pre: FileState::Absent,
+                    post: FileState::Absent,
+                }).collect(),
+            });
+        }
+        enforce_budget(&mut inner, DEFAULT_STORE_BUDGET_BYTES);
+        assert_eq!(inner.undo_stack.len(), 2);
+        assert_eq!(inner.evicted_units, 1);
+        assert!(inner.undo_stack.iter().map(|unit| unit.files.len()).sum::<usize>()
+            <= journal::MAX_UNITS);
+    }
+
+    #[test]
     fn blob_dedup_shares_identical_content() {
         let dir = tempdir().expect("tempdir");
         let a = dir.path().join("a.txt");
