@@ -1,0 +1,23 @@
+    Blocking waiting for file lock on build directory
+   Compiling pi_core_diagnostic v0.0.0 (/workspace/scratch/b95c142b8b6d/qualification-tools/recovery-main-harness)
+    Finished `test` profile [unoptimized] target(s) in 7.22s
+     Running unittests source/lib.rs (target/debug/build/pi_core_diagnostic/7857378ea070ff81/out/pi-7857378ea070ff81)
+
+running 1 test
+test undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them ... FAILED
+
+failures:
+
+---- undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them stdout ----
+
+thread 'undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them' (47) panicked at source/undo.rs:1058:53:
+socket: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

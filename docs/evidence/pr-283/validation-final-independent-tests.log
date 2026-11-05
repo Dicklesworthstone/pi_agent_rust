@@ -1,0 +1,39 @@
+   Compiling pi_core_diagnostic v0.0.0 (/workspace/scratch/b95c142b8b6d/qualification-tools/validation-final-independent-harness)
+    Finished `test` profile [unoptimized] target(s) in 52.62s
+     Running diagnostic_tests/validation_broker_store.rs (target/debug/build/pi_core_diagnostic/139fbe3ec5444f41/out/validation_broker_store-139fbe3ec5444f41)
+
+running 31 tests
+test admission_refuses_required_reuse_when_no_valid_artifact_exists ... ok
+test admission_allows_when_capacity_and_sources_are_healthy ... ok
+test admission_denies_required_rch_gate_on_local_fallback ... ok
+test admission_waits_or_narrows_under_rch_and_scratch_backpressure ... ok
+test beads_normalizer_detects_stale_in_progress_work ... ok
+test admission_does_not_coalesce_non_equivalent_git_or_target ... ok
+test admission_recovers_stale_slots_and_stale_beads ... ok
+test admission_waits_for_equivalent_active_slots ... ok
+test admission_coalesces_reusable_slots ... ok
+test admission_priority_or_age_overrides_soft_broad_gate_backpressure ... ok
+test malformed_records_degrade_snapshot_but_keep_valid_history ... ok
+test lease_store_acquires_renews_releases_and_appends_records ... ok
+test persisted_reusable_evidence_obeys_exact_freshness_boundaries ... ok
+test reusable_slots_require_matching_provenance_for_coalescing ... ok
+test rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence ... ok
+test source_normalizers_make_missing_and_unavailable_inputs_degraded ... ok
+test source_normalizers_build_available_input_snapshot ... ok
+test stale_detection_requires_expiry_and_explicit_reason ... ok
+test source_paths_cannot_be_excluded_as_validation_outputs ... ok
+test rch_saturation_and_local_fallback_are_explicit_inputs ... ok
+test unavailable_identity_is_never_reusable ... ok
+test persisted_freshness_tracks_renames_permissions_and_external_executable_identity ... ok
+test unavailable_and_legacy_identity_preserve_active_ownership_but_never_reuse ... ok
+test symlink_substitutions_and_oversized_inputs_fail_closed_after_restart ... ok
+test unavailable_store_loads_as_read_only_degraded_snapshot ... ok
+test validation_broker_large_host_stress_budget_evidence_is_fail_closed ... ok
+test validation_broker_fault_corpus_covers_build_storm_and_stale_recovery ... ok
+test reuse_binds_workspace_and_executable_bytes_before_and_after_validation ... ok
+test inherited_path_changes_are_checked_at_completion ... ok
+test invalid_lease_timestamp_order_degrades_persisted_history ... ok
+test admission_scans_only_eligible_reuse_after_authority_checks ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+

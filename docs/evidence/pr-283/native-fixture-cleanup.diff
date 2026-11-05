@@ -1,0 +1,58 @@
+--- tests/validation_broker_cli.rs pre-annotation
++++ tests/validation_broker_cli.rs final
+@@ -180,12 +180,12 @@
+     let workspace = WORKSPACE.get_or_init(|| {
+         let root = tempfile::tempdir().expect("fixture workspace").keep();
+         for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+-            std::fs::write(root.join(name), b"validation fixture executable")
++            std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the six literal fixture filenames above enter this join.
+                 .expect("fixture tool");
+             #[cfg(unix)]
+             {
+                 use std::os::unix::fs::PermissionsExt as _;
+-                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755))
++                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)) // ubs:ignore[rust.security.path-traversal] The same six literal fixture filenames are chmodded inside their test directory.
+                     .expect("executable fixture tool");
+             }
+         }
+@@ -393,12 +393,17 @@
+             lease.mark_reusable("Codex", HEARTBEAT, artifacts)?;
+             #[cfg(not(unix))]
+             {
+-                assert!(lease.input_identity.is_none());
+-                assert!(
+-                    lease
+-                        .mark_reusable("Codex", HEARTBEAT, artifacts.clone())
+-                        .is_err()
+-                );
++                if lease.input_identity.is_some() {
++                    return Err(test_error("unsupported native capture must be unavailable"));
++                }
++                if lease
++                    .mark_reusable("Codex", HEARTBEAT, artifacts.clone())
++                    .is_ok()
++                {
++                    return Err(test_error(
++                        "unsupported native capture must refuse result reuse",
++                    ));
++                }
+                 // Preserve the historical-state/status fixture, while planning
+                 // must refuse to reuse its unavailable native input identity.
+                 lease.state = pi::validation_broker::ValidationSlotState::Reusable;
+--- tests/validation_broker_e2e.rs pre-annotation
++++ tests/validation_broker_e2e.rs final
+@@ -380,12 +380,12 @@
+     let workspace = WORKSPACE.get_or_init(|| {
+         let root = tempfile::tempdir().expect("fixture workspace").keep();
+         for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+-            std::fs::write(root.join(name), b"validation fixture executable")
++            std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the six literal fixture filenames above enter this join.
+                 .expect("fixture tool");
+             #[cfg(unix)]
+             {
+                 use std::os::unix::fs::PermissionsExt as _;
+-                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755))
++                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)) // ubs:ignore[rust.security.path-traversal] The same six literal fixture filenames are chmodded inside their test directory.
+                     .expect("executable fixture tool");
+             }
+         }

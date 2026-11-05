@@ -1,0 +1,8 @@
+{
+  "head": "667c9ba8b92aefdace99d9d3bc7472007031a6e5",
+  "status_porcelain": "",
+  "recipe_sha256": "7bad31c83a4d5372f5c789ce4a86c47dc75c85dda400d289d78c79d2e2408e43",
+  "canonical_project_root": "/workspace/scratch/b95c142b8b6d",
+  "remote_requirement": "Unchanged recipe RCH_REQUIRE_REMOTE=1 for Rust gates",
+  "tool_preflight": "Verified official yq SHA256, executable mode0755, recipe parsed successfully; rch2.1.35 present"
+}

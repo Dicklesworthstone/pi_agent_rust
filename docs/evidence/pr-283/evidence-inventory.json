@@ -1,0 +1,241 @@
+{
+  "publication_directory": "docs/evidence/pr-283",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "bbd682f11b760d95ece35bf310f8f2502b5c53527bc1270ad2f90b093852c4a7",
+      "bytes": 26355
+    },
+    {
+      "path": "annotation-equivalence.json",
+      "sha256": "f863f1c8fe901dc8ab1f12f6432ff4991567ac973a5ca68344c70bea36077631",
+      "bytes": 1330
+    },
+    {
+      "path": "annotation-only.diff",
+      "sha256": "317e883125cc9326e016a882ac2efbd1903ae1c9418adcd2d7b5dc62fdb5fa91",
+      "bytes": 16945
+    },
+    {
+      "path": "baseline-dsr-receipt.json",
+      "sha256": "65fb3ff91541860900e446434b9e33f7dca2fe15054b0cd2226a0f7063e2ce6a",
+      "bytes": 11390
+    },
+    {
+      "path": "donor-exact-compile.log",
+      "sha256": "c1cecdeb811bc000965da6ceb135165673452b55b876e888546604cd8bf5a4c1",
+      "bytes": 8704
+    },
+    {
+      "path": "final-dsr-entry-config-error-stderr.log",
+      "sha256": "a0e8b35c35e10cfa82f3a9ea5215562fd7707f6972789d6d4aea1bb08fb59072",
+      "bytes": 125
+    },
+    {
+      "path": "final-dsr-entry-config-error.json",
+      "sha256": "10471b509a791b146f84aba4d57cd43236bcdc25208079850344dee10884610b",
+      "bytes": 389
+    },
+    {
+      "path": "final-dsr-fixture-read-patience.log",
+      "sha256": "1ea19ced6769736e8c6f445a8c386cfb52fb89bb893aa03e479bb8b6d9f226a9",
+      "bytes": 1673
+    },
+    {
+      "path": "final-dsr-installer.log",
+      "sha256": "6113e4c87d157dfc30072048f053afe9158830bfbb4bea179eb1e8a4cf56e127",
+      "bytes": 6000
+    },
+    {
+      "path": "final-dsr-reachability.log",
+      "sha256": "9448d624c9b2c90d7249cc00d0407204b666e5db91cbfaf08ddda9e0bd7e309d",
+      "bytes": 2126
+    },
+    {
+      "path": "final-dsr-receipt.json",
+      "sha256": "26bae00f669fdae0768fc3db06892979be622754c1627eac926074e8f430ecb7",
+      "bytes": 12162
+    },
+    {
+      "path": "final-dsr-rust-refusal.log",
+      "sha256": "027b06144d26f272bc959ec8ec73bfdd42e5502befbfb188b01b8ba296b31556",
+      "bytes": 3208
+    },
+    {
+      "path": "final-dsr-source-after.json",
+      "sha256": "ab6f55af1140f2fb84ef97222f3905c4bd7010a06776c5e41f73d17c5ebc1746",
+      "bytes": 83
+    },
+    {
+      "path": "final-dsr-source-before.json",
+      "sha256": "2a623b1abf58309488712e379f2177ab6b702350f6c4d0b6891c67e0ddb64cb1",
+      "bytes": 432
+    },
+    {
+      "path": "final-format-ubs-delta-retry.log",
+      "sha256": "c292d3d5e5343580b39703b0f951d9ccfb73e88f1662084175ce0a4604df2e70",
+      "bytes": 38838
+    },
+    {
+      "path": "final-rch-worker-inventory.json",
+      "sha256": "6a0c126ec9716a5735bf31c341a67ac00f27b4e013eed62739dcec6c9a2de220",
+      "bytes": 153
+    },
+    {
+      "path": "final-tools-format-equivalence.json",
+      "sha256": "b9007239c76186e666803d07bc764646aaa31ca3170f06d43ed33a19e7516d5d",
+      "bytes": 904
+    },
+    {
+      "path": "integrated-final-ubs-delta.log",
+      "sha256": "5a1fd68d85a2ba2f489a69ee502c5bed0b994ef23cc9e7346569d0fbec261511",
+      "bytes": 39876
+    },
+    {
+      "path": "native-fixture-cleanup.diff",
+      "sha256": "50afeff538fcf7b873f200689540de7b48f1d8479a7f5fb784ec72f01fb36bf8",
+      "bytes": 3376
+    },
+    {
+      "path": "native-provider-preflight.log",
+      "sha256": "5ca7d30e6da3c580fe44d5a87e321edd8c18f88bf2c2008f6fc2795659a7a81c",
+      "bytes": 264
+    },
+    {
+      "path": "native-provider-source-head.txt",
+      "sha256": "27c548e2cbb7383e2c1be74d748c03c0eb0b04ed6f242d23e0dfb7a6ab871053",
+      "bytes": 41
+    },
+    {
+      "path": "prepare_core_diagnostics.py",
+      "sha256": "dc7502ff607650569b20fb1d6d64b488c119e9a2f6e6f9c51368aa98a50979a0",
+      "bytes": 9058
+    },
+    {
+      "path": "provider-live-preflight.json",
+      "sha256": "7a224c599349e0538b047a7d46017f816c857033cbea5db63c0be6ad774e31ed",
+      "bytes": 1464
+    },
+    {
+      "path": "recovery-final-independent-clippy.log",
+      "sha256": "4ece1f4707f409bc43bd0f726385033d8d3ce4884100c6ff1fa31a1853b74987",
+      "bytes": 188
+    },
+    {
+      "path": "recovery-final-independent-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "recovery-final-independent-harness-Cargo.toml",
+      "sha256": "d61ea1042b6c87177183c997f3fc96532d50612159f7d32ed70de9f0a4888a91",
+      "bytes": 6765
+    },
+    {
+      "path": "recovery-final-independent-harness-source-inventory.json",
+      "sha256": "2a54ffc98b5986e6d42f7f878ff12725a5d1347ccfb7263ede29bc5e1c4ebf24",
+      "bytes": 743
+    },
+    {
+      "path": "recovery-final-independent-tests.log",
+      "sha256": "e78d83e5eef3fe7f113a22fca2e2b657b8a82cae7faaf7a55be144dad70324a0",
+      "bytes": 5982
+    },
+    {
+      "path": "recovery-final-independent-ubs-delta.log",
+      "sha256": "5a1a61538d3b1a6919c81f8f95bedc09fa6f150a2501638921726773642a20ba",
+      "bytes": 34714
+    },
+    {
+      "path": "recovery-final-independent-verification.log",
+      "sha256": "d2a579f04507e0feb37c7421caa329575608dcf290be54afd46fb2252d9cd4bb",
+      "bytes": 68
+    },
+    {
+      "path": "recovery-final-reviewed-ubs-delta.log",
+      "sha256": "431dc3c9ff5c7096c4c83192adbfa17585485eead6c197cf77df0d7a0d9a968a",
+      "bytes": 33348
+    },
+    {
+      "path": "recovery-main-socket.log",
+      "sha256": "72a3b86ab8c279d47c931f20d54636a89861e4028a1162254cf912367a8068e9",
+      "bytes": 1076
+    },
+    {
+      "path": "recovery-snapshot-tests-serial.log",
+      "sha256": "88c1f2784ad85d639467f9b75c4b387ab53f6ec6d4535976e9865a857311b003",
+      "bytes": 5903
+    },
+    {
+      "path": "recovery-snapshot-tests.log",
+      "sha256": "3da30df4e97a4bd1f182729b4c0b898eefcc397ef279b0687b68dc2a6aefcfda",
+      "bytes": 6347
+    },
+    {
+      "path": "validation-final-independent-clippy.log",
+      "sha256": "ded4b1c22c3ed0b2904531b27e67e719f6b12b07a542ae3dbed4defb9c61f968",
+      "bytes": 190
+    },
+    {
+      "path": "validation-final-independent-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "validation-final-independent-harness-Cargo.toml",
+      "sha256": "e1387b11d29891020d17bf65c010c9cdd993f8d93621bd00c37cfa66db3d1007",
+      "bytes": 6847
+    },
+    {
+      "path": "validation-final-independent-harness-source-inventory.json",
+      "sha256": "5cf2c7126175fdfe1f1681d4578d5cb07328c2487f97452dbfaa3f05c9e69f58",
+      "bytes": 927
+    },
+    {
+      "path": "validation-final-independent-tests.log",
+      "sha256": "5f78f8da1e6dd9f8560cfbae962d6fbde0ae7913a8d7920cfe0a063540915743",
+      "bytes": 2633
+    },
+    {
+      "path": "validation-final-independent-verification.log",
+      "sha256": "a16844ff88f28e9bc7d9ab902dbd7d7a9e0e22395b1007cd3dd2c47ed4d5d533",
+      "bytes": 68
+    },
+    {
+      "path": "validation-final-reviewed-ubs-delta.log",
+      "sha256": "fb50b9e988de4fe715ec375cc58264c766c996c7479ed4eefff5ee7e546ce419",
+      "bytes": 33569
+    },
+    {
+      "path": "validation-independent-ubs-delta.log",
+      "sha256": "c80540965c52fe8f4d0649641d4cd5b23a6c048918603ca58141ec35caf37f3e",
+      "bytes": 34536
+    },
+    {
+      "path": "validation-main-exact-tests.log",
+      "sha256": "c11c0dc2be836e5006e953a93271e7c19d5a4a83c6fdad50dc9581954e913488",
+      "bytes": 2940
+    },
+    {
+      "path": "validation-timestamp-clippy-repository-lints.log",
+      "sha256": "eaac099889d38a0f938e13026d0a6ed42a214f5447701cbadf8346abd3e11b0f",
+      "bytes": 181
+    },
+    {
+      "path": "validation-timestamp-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "validation-timestamp-tests.log",
+      "sha256": "d244b057f23f5603fc2526199c7662c91cc72217cfa42bbeb75a2dd88082fc3f",
+      "bytes": 2165
+    }
+  ],
+  "excluded_uncompleted_attempt": {
+    "path": "final-format-ubs-delta.log",
+    "reason": "First format gate attempt produced no result; completed retry is included"
+  },
+  "note": "This inventory lists the frozen artifacts other than itself; publish this inventory as well.",
+  "source_checked_by_dsr": "667c9ba8b92aefdace99d9d3bc7472007031a6e5"
+}

@@ -18810,7 +18810,10 @@ impl Tool for HashlineEditTool {
             recorder
                 .begin_file(tool_call_id, "hashline_edit", &absolute_path)
                 .map_err(|error| {
-                    Error::tool("hashline_edit", format!("Cannot record undo intent: {error}"))
+                    Error::tool(
+                        "hashline_edit",
+                        format!("Cannot record undo intent: {error}"),
+                    )
                 })?;
         }
         let persisted = asupersync::runtime::spawn_blocking_io(move || {

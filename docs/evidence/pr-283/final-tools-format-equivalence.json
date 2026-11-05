@@ -1,0 +1,20 @@
+{
+  "base_head": "667c9ba8b92aefdace99d9d3bc7472007031a6e5",
+  "path": "src/tools.rs",
+  "change": "One HashlineEditTool Error::tool call formatted to pinned rustfmt output; no behavioral change",
+  "before_sha256": "9f87bd9d2f1ea4b514c6f595cbd25899c6d70684a4714c3c9577a9ffdefacec1",
+  "after_sha256": "1a7b1e0e9010e96ddad0593c91cbb71f57eae4dd21090c291a815f60074cecb1",
+  "normalized_sha256": "f5536afebb315c60928ee982f684de97789c425a5bb136ead305e6985dcdf275",
+  "normalized_bytes_equal": true,
+  "diff_numstat": "4\t1\tsrc/tools.rs",
+  "command": [
+    "/workspace/scratch/c82c6a5fc7a5/toolchain/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin/rustfmt",
+    "--edition",
+    "2024",
+    "--emit",
+    "stdout",
+    "--config",
+    "skip_children=true"
+  ],
+  "scope": "Formatting-only follow-up after the complete DSR run; not a rerun or a claim of whole-file formatter cleanliness"
+}

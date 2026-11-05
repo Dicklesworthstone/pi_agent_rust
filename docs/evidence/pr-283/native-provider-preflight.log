@@ -1,0 +1,2 @@
+FAIL: binary not found at /workspace/scratch/b95c142b8b6d/pi_agent_rust/target/release/pi
+  wrote /workspace/scratch/b95c142b8b6d/qualification-tools/logs/final-provider-live-preflight.json with verdict=binary_missing; rerun after `cargo build --release --bin pi`

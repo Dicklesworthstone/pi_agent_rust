@@ -1,0 +1,11 @@
+{
+  "command": "quality",
+  "status": "config-error",
+  "exit_code": 4,
+  "run_id": "be018691-e327-4921-b427-4d6dec6c523f",
+  "started_at": "2026-11-05T22:20:53Z",
+  "duration_ms": 0,
+  "tool": "dsr",
+  "version": "0.2.3",
+  "details": {"tool":"pi_agent_rust","status":"config-error","skipped":false,"checks":[],"passed":0,"failed":0,"planned":0,"total":0,"duration_ms":0,"config_rc":4}
+}

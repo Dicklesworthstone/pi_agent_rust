@@ -1,0 +1,150 @@
+[package]
+name = "pi_core_diagnostic"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autotests = false
+
+[lib]
+name = "pi"
+path = "source/lib.rs"
+
+[dependencies]
+base64 = "=0.23.1"
+dirs = "=7.0.0"
+fs4 = "=1.1.0"
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "=1.0.151", features = ["raw_value"] }
+sha2 = "=0.11.0"
+tempfile = "=3.27.0"
+tracing = "=0.1.44"
+uuid = { version = "=1.27.0", features = ["v4"] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allow some common patterns
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+# Both of the following arrived with the nightly-2026-08-31 pin (e403485b3),
+# which was a fleet-wide housekeeping change that touched no source and, as
+# rust-toolchain.toml's own comment warns can happen, strengthened the
+# pedantic/nursery groups underneath us. Between them they were 294 of the 296
+# errors blocking `cargo clippy -- -D warnings`, i.e. the entire quality gate.
+# Decided deliberately rather than reverted (bd-39x9z).
+#
+# One deviation from bd-39x9z's acceptance, recorded rather than glossed: that
+# bead asked for per-module suppression rather than crate-wide if this route was
+# taken. The owner chose the allow directly, and per-module would mean an inner
+# attribute in each of the ~78 affected files, which scatters the reasoning
+# across the tree instead of stating it once where the lint policy lives. One
+# documented place is easier to revisit than 78 undocumented ones.
+
+# 288 hits, essentially all in test assertions. The lint wants
+#   assert_eq!(plan_tool_effect_batches(&effect_plan(&cases)), [] as [agent::ToolEffectBatch; 0])
+# in place of
+#   assert!(plan_tool_effect_batches(&effect_plan(&cases)).is_empty())
+# which needs the element type spelled out at every site, is longer, and reads
+# worse. Its real argument — that assert_eq! shows the value on failure — is
+# fair, but not worth 288 rewrites of that shape. Prefer assert_eq! in NEW
+# assertions where the value is cheap to render.
+assert_is_empty = "allow"
+
+# 6 hits. The lint wants f64::mul_add, which is a FUSED multiply-add with no
+# intermediate rounding, so applying it changes results bit-for-bit. The sites
+# are bandit loss/regret accumulation (src/extensions.rs) and risk calibration
+# (src/resource_governor.rs, src/provider.rs), with tests pinning values
+# downstream. Changing risk arithmetic to satisfy a micro-optimisation lint is
+# the wrong trade; a sibling project on the same build fleet allows it too.
+suboptimal_flops = "allow"
+
+# Lint debt allowed for the 0.9.0 release (a release decision; see `bd-jdf1u`). Work since the
+# nightly-2026-08-31 validation run (7b6a53cc0) added clippy warnings that `-D warnings`
+# turns into errors. The kinds below are style or design lints with no correctness
+# impact, so they are allowed here, in one place, as bd-39x9z did, instead of being
+# rewritten under release pressure. Counts are from `cargo clippy --all-targets` with
+# CI's features at efdcaeaf9d; `bd-jdf1u` lists them for burn-down. Correctness-relevant
+# kinds were fixed per site, and machine-applicable ones applied, in the same release.
+# large_futures stays on: clippy.toml raises its size threshold to 64 KiB instead.
+# 55 sites. Narrowing each guard's scope reorders releases; each site needs review.
+significant_drop_tightening = "allow"
+# 31 sites. Splitting long functions is a refactor, not a lint fix.
+too_many_lines = "allow"
+# 17 sites. Changing these parameters to borrows changes signatures.
+needless_pass_by_value = "allow"
+# 1 site. Changing these parameters to shared borrows changes signatures.
+needless_pass_by_ref_mut = "allow"
+# 1 site. Passing these small Copy values by value changes signatures.
+trivially_copy_pass_by_ref = "allow"
+# 11 sites. Making a public fn const is an API commitment, decided per fn.
+missing_const_for_fn = "allow"
+# 14 sites. Making these futures Send is a design change.
+future_not_send = "allow"
+# 9 sites. Returning &'static str changes signatures.
+unnecessary_literal_bound = "allow"
+# 1 site. Unwrapping these return types changes signatures.
+unnecessary_wraps = "allow"
+# 14 sites. Rewording these doc summaries is documentation work.
+too_long_first_doc_paragraph = "allow"
+# 4 sites. Boxing a variant changes the type's layout and its constructors.
+large_enum_variant = "allow"
+# 3 sites. Replacing these bools with enums changes the type.
+struct_excessive_bools = "allow"
+# 1 site. Replacing these bool parameters changes signatures.
+fn_params_excessive_bools = "allow"
+# 1 site. Renaming these fields changes the type.
+struct_field_names = "allow"
+# 2 sites. Naming these types is a refactor, not a lint fix.
+type_complexity = "allow"
+# 2 sites. Replacing Option<Option<T>> changes the type.
+option_option = "allow"
+# 1 site. Rewriting these joins with fmt::Write is a refactor.
+format_collect = "allow"
+# 1 site. Uninhabited enums used as marker types are intended.
+empty_enums = "allow"
+# 10 sites. Rewriting these if-let/else blocks as map_or_else is a style refactor.
+option_if_let_else = "allow"
+# 9 sites. Naming the type in place of Default::default() is style only.
+default_trait_access = "allow"
+# 6 sites. Adding digit separators to these literals is style only.
+unreadable_literal = "allow"
+# 4 sites. Moving these local items above the statements is style only.
+items_after_statements = "allow"
+# 4 sites. Rewriting these early returns with `?` is a style refactor.
+question_mark = "allow"
+# 3 sites. Making these default values lazy is a per-site style change.
+or_fun_call = "allow"
+# 3 sites. Rewriting these matches as let-else is a style refactor.
+manual_let_else = "allow"
+# 3 sites. Switching these assignments to clone_from is a per-site refactor.
+assigning_clones = "allow"
+# 2 sites. Folding these let-then-if sequences is a style refactor.
+useless_let_if_seq = "allow"
+# 2 sites. Naming the variant changes how a new variant would match.
+match_wildcard_for_single_variants = "allow"
+# 1 site. Dropping the redundant #[must_use] is style only.
+double_must_use = "allow"
+# 1 site. Using From for this tuple/array conversion is style only.
+tuple_array_conversions = "allow"
+# 1 site. Rewriting format!-then-push_str with write! is a style refactor.
+format_push_string = "allow"
+# 1 site. Dropping this collect changes when the iterator runs; decided per site.
+needless_collect = "allow"
+# 1 site. Folding this field assignment into the literal is style only.
+field_reassign_with_default = "allow"
+

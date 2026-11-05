@@ -1,0 +1,10 @@
+{
+  "api_version": "1.0",
+  "timestamp": 1793917510,
+  "command": "workers list",
+  "success": true,
+  "data": {
+    "workers": [],
+    "count": 0
+  }
+}

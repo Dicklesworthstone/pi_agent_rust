@@ -1,0 +1,32 @@
+    Blocking waiting for file lock on build directory
+   Compiling tempfile v3.27.0
+   Compiling pi_validation_qualification v0.0.0 (/workspace/scratch/b95c142b8b6d/qualification-tools/validation-harness)
+    Finished `test` profile [unoptimized] target(s) in 43.56s
+     Running ../validation-timestamp-snapshot/tests/validation_broker_store.rs (/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_validation_qualification/48cb49e3953a3af1/out/validation_broker_store-48cb49e3953a3af1)
+
+running 22 tests
+test admission_coalesces_reusable_and_waits_for_active_slots ... ok
+test admission_allows_when_capacity_and_sources_are_healthy ... ok
+test beads_normalizer_detects_stale_in_progress_work ... ok
+test admission_does_not_coalesce_non_equivalent_git_or_target ... ok
+test admission_waits_or_narrows_under_rch_and_scratch_backpressure ... ok
+test admission_priority_or_age_overrides_soft_broad_gate_backpressure ... ok
+test admission_recovers_stale_slots_and_stale_beads ... ok
+test admission_refuses_required_reuse_when_no_valid_artifact_exists ... ok
+test lease_store_acquires_renews_releases_and_appends_records ... ok
+test admission_denies_required_rch_gate_on_local_fallback ... ok
+test rch_saturation_and_local_fallback_are_explicit_inputs ... ok
+test malformed_records_degrade_snapshot_but_keep_valid_history ... ok
+test persisted_reusable_evidence_obeys_exact_freshness_boundaries ... ok
+test reusable_slots_require_matching_provenance_for_coalescing ... ok
+test stale_detection_requires_expiry_and_explicit_reason ... ok
+test rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence ... ok
+test source_normalizers_make_missing_and_unavailable_inputs_degraded ... ok
+test source_normalizers_build_available_input_snapshot ... ok
+test unavailable_store_loads_as_read_only_degraded_snapshot ... ok
+test invalid_lease_timestamp_order_degrades_persisted_history ... ok
+test validation_broker_large_host_stress_budget_evidence_is_fail_closed ... ok
+test validation_broker_fault_corpus_covers_build_storm_and_stale_recovery ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+

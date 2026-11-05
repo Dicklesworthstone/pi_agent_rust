@@ -1,0 +1,491 @@
+UBS staged delta: 6 staged Rust file(s), 1624 changed line(s), 16 parsed UBS location(s), 2 finding location(s) on changed lines.
+UBS staged totals: critical=0 warning=162 info=229
+UBS staged delta info-only findings on changed lines:
+ - info: tests/validation_broker_store.rs:668 - [rule:rust.filesystem.command-new][0m
+ - info: src/validation_broker/freshness.rs:414 - [rule:rust.modules.wildcard-imports][0m
+UBS staged delta passed: no warning/critical findings on staged changed lines.
+ℹ Ignoring paths from /workspace/scratch/b95c142b8b6d/validation-work/.ubsignore → target target-* legacy_pi_mono_code .ruff_cache .git .beads .bench .bench_round3 .bv .ntm ubuntu-review* codex* codex_extindex_review codex_extindex_review_test bd-* bd-*/** fuzz release_artifacts pane* pane*/**
+ℹ Preparing shadow workspace from Git index (7 files)
+ℹ Scanning shadow workspace at /tmp/tmp.3hxT8VnNXW/git_scan
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ██╗   ██╗██╗  ████████╗██╗███╗   ███╗ █████╗ ████████╗███████╗              ║
+║  ██║   ██║██║  ╚══██╔══╝██║████╗ ████║██╔══██╗╚══██╔══╝██╔════╝              ║
+║  ██║   ██║██║     ██║   ██║██╔████╔██║███████║   ██║   █████╗                ║
+║  ██║   ██║██║     ██║   ██║██║╚██╔╝██║██╔══██║   ██║   ██╔══╝                ║
+║  ╚██████╔╝███████╗██║   ██║██║ ╚═╝ ██║██║  ██║   ██║   ███████╗              ║
+║   ╚═════╝ ╚══════╝╚═╝   ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝              ║
+║                                                                              ║
+║  ██████╗ ██╗   ██╗ ██████╗         __       __                               ║
+║  ██╔══██╗██║   ██║██╔════╝         \ `-'"-'` /                               ║
+║  ██████╔╝██║   ██║██║  ███╗        / \_   _/ \                               ║
+║  ██╔══██╗██║   ██║██║   ██║        |  d\_/b  |                               ║
+║  ██████╔╝╚██████╔╝╚██████╔╝       .'\   V   /'.                              ║
+║  ╚═════╝  ╚═════╝  ╚═════╝        /   '-...-'   \                            ║
+║                                  | /         \ |                             ║
+║                                  \/\         /\/                             ║
+║                                  ==(||)---(||)==                             ║
+║                                                                              ║
+║  ███████╗  ██████╗   █████╗ ███╗   ██╗███╗   ██╗███████╗██████╗              ║
+║  ██╔════╝  ██╔═══╝  ██╔══██╗████╗  ██║████╗  ██║██╔════╝██╔══██╗             ║
+║  ███████╗  ██║      ███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██████╔╝             ║
+║  ╚════██║  ██║      ██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██╔══██╗             ║
+║  ███████║  ██████╗  ██║  ██║██║ ╚████║██║ ╚████║███████╗██║  ██║             ║
+║  ╚══════╝  ╚═════╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝                  ║
+║                                                                              ║
+║   JS / TS • PYTHON • C / C++ • RUST • GO • JAVA • RUBY                       ║
+║   KOTLIN • SWIFT • C# • ELIXIR • BASH • PHP                                  ║
+║                    UBS: ULTIMATE BUG SCANNER • SARIF FUSION ☄️               ║
+║                                                                              ║
+║                                                                              ║
+║                     Night Owl QA                                             ║
+║                     “We see bugs before you do.”                             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+UBS Meta-Runner v5.5.26  2026-11-05T22:15:57Z
+Project: /workspace/scratch/b95c142b8b6d/validation-work
+Format:  text
+Detected: rust
+Scanning rust...
+Finished rust (10s)
+
+──────── rust ────────
+UBS module: rust (contract v2) — /workspace/scratch/b95c142b8b6d/validation-work
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m1. OWNERSHIP & ERROR HANDLING MACROS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: unwrap/expect, panic/unreachable/todo/unimplemented, dbg/println[0m
+[2mPanic-prone and debug macros frequently leak into production and cause crashes[0m
+
+[1;33m[1m• unwrap()/expect() usage[0m
+  [0;32m✓ OK[0m [2mNo unwrap/expect detected[0m
+
+[1;33m[1m• panic!/unreachable!/todo!/unimplemented![0m
+  [0;32m✓ OK[0m [2mNo panic! macros[0m
+
+[1;33m[1m• dbg!/println!/eprintln![0m
+
+[1;33m[1m• Guard clauses that still unwrap later[0m
+  [0;32m✓ OK[0m [2mNo guard/unwrap mismatches detected[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m2. UNSAFE & MEMORY OPERATIONS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: unsafe blocks, transmute/uninitialized/zeroed/forget, raw ffi hazards[0m
+[2mThese patterns may introduce UB, memory leaks, or hard-to-debug crashes[0m
+
+[1;33m[1m• unsafe { ... } blocks[0m
+  [0;32m✓ OK[0m [2mNo unsafe blocks detected[0m
+
+[1;33m[1m• transmute, uninitialized, zeroed, assume_init, forget[0m
+
+[1;33m[1m• CStr::from_bytes_with_nul_unchecked[0m
+
+[1;33m[1m• get_unchecked / from_utf8_unchecked / from_raw_parts[0m
+
+[1;33m[1m• Unsafe Send/Sync impls[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m3. CONCURRENCY & ASYNC PITFALLS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: Arc<Mutex>, Rc<RefCell>, blocking ops in async, await-in-loop, spawn misuse[0m
+[2mConcurrency misuse leads to deadlocks, head-of-line blocking, and performance issues[0m
+
+[1;33m[1m• Arc<Mutex<..>> / Rc<RefCell<..>> / RwLock[0m
+
+[1;33m[1m• Mutex::lock().unwrap()/expect()[0m
+
+[1;33m[1m• await inside loops (sequentialism)[0m
+
+[1;33m[1m• Blocking ops inside async (thread::sleep, std::fs)[0m
+
+[1;33m[1m• block_on within async context[0m
+
+[1;33m[1m• std::thread::spawn within async[0m
+
+[1;33m[1m• tokio::spawn usage (heuristic for detached tasks)[0m
+
+[1;33m[1m• Async error path coverage[0m
+  [0;32m✓ OK[0m [2mNo tokio::spawn usage detected[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m4. NUMERIC & FLOATING-POINT[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: float equality, division/modulo by variable, potential overflow hints[0m
+[2mNumeric bugs cause subtle logic errors or panics in debug builds (overflow)[0m
+
+[1;33m[1m• Floating-point equality comparisons[0m
+  [0;34mℹ Info[0m [1;37m(14 found)[0m
+    [0;34mFloat equality/inequality check[0m
+    [2mConsider epsilon comparisons[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_store.rs:1407:37 [rule:rust.numeric.float-equality][0m
+[1;37m                  .find(|slot| slot.slot_id == expected_slot.slot_id)[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_store.rs:1489:23 [rule:rust.numeric.float-equality][0m
+[1;37m              if decision_key != scenario.expected.decision {[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_store.rs:1492:30 [rule:rust.numeric.float-equality][0m
+[1;37m              if decision.confidence != scenario.expected.confidence {[0m
+
+[1;33m[1m• Division/modulo by variable (verify non-zero)[0m
+  [0;34mℹ Info[0m [1;37m(144 found)[0m
+    [0;34mDivision by variables - guard zero divisors[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m5. COLLECTIONS & ITERATORS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: clone in loops, collect then iterate, nth(0), length checks[0m
+[2mIterator misuse often leads to unnecessary allocations or slow paths[0m
+
+[1;33m[1m• clone() occurrences & clone() in loops[0m
+  [1;33m⚠ Warning[0m [1;37m(6 found)[0m
+    [1;33mclone() inside loops - potential perf hit[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_e2e.rs:1321:1 [rule:rust.collections.clone-in-loop][0m
+[1;37m      seen_decisions.insert(decision.clone());[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_e2e.rs:1323:1 [rule:rust.collections.clone-in-loop][0m
+[1;37m      stale_store_for_projection = Some(artifacts.store_path.clone());[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/src/validation_broker.rs:881:1 [rule:rust.collections.clone-in-loop][0m
+[1;37m      staged_paths.push(path.clone());[0m
+
+[1;33m[1m• collect::<Vec<_>>() then for[0m
+
+[1;33m[1m• nth(0) → next()[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m6. STRING & ALLOCATION SMELLS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: needless allocations, format!(literal), to_owned().to_string()[0m
+[2mUnnecessary allocations and conversions reduce performance[0m
+
+[1;33m[1m• to_owned().to_string() chain[0m
+
+[1;33m[1m• format!("literal") with no placeholders[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m7. FILESYSTEM & PROCESS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: blocking std::fs in async, process::Command usage heuristics[0m
+[2mI/O misuse or command construction from untrusted input can be risky[0m
+
+[1;33m[1m• std::fs usage (general inventory)[0m
+  [0;34mℹ Info[0m [1;37m(59 found)[0m
+    [0;34mstd::fs operations present - consider async equivalents where applicable[0m
+
+[1;33m[1m• std::process::Command usage[0m
+  [0;34mℹ Info[0m [1;37m(1 found)[0m
+    [0;34mCommand::new detected - ensure args are sanitized and errors handled[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_store.rs:668:21 [rule:rust.filesystem.command-new][0m
+[1;37m                          std::process::Command::new(std::env::current_exe().map_err(to_string)?)[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m8. SECURITY FINDINGS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: TLS verification disabled, weak hash algos, security-sensitive non-crypto randomness, timing-unsafe secret comparisons, JWT verification bypasses, shell command injection, request-derived response headers/open redirects/host-header absolute URLs/outbound URLs/SQL/regex, unbounded request body reads, credentialed CORS, HTTP URLs, secrets[0m
+[2mSecurity misconfigurations can lead to credential leaks, command injection, and MITM attacks[0m
+
+[1;33m[1m• Weak hash algorithms (MD5/SHA1)[0m
+  [0;32m✓ OK[0m [2mNo MD5/SHA1 found[0m
+
+[1;33m[1m• TLS verification disabled[0m
+
+[1;33m[1m• Security-sensitive non-crypto randomness[0m
+  [0;32m✓ OK[0m [2mNo security-sensitive non-crypto randomness detected[0m
+
+[1;33m[1m• Secret/token comparisons without timing-safe equality[0m
+  [0;32m✓ OK[0m [2mNo secret comparisons using ==/!= detected[0m
+
+[1;33m[1m• JWT decode, validation bypass, or missing claim binding[0m
+  [0;32m✓ OK[0m [2mNo JWT decode/validation bypass patterns detected[0m
+
+[1;33m[1m• Shell command execution through -c/-lc[0m
+  [0;32m✓ OK[0m [2mNo shell -c/-lc Command usage detected[0m
+
+[1;33m[1m• Command::new executable from untrusted-looking value[0m
+
+[1;33m[1m• Path join/push with untrusted-looking segment[0m
+  [1;33m⚠ Warning[0m [1;37m(1 found)[0m
+    [1;33mPath join/push with untrusted-looking segment[0m
+    [2mReject absolute paths and '..' components; canonicalize and verify the result stays under the intended root[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_store.rs:49:1 [rule:rust.security.path-traversal][0m
+[1;37m      let candidate = root.join(&candidate_name);[0m
+
+[1;33m[1m• Archive entry paths joined into extraction destination[0m
+
+[1;33m[1m• Predictable temp-file writes[0m
+
+[1;33m[1m• Request-derived open redirects[0m
+  [0;32m✓ OK[0m [2mNo request-derived open redirect sinks detected[0m
+
+[1;33m[1m• Host header used for absolute URL construction[0m
+  [0;32m✓ OK[0m [2mNo Host-header-derived absolute URL construction detected[0m
+
+[1;33m[1m• Request-derived response headers[0m
+  [0;32m✓ OK[0m [2mNo request-derived response header values detected[0m
+
+[1;33m[1m• Request-derived outbound HTTP URLs[0m
+  [0;32m✓ OK[0m [2mNo request-derived outbound HTTP URL sinks detected[0m
+
+[1;33m[1m• Request-derived SQL construction[0m
+  [0;32m✓ OK[0m [2mNo request-derived SQL construction sinks detected[0m
+
+[1;33m[1m• Request-controlled regex patterns[0m
+  [0;32m✓ OK[0m [2mNo request-controlled regex compilation detected[0m
+
+[1;33m[1m• Unbounded request body reads[0m
+  [0;32m✓ OK[0m [2mNo unbounded request body reads detected[0m
+
+[1;33m[1m• CORS credential policy[0m
+  [0;32m✓ OK[0m [2mNo unsafe CORS credential policy detected[0m
+
+[1;33m[1m• Plain http:// URLs[0m
+
+[1;33m[1m• Hardcoded secrets/credentials[0m
+  [0;32m✓ OK[0m [2mNo hardcoded secrets detected[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m9. CODE QUALITY MARKERS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: TODO, FIXME, HACK, NOTE[0m
+[2mTechnical debt markers indicate incomplete or problematic code[0m
+  [0;32m✓ OK[0m [2mNo TODO/FIXME/HACK markers found[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m10. MODULE & VISIBILITY ISSUES[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: pub use wildcards, glob imports, re-exports[0m
+[2mOverly broad visibility complicates API stability and encapsulation[0m
+
+[1;33m[1m• Wildcard imports (use crate::* or ::*)[0m
+  [0;34mℹ Info[0m [1;37m(2 found)[0m
+    [0;34mWildcard imports found; prefer explicit names[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/src/validation_broker/freshness.rs:414:9 [rule:rust.modules.wildcard-imports][0m
+[1;37m              use super::*;[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/src/validation_broker/doctor.rs:351:5 [rule:rust.modules.wildcard-imports][0m
+[1;37m          use super::*;[0m
+
+[1;33m[1m• pub use re-exports (inventory)[0m
+  [0;34mℹ Info[0m [1;37m(1 found)[0m
+    [0;34mpub use re-exports present - verify API surface[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m11. TESTS & BENCHES HYGIENE[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: ignored tests, todo! in tests, println!/dbg! in tests[0m
+[2mEnsure tests do not hide failures or produce noisy output[0m
+
+[1;33m[1m• #[ignore] tests[0m
+
+[1;33m[1m• todo!/unimplemented! in tests[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m15. API MISUSE (COMMON)[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: nth(0), DefaultHasher, expect_err/unwrap_err, Option::unwrap_or_default in hot paths[0m
+[2mCommon footguns and readability hazards[0m
+
+[1;33m[1m• std::collections::hash_map::DefaultHasher[0m
+
+[1;33m[1m• unwrap_err()/expect_err() usage inventory[0m
+
+[1;33m[1m• Option::unwrap_or_default inventory[0m
+  [0;34mℹ Info[0m [1;37m(3 found)[0m
+    [0;34munwrap_or_default present - validate default semantics[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m16. DOMAIN-SPECIFIC HEURISTICS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: reqwest builder, SQL string concatenation (heuristic), serde_json::from_str without context[0m
+[2mDomain patterns that often hint at bugs[0m
+
+[1;33m[1m• reqwest::ClientBuilder inventory[0m
+
+[1;33m[1m• serde_json::from_str without error context (heuristic)[0m
+  [0;34mℹ Info[0m [1;37m(1 found)[0m
+    [0;34mserde_json::from_str uses - ensure error context and validation[0m
+
+[1;33m[1m• SQL string concatenation (heuristic)[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m19. RESOURCE LIFECYCLE CORRELATION[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: std::thread::spawn without join, tokio::spawn without await, TcpStream without shutdown[0m
+[2mRust relies on explicit joins/shutdowns even with RAII—leaks create zombie work[0m
+
+[1;33m[1m• Resource lifecycle correlation[0m
+  [0;32m✓ OK[0m [2mAll tracked resource acquisitions have matching cleanups[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m20. ASYNC LOCKING ACROSS AWAIT[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: locks acquired in async fns and potentially held across await[0m
+[2mHolding locks across await can deadlock, starve tasks, and cause latency spikes; std::sync locks can block executor threads[0m
+
+[1;33m[1m• std::sync lock usage inside async fn (blocking risk)[0m
+  [0;32m✓ OK[0m [2mNo obvious std::sync lock usage inside async fns[0m
+
+[1;33m[1m• Potential std::sync guard held across await (heuristic)[0m
+
+[1;33m[1m• Potential async lock guard held across await (tokio/async locks heuristic)[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m21. PANIC SURFACES & UNWINDING[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: assert macros, direct indexing, unreachable_unchecked/unwrap_unchecked, panic/unwrap inside Drop[0m
+[2mPanics in destructors or UB hints can crash/abort in subtle ways; these can slip past linting depending on cfg/features[0m
+
+[1;33m[1m• assert!/assert_eq!/assert_ne! inventory[0m
+  [1;33m⚠ Warning[0m [1;37m(113 found)[0m
+    [1;33massert! macros present (panic surface)[0m
+    [2mIf these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_cli.rs:479:5 [rule:rust.panic.assert-macros][0m
+[1;37m          assert_eq!([0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_cli.rs:483:5 [rule:rust.panic.assert-macros][0m
+[1;37m          assert_eq!([0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_cli.rs:487:5 [rule:rust.panic.assert-macros][0m
+[1;37m          assert_eq!([0m
+
+[1;33m[1m• unreachable_unchecked / unwrap_unchecked[0m
+
+[1;33m[1m• direct indexing / slicing panic surfaces[0m
+
+[1;33m[1m• panic!/unwrap/expect inside Drop[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m22. SUSPICIOUS CASTS & TRUNCATION[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: pervasive `as` casts, try_into().unwrap, numeric narrowing patterns[0m
+[2m`as` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths[0m
+
+[1;33m[1m• `as` cast inventory[0m
+  [0;32m✓ OK[0m [2mNo obvious `as` casts detected[0m
+
+[1;33m[1m• len()/count() narrowed via `as`[0m
+
+[1;33m[1m• try_into().unwrap()/expect() (panic on conversion failure)[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m23. PARSING & VALIDATION ROBUSTNESS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: parse/from_str/env-var unwraps, decode unwraps, missing error context[0m
+[2mParsing and decoding failures often happen in prod on edge inputs; unwrap/expect turns them into panics[0m
+
+[1;33m[1m• parse::<T>().unwrap()/expect()[0m
+
+[1;33m[1m• serde/toml deserialization unwrap()/expect()[0m
+
+[1;33m[1m• env::var(...).unwrap()/expect()[0m
+
+[0;36m[1m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;37m[1m24. PERF/DoS HOTSPOTS[0m
+[0;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+[0;35m[1m▓▓▓ Detects: regex compilation in loops, chars().nth(n), format!/allocations in loops[0m
+[2mSome perf pitfalls become DoS risks on large inputs or hot paths; these often evade linting in non-bench builds[0m
+
+[1;33m[1m• Regex::new occurrences and in-loop compilation[0m
+  [0;32m✓ OK[0m [2mNo regex::Regex::new detected[0m
+
+[1;33m[1m• chars().nth(n)/nth_back(n) (O(n))[0m
+
+[1;33m[1m• format!/to_string/allocations inside loops (heuristic)[0m
+  [1;33m⚠ Warning[0m [1;37m(42 found)[0m
+    [1;33mString allocation inside loop[0m
+    [2mConsider preallocating buffers, using write!, or restructuring to reduce allocations[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_store.rs:2263:1 [rule:rust.perf.string-alloc-in-loop][0m
+[1;37m      format!("saturated profile records {expected_failure}"),[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_cli.rs:743:1 [rule:rust.perf.string-alloc-in-loop][0m
+[1;37m      "id": format!("fixture_{}", fixture.replace(['/', '.'], "_")),[0m
+[0;90m      /workspace/scratch/b95c142b8b6d/validation-work/tests/validation_broker_cli.rs:744:1 [rule:rust.perf.string-alloc-in-loop][0m
+[1;37m      "path": path.display().to_string(),[0m
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. LINTS & STYLE (fmt/clippy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Runs: cargo fmt -- --check, cargo clippy
+Formatter and lints help maintain consistent style and catch many issues
+  ℹ Info (1 found)
+    Not evaluated: formatting (cargo fmt --check) and lints (cargo clippy)
+    cargo phases skipped: no Cargo.toml in scan root (targeted or shadow-workspace scan)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. BUILD HEALTH (check/test)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Runs: cargo check, cargo test --no-run
+Ensures the project compiles and tests build
+  ℹ Info (1 found)
+    Not evaluated: compilation (cargo check) and test build (cargo test --no-run)
+    cargo phases skipped: no Cargo.toml in scan root (targeted or shadow-workspace scan)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. DEPENDENCY HYGIENE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Runs: cargo audit, cargo deny check, cargo udeps, cargo outdated
+Keeps dependencies safe, minimal, and up-to-date
+  ℹ Info (1 found)
+    Not evaluated: dependency hygiene (cargo audit / deny / udeps / outdated)
+    cargo phases skipped: no Cargo.toml in scan root (targeted or shadow-workspace scan)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17. AST-GREP RULE PACK FINDINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠ ast-grep scan subcommand unavailable; rule-pack mode skipped.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+18. META STATISTICS & INVENTORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: crate counts, bin/lib targets, feature flags (Cargo.toml heuristic)
+High-level view of the project layout
+
+• Cargo.toml features (heuristic count)
+  ℹ Info (1 found)
+    No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)
+
+═══════════════════════════════════════════════════════════════════════════
+                    🎯 SCAN COMPLETE 🎯                                  
+═══════════════════════════════════════════════════════════════════════════
+
+Summary Statistics:
+  Files scanned:    6
+  Critical issues:  0
+  Warning issues:   162
+  Info items:       229
+
+Priority Actions:
+  ⚠ Review and fix WARNING items
+  These cause bugs, performance issues, or maintenance problems
+  ℹ Consider INFO suggestions
+  Code quality improvements and best practices
+
+Scan completed at: 2026-11-05T22:16:10Z
+
+Tip: Run with -v/--verbose for more code samples per finding.
+Add to CI: ./ubs --ci --fail-on-warning . > rust-bug-scan.txt
+
+
+──────── Combined Summary ────────
+Files: 6
+Critical: 0
+Warning: 162
+Info: 229
+

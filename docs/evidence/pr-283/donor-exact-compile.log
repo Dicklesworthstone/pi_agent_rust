@@ -1,0 +1,155 @@
+   Compiling libc v0.2.190
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling dirs-sys v0.5.0
+   Compiling serde_derive v1.0.229
+   Compiling getrandom v0.4.3
+   Compiling tempfile v3.27.0
+   Compiling serde v1.0.229
+   Compiling tracing-attributes v0.1.31
+   Compiling dirs v7.0.0
+   Compiling tracing v0.1.44
+   Compiling pi_undo_qualification v0.0.0 (/workspace/scratch/b95c142b8b6d/qualification-tools/donor-harness)
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied
+  --> source/undo/journal.rs:96:41
+   |
+96 |         let name = format!("{:x}.json", sha2::Sha256::digest(session_id.as_bytes()));
+   |                             ----        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`
+   |                             |
+   |                             required by this formatting parameter
+   |
+   = help: the following other types implement trait `LowerHex`:
+             &T
+             &mut T
+             Access
+             AtFlags
+             CreateFlags
+             DupFlags
+             FallocateFlags
+             FdFlags
+           and 75 others
+   = note: the full name for the type has been written to '/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_undo_qualification/4aecd5608ea9cc86/out/pi_undo_qualification-4aecd5608ea9cc86.long-type-10001897360874165147.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied
+  --> source/undo/journal.rs:96:41
+   |
+96 |         let name = format!("{:x}.json", sha2::Sha256::digest(session_id.as_bytes()));
+   |                             ----        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`
+   |                             |
+   |                             required by this formatting parameter
+   |
+   = help: the following other types implement trait `LowerHex`:
+             &T
+             &mut T
+             Access
+             AtFlags
+             CreateFlags
+             DupFlags
+             FallocateFlags
+             FdFlags
+           and 75 others
+   = note: the full name for the type has been written to '/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_undo_qualification/efeaa8481c48427f/out/pi_undo_qualification-efeaa8481c48427f.long-type-13844593099163274939.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied
+   --> source/undo/journal.rs:136:55
+    |
+136 |                 if envelope.sha256 != format!("{:x}", sha2::Sha256::digest(envelope.payload.as_bytes())) {
+    |                                                ----   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`
+    |                                                |
+    |                                                required by this formatting parameter
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              Access
+              AtFlags
+              CreateFlags
+              DupFlags
+              FallocateFlags
+              FdFlags
+            and 75 others
+    = note: the full name for the type has been written to '/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_undo_qualification/efeaa8481c48427f/out/pi_undo_qualification-efeaa8481c48427f.long-type-13844593099163274939.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied
+   --> source/undo/journal.rs:136:55
+    |
+136 |                 if envelope.sha256 != format!("{:x}", sha2::Sha256::digest(envelope.payload.as_bytes())) {
+    |                                                ----   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`
+    |                                                |
+    |                                                required by this formatting parameter
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              Access
+              AtFlags
+              CreateFlags
+              DupFlags
+              FallocateFlags
+              FdFlags
+            and 75 others
+    = note: the full name for the type has been written to '/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_undo_qualification/4aecd5608ea9cc86/out/pi_undo_qualification-4aecd5608ea9cc86.long-type-10001897360874165147.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: no method named `is_err_or` found for enum `Result<T, E>` in the current scope
+   --> source/undo/journal.rs:180:63
+    |
+180 | ...                   || capture_parent(&file.path).is_err_or(|current| current != *parent)
+    |                                                     ^^^^^^^^^
+    |
+help: there is a method `is_err` with a similar name, but with different arguments
+   --> /workspace/scratch/c82c6a5fc7a5/toolchain/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:647:5
+    |
+647 |     pub const fn is_err(&self) -> bool {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied
+   --> source/undo/journal.rs:243:58
+    |
+243 |         let envelope = Envelope { sha256:format!("{:x}", sha2::Sha256::digest(payload.as_bytes())),payload };
+    |                                                   ----   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`
+    |                                                   |
+    |                                                   required by this formatting parameter
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              Access
+              AtFlags
+              CreateFlags
+              DupFlags
+              FallocateFlags
+              FdFlags
+            and 75 others
+    = note: the full name for the type has been written to '/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_undo_qualification/efeaa8481c48427f/out/pi_undo_qualification-efeaa8481c48427f.long-type-13844593099163274939.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0277]: the trait bound `Array<u8, UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>>: LowerHex` is not satisfied
+   --> source/undo/journal.rs:243:58
+    |
+243 |         let envelope = Envelope { sha256:format!("{:x}", sha2::Sha256::digest(payload.as_bytes())),payload };
+    |                                                   ----   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `LowerHex` is not implemented for `Array<u8, UInt<UInt<UInt<UInt<UInt<_, B0>, B0>, B0>, B0>, B0>>`
+    |                                                   |
+    |                                                   required by this formatting parameter
+    |
+    = help: the following other types implement trait `LowerHex`:
+              &T
+              &mut T
+              Access
+              AtFlags
+              CreateFlags
+              DupFlags
+              FallocateFlags
+              FdFlags
+            and 75 others
+    = note: the full name for the type has been written to '/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_undo_qualification/4aecd5608ea9cc86/out/pi_undo_qualification-4aecd5608ea9cc86.long-type-10001897360874165147.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+Some errors have detailed explanations: E0277, E0599.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `pi_undo_qualification` (lib test) due to 4 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `pi_undo_qualification` (lib) due to 4 previous errors

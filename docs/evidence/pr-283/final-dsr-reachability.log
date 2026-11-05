@@ -1,0 +1,30 @@
+# dsr quality check
+# argv: python3 scripts/check_module_reachability.py
+# cwd: /workspace/scratch/b95c142b8b6d/pi_agent_rust
+# env: PATH=/workspace/scratch/b95c142b8b6d/qualification-tools/bin:/workspace/scratch/b95c142b8b6d/qualification-tools/doodlestein_self_releaser:/workspace/scratch/c82c6a5fc7a5/toolchain/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin:/root/.codex/tmp/arg0-linux/codex-arg0JcnAKf:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/b95c142b8b6d/qualification-tools/logs/dsr-quality/pi_agent_rust/20261105T172604-26
+# env: DSR_REPOS_FILE=/workspace/scratch/b95c142b8b6d/pi_agent_rust/.dsr/repos.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1793917563-26
+# env: CARGO_HOME=/workspace/scratch/b95c142b8b6d/qualification-tools/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31
+# env: RUSTUP_HOME=/workspace/scratch/c82c6a5fc7a5/toolchain/rustup
+# env: CARGO_HTTP_USER_AGENT=pi_agent_rust-agent (+https://github.com/Dicklesworthstone/pi_agent_rust)
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/b95c142b8b6d/qualification-tools/logs/dsr-quality
+# started_monotonic_ms: 5224344
+# ----
+
+UNREACHABLE MODULES: declared `pub mod` in src/lib.rs with no non-test
+call site anywhere in src/.
+  - web_remote: nothing references it
+
+A module no shipped code calls is not a shipped feature. Either:
+  1. land the call site that makes it reachable, or
+  2. add it to ALLOWLIST in this script with a real reason.
+
+Do NOT delete a module to satisfy this gate -- AGENTS.md Rule 1 forbids
+file deletion without the owner's written permission.
+Module reachability: 153 declared, 149 reachable, 3 allowlisted, 1 unreachable.
+# exit_code: 1

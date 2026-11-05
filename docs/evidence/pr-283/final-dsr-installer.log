@@ -1,0 +1,98 @@
+# dsr quality check
+# argv: bash tests/installer_regression.sh
+# cwd: /workspace/scratch/b95c142b8b6d/pi_agent_rust
+# env: PATH=/workspace/scratch/b95c142b8b6d/qualification-tools/bin:/workspace/scratch/b95c142b8b6d/qualification-tools/doodlestein_self_releaser:/workspace/scratch/c82c6a5fc7a5/toolchain/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin:/root/.codex/tmp/arg0-linux/codex-arg0JcnAKf:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/b95c142b8b6d/qualification-tools/logs/dsr-quality/pi_agent_rust/20261105T172604-26
+# env: DSR_REPOS_FILE=/workspace/scratch/b95c142b8b6d/pi_agent_rust/.dsr/repos.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1793917563-26
+# env: CARGO_HOME=/workspace/scratch/b95c142b8b6d/qualification-tools/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31
+# env: RUSTUP_HOME=/workspace/scratch/c82c6a5fc7a5/toolchain/rustup
+# env: CARGO_HTTP_USER_AGENT=pi_agent_rust-agent (+https://github.com/Dicklesworthstone/pi_agent_rust)
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/b95c142b8b6d/qualification-tools/logs/dsr-quality
+# started_monotonic_ms: 5122890
+# ----
+[PASS] test_installer_regexes_avoid_interval_expressions
+[PASS] test_help_lists_installer_flags
+[PASS] test_release_publish_no_verify_is_secret_scoped
+[PASS] test_installer_retain_temp_mode_preserves_owned_scratch
+[PASS] test_stale_lock_recovery_preserves_the_old_lock_receipt
+[PASS] test_lock_override_rejects_ambiguous_lexical_paths
+[PASS] test_installer_harness_isolates_inherited_lock_settings
+[PASS] test_installer_harness_isolates_inherited_codex_home
+[PASS] test_active_lock_is_not_recovered
+[PASS] test_skill_smoke_script_passes
+[PASS] test_invalid_completions_value_fails
+[PASS] test_unknown_option_fails
+[PASS] test_missing_option_value_fails
+[PASS] test_missing_option_value_when_next_arg_is_flag_fails
+[PASS] test_custom_artifact_download_failure_does_not_source_fallback_without_version
+[PASS] test_offline_tarball_mode_installs_local_artifact
+[PASS] test_offline_mode_blocks_network_artifact_urls
+[PASS] test_offline_relative_tarball_path_is_accepted
+[PASS] test_proxy_args_are_applied_to_curl_downloads
+[PASS] test_linux_target_uses_supported_linux_artifact_naming
+[PASS] test_release_binary_needing_newer_glibc_is_not_installed
+[PASS] test_release_binary_needing_newer_glibc_custom_artifact_has_no_source_fallback
+[PASS] test_glibc_guard_ignores_unrelated_startup_failures
+[PASS] test_glibc_guard_only_applies_on_linux
+[PASS] test_probe_timeout_with_broken_wrapper_preserves_existing_install
+[PASS] test_missing_interpreter_child127_falls_back_with_distinct_diagnostic
+[PASS] test_glibcxx_only_diagnostic_names_component
+[PASS] test_cxxabi_only_diagnostic_names_component
+[PASS] test_rosetta_prefers_arm64_artifact_naming
+[PASS] test_wsl_detection_warning_is_emitted
+[PASS] test_installer_creates_rpi_alias_when_available
+[PASS] test_installer_skips_rpi_alias_when_existing_command_present
+[PASS] test_legacy_agent_settings_cleanup_is_safe_and_idempotent
+[PASS] test_legacy_cleanup_skips_unexpected_settings_paths
+[PASS] test_agent_skills_install_by_default
+[PASS] test_agent_skill_install_ignores_shadow_pwd_skill
+[PASS] test_no_agent_skills_opt_out
+[PASS] test_existing_custom_skill_dirs_are_not_overwritten
+[PASS] test_skill_copy_failure_preserves_existing_managed_skills
+[PASS] test_skill_custom_plus_copy_failure_reports_partial
+[PASS] test_uninstall_removes_only_installer_managed_skills
+[PASS] test_uninstall_removes_recorded_rpi_alias
+[PASS] test_uninstall_cleans_legacy_agent_settings_hooks
+[PASS] test_uninstall_uses_recorded_skill_paths
+[PASS] test_uninstall_skips_unexpected_skill_paths
+[PASS] test_checksum_inline_success
+[PASS] test_checksum_mismatch_fails_hard
+[PASS] test_checksum_missing_manifest_entry_fails_hard
+[PASS] test_local_checksum_copy_failure_fails_closed
+[PASS] test_release_install_uses_dsr_asset_sidecar_when_manifest_absent
+skipping: this host has an xz program on the sandbox PATH
+[SKIP] test_release_install_extracts_tar_xz_without_an_xz_program
+[PASS] test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent
+[PASS] test_release_install_without_any_checksum_fails_closed
+[PASS] test_release_install_rejects_wrong_dsr_asset_sidecar
+[PASS] test_release_install_rejects_misbound_dsr_sidecar_without_legacy_fallback
+[PASS] test_release_install_does_not_downgrade_on_sidecar_transport_failure
+[PASS] test_release_install_does_not_downgrade_on_artifact_transport_failure
+[PASS] test_release_install_distinguishes_manifest_transport_failure_from_absence
+[PASS] test_release_install_rejects_checksum_verified_broken_canonical_archive
+[PASS] test_sigstore_bundle_unavailable_soft_skip
+[PASS] test_explicit_sigstore_bundle_without_cosign_fails_closed
+[PASS] test_explicit_sigstore_bundle_fetch_failure_fails_closed
+[PASS] test_sigstore_bundle_without_identity_policy_fails_closed
+[PASS] test_sigstore_cosign_failure_fails_hard
+[PASS] test_sigstore_cosign_success
+[PASS] test_completions_unsupported_build_soft_skip
+[PASS] test_completions_generation_failure_recorded
+[PASS] test_completions_success_writes_file
+[PASS] test_completions_help_discovery_path_succeeds
+[PASS] test_completions_help_inconclusive_falls_back_to_probe
+[PASS] test_completions_help_conclusive_no_command_skips_fast
+[PASS] test_completions_internal_timeout_fallback_succeeds
+[PASS] test_completions_probe_timeout_is_non_fatal
+[PASS] test_completions_generation_timeout_is_non_fatal
+
+work dir: /tmp/pi-installer-regression-20261105T222738Z-218
+passed:   73
+failed:   0
+skipped:  1
+# exit_code: 0

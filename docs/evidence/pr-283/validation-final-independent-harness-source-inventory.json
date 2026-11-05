@@ -1,0 +1,14 @@
+{
+  "source_checkout": "/workspace/scratch/b95c142b8b6d/validation-work",
+  "surface": "validation",
+  "source_files_sha256": {
+    "src/validation_broker.rs": "227b6b332b899984d9a8125245517c0e080c1ceb6154c2efd10a8ada0c70b4ef",
+    "src/validation_broker/doctor.rs": "b2a93bc157c7e54756fd8d19a07bb23a2f745ebf540b291f803fb5852114110e",
+    "src/validation_broker/freshness.rs": "7d2ab54c657ab444b3f8bb02bb38af556f180b831d7ce6e8e4e5ac163bb8ad44",
+    "tests/validation_broker_store.rs": "74aeb8da216579b643bf0ef386e88afff5c59a14bb5e8da6f25675e9276eae9a"
+  },
+  "source_lock_sha256": "265dc436906f1ac109edf4ab9878a40d66e0e742b95daf14ea29899d757e59e5",
+  "toolchain_sha256": "5d2179aa7bc3a1f550d40c10e37c5419428aca0faa05947f468dcfccbb2db24b",
+  "fixture_note": "tests/docs are links to the fixed source checkout",
+  "scope": "Exact source module diagnostics with explicit Config/Error adapters; not full Pi or DSR qualification"
+}

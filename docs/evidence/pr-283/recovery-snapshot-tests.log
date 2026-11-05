@@ -1,0 +1,87 @@
+   Compiling pi_core_diagnostic v0.0.0 (/workspace/scratch/b95c142b8b6d/qualification-tools/recovery-snapshot-harness)
+    Finished `test` profile [unoptimized] target(s) in 2m 24s
+     Running unittests source/lib.rs (target/debug/build/pi_core_diagnostic/7857378ea070ff81/out/pi-7857378ea070ff81)
+
+running 60 tests
+test file_identity::tests::a_directory_has_an_identity_too ... ok
+test file_identity::tests::a_same_name_replacement_is_a_different_file ... ok
+test file_identity::tests::a_file_matches_itself_through_both_constructors ... ok
+test file_identity::tests::a_missing_path_reports_not_found ... ok
+test file_identity::tests::two_distinct_files_do_not_share_an_identity ... ok
+test undo::journal::tests::edits_outside_the_original_roots_do_not_claim_durability ... ok
+test undo::journal::tests::journal_directory_must_be_private_even_when_it_already_exists ... ok
+test undo::journal::tests::interrupted_restore_and_wrong_session_fail_closed ... ok
+test undo::journal::tests::journal_failure_is_visible_and_blocks_restore ... ok
+test undo::journal::tests::excessive_files_cannot_overwrite_the_last_recoverable_snapshot ... ok
+test undo::journal::tests::linked_journal_or_lock_never_follows_or_overwrites_its_target ... ok
+test undo::journal::tests::oversized_commit_preserves_a_loadable_gap_instead_of_unloadable_success ... ok
+test undo::journal::tests::abrupt_process_exit_during_restore_preserves_the_partial_state_for_inspection ... ok
+test undo::journal::tests::checksum_blob_and_path_corruption_are_preserved_without_replay ... ok
+test undo::journal::tests::journal_lease_excludes_another_process_and_is_released_on_exit ... ok
+test undo::journal::tests::pending_creation_with_missing_parent_reopens_as_a_gap ... FAILED
+test undo::journal::tests::persisted_journal_child_process ... ok
+test undo::journal::tests::pending_edits_and_corrupt_journals_never_replay ... ok
+test undo::journal::tests::abrupt_process_exit_during_an_edit_blocks_undo_and_old_redo ... ok
+test undo::journal::tests::failed_durable_intent_refuses_the_write_and_preserves_restart_history ... ok
+test undo::journal::tests::removed_parent_reopens_history_as_a_gap_without_disabling_journal ... ok
+test undo::journal::tests::replaced_journal_directory_is_never_a_publication_destination ... ok
+test undo::journal::tests::replaced_snapshot_is_preserved_and_disables_the_existing_writer ... ok
+test undo::journal::tests::replaced_parent_is_not_blessed_when_loading_history ... ok
+test undo::journal::tests::session_recovery_failure_disables_replay_without_overwriting_journal ... ok
+test undo::journal::tests::replaced_lock_stops_the_old_writer_without_touching_new_history ... ok
+test undo::journal::tests::substituted_ancestor_never_enters_the_persisted_post_snapshot ... ok
+test undo::tests::abort_discards_pending_unit ... ok
+test undo::tests::absent_target_publication_never_overwrites_a_late_creator ... ok
+test undo::journal::tests::restart_keeps_canonical_parent_when_recording_through_alias ... ok
+test undo::journal::tests::persisted_maximum_counters_saturate_instead_of_panicking ... ok
+test undo::tests::blob_dedup_shares_identical_content ... ok
+test undo::tests::bounded_snapshot_reads_only_one_sentinel_byte ... ok
+test undo::tests::changed_parent_directory_blocks_replay_even_with_matching_bytes ... ok
+test undo::tests::atomic_restore_does_not_modify_an_unrelated_hard_link ... ok
+test undo::journal::tests::abrupt_process_exit_recovers_committed_and_undone_history ... ok
+test undo::tests::directories_are_unrecorded_instead_of_read_as_files ... ok
+test undo::tests::atomic_restore_preserves_existing_file_permissions ... ok
+test undo::tests::eviction_drops_oldest_units_and_counts ... ok
+test undo::tests::missing_blob_never_becomes_an_empty_restored_file ... ok
+test undo::tests::dangling_symlink_is_not_an_absent_redo_target ... ok
+test undo::journal::tests::workspace_sync_failure_keeps_restore_intent_and_prevents_restart_replay ... ok
+test undo::tests::multi_file_units_evict_before_journal_file_count_limit ... ok
+test undo::tests::oversized_pre_snapshot_blocks_undo_even_when_forced ... ok
+test undo::tests::external_change_blocks_undo_unless_forced ... ok
+test undo::tests::new_mutation_clears_redo_stack ... ok
+test undo::tests::newly_created_parent_can_be_recorded_after_the_tool_write ... ok
+test undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them ... FAILED
+test undo::tests::snapshots_stay_with_the_held_parent_after_ancestor_substitution ... ok
+test undo::journal::tests::separate_sessions_preserve_each_others_external_change_guard ... ok
+test undo::tests::multi_step_undo_is_lifo ... ok
+test undo::tests::replacement_symlink_is_not_followed_even_with_force ... ok
+test undo::journal::tests::partial_abort_is_a_persisted_gap_while_complete_rollback_is_discarded ... ok
+test undo::journal::tests::restart_restores_history_and_conflict_checks ... ok
+test undo::tests::unsafe_later_path_is_rejected_before_any_file_is_restored ... ok
+test undo::tests::pending_mutation_blocks_replay_until_it_is_completed ... ok
+test undo::tests::undo_of_file_creation_removes_and_redo_recreates ... ok
+test undo::tests::undo_and_redo_round_trip_an_edit ... ok
+test undo::tests::staging_publication_cannot_be_redirected_by_replacing_the_parent ... ok
+test undo::tests::unit_count_eviction_prevents_small_edit_journal_exhaustion ... ok
+
+failures:
+
+---- undo::journal::tests::pending_creation_with_missing_parent_reopens_as_a_gap stdout ----
+
+thread 'undo::journal::tests::pending_creation_with_missing_parent_reopens_as_a_gap' (90) panicked at source/undo/journal.rs:684:18:
+called `Result::unwrap()` on an `Err` value: Kind(WouldBlock)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them stdout ----
+
+thread 'undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them' (127) panicked at source/undo.rs:1682:53:
+socket: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+
+
+failures:
+    undo::journal::tests::pending_creation_with_missing_parent_reopens_as_a_gap
+    undo::tests::snapshot_rejects_symlinks_and_sockets_without_following_them
+
+test result: FAILED. 58 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.68s
+
+error: test failed, to rerun pass `--lib`

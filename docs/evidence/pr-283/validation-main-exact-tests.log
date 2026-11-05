@@ -1,0 +1,52 @@
+   Compiling pi_validation_qualification v0.0.0 (/workspace/scratch/b95c142b8b6d/qualification-tools/validation-main-harness)
+    Finished `test` profile [unoptimized] target(s) in 1m 12s
+     Running validation_broker_store.rs (/workspace/scratch/b95c142b8b6d/qualification-tools/target/debug/build/pi_validation_qualification/554b7187c04afc50/out/validation_broker_store-554b7187c04afc50)
+
+running 22 tests
+test admission_does_not_coalesce_non_equivalent_git_or_target ... ok
+test admission_denies_required_rch_gate_on_local_fallback ... ok
+test admission_allows_when_capacity_and_sources_are_healthy ... ok
+test admission_recovers_stale_slots_and_stale_beads ... ok
+test admission_refuses_required_reuse_when_no_valid_artifact_exists ... ok
+test admission_waits_or_narrows_under_rch_and_scratch_backpressure ... ok
+test admission_priority_or_age_overrides_soft_broad_gate_backpressure ... ok
+test admission_coalesces_reusable_and_waits_for_active_slots ... ok
+test beads_normalizer_detects_stale_in_progress_work ... ok
+test malformed_records_degrade_snapshot_but_keep_valid_history ... ok
+test rch_saturation_and_local_fallback_are_explicit_inputs ... ok
+test persisted_reusable_evidence_obeys_exact_freshness_boundaries ... FAILED
+test lease_store_acquires_renews_releases_and_appends_records ... ok
+test invalid_lease_timestamp_order_degrades_persisted_history ... FAILED
+test rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence ... FAILED
+test reusable_slots_require_matching_provenance_for_coalescing ... ok
+test unavailable_store_loads_as_read_only_degraded_snapshot ... ok
+test stale_detection_requires_expiry_and_explicit_reason ... FAILED
+test source_normalizers_build_available_input_snapshot ... ok
+test source_normalizers_make_missing_and_unavailable_inputs_degraded ... ok
+test validation_broker_large_host_stress_budget_evidence_is_fail_closed ... ok
+test validation_broker_fault_corpus_covers_build_storm_and_stale_recovery ... ok
+
+failures:
+
+---- persisted_reusable_evidence_obeys_exact_freshness_boundaries stdout ----
+Error: "persisted evidence respects future, fractional, and expiry boundaries"
+
+---- invalid_lease_timestamp_order_degrades_persisted_history stdout ----
+Error: "invalid timestamp order degrades store"
+
+---- rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence stdout ----
+Error: "failed reuse leaves lease unchanged"
+
+---- stale_detection_requires_expiry_and_explicit_reason stdout ----
+Error: "lease expires at its exact deadline"
+
+
+failures:
+    invalid_lease_timestamp_order_degrades_persisted_history
+    persisted_reusable_evidence_obeys_exact_freshness_boundaries
+    rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence
+    stale_detection_requires_expiry_and_explicit_reason
+
+test result: FAILED. 18 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `--test validation_broker_store`

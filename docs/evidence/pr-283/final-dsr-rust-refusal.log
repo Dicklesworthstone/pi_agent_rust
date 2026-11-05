@@ -1,0 +1,34 @@
+# dsr quality check
+# argv: RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets
+# cwd: /workspace/scratch/b95c142b8b6d/pi_agent_rust
+# env: PATH=/workspace/scratch/b95c142b8b6d/qualification-tools/bin:/workspace/scratch/b95c142b8b6d/qualification-tools/doodlestein_self_releaser:/workspace/scratch/c82c6a5fc7a5/toolchain/rustup/toolchains/nightly-2026-08-31-x86_64-unknown-linux-gnu/bin:/root/.codex/tmp/arg0-linux/codex-arg0JcnAKf:/opt/codex/codex-path:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/override:/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/node/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/codex/runtimes/codex-primary-runtime/dependencies/bin/fallback
+# env: DSR_QUALITY_RUN_DIR=/workspace/scratch/b95c142b8b6d/qualification-tools/logs/dsr-quality/pi_agent_rust/20261105T172604-26
+# env: DSR_REPOS_FILE=/workspace/scratch/b95c142b8b6d/pi_agent_rust/.dsr/repos.yaml
+# env: DSR_CURRENT_CMD=quality
+# env: DSR_CURRENT_HOST=
+# env: DSR_RUN_ID=run-1793917563-26
+# env: CARGO_HOME=/workspace/scratch/b95c142b8b6d/qualification-tools/cargo
+# env: RUSTUP_TOOLCHAIN=nightly-2026-08-31
+# env: RUSTUP_HOME=/workspace/scratch/c82c6a5fc7a5/toolchain/rustup
+# env: CARGO_HTTP_USER_AGENT=pi_agent_rust-agent (+https://github.com/Dicklesworthstone/pi_agent_rust)
+# env: DSR_CURRENT_TOOL=
+# env: DSR_QUALITY_LOG_DIR=/workspace/scratch/b95c142b8b6d/qualification-tools/logs/dsr-quality
+# started_monotonic_ms: 5113283
+# ----
+  [2m2026-11-05T22:27:29.152317Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mFailed to query daemon: Daemon socket not found at /root/.cache/rch/rch.sock, attempting recovery[0m
+    [2;3mat[0m rch/src/hook.rs:5258 [2;3mon[0m ThreadId(1)
+
+  [2m2026-11-05T22:27:29.156300Z[0m [33m WARN[0m [1;33mrch::hook::incident[0m[33m: [33mhook incident recorded, [1;33mreason_code[0m[33m: RCH-I010, [1;33mfailure_class[0m[33m: "daemon socket refused", [1;33mselected_mode[0m[33m: Local, [1;33mlocal_fallback_allowed[0m[33m: false[0m
+    [2;3mat[0m rch/src/hook.rs:3182 [2;3mon[0m ThreadId(1)
+
+  [2m2026-11-05T22:27:29.157578Z[0m [32m INFO[0m [1;32mrch::hook::auto_start[0m[32m: [32mDaemon unavailable, attempting recovery[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:502 [2;3mon[0m ThreadId(1)
+
+  [2m2026-11-05T22:27:29.158986Z[0m [32m INFO[0m [1;32mrch::hook::auto_start_lock[0m[32m: [32mdoctor.autostart_lock.acquired, [1;32mpath[0m[32m: /tmp/rch-autostart-0/startup.lock, [1;32mpid[0m[32m: 143[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:286 [2;3mon[0m ThreadId(1)
+
+  [2m2026-11-05T22:27:29.159130Z[0m [32m INFO[0m [1;32mrch::hook::auto_start[0m[32m: [32mSpawning rchd, [1;32mbinary[0m[32m: /workspace/scratch/b95c142b8b6d/qualification-tools/bin/rchd, [1;32msocket[0m[32m: /root/.cache/rch/rch.sock[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:469 [2;3mon[0m ThreadId(1)
+
+[RCH] remote required; refusing local fallback (daemon unavailable) — retryable
+# exit_code: 103

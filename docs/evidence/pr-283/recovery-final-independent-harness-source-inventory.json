@@ -1,0 +1,13 @@
+{
+  "source_checkout": "/workspace/scratch/b95c142b8b6d/recovery-work",
+  "surface": "undo",
+  "source_files_sha256": {
+    "src/undo.rs": "fb270019523df8941bcfbb16eb0738eca7b1567084df186cf14e7ae30c08071a",
+    "src/file_identity.rs": "74cc117c0ee61beb3a4ea801a6b084a318dce6731430322a312f90efda4013a9",
+    "src/undo/journal.rs": "b510e13314ddabe649d39c36e9fbce8d96f2399a3cb3caf9c5db7f0f6e7c3307"
+  },
+  "source_lock_sha256": "265dc436906f1ac109edf4ab9878a40d66e0e742b95daf14ea29899d757e59e5",
+  "toolchain_sha256": "5d2179aa7bc3a1f550d40c10e37c5419428aca0faa05947f468dcfccbb2db24b",
+  "fixture_note": "No external fixtures",
+  "scope": "Exact source module diagnostics with explicit Config/Error adapters; not full Pi or DSR qualification"
+}

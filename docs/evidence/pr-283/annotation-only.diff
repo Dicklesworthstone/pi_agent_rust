@@ -1,0 +1,280 @@
+--- src/undo.rs executed
++++ src/undo.rs annotated
+@@ -294,7 +294,7 @@
+             let _ = parent;
+             let directory = directory.try_clone()?;
+             for _ in 0..16 {
+-                let name = std::ffi::OsString::from(format!(
++                let name /* ubs:ignore 16 collision retries */ = std::ffi::OsString::from(format!(
+                     ".pi-undo-{}.pending",
+                     uuid::Uuid::new_v4().simple(),
+                 ));
+@@ -448,7 +448,7 @@
+     #[cfg(unix)]
+     let content = read_snapshot_in_directory(&directory, name)?;
+     #[cfg(not(unix))]
+-    let content = read_snapshot_by_path(&parent.path.join(name))?;
++    let content = read_snapshot_by_path(&parent.path.join(name))?; // ubs:ignore file_name is one component under an identity-checked parent; durable journals are unsupported on this platform
+     validate_open_directory(&parent.path, &directory)?;
+     Ok(content)
+ }
+@@ -792,7 +792,7 @@
+         let path = if self.journal.is_some() {
+             parent
+                 .as_ref()
+-                .and_then(|parent| path.file_name().map(|name| parent.path.join(name)))
++                .and_then(|parent| path.file_name().map(|name| parent.path.join(name))) // ubs:ignore file_name is one component under the canonical captured parent; journal save independently enforces workspace roots
+                 .unwrap_or_else(|| {
+                     // Missing nested parents still need the canonical workspace prefix (notably on Windows).
+                     path.ancestors()
+@@ -870,7 +870,7 @@
+                     && let Some(parent) = &file.parent
+                     && let Some(name) = file.path.file_name()
+                 {
+-                    file.path = parent.path.join(name);
++                    file.path = parent.path.join(name); // ubs:ignore file_name is one component under the newly captured canonical parent; journal save independently enforces workspace roots
+                 }
+             }
+             file.post = capture_state(
+--- src/undo/journal.rs executed
++++ src/undo/journal.rs annotated
+@@ -743,7 +743,7 @@
+         let recorder =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+-        let mut inner = recorder.inner.lock().unwrap();
++        let mut inner = recorder.inner.lock().unwrap(); // ubs:ignore synchronous test fixture injects an oversized pending unit; poisoning must fail the test and no await occurs
+         assert!(recorder.persist(&mut inner, false));
+         let original = std::fs::read(&path).unwrap();
+         inner.pending.insert(
+@@ -774,7 +774,7 @@
+         let recorder =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+-        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore test synchronously persists its baseline; poisoned fixture state must fail the assertion
+         let original = std::fs::read(&path).unwrap();
+         assert!(
+             recorder
+@@ -796,7 +796,7 @@
+         let recorder =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+-        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous test seeds the journal for busy and scope rejection; no async boundary exists
+         let original = std::fs::read(&path).unwrap();
+         let busy =
+             FileMutationRecorder::open_session_journal(&path, "s", std::slice::from_ref(&root));
+@@ -825,7 +825,7 @@
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+         {
+-            let mut inner = recorder.inner.lock().unwrap();
++            let mut inner = recorder.inner.lock().unwrap(); // ubs:ignore synchronous test injects persisted restore intent; poisoning must fail this fixture and no await occurs
+             assert!(recorder.persist(&mut inner, true));
+         }
+         drop(recorder);
+@@ -974,7 +974,7 @@
+         let first =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+-        assert!(first.persist(&mut first.inner.lock().unwrap(), false));
++        assert!(first.persist(&mut first.inner.lock().unwrap(), false)); // ubs:ignore synchronous test seeds the first writer before lease replacement; poisoned fixture state must fail
+         std::fs::rename(path.with_extension("lock"), root.join("retired.lock")).unwrap();
+         let second =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+@@ -984,7 +984,7 @@
+         std::fs::write(&file, "second writer").unwrap();
+         second.commit("new");
+         let current = std::fs::read(&path).unwrap();
+-        assert!(!first.persist(&mut first.inner.lock().unwrap(), false));
++        assert!(!first.persist(&mut first.inner.lock().unwrap(), false)); // ubs:ignore synchronous test asserts the old writer cannot publish; no await occurs while the guard is held
+         assert!(first.stats().durability_error.is_some());
+         assert_eq!(std::fs::read(&path).unwrap(), current);
+         assert_eq!(second.undo(1, false).applied.len(), 1);
+@@ -1008,7 +1008,7 @@
+             let recorder =
+                 FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                     .unwrap();
+-            assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++            assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous test creates the original snapshot before parent substitution; poisoning must fail the fixture
+             let original = std::fs::read(&path).unwrap();
+             std::fs::rename(&parent, &original_parent).unwrap();
+             if symlink {
+@@ -1018,7 +1018,7 @@
+                 std::fs::create_dir(&parent).unwrap();
+             }
+             std::fs::write(&path, "unrelated replacement").unwrap();
+-            assert!(!recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++            assert!(!recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous test checks rejection of the substituted parent; guard never crosses an await
+             assert_eq!(
+                 std::fs::read_to_string(&path).unwrap(),
+                 "unrelated replacement"
+@@ -1049,14 +1049,14 @@
+         let recorder =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+-        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous permissions fixture creates its private baseline; poisoned state must fail the test
+         assert_eq!(
+             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+             0o600
+         );
+         let original = std::fs::read(&path).unwrap();
+         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+-        assert!(!recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++        assert!(!recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous test verifies rejection after permissions widen; no async boundary exists
+         assert_eq!(std::fs::read(&path).unwrap(), original);
+     }
+ 
+@@ -1105,14 +1105,14 @@
+         let recorder =
+             FileMutationRecorder::open_journal(&path, "s", std::slice::from_ref(&root), 1024)
+                 .unwrap();
+-        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++        assert!(recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous test seeds the snapshot before replacement; poisoning must fail this fixture
+         std::fs::rename(&path, root.join("original.json")).unwrap();
+         let mut replacement = tempfile::NamedTempFile::new_in(&root).unwrap();
+         replacement
+             .write_all(b"corrupt replacement for inspection")
+             .unwrap();
+         replacement.persist(&path).unwrap();
+-        assert!(!recorder.persist(&mut recorder.inner.lock().unwrap(), false));
++        assert!(!recorder.persist(&mut recorder.inner.lock().unwrap(), false)); // ubs:ignore synchronous test verifies replacement preservation; the mutex guard never crosses an await
+         assert_eq!(
+             std::fs::read_to_string(&path).unwrap(),
+             "corrupt replacement for inspection"
+@@ -1420,7 +1420,7 @@
+                 }
+             }
+             "restore_intent" => {
+-                let mut inner = recorder.inner.lock().unwrap();
++                let mut inner = recorder.inner.lock().unwrap(); // ubs:ignore synchronous child-process fixture injects partial restore state before deliberate exit; poisoned state must fail
+                 assert!(recorder.persist(&mut inner, true));
+                 let mutation = inner.undo_stack.last().unwrap().files[0].clone();
+                 restore_file(
+--- tests/validation_broker_store.rs executed
++++ tests/validation_broker_store.rs annotated
+@@ -82,12 +82,12 @@
+         schema: Some("test.v1".into()),
+     }];
+     for path in ["source.rs", "Cargo.toml", "Cargo.lock"] {
+-        let input = root.join(path);
++        let input = root.join(path); // ubs:ignore[rust.security.path-traversal] Only the three literal fixture filenames above enter this join.
+         std::fs::write(&input, b"original").map_err(to_string)?;
+-        let mut lease =
+-            ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
++        let mut lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES) // ubs:ignore[rust.collections.clone-in-loop] Each of three fixed regression cases needs independently owned lease input.
++            .map_err(to_string)?;
+         lease
+-            .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone())
++            .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()) // ubs:ignore[rust.collections.clone-in-loop] A one-item artifact fixture is consumed independently by each fixed case.
+             .map_err(to_string)?;
+         require(
+             lease
+@@ -104,7 +104,7 @@
+         )?;
+         require(
+             lease
+-                .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone())
++                .mark_reusable("SilentReef", HEARTBEAT, artifacts.clone()) // ubs:ignore[rust.collections.clone-in-loop] The ownership-taking failure path needs the same one-item fixture in each fixed case.
+                 .is_err(),
+             "changed during validation cannot become reusable",
+         )?;
+@@ -439,7 +439,7 @@
+             .map_err(to_string)?;
+         let snapshot = ValidationSlotStore::new(store.path()).load_snapshot();
+         let decision = decide_validation_admission(
+-            admission_context_for("active_without_identity", request.clone(), START, 4),
++            admission_context_for("active_without_identity", request.clone(), START, 4), // ubs:ignore[rust.collections.clone-in-loop] Two current/legacy fixtures each consume an independently owned admission request.
+             &healthy_inputs()?,
+             &snapshot,
+             &ValidationAdmissionPolicy::default(),
+@@ -466,7 +466,7 @@
+             ..ValidationAdmissionPolicy::default()
+         };
+         let decision = decide_validation_admission(
+-            admission_context_for("result_without_identity", request.clone(), START, 4),
++            admission_context_for("result_without_identity", request.clone(), START, 4), // ubs:ignore[rust.collections.clone-in-loop] Each of two persisted-result cases consumes an independent fixture request.
+             &healthy_inputs()?,
+             &store.load_snapshot(),
+             &policy,
+@@ -497,8 +497,8 @@
+     std::fs::write(root.join("src/input.rs"), "source").map_err(to_string)?;
+     for invalid in [root.clone(), root.join("src"), root.join("src/input.rs")] {
+         request.target_dir = invalid.to_string_lossy().into_owned();
+-        let lease =
+-            ValidationSlotLease::acquire(request.clone(), START, EXPIRES).map_err(to_string)?;
++        let lease = ValidationSlotLease::acquire(request.clone(), START, EXPIRES) // ubs:ignore[rust.collections.clone-in-loop] Three invalid-output cases each need an independently owned fixture request.
++            .map_err(to_string)?;
+         require(
+             lease.input_identity.is_none(),
+             "untrusted output exclusion refuses input capture",
+@@ -533,7 +533,7 @@
+         "local_fallback",
+         "eligible",
+     ] {
+-        let mut lease = reusable.clone();
++        let mut lease = reusable.clone(); // ubs:ignore[rust.collections.clone-in-loop] Seven scan-admission cases mutate independent copies of the baseline lease.
+         let mut inputs = healthy_inputs()?;
+         match scenario {
+             "active" => lease.state = ValidationSlotState::Active,
+@@ -556,7 +556,7 @@
+         )
+         .map_err(to_string)?;
+         let decision = decide_validation_admission(
+-            admission_context_for(scenario, request.clone(), START, 4),
++            admission_context_for(scenario, request.clone(), START, 4), // ubs:ignore[rust.collections.clone-in-loop] Each of seven scan-admission cases consumes its own fixture request.
+             &inputs,
+             &snapshot,
+             &ValidationAdmissionPolicy::default(),
+@@ -680,6 +680,7 @@
+                 require(
+                     output.status.success(),
+                     format!(
++                        // ubs:ignore[rust.perf.string-alloc-in-loop] At most six focused subprocess cases allocate their failure diagnostics.
+                         "PATH subprocess {stage} failed: {} {}",
+                         String::from_utf8_lossy(&output.stdout),
+                         String::from_utf8_lossy(&output.stderr)
+@@ -696,12 +697,12 @@
+     let workspace = WORKSPACE.get_or_init(|| {
+         let root = temp_root("fixture_workspace").expect("fixture workspace");
+         for name in ["rch", "cargo", "ubs", "rch.exe", "cargo.exe", "ubs.exe"] {
+-            std::fs::write(root.join(name), b"validation fixture executable")
++            std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the six literal fixture filenames above enter this join.
+                 .expect("fixture tool");
+             #[cfg(unix)]
+             {
+                 use std::os::unix::fs::PermissionsExt as _;
+-                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755))
++                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755)) // ubs:ignore[rust.security.path-traversal] The same six literal fixture filenames are chmodded inside their test directory.
+                     .expect("executable fixture tool");
+             }
+         }
+@@ -1715,7 +1716,7 @@
+         .renew("SilentReef", HEARTBEAT, EXPIRES)
+         .map_err(to_string)?;
+     for invalid in ["invalid", "2026-05-14T06:59:59Z", START] {
+-        let mut lease = original.clone();
++        let mut lease = original.clone(); // ubs:ignore[rust.collections.clone-in-loop] Three invalid timestamps must be applied to fresh copies of the baseline lease.
+         require(
+             lease.renew("SilentReef", invalid, EXPIRES).is_err(),
+             "invalid renewal heartbeat rejected",
+--- src/validation_broker/doctor.rs executed
++++ src/validation_broker/doctor.rs annotated
+@@ -661,13 +661,13 @@
+         let workspace = WORKSPACE.get_or_init(|| {
+             let root = tempfile::tempdir().expect("fixture workspace").keep();
+             for name in ["cargo", "cargo.exe"] {
+-                std::fs::write(root.join(name), b"validation fixture executable")
++                std::fs::write(root.join(name), b"validation fixture executable") // ubs:ignore[rust.security.path-traversal] Only the two literal fixture filenames above enter this join.
+                     .expect("fixture tool");
+                 #[cfg(unix)]
+                 {
+                     use std::os::unix::fs::PermissionsExt as _;
+                     std::fs::set_permissions(
+-                        root.join(name),
++                        root.join(name), // ubs:ignore[rust.security.path-traversal] The same two literal fixture filenames are chmodded inside their test directory.
+                         std::fs::Permissions::from_mode(0o755),
+                     )
+                     .expect("executable fixture tool");
