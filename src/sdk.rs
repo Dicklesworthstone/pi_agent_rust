@@ -4335,7 +4335,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     } else if options.no_session || cli.builtin_tools_disabled() {
         Arc::default()
     } else {
-        let roots = workspace.as_ref().map_or_else(|| vec![cwd.clone()], |workspace| workspace.roots());
+        let roots = workspace.as_ref().map_or_else(
+            || vec![cwd.clone()],
+            |workspace| workspace.snapshot_or(&cwd).all(),
+        );
         Arc::new(crate::undo::FileMutationRecorder::for_session(&session.header.id, &roots)?)
     };
     let factory_context = ToolFactoryContext {
