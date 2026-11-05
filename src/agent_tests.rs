@@ -7272,6 +7272,162 @@ mod tests {
     }
 
     #[test]
+    fn manual_snapcompact_survives_save_resume_and_reader_switches() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            for shake in [false, true] {
+                let directory = tempfile::tempdir().expect("session directory");
+                let mut original =
+                    Session::create_with_dir(Some(directory.path().to_path_buf()));
+                original.append_message(user_message("Inspect report.txt").into());
+                let mut tool_message = assistant_message("");
+                tool_message.content = vec![ContentBlock::ToolCall(ToolCall {
+                    id: "archive-read".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({"path": "report.txt"}),
+                    thought_signature: None,
+                })];
+                tool_message.stop_reason = StopReason::ToolUse;
+                original.append_message(crate::session::SessionMessage::Assistant {
+                    message: tool_message,
+                });
+                // The shake summary drops this bulky result, so only a retained
+                // archive can recover its exact fact for the next reader.
+                original.append_message(crate::session::SessionMessage::ToolResult {
+                    tool_call_id: "archive-read".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "ARCHIVE-ONLY-WREN-782\n{}",
+                        "ordinary archived detail ".repeat(40)
+                    )))],
+                    details: None,
+                    is_error: false,
+                    timestamp: Some(0),
+                });
+                original.append_message(user_message("retained recent turn").into());
+                original.save().await.expect("save original history");
+                let path = original.path.clone().expect("saved session path");
+                let session = Arc::new(Mutex::new(original));
+                let calls = Arc::new(StdTestMutex::new(Vec::new()));
+                let agent = Agent::new(
+                    Arc::new(PiAiCaptureProvider {
+                        calls: Arc::clone(&calls),
+                    }),
+                    ToolRegistry::new(&[], directory.path(), None),
+                    AgentConfig::default(),
+                );
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&session),
+                    true,
+                    ResolvedCompactionSettings {
+                        enabled: false,
+                        keep_recent_tokens: 1,
+                        render_mode: compaction::CompactionRenderMode::SnapCompact,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                );
+
+                let changed = if shake {
+                    agent_session.shake_now(|_| {}).await
+                } else {
+                    agent_session.compact_now(None, |_| {}).await
+                }
+                .expect("manual snapcompact");
+                assert!(changed, "manual compaction must install an archive");
+                assert_eq!(
+                    calls.lock().expect("summary requests").len(),
+                    usize::from(!shake),
+                    "shake must remain provider-free"
+                );
+
+                let installed = {
+                    let cx = AgentCx::for_request();
+                    let guard = session.lock(cx.cx()).await.expect("session lock");
+                    guard
+                        .entries_for_current_path()
+                        .into_iter()
+                        .find_map(|entry| match entry {
+                            crate::session::SessionEntry::Compaction(entry) => {
+                                Some(entry.clone())
+                            }
+                            _ => None,
+                        })
+                        .expect("installed compaction")
+                };
+                assert!(!installed.summary.contains("ARCHIVE-ONLY-WREN-782"));
+                let details = installed.details.as_ref().expect("compaction details");
+                assert_eq!(details["readFiles"], json!(["report.txt"]));
+                if shake {
+                    assert_eq!(details["mode"], "shake");
+                }
+                let archive = crate::compaction_snap::frames_from_details(Some(details))
+                    .expect("native compaction must retain its generated archive");
+                assert!(!archive.frames.is_empty());
+                assert!(
+                    archive
+                        .source_text
+                        .as_deref()
+                        .is_some_and(|source| source.contains("ARCHIVE-ONLY-WREN-782"))
+                );
+
+                let reopened = Session::open(path.to_str().expect("UTF-8 test path"))
+                    .await
+                    .expect("reopen compacted session");
+                let persisted = reopened
+                    .entries_for_current_path()
+                    .into_iter()
+                    .find_map(|entry| match entry {
+                        crate::session::SessionEntry::Compaction(entry) => Some(entry),
+                        _ => None,
+                    })
+                    .expect("persisted compaction");
+                assert_eq!(persisted.details, installed.details);
+                let canonical = reopened.to_messages_for_current_path();
+                let canonical_json = serde_json::to_value(&canonical).expect("canonical history");
+
+                for vision in [false, true, false] {
+                    let replay_calls = Arc::new(StdTestMutex::new(Vec::new()));
+                    let mut replay = Agent::new(
+                        Arc::new(PiAiCaptureProvider {
+                            calls: Arc::clone(&replay_calls),
+                        }),
+                        ToolRegistry::new(&[], directory.path(), None),
+                        AgentConfig {
+                            model_accepts_images: vision,
+                            ..AgentConfig::default()
+                        },
+                    );
+                    replay.replace_messages(canonical.clone());
+                    replay.run("continue", |_| {}).await.expect("replay archive");
+                    let requests = replay_calls.lock().expect("replay requests");
+                    assert_eq!(requests.len(), 1);
+                    let messages = &requests[0].messages;
+                    let wire = serde_json::to_string(messages).expect("provider context");
+                    assert_eq!(wire.contains("ARCHIVE-ONLY-WREN-782"), !vision);
+                    assert_eq!(
+                        messages.iter().map(image_count_in_message).sum::<usize>() > 0,
+                        vision
+                    );
+                    assert!(wire.contains("retained recent turn"));
+                    assert!(!wire.contains("sourceText"));
+                    assert!(!wire.contains("pi.snapcompact"));
+                }
+
+                assert_eq!(
+                    serde_json::to_value(reopened.to_messages_for_current_path())
+                        .expect("retained canonical history"),
+                    canonical_json,
+                    "reader projections must preserve the durable archive"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn apply_compaction_result_emits_structured_result_payload() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

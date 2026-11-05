@@ -20792,7 +20792,12 @@ impl AgentSession {
     ) -> Result<()> {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
-            Ok(details) => Some(details),
+            Ok(details) => Some(match result.snap_payload.as_ref() {
+                Some(payload) => {
+                    crate::compaction_snap::payload_to_details(Some(details), payload)
+                }
+                None => details,
+            }),
             Err(err) => {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
