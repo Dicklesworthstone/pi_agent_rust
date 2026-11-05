@@ -167,17 +167,21 @@ impl FileMutationRecorder {
                     inner.undo_stack.push(unit);
                     inner.unrecorded_files = inner.unrecorded_files.saturating_add(1);
                 }
-                for unit in inner.undo_stack.iter().chain(&inner.redo_stack) {
+                for unit in inner.undo_stack.iter_mut().chain(&mut inner.redo_stack) {
                     if unit.files.len() > MAX_UNITS { return Err(snapshot_error("undo file limit exceeded")); }
-                    for file in &unit.files {
+                    for file in &mut unit.files {
                         if !file.path.is_absolute()
                             || file.path.components().any(|part| matches!(part, std::path::Component::ParentDir))
                             || !journal.roots.iter().any(|root| file.path.starts_with(root))
                         { return Err(snapshot_error("undo path escapes its saved workspace")); }
                         if let Some(parent) = &file.parent {
                             // Historical identifiers detect ordinary replacement, not hostile inode reuse.
-                            if file.path.parent() != Some(parent.path.as_path()) || capture_parent(&file.path)? != *parent {
-                                return Err(snapshot_error("undo parent changed since recording"));
+                            if file.path.parent() != Some(parent.path.as_path())
+                                || capture_parent(&file.path).is_err_or(|current| current != *parent)
+                            {
+                                // A missing/replaced parent invalidates only this file's
+                                // historical snapshot. Never re-trust a recreated parent.
+                                file.parent = None;
                             }
                         }
                         // Missing historical parents remain gaps; never bless a newly created directory.
@@ -300,6 +304,33 @@ mod tests {
         std::fs::write(&path,"corrupt").unwrap();
         assert!(FileMutationRecorder::open_journal(&path,"s",std::slice::from_ref(&root),1024).is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(),"ambiguous");
+    }
+
+    #[test]
+    fn removed_parent_reopens_history_as_a_gap_without_disabling_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let journal = root.join("journal.json");
+        let nested = root.join("removed");
+        std::fs::create_dir(&nested).unwrap();
+        let file = nested.join("file.txt");
+        std::fs::write(&file, "before").unwrap();
+        let recorder = FileMutationRecorder::open_journal(
+            &journal, "s", std::slice::from_ref(&root), 1024,
+        ).unwrap();
+        recorder.begin_file("edit", "write", &file);
+        std::fs::write(&file, "after").unwrap();
+        recorder.commit("edit");
+        drop(recorder);
+        std::fs::remove_dir_all(&nested).unwrap();
+        let reopened = FileMutationRecorder::open_journal(
+            &journal, "s", std::slice::from_ref(&root), 1024,
+        ).unwrap();
+        assert!(reopened.stats().durable);
+        assert!(matches!(
+            reopened.undo(1, false).stopped,
+            Some(UndoStop::SnapshotOmitted { .. })
+        ));
     }
 
     #[test]
