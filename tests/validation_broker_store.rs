@@ -973,6 +973,16 @@ fn stale_detection_requires_expiry_and_explicit_reason() -> TestResult {
     )?;
     require(lease.is_stale_at(STALE_AT).map_err(to_string)?, "stale")?;
     require(
+        !lease
+            .is_stale_at("2026-05-14T07:29:59.999999999Z")
+            .map_err(to_string)?,
+        "lease remains active immediately before expiry",
+    )?;
+    require(
+        lease.is_stale_at(EXPIRES).map_err(to_string)?,
+        "lease expires at its exact deadline",
+    )?;
+    require(
         lease.mark_stale(STALE_AT, "   ").is_err(),
         "blank stale reason rejected",
     )?;
@@ -994,6 +1004,162 @@ fn stale_detection_requires_expiry_and_explicit_reason() -> TestResult {
         lease.state_reason.as_deref() == Some("owner heartbeat expired"),
         "stale reason recorded",
     )
+}
+
+#[test]
+fn rejected_lease_mutations_preserve_state_and_cannot_backdate_evidence() -> TestResult {
+    let mut original = acquire("slot-atomic-failure")?;
+    original
+        .renew("SilentReef", HEARTBEAT, EXPIRES)
+        .map_err(to_string)?;
+    for invalid in ["invalid", "2026-05-14T06:59:59Z", START] {
+        let mut lease = original.clone();
+        require(
+            lease.renew("SilentReef", invalid, EXPIRES).is_err(),
+            "invalid renewal heartbeat rejected",
+        )?;
+        require(lease == original, "failed renewal leaves lease unchanged")?;
+
+        require(
+            lease
+                .mark_reusable("SilentReef", invalid, reusable_fault_artifacts())
+                .is_err(),
+            "invalid reusable heartbeat rejected",
+        )?;
+        require(lease == original, "failed reuse leaves lease unchanged")?;
+
+        require(
+            lease.release("SilentReef", invalid, "done").is_err(),
+            "invalid release heartbeat rejected",
+        )?;
+        require(lease == original, "failed release leaves lease unchanged")?;
+
+        require(
+            lease.fail("SilentReef", invalid, "failed").is_err(),
+            "invalid failure heartbeat rejected",
+        )?;
+        require(
+            lease == original,
+            "failed failure update leaves lease unchanged",
+        )?;
+
+        require(
+            lease.mark_stale(invalid, "expired").is_err(),
+            "invalid stale heartbeat rejected",
+        )?;
+        require(
+            lease == original,
+            "failed stale update leaves lease unchanged",
+        )?;
+    }
+    let mut expired = original.clone();
+    require(
+        expired
+            .mark_reusable("SilentReef", EXPIRES, reusable_fault_artifacts())
+            .is_err(),
+        "expired lease cannot publish reusable evidence without renewal",
+    )?;
+    require(expired == original, "expired reuse leaves lease unchanged")?;
+    // Terminal observations may legitimately arrive after a lease expires.
+    expired
+        .release("SilentReef", STALE_AT, "owner completed after expiry")
+        .map_err(to_string)?;
+    let root = temp_root("late_release")?;
+    let store = ValidationSlotStore::new(root.join("slots.jsonl"));
+    store
+        .append_lease("released", STALE_AT, &expired)
+        .map_err(to_string)?;
+    require(
+        !store.load_snapshot().is_degraded(),
+        "late release remains valid",
+    )
+}
+
+#[test]
+fn invalid_lease_timestamp_order_degrades_persisted_history() -> TestResult {
+    for (field, value) in [
+        ("started_at_utc", STALE_AT),
+        ("expires_at_utc", START),
+        ("heartbeat_at_utc", "2026-05-14T06:59:59Z"),
+        ("heartbeat_at_utc", EXPIRES),
+        ("heartbeat_at_utc", STALE_AT),
+    ] {
+        let root = temp_root("invalid_lease_time")?;
+        let store = ValidationSlotStore::new(root.join("slots.jsonl"));
+        let mut lease = acquire("slot-time-history")?;
+        lease
+            .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+            .map_err(to_string)?;
+        store
+            .append_lease("reusable", HEARTBEAT, &lease)
+            .map_err(to_string)?;
+        let mut raw = std::fs::read_to_string(store.path()).map_err(to_string)?;
+        let mut corrupted: Value = serde_json::from_str(raw.trim()).map_err(to_string)?;
+        corrupted["lease"][field] = json!(value);
+        raw.push_str(&serde_json::to_string(&corrupted).map_err(to_string)?);
+        raw.push('\n');
+        std::fs::write(store.path(), raw).map_err(to_string)?;
+
+        let snapshot = ValidationSlotStore::new(store.path()).load_snapshot();
+        require(
+            snapshot.is_degraded(),
+            "invalid timestamp order degrades store",
+        )?;
+        require(snapshot.leases.len() == 1, "earlier valid history retained")?;
+        let decision = decide_validation_admission(
+            admission_context("invalid-time-record"),
+            &healthy_inputs()?,
+            &snapshot,
+            &ValidationAdmissionPolicy::default(),
+            HEARTBEAT,
+        )
+        .map_err(to_string)?;
+        require(
+            decision.decision == ValidationAdmissionDecision::DegradedBlock,
+            "invalid later timestamp cannot revive earlier reusable evidence",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn persisted_reusable_evidence_obeys_exact_freshness_boundaries() -> TestResult {
+    let root = temp_root("freshness_time")?;
+    let store = ValidationSlotStore::new(root.join("slots.jsonl"));
+    let mut lease = acquire("slot-freshness-time")?;
+    lease
+        .mark_reusable("SilentReef", HEARTBEAT, reusable_fault_artifacts())
+        .map_err(to_string)?;
+    store
+        .append_lease("reusable", HEARTBEAT, &lease)
+        .map_err(to_string)?;
+    let snapshot = ValidationSlotStore::new(store.path()).load_snapshot();
+    require(!snapshot.is_degraded(), "timestamp fixture reloads")?;
+    let policy = ValidationAdmissionPolicy {
+        reusable_artifact_freshness_seconds: 60,
+        ..ValidationAdmissionPolicy::default()
+    };
+    for (now, coalesce) in [
+        ("2026-05-14T07:04:59.999999999Z", false),
+        (HEARTBEAT, true),
+        ("2026-05-14T07:06:00Z", true),
+        ("2026-05-14T07:06:00.000000001Z", false),
+        (EXPIRES, false),
+    ] {
+        let decision = decide_validation_admission(
+            admission_context("freshness-boundary"),
+            &healthy_inputs()?,
+            &snapshot,
+            &policy,
+            now,
+        )
+        .map_err(to_string)?;
+        require(
+            (decision.decision == ValidationAdmissionDecision::Coalesce) == coalesce,
+            "persisted evidence respects future, fractional, and expiry boundaries",
+        )?;
+    }
+    Ok(())
 }
 
 #[test]

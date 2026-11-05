@@ -180,6 +180,7 @@ impl ValidationSlotLease {
         }
         let heartbeat_at_utc = heartbeat_at_utc.into();
         let expires_at_utc = expires_at_utc.into();
+        self.validate_next_heartbeat(&heartbeat_at_utc)?;
         ensure_future_expiry(&heartbeat_at_utc, &expires_at_utc)?;
         self.heartbeat_at_utc = heartbeat_at_utc;
         self.expires_at_utc = expires_at_utc;
@@ -204,8 +205,10 @@ impl ValidationSlotLease {
         if artifacts.is_empty() {
             return Err(Error::validation("reusable slots require artifacts"));
         }
-        self.heartbeat_at_utc = heartbeat_at_utc.into();
-        parse_utc(&self.heartbeat_at_utc)?;
+        let heartbeat_at_utc = heartbeat_at_utc.into();
+        self.validate_next_heartbeat(&heartbeat_at_utc)?;
+        ensure_future_expiry(&heartbeat_at_utc, &self.expires_at_utc)?;
+        self.heartbeat_at_utc = heartbeat_at_utc;
         self.artifacts = artifacts;
         self.state = ValidationSlotState::Reusable;
         self.state_reason = Some("validation_succeeded".to_string());
@@ -218,7 +221,7 @@ impl ValidationSlotLease {
         reason: impl Into<String>,
     ) -> Result<()> {
         let now_utc = now_utc.into();
-        parse_utc(&now_utc)?;
+        self.validate_next_heartbeat(&now_utc)?;
         let reason = non_empty(reason.into(), "stale reason")?;
         if !self.is_stale_at(&now_utc)? {
             return Err(Error::validation(format!(
@@ -246,8 +249,9 @@ impl ValidationSlotLease {
     ) -> Result<()> {
         self.ensure_owner(owner_agent)?;
         let reason = non_empty(reason.into(), "release reason")?;
-        self.heartbeat_at_utc = heartbeat_at_utc.into();
-        parse_utc(&self.heartbeat_at_utc)?;
+        let heartbeat_at_utc = heartbeat_at_utc.into();
+        self.validate_next_heartbeat(&heartbeat_at_utc)?;
+        self.heartbeat_at_utc = heartbeat_at_utc;
         self.state = ValidationSlotState::Released;
         self.release_reason = Some(reason);
         self.state_reason = Some("released_by_owner".to_string());
@@ -262,8 +266,9 @@ impl ValidationSlotLease {
     ) -> Result<()> {
         self.ensure_owner(owner_agent)?;
         let reason = non_empty(reason.into(), "failure reason")?;
-        self.heartbeat_at_utc = heartbeat_at_utc.into();
-        parse_utc(&self.heartbeat_at_utc)?;
+        let heartbeat_at_utc = heartbeat_at_utc.into();
+        self.validate_next_heartbeat(&heartbeat_at_utc)?;
+        self.heartbeat_at_utc = heartbeat_at_utc;
         self.state = ValidationSlotState::Failed;
         self.state_reason = Some(reason);
         Ok(())
@@ -272,7 +277,7 @@ impl ValidationSlotLease {
     pub fn is_stale_at(&self, now_utc: &str) -> Result<bool> {
         let now = parse_utc(now_utc)?;
         let expires = parse_utc(&self.expires_at_utc)?;
-        Ok(now > expires)
+        Ok(now >= expires)
     }
 
     pub fn matches_request_equivalence(&self, request: &ValidationSlotRequest) -> Result<bool> {
@@ -300,6 +305,16 @@ impl ValidationSlotLease {
         }
     }
 
+    fn validate_next_heartbeat(&self, heartbeat_at_utc: &str) -> Result<()> {
+        let heartbeat = parse_utc(heartbeat_at_utc)?;
+        if heartbeat < parse_utc(&self.started_at_utc)?
+            || heartbeat < parse_utc(&self.heartbeat_at_utc)?
+        {
+            return Err(Error::validation("slot heartbeat must not move backwards"));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.schema != VALIDATION_BROKER_SLOT_SCHEMA {
             return Err(Error::validation(format!(
@@ -316,9 +331,21 @@ impl ValidationSlotLease {
         require_non_empty(&self.target_dir, "target_dir")?;
         require_non_empty(&self.tmpdir, "tmpdir")?;
         require_non_empty(&self.runner, "runner")?;
-        parse_utc(&self.started_at_utc)?;
-        parse_utc(&self.heartbeat_at_utc)?;
-        parse_utc(&self.expires_at_utc)?;
+        let started = parse_utc(&self.started_at_utc)?;
+        let heartbeat = parse_utc(&self.heartbeat_at_utc)?;
+        let expires = parse_utc(&self.expires_at_utc)?;
+        if expires <= started || heartbeat < started {
+            return Err(Error::validation("slot timestamps are out of order"));
+        }
+        if matches!(
+            self.state,
+            ValidationSlotState::Requested
+                | ValidationSlotState::Active
+                | ValidationSlotState::Reusable
+        ) && heartbeat >= expires
+        {
+            return Err(Error::validation("live slot heartbeat must precede expiry"));
+        }
         Ok(())
     }
 }
@@ -1557,8 +1584,12 @@ fn reusable_artifact_is_fresh(
 ) -> Result<bool> {
     let now = parse_utc(now_utc)?;
     let heartbeat = parse_utc(&lease.heartbeat_at_utc)?;
-    let age_seconds = now.signed_duration_since(heartbeat).num_seconds().max(0);
-    Ok(age_seconds <= freshness_seconds)
+    let age = now.signed_duration_since(heartbeat);
+    // A future timestamp is unknown evidence, and truncating fractional seconds
+    // would extend the freshness window past its stated boundary.
+    Ok(heartbeat <= now
+        && (age.num_seconds() < freshness_seconds
+            || (age.num_seconds() == freshness_seconds && age.subsec_nanos() == 0)))
 }
 
 fn active_broad_gate_count(
