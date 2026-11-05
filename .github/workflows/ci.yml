@@ -1815,9 +1815,12 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "$SHARD_ARTIFACT_DIR"
+          # run_all.sh requires the E2E_ARTIFACT_DIR basename to be a canonical UTC timestamp.
+          # Keep the shard directory as the evidence index root; let the runner write beneath it.
+          SHARD_E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR/$(date -u +%Y%m%dT%H%M%SZ)"
           case "${{ matrix.shard.lane }}" in
             unit)
-              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              E2E_ARTIFACT_DIR="$SHARD_E2E_ARTIFACT_DIR" \
               CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
               ./scripts/e2e/run_all.sh \
                 --profile quick \
@@ -1825,7 +1828,7 @@ jobs:
                 --shard-name "${{ matrix.shard.name }}"
               ;;
             integration)
-              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              E2E_ARTIFACT_DIR="$SHARD_E2E_ARTIFACT_DIR" \
               CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
               ./scripts/e2e/run_all.sh \
                 --profile ci \
@@ -1837,7 +1840,7 @@ jobs:
                 --shard-name "${{ matrix.shard.name }}"
               ;;
             e2e)
-              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              E2E_ARTIFACT_DIR="$SHARD_E2E_ARTIFACT_DIR" \
               CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
               ./scripts/e2e/run_all.sh \
                 --profile full \
