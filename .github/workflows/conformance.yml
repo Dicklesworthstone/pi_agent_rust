@@ -107,6 +107,7 @@ jobs:
     steps:
       - name: Skip unmatched profile
         if: env.SHOULD_RUN != 'true'
+        working-directory: .
         run: echo "Skipping ${{ matrix.name }} for event/profile selection"
 
       - name: Free disk space
