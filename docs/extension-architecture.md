@@ -202,7 +202,7 @@ Summary options are optional:
 | `model: { provider, id }` | Select the current model or another model registered in the host's model registry for this compaction only. |
 | `customInstructions: string` | Add summary guidance, subject to the normal compaction privacy policy. |
 | `thinkingLevel` | Request `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; the host clamps the request to the registered model's capabilities. When omitted, the current stream setting is used, with `high` as the unset fallback. |
-| `signal: AbortSignal` | Reject before host work if already aborted. Mid-call JavaScript abort propagation is not implemented. |
+| `signal: AbortSignal` | Reject before host work if already aborted; otherwise cancel pending host generation and reject with the signal's reason. Once the compaction result has returned, a later abort does not undo it or interrupt subsequent session persistence. |
 
 For example, add `model: { provider: "configured-provider", id: "summary-model" }`
 to use a separately configured summary model. The host resolves its endpoint,

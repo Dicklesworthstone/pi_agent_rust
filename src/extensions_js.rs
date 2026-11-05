@@ -10121,12 +10121,10 @@ export function rawKeyHint(key, description = "") {
 // thinkingLevel, streamFn, env) signature. Host-owned arguments must be absent.
 // ctx.compact uses this same implementation with an options object.
 //
-// Cancellation (gh #178): a signal (`options.signal`, or the sixth
-// argument) that has already aborted rejects before any host work starts.
-// An abort that fires mid-call is NOT propagated: hostcalls are serialized on
-// the extension runtime thread, so no JS abort handler can run until the
-// compact hostcall returns. The host's dedicated compact event budget bounds
-// that round-trip instead.
+// Both signal forms cancel the exact pending generation hostcall. The runtime
+// keeps native dispatches pollable while advancing JavaScript timers and abort
+// listeners. Compaction hostcalls only return candidates: cancellation never
+// rolls back a candidate already returned or interrupts its later session save.
 export async function compact(preparation, modelOrOptions, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env) {
   const supplied = modelOrOptions ?? {};
   if (typeof supplied !== "object" || Array.isArray(supplied)) {
@@ -10182,7 +10180,7 @@ export async function compact(preparation, modelOrOptions, apiKey, headers, cust
   } else if (options.request !== undefined && options.request !== null) {
     throw new TypeError("compact: request requires a native strategy");
   }
-  return await globalThis.pi.events("compact", payload);
+  return await globalThis.pi.events("compact", payload, { signal: abortSignal });
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -24308,7 +24306,7 @@ function __pi_make_extension_ctx(ctx_payload) {
             // pi-better-compaction feature-detects the absence and fails
             // open to normal compaction.
         },
-        // Share the public summary options, credential checks and pre-abort
+        // Share the public summary options, credential checks and cancellation
         // behavior with the exported API. Native strategy requests remain
         // host-sanitized and pinned to the current session model.
         compact: async (preparation, options) => {
@@ -25126,6 +25124,78 @@ function __pi_make_hostcall(nativeFn) {
     };
 }
 
+// Only compaction generation is abortable through this Promise wrapper.
+// Session mutation hostcalls retain their admitted transaction lifetime.
+function __pi_compact_hostcall(payload, signal) {
+    return new Promise((resolve, reject) => {
+        if (typeof signal.aborted !== 'boolean' ||
+            typeof signal.addEventListener !== 'function' ||
+            typeof signal.removeEventListener !== 'function') {
+            throw new TypeError('compact: signal must be an AbortSignal');
+        }
+        let callId = null;
+        let settled = false;
+        let listening = false;
+        const abortReason = () => {
+            const reason = signal.reason;
+            if (reason !== undefined) return reason;
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            return error;
+        };
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            if (listening) {
+                listening = false;
+                // A foreign signal shim must not hide the original result or
+                // abort reason by throwing during listener cleanup.
+                try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+            }
+            callback(value);
+        };
+        const cancelNative = () => {
+            if (callId === null) return;
+            __pi_cancel_hostcall_native(callId);
+            __pi_pending_hostcalls.delete(callId);
+        };
+        const onAbort = () => {
+            // Synthetic abort events cannot retire a live request or consume
+            // the listener needed for the controller's actual cancellation.
+            if (settled || !signal.aborted) return;
+            const reason = abortReason();
+            cancelNative();
+            finish(reject, reason);
+        };
+        try {
+            if (signal.aborted) {
+                finish(reject, abortReason());
+                return;
+            }
+            listening = true;
+            signal.addEventListener('abort', onAbort);
+            if (signal.aborted) onAbort();
+            if (settled) return;
+            callId = __pi_events_native('compact', payload);
+            // Payload getters can abort while the native bridge captures the
+            // request, before its call ID has been returned to this closure.
+            if (settled) {
+                cancelNative();
+                return;
+            }
+            __pi_pending_hostcalls.set(callId, {
+                resolve: (value) => finish(resolve, value),
+                reject: (error) => finish(reject, error),
+                extensionId: __pi_get_current_extension_id()
+            });
+            if (signal.aborted) onAbort();
+        } catch (error) {
+            cancelNative();
+            finish(reject, error);
+        }
+    });
+}
+
 function __pi_make_streaming_hostcall(nativeFn, ...args) {
     const call_id = nativeFn(...args);
     let options = undefined;
@@ -25203,6 +25273,7 @@ function __pi_sleep(ms) {
 
 // Create the pi global object with Promise-returning methods
 const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
+const __pi_events_hostcall = __pi_make_hostcall(__pi_events_native);
 	const pi = {
     // pi.tool(name, input) - invoke a tool
     tool: __pi_make_hostcall(__pi_tool_native),
@@ -25262,8 +25333,13 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     // pi.ui(op, args) - UI operations
     ui: __pi_make_hostcall(__pi_ui_native),
 
-	    // pi.events(op, args) - event operations
-	    events: __pi_make_hostcall(__pi_events_native),
+    // The signal is runtime-local and never serialized into host authority.
+    events: (op, args, options = undefined) => {
+        const signal = options && options.signal;
+        if (signal === undefined || signal === null) return __pi_events_hostcall(op, args);
+        if (op !== 'compact') return Promise.reject(new TypeError('events: signal is only supported for compact'));
+        return __pi_compact_hostcall(args, signal);
+    },
 
     // pi.log(entry) - structured log emission
     log: __pi_make_hostcall(__pi_log_native),

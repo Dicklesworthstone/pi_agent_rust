@@ -7506,6 +7506,313 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_compact_abort_cancels_generation_and_provider_admission() {
+        struct PendingSummary(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Stream for PendingSummary {
+            type Item = Result<StreamEvent>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingSummary {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Debug)]
+        struct PendingSummaryProvider {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            drops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Provider for PendingSummaryProvider {
+            fn name(&self) -> &'static str {
+                "pending-summary"
+            }
+
+            fn api(&self) -> &'static str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &'static str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(PendingSummary(Arc::clone(&self.drops))))
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("workspace");
+            let entry = directory.path().join("abort-compaction.mjs");
+            std::fs::write(
+                &entry,
+                r#"
+                import { compact } from "@mariozechner/pi-coding-agent";
+
+                export default function(pi) {
+                    let probe = {};
+                    function watchedController() {
+                        const controller = new AbortController();
+                        const signal = controller.signal;
+                        const add = signal.addEventListener.bind(signal);
+                        const remove = signal.removeEventListener.bind(signal);
+                        let listeners = 0;
+                        signal.addEventListener = (type, callback, options) => {
+                            if (type === 'abort') listeners += 1;
+                            add(type, callback, options);
+                        };
+                        signal.removeEventListener = (type, callback, options) => {
+                            if (type === 'abort') listeners -= 1;
+                            remove(type, callback, options);
+                        };
+                        return { controller, signal, listeners: () => listeners };
+                    }
+                    pi.registerCommand('compact-abort-probe', { handler: () => probe });
+                    pi.on('session_before_compact', async (event) => {
+                        const active = watchedController();
+                        const queued = watchedController();
+                        const activeReason = new Error('stop the active generation');
+                        const queuedReason = { request: 'waiting for provider admission' };
+                        const generation = compact(event.preparation,
+                            undefined, undefined, undefined, undefined, active.signal);
+                        const waiting = compact(event.preparation, { signal: queued.signal });
+                        // Synthetic events cannot consume the real abort listeners.
+                        active.signal.dispatchEvent(new Event('abort'));
+                        queued.signal.dispatchEvent(new Event('abort'));
+                        setTimeout(() => {
+                            // Retire the admission waiter before releasing its owner.
+                            queued.controller.abort(queuedReason);
+                            active.controller.abort(activeReason);
+                        }, 20);
+                        const results = await Promise.allSettled([generation, waiting]);
+                        probe = {
+                            activeReason: results[0].status === 'rejected' && results[0].reason === activeReason,
+                            queuedReason: results[1].status === 'rejected' && results[1].reason === queuedReason,
+                            activeListeners: active.listeners(),
+                            queuedListeners: queued.listeners()
+                        };
+                        return { cancel: true };
+                    });
+                }
+                "#,
+            )
+            .expect("write aborting extension");
+            let mut original = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            original.append_message(user_message("old request").into());
+            original.append_message(crate::session::SessionMessage::Assistant {
+                message: assistant_message(&"old context ".repeat(128)),
+            });
+            original.append_message(user_message("retained recent turn").into());
+            original.save().await.expect("save original session");
+            let path = original.path.clone().expect("saved session path");
+            let session = Arc::new(Mutex::new(original));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent::new(
+                Arc::new(PendingSummaryProvider {
+                    calls: Arc::clone(&calls),
+                    drops: Arc::clone(&drops),
+                }),
+                ToolRegistry::new(&[], directory.path(), None),
+                AgentConfig::default(),
+            );
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens: 1,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            agent_session
+                .enable_extensions(&[], directory.path(), None, &[entry])
+                .await
+                .expect("enable aborting extension");
+            let saved_before = std::fs::read(&path).expect("saved history before cancellation");
+            let error = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                agent_session.compact_now(None, |_| {}),
+            )
+            .await
+            .expect("JS abort must interrupt an actually pending provider stream")
+            .expect_err("extension cancelled the compaction");
+            assert!(error.to_string().contains("Compaction cancelled"), "{error}");
+
+            // The actor must drop both retained native futures, including the
+            // admission waiter, so later provider work can acquire the gate.
+            let cx = asupersync::Cx::for_testing();
+            let admission = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                agent_session.provider_admission.acquire(&cx),
+            )
+            .await
+            .expect("cancelled generation must release provider admission")
+            .expect("provider admission remains usable");
+            drop(admission);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "queued work must never start");
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "active stream must be dropped");
+            let manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .manager();
+            let probe = manager
+                .execute_command("compact-abort-probe", "", 5_000)
+                .await
+                .expect("actor remains usable after cancellation");
+            assert_eq!(
+                probe,
+                json!({
+                    "activeReason": true,
+                    "queuedReason": true,
+                    "activeListeners": 0,
+                    "queuedListeners": 0
+                })
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("saved history after cancellation"),
+                saved_before,
+                "cancelled candidate generation must not change durable history"
+            );
+            {
+                let guard = session.lock(&cx).await.expect("live session");
+                assert!(guard.entries_for_current_path().iter().all(|entry| {
+                    !matches!(entry, crate::session::SessionEntry::Compaction(_))
+                }));
+            }
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_compact_late_abort_preserves_candidate_and_durable_save() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("workspace");
+            let entry = directory.path().join("late-abort-compaction.mjs");
+            std::fs::write(
+                &entry,
+                r"
+                export default function(pi) {
+                    let probe = {};
+                    pi.registerCommand('compact-late-abort-probe', { handler: () => probe });
+                    pi.on('session_before_compact', async (event, ctx) => {
+                        const controller = new AbortController();
+                        const signal = controller.signal;
+                        const add = signal.addEventListener.bind(signal);
+                        const remove = signal.removeEventListener.bind(signal);
+                        let listeners = 0;
+                        signal.addEventListener = (type, callback, options) => {
+                            if (type === 'abort') listeners += 1;
+                            add(type, callback, options);
+                        };
+                        signal.removeEventListener = (type, callback, options) => {
+                            if (type === 'abort') listeners -= 1;
+                            remove(type, callback, options);
+                        };
+                        const result = await ctx.compact(event.preparation, { signal });
+                        probe.listenersAfterResult = listeners;
+                        controller.abort(new Error('candidate already returned'));
+                        probe.lateAborted = signal.aborted;
+                        return { compaction: result };
+                    });
+                }
+                ",
+            )
+            .expect("write late abort extension");
+            let mut original = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            original.append_message(user_message("old request").into());
+            original.append_message(crate::session::SessionMessage::Assistant {
+                message: assistant_message(&"old context ".repeat(128)),
+            });
+            original.append_message(user_message("retained recent turn").into());
+            original.save().await.expect("save original session");
+            let path = original.path.clone().expect("saved session path");
+            let calls = Arc::new(StdTestMutex::new(Vec::new()));
+            let agent = Agent::new(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                ToolRegistry::new(&[], directory.path(), None),
+                AgentConfig::default(),
+            );
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(original)),
+                true,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens: 1,
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            agent_session
+                .enable_extensions(&[], directory.path(), None, &[entry])
+                .await
+                .expect("enable late abort extension");
+            assert!(
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    agent_session.compact_now(None, |_| {}),
+                )
+                .await
+                .expect("returned candidate must release provider admission")
+                .expect("persist the returned candidate")
+            );
+            assert_eq!(calls.lock().expect("summary requests").len(), 1);
+            let manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .manager();
+            let probe = manager
+                .execute_command("compact-late-abort-probe", "", 5_000)
+                .await
+                .expect("read late abort outcome");
+            assert_eq!(probe, json!({ "listenersAfterResult": 0, "lateAborted": true }));
+            let reopened = Session::open(path.to_str().expect("UTF-8 test path"))
+                .await
+                .expect("reopen durable compaction");
+            let installed = reopened
+                .entries_for_current_path()
+                .into_iter()
+                .find_map(|entry| match entry {
+                    crate::session::SessionEntry::Compaction(entry) => Some(entry),
+                    _ => None,
+                })
+                .expect("late abort must not retract the durable compaction");
+            assert_eq!(installed.summary, "captured");
+            let history = serde_json::to_string(&reopened.to_messages_for_current_path())
+                .expect("reopened context");
+            assert!(history.contains("retained recent turn"));
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
     // Guard scope is deliberate; tightening drops would change lock-hold semantics.
     #[allow(clippy::significant_drop_tightening)]
     fn session_compact_hook_can_reenter_provider_after_transition_install() {
