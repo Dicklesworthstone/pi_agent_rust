@@ -26,7 +26,7 @@ fn safe_project(value: &str) -> bool {
     let bytes = value.as_bytes();
     (6..=63).contains(&bytes.len())
         && bytes[0].is_ascii_lowercase()
-        && bytes[bytes.len() - 1].is_ascii_lowercase_or_digit()
+        && (bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit())
         && bytes.iter().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == b'-')
 }
 
@@ -169,7 +169,7 @@ pub(super) async fn discover_model_ids(
             let url_text = url.to_string();
             let request = client.get(&url_text)
                 .header("Accept", "application/json")
-                .try_header("Authorization", &authorization)?;
+                .try_header("Authorization", authorization.as_str())?;
             let operation = async move {
                 let response = request.send().await?;
                 let status = response.status();
