@@ -321,15 +321,19 @@ fn result(output: &ToolOutput) -> &Value {
 
 fn record_model_script(body: &str) -> String {
     format!(
-        "provider=\nmodel=\n\
+        "provider=\nmodel=\nthinking=\nfallback=\n\
          while [ \"$#\" -gt 0 ]; do\n\
            case \"$1\" in\n\
              --provider) shift; provider=\"$1\" ;;\n\
              --model) shift; model=\"$1\" ;;\n\
+             --thinking) shift; thinking=\"$1\" ;;\n\
+             --subagent-fallback-policy) shift; fallback=\"$1\" ;;\n\
            esac\n\
            shift\n\
          done\n\
          printf '%s|%s\\n' \"$provider\" \"$model\" >> \"$PI_CODING_AGENT_DIR/models-used\"\n\
+         printf '%s\\n' \"$thinking\" >> \"$PI_CODING_AGENT_DIR/model-thinking\"\n\
+         if [ -n \"$fallback\" ]; then printf '%s\\n' \"$fallback\" >> \"$PI_CODING_AGENT_DIR/fallback-used\"; fi\n\
          {body}"
     )
 }
@@ -364,6 +368,28 @@ fn fallback_config() -> Config {
             ..Default::default()
         }),
         disabled_providers: Some(vec!["excluded-provider".to_string()]),
+        ..Default::default()
+    }
+}
+
+fn explicit_role_config() -> Config {
+    Config {
+        model_roles: Some(crate::config::ModelRoleSettings {
+            smol: Some("selection-local/selection-fast".to_string()),
+            slow: Some("selection-local/selection-careful:high".to_string()),
+            ..Default::default()
+        }),
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(std::collections::HashMap::from([
+                (
+                    "smol".to_string(),
+                    vec!["selection-local/selection-careful:high".to_string()],
+                ),
+                ("slow".to_string(), vec![]),
+                ("default".to_string(), vec![]),
+            ])),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -529,6 +555,56 @@ fn explicit_models_override_definition_role_and_parent_in_every_one_shot_mode() 
 }
 
 #[test]
+fn explicit_roles_route_every_mode_with_their_own_thinking_and_fallback_chain() {
+    let first = json!({"agent":"worker", "task":"inspect", "model":{"role":"smol"}});
+    let second = json!({"agent":"worker", "task":"review {previous}", "model":{"role":"slow"}});
+    for input in [
+        first.clone(),
+        json!({"tasks":[first, second], "concurrency":1}),
+        json!({"chain":[first, second]}),
+        json!({"workflow":[
+            {"id":"inspect", "call":first},
+            {"id":"review", "needs":["inspect"], "call":second}
+        ]}),
+    ] {
+        let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        std::fs::write(tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: pinned fixture\nmodel: definition/model\nreasoning: low\n---\nComplete the task.").unwrap();
+        let tool = tool
+            .with_model_config(Some(explicit_role_config()))
+            .with_role_model_selection(Some((
+                crate::models::ModelRole::Task,
+                "role/model".to_string(),
+            )))
+            .with_parent_model(Some(ToolModelSelection {
+                provider: "parent".to_string(),
+                model: "parent-model".to_string(),
+            }));
+        let single = input.get("agent").is_some();
+        let output = run(&tool, input);
+        assert!(!output.is_error, "{output:?}");
+        assert_eq!(recorded_models(&tool)[0], "selection-local|selection-fast");
+        let efforts = std::fs::read_to_string(tool.global_dir.join("model-thinking")).unwrap();
+        assert_eq!(efforts, if single { "low\n" } else { "low\nhigh\n" });
+        let policies = recorded_fallbacks(&tool);
+        assert_eq!(policies[0]["role"], "smol");
+        assert_eq!(
+            policies[0]["retry"]["fallback_chains"]["smol"],
+            json!(["selection-local/selection-careful:high"])
+        );
+        assert_eq!(policies.len(), if single { 1 } else { 2 });
+        if !single {
+            assert_eq!(
+                recorded_models(&tool)[1],
+                "selection-local|selection-careful"
+            );
+            assert_eq!(policies[1]["role"], "slow");
+        }
+    }
+}
+
+#[test]
 fn invalid_later_model_rejects_entire_request_before_process_or_isolation() {
     for key in ["tasks", "chain", "workflow"] {
         let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
@@ -553,6 +629,69 @@ fn invalid_later_model_rejects_entire_request_before_process_or_isolation() {
         assert!(!error.contains("private-selector-sentinel"), "{error}");
         assert!(!tool.global_dir.join("models-used").exists());
     }
+}
+
+#[test]
+fn missing_later_role_rejects_the_batch_before_a_child_worktree_or_job() {
+    let _guard = crate::jobs::process_test_guard();
+    for key in ["tasks", "chain", "workflow"] {
+        for background in [false, true] {
+            let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+            explicit_model_catalog(&tool);
+            let mut tool = tool.with_model_config(Some(explicit_role_config()));
+            let owner = format!("missing-role-{}", uuid::Uuid::new_v4());
+            tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&owner));
+            let first = json!({"agent":"worker", "task":"must not run",
+                "model":{"role":"smol"}, "isolation":"worktree"});
+            let second = json!({"agent":"worker", "task":"unconfigured role",
+                "model":{"role":"advisor"}});
+            let mut input = if key == "workflow" {
+                json!({"workflow":[{"id":"first", "call":first},
+                    {"id":"second", "needs":["first"], "call":second}]})
+            } else {
+                let mut input = json!({});
+                input[key] = json!([first, second]);
+                input
+            };
+            input["async"] = json!(background);
+            let error = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap()
+                .block_on(tool.execute("missing-role", input, None))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("PI_SUBAGENT_MODEL"), "{error}");
+            assert!(!tool.global_dir.join("models-used").exists());
+            assert!(!tool.global_dir.join("tool-output-artifacts").exists());
+            assert!(crate::jobs::list(&owner).unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn seance_refuses_role_objects_before_reading_the_saved_session() {
+    let (_dir, tool) = fixture(&record_model_script(&emit(&[ended(
+        "must not run",
+        "stop",
+    )])));
+    let error = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(tool.execute(
+            "seance-role",
+            json!({
+                "agent":"seance", "sourceSession":"missing.jsonl", "task":"inspect history",
+                "model":{"role":"smol"}
+            }),
+            None,
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("seance model must be an exact-model string"),
+        "{error}"
+    );
+    assert!(!tool.global_dir.join("models-used").exists());
 }
 
 #[test]
@@ -584,6 +723,61 @@ fn prepared_model_identity_survives_catalog_and_parent_changes() {
             "selection-local|selection-careful"
         ]
     );
+}
+
+#[test]
+fn prepared_role_identity_and_policy_survive_settings_changes_retry_and_revival() {
+    let body = format!(
+        "if [ -f \"$PI_CODING_AGENT_DIR/retried\" ]; then\n{}\
+         else\n: > \"$PI_CODING_AGENT_DIR/retried\"\n{}\
+         fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (_dir, tool) = fixture(&record_model_script(&body));
+    explicit_model_catalog(&tool);
+    let mut tool = tool.with_model_config(Some(explicit_role_config()));
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "chain":[
+            {"agent":"worker", "task":format!("frozen-role-{}", uuid::Uuid::new_v4()),
+             "model":{"role":"slow"}, "outputSchema":{"type":"object", "required":["accepted"]},
+             "schemaMode":"strict"},
+            {"agent":"worker", "task":"follow-up", "model":{"role":"smol"}}
+        ]
+    }))
+    .unwrap();
+    let prepared = tool.prepare_request(&request).unwrap();
+    tool.model_config = Some(Config::default());
+    std::fs::write(tool.global_dir.join("models.json"), "{\"providers\":{}}").unwrap();
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepared.run(None));
+    assert!(results.iter().all(|result| !result.is_error));
+    assert_eq!(results[0].schema_retries, Some(1));
+    assert_eq!(
+        recorded_models(&tool),
+        [
+            "selection-local|selection-careful",
+            "selection-local|selection-careful",
+            "selection-local|selection-fast",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(tool.global_dir.join("model-thinking")).unwrap(),
+        "high\nhigh\n\n"
+    );
+    let policies = recorded_fallbacks(&tool);
+    assert_eq!(policies[0], policies[1]);
+    assert_eq!(policies[0]["role"], "slow");
+    assert_eq!(policies[2]["role"], "smol");
+    let revived = revive_through_hub(&tool.cwd, results[0].hub_id.as_deref().unwrap());
+    assert!(!revived.is_error, "{revived:?}");
+    assert_eq!(
+        recorded_models(&tool)[3],
+        "selection-local|selection-careful"
+    );
+    assert_eq!(recorded_fallbacks(&tool)[3], policies[0]);
 }
 
 #[test]

@@ -8,8 +8,72 @@ use super::{
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::model::ThinkingLevel;
-use crate::models::{ModelEntry, ModelRegistry};
+use crate::models::{ModelEntry, ModelRegistry, ModelRole};
+use serde::Deserialize;
+use serde_json::json;
 use std::time::Duration;
+
+/// A role is explicit syntax, never an interpretation of a literal model ID.
+/// Resolve it from the host's trusted settings once at request admission.
+#[derive(Debug, Clone)]
+pub(super) enum Selector {
+    Exact(String),
+    Role(ModelRole),
+}
+
+impl Selector {
+    fn parse(value: &Value) -> Result<Self> {
+        if let Some(spec) = value.as_str() {
+            validate_selector(spec)?;
+            return Ok(Self::Exact(spec.to_string()));
+        }
+        if let Some(fields) = value.as_object()
+            && fields.len() == 1
+            && let Some(name) = fields.get("role").and_then(Value::as_str)
+            && let Some(role) = ModelRole::ALL
+                .into_iter()
+                .find(|role| role.as_str() == name)
+        {
+            return Ok(Self::Role(role));
+        }
+        Err(invalid(
+            "model must be an exact model string or an object containing only one canonical role name",
+        ))
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Exact(spec) => validate_selector(spec),
+            Self::Role(_) => Ok(()),
+        }
+    }
+
+    const fn fallback_role(&self) -> ModelRole {
+        match self {
+            Self::Exact(_) => ModelRole::Default,
+            Self::Role(role) => *role,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Selector {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::parse(&Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+pub(super) fn schema() -> Value {
+    json!({
+        "anyOf": [
+            {"type":"string", "minLength":1, "maxLength":512},
+            {"type":"object", "required":["role"], "additionalProperties":false,
+             "properties":{"role":{"type":"string", "enum":ModelRole::ALL.map(ModelRole::as_str)}}}
+        ],
+        "description":"Explicit destination for one delegation, worker_start or pool_start: exact provider/model[:thinking], an unambiguous exact model ID, or {role: canonicalName} from trusted modelRoles settings. An explicit role must be configured; it never falls back to default role or model selection. Overrides definition/task-role/parent defaults. Unknown, unavailable, disabled or unsupported destinations fail before launch. Put model on each tasks/chain entry or workflow call. Queued tasks, retries and workers/pools freeze the resolved destination and role-specific fallback policy. Seance accepts only the exact-model string form."
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Selection {
@@ -31,23 +95,14 @@ fn validate_selector(spec: &str) -> Result<()> {
         || matches!(spec, "default" | "inherit")
     {
         return Err(invalid(
-            "model must be an exact provider/model[:thinking] or unambiguous model ID, at most 512 bytes; roles, patterns and lists are unsupported",
+            "model strings must be an exact provider/model[:thinking] or unambiguous model ID, at most 512 bytes; use an object with role for configured roles, not aliases, patterns or lists",
         ));
     }
     Ok(())
 }
 
-fn field(value: &Value) -> Result<Option<&str>> {
-    value
-        .get("model")
-        .map(|model| {
-            let spec = model
-                .as_str()
-                .ok_or_else(|| invalid("model must be a string, not null or a list"))?;
-            validate_selector(spec)?;
-            Ok(spec)
-        })
-        .transpose()
+fn field(value: &Value) -> Result<Option<Selector>> {
+    value.get("model").map(Selector::parse).transpose()
 }
 
 /// Serde maps explicit null to None; validate before deserialization so an
@@ -112,6 +167,27 @@ impl Admission {
             ));
         }
         Ok(Self { config, registry })
+    }
+
+    fn resolve_selector(&self, selector: &Selector, host: &Path, cwd: &Path) -> Result<Selection> {
+        let spec = match selector {
+            Selector::Exact(spec) => spec.as_str(),
+            Selector::Role(role) => self
+                .config
+                .model_roles
+                .as_ref()
+                .and_then(|roles| crate::app::role_spec_from_settings(roles, *role))
+                .map(str::trim)
+                .ok_or_else(|| {
+                    invalid(
+                        "the requested role has no explicit trusted modelRoles assignment; no default-model fallback",
+                    )
+                })?,
+        };
+        // Use the same exact-ID-first admission as string selectors. A role
+        // does not bypass ambiguity, supported effort, credentials or either
+        // workspace's provider restrictions, nor clamp an unsupported effort.
+        self.resolve(spec, host, cwd)
     }
 
     fn resolve(&self, spec: &str, host: &Path, cwd: &Path) -> Result<Selection> {
@@ -183,16 +259,17 @@ fn fallback_policy(
     tool: &SubagentTool,
     config: &Config,
     agent: Option<&AgentDefinition>,
-    explicit_model: bool,
+    explicit_role: Option<ModelRole>,
     host: &Path,
     cwd: &Path,
 ) -> Result<String> {
-    let role = if explicit_model || agent.is_some_and(|agent| agent.model.is_some()) {
-        crate::models::ModelRole::Default
-    } else {
-        tool.role_model_role
-            .unwrap_or(crate::models::ModelRole::Default)
-    };
+    let role = explicit_role.unwrap_or_else(|| {
+        if agent.is_some_and(|agent| agent.model.is_some()) {
+            ModelRole::Default
+        } else {
+            tool.role_model_role.unwrap_or(ModelRole::Default)
+        }
+    });
     crate::failover::ChildFallbackPolicy::capture(config, role, &[host, cwd])
         .to_cli_arg()
         .map_err(|message| Error::tool("subagent", format!("PI_SUBAGENT_FALLBACK: {message}")))
@@ -257,7 +334,7 @@ pub(super) fn prepare_saved_session(tool: &SubagentTool, deadline: Deadline) -> 
     check(&owner, deadline)?;
     let host = directory(&tool.cwd, None)?;
     let config = host_config(tool)?;
-    let policy = fallback_policy(tool, &config, None, true, &host, &host)?;
+    let policy = fallback_policy(tool, &config, None, Some(ModelRole::Default), &host, &host)?;
     check(&owner, deadline)?;
     Ok(policy)
 }
@@ -273,8 +350,8 @@ pub(super) fn prepare<'a>(
         return Ok(());
     }
     for task in &pending {
-        if let Some(spec) = &task.model {
-            validate_selector(spec)?;
+        if let Some(selector) = &task.model {
+            selector.validate()?;
         }
     }
     let owner = AgentCx::for_current_or_request();
@@ -297,14 +374,14 @@ pub(super) fn prepare<'a>(
             tool,
             &config,
             agents.get(&task.agent),
-            task.model.is_some(),
+            task.model.as_ref().map(Selector::fallback_role),
             &host,
             &cwd,
         )?);
-        if let Some(spec) = task.model.as_deref()
+        if let Some(selector) = &task.model
             && let Some(admission) = &admission
         {
-            task.model_selection = Some(admission.resolve(spec, &host, &cwd)?);
+            task.model_selection = Some(admission.resolve_selector(selector, &host, &cwd)?);
         }
     }
     check(&owner, deadline)
@@ -319,14 +396,23 @@ pub(super) fn prepare_worker(
     cwd: &Path,
     deadline: Deadline,
 ) -> Result<(Option<Selection>, String)> {
-    let spec = field(input)?;
+    let selector = field(input)?;
     let owner = AgentCx::for_current_or_request();
     check(&owner, deadline)?;
     let host = directory(&tool.cwd, None)?;
     let config = host_config(tool)?;
-    let policy = fallback_policy(tool, &config, Some(agent), spec.is_some(), &host, cwd)?;
-    let selected = spec
-        .map(|spec| Admission::load(tool, config, deadline)?.resolve(spec, &host, cwd))
+    let policy = fallback_policy(
+        tool,
+        &config,
+        Some(agent),
+        selector.as_ref().map(Selector::fallback_role),
+        &host,
+        cwd,
+    )?;
+    let selected = selector
+        .map(|selector| {
+            Admission::load(tool, config, deadline)?.resolve_selector(&selector, &host, cwd)
+        })
         .transpose()?;
     check(&owner, deadline)?;
     Ok((selected, policy))
@@ -387,6 +473,7 @@ mod tests {
                     {"id": "selection-fast", "reasoning": false},
                     {"id": "selection-reasoner", "reasoning": true},
                     {"id": "vendor/model:1", "reasoning": false},
+                    {"id": "smol", "reasoning": false},
                     {"id": "selection-shared", "reasoning": false}
                 ]
             },
@@ -465,11 +552,93 @@ mod tests {
     }
 
     #[test]
+    fn configured_roles_keep_literal_ids_effort_and_explicit_fallback_identity() {
+        let admission = admission(Config {
+            model_roles: Some(crate::config::ModelRoleSettings {
+                smol: Some(" selection-local/selection-reasoner:high ".to_string()),
+                task: Some("selection-local/vendor/model:1".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let cwd = Path::new("/workspace");
+        let role = Selector::parse(&json!({"role":"smol"})).unwrap();
+        assert_eq!(
+            admission.resolve_selector(&role, cwd, cwd).unwrap(),
+            Selection {
+                provider: "selection-local".to_string(),
+                model: "selection-reasoner".to_string(),
+                thinking: Some(ThinkingLevel::High),
+            }
+        );
+        assert_eq!(role.fallback_role(), ModelRole::Smol);
+        let literal = Selector::parse(&json!("smol")).unwrap();
+        assert_eq!(
+            admission
+                .resolve_selector(&literal, cwd, cwd)
+                .unwrap()
+                .model,
+            "smol",
+            "a bare model ID must never become a role alias"
+        );
+        assert_eq!(literal.fallback_role(), ModelRole::Default);
+        let literal_suffix = admission
+            .resolve_selector(&Selector::Role(ModelRole::Task), cwd, cwd)
+            .unwrap();
+        assert_eq!(literal_suffix.model, "vendor/model:1");
+        assert_eq!(literal_suffix.thinking, None);
+    }
+
+    #[test]
+    fn missing_or_invalid_role_destinations_never_select_another_model() {
+        let cwd = Path::new("/workspace");
+        for spec in [
+            None,
+            Some(""),
+            Some("selection-shared"),
+            Some("unknown/selection-fast"),
+            Some("selection-local/selection-fast:high"),
+            Some("selection-local/selection-reasoner:max"),
+            Some("selection-keyed/selection-private"),
+            Some("private-credential-sentinel"),
+        ] {
+            let admission = admission(Config {
+                model_roles: Some(crate::config::ModelRoleSettings {
+                    default: Some("selection-local/selection-fast".to_string()),
+                    smol: spec.map(str::to_string),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let error = admission
+                .resolve_selector(&Selector::Role(ModelRole::Smol), cwd, cwd)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("PI_SUBAGENT_MODEL"), "{error}");
+            assert!(!error.contains("private-credential-sentinel"), "{error}");
+        }
+        let unconfigured = admission(Config::default());
+        for role in ModelRole::ALL {
+            assert!(
+                unconfigured
+                    .resolve_selector(&Selector::Role(role), cwd, cwd)
+                    .is_err(),
+                "{role} must have its own assignment, including default"
+            );
+        }
+    }
+
+    #[test]
     fn host_and_task_provider_restrictions_both_apply() {
         let host = Path::new("/host/project");
         let task = Path::new("/task/project");
+        let roles = crate::config::ModelRoleSettings {
+            smol: Some("selection-local/selection-fast".to_string()),
+            ..Default::default()
+        };
         for path in ["/host", "/task"] {
             let admission = admission(Config {
+                model_roles: Some(roles.clone()),
                 model_scope_overrides: Some(vec![crate::config::ModelScopeOverride {
                     path: path.to_string(),
                     disabled_providers: Some(vec!["selection-local".to_string()]),
@@ -478,12 +647,23 @@ mod tests {
                 ..Config::default()
             });
             assert!(admission.resolve("selection-fast", host, task).is_err());
+            assert!(
+                admission
+                    .resolve_selector(&Selector::Role(ModelRole::Smol), host, task)
+                    .is_err()
+            );
         }
         let admission = admission(Config {
+            model_roles: Some(roles),
             disabled_providers: Some(vec!["selection-local".to_string()]),
             ..Config::default()
         });
         assert!(admission.resolve("selection-fast", host, task).is_err());
+        assert!(
+            admission
+                .resolve_selector(&Selector::Role(ModelRole::Smol), host, task)
+                .is_err()
+        );
     }
 
     #[test]
@@ -491,9 +671,16 @@ mod tests {
         for input in [
             json!({"model": null}),
             json!({"model": ["selection-fast"]}),
+            json!({"model": {"role":"Smol"}}),
+            json!({"model": {"role":" smol"}}),
+            json!({"model": {"role":"@smol"}}),
+            json!({"model": {"role":"reviewer"}}),
+            json!({"model": {"role":null}}),
+            json!({"model": {"role":"smol", "model":"selection-fast"}}),
             json!({"tasks": [{"agent":"task", "task":"work", "model":null}]}),
             json!({"chain": [{"agent":"task", "task":"work", "model":42}]}),
             json!({"model":"selection-fast", "tasks":[{"agent":"task", "task":"work"}]}),
+            json!({"model":{"role":"smol"}, "chain":[{"agent":"task", "task":"work"}]}),
         ] {
             assert!(validate_request(&input).is_err(), "{input}");
         }
@@ -503,5 +690,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn role_schema_and_request_deserialization_agree_on_explicit_shape() {
+        let validator = jsonschema::validator_for(&schema()).unwrap();
+        for role in ModelRole::ALL {
+            let model = json!({"role":role.as_str()});
+            assert!(validator.is_valid(&model));
+            let request = json!({"agent":"task", "task":"work", "model":model});
+            validate_request(&request).unwrap();
+            let request: super::super::SubagentRequest = serde_json::from_value(request).unwrap();
+            assert_eq!(request.model.unwrap().fallback_role(), role);
+        }
+        for model in [
+            json!({}),
+            json!({"role":"Smol"}),
+            json!({"role":"smol", "thinking":"high"}),
+            json!({"role":["smol"]}),
+        ] {
+            assert!(!validator.is_valid(&model));
+            assert!(serde_json::from_value::<Selector>(model).is_err());
+        }
     }
 }

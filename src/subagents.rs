@@ -660,7 +660,7 @@ impl Tool for SubagentTool {
     fn description(&self) -> &'static str {
         concat!(
             "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both only when the host has admitted workspace trust. Scope never grants trust. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
-            " Model selection: an optional model on one task or workflow call accepts an exact provider/model[:thinking] or unambiguous catalog ID, overriding definition/task-role/parent defaults. Every explicit selector is checked before any child or worktree is created; unknown, unavailable, disabled or unsupported destinations fail without fallback. Put model on each tasks/chain entry, not the batch. worker_start and pool_start freeze the same option for their entire lifetime; send/push cannot switch models.",
+            " Model selection: an optional model on one task or workflow call accepts an exact provider/model[:thinking], unambiguous catalog ID, or {role: canonicalName} explicitly assigned in trusted modelRoles settings, overriding definition/task-role/parent defaults. An unconfigured role never falls back to another role or default model. Every explicit selector is checked before any child or worktree is created; unknown, unavailable, disabled or unsupported destinations fail without fallback. Put model on each tasks/chain entry, not the batch. worker_start and pool_start freeze the resolved destination and role-specific fallback policy for their entire lifetime; send/push cannot switch models. Seance accepts only exact-model strings.",
             " File instructions: ordinary single/tasks/chain requests and workflow calls accept taskFile instead of task. Supply an absolute read-admitted workspace/agent file or local:// scratch document, containing nonempty UTF-8 instructions of at most 4 MiB (workflow tasks retain their 64 KiB expanded-task limit). Every source is captured before any child starts or a background job is acknowledged; results retain taskFile and taskFileSha256 for the original bytes. Queued tasks, schema retries and revival use the captured instructions. File content never changes the selected agent, model, tools, workspace or approval policy. Seance and retained workers/pools do not accept taskFile.",
             " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
             " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
@@ -687,7 +687,7 @@ impl Tool for SubagentTool {
                 "taskFile": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Alternative to task: an absolute UTF-8 file path inside the read-admitted workspace/agent roots, or a local:// scratch document. Snapshot once before launch, at most 4 MiB; the submitted reference and SHA-256 of its original bytes are returned. Single, tasks, chain and workflow calls only; workflows retain a 64 KiB expanded-task limit."},
                 "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, chain, or workflow request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance."},
                 "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
-                "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit model for one delegation, worker_start or pool_start: provider/model with optional :thinking, or an unambiguous exact model ID. Overrides agent definition and task/smol/parent defaults. Validated before launch; unknown, unavailable or disabled models fail without fallback. Put model on each tasks/chain entry or workflow call. Workers/pools freeze it for their lifetime. Seance instead defaults to its saved branch model."},
+                "model": model_selection::schema(),
                 "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
                 "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "Single delegation isolation. worktree uses the existing captured-baseline and acceptance gates; non-Git directories refuse rather than falling back."},
                 "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "description": "Single delegation worktree disposition, requiring isolation: worktree. Defaults to apply; keep preserves it for inspection, drop reports the patch without writeback."},
@@ -711,7 +711,7 @@ impl Tool for SubagentTool {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
                         "taskFile": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute read-admitted file or local:// scratch document, mutually exclusive with task. Captured before any child starts; chain placeholders apply to the captured instructions."},
-                        "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit provider/model[:thinking] or unambiguous exact model ID. Overrides the definition and task/smol/parent defaults, frozen before any child or worktree is created."},
+                        "model": model_selection::schema(),
                         "cwd": {"type": "string", "minLength": 1},
                         "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
                         "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion; requires isolation: worktree."},
@@ -814,6 +814,12 @@ impl Tool for SubagentTool {
             ));
         }
         if seance::is_request(&input)? {
+            if input.get("model").is_some_and(|model| !model.is_string()) {
+                return Err(Error::tool(
+                    "subagent",
+                    "PI_SEANCE_INVALID: seance model must be an exact-model string; role selections are not supported",
+                ));
+            }
             return seance::execute(self, input, on_update.map(Arc::from), protect).await;
         }
         if let Some(plan) = workflow::Plan::parse(&input)? {
@@ -877,7 +883,7 @@ struct SubagentRequest {
     #[serde(default)]
     task_file: Option<String>,
     #[serde(default)]
-    model: Option<String>,
+    model: Option<model_selection::Selector>,
     /// Single-delegation workspace controls use the same runner as array entries.
     #[serde(default)]
     cwd: Option<PathBuf>,
@@ -1017,7 +1023,7 @@ struct SubagentTask {
     #[serde(skip)]
     task_file_sha256: Option<String>,
     #[serde(default)]
-    model: Option<String>,
+    model: Option<model_selection::Selector>,
     /// Admission resolves the public selector once. Retries, queues and hub
     /// revival retain this identity; callers cannot inject a resolved target.
     #[serde(skip)]

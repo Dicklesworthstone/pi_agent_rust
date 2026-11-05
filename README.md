@@ -736,6 +736,14 @@ stderr details, and are killed/reaped if the parent is cancelled. Child agents
 receive the declared tool allowlist; the default child allowlist deliberately
 excludes `subagent` to prevent accidental recursive delegation.
 
+An individual task can select an exact `model: "provider/model:thinking"` or
+an explicit configured role, such as `model: {"role": "smol"}`. Role selections
+require a trusted `modelRoles` assignment and are resolved before any child,
+worktree, or job starts. The selected model, thinking level, and role-specific
+fallback policy remain fixed for queued tasks and reusable workers or pools.
+See [subagent model selection](docs/subagent-definitions.md) for the supported
+roles and refusal behavior.
+
 With per-task `isolation: "worktree"`, a parallel batch captures each source
 workspace before launching children, including staged, unstaged, and untracked
 files. Queued children and corrective retries use that same baseline. Accepted
