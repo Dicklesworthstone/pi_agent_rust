@@ -64,9 +64,13 @@ pub async fn sync_ready_model_catalogs(
         .collect::<BTreeSet<_>>();
     let mut persisted = 0;
     for provider in providers {
-        // Account-scoped Bedrock discovery has no safe on-disk binding. Do
-        // not poll it in a job whose purpose is persisting verified membership.
-        if super::canonical_provider_key(&provider) == "amazon-bedrock" {
+        // These native discovery results are scoped to a cloud account or
+        // project and cannot be bound safely in the route-only disk schema.
+        // Avoid polling endpoints we must refuse to persist.
+        if matches!(
+            super::canonical_provider_key(&provider).as_str(),
+            "amazon-bedrock" | "google-vertex"
+        ) {
             continue;
         }
         if !force && !provider_catalog_refresh_due(models_path, &provider) {
