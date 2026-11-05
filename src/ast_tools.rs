@@ -184,8 +184,13 @@ pub(crate) fn source_outline(path: &Path, source: &str) -> Option<serde_json::Va
             partial = true;
         }
         let kind = node.kind();
+        // Python keyword tokens such as the anonymous `class` node are
+        // not declarations and must not consume the outline symbol limit.
+        if kind.as_ref() == "class" && node.field("name").is_none() {
+            continue;
+        }
         if !matches!(kind.as_ref(),
-            "function_item" | "function_definition" | "function_declaration"
+            "function_item" | "function_signature_item" | "function_definition" | "function_declaration"
             | "method_definition" | "method_declaration" | "method"
             | "struct_item" | "enum_item" | "trait_item" | "impl_item" | "mod_item"
             | "class_definition" | "class_declaration" | "class"
@@ -237,6 +242,30 @@ mod outline_tests {
         assert_eq!(symbols[1]["end_line"], 4);
         assert_eq!(outline["partial"], false);
         assert!(source_outline(Path::new("unknown.txt"), source).is_none());
+    }
+
+    #[test]
+    fn outline_includes_trait_method_signatures() {
+        let outline = source_outline(
+            Path::new("traits.rs"),
+            "trait Access { fn check(&self); }",
+        ).unwrap();
+        let names = outline["symbols"].as_array().unwrap().iter()
+            .filter_map(|row| row["name"].as_str()).collect::<Vec<_>>();
+        assert!(names.contains(&"Access"), "{outline}");
+        assert!(names.contains(&"check"), "{outline}");
+        assert_eq!(outline["partial"], false);
+    }
+
+    #[test]
+    fn python_class_keyword_does_not_create_a_nameless_symbol() {
+        let outline = source_outline(
+            Path::new("classes.py"),
+            "class Service:\\n    def run(self):\\n        pass\\n",
+        ).unwrap();
+        let symbols = outline["symbols"].as_array().unwrap();
+        assert_eq!(symbols.len(), 2, "{outline}");
+        assert!(symbols.iter().all(|row| row["name"].is_string()), "{outline}");
     }
 
     #[test]
