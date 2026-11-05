@@ -261,7 +261,7 @@ mod outline_tests {
     fn python_class_keyword_does_not_create_a_nameless_symbol() {
         let outline = source_outline(
             Path::new("classes.py"),
-            "class Service:\\n    def run(self):\\n        pass\\n",
+            "class Service:\n    def run(self):\n        pass\n",
         ).unwrap();
         let symbols = outline["symbols"].as_array().unwrap();
         assert_eq!(symbols.len(), 2, "{outline}");
