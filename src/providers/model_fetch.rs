@@ -598,16 +598,29 @@ async fn fetch_provider_model_catalog_with_route(
                 route_persistable: false,
                 fetched_at_unix_ms: Some(current_unix_timestamp_ms()?),
             }),
-            Ok(_) | Err(_) => Ok(ProviderModelCatalog {
-                provider: canonical_provider,
-                models: static_registry_models(provider)?,
-                reasoning_levels: ReasoningCatalog::new(),
-                service_tiers: ServiceTierCatalog::new(),
-                source: ModelCatalogSource::StaticFallback,
-                route_fingerprint: None,
-                route_persistable: false,
-                fetched_at_unix_ms: None,
-            }),
+            outcome => {
+                match &outcome {
+                    Err(error) => tracing::warn!(
+                        provider = %canonical_provider,
+                        error = %error,
+                        "native model discovery failed; using static fallback (not verified live)"
+                    ),
+                    Ok(_) => tracing::warn!(
+                        provider = %canonical_provider,
+                        "native model discovery returned no models; using static fallback"
+                    ),
+                }
+                Ok(ProviderModelCatalog {
+                    provider: canonical_provider,
+                    models: static_registry_models(provider)?,
+                    reasoning_levels: ReasoningCatalog::new(),
+                    service_tiers: ServiceTierCatalog::new(),
+                    source: ModelCatalogSource::StaticFallback,
+                    route_fingerprint: None,
+                    route_persistable: false,
+                    fetched_at_unix_ms: None,
+                })
+            },
         };
     }
     let effective_api_key = route.as_ref().map_or_else(
