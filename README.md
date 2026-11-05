@@ -371,6 +371,29 @@ Each standalone CLI invocation starts a new process, so its in-memory cache is
 fresh. The five-minute cache only avoids repeat discovery calls made within one
 long-lived process by SDK/library users; `--refresh-models` bypasses that cache.
 
+**Interactive model updates (experimental):** For authenticated, supported
+provider model-list endpoints, Pi checks the persisted catalog when interactive
+mode starts. A running FrankenTUI session checks for stale catalogs every
+15 minutes while its command driver is idle, and `/model refresh` explicitly
+requests fresh catalogs. The next `/model` picker reads the updated model
+identities without restarting Pi. `PI_DISABLE_AUTO_MODEL_SYNC=1` disables
+automatic refresh but not an explicit `/model refresh`. Manual `models.json`
+entries retain precedence. A failed fetch preserves the last verified list.
+
+The native live-list adapters currently cover Anthropic and Gemini alongside
+OpenAI-compatible endpoints. **AWS Bedrock and Google Vertex do not yet have
+native live catalog adapters.** Bedrock requires AWS-signed
+`ListFoundationModels` and inference-profile discovery; Vertex depends on
+project/location and Google authorization. Neither is implemented by treating
+the provider as an OpenAI-compatible `/v1/models` route.
+
+**Captured mouse transcript selection (experimental):** In the FrankenTUI
+conversation area, drag to select text and release to copy it to the clipboard.
+Wrapped HTTP(S) URL rows retain their full hyperlink target, and copied
+multirow URL text is reconstructed as a continuous link. Selection is bounded
+to 256 KiB. `--no-mouse-capture` remains available for native terminal selection.
+
+
 Discovery also reads usable `supported_reasoning_levels` advertisements, including
 `metadata.supported_reasoning_levels` and entries shaped as `{"effort":"high"}`.
 Nested metadata takes precedence. Pi preserves the advertised tiers through the

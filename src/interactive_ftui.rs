@@ -13249,6 +13249,16 @@ mod tests {
     }
 
     #[test]
+    fn model_refresh_is_an_explicit_ui_command() {
+        let (_agent_tx, agent_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
+        model.route_model_command("refresh");
+        assert_eq!(submit_rx.try_recv(), Ok(UiCommand::RefreshModels));
+        assert!(model.picker.is_none());
+    }
+
+    #[test]
     fn model_picker_reloads_catalog_during_running_session() {
         let (_tx, model) = new_model();
         let shared = Arc::new(Mutex::new(vec!["openai/old-model".to_string()]));
