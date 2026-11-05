@@ -540,10 +540,10 @@ fn provider_model_catalog_route_is_configured_at_path(
     let Some((base_url, api)) = model_catalog_provider_route_shape(provider, models_path)? else {
         return Ok(false);
     };
-    Ok(if canonical_provider_key(provider) == "amazon-bedrock" && api == "bedrock-converse-stream" {
-        base_url.is_empty()
-    } else {
-        catalog_models_url(&base_url, &api).is_some()
+    Ok(match (canonical_provider_key(provider).as_str(), api.as_str()) {
+        ("amazon-bedrock", "bedrock-converse-stream")
+        | ("google-vertex", "google-vertex") => base_url.is_empty(),
+        _ => catalog_models_url(&base_url, &api).is_some(),
     })
 }
 
@@ -578,9 +578,12 @@ async fn fetch_provider_model_catalog_with_route(
     route: Option<ModelCatalogProviderConfig>,
 ) -> Result<ProviderModelCatalog> {
     let canonical_provider = canonical_provider_key(provider);
-    if canonical_provider == "amazon-bedrock"
+    if matches!(
+        (canonical_provider.as_str(), route.as_ref().map(|route| route.api.as_str())),
+        ("amazon-bedrock", Some("bedrock-converse-stream"))
+            | ("google-vertex", Some("google-vertex"))
+    )
         && let Some(route) = route.as_ref()
-        && route.api == "bedrock-converse-stream"
     {
         // Account-specific AWS catalogs cannot be safely rebound across credential
         // rotation, so skip the general cache and refuse disk persistence.
@@ -679,8 +682,11 @@ async fn refresh_provider_model_catalog_with_route(
     api_key: &str,
     route: ModelCatalogProviderConfig,
 ) -> Result<ProviderModelCatalog> {
-    if canonical_provider_key(provider) == "amazon-bedrock"
-        && route.api == "bedrock-converse-stream"
+    if matches!(
+        (canonical_provider_key(provider).as_str(), route.api.as_str()),
+        ("amazon-bedrock", "bedrock-converse-stream")
+            | ("google-vertex", "google-vertex")
+    )
     {
         let live = fetch_live_models(provider, api_key, &route).await?;
         if live.models.is_empty() {
@@ -2458,6 +2464,13 @@ async fn fetch_live_models(
         return Ok(DiscoveredModels::from(normalize_model_ids(provider, models)?));
     }
 
+    if canonical_provider_key(provider) == "google-vertex"
+        && route.api == "google-vertex"
+    {
+        let models = super::vertex::discover_catalog_model_ids(api_key, route).await?;
+        return Ok(DiscoveredModels::from(normalize_model_ids(provider, models)?));
+    }
+
     if route.auth_header && custom_authorization.is_none() && api_key.trim().is_empty() {
         return Err(Error::api(
             "no api_key supplied; skipping live provider model fetch",
@@ -2833,6 +2846,25 @@ fn openai_compat_models_url(base_url: &str, api: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_vertex_route_is_discoverable_without_an_inference_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let models_path = directory.path().join("models.json");
+        assert!(
+            provider_model_catalog_route_is_configured_at_path("google-vertex", &models_path)
+                .unwrap()
+        );
+        assert!(
+            provider_model_catalog_route_is_configured_at_path("vertexai", &models_path)
+                .unwrap()
+        );
+        let route = crate::models::resolve_model_catalog_provider_config(
+            "google-vertex", &models_path,
+        ).unwrap().unwrap();
+        assert_eq!(route.api, "google-vertex");
+        assert!(route.base_url.is_empty());
+    }
 
     #[test]
     fn native_bedrock_route_is_discoverable_without_an_inference_endpoint() {
