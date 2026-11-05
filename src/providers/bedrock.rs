@@ -33,6 +33,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
+mod catalog;
+
+pub(crate) async fn discover_catalog_model_ids(
+    api_key: &str,
+    route: &crate::models::ModelCatalogProviderConfig,
+) -> Result<Vec<String>> {
+    catalog::discover_model_ids(api_key, route).await
+}
+
 mod request_options;
 mod streaming;
 
@@ -1271,6 +1280,24 @@ fn build_sigv4_headers(
     region: &str,
     now: DateTime<Utc>,
 ) -> Result<Sigv4Headers> {
+    build_sigv4_headers_for_method(
+        "POST", url, payload, access_key_id, secret_access_key, session_token, region, now,
+    )
+}
+
+fn build_sigv4_headers_for_method(
+    method: &str,
+    url: &Url,
+    payload: &[u8],
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+    region: &str,
+    now: DateTime<Utc>,
+) -> Result<Sigv4Headers> {
+    if !matches!(method, "GET" | "POST") {
+        return Err(Error::api("unsupported HTTP method for Bedrock SigV4 signing"));
+    }
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = now.format("%Y%m%d").to_string();
     let payload_hash = sha256_hex(payload);
@@ -1303,7 +1330,7 @@ fn build_sigv4_headers(
     }
 
     let canonical_request = format!(
-        "POST\n{canonical_uri}\n{canonical_query}\n{canonical_headers_block}\n{signed_headers}\n{payload_hash}"
+        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers_block}\n{signed_headers}\n{payload_hash}"
     );
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
     let credential_scope = format!("{date_stamp}/{region}/{BEDROCK_SERVICE}/aws4_request");
