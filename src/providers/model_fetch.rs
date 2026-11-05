@@ -540,7 +540,11 @@ fn provider_model_catalog_route_is_configured_at_path(
     let Some((base_url, api)) = model_catalog_provider_route_shape(provider, models_path)? else {
         return Ok(false);
     };
-    Ok(catalog_models_url(&base_url, &api).is_some())
+    Ok(if canonical_provider_key(provider) == "amazon-bedrock" && api == "bedrock-converse-stream" {
+        base_url.is_empty()
+    } else {
+        catalog_models_url(&base_url, &api).is_some()
+    })
 }
 
 /// Resolve a provider's catalog route while leaving every unused credential
@@ -574,6 +578,35 @@ async fn fetch_provider_model_catalog_with_route(
     route: Option<ModelCatalogProviderConfig>,
 ) -> Result<ProviderModelCatalog> {
     let canonical_provider = canonical_provider_key(provider);
+    if canonical_provider == "amazon-bedrock"
+        && let Some(route) = route.as_ref()
+        && route.api == "bedrock-converse-stream"
+    {
+        // Account-specific AWS catalogs cannot be safely rebound across credential
+        // rotation, so skip the general cache and refuse disk persistence.
+        return match fetch_live_models(provider, api_key, route).await {
+            Ok(live) if !live.models.is_empty() => Ok(ProviderModelCatalog {
+                provider: canonical_provider,
+                models: live.models,
+                reasoning_levels: live.reasoning_levels,
+                service_tiers: live.service_tiers,
+                source: ModelCatalogSource::Live,
+                route_fingerprint: None,
+                route_persistable: false,
+                fetched_at_unix_ms: Some(current_unix_timestamp_ms()?),
+            }),
+            Ok(_) | Err(_) => Ok(ProviderModelCatalog {
+                provider: canonical_provider,
+                models: static_registry_models(provider)?,
+                reasoning_levels: ReasoningCatalog::new(),
+                service_tiers: ServiceTierCatalog::new(),
+                source: ModelCatalogSource::StaticFallback,
+                route_fingerprint: None,
+                route_persistable: false,
+                fetched_at_unix_ms: None,
+            }),
+        };
+    }
     let effective_api_key = route.as_ref().map_or_else(
         || api_key.trim().to_string(),
         |route| effective_model_catalog_api_key(api_key, route),
@@ -646,6 +679,24 @@ async fn refresh_provider_model_catalog_with_route(
     api_key: &str,
     route: ModelCatalogProviderConfig,
 ) -> Result<ProviderModelCatalog> {
+    if canonical_provider_key(provider) == "amazon-bedrock"
+        && route.api == "bedrock-converse-stream"
+    {
+        let live = fetch_live_models(provider, api_key, &route).await?;
+        if live.models.is_empty() {
+            return Err(Error::api("Bedrock live model listing returned an empty catalog"));
+        }
+        return Ok(ProviderModelCatalog {
+            provider: canonical_provider_key(provider),
+            models: live.models,
+            reasoning_levels: live.reasoning_levels,
+            service_tiers: live.service_tiers,
+            source: ModelCatalogSource::Live,
+            route_fingerprint: None,
+            route_persistable: false,
+            fetched_at_unix_ms: Some(current_unix_timestamp_ms()?),
+        });
+    }
     let effective_api_key = effective_model_catalog_api_key(api_key, &route);
     let key = cache_key(provider, &effective_api_key, &route);
     let route_fingerprint = model_catalog_route_fingerprint(provider, &route);
@@ -2399,6 +2450,13 @@ async fn fetch_live_models(
     let provider = validate_provider_id(provider)?;
     validate_route_headers(route)?;
     let custom_authorization = custom_authorization_header(route);
+
+    if canonical_provider_key(provider) == "amazon-bedrock"
+        && route.api == "bedrock-converse-stream"
+    {
+        let models = super::bedrock::discover_catalog_model_ids(api_key, route).await?;
+        return Ok(DiscoveredModels::from(normalize_model_ids(provider, models)?));
+    }
 
     if route.auth_header && custom_authorization.is_none() && api_key.trim().is_empty() {
         return Err(Error::api(
