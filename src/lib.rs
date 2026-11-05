@@ -314,7 +314,6 @@ pub mod session_metrics;
 #[doc(hidden)]
 pub mod session_picker;
 pub mod session_recovery;
-#[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;
 #[doc(hidden)]
