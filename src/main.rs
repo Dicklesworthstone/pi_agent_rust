@@ -2541,13 +2541,20 @@ async fn run(
     let global_dir = Config::global_dir();
     let package_dir = invocation_path(&Config::package_dir(), &cwd);
     let models_path = default_models_path(&global_dir);
-    let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
-    // Existing user catalog loads immediately. Refresh provider membership
-    // only when stale, then rebuild the registry before creating the picker.
-    if startup_is_interactive
-        && pi::providers::model_fetch::sync_ready_model_catalogs(&auth, &model_registry, &models_path, false).await > 0
-    {
-        model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+    let model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+    // Never block interactive startup on slow model-discovery endpoints. The
+    // already-loaded registry remains usable immediately; the running FTUI
+    // periodically reloads any newly persisted catalog membership.
+    // ACP is independent of the interactive terminal and must not sync here.
+    if startup_is_interactive && !cli.acp {
+        let sync_auth = auth.clone();
+        let sync_registry = model_registry.clone();
+        let sync_models_path = models_path.clone();
+        let _ = runtime_handle.spawn(async move {
+            pi::providers::model_fetch::sync_ready_model_catalogs(
+                &sync_auth, &sync_registry, &sync_models_path, false,
+            ).await
+        });
     }
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
