@@ -544,8 +544,8 @@ impl FileMutationRecorder {
         let inner = &mut *inner;
         if let Some(unit) = inner.pending.remove(tool_call_id) {
             release_unit(&mut inner.store, &unit);
+            self.persist(inner, false);
         }
-        self.persist(inner, false);
     }
 
     /// Undo up to `n` mutation units, newest first.
