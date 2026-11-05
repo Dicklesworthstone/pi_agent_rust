@@ -45,7 +45,7 @@ mod imp {
 
     /// Folded-stack snapshot of everything sampled so far.
     pub fn folded_snapshot() -> Result<Vec<String>, String> {
-        let mut slot = GUARD.lock().map_err(|_| "profiler lock poisoned")?;
+        let slot = GUARD.lock().map_err(|_| "profiler lock poisoned")?;
         let Some(guard) = slot.as_ref() else {
             return Err("profiler not running".into());
         };

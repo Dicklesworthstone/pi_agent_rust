@@ -2785,7 +2785,8 @@ async fn fetch_native_models(provider: &str, api_key: &str, route: &ModelCatalog
             } else { "pageToken" }, cursor);
         }
         let url_text = url.to_string();
-        let mut request = Client::new().get(&url_text).header("Accept", "application/json");
+        let client = Client::new();
+        let mut request = client.get(&url_text).header("Accept", "application/json");
         if !custom_key {
             let name = if route.api == "anthropic-messages" { "x-api-key" } else { "x-goog-api-key" };
             request = request.try_header(name, api_key.trim())?;

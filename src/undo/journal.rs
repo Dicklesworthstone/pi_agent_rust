@@ -9,6 +9,17 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 const SCHEMA: &str = "pi.undo.journal.v1";
+
+/// Encode SHA-256 as lowercase hexadecimal without relying on digest-array
+/// formatting traits.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(64);
+    for byte in sha2::Sha256::digest(bytes) {
+        write!(&mut encoded, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    encoded
+}
 pub(super) const MAX_UNITS: usize = 4096;
 
 #[derive(Debug)]
@@ -93,7 +104,7 @@ impl FileMutationRecorder {
         if let Err(error) = setup {
             return Ok(Self::unavailable_journal(error));
         }
-        let name = format!("{:x}.json", sha2::Sha256::digest(session_id.as_bytes()));
+        let name = format!("{}.json", sha256_hex(session_id.as_bytes()));
         Ok(Self::open_session_journal(&directory.join(name), session_id, roots))
     }
 
@@ -133,7 +144,7 @@ impl FileMutationRecorder {
                 let limit = budget_bytes.saturating_mul(2).saturating_add(4 * 1024 * 1024);
                 let bytes = read_bounded_snapshot(file, limit)?;
                 let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|_| snapshot_error("invalid undo journal"))?;
-                if envelope.sha256 != format!("{:x}", sha2::Sha256::digest(envelope.payload.as_bytes())) {
+                if envelope.sha256 != sha256_hex(envelope.payload.as_bytes()) {
                     return Err(snapshot_error("undo journal checksum mismatch"));
                 }
                 let document: Document = serde_json::from_str(&envelope.payload).map_err(|_| snapshot_error("invalid undo journal payload"))?;
@@ -240,7 +251,7 @@ impl Journal {
             undo:inner.undo_stack.clone(), redo:inner.redo_stack.clone(), pending:inner.pending.clone().into_iter().collect(),
             evicted_units:inner.evicted_units,unrecorded_files:inner.unrecorded_files,restoring };
         let payload = serde_json::to_string(&document).map_err(io::Error::other)?;
-        let envelope = Envelope { sha256:format!("{:x}", sha2::Sha256::digest(payload.as_bytes())),payload };
+        let envelope = Envelope { sha256:sha256_hex(payload.as_bytes()),payload };
         let encoded = serde_json::to_vec(&envelope).map_err(io::Error::other)?;
         if encoded.len() as u64 > budget_bytes.saturating_mul(2).saturating_add(4 * 1024 * 1024) {
             return Err(snapshot_error("undo journal byte limit exceeded"));
@@ -259,6 +270,14 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_hex_encodes_digest_without_debug_array_syntax() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+    }
 
     #[test]
     fn restart_restores_history_and_conflict_checks() {

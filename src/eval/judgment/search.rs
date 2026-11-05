@@ -115,7 +115,14 @@ fn screening_evidence(source: &str, outline: Option<&Value>) -> Value {
     json!({"outline":outline,"declarations":declarations,"method":"ast"})
 }
 
-fn digest(text: &str) -> String { format!("{:x}", Sha256::digest(text.as_bytes())) }
+fn digest(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(text.as_bytes()) {
+        write!(&mut encoded, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    encoded
+}
 
 fn relative_path(path: &str) -> bool {
     !path.is_empty() && path.len() <= 4096 && !path.contains(['\\', ':'])
@@ -181,7 +188,8 @@ impl Invocation<'_> {
         // Raw hashes are strictly internal; only privacy-projected evidence may leave this operation.
         let mut raw_identities: BTreeMap<String, String> = BTreeMap::new();
         for path in &paths {
-            crate::agent_cx::AgentCx::for_current_or_request().checkpoint().map_err(public_error)?;
+            crate::agent_cx::AgentCx::for_current_or_request().checkpoint()
+                .map_err(|_| "PI_SEARCH_CANCELLED: source search cancelled".to_owned())?;
             let result = self.call_host_output(host, "read".into(), json!({"path":path,"raw":true})).await;
             let raw = match result.and_then(|output| source(&output)) {
                 Ok(raw) => raw,
@@ -297,6 +305,14 @@ impl Invocation<'_> {
 mod tests {
     use super::*;
     use crate::model::TextContent;
+
+    #[test]
+    fn digest_has_standard_lowercase_sha256_encoding() {
+        assert_eq!(
+            digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+    }
 
     #[test]
     fn public_evidence_identity_cannot_expose_unscreened_secret() {
