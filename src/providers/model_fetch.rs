@@ -299,11 +299,16 @@ fn custom_authorization_header(route: &ModelCatalogProviderConfig) -> Option<&st
 fn cache_key(provider: &str, api_key: &str, route: &ModelCatalogProviderConfig) -> String {
     let mut hasher = Sha256::new();
     let route_fingerprint = model_catalog_route_fingerprint(provider, route);
-    let transmitted_api_key = if route.auth_header && custom_authorization_header(route).is_none() {
-        api_key.trim()
-    } else {
-        ""
+    let native_header = match route.api.as_str() {
+        "anthropic-messages" => Some("x-api-key"),
+        "google-generative-ai" => Some("x-goog-api-key"),
+        _ => None,
     };
+    let sends_caller_key = native_header.map_or_else(
+        || route.auth_header && custom_authorization_header(route).is_none(),
+        |name| !route.headers.keys().any(|key| key.eq_ignore_ascii_case(name)),
+    );
+    let transmitted_api_key = if sends_caller_key { api_key.trim() } else { "" };
     for component in [
         b"pi.models.fetch-cache.v1".as_slice(),
         route_fingerprint.as_bytes(),
@@ -3685,6 +3690,29 @@ mod tests {
             cache_key("openai", "unused-caller-b", &custom),
             "a complete custom Authorization header must bind the credential actually sent, not an unused caller key"
         );
+    }
+
+    #[test]
+    fn native_catalog_cache_separates_transmitted_keys() {
+        for (provider, header) in [
+            ("anthropic", "x-api-key"),
+            ("google", "x-goog-api-key"),
+        ] {
+            let route = built_in_route(provider);
+            let first = cache_key(provider, "account-a", &route);
+            assert_ne!(first, cache_key(provider, "account-b", &route));
+            assert!(!first.contains("account-a"));
+
+            let mut custom = route;
+            custom.headers.insert(header.to_owned(), "route-owned".to_owned());
+            assert_eq!(
+                cache_key(provider, "unused-a", &custom),
+                cache_key(provider, "unused-b", &custom),
+                "the caller key must not affect native route cache when a custom header is sent"
+            );
+            custom.headers.insert(header.to_owned(), "different-account".to_owned());
+            assert_ne!(first, cache_key(provider, "unused-a", &custom));
+        }
     }
 
     #[test]
