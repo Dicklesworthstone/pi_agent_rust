@@ -70,12 +70,14 @@ mod queued_compaction;
 pub mod session_pins;
 mod settings;
 mod textarea;
+mod transcript_selection;
 pub mod tool_progress;
 mod workspace_commands;
 
 pub use queued_compaction::QueuedCompaction;
 pub use settings::{SettingsKey, SettingsSnapshot};
 use textarea::TextArea;
+use transcript_selection::{Point as TranscriptPoint, Selection as TranscriptSelection};
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -2249,6 +2251,8 @@ pub struct PiFtuiModel {
     /// semantics as `follow_stream_tail` in the bubbletea stack, but derived
     /// instead of stored so update() never needs the rendered line count.
     scroll_from_tail: usize,
+    /// Drag selection while the terminal routes mouse events to this UI.
+    transcript_selection: Option<TranscriptSelection>,
     /// Total rendered conversation lines from the last frame. Markdown
     /// rendering expands the raw text (blank lines after blocks, fence
     /// chrome), so the raw-line approximation in `conversation_line_count()`
@@ -2676,6 +2680,7 @@ impl PiFtuiModel {
             term_size_known: false,
             rendered_frame_height: std::cell::Cell::new(0),
             scroll_from_tail: 0,
+            transcript_selection: None,
             rendered_total_lines: std::cell::Cell::new(0),
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
 
@@ -3735,6 +3740,103 @@ impl PiFtuiModel {
 
     const fn scroll_down(&mut self, lines: usize) {
         self.scroll_from_tail = self.scroll_from_tail.saturating_sub(lines);
+    }
+
+    /// Convert a physical mouse location to an already-wrapped transcript cell.
+    /// Outside-body drags clamp only while a transcript gesture is active.
+    fn transcript_mouse_point(
+        &self,
+        x: u16,
+        y: u16,
+        clamp: bool,
+    ) -> Option<TranscriptPoint> {
+        if self.picker.is_some() || self.custom_overlay_open() || self.settings_pending {
+            return None;
+        }
+        let frame_height = self.rendered_frame_height.get();
+        if frame_height == 0 || self.term.0 == 0 {
+            return None;
+        }
+        let y = if self.alt_screen {
+            y
+        } else {
+            if !self.term_size_known { return None; }
+            let top = self.term.1.saturating_sub(frame_height);
+            if y < top && !clamp { return None; }
+            y.saturating_sub(top)
+        };
+        let areas = layout_regions(
+            Rect::new(0, 0, self.term.0, frame_height),
+            self.input_rows_at_width(self.term.0),
+            u16::from(self.error_banner.is_some()),
+            self.widget_rows(),
+            self.completion_rows(),
+        );
+        let body = areas.body;
+        if body.height == 0 || body.width == 0 {
+            return None;
+        }
+        if !clamp && (y < body.y || y >= body.y.saturating_add(body.height)
+            || x < body.x || x >= body.x.saturating_add(body.width)) {
+            return None;
+        }
+        let transcript = self.conversation_text(body.width);
+        let total = transcript.lines().len();
+        if total == 0 { return None; }
+        let visible = usize::from(body.height);
+        let from_tail = self.scroll_from_tail.min(total.saturating_sub(visible));
+        let offset = total.saturating_sub(visible + from_tail);
+        let body_row = y.saturating_sub(body.y).min(body.height - 1);
+        let row = (offset + usize::from(body_row)).min(total - 1);
+        let cell = usize::from(x.saturating_sub(body.x).min(body.width));
+        Some(TranscriptPoint { row, cell })
+    }
+
+    /// Mouse capture owns body selection; the composer still handles its own
+    /// clicks and drags when this returns false.
+    fn handle_transcript_mouse(&mut self, mouse: &ftui::core::event::MouseEvent) -> bool {
+        use ftui::core::event::MouseButton;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(point) = self.transcript_mouse_point(mouse.x, mouse.y, false) else {
+                    self.transcript_selection = None;
+                    return false;
+                };
+                self.transcript_selection = Some(TranscriptSelection::new(point));
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.transcript_selection.is_some() => {
+                if let Some(point) = self.transcript_mouse_point(mouse.x, mouse.y, true)
+                    && let Some(selection) = &mut self.transcript_selection
+                {
+                    selection.focus = point;
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.transcript_selection.is_some() => {
+                let Some(mut selection) = self.transcript_selection.take() else {
+                    return true;
+                };
+                if let Some(point) = self.transcript_mouse_point(mouse.x, mouse.y, true) {
+                    selection.focus = point;
+                }
+                if !selection.is_empty() {
+                    let transcript = self.conversation_text(self.term.0);
+                    match transcript_selection::selected_text(
+                        transcript.lines(), selection, 256 * 1024
+                    ) {
+                        Some(text) => {
+                            let notice = crate::interactive::copy_text_to_clipboard(&text);
+                            self.push_entry(EntryRole::System, notice);
+                        }
+                        None => self.push_entry(EntryRole::Error,
+                            "Transcript selection is empty or exceeds 256 KiB.".to_string()),
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7009,8 +7111,9 @@ impl PiFtuiModel {
             }
             Event::Mouse(_) if !self.mouse => {}
             Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_up(3),
-                MouseEventKind::ScrollDown => self.scroll_down(3),
+                MouseEventKind::ScrollUp => { self.transcript_selection = None; self.scroll_up(3); },
+                MouseEventKind::ScrollDown => { self.transcript_selection = None; self.scroll_down(3); },
+                _ if self.handle_transcript_mouse(mouse) => {},
                 _ if self.editor_mouse_active() => {
                     let mut local = *mouse;
                     if !self.alt_screen {
@@ -7039,6 +7142,7 @@ impl PiFtuiModel {
                 // Mouse coordinates belong to the last painted viewport.
                 // Wait for the resized editor to render before using them.
                 self.input.reset_mouse_interaction();
+                self.transcript_selection = None;
                 // Cached blocks are wrapped (issue #227) and their tables
                 // fitted (gh #195) for one width; drop them when it changes.
                 // Height-only resizes keep the cache. `conversation_text`
@@ -7448,6 +7552,9 @@ impl PiFtuiModel {
             };
             wrap_body_block(&mut tail, wrap_width, &theme);
             lines.extend(tail);
+        }
+        if let Some(selection) = self.transcript_selection {
+            transcript_selection::highlight(&mut lines, selection, self.palette.accent);
         }
         Text::from_lines(lines)
     }
