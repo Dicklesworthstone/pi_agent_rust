@@ -2976,9 +2976,18 @@ impl PiFtuiModel {
     /// Pin an error above the editor. The banner is one row, so an error it
     /// cannot show whole (a multi-line extension stack trace, say) is also
     /// written in full to the conversation, where it wraps and scrolls; the
-    /// banner then shows its first line and points there (gh #280).
+    /// banner then shows its first line and points there (gh #280). A failed
+    /// turn's AgentDone has usually written that text, or the provider card
+    /// that starts with it, already: one copy since the last prompt is enough.
     fn set_error_banner(&mut self, text: String) {
-        if banner_needs_transcript(&text) {
+        if banner_needs_transcript(&text)
+            && !self
+                .transcript
+                .iter()
+                .rev()
+                .take_while(|entry| entry.role != EntryRole::User)
+                .any(|entry| entry.role == EntryRole::Error && entry.text.contains(text.as_str()))
+        {
             self.push_entry(EntryRole::Error, text.clone());
         }
         self.error_banner = Some(text);
@@ -3207,7 +3216,9 @@ impl PiFtuiModel {
             return None;
         }
         if self.pending_image_pastes.len() >= MAX_PENDING_IMAGE_PASTES {
-            self.error_banner = Some(String::from(
+            // Wider than BANNER_INLINE_MAX_WIDTH: set_error_banner writes the
+            // conversation copy that a cut banner's pointer refers to.
+            self.set_error_banner(String::from(
                 "Clipboard image pastes are still running; wait before pasting another image.",
             ));
             return None;
@@ -26285,6 +26296,72 @@ mod tests {
         let row = banner_row("provider said no to this request", 24);
         assert!(!row.contains("full error"), "{row:?}");
         assert!(row.ends_with('…'), "{row:?}");
+    }
+
+    /// A failed turn ends with AgentDone, which already writes the error (or
+    /// its provider card) to the conversation, and then AgentError pins the
+    /// same text above the editor. A long error must not be written twice.
+    #[test]
+    fn long_turn_error_reaches_the_conversation_once() {
+        let error = "Extension error: host write denied: path outside extension root\n    at checkWriteAccess (node:fs:45:58)";
+        let headline =
+            "Provider error: example-gateway-provider: HTTP 503 (service unavailable / overloaded)";
+        let card = format!("{headline}\nnot retryable as-is\nDetail: upstream overloaded");
+        for (stop_reason, done_text, banner_text) in [
+            (StopReason::ToolUse, error.to_string(), error),
+            (StopReason::Error, card, headline),
+        ] {
+            let (_agent_tx, rx) = mpsc::channel();
+            let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+            sim.init();
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+                usage: None,
+                stop_reason,
+                error_message: Some(done_text.clone()),
+            }));
+            sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(banner_text.to_string())));
+            assert_eq!(sim.model().error_banner.as_deref(), Some(banner_text));
+            let errors = sim
+                .model()
+                .transcript
+                .iter()
+                .filter(|e| e.role == EntryRole::Error)
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(errors, [done_text.as_str()], "one copy in the conversation");
+        }
+    }
+
+    /// The banner's "full error above" pointer must have a copy to point at,
+    /// including for banners raised outside the agent error path.
+    #[test]
+    fn long_clipboard_banner_has_the_copy_its_pointer_promises() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 60,
+            height: 20,
+        });
+        for _ in 0..MAX_PENDING_IMAGE_PASTES {
+            sim.model_mut()
+                .begin_image_paste()
+                .expect("bounded capture");
+        }
+        for _ in 0..2 {
+            assert!(sim.model_mut().begin_image_paste().is_none());
+        }
+        let banner = sim.model().error_banner.clone().expect("limit banner");
+        let rendered = buffer_text(sim.capture_frame(60, 20), 60, 20);
+        assert!(rendered.contains("full error above"), "{rendered:?}");
+        let copies = sim
+            .model()
+            .transcript
+            .iter()
+            .filter(|e| e.role == EntryRole::Error && e.text == banner)
+            .count();
+        assert_eq!(copies, 1, "{:?}", sim.model().transcript);
     }
 
     #[test]
