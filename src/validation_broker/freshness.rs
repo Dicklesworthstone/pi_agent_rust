@@ -202,7 +202,7 @@ fn hash_file(path: &Path, remaining_bytes: &mut u64) -> Result<String> {
             | rustix::fs::OFlags::NOFOLLOW
             | rustix::fs::OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
-    )?);
+    ).map_err(std::io::Error::from)?);
     #[cfg(not(unix))]
     let mut file = {
         let mut options = fs::OpenOptions::new();
