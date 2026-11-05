@@ -28,6 +28,15 @@ use futures::StreamExt;
 use futures::stream::Stream;
 use std::pin::Pin;
 
+mod catalog;
+
+pub(crate) async fn discover_catalog_model_ids(
+    api_key: &str,
+    route: &crate::models::ModelCatalogProviderConfig,
+) -> Result<Vec<String>> {
+    catalog::discover_model_ids(api_key, route).await
+}
+
 #[cfg(test)]
 mod tests_transport;
 
