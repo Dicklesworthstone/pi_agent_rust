@@ -4367,19 +4367,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
     let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
-        let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-            ResolvedCompactionSettings::default().context_window_tokens
-        } else {
-            selection.model_entry.model.context_window
-        };
-        ResolvedCompactionSettings {
-            enabled: config.compaction_enabled(),
-            reserve_tokens: config.compaction_reserve_tokens(),
-            keep_recent_tokens: config.compaction_keep_recent_tokens(),
-            context_window_tokens,
-            mode: config.compaction_mode(),
-            render_mode: config.compaction_render_mode(),
-        }
+        config.resolved_compaction_settings(selection.model_entry.model.context_window)
     });
 
     let mut agent_session = AgentSession::new(
@@ -10306,6 +10294,8 @@ printf sdk-owned-command-key
             context_window_tokens: 55_555,
             reserve_tokens: 1_234,
             keep_recent_tokens: 4_321,
+            threshold_tokens: Some(20_000),
+            threshold_percent: Some(50.0),
             mode: crate::compaction::AutoCompactionMode::default(),
             render_mode: crate::compaction::CompactionRenderMode::default(),
         };
@@ -10320,19 +10310,40 @@ printf sdk-owned-command-key
         assert_eq!(resolved.context_window_tokens, custom.context_window_tokens);
         assert_eq!(resolved.reserve_tokens, custom.reserve_tokens);
         assert_eq!(resolved.keep_recent_tokens, custom.keep_recent_tokens);
+        assert_eq!(resolved.threshold_tokens, custom.threshold_tokens);
+        assert_eq!(resolved.threshold_percent, custom.threshold_percent);
+        assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
     #[test]
     fn create_agent_session_derives_compaction_without_override() {
         let tmp = tempdir().expect("tempdir");
-        let options = hermetic_session_options(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".pi")).expect("project config directory");
+        std::fs::write(
+            tmp.path().join(".pi/settings.json"),
+            r#"{"compaction":{
+                "enabled":true,"reserveTokens":1234,"keepRecentTokens":4321,
+                "thresholdTokens":20000,"thresholdPercent":50
+            }}"#,
+        )
+        .expect("project compaction settings");
+        let options = SessionOptions {
+            workspace_trusted: true,
+            ..hermetic_session_options(tmp.path())
+        };
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let resolved = handle.compaction_settings();
+        assert!(resolved.enabled);
         assert!(
             resolved.context_window_tokens > 0,
             "derived settings must resolve a context window"
         );
+        assert_eq!(resolved.reserve_tokens, 1_234);
+        assert_eq!(resolved.keep_recent_tokens, 4_321);
+        assert_eq!(resolved.threshold_tokens, Some(20_000));
+        assert_eq!(resolved.threshold_percent, Some(50.0));
+        assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
     #[test]

@@ -15776,12 +15776,6 @@ mod retry_tests {
     }
 }
 
-fn should_auto_compact(tokens_before: u64, context_window: u32, reserve_tokens: u32) -> bool {
-    let reserve = u64::from(reserve_tokens);
-    let window = u64::from(context_window);
-    tokens_before > window.saturating_sub(reserve)
-}
-
 fn emit_auto_compaction_error(
     out_tx: &std::sync::mpsc::SyncSender<String>,
     error_message: impl Into<String>,
@@ -15835,25 +15829,12 @@ async fn maybe_auto_compact(
         ) else {
             return;
         };
-        let context_window = entry.model.context_window;
-
-        let reserve_tokens = options.config.compaction_reserve_tokens();
-        // Carry the configured mode (shake-first/aggressive) and the real
-        // model window: `prepare_compaction` re-checks the threshold against
-        // `context_window_tokens`, so the 128k default would silently disable
-        // auto-compaction for smaller-window models.
-        let settings = ResolvedCompactionSettings {
-            enabled: true,
-            reserve_tokens,
-            keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
-            context_window_tokens: if context_window == 0 {
-                ResolvedCompactionSettings::default().context_window_tokens
-            } else {
-                context_window
-            },
-            mode: options.config.compaction_mode(),
-            render_mode: options.config.compaction_render_mode(),
-        };
+        let mut settings = options
+            .config
+            .resolved_compaction_settings(entry.model.context_window);
+        // The live RPC auto-compaction toggle gates admission, so it may
+        // enable compaction even when startup settings disabled it.
+        settings.enabled = true;
 
         let prepare = |inner_session: &Session| {
             let path_entries = inner_session
@@ -15867,7 +15848,6 @@ async fn maybe_auto_compact(
                 reader.name(),
                 reader.model_id(),
             )
-            .filter(|prep| should_auto_compact(prep.tokens_before, context_window, reserve_tokens))
         };
         let Some(mut prep) = prepare(&inner_session) else {
             return;
@@ -19284,6 +19264,7 @@ mod tests {
             reserve_tokens: Some(2),
             keep_recent_tokens: Some(1),
             mode: None,
+            ..Default::default()
         });
         let auth_dir = tempfile::tempdir().expect("tempdir");
         let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth load");
@@ -22910,6 +22891,7 @@ export default function init(pi) {
                     reserve_tokens: Some(63),
                     keep_recent_tokens: Some(1),
                     mode: None,
+                    ..Default::default()
                 });
                 let cx = AgentCx::for_request();
                 let admission = session // ubs:ignore[rust.ownership.unwrap-expect] -- Match production RPC admission ownership.
@@ -26613,37 +26595,145 @@ export default function init(pi) {
         assert!(delay <= config.retry_max_delay_ms());
     }
 
-    // -----------------------------------------------------------------------
-    // should_auto_compact
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn auto_compact_below_threshold() {
-        // 50k tokens used, 200k window, 40k reserve → threshold = 160k → no compact
-        assert!(!should_auto_compact(50_000, 200_000, 40_000));
-    }
+    fn auto_compaction_uses_configured_thresholds_and_rpc_toggle() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
 
-    #[test]
-    fn auto_compact_above_threshold() {
-        // 170k tokens used, 200k window, 40k reserve → threshold = 160k → compact
-        assert!(should_auto_compact(170_000, 200_000, 40_000));
-    }
-
-    #[test]
-    fn auto_compact_exact_threshold() {
-        // Exactly at threshold → not above → no compact
-        assert!(!should_auto_compact(160_000, 200_000, 40_000));
-    }
-
-    #[test]
-    fn auto_compact_reserve_exceeds_window() {
-        // reserve > window → window - reserve saturates to 0 → any tokens > 0 triggers compact
-        assert!(should_auto_compact(1, 100, 200));
-    }
-
-    #[test]
-    fn auto_compact_zero_tokens() {
-        assert!(!should_auto_compact(0, 200_000, 40_000));
+        runtime.block_on(Box::pin(async move {
+            for (case, threshold_tokens, threshold_percent, context_window, expected_compaction) in [
+                ("tokens", Some(80_000), None, 200_000, true),
+                ("percent", None, Some(40.0), 200_000, true),
+                ("earlier token", Some(80_000), Some(60.0), 200_000, true),
+                ("earlier percent", Some(120_000), Some(40.0), 200_000, true),
+                ("percent on larger model", None, Some(40.0), 400_000, false),
+                ("reserve only", None, None, 200_000, false),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::in_memory();
+                stored.header.provider = Some("test-provider".to_string());
+                stored.header.model_id = Some("test-model".to_string());
+                // End at measured usage so 80k is the exact boundary. Both
+                // configured triggers precede the reserve-only 160k trigger.
+                for (index, tokens) in [40_000, 80_000].into_iter().enumerate() {
+                    stored.append_message(crate::session::SessionMessage::User {
+                        content: UserContent::Text(format!("user turn {index}")),
+                        timestamp: Some(0),
+                    });
+                    stored.append_message(crate::session::SessionMessage::Assistant {
+                        message: AssistantMessage {
+                            content: vec![ContentBlock::Text(TextContent::new(format!(
+                                "assistant turn {index}"
+                            )))],
+                            api: "test-api".to_string(),
+                            provider: "test-provider".to_string(),
+                            model: "test-model".to_string(),
+                            usage: Usage {
+                                total_tokens: tokens,
+                                ..Usage::default()
+                            },
+                            stop_reason: StopReason::Stop,
+                            stop_details: None,
+                            error_message: None,
+                            timestamp: 0,
+                        },
+                    });
+                }
+                let first_kept_entry_id = stored.entries[2]
+                    .base_id()
+                    .expect("second user entry ID")
+                    .clone();
+                let original_messages = stored.to_messages_for_current_path();
+                // Keep the entire second turn under either token-counter
+                // feature; changing the trigger must not change retention.
+                let table = crate::token_count::table_for_model("test-provider", "test-model");
+                let counter = crate::token_count::active_counter();
+                let keep_recent_tokens = u32::try_from(
+                    counter.count("user turn 1", table)
+                        + counter.count("assistant turn 1\n", table),
+                )
+                .expect("small retained turn");
+                assert!(keep_recent_tokens > 0);
+                let agent_session = Arc::new(asupersync::sync::Mutex::new(handoff_agent_session(
+                    stored,
+                    false,
+                    Arc::new(CompactionSummaryProvider),
+                )));
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                model.model.context_window = context_window;
+                options.available_models = vec![model];
+                options.config = serde_json::from_value(json!({
+                    "compaction": {
+                        "enabled": false,
+                        "reserveTokens": 40_000,
+                        "keepRecentTokens": keep_recent_tokens,
+                        "thresholdTokens": threshold_tokens,
+                        "thresholdPercent": threshold_percent
+                    }
+                }))
+                .expect("compaction config");
+                let mut state = RpcSharedState::new(&options.config);
+                assert!(!state.auto_compaction_enabled);
+                // set_auto_compaction updates shared RPC state, not the
+                // startup config. The post-turn caller checks this flag.
+                state.auto_compaction_enabled = true;
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(state));
+                let is_compacting = Arc::new(AtomicBool::new(false));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                maybe_auto_compact(
+                    Arc::clone(&agent_session),
+                    shared_state,
+                    options,
+                    Arc::clone(&is_compacting),
+                    out_tx,
+                )
+                .await;
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert!(!is_compacting.load(Ordering::SeqCst), "{case}");
+                let cx = AgentCx::for_request();
+                let live = agent_session.lock(&cx).await.expect("live session");
+                let stored = live.session.lock(&cx).await.expect("stored session");
+                if !expected_compaction {
+                    assert!(events.is_empty(), "{case}: {events:?}");
+                    assert_eq!(provider_compaction_count(&stored), 0, "{case}");
+                    assert_eq!(
+                        serde_json::to_value(live.agent.messages()).unwrap(),
+                        serde_json::to_value(&original_messages).unwrap(),
+                        "{case} must leave the context unchanged",
+                    );
+                    continue;
+                }
+                assert_eq!(events.len(), 2, "{case}: {events:?}");
+                assert_eq!(events[0]["type"], "auto_compaction_start", "{case}");
+                assert_eq!(events[1]["type"], "auto_compaction_end", "{case}");
+                assert!(events[1].get("errorMessage").is_none(), "{case}: {events:?}");
+                assert_eq!(events[1]["result"]["tokensBefore"], 80_000, "{case}");
+                assert_eq!(
+                    events[1]["result"]["firstKeptEntryId"],
+                    first_kept_entry_id,
+                    "{case}",
+                );
+                assert_eq!(provider_compaction_count(&stored), 1, "{case}");
+                assert_eq!(live.agent.messages().len(), 3, "{case}");
+                assert_eq!(
+                    serde_json::to_value(&live.agent.messages()[1..]).unwrap(),
+                    serde_json::to_value(&original_messages[2..]).unwrap(),
+                    "{case} must preserve the configured recent turn",
+                );
+                let (live_context, stored_context) =
+                    stored.current_path_comparison_values(live.agent.messages());
+                assert_eq!(live_context, stored_context, "{case}");
+            }
+        }));
     }
 
     #[test]
@@ -26724,6 +26814,7 @@ export default function init(pi) {
                 reserve_tokens: Some(2),
                 keep_recent_tokens: Some(1),
                 mode: None,
+                ..Default::default()
             });
 
             let auth_dir = tempfile::tempdir().expect("tempdir");
@@ -27105,6 +27196,7 @@ export default function init(pi) {
                 reserve_tokens: Some(2),
                 keep_recent_tokens: Some(1),
                 mode: None,
+                ..Default::default()
             });
 
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -27384,6 +27476,7 @@ export default function init(pi) {
                     reserve_tokens: Some(2),
                     keep_recent_tokens: Some(1),
                     mode: None,
+                    ..Default::default()
                 });
 
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);

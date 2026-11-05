@@ -7729,6 +7729,8 @@ mod tests {
                 context_window_tokens: 100,
                 reserve_tokens: 10,
                 keep_recent_tokens: 30,
+                threshold_tokens: None,
+                threshold_percent: None,
                 mode: compaction::AutoCompactionMode::default(),
                 render_mode: compaction::CompactionRenderMode::default(),
             };
@@ -7832,6 +7834,8 @@ mod tests {
                 context_window_tokens: 150,
                 reserve_tokens: 10,
                 keep_recent_tokens: 30,
+                threshold_tokens: None,
+                threshold_percent: None,
                 mode: compaction::AutoCompactionMode::default(),
                 render_mode: compaction::CompactionRenderMode::default(),
             };

@@ -45,7 +45,6 @@ use crate::agent::{
 };
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
-use crate::compaction::ResolvedCompactionSettings;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{AssistantMessageEvent, ContentBlock};
@@ -2541,18 +2540,9 @@ fn build_acp_session_with_budget(
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
     let session_arc = Arc::new(Mutex::new(session));
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: options.config.compaction_enabled(),
-        reserve_tokens: options.config.compaction_reserve_tokens(),
-        keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
-        mode: options.config.compaction_mode(),
-        render_mode: options.config.compaction_render_mode(),
-        context_window_tokens: if model_entry.model.context_window == 0 {
-            ResolvedCompactionSettings::default().context_window_tokens
-        } else {
-            model_entry.model.context_window
-        },
-    };
+    let compaction_settings = options
+        .config
+        .resolved_compaction_settings(model_entry.model.context_window);
 
     // Wire the model registry and auth storage so the session can switch
     // provider/model at runtime via `session/set_model` (set_provider_model
@@ -3520,6 +3510,7 @@ fn classify_tool_kind(tool_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::ResolvedCompactionSettings;
     use crate::model::{AssistantMessage, StopReason, StreamEvent, TextContent};
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;

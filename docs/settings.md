@@ -553,6 +553,7 @@ Legacy aliases: `steeringMode`, `followUpMode`.
 ### Compaction (defaults)
 
 Accessor defaults:
+
 - `compaction.enabled`: `true`
 - `compaction.reserve_tokens`: `16384`
 - `compaction.keep_recent_tokens`: `20000`
@@ -566,6 +567,51 @@ Accessor defaults:
   }
 }
 ```
+
+Optional settings can trigger automatic compaction earlier:
+
+- `compaction.threshold_tokens` (alias `thresholdTokens`): A positive `u32`
+  integer token count.
+- `compaction.threshold_percent` (alias `thresholdPercent`): A finite number
+  greater than `0` and at most `100`, expressed as a percentage of the active
+  model's context window.
+
+Both default to unset, preserving the existing automatic trigger. Omitting a
+field or setting it to `null` supplies no override in that configuration layer;
+the usual global/project field merge still applies. Invalid non-null values
+produce a configuration error.
+
+For example, keep the existing reserve and keep-recent budgets while adding
+earlier triggers:
+
+```json
+{
+  "compaction": {
+    "thresholdTokens": 60000,
+    "thresholdPercent": 75
+  }
+}
+```
+
+Either threshold can be used alone. When both are set, automatic compaction
+becomes eligible when the estimated context reaches or exceeds the smallest
+of:
+
+- The active model's context window minus `reserve_tokens`, with a minimum of
+  zero.
+- `threshold_tokens`, when set.
+- The active model's context window multiplied by `threshold_percent / 100`,
+  rounded down to whole tokens, when set.
+
+This preserves the reserved response headroom even if an explicit threshold is
+larger. Percentages are recalculated against the active model's context window
+when models change. The policy applies to native print, SDK, classic and FTUI
+interactive, ACP, and RPC sessions using configuration-derived settings.
+
+`keep_recent_tokens` and the safe-cut rules still apply: reaching a threshold
+does not force compaction when no older prefix can be safely summarized.
+Explicit `/compact`, `/shake`, and their SDK operations continue to bypass the
+automatic thresholds and enable switch.
 
 ### Branch summary
 

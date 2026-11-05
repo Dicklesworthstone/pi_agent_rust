@@ -412,10 +412,54 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u32>,
     #[serde(alias = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u32>,
+    /// Optional earlier automatic trigger in tokens; reserved headroom still applies.
+    #[serde(
+        alias = "thresholdTokens",
+        deserialize_with = "deserialize_compaction_token_threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub threshold_tokens: Option<u32>,
+    /// Optional earlier automatic trigger as a percentage of the active context window.
+    #[serde(
+        alias = "thresholdPercent",
+        deserialize_with = "deserialize_compaction_percent_threshold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub threshold_percent: Option<f64>,
     /// Compaction output rendering: "text" (default) | "snapcompact"
     /// (bd-cv653.7.6).
     #[serde(alias = "mode")]
     pub mode: Option<crate::compaction::CompactionRenderMode>,
+}
+
+fn deserialize_compaction_token_threshold<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(serde::de::Error::custom(
+            "compaction thresholdTokens must be a positive integer",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_compaction_percent_threshold<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|percent| !percent.is_finite() || percent <= 0.0 || percent > 100.0) {
+        return Err(serde::de::Error::custom(
+            "compaction thresholdPercent must be greater than 0 and at most 100",
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1402,6 +1446,29 @@ impl Config {
             .unwrap_or(20000)
     }
 
+    /// Resolve one automatic compaction policy for every native session surface.
+    /// Thresholds retain their original units so a model switch can recompute them.
+    #[must_use]
+    pub fn resolved_compaction_settings(
+        &self,
+        context_window_tokens: u32,
+    ) -> crate::compaction::ResolvedCompactionSettings {
+        crate::compaction::ResolvedCompactionSettings {
+            enabled: self.compaction_enabled(),
+            context_window_tokens: if context_window_tokens == 0 {
+                crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
+            } else {
+                context_window_tokens
+            },
+            reserve_tokens: self.compaction_reserve_tokens(),
+            keep_recent_tokens: self.compaction_keep_recent_tokens(),
+            threshold_tokens: self.compaction.as_ref().and_then(|c| c.threshold_tokens),
+            threshold_percent: self.compaction.as_ref().and_then(|c| c.threshold_percent),
+            mode: self.compaction_mode(),
+            render_mode: self.compaction_render_mode(),
+        }
+    }
+
     pub fn branch_summary_reserve_tokens(&self) -> u32 {
         self.branch_summary
             .as_ref()
@@ -2147,6 +2214,8 @@ fn merge_compaction(
             enabled: other.enabled.or(base.enabled),
             reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
             keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
+            threshold_tokens: other.threshold_tokens.or(base.threshold_tokens),
+            threshold_percent: other.threshold_percent.or(base.threshold_percent),
             mode: other.mode.or(base.mode),
         }),
         (None, Some(other)) => Some(other),
@@ -2963,6 +3032,97 @@ mod tests {
             config.secrets.and_then(|secrets| secrets.extra_patterns),
             Some(vec![String::from("sk-[a-z]+")])
         );
+    }
+
+    #[test]
+    fn compaction_threshold_settings_validate_aliases_and_roundtrip() {
+        for content in [
+            r#"{"compaction":{"thresholdTokens":60000,"thresholdPercent":75.5}}"#,
+            r#"{"compaction":{"threshold_tokens":60000,"threshold_percent":75.5}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("threshold settings");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let encoded = serde_json::to_value(&config).expect("serialize thresholds");
+            let restored: Config = serde_json::from_value(encoded).expect("restore thresholds");
+            let resolved = restored.resolved_compaction_settings(100_000);
+            assert_eq!(resolved.threshold_tokens, Some(60_000));
+            assert_eq!(resolved.threshold_percent, Some(75.5));
+            assert_eq!(resolved.trigger_tokens(), 60_000);
+        }
+        for content in [
+            r#"{}"#,
+            r#"{"compaction":{}}"#,
+            r#"{"compaction":{"thresholdTokens":null,"thresholdPercent":null}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("legacy settings");
+            let resolved = config.resolved_compaction_settings(100_000);
+            assert_eq!(resolved.threshold_tokens, None);
+            assert_eq!(resolved.threshold_percent, None);
+            assert_eq!(resolved.trigger_tokens(), 100_000 - 16_384);
+            if let Some(settings) = config.compaction.as_ref() {
+                let encoded = serde_json::to_value(settings).expect("legacy compaction settings");
+                assert!(encoded.get("threshold_tokens").is_none());
+                assert!(encoded.get("threshold_percent").is_none());
+            }
+        }
+        for (key, values) in [
+            (
+                "thresholdTokens",
+                &["0", "-1", "1.5", "4294967296", "\"60000\"", "true"][..],
+            ),
+            (
+                "thresholdPercent",
+                &["0", "-1", "100.1", "1e999", "\"NaN\"", "true"][..],
+            ),
+        ] {
+            for value in values {
+                let content = format!(r#"{{"compaction":{{"{key}":{value}}}}}"#);
+                assert!(
+                    serde_json::from_str::<Config>(&content).is_err(),
+                    "accepted {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_thresholds_layer_without_changing_context_capacity_or_retention() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"compaction":{
+                "reserveTokens":10000,"keepRecentTokens":4000,
+                "thresholdTokens":60000,"thresholdPercent":75
+            }}"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"compaction":{"enabled":false,"thresholdPercent":50}}"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load settings");
+        let mut resolved = config.resolved_compaction_settings(100_000);
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.context_window_tokens, 100_000);
+        assert_eq!(resolved.reserve_tokens, 10_000);
+        assert_eq!(resolved.keep_recent_tokens, 4_000);
+        assert_eq!(resolved.threshold_tokens, Some(60_000));
+        assert_eq!(resolved.threshold_percent, Some(50.0));
+        assert_eq!(resolved.trigger_tokens(), 50_000);
+
+        resolved.context_window_tokens = 40_000;
+        assert_eq!(resolved.trigger_tokens(), 20_000);
+        assert_eq!(resolved.reserve_tokens, 10_000);
+        assert_eq!(resolved.keep_recent_tokens, 4_000);
+        let unknown_window = config.resolved_compaction_settings(0);
+        assert_eq!(
+            unknown_window.context_window_tokens,
+            crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
+        );
+        assert_eq!(unknown_window.threshold_tokens, Some(60_000));
+        assert_eq!(unknown_window.threshold_percent, Some(50.0));
     }
 
     #[test]
@@ -4903,6 +5063,7 @@ mod tests {
                 reserve_tokens: Some(1000),
                 keep_recent_tokens: Some(2000),
                 mode: None,
+                ..Default::default()
             }),
             ..Config::default()
         };
@@ -5967,7 +6128,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None };
+                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None, ..Default::default() };
                 let result = merge_compaction(Some(base.clone()), None).unwrap();
                 assert_eq!(result.enabled, base.enabled);
                 assert_eq!(result.reserve_tokens, base.reserve_tokens);
@@ -5980,7 +6141,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None };
+                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None, ..Default::default() };
                 let result = merge_compaction(None, Some(other.clone())).unwrap();
                 assert_eq!(result.enabled, other.enabled);
                 assert_eq!(result.reserve_tokens, other.reserve_tokens);
@@ -5994,8 +6155,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_res in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None, mode: None };
-                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None, mode: None };
+                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None, mode: None, ..Default::default() };
+                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None, mode: None, ..Default::default() };
                 let result = merge_compaction(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.reserve_tokens, o_res.or(b_res));

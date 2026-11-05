@@ -150,12 +150,41 @@ pub struct ResolvedCompactionSettings {
     pub context_window_tokens: u32,
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
+    /// Optional earlier trigger; the model's reserved headroom still applies.
+    pub threshold_tokens: Option<u32>,
+    /// Optional earlier trigger as a percentage of the active model's window.
+    pub threshold_percent: Option<f64>,
     pub mode: AutoCompactionMode,
     /// Snapcompact rendering policy (bd-cv653.7.6).
     pub render_mode: CompactionRenderMode,
 }
 
 impl ResolvedCompactionSettings {
+    /// Recompute the automatic trigger against the active model's capacity.
+    /// Explicit thresholds may compact earlier, but never consume reserved
+    /// response headroom. Invalid direct SDK values leave the safe default.
+    #[must_use]
+    pub fn trigger_tokens(&self) -> u64 {
+        self.trigger_tokens_for_window(self.context_window_tokens)
+    }
+
+    fn trigger_tokens_for_window(&self, context_window: u32) -> u64 {
+        let mut trigger = u64::from(context_window.saturating_sub(self.reserve_tokens));
+        if let Some(tokens) = self.threshold_tokens.filter(|tokens| *tokens > 0) {
+            trigger = trigger.min(u64::from(tokens));
+        }
+        if let Some(percent) = self
+            .threshold_percent
+            .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+        {
+            // The finite percentage and u32 window bound the result to u32.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let tokens = (f64::from(context_window) * percent / 100.0).floor() as u64;
+            trigger = trigger.min(tokens);
+        }
+        trigger
+    }
+
     /// Apply the mode's settings adjustments (aggressive halves keep-recent).
     #[must_use]
     pub const fn with_mode_applied(mut self) -> Self {
@@ -184,6 +213,8 @@ impl Default for ResolvedCompactionSettings {
             reserve_tokens: 10_240,
             // 10% of context window
             keep_recent_tokens: 12_800,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         }
@@ -1273,6 +1304,15 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
         "keepRecentTokens".to_string(),
         Value::from(settings.keep_recent_tokens),
     );
+    if let Some(tokens) = settings.threshold_tokens.filter(|tokens| *tokens > 0) {
+        obj.insert("thresholdTokens".to_string(), Value::from(tokens));
+    }
+    if let Some(percent) = settings
+        .threshold_percent
+        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+    {
+        obj.insert("thresholdPercent".to_string(), Value::from(percent));
+    }
     obj.insert(
         "renderMode".to_string(),
         Value::String(
@@ -1401,8 +1441,35 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
             "compaction preparation: `settings.enabled` must be a boolean".to_string(),
         )
     })?;
+    let threshold_tokens = match preparation_field(obj, "thresholdTokens", "threshold_tokens") {
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            let tokens = preparation_settings_u32(obj, "thresholdTokens", "threshold_tokens")?;
+            if tokens == 0 {
+                return Err(Error::validation(
+                    "compaction preparation: `settings.thresholdTokens` must be positive",
+                ));
+            }
+            Some(tokens)
+        }
+    };
+    let threshold_percent = match preparation_field(obj, "thresholdPercent", "threshold_percent") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+                .ok_or_else(|| {
+                    Error::validation(
+                        "compaction preparation: `settings.thresholdPercent` must be greater than 0 and at most 100",
+                    )
+                })?,
+        ),
+    };
     Ok(ResolvedCompactionSettings {
         enabled,
+        threshold_tokens,
+        threshold_percent,
         mode: AutoCompactionMode::default(),
         render_mode: match obj.get("renderMode") {
             None => CompactionRenderMode::default(),
@@ -1831,9 +1898,7 @@ fn should_compact(
     if !settings.enabled {
         return false;
     }
-    let reserve = u64::from(settings.reserve_tokens);
-    let window = u64::from(context_window);
-    context_tokens >= window.saturating_sub(reserve)
+    context_tokens >= settings.trigger_tokens_for_window(context_window)
 }
 
 /// Accumulate one content block's countable text into `text`, or add its
@@ -4392,6 +4457,79 @@ mod tests {
         assert!(should_compact(90_001, 100_000, &settings));
     }
 
+    #[test]
+    fn explicit_thresholds_keep_reserved_headroom_and_track_the_active_window() {
+        let mut settings = ResolvedCompactionSettings {
+            context_window_tokens: 100_000,
+            reserve_tokens: 10_000,
+            threshold_tokens: Some(60_000),
+            threshold_percent: Some(50.0),
+            ..Default::default()
+        };
+        assert_eq!(settings.trigger_tokens(), 50_000);
+        assert!(!should_compact(49_999, 100_000, &settings));
+        assert!(should_compact(50_000, 100_000, &settings));
+        settings.threshold_tokens = Some(40_000);
+        assert_eq!(settings.trigger_tokens(), 40_000);
+        settings.threshold_tokens = Some(120_000);
+        settings.threshold_percent = Some(100.0);
+        assert_eq!(settings.trigger_tokens(), 90_000);
+
+        settings.threshold_tokens = None;
+        settings.threshold_percent = Some(37.5);
+        settings.reserve_tokens = 0;
+        settings.context_window_tokens = 101;
+        assert_eq!(settings.trigger_tokens(), 37);
+        settings.context_window_tokens = 201;
+        assert_eq!(settings.trigger_tokens(), 75);
+        settings.reserve_tokens = 202;
+        assert_eq!(settings.trigger_tokens(), 0);
+
+        settings.reserve_tokens = 0;
+        settings.threshold_tokens = Some(0);
+        for percent in [0.0, -1.0, 100.1, f64::NAN, f64::INFINITY] {
+            settings.threshold_percent = Some(percent);
+            assert_eq!(settings.trigger_tokens(), 201);
+        }
+        settings.threshold_tokens = Some(1);
+        settings.enabled = false;
+        assert!(!should_compact(1_000_000, 201, &settings));
+    }
+
+    #[test]
+    fn explicit_thresholds_drive_preparation_and_shake_escalation() {
+        let entries = vec![
+            user_entry("old-user", "Earlier work to preserve."),
+            assistant_entry("old-answer", "The earlier task is complete.", 800, 100),
+            user_entry("current-user", "Continue the work."),
+        ];
+        let mut settings = ResolvedCompactionSettings {
+            context_window_tokens: 100_000,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        settings.threshold_tokens = Some(500);
+        let prep = prepare_compaction(&entries, settings.clone()).expect("earlier trigger");
+        assert_eq!(prep.settings.context_window_tokens, 100_000);
+        assert_eq!(prep.settings.reserve_tokens, 10_000);
+        let projection = ShakeProjection {
+            tokens_before: prep.tokens_before,
+            projected_tokens: 500,
+        };
+        assert!(shake_first_needs_summary(projection, &settings));
+        settings.threshold_tokens = None;
+        assert!(!shake_first_needs_summary(projection, &settings));
+
+        settings.threshold_percent = Some(0.5);
+        assert!(prepare_compaction(&entries, settings.clone()).is_some());
+        settings.context_window_tokens = 1_000_000;
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        settings.enabled = false;
+        assert!(prepare_manual_compaction(&entries, settings).is_some());
+    }
+
     // ── estimate_tokens ──────────────────────────────────────────────
 
     #[test]
@@ -5636,6 +5774,8 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -5898,6 +6038,8 @@ mod tests {
             context_window_tokens: 1_000_000,
             reserve_tokens: 32_000,
             keep_recent_tokens: u32::try_from(latest_turn_tokens + 1).unwrap(),
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::Aggressive,
             render_mode: CompactionRenderMode::SnapCompact,
         };
@@ -6008,6 +6150,8 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::ShakeFirst,
             render_mode: CompactionRenderMode::default(),
         };
@@ -6035,6 +6179,8 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 12_800,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::Aggressive,
             render_mode: CompactionRenderMode::default(),
         };
@@ -6070,6 +6216,8 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6113,6 +6261,8 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6135,6 +6285,8 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6191,6 +6343,8 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6332,6 +6486,8 @@ mod tests {
             context_window_tokens: 15,
             reserve_tokens: 0,
             keep_recent_tokens: 100,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6396,6 +6552,8 @@ mod tests {
             context_window_tokens: 200,
             reserve_tokens: 0,
             keep_recent_tokens: 150,
+            threshold_tokens: None,
+            threshold_percent: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6480,6 +6638,90 @@ mod tests {
             assert_eq!(
                 parsed.settings.keep_recent_tokens,
                 prep.settings.keep_recent_tokens
+            );
+        }
+
+        #[test]
+        fn threshold_policy_round_trips_and_rejects_invalid_extension_values() {
+            let mut prep = make_preparation();
+            prep.settings.threshold_tokens = Some(75_000);
+            prep.settings.threshold_percent = Some(37.5);
+            let value = compaction_preparation_to_value(&prep);
+            let parsed = compaction_preparation_from_value(&value).expect("threshold round trip");
+            assert_eq!(parsed.settings.threshold_tokens, Some(75_000));
+            assert_eq!(parsed.settings.trigger_tokens(), 48_000);
+            assert_eq!(value["settings"]["thresholdPercent"], json!(37.5));
+
+            let mut aliases = value.clone();
+            let settings = aliases["settings"].as_object_mut().unwrap();
+            let tokens = settings.remove("thresholdTokens").unwrap();
+            let percent = settings.remove("thresholdPercent").unwrap();
+            settings.insert("threshold_tokens".into(), tokens);
+            settings.insert("threshold_percent".into(), percent);
+            assert_eq!(
+                compaction_preparation_from_value(&aliases)
+                    .expect("snake-case threshold aliases")
+                    .settings
+                    .trigger_tokens(),
+                48_000
+            );
+
+            for (field, invalid) in [
+                ("thresholdTokens", json!(0)),
+                ("thresholdTokens", json!(-1)),
+                ("thresholdTokens", json!(1.5)),
+                ("thresholdTokens", json!(u64::from(u32::MAX) + 1)),
+                ("thresholdPercent", json!(0)),
+                ("thresholdPercent", json!(-1)),
+                ("thresholdPercent", json!(100.1)),
+                ("thresholdPercent", json!("75%")),
+            ] {
+                let mut malformed = value.clone();
+                malformed["settings"][field] = invalid;
+                assert!(
+                    compaction_preparation_from_value(&malformed).is_err(),
+                    "invalid {field} must not cross the compaction boundary"
+                );
+            }
+
+            // A native SDK setting ignored by the trigger must also be safe
+            // to echo through session_before_compact into the host bridge.
+            for (tokens, percent, expected_trigger) in [
+                (0, 37.5, 48_000),
+                (0, 0.0, 117_760),
+                (75_000, -1.0, 75_000),
+                (75_000, 100.1, 75_000),
+                (75_000, f64::NAN, 75_000),
+                (75_000, f64::INFINITY, 75_000),
+                (75_000, f64::NEG_INFINITY, 75_000),
+            ] {
+                let mut sdk_prep = make_preparation();
+                sdk_prep.settings.threshold_tokens = Some(tokens);
+                sdk_prep.settings.threshold_percent = Some(percent);
+                let encoded = compaction_preparation_to_value(&sdk_prep);
+                let echoed = compaction_preparation_from_value(&encoded)
+                    .expect("ignored SDK thresholds must survive an extension echo");
+                assert_eq!(echoed.settings.trigger_tokens(), expected_trigger);
+                assert_eq!(
+                    echoed.settings.trigger_tokens(),
+                    sdk_prep.settings.trigger_tokens()
+                );
+                assert_eq!(
+                    compaction_preparation_to_value(&echoed)["settings"],
+                    encoded["settings"],
+                    "serialized settings must already omit invalid optional values"
+                );
+            }
+
+            let legacy = compaction_preparation_to_value(&make_preparation());
+            assert!(legacy["settings"].get("thresholdTokens").is_none());
+            assert!(legacy["settings"].get("thresholdPercent").is_none());
+            assert_eq!(
+                compaction_preparation_from_value(&legacy)
+                    .expect("legacy preparation")
+                    .settings
+                    .trigger_tokens(),
+                117_760
             );
         }
 
@@ -7068,6 +7310,8 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: 16_384,
                     keep_recent_tokens: 20_000,
+                    threshold_tokens: None,
+                    threshold_percent: None,
                     mode: AutoCompactionMode::default(),
                     render_mode: CompactionRenderMode::default(),
                 };
@@ -7086,6 +7330,8 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: reserve,
                     keep_recent_tokens: 20_000,
+                    threshold_tokens: None,
+                    threshold_percent: None,
                     mode: AutoCompactionMode::default(),
                     render_mode: CompactionRenderMode::default(),
                 };

@@ -3045,14 +3045,8 @@ async fn run(
     };
 
     let session_arc = Arc::new(Mutex::new(session));
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: config.compaction_enabled(),
-        reserve_tokens: config.compaction_reserve_tokens(),
-        keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
-        mode: config.compaction_mode(),
-        render_mode: config.compaction_render_mode(),
-    };
+    let compaction_settings =
+        config.resolved_compaction_settings(selection.model_entry.model.context_window);
     let mut agent_session = AgentSession::new(
         // The same registry the pre-warmed extension runtime resolves
         // `pi.tool` hostcalls through (bd-4t6oz).

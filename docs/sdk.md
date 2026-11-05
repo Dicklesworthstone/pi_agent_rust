@@ -521,6 +521,9 @@ fn main() -> pi::sdk::Result<()> {
             context_window_tokens: 200_000,
             reserve_tokens: 32_768,
             keep_recent_tokens: 40_000,
+            threshold_tokens: Some(60_000),
+            threshold_percent: Some(75.0),
+            ..Default::default()
         }),
         ..SessionOptions::default()
     }))?;
@@ -528,6 +531,28 @@ fn main() -> pi::sdk::Result<()> {
     Ok(())
 }
 ```
+
+`threshold_tokens` and `threshold_percent` are optional earlier automatic
+triggers; both default to `None` and either can be supplied alone.
+`ResolvedCompactionSettings::trigger_tokens()` returns the smallest of the
+context window minus reserved response tokens (with a minimum of zero), the
+explicit token threshold, and the percentage of the context window rounded
+down. The example becomes eligible at `60_000` tokens: the minimum of
+`167_232` reserved-window tokens, `60_000` explicit tokens, and `150_000`
+percentage-based tokens.
+
+Eligibility starts at equality. The calculation uses `context_window_tokens`
+each time; configuration-derived settings use the active model's window when
+models change. An explicit `SessionOptions::compaction_settings` override
+supplies its own capacity and budgets. Leave it as `None` to use the shared
+[compaction settings](settings.md#compaction-defaults).
+
+Token thresholds must be positive and percentage thresholds must be finite,
+greater than zero, and at most `100`. Configuration files reject invalid
+values; direct Rust settings ignore invalid optional thresholds defensively.
+The keep-recent budget and safe-cut rules remain in force, so a threshold
+cannot force an unsafe cut. Explicit `compact` and `shake` operations bypass
+the automatic thresholds and enable switch.
 
 ## Recipe 6: Use RPC Transport Client
 

@@ -3342,18 +3342,7 @@ impl PiApp {
             agent,
             session,
             save_enabled,
-            crate::compaction::ResolvedCompactionSettings {
-                enabled: config.compaction_enabled(),
-                reserve_tokens: config.compaction_reserve_tokens(),
-                keep_recent_tokens: config.compaction_keep_recent_tokens(),
-                context_window_tokens: if model_entry.model.context_window == 0 {
-                    crate::compaction::ResolvedCompactionSettings::default().context_window_tokens
-                } else {
-                    model_entry.model.context_window
-                },
-                mode: config.compaction_mode(),
-                render_mode: config.compaction_render_mode(),
-            },
+            config.resolved_compaction_settings(model_entry.model.context_window),
         )
         .with_runtime_handle(runtime_handle.clone());
         agent_session.extensions = extensions.map(crate::extensions::ExtensionRegion::new);
