@@ -2835,6 +2835,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_bedrock_route_is_discoverable_without_an_inference_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let models_path = directory.path().join("models.json");
+        assert!(
+            provider_model_catalog_route_is_configured_at_path("amazon-bedrock", &models_path)
+                .unwrap()
+        );
+        assert!(
+            provider_model_catalog_route_is_configured_at_path("bedrock", &models_path)
+                .unwrap()
+        );
+        let route = crate::models::resolve_model_catalog_provider_config(
+            "amazon-bedrock",
+            &models_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(route.api, "bedrock-converse-stream");
+        assert!(route.base_url.is_empty());
+        assert!(!route.auth_header);
+    }
+
+    #[test]
     fn native_catalog_routes_follow_each_providers_protocol() {
         assert_eq!(
             catalog_models_url("https://api.anthropic.com/v1/messages", "anthropic-messages").as_deref(),
