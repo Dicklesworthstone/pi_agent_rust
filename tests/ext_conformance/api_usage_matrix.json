@@ -521,9 +521,9 @@
     {
       "module": "axios",
       "extensions_using": 2,
-      "shim_status": "stub",
+      "shim_status": "partial",
       "criticality": "P2",
-      "notes": "Promise HTTP client facade returns synthetic responses; no network I/O"
+      "notes": "Real capability-gated HTTP via PiJS fetch: JSON/form/binary bodies, response status/errors, defaults/interceptors, AbortSignal/CancelToken, timeouts and byte limits. ESM and createRequire supported; custom transports/agents, progress callbacks and streaming/blob response types fail explicitly. Native integration tests await DSR qualification."
     },
     {
       "module": "express",
@@ -631,8 +631,8 @@
     "total_virtual_modules": 62,
     "shim_completeness": {
       "real": 18,
-      "partial": 21,
-      "stub": 25,
+      "partial": 22,
+      "stub": 24,
       "external": 5,
       "error_throw": 2,
       "missing_from_corpus": 2

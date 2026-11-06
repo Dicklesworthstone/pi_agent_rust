@@ -12549,6 +12549,7 @@ import * as v8 from "node:v8";
 import * as workerThreads from "node:worker_threads";
 import * as testMod from "node:test";
 import * as bunSqlite from "bun:sqlite";
+import * as axiosModule from "axios";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -12665,6 +12666,7 @@ function __normalizeBuiltin(id) {
 
 const __builtinModules = {
   "bun:sqlite": bunSqlite,
+  "axios": axiosModule,
   "node:fs": fs,
   "node:fs/promises": fsPromises,
   "node:path": path,
@@ -17946,69 +17948,7 @@ export default WebSocket;
 
     modules.insert(
         "axios".to_string(),
-        compressed_js_literal!(
-            r#"
-function __makeResponse(config, data) {
-  return {
-    data: data ?? null,
-    status: 200,
-    statusText: "OK",
-    headers: {},
-    config: config ?? {},
-    request: {},
-  };
-}
-
-async function axios(config = {}) {
-  return __makeResponse(config, config.data);
-}
-
-axios.request = (config) => axios(config);
-axios.defaults = {};
-axios.get = (url, config = {}) => axios({ ...config, url, method: "get" });
-axios.delete = (url, config = {}) => axios({ ...config, url, method: "delete" });
-axios.head = (url, config = {}) => axios({ ...config, url, method: "head" });
-axios.options = (url, config = {}) => axios({ ...config, url, method: "options" });
-axios.post = (url, data, config = {}) => axios({ ...config, url, data, method: "post" });
-axios.put = (url, data, config = {}) => axios({ ...config, url, data, method: "put" });
-axios.patch = (url, data, config = {}) => axios({ ...config, url, data, method: "patch" });
-axios.create = (defaults = {}) => {
-  const instance = (config = {}) => axios({ ...defaults, ...config });
-  instance.request = (config) => instance(config);
-  instance.get = (url, config = {}) => instance({ ...config, url, method: "get" });
-  instance.delete = (url, config = {}) => instance({ ...config, url, method: "delete" });
-  instance.head = (url, config = {}) => instance({ ...config, url, method: "head" });
-  instance.options = (url, config = {}) => instance({ ...config, url, method: "options" });
-  instance.post = (url, data, config = {}) => instance({ ...config, url, data, method: "post" });
-  instance.put = (url, data, config = {}) => instance({ ...config, url, data, method: "put" });
-  instance.patch = (url, data, config = {}) => instance({ ...config, url, data, method: "patch" });
-  instance.defaults = { ...defaults };
-  return instance;
-};
-axios.isAxiosError = (err) => !!(err && err.isAxiosError);
-axios.AxiosError = class AxiosError extends Error {
-  constructor(message) {
-    super(message || "AxiosError");
-    this.isAxiosError = true;
-  }
-};
-axios.Cancel = class Cancel extends Error {
-  constructor(message) {
-    super(message || "Cancel");
-    this.__CANCEL__ = true;
-  }
-};
-axios.CancelToken = {
-  source() { return { token: {}, cancel: () => {} }; },
-};
-axios.all = (promises) => Promise.all(promises);
-axios.spread = (cb) => (arr) => cb(...arr);
-
-export default axios;
-"#
-        )
-        .trim()
-        .to_string(),
+        include_str!("extensions_js/axios.mjs").to_string(),
     );
 
     modules.insert(
