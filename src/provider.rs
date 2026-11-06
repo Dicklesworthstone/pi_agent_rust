@@ -153,11 +153,15 @@ impl Provider for CostGuardedProvider {
         });
         let mut observed_options = options.clone();
         observed_options.usage_observer = Some(accounting.observer());
-        CostMeteredSetup {
+        let (inner, accounting) = CostMeteredSetup {
             inner: Some(self.inner.stream(context, &observed_options)),
             accounting: Some(accounting),
         }
-        .await
+        .await?;
+        Ok(Box::pin(CostMeteredStream {
+            inner: Some(inner),
+            accounting,
+        }))
     }
 
     async fn compact_native(
@@ -165,59 +169,147 @@ impl Provider for CostGuardedProvider {
         request_body: &serde_json::Value,
         options: &StreamOptions,
     ) -> crate::error::Result<serde_json::Value> {
-        let mut attempt = self.budget.start_attempt()?;
-        let response = self.inner.compact_native(request_body, options).await?;
-        if let Some(usage) = response.get("usage") {
-            let input = usage
-                .get("input_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let cached = usage
-                .pointer("/input_tokens_details/cached_tokens")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                .min(input);
-            let mut priced = crate::model::Usage {
-                input: input.saturating_sub(cached),
-                output: usage
-                    .get("output_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                cache_read: cached,
-                ..Default::default()
-            };
-            if let Some(cost) = usage.get("cost") {
-                priced.billing = Some(
-                    match cost
-                        .as_f64()
-                        .filter(|cost| cost.is_finite() && *cost >= 0.0)
-                    {
-                        Some(total) => crate::model::BillingUsage::ReportedTotal { total },
-                        None => crate::model::BillingUsage::Unavailable {
-                            reason: "Native compaction reported an invalid billed total"
-                                .to_string(),
-                        },
-                    },
-                );
-            }
-            let cost = match self
-                .inner
-                .model_cost()
-                .unwrap_or_default()
-                .price_usage(&mut priced)
-            {
-                Ok(()) => priced.cost.total,
-                Err(error) => {
-                    tracing::warn!(%error, "native compaction billing is unavailable");
-                    f64::NAN
-                }
-            };
-            if let Err(error) = attempt.finish(cost) {
-                tracing::warn!(%error, "native compaction spend accounting failed; budget quarantined");
-            }
+        let attempt = self.budget.start_attempt()?;
+        let rates = self.inner.model_cost();
+        let known_pricing = rates.is_some();
+        let accounting = CostAccountingOwner::new(CostAccounting {
+            attempt: Some(attempt),
+            rates,
+            known_cost: 0.0,
+            settled: false,
+            failure: None,
+        });
+        let mut observed_options = options.clone();
+        observed_options.usage_observer = Some(accounting.observer());
+        let (response, accounting) = CostMeteredSetup {
+            inner: Some(self.inner.compact_native(request_body, &observed_options)),
+            accounting: Some(accounting),
+        }
+        .await?;
+        if let Some(mut usage) = native_compaction_usage(&response, known_pricing) {
+            accounting.observe(&mut usage, true)?;
+        } else {
+            // A provider may acknowledge usage through the observer alone.
+            // Missing response metadata cannot erase that known charge.
+            accounting.settle();
         }
         Ok(response)
     }
+}
+
+/// Decode native Responses compaction billing without turning invalid evidence
+/// into a free request. An explicit USD bill is sufficient even if the provider
+/// does not supply a usable token breakdown; absent usage preserves observer
+/// evidence instead of inventing a final zero.
+fn native_compaction_usage(
+    response: &serde_json::Value,
+    known_pricing: bool,
+) -> Option<crate::model::Usage> {
+    use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+    #[derive(Deserialize)]
+    struct InputDetails {
+        #[serde(default)]
+        cached_tokens: u64,
+        #[serde(default)]
+        audio_tokens: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct OutputDetails {
+        #[serde(default)]
+        audio_tokens: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct NativeUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+        #[serde(default)]
+        total_tokens: Option<u64>,
+        #[serde(default)]
+        input_tokens_details: Option<InputDetails>,
+        #[serde(default)]
+        output_tokens_details: Option<OutputDetails>,
+    }
+
+    let raw = response.get("usage")?;
+    let unavailable = |reason: &str| Usage {
+        billing: Some(BillingUsage::Unavailable {
+            reason: reason.to_string(),
+        }),
+        ..Usage::default()
+    };
+    if let Some(cost) = raw.get("cost") {
+        return Some(
+            match cost
+                .as_f64()
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            {
+                Some(total) => Usage {
+                    billing: Some(BillingUsage::ReportedTotal { total }),
+                    ..Usage::default()
+                },
+                None => unavailable("Native compaction reported an invalid billed total"),
+            },
+        );
+    }
+    let Ok(usage) = serde_json::from_value::<NativeUsage>(raw.clone()) else {
+        return Some(unavailable(
+            "Native compaction reported invalid token usage",
+        ));
+    };
+    let cached = usage
+        .input_tokens_details
+        .as_ref()
+        .map_or(0, |details| details.cached_tokens);
+    let Some(total) = usage.input_tokens.checked_add(usage.output_tokens) else {
+        return Some(unavailable(
+            "Native compaction reported inconsistent token usage",
+        ));
+    };
+    if cached > usage.input_tokens || usage.total_tokens.is_some_and(|reported| reported != total) {
+        return Some(unavailable(
+            "Native compaction reported inconsistent token usage",
+        ));
+    }
+    if usage
+        .input_tokens_details
+        .as_ref()
+        .is_some_and(|details| details.audio_tokens > 0)
+        || usage
+            .output_tokens_details
+            .as_ref()
+            .is_some_and(|details| details.audio_tokens > 0)
+    {
+        // Native compaction does not define an exclusive audio/cache billing
+        // partition. Charge an explicit USD bill above, or refuse to price
+        // these units as text and silently bypass the session's spending cap.
+        return Some(unavailable(
+            "Native compaction audio usage requires a billed total",
+        ));
+    }
+    let text = BillingTokenCounts {
+        input: usage.input_tokens - cached,
+        output: usage.output_tokens,
+        cache_read: cached,
+        cache_write: 0,
+    };
+    Some(Usage {
+        input: text.input,
+        output: text.output,
+        cache_read: cached,
+        total_tokens: total,
+        // Known prices or genuinely zero work establish a final bill. Unknown
+        // prices do not turn positive token counts into an authoritative zero
+        // that could refund an earlier acknowledged USD amount.
+        billing: (known_pricing || total == 0).then_some(BillingUsage::Tokens {
+            text,
+            audio: BillingTokenCounts::default(),
+            reported_total: None,
+        }),
+        ..Usage::default()
+    })
 }
 
 /// A provider can publish acknowledged cumulative usage without adding a
@@ -436,23 +528,16 @@ impl Drop for CostAccountingOwner {
 
 type BoxedProviderStream = Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>;
 
-/// Drop the provider's setup future before the accounting owner. Its cleanup
-/// can still report usage, even when setup never produced a public stream.
-struct CostMeteredSetup<'a> {
-    inner: Option<
-        Pin<
-            Box<
-                dyn std::future::Future<Output = crate::error::Result<BoxedProviderStream>>
-                    + Send
-                    + 'a,
-            >,
-        >,
-    >,
+/// Drop the provider's request future before the accounting owner. Its cleanup
+/// can still report usage, including native compaction or stream setup which
+/// never produced a public result. The caller owns final response accounting.
+struct CostMeteredSetup<'a, T> {
+    inner: Option<Pin<Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + 'a>>>,
     accounting: Option<CostAccountingOwner>,
 }
 
-impl std::future::Future for CostMeteredSetup<'_> {
-    type Output = crate::error::Result<BoxedProviderStream>;
+impl<T> std::future::Future for CostMeteredSetup<'_, T> {
+    type Output = crate::error::Result<(T, CostAccountingOwner)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
         let result = self
@@ -482,10 +567,7 @@ impl std::future::Future for CostMeteredSetup<'_> {
             return Poll::Ready(Err(error));
         }
         match result {
-            Poll::Ready(Ok(inner)) => Poll::Ready(Ok(Box::pin(CostMeteredStream {
-                inner: Some(inner),
-                accounting,
-            }))),
+            Poll::Ready(Ok(result)) => Poll::Ready(Ok((result, accounting))),
             Poll::Ready(Err(error)) => {
                 drop(accounting);
                 Poll::Ready(Err(error))
@@ -497,7 +579,7 @@ impl std::future::Future for CostMeteredSetup<'_> {
     }
 }
 
-impl Drop for CostMeteredSetup<'_> {
+impl<T> Drop for CostMeteredSetup<'_, T> {
     fn drop(&mut self) {
         drop(self.inner.take());
         drop(self.accounting.take());
@@ -1517,6 +1599,7 @@ mod tests {
         events: Vec<StreamEvent>,
         rates: Option<ModelCost>,
         native_cost: Option<serde_json::Value>,
+        native_response: Option<serde_json::Value>,
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -1554,10 +1637,14 @@ mod tests {
             _options: &StreamOptions,
         ) -> crate::error::Result<serde_json::Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(response) = &self.native_response {
+                return Ok(response.clone());
+            }
             let mut response = serde_json::json!({"usage": {
                 "input_tokens": 1_000_000,
                 "input_tokens_details": {"cached_tokens": 250_000},
-                "output_tokens": 500_000
+                "output_tokens": 500_000,
+                "total_tokens": 1_500_000
             }});
             if let Some(cost) = &self.native_cost {
                 response["usage"]["cost"] = cost.clone();
@@ -1593,6 +1680,7 @@ mod tests {
             events,
             rates,
             native_cost: None,
+            native_response: None,
         })
     }
 
@@ -1610,6 +1698,9 @@ mod tests {
             Eof,
             Done,
             Invalid,
+            NativeMalformed,
+            NativeZero,
+            NativeUnpriced,
         }
 
         struct DropUsage {
@@ -1672,6 +1763,47 @@ mod tests {
                     cleanup,
                 }))
             }
+
+            async fn compact_native(
+                &self,
+                _request_body: &serde_json::Value,
+                options: &StreamOptions,
+            ) -> crate::error::Result<serde_json::Value> {
+                let observer = options
+                    .usage_observer
+                    .clone()
+                    .expect("per-attempt native compaction observer");
+                *self.observer.lock().unwrap() = Some(observer.clone());
+                observer.observe(&cost_message(0.5, 0).usage)?;
+                let _cleanup = DropUsage {
+                    observer: observer.clone(),
+                    cost: 0.75,
+                    drops: Arc::clone(&self.drops),
+                };
+                match self.mode {
+                    Mode::SetupPending => std::future::pending().await,
+                    Mode::SetupError => Err(crate::error::Error::api("compact request failed")),
+                    Mode::Eof => Ok(serde_json::json!({"output": []})),
+                    Mode::Done => Ok(serde_json::json!({"usage": {"cost": 0.25}})),
+                    Mode::NativeZero => Ok(serde_json::json!({"usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0
+                    }})),
+                    Mode::NativeUnpriced => Ok(serde_json::json!({"usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20
+                    }})),
+                    Mode::NativeMalformed => Ok(serde_json::json!({"usage": {
+                        "input_tokens": -1,
+                        "output_tokens": 0
+                    }})),
+                    Mode::Invalid => {
+                        let _ = observer.observe(&cost_message(f64::NAN, 0).usage);
+                        std::future::pending().await
+                    }
+                    _ => unreachable!("stream-only fixture"),
+                }
+            }
         }
 
         struct ObservedStream {
@@ -1707,7 +1839,11 @@ mod tests {
                             .observe(&cost_message(f64::NAN, 0).usage);
                         Poll::Pending
                     }
-                    Mode::SetupPending | Mode::SetupError => unreachable!("setup-only fixture"),
+                    Mode::SetupPending
+                    | Mode::SetupError
+                    | Mode::NativeMalformed
+                    | Mode::NativeZero
+                    | Mode::NativeUnpriced => unreachable!("request-only fixture"),
                 }
             }
         }
@@ -1762,6 +1898,108 @@ mod tests {
                     Err(crate::error::Error::CostCap { .. })
                 ));
             }
+        }
+
+        #[test]
+        fn native_compaction_owns_usage_through_response_failure_and_cancellation() {
+            for mode in [
+                Mode::SetupPending,
+                Mode::SetupError,
+                Mode::Done,
+                Mode::Eof,
+                Mode::Invalid,
+                Mode::NativeMalformed,
+                Mode::NativeZero,
+                Mode::NativeUnpriced,
+            ] {
+                let budget = crate::cost::CostBudget::new(None, Some(0.4), 0.0).unwrap();
+                let probe = probe(mode);
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                let body = serde_json::json!({});
+                let options = StreamOptions::default();
+                let mut request = Box::pin(provider.compact_native(&body, &options));
+                let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                let result = std::future::Future::poll(request.as_mut(), &mut cx);
+                match mode {
+                    Mode::SetupPending => {
+                        assert!(result.is_pending());
+                        assert_eq!(budget.snapshot().pending, 0.5);
+                        assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                        assert!(matches!(
+                            budget.admit(),
+                            Err(crate::error::Error::CostCap { .. })
+                        ));
+                    }
+                    Mode::SetupError => assert!(matches!(result, Poll::Ready(Err(_)))),
+                    Mode::Invalid | Mode::NativeMalformed => assert!(matches!(
+                        result,
+                        Poll::Ready(Err(crate::error::Error::Session(_)))
+                    )),
+                    _ => assert!(matches!(result, Poll::Ready(Ok(_)))),
+                }
+                drop(request);
+                let expected = match mode {
+                    Mode::Done => 0.25,
+                    Mode::NativeZero => 0.0,
+                    Mode::Invalid => 0.5,
+                    _ => 0.75,
+                };
+                assert_closed(&probe, &budget, expected);
+                match mode {
+                    Mode::Done | Mode::NativeZero => budget.admit().unwrap(),
+                    Mode::Invalid | Mode::NativeMalformed => assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::Session(_))
+                    )),
+                    _ => assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::CostCap { .. })
+                    )),
+                }
+            }
+        }
+
+        #[test]
+        fn canceled_native_compaction_persists_its_final_charge_to_the_retired_source() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            let budget = crate::cost::CostBudget::new(None, Some(0.5), 0.0).unwrap();
+            let mut session =
+                crate::session::Session::create_with_dir(Some(directory.path().to_path_buf()));
+            budget.checkpoint(&mut session).unwrap();
+            runtime.block_on(session.save()).unwrap();
+            let path = session.path.clone().unwrap();
+            let transcript = std::fs::read(&path).unwrap();
+            let probe = probe(Mode::SetupPending);
+            let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+            let body = serde_json::json!({});
+            let options = StreamOptions::default();
+            let mut request = Box::pin(provider.compact_native(&body, &options));
+            let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+            assert!(std::future::Future::poll(request.as_mut(), &mut cx).is_pending());
+
+            // Replacement activates the source's fixed journal while the
+            // compact request is still pending. Cancellation then drops the
+            // provider, which acknowledges more usage during cleanup.
+            budget.retire_session(&session, owner.cx()).unwrap();
+            drop(request);
+            assert_closed(&probe, &budget, 0.75);
+            assert_eq!(std::fs::read(&path).unwrap(), transcript);
+            let reopened = runtime
+                .block_on(crate::session::Session::open(path.to_str().unwrap()))
+                .unwrap();
+            let restored = crate::cost::resolve_budget(&reopened, None, None, Some(0.5), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.spent(), 0.75);
+            assert!(matches!(
+                restored.admit(),
+                Err(crate::error::Error::CostCap { .. })
+            ));
+            assert_eq!(restored.refresh().unwrap().spent, 0.75);
         }
 
         #[test]
@@ -2046,7 +2284,7 @@ mod tests {
                 provider
                     .compact_native(&serde_json::json!({}), &StreamOptions::default())
                     .await
-                    .unwrap();
+                    .expect_err("invalid billing must surface on the request which reported it");
                 assert!(matches!(
                     provider
                         .compact_native(&serde_json::json!({}), &StreamOptions::default())
@@ -2055,6 +2293,117 @@ mod tests {
                 ));
                 assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert_eq!(budget.spent(), 0.0);
+            }
+        });
+    }
+
+    #[test]
+    fn native_compaction_rejects_malformed_or_inconsistent_token_billing_before_readmission() {
+        futures::executor::block_on(async {
+            let invalid = [
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!({}),
+                serde_json::json!({"input_tokens": -1, "output_tokens": 0}),
+                serde_json::json!({"input_tokens": 100, "output_tokens": "2"}),
+                serde_json::json!({"input_tokens": 100, "output_tokens": 0.5}),
+                serde_json::json!({"input_tokens": 100}),
+                serde_json::json!({"input_tokens": u64::MAX, "output_tokens": 1}),
+                serde_json::json!({"input_tokens": 100, "output_tokens": 2, "total_tokens": 100}),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": 101}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": "90"}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": null}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"audio_tokens": 10}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "output_tokens_details": {"audio_tokens": 1}
+                }),
+            ];
+            for usage in invalid {
+                let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let mut probe = spend_probe(
+                    vec![],
+                    Some(ModelCost {
+                        input: 2.0,
+                        output: 4.0,
+                        cache_read: 1.0,
+                        ..Default::default()
+                    }),
+                );
+                Arc::get_mut(&mut probe).unwrap().native_response =
+                    Some(serde_json::json!({"usage": usage}));
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                let result = provider
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await;
+                assert!(matches!(result, Err(crate::error::Error::Session(_))));
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert_eq!(
+                    budget.spent(),
+                    0.0,
+                    "invalid evidence does not invent a bill"
+                );
+                assert!(matches!(
+                    provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await,
+                    Err(crate::error::Error::Session(_))
+                ));
+                assert!(matches!(
+                    provider
+                        .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                        .await,
+                    Err(crate::error::Error::Session(_))
+                ));
+                assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn native_compaction_billed_total_does_not_require_a_token_partition() {
+        futures::executor::block_on(async {
+            for total in [0.0, 0.5] {
+                let budget = crate::cost::CostBudget::new(None, Some(0.25), 0.0).unwrap();
+                let mut probe = spend_probe(vec![], Some(ModelCost::default()));
+                let response = serde_json::json!({
+                    "output": [{"type": "compaction", "encrypted_content": "retained"}],
+                    "usage": {
+                        "input_tokens": "unknown",
+                        "input_tokens_details": {"audio_tokens": 100},
+                        "cost": total
+                    }
+                });
+                Arc::get_mut(&mut probe).unwrap().native_response = Some(response.clone());
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                let actual = provider
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(actual, response, "native replay payload is unchanged");
+                assert!((budget.spent() - total).abs() < f64::EPSILON);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                if total == 0.0 {
+                    budget.admit().unwrap();
+                } else {
+                    assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::CostCap { .. })
+                    ));
+                }
+                assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
             }
         });
     }
