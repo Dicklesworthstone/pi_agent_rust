@@ -1961,6 +1961,86 @@ fn js_runtime_pump_once_advances_timers_and_hostcalls() {
     });
 }
 
+#[test]
+fn registered_message_renderer_executes_in_owner_realm_and_flattens_pi_tui_components() {
+    let manager = ExtensionManager::new();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+
+    runtime.block_on(async move {
+        let dir = tempdir().expect("tempdir");
+        let entry_path = dir.path().join("renderer.mjs");
+        std::fs::write(
+            &entry_path,
+            r#"
+                import { Box, Text } from "@mariozechner/pi-tui";
+                export default function init(pi) {
+                  pi.registerMessageRenderer("status-update", (message, { expanded }, theme) => {
+                    const level = message.details?.level ?? "info";
+                    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+                    let rendered = theme.fg("success", "[" + level.toUpperCase() + "] " + message.content);
+                    if (expanded) rendered += "\nexpanded";
+                    box.addChild(new Text(rendered, 0, 0));
+                    return box;
+                  });
+                }
+            "#,
+        )
+        .expect("write renderer extension");
+
+        let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: dir.path().display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime);
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load renderer extension");
+
+        let message = crate::model::CustomMessage {
+            content: "deploy ready".to_string(),
+            custom_type: "status-update".to_string(),
+            display: true,
+            details: Some(json!({"level":"warn"})),
+            timestamp: 1,
+        };
+        let rendered = manager
+            .render_custom_message(&message, false, 80, 5_000)
+            .await
+            .expect("render custom message");
+        assert_eq!(rendered.as_deref(), Some("[WARN] deploy ready"));
+
+        let expanded = manager
+            .render_custom_message(&message, true, 80, 5_000)
+            .await
+            .expect("render expanded custom message");
+        assert_eq!(expanded.as_deref(), Some("[WARN] deploy ready\nexpanded"));
+
+        let missing = crate::model::CustomMessage {
+            custom_type: "unregistered".to_string(),
+            ..message
+        };
+        assert_eq!(
+            manager
+                .render_custom_message(&missing, false, 80, 5_000)
+                .await
+                .expect("missing renderer is a normal fallback"),
+            None
+        );
+        assert!(manager.shutdown(Duration::from_secs(3)).await);
+    });
+}
+
 /// gh #167: registering a hook for an event this host never fires must stay
 /// fail-open (the handler is kept for forward-compat) but emit a loud tracing
 /// warning naming the extension and the unknown event. Known events must not

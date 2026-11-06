@@ -9673,6 +9673,11 @@ async fn run_extension_interaction(
             "ftui-ext-shortcut",
             crate::extensions::EXTENSION_SHORTCUT_BUDGET_MS,
         ),
+        ExtensionInteraction::MessageRenderer { custom_type, .. } => (
+            format!("Renderer [{custom_type}]"),
+            "ftui-ext-renderer",
+            crate::extensions::EXTENSION_UI_BUDGET_MS,
+        ),
     };
     let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
     let _operation_abort =
@@ -9707,6 +9712,8 @@ async fn run_extension_interaction(
     let callback_card = Arc::clone(&card_open);
     let progress = Arc::new(Mutex::new(None::<tool_progress::Bridge>));
     let callback_progress = Arc::clone(&progress);
+    let custom_messages = Arc::new(Mutex::new(Vec::<crate::model::CustomMessage>::new()));
+    let callback_custom_messages = Arc::clone(&custom_messages);
     let callback_label = label.clone();
     let tx = agent_tx.clone();
     let result = handle
@@ -9747,7 +9754,10 @@ async fn run_extension_interaction(
                             });
                         }
                         Message::Custom(custom) if custom.display => {
-                            let _ = tx.send(PiMsg::SystemNote(custom.content.clone()));
+                            callback_custom_messages
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(custom.clone());
                         }
                         _ => {}
                     }
@@ -9776,6 +9786,39 @@ async fn run_extension_interaction(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(),
     );
+    let pending_custom_messages = std::mem::take(
+        &mut *custom_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for custom in pending_custom_messages {
+        let rendered = if let Some(manager) = handle.extension_manager() {
+            match manager
+                .render_custom_message(
+                    &custom,
+                    false,
+                    80,
+                    crate::extensions::EXTENSION_UI_BUDGET_MS,
+                )
+                .await
+            {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    tracing::warn!(
+                        custom_type = %custom.custom_type,
+                        error = %error,
+                        "Extension custom message renderer failed; using original content"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let _ = agent_tx.send(PiMsg::SystemNote(
+            rendered.unwrap_or_else(|| custom.content.clone()),
+        ));
+    }
     let is_error = result
         .as_ref()
         .is_err_and(|error| !matches!(error, crate::error::Error::Aborted));

@@ -3223,6 +3223,7 @@ impl ExtensionManager {
                 providers,
                 mcp_servers,
                 shortcuts,
+                message_renderers: _,
                 flags,
                 event_hooks,
                 active_tools: ext_active_tools,
@@ -4012,6 +4013,43 @@ impl ExtensionManager {
         runtime
             .execute_interaction_with_abort(interaction, Arc::new(context), timeout_ms, abort)
             .await
+    }
+
+    /// Render a displayed custom message with its registered extension renderer.
+    ///
+    /// Missing renderers are an ordinary fallback condition: the caller should
+    /// display the message's original content. Renderer failures remain errors
+    /// so surfaces can fall back while still recording a diagnostic.
+    pub async fn render_custom_message(
+        &self,
+        message: &crate::model::CustomMessage,
+        expanded: bool,
+        width: u16,
+        timeout_ms: u64,
+    ) -> Result<Option<String>> {
+        let interaction = ExtensionInteraction::MessageRenderer {
+            custom_type: message.custom_type.clone(),
+            message: serde_json::to_value(message)
+                .map_err(|error| Error::extension(format!("Failed to serialize custom message: {error}")))?,
+            expanded,
+            width,
+        };
+        match self
+            .execute_interaction_with_abort(interaction, timeout_ms, None)
+            .await
+        {
+            Ok(Value::String(rendered)) if !rendered.is_empty() => Ok(Some(rendered)),
+            Ok(Value::String(_) | Value::Null) => Ok(None),
+            Ok(other) => Ok(other.as_str().filter(|text| !text.is_empty()).map(ToString::to_string)),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("Unknown JS extension message renderer:") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Return extension-registered providers as raw JSON specs.

@@ -15,6 +15,7 @@ fn loaded_extension(chunks: Arc<[Value]>) -> NativeRustLoadedExtension {
             ],
             slash_commands: vec![json!({"name":"command"})],
             shortcuts: vec![json!({"key_id":"ctrl+k"})],
+            message_renderers: Vec::new(),
             providers: Vec::new(),
             mcp_servers: Vec::new(),
             flags: Vec::new(),

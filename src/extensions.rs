@@ -10075,6 +10075,12 @@ pub const EXTENSION_SHORTCUT_BUDGET_MS: u64 = 30_000;
 pub(crate) enum ExtensionInteraction {
     Command { name: String, args: String },
     Shortcut { key_id: String },
+    MessageRenderer {
+        custom_type: String,
+        message: Value,
+        expanded: bool,
+        width: u16,
+    },
 }
 
 impl ExtensionInteraction {
@@ -10082,6 +10088,7 @@ impl ExtensionInteraction {
         match self {
             Self::Command { .. } => "command",
             Self::Shortcut { .. } => "shortcut",
+            Self::MessageRenderer { .. } => "message renderer",
         }
     }
 
@@ -10089,6 +10096,7 @@ impl ExtensionInteraction {
         match self {
             Self::Command { name, .. } => name,
             Self::Shortcut { key_id } => key_id,
+            Self::MessageRenderer { custom_type, .. } => custom_type,
         }
     }
 }
@@ -10982,6 +10990,8 @@ struct JsExtensionSnapshot {
     #[serde(default)]
     shortcuts: Vec<Value>,
     #[serde(default)]
+    message_renderers: Vec<String>,
+    #[serde(default)]
     providers: Vec<Value>,
     #[serde(default)]
     mcp_servers: Vec<Value>,
@@ -11636,6 +11646,7 @@ struct JsRuntimeShardSet {
     tool_owner: HashMap<String, usize>,
     command_owner: HashMap<String, usize>,
     shortcut_owner: HashMap<String, usize>,
+    message_renderer_owner: HashMap<String, usize>,
     provider_owner: HashMap<String, usize>,
     mcp_server_owner: HashMap<String, usize>,
     event_owners: HashMap<String, Vec<usize>>,
@@ -11741,6 +11752,19 @@ impl JsRuntimeShardIndexes {
         }
     }
 
+    fn index_message_renderers(&mut self, shard_index: usize, shard: &JsRuntimeShard) {
+        for custom_type in &shard.snapshot.message_renderers {
+            let custom_type = custom_type.trim();
+            if custom_type.is_empty() {
+                continue;
+            }
+            // Upstream resolves the first renderer in extension load order.
+            self.message_renderer_owner
+                .entry(custom_type.to_string())
+                .or_insert(shard_index);
+        }
+    }
+
     fn index_providers(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
         for provider in &shard.snapshot.providers {
             let Some(provider_id) = provider
@@ -11800,6 +11824,7 @@ impl JsRuntimeShardIndexes {
         self.index_tools(shard_index, shard)?;
         self.index_commands(shard_index, shard)?;
         self.index_shortcuts(shard_index, shard);
+        self.index_message_renderers(shard_index, shard);
         self.index_providers(shard_index, shard)?;
         self.index_mcp_servers(shard_index, shard)?;
         self.index_events(shard_index, shard);
@@ -11887,6 +11912,7 @@ impl JsRuntimeShardSet {
         self.tool_owner = indexes.tool_owner;
         self.command_owner = indexes.command_owner;
         self.shortcut_owner = indexes.shortcut_owner;
+        self.message_renderer_owner = indexes.message_renderer_owner;
         self.provider_owner = indexes.provider_owner;
         self.mcp_server_owner = indexes.mcp_server_owner;
         self.event_owners = indexes.event_owners;
@@ -12563,6 +12589,13 @@ impl JsExtensionRuntimeHandle {
                                         &shard_set.shortcut_owner,
                                         "shortcut",
                                         &key_id.trim().to_lowercase(),
+                                    )
+                                }
+                                ExtensionInteraction::MessageRenderer { custom_type, .. } => {
+                                    shard_set.shard_index_for_route(
+                                        &shard_set.message_renderer_owner,
+                                        "message renderer",
+                                        custom_type.trim(),
                                     )
                                 }
                             };
@@ -16820,6 +16853,7 @@ async fn execute_extension_interaction_sharded(
     let task_id = next_runtime_task_id(match interaction {
         ExtensionInteraction::Command { .. } => "task-cmd",
         ExtensionInteraction::Shortcut { .. } => "task-shortcut",
+        ExtensionInteraction::MessageRenderer { .. } => "task-renderer",
     });
     let runtime = Rc::clone(
         &shards
@@ -16845,6 +16879,23 @@ async fn execute_extension_interaction_sharded(
                 ExtensionInteraction::Shortcut { key_id } => {
                     let exec: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
                     exec.call((bridge_secret.as_str(), key_id.as_str(), ctx_js))?
+                }
+                ExtensionInteraction::MessageRenderer {
+                    custom_type,
+                    message,
+                    expanded,
+                    width,
+                } => {
+                    let exec: rquickjs::Function<'_> =
+                        global.get("__pi_execute_message_renderer")?;
+                    let message_js = json_to_js(&ctx, message)?;
+                    exec.call((
+                        bridge_secret.as_str(),
+                        custom_type.as_str(),
+                        message_js,
+                        *expanded,
+                        *width,
+                    ))?
                 }
             };
             let _task: String =

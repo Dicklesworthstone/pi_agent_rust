@@ -23796,9 +23796,13 @@ function __pi_make_extension_theme() {
 }
 
 const __pi_extension_theme_template = {
-    // Minimal theme shim. Legacy emits ANSI; conformance harness should normalize ANSI away.
+    // Minimal theme shim. Legacy emits ANSI; host rendering intentionally
+    // preserves text while the native TUI owns final colors and layout.
     fg: (_style, text) => String(text === undefined || text === null ? '' : text),
+    bg: (_style, text) => String(text === undefined || text === null ? '' : text),
     bold: (text) => String(text === undefined || text === null ? '' : text),
+    italic: (text) => String(text === undefined || text === null ? '' : text),
+    underline: (text) => String(text === undefined || text === null ? '' : text),
     strikethrough: (text) => String(text === undefined || text === null ? '' : text),
 };
 
@@ -24826,6 +24830,68 @@ async function __pi_execute_shortcut(key_id, ctx_payload) {
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
     return __pi_with_extension_async(record.extensionId, () => record.handler(ctx));
+}
+
+function __pi_component_to_text(component, width) {
+    if (component === undefined || component === null) return null;
+    if (typeof component === 'string' || typeof component === 'number' || typeof component === 'boolean') {
+        return String(component);
+    }
+    if (Array.isArray(component)) {
+        const rendered = component
+            .map((child) => __pi_component_to_text(child, width))
+            .filter((text) => text !== null && text !== '');
+        return rendered.length > 0 ? rendered.join('\n') : null;
+    }
+    if (typeof component !== 'object') return null;
+
+    if (typeof component.render === 'function') {
+        try {
+            const rendered = component.render(width);
+            if (Array.isArray(rendered)) {
+                return rendered.map((line) => String(line ?? '')).join('\n');
+            }
+            if (rendered !== undefined && rendered !== null) {
+                return String(rendered);
+            }
+        } catch (_) {
+            // Fall through to structural rendering for lightweight Pi-TUI shims.
+        }
+    }
+    if (component.text !== undefined && component.text !== null) {
+        return String(component.text);
+    }
+    if (Array.isArray(component.children)) {
+        const rendered = component.children
+            .map((child) => __pi_component_to_text(child, width))
+            .filter((text) => text !== null && text !== '');
+        return rendered.length > 0 ? rendered.join('\n') : null;
+    }
+    if (
+        component.content !== undefined &&
+        component.content !== null &&
+        typeof component.content !== 'object'
+    ) {
+        return String(component.content);
+    }
+    return null;
+}
+
+async function __pi_execute_message_renderer(custom_type, message, expanded, width) {
+    const typeId = String(custom_type || '').trim();
+    const record = __pi_message_renderer_index.get(typeId);
+    if (!record) {
+        throw new Error('Unknown message renderer: ' + typeId);
+    }
+
+    return __pi_with_extension_async(record.extensionId, async () => {
+        const component = await record.renderer(
+            message && typeof message === 'object' ? message : {},
+            { expanded: Boolean(expanded) },
+            __pi_make_extension_theme(),
+        );
+        return __pi_component_to_text(component, Math.max(1, Number(width) || 80));
+    });
 }
 
 // Hostcall stream class (async iterator for streaming hostcall results)
@@ -28269,6 +28335,7 @@ for (const [name, fn] of Object.entries({
     __pi_finish_tool_invocation,
     __pi_execute_command,
     __pi_execute_shortcut,
+    __pi_execute_message_renderer,
     __pi_provider_stream_simple_start,
     __pi_virtual_http_start,
     __pi_provider_stream_simple_next,
@@ -28476,8 +28543,8 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            261_609,
-            "fc46d7ab3f31ba0d1fdacebb34dcbdf2e52c32a3220b53150c7ff52b5b72ce2d",
+            264_302,
+            "d643e92c66d93d1eb229ccadac85eafa36da11b7843bde7cd31d3ada445d916b",
         ),
         (
             "node:fs",

@@ -36,6 +36,8 @@ struct NativeRustExtensionDescriptor {
     #[serde(default)]
     shortcuts: Vec<Value>,
     #[serde(default)]
+    message_renderers: Vec<String>,
+    #[serde(default)]
     providers: Vec<Value>,
     #[serde(default)]
     mcp_servers: Vec<Value>,
@@ -616,6 +618,7 @@ fn load_native_extension_from_spec(
             tools: descriptor.tools,
             slash_commands: descriptor.slash_commands,
             shortcuts: descriptor.shortcuts,
+            message_renderers: descriptor.message_renderers,
             providers: descriptor.providers,
             mcp_servers: descriptor.mcp_servers,
             flags: descriptor.flags,
@@ -875,6 +878,11 @@ impl ExtensionRuntimeHandle {
                     ExtensionInteraction::Shortcut { key_id } => {
                         runtime.execute_shortcut(key_id, timeout_ms).await
                     }
+                    ExtensionInteraction::MessageRenderer { custom_type, .. } => Err(
+                        Error::extension(format!(
+                            "native-rust message renderer `{custom_type}` is not executable"
+                        )),
+                    ),
                 };
                 if abort
                     .as_ref()

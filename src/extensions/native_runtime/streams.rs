@@ -263,6 +263,7 @@ mod tests {
                     tools: Vec::new(),
                     slash_commands: Vec::new(),
                     shortcuts: Vec::new(),
+                    message_renderers: Vec::new(),
                     providers: Vec::new(),
                     mcp_servers: Vec::new(),
                     flags: Vec::new(),
