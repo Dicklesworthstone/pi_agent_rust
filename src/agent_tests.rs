@@ -643,6 +643,149 @@ mod tests {
     }
 
     #[test]
+    fn last_agent_owner_restores_only_undelivered_job_notices_in_fifo_order() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let saved = Session::in_memory();
+            let owner = saved.header.id.clone();
+            let replacement_owner = format!("replacement-{}", uuid::Uuid::new_v4().simple());
+            let saved = Arc::new(Mutex::new(saved));
+            let agent = Agent::new(
+                Arc::new(SilentProvider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            let original = Arc::new(Mutex::new(AgentSession::new(
+                agent,
+                Arc::clone(&saved),
+                false,
+                ResolvedCompactionSettings::default(),
+            )));
+            let remaining_owner = Arc::clone(&original);
+            for text in ["already delivered", "first undelivered", "second undelivered"] {
+                crate::jobs::push_completion_notice(&owner, text).expect("queue notice");
+            }
+            let cx = AgentCx::for_current_or_request();
+            {
+                let mut session = original.lock(cx.cx()).await.expect("agent session");
+                assert!(session.stage_pending_job_follow_up().await);
+                let delivered = session.agent.pop_follow_up_for_current_session().await;
+                assert_eq!(delivered.len(), 1);
+                assert_user_text(delivered[0].message(), "already delivered");
+                session.agent.queue_follow_up(user_message("ordinary input"));
+            }
+            drop(original);
+            assert!(
+                crate::jobs::take_completion_notices(&owner).is_empty(),
+                "a live shared owner still owns its staged notices"
+            );
+            crate::jobs::push_completion_notice(&owner, "newer registry notice")
+                .expect("queue later notice");
+            // No delivery poll follows this identity change. Destruction must
+            // still return each staged result to its captured original owner.
+            saved
+                .lock(cx.cx())
+                .await
+                .expect("session store")
+                .header
+                .id
+                .clone_from(&replacement_owner);
+            drop(remaining_owner);
+
+            let restored = crate::jobs::take_completion_notices(&owner);
+            assert_eq!(restored.len(), 3, "consumed and ordinary input cannot replay");
+            for (notice, expected) in restored.iter().zip([
+                "first undelivered",
+                "second undelivered",
+                "newer registry notice",
+            ]) {
+                assert_user_text(notice, expected);
+            }
+            assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+            assert!(crate::jobs::take_completion_notices(&replacement_owner).is_empty());
+        });
+    }
+
+    #[test]
+    fn cancelled_staged_job_wake_survives_sdk_replacement_and_is_recorded_once() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let saved = Session::in_memory();
+            let owner = saved.header.id.clone();
+            let saved = Arc::new(Mutex::new(saved));
+            let provider = Arc::new(CapturingProvider::new("test-api"));
+            let calls = provider.calls();
+            let make_handle = || {
+                let agent = Agent::new(
+                    provider.clone(),
+                    ToolRegistry::from_tools(Vec::new()),
+                    AgentConfig::default(),
+                );
+                crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                    AgentSession::new(
+                        agent,
+                        Arc::clone(&saved),
+                        false,
+                        ResolvedCompactionSettings::default(),
+                    ),
+                    crate::sdk::EventListeners::default(),
+                )
+            };
+            let mut handle = make_handle();
+            crate::jobs::push_completion_notice(&owner, "completed work after cancellation")
+                .expect("queue completion");
+            assert!(handle.session_mut().stage_pending_job_follow_up().await);
+            let (abort, signal) = AbortHandle::new();
+            abort.abort();
+            assert!(matches!(
+                handle
+                    .session_mut()
+                    .run_pending_job_follow_up_with_abort(None, Some(signal), |_| {})
+                    .await,
+                Err(Error::Aborted)
+            ));
+            assert!(calls.lock().expect("provider calls").is_empty());
+
+            // Match the production replacement boundary: install the new
+            // handle, then exhaustively shut down the predecessor's resources.
+            let prepared = handle.preflight_replacement().await.expect("preflight");
+            let predecessor = std::mem::replace(&mut handle, make_handle());
+            assert!(
+                predecessor
+                    .commit_resource_shutdown(prepared)
+                    .await
+                    .completed_cleanly()
+            );
+            handle
+                .session_mut()
+                .run_pending_job_follow_up_with_abort(None, None, |_| {})
+                .await
+                .expect("replacement delivers preserved completion");
+            {
+                let calls = calls.lock().expect("provider calls");
+                assert_eq!(calls.len(), 1, "one completion produces one wake request");
+                assert_eq!(calls[0].messages.len(), 1);
+                assert_user_text(&calls[0].messages[0], "completed work after cancellation");
+            }
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            let mut reopened = make_handle();
+            assert!(
+                !reopened.session_mut().stage_pending_job_follow_up().await,
+                "a delivered completion cannot reappear on another replacement"
+            );
+            let cx = AgentCx::for_current_or_request();
+            let messages = saved
+                .lock(cx.cx())
+                .await
+                .expect("saved session")
+                .to_messages_for_current_path();
+            assert_eq!(messages.len(), 2, "notice and response are recorded exactly once");
+            assert_user_text(&messages[0], "completed work after cancellation");
+            assert!(matches!(&messages[1], Message::Assistant(_)));
+        });
+    }
+
+    #[test]
     fn stale_only_job_handoff_does_not_invoke_the_provider_empty() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

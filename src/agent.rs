@@ -1412,6 +1412,25 @@ impl MessageQueue {
     }
 }
 
+impl Drop for MessageQueue {
+    fn drop(&mut self) {
+        // Staging transfers a completion out of the jobs registry, but does
+        // not deliver it to the model or persist it. A cancelled/paused turn
+        // can leave that notice here when /reload replaces the Agent. Return
+        // only notices still owned by this queue; popped deliveries already
+        // belong to the turn and must never be replayed. MessageQueue is not
+        // Clone, so shared Agent owners release these only on their final drop.
+        if self.has_job_follow_up() {
+            crate::jobs::restore_completion_notices(
+                self.take_job_follow_ups_except(None)
+                    .into_iter()
+                    .map(|(owner, delivery)| (owner, delivery.into_message()))
+                    .collect(),
+            );
+        }
+    }
+}
+
 // ============================================================================
 // Agent Event
 // ============================================================================
