@@ -16,11 +16,13 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::pin::Pin;
 
+use super::valid_tool_identity;
+
 pub(super) const CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
 // Local resource budgets, not validation of the service's protocol maxima.
 const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_BLOCKS: usize = 1024;
+const MAX_BLOCKS: usize = super::MAX_BEDROCK_CONTENT_BLOCKS;
 type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
 
 fn invalid(message: &str) -> Error {
@@ -341,49 +343,8 @@ impl MessageState {
         if wire_reason == "tool_use" && self.tool_ids.is_empty() {
             return Err(invalid("tool_use stop reason has no local tool calls"));
         }
-        let (reason, failure) = match wire_reason {
-            "end_turn" | "stop_sequence" => (StopReason::Stop, None),
-            "tool_use" => (StopReason::ToolUse, None),
-            "max_tokens" | "model_context_window_exceeded" => (StopReason::Length, None),
-            "guardrail_intervened" => (
-                StopReason::Error,
-                Some("Bedrock guardrail_intervened: response blocked; local tool calls withheld"),
-            ),
-            "content_filtered" => (
-                StopReason::Error,
-                Some("Bedrock content_filtered: response refused; local tool calls withheld"),
-            ),
-            "malformed_tool_use" => (
-                StopReason::Error,
-                Some("Bedrock malformed_tool_use: invalid tool request; local tool calls withheld"),
-            ),
-            "malformed_model_output" => (
-                StopReason::Error,
-                Some(
-                    "Bedrock malformed_model_output: invalid model response; local tool calls withheld",
-                ),
-            ),
-            // Unknown provider strings can contain credentials or terminal
-            // controls. Keep a fixed diagnostic rather than echoing the wire.
-            _ => (
-                StopReason::Error,
-                Some("Bedrock returned an unsupported stop reason; local tool calls withheld"),
-            ),
-        };
-        let failure = failure.or_else(|| {
-            if self.tool_ids.is_empty() || reason == StopReason::ToolUse {
-                None
-            } else if reason == StopReason::Length {
-                Some("Bedrock response was truncated before tool_use authorization; local tool calls withheld")
-            } else {
-                Some("Bedrock ended without tool_use authorization; local tool calls withheld")
-            }
-        });
-        self.message.stop_reason = if failure.is_some() {
-            StopReason::Error
-        } else {
-            reason
-        };
+        let (reason, failure) = super::response_stop_outcome(wire_reason, !self.tool_ids.is_empty());
+        self.message.stop_reason = reason;
         self.message.error_message = failure.map(str::to_string);
         self.stopped = true;
         Ok(())
@@ -639,19 +600,6 @@ impl MessageState {
             })
         }
     }
-}
-
-// Bedrock's service identity grammar, checked before allocation or publication:
-// ToolUseBlockStart.name is [a-zA-Z0-9_-]+ and toolUseId additionally allows
-// '.', ':'; both are at most 64 bytes. IDs are preserved, never normalized.
-fn valid_tool_identity(value: &str, is_id: bool) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'_' | b'-')
-                || (is_id && matches!(byte, b'.' | b':'))
-        })
 }
 
 fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {

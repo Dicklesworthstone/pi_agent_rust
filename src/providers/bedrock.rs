@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -40,6 +40,7 @@ const DEFAULT_REGION: &str = "us-east-1";
 const BEDROCK_SERVICE: &str = "bedrock";
 const MAX_BEDROCK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BEDROCK_ERROR_SNIPPET_BYTES: usize = 8 * 1024;
+const MAX_BEDROCK_CONTENT_BLOCKS: usize = 1024;
 const SIGV4_OWNED_HEADERS: [&str; 6] = [
     "authorization",
     "host",
@@ -470,7 +471,23 @@ impl BedrockProvider {
             .as_ref()
             .map_or_else(Usage::default, convert_usage);
 
-        let stop_reason = map_stop_reason(response.stop_reason.as_deref());
+        // JSON gateways return the complete response at once. Validate the
+        // entire batch before mapping any block to an executable local call.
+        let has_tools = response.output.as_ref().is_some_and(|output| {
+            output
+                .message
+                .content
+                .iter()
+                .any(|block| matches!(block, BedrockResponseContent::ToolUse { .. }))
+        });
+        let (mut stop_reason, failure) = response_stop_outcome(
+            response.stop_reason.as_deref().unwrap_or_default(),
+            has_tools,
+        );
+        let failure = failure.or_else(|| validate_json_output(response.output.as_ref()));
+        if failure.is_some() {
+            stop_reason = StopReason::Error;
+        }
         let mut content = Vec::new();
 
         if let Some(output) = response.output {
@@ -485,12 +502,14 @@ impl BedrockProvider {
                         }
                     }
                     BedrockResponseContent::ToolUse { tool_use } => {
-                        content.push(ContentBlock::ToolCall(ToolCall {
-                            id: tool_use.tool_use_id,
-                            name: tool_use.name,
-                            arguments: tool_use.input,
-                            thought_signature: None,
-                        }));
+                        if stop_reason == StopReason::ToolUse {
+                            content.push(ContentBlock::ToolCall(ToolCall {
+                                id: tool_use.tool_use_id,
+                                name: tool_use.name,
+                                arguments: tool_use.input,
+                                thought_signature: None,
+                            }));
+                        }
                     }
                     BedrockResponseContent::ReasoningContent { reasoning_content } => {
                         content.push(match reasoning_content {
@@ -507,6 +526,7 @@ impl BedrockProvider {
                             }
                         });
                     }
+                    BedrockResponseContent::Invalid(_) => {}
                 }
             }
         }
@@ -519,7 +539,7 @@ impl BedrockProvider {
             usage,
             stop_reason,
             stop_details: None,
-            error_message: None,
+            error_message: failure.map(str::to_string),
             timestamp: Utc::now().timestamp_millis(),
         }
     }
@@ -553,7 +573,7 @@ impl BedrockProvider {
                         content: thinking.thinking.clone(),
                     }));
                 }
-                ContentBlock::ToolCall(tool_call) => {
+                ContentBlock::ToolCall(tool_call) if message.stop_reason == StopReason::ToolUse => {
                     let delta = serde_json::to_string(&tool_call.arguments)
                         .unwrap_or_else(|_| "{}".to_string());
                     events.push(Ok(StreamEvent::ToolCallStart {
@@ -574,9 +594,16 @@ impl BedrockProvider {
             }
         }
 
-        events.push(Ok(StreamEvent::Done {
-            reason: message.stop_reason,
-            message: message.clone(),
+        events.push(Ok(if message.stop_reason == StopReason::Error {
+            StreamEvent::Error {
+                reason: StopReason::Error,
+                error: message.clone(),
+            }
+        } else {
+            StreamEvent::Done {
+                reason: message.stop_reason,
+                message: message.clone(),
+            }
         }));
         events
     }
@@ -1147,14 +1174,13 @@ struct BedrockResponseOutput {
 
 #[derive(Debug, Deserialize)]
 struct BedrockResponseMessage {
-    #[allow(dead_code)]
     role: Option<String>,
     #[serde(default)]
     content: Vec<BedrockResponseContent>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum BedrockResponseContent {
     Text {
         text: String,
@@ -1167,6 +1193,9 @@ enum BedrockResponseContent {
         #[serde(rename = "reasoningContent")]
         reasoning_content: BedrockReasoningContent,
     },
+    // Reject unsupported/ambiguous blocks during whole-message validation,
+    // after retaining the valid envelope's billing and other readable text.
+    Invalid(Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1176,6 +1205,60 @@ struct BedrockResponseToolUse {
     name: String,
     #[serde(default)]
     input: Value,
+    // Keep presence, including null, so a server-managed or unknown `type`
+    // cannot disappear during deserialization and become a local tool call.
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+fn validate_json_output(output: Option<&BedrockResponseOutput>) -> Option<&'static str> {
+    let Some(output) = output else {
+        return Some("Bedrock JSON response is missing output; local tool calls withheld");
+    };
+    if output.message.role.as_deref() != Some("assistant") {
+        return Some("Bedrock JSON response has no assistant role; local tool calls withheld");
+    }
+    if output.message.content.len() > MAX_BEDROCK_CONTENT_BLOCKS {
+        return Some(
+            "Bedrock JSON response exceeds the content-block limit; local tool calls withheld",
+        );
+    }
+    let mut tool_ids = HashSet::new();
+    for block in &output.message.content {
+        if let BedrockResponseContent::Invalid(value) = block {
+            return Some(if value.get("toolUse").is_some() {
+                "Bedrock JSON response has malformed or ambiguous tool content; local tool calls withheld"
+            } else {
+                "Bedrock JSON response has unsupported or ambiguous content; local tool calls withheld"
+            });
+        }
+        let BedrockResponseContent::ToolUse { tool_use } = block else {
+            continue;
+        };
+        if tool_use.extra.contains_key("type") {
+            return Some(
+                "Bedrock server-managed or unknown tool type is not a local tool request; local tool calls withheld",
+            );
+        }
+        if !valid_tool_identity(&tool_use.tool_use_id, true)
+            || !valid_tool_identity(&tool_use.name, false)
+        {
+            return Some(
+                "Bedrock JSON response has an invalid tool-call identity; local tool calls withheld",
+            );
+        }
+        if !tool_ids.insert(tool_use.tool_use_id.as_str()) {
+            return Some(
+                "Bedrock JSON response has duplicate tool-call ids; local tool calls withheld",
+            );
+        }
+        if !tool_use.input.is_object() {
+            return Some(
+                "Bedrock JSON tool input must be a complete JSON object; local tool calls withheld",
+            );
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -1215,13 +1298,70 @@ fn convert_usage(usage: &BedrockUsage) -> Usage {
     }
 }
 
-fn map_stop_reason(stop_reason: Option<&str>) -> StopReason {
-    match stop_reason.unwrap_or("end_turn") {
-        "tool_use" => StopReason::ToolUse,
-        "max_tokens" => StopReason::Length,
-        "guardrail_intervened" | "content_filtered" => StopReason::Error,
-        _ => StopReason::Stop,
-    }
+/// Shared by JSON Converse replies and binary ConverseStream messageStop.
+/// A complete tool input alone is not authorization to execute it: the agent
+/// also admits tools on Stop/Length, so those outcomes must withhold calls.
+fn response_stop_outcome(wire_reason: &str, has_tools: bool) -> (StopReason, Option<&'static str>) {
+    let (reason, failure) = match wire_reason {
+        "end_turn" | "stop_sequence" => (StopReason::Stop, None),
+        "tool_use" if has_tools => (StopReason::ToolUse, None),
+        "tool_use" => (
+            StopReason::Error,
+            Some("Bedrock tool_use stop reason has no local tool calls"),
+        ),
+        "max_tokens" | "model_context_window_exceeded" => (StopReason::Length, None),
+        "guardrail_intervened" => (
+            StopReason::Error,
+            Some("Bedrock guardrail_intervened: response blocked; local tool calls withheld"),
+        ),
+        "content_filtered" => (
+            StopReason::Error,
+            Some("Bedrock content_filtered: response refused; local tool calls withheld"),
+        ),
+        "malformed_tool_use" => (
+            StopReason::Error,
+            Some("Bedrock malformed_tool_use: invalid tool request; local tool calls withheld"),
+        ),
+        "malformed_model_output" => (
+            StopReason::Error,
+            Some("Bedrock malformed_model_output: invalid model response; local tool calls withheld"),
+        ),
+        // Do not echo unknown wire strings, which may contain secrets or
+        // terminal controls. These are provider failures, never normal stops.
+        _ => (
+            StopReason::Error,
+            Some("Bedrock returned an unsupported stop reason; local tool calls withheld"),
+        ),
+    };
+    let failure = failure.or_else(|| {
+        if !has_tools || reason == StopReason::ToolUse {
+            None
+        } else if reason == StopReason::Length {
+            Some("Bedrock response was truncated before tool_use authorization; local tool calls withheld")
+        } else {
+            Some("Bedrock ended without tool_use authorization; local tool calls withheld")
+        }
+    });
+    (
+        if failure.is_some() {
+            StopReason::Error
+        } else {
+            reason
+        },
+        failure,
+    )
+}
+
+// Bedrock's ToolUseBlock and ToolUseBlockStart share this identity grammar.
+// IDs allow '.', ':' in addition to the tool-name alphabet; both max 64 bytes.
+fn valid_tool_identity(value: &str, is_id: bool) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-')
+                || (is_id && matches!(byte, b'.' | b':'))
+        })
 }
 
 fn normalize_model_id(model_id: &str) -> Result<String> {
@@ -1480,79 +1620,96 @@ mod tests {
     }
 
     fn spawn_bedrock_test_server() -> (String, mpsc::Receiver<CapturedBedrockRequest>) {
+        spawn_bedrock_json_server(vec![json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "ok"}]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
+        })])
+    }
+
+    fn spawn_bedrock_json_server(
+        responses: Vec<Value>,
+    ) -> (String, mpsc::Receiver<CapturedBedrockRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind Bedrock test server");
         let address = listener.local_addr().expect("Bedrock test server address");
         let (sender, receiver) = mpsc::channel();
 
         std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept Bedrock request");
-            socket
-                .set_read_timeout(Some(FIXTURE_POLL))
-                .expect("set Bedrock request read timeout");
-            let deadline = Instant::now() + FIXTURE_BUDGET;
-
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            let header_end = loop {
-                let read =
-                    read_with_deadline(&mut socket, &mut chunk, deadline, "read Bedrock request");
-                assert!(read > 0, "Bedrock request ended before its headers");
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                    break position;
-                }
-            };
-
-            let header_text = String::from_utf8_lossy(&request[..header_end]);
-            let headers = header_text
-                .lines()
-                .skip(1)
-                .filter_map(|line| line.split_once(':'))
-                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
-                .collect::<HashMap<_, _>>();
-            let content_length = headers
-                .get("content-length")
-                .and_then(|value| value.parse::<usize>().ok())
-                .expect("Bedrock request content-length");
-            let body_start = header_end + 4;
-            while request.len().saturating_sub(body_start) < content_length {
-                let read = read_with_deadline(
-                    &mut socket,
-                    &mut chunk,
-                    deadline,
-                    "read Bedrock request body",
-                );
-                assert!(read > 0, "Bedrock request ended before its body");
-                request.extend_from_slice(&chunk[..read]);
+            for response_body in responses {
+                let (socket, _) = listener.accept().expect("accept Bedrock request");
+                serve_bedrock_json_reply(socket, &sender, &response_body);
             }
-            sender
-                .send(CapturedBedrockRequest {
-                    headers,
-                    body: request[body_start..body_start + content_length].to_vec(),
-                })
-                .expect("capture Bedrock request");
-
-            let response_body = serde_json::to_string(&json!({
-                "output": {
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"text": "ok"}]
-                    }
-                },
-                "stopReason": "end_turn",
-                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
-            }))
-            .expect("serialize Bedrock response");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .expect("write Bedrock response");
         });
 
         (format!("http://{address}"), receiver)
+    }
+
+    fn serve_bedrock_json_reply(
+        mut socket: TcpStream,
+        sender: &mpsc::Sender<CapturedBedrockRequest>,
+        response_body: &Value,
+    ) {
+        socket
+            .set_read_timeout(Some(FIXTURE_POLL))
+            .expect("set Bedrock request read timeout");
+        socket
+            .set_write_timeout(Some(FIXTURE_BUDGET))
+            .expect("set Bedrock response write timeout");
+        let deadline = Instant::now() + FIXTURE_BUDGET;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let read = read_with_deadline(&mut socket, &mut chunk, deadline, "read Bedrock request");
+            assert!(read > 0, "Bedrock request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position;
+            }
+        };
+
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let headers = header_text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect::<HashMap<_, _>>();
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("Bedrock request content-length");
+        let body_start = header_end + 4;
+        while request.len().saturating_sub(body_start) < content_length {
+            let read = read_with_deadline(
+                &mut socket,
+                &mut chunk,
+                deadline,
+                "read Bedrock request body",
+            );
+            assert!(read > 0, "Bedrock request ended before its body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        sender
+            .send(CapturedBedrockRequest {
+                headers,
+                body: request[body_start..body_start + content_length].to_vec(),
+            })
+            .expect("capture Bedrock request");
+
+        let response_body = serde_json::to_string(response_body).expect("serialize Bedrock response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .expect("write Bedrock response");
     }
 
     fn write_test_sigv4_auth(path: &Path) {
@@ -2155,6 +2312,358 @@ mod tests {
         assert_eq!(message.usage.total_tokens, 15);
         assert!(matches!(message.content[0], ContentBlock::Text(_)));
         assert!(matches!(message.content[1], ContentBlock::ToolCall(_)));
+    }
+
+    fn json_tool(id: &str, name: &str, input: Value) -> Value {
+        json!({"toolUse": {"toolUseId": id, "name": name, "input": input}})
+    }
+
+    fn json_reply(content: Vec<Value>, stop_reason: &str) -> Value {
+        json!({
+            "output": {"message": {"role": "assistant", "content": content}},
+            "stopReason": stop_reason,
+            "usage": {
+                "inputTokens": 7, "outputTokens": 3,
+                "cacheReadInputTokens": 20, "cacheWriteInputTokens": 5,
+                "totalTokens": 35
+            }
+        })
+    }
+
+    fn collect_json_reply(response: Value) -> Vec<Result<StreamEvent>> {
+        let (base_url, requests) = spawn_bedrock_json_server(vec![response]);
+        let provider = BedrockProvider::new("model-a").with_base_url(format!("{base_url}/converse"));
+        let options = StreamOptions {
+            api_key: Some("fixture-bearer-token".to_string()),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let events = runtime.block_on(async {
+            provider
+                .stream(&Context::default(), &options)
+                .await
+                .expect("JSON response stream")
+                .collect()
+                .await
+        });
+        requests
+            .recv_timeout(FIXTURE_BUDGET)
+            .expect("real HTTP request");
+        events
+    }
+
+    fn assert_json_failure(events: &[Result<StreamEvent>]) -> &AssistantMessage {
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Ok(StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallDelta { .. }
+                    | StreamEvent::ToolCallEnd { .. }
+                    | StreamEvent::Done { .. })
+            )),
+            "invalid whole response must not publish local calls: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Ok(StreamEvent::Error { .. })))
+                .count(),
+            1
+        );
+        let Some(Ok(StreamEvent::Error { reason, error })) = events.last() else {
+            panic!("expected one terminal Error: {events:?}");
+        };
+        assert_eq!(*reason, StopReason::Error);
+        assert_eq!(error.stop_reason, StopReason::Error);
+        assert!(
+            !error
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        );
+        assert_eq!(error.usage.input, 7);
+        assert_eq!(error.usage.output, 3);
+        assert_eq!(error.usage.cache_read, 20);
+        assert_eq!(error.usage.cache_write, 5);
+        assert_eq!(error.usage.total_tokens, 35);
+        error
+    }
+
+    #[test]
+    fn json_http_tools_require_terminal_tool_use_authorization() {
+        for reason in [
+            "end_turn",
+            "stop_sequence",
+            "max_tokens",
+            "model_context_window_exceeded",
+            "guardrail_intervened",
+            "content_filtered",
+            "malformed_tool_use",
+            "malformed_model_output",
+            "future_status secret-canary\u{1b}[31m\n",
+        ] {
+            let events = collect_json_reply(json_reply(
+                vec![
+                    json!({"text": "retained explanation"}),
+                    json_tool("call-a", "write", json!({"path": "kept.txt", "content": "x"})),
+                ],
+                reason,
+            ));
+            let error = assert_json_failure(&events);
+            assert!(matches!(
+                &error.content[0], ContentBlock::Text(text) if text.text == "retained explanation"
+            ));
+            assert_eq!(error.model, "model-a");
+            assert_eq!(error.provider, "amazon-bedrock");
+            let diagnostic = error.error_message.as_deref().expect("fixed diagnostic");
+            assert!(
+                diagnostic.contains("local tool calls withheld"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("secret-canary"), "{diagnostic}");
+        }
+    }
+
+    #[test]
+    fn json_http_text_stops_preserve_normal_truncated_and_refused_outcomes() {
+        for (reason, expected) in [
+            ("end_turn", StopReason::Stop),
+            ("stop_sequence", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("model_context_window_exceeded", StopReason::Length),
+            ("guardrail_intervened", StopReason::Error),
+            ("content_filtered", StopReason::Error),
+        ] {
+            let events = collect_json_reply(json_reply(vec![json!({"text": "héllo"})], reason));
+            let message = if expected == StopReason::Error {
+                assert_json_failure(&events)
+            } else {
+                let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                    panic!("expected Done for {reason}: {events:?}");
+                };
+                assert_eq!(*reason, expected);
+                assert!(message.error_message.is_none());
+                message
+            };
+            assert_eq!(message.stop_reason, expected);
+            assert_eq!(message.usage.total_tokens, 35);
+            assert!(matches!(
+                &message.content[0], ContentBlock::Text(text) if text.text == "héllo"
+            ));
+        }
+    }
+
+    #[test]
+    fn json_invalid_parallel_batch_withholds_every_call() {
+        let valid = json_tool("call-a", "write", json!({"path": "a", "content": "x"}));
+        let mut invalid_calls = vec![
+            json_tool("call-a", "read", json!({})),
+            json_tool("", "read", json!({})),
+            json_tool("call-b", "read/file", json!({})),
+            json_tool("call-b", "é", json!({})),
+            json_tool(&"x".repeat(65), "read", json!({})),
+            json_tool("call-b", &"x".repeat(65), json!({})),
+            json_tool("call-b", "read", Value::Null),
+            json_tool("call-b", "read", json!([])),
+            json_tool("call-b", "read", json!(42)),
+            json_tool("call-b", "read", json!("{}")),
+            json!({"toolUse": {"toolUseId": "call-b", "name": "read"}}),
+            json!({"toolUse": {"name": "read", "input": {}}}),
+            json!({"toolUse": {"toolUseId": "call-b", "input": {}}}),
+            json!({"toolUse": {"toolUseId": 42, "name": "read", "input": {}}}),
+            json!({"toolUse": {"toolUseId": "call-b", "name": false, "input": {}}}),
+        ];
+        for kind in [
+            json!("server_tool_use"),
+            json!("future_type"),
+            Value::Null,
+            json!(false),
+        ] {
+            let mut tool = json_tool("call-b", "read", json!({}));
+            tool["toolUse"]["type"] = kind;
+            invalid_calls.push(tool);
+        }
+        for invalid in invalid_calls {
+            let response: BedrockConverseResponse = serde_json::from_value(json_reply(
+                vec![json!({"text": "before calls"}), valid.clone(), invalid],
+                "tool_use",
+            ))
+            .expect("valid JSON shape");
+            let message = BedrockProvider::new("m").response_to_message(response);
+            let events = BedrockProvider::message_events(&message);
+            assert_json_failure(&events);
+        }
+    }
+
+    #[test]
+    fn json_missing_role_empty_tool_stop_and_block_limit_fail_closed() {
+        let call = json_tool("call-a", "read", json!({}));
+        // A valid unique tool after otherwise valid text blocks isolates the
+        // size guard from identity/argument errors in this regression.
+        let mut too_many = vec![json!({"text": "x"}); MAX_BEDROCK_CONTENT_BLOCKS];
+        too_many.push(call.clone());
+        let mut replies = vec![
+            json_reply(vec![json!({"text": "no calls"})], "tool_use"),
+            json_reply(too_many, "tool_use"),
+        ];
+        for role in [json!("user"), json!("system"), Value::Null] {
+            let mut reply = json_reply(vec![call.clone()], "tool_use");
+            reply["output"]["message"]["role"] = role;
+            replies.push(reply);
+        }
+        let mut missing_role = json_reply(vec![call], "tool_use");
+        missing_role["output"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        replies.push(missing_role);
+        for reply in replies {
+            let response: BedrockConverseResponse = serde_json::from_value(reply).unwrap();
+            let message = BedrockProvider::new("m").response_to_message(response);
+            assert_json_failure(&BedrockProvider::message_events(&message));
+        }
+    }
+
+    #[test]
+    fn json_content_union_never_hides_a_second_tool_member() {
+        let mut ambiguous = json_tool("call-b", "write", json!({"path": "a", "content": "x"}));
+        ambiguous["text"] = json!("cannot conceal the tool");
+        let events = collect_json_reply(json_reply(
+            vec![
+                json!({"text": "retained explanation"}),
+                json_tool("call-a", "read", json!({})),
+                ambiguous,
+            ],
+            "tool_use",
+        ));
+        let error = assert_json_failure(&events);
+        assert!(matches!(
+            &error.content[0], ContentBlock::Text(text) if text.text == "retained explanation"
+        ));
+        assert!(
+            error.error_message.as_deref().unwrap().contains("ambiguous tool content")
+        );
+    }
+
+    #[test]
+    fn json_http_authorized_parallel_calls_preserve_ids_inputs_and_order() {
+        let events = collect_json_reply(json_reply(
+            vec![
+                json!({"text": "working"}),
+                json_tool("provider:call.1_a-b", "read", json!({"path": "a"})),
+                json_tool("call-b", "current_time", json!({})),
+            ],
+            "tool_use",
+        ));
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "provider:call.1_a-b");
+        assert_eq!(calls[0].arguments, json!({"path": "a"}));
+        assert_eq!(calls[1].id, "call-b");
+        assert_eq!(calls[1].arguments, json!({}));
+        let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+            panic!("authorized batch must end successfully: {events:?}");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.usage.total_tokens, 35);
+    }
+
+    #[test]
+    fn json_http_invalid_calls_cannot_write_files_through_the_agent() {
+        use crate::agent::{Agent, AgentConfig, AgentEvent};
+        use crate::tools::ToolRegistry;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for case in [
+            "authorized",
+            "malformed",
+            "truncated",
+            "server",
+            "invalid-batch",
+        ] {
+            let directory = tempfile::tempdir().expect("isolated write target");
+            let marker = directory.path().join("marker.txt");
+            let mut call = json_tool(
+                "call-a",
+                "write",
+                json!({"path": marker.to_string_lossy(), "content": "authorized write"}),
+            );
+            if case == "server" {
+                call["toolUse"]["type"] = json!("server_tool_use");
+            }
+            let mut content = vec![json!({"text": "write decision"}), call];
+            if case == "invalid-batch" {
+                content.push(json_tool("call-b", "read", Value::Null));
+            }
+            let reason = match case {
+                "malformed" => "malformed_tool_use",
+                "truncated" => "max_tokens",
+                _ => "tool_use",
+            };
+            let authorized = case == "authorized";
+            let mut replies = vec![json_reply(content, reason)];
+            if authorized {
+                replies.push(json_reply(vec![json!({"text": "Finished."})], "end_turn"));
+            }
+            let (url, requests) = spawn_bedrock_json_server(replies);
+            let provider = BedrockProvider::new("m").with_base_url(format!("{url}/converse"));
+            let config = AgentConfig {
+                max_tool_iterations: 1,
+                stream_options: StreamOptions {
+                    api_key: Some("fixture-bearer-token".to_string()),
+                    ..StreamOptions::default()
+                },
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                ..AgentConfig::default()
+            };
+            let tools = ToolRegistry::new(&["write", "read"], directory.path(), None);
+            let mut agent = Agent::new(Arc::new(provider), tools, config);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            let result = runtime
+                .block_on(async {
+                    agent
+                        .run("Write the marker when the provider authorizes it.", move |event| {
+                            if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                                observed_calls.fetch_add(1, Ordering::SeqCst);
+                            }
+                        })
+                        .await
+                })
+                .expect("agent response");
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(authorized), "{case}");
+            assert_eq!(
+                marker.exists(),
+                authorized,
+                "{case} must respect tool authorization"
+            );
+            if authorized {
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "authorized write");
+                assert_eq!(result.stop_reason, StopReason::Stop);
+            } else {
+                assert_eq!(result.stop_reason, StopReason::Error, "{case}");
+                assert_eq!(result.usage.total_tokens, 35);
+            }
+            let expected_requests = if authorized { 2 } else { 1 };
+            for _ in 0..expected_requests {
+                requests
+                    .recv_timeout(FIXTURE_BUDGET)
+                    .expect("captured inference request");
+            }
+            assert!(requests.try_recv().is_err(), "{case} retried unexpectedly");
+        }
     }
 
     #[test]
