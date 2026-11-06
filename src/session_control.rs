@@ -94,6 +94,7 @@ struct RunData {
     pending: VecDeque<PendingInput>,
     pending_bytes: usize,
     handed_to_agent: u64,
+    initial_input_handed_off: bool,
     yield_barrier: Option<YieldBarrier>,
     cancelled: bool,
     completed_successfully: bool,
@@ -134,6 +135,7 @@ impl Run {
                 pending: VecDeque::new(),
                 pending_bytes: 0,
                 handed_to_agent: 0,
+                initial_input_handed_off: false,
                 yield_barrier: None,
                 cancelled: false,
                 completed_successfully: false,
@@ -224,6 +226,17 @@ impl fmt::Debug for SessionControlHandle {
 }
 
 impl SessionControlHandle {
+    /// Native input hooks own the initial payload after this boundary, even
+    /// if they reject it before a provider call. This is not a persistence or
+    /// provider acknowledgement and does not count queued mailbox inputs.
+    pub(crate) fn initial_input_handed_off(&self) -> bool {
+        lock(&self.run.data).initial_input_handed_off
+    }
+
+    fn hand_off_initial_input(&self) {
+        lock(&self.run.data).initial_input_handed_off = true;
+    }
+
     /// Whether an ordered host operation still owns this turn's held input.
     #[must_use]
     pub fn has_yield_barrier(&self) -> bool {
@@ -562,6 +575,27 @@ impl AgentSessionHandle {
         content: UserContent,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        self.prompt_controlled_input_with_source(content, None, on_event)
+    }
+
+    /// Preserve authored provenance with the prepared payload until the SDK
+    /// actually hands it to native hooks. Failed or dropped startup cannot
+    /// leak this one-shot override into an unrelated subsequent prompt.
+    pub(crate) fn prompt_controlled_authored_input(
+        &mut self,
+        content: UserContent,
+        authored_source: String,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
+        self.prompt_controlled_input_with_source(content, Some(authored_source), on_event)
+    }
+
+    fn prompt_controlled_input_with_source(
+        &mut self,
+        content: UserContent,
+        authored_source: Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> ControlledTurn<impl Future<Output = Result<AssistantMessage>> + '_> {
         let active: ActiveRun = Arc::new(Mutex::new(Weak::new()));
         let (run, signal) = Run::new();
         *lock(&active) = Arc::downgrade(&run);
@@ -584,17 +618,18 @@ impl AgentSessionHandle {
         let control = SessionControlHandle {
             run: Arc::clone(&guard.run),
         };
+        let handoff_control = control.clone();
         let session = self;
         let future = async move {
             let _guard = guard;
-            match content {
-                UserContent::Text(text) => session.prompt_with_abort(text, signal, on_event).await,
-                UserContent::Blocks(blocks) => {
-                    session
-                        .prompt_with_content_with_abort(blocks, signal, on_event)
-                        .await
-                }
-            }
+            session
+                .run_recoverable_turn_with_handoff(Some(content), signal, on_event, move |agent| {
+                    handoff_control.hand_off_initial_input();
+                    if let Some(source) = authored_source {
+                        agent.set_magic_keyword_scan_override(Some(source));
+                    }
+                })
+                .await
         };
         ControlledTurn {
             future: Box::pin(execution::OwnedTurn::new(future, control.clone())),
@@ -714,20 +749,18 @@ impl ControllableSession {
             run: Arc::clone(&guard.run),
         };
         let callback_control = control.clone();
+        let handoff_control = control.clone();
         let session = &mut self.session;
         let future = async move {
             // Capture the guard in the future so cancellation before its first
             // poll is just as safe as dropping it during a provider request.
             let _guard = guard;
             let callback = move |event| on_event(&callback_control, event);
-            match content {
-                UserContent::Text(text) => session.prompt_with_abort(text, signal, callback).await,
-                UserContent::Blocks(blocks) => {
-                    session
-                        .prompt_with_content_with_abort(blocks, signal, callback)
-                        .await
-                }
-            }
+            session
+                .run_recoverable_turn_with_handoff(Some(content), signal, callback, move |_| {
+                    handoff_control.hand_off_initial_input()
+                })
+                .await
         };
         Ok(ControlledTurn {
             future: Box::pin(execution::OwnedTurn::new(future, control.clone())),

@@ -1383,6 +1383,69 @@ fn a_public_continuation_restores_the_primary_before_provider_reentry() {
 }
 
 #[test]
+fn restoration_listener_rejection_keeps_the_initial_input_unclaimed() {
+    for with_blocks in [false, true] {
+        let mut handle = handle_after_one_failover(0);
+        let original_messages =
+            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+        let original_agent_messages =
+            serde_json::to_value(handle.session.agent.messages()).unwrap();
+        let admission = handle.session.provider_admission_gate();
+        let restored = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&restored);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&starts);
+        handle.subscribe(move |event| match event {
+            AgentEvent::FailoverEnd {
+                restored_primary: true,
+                ..
+            } => {
+                observed.fetch_add(1, Ordering::SeqCst);
+                // Restoration has passed SDK preflight. An independent
+                // session operation can still close native admission before
+                // input hooks run; no external primary request is permitted.
+                admission.block("fixture transition failed after primary restoration".into());
+            }
+            AgentEvent::AgentStart { .. } => {
+                started.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        });
+        let content = if with_blocks {
+            UserContent::Blocks(native_content_fixture())
+        } else {
+            UserContent::Text("prepared recovered text".into())
+        };
+        let turn = handle.prompt_controlled_authored_input(
+            content,
+            "ultrathink original @file".into(),
+            |_| {},
+        );
+        let control = turn.control();
+        let error = run_async(turn).expect_err("native admission must reject the recovered input");
+
+        assert!(error.is_session_persistence());
+        assert_eq!(restored.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
+        assert!(handle.failover_state.primary().is_none());
+        assert!(control.snapshot().finished);
+        assert!(
+            !control.initial_input_handed_off(),
+            "a restoration listener's admission refusal cannot consume the first payload"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+            original_messages
+        );
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            original_agent_messages
+        );
+    }
+}
+
+#[test]
 fn known_model_capacity_blocks_silent_overflow_recovery_on_every_entrypoint() {
     for entrypoint in ENTRYPOINTS {
         let calls = Arc::new(AtomicUsize::new(0));

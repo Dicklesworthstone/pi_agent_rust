@@ -10438,6 +10438,90 @@ mod extensions_integration_tests {
         }
     }
 
+    #[test]
+    fn native_input_rejects_before_handoff_and_authored_provenance() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (use_blocks, invalid) in [(false, false), (true, false), (true, true)] {
+                let agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig::default(),
+                );
+                let mut session = AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                // SDK preflight can succeed before a separate transition
+                // closes admission. The native check must still precede both
+                // the caller's receipt and its one-shot authored provenance.
+                session
+                    .ensure_provider_reentry_allowed()
+                    .expect("preflight");
+                if invalid {
+                    session
+                        .agent
+                        .set_magic_keyword_scan_override(Some("prior provenance".into()));
+                } else {
+                    let independent_gate = session.provider_admission_gate();
+                    independent_gate
+                        .block("transition became indeterminate after preflight".into());
+                }
+                let handed_off = Arc::new(AtomicBool::new(false));
+                let receipt = Arc::clone(&handed_off);
+                let handoff = move |agent: &mut Agent| {
+                    receipt.store(true, Ordering::SeqCst);
+                    agent
+                        .set_magic_keyword_scan_override(Some("ultrathink recovered input".into()));
+                };
+                let mut turn_system_prompt = None;
+                let result = if use_blocks {
+                    let content = if invalid {
+                        ContentBlock::ToolCall(ToolCall {
+                            id: "assistant-only".into(),
+                            name: "read".into(),
+                            arguments: json!({}),
+                            thought_signature: None,
+                        })
+                    } else {
+                        ContentBlock::Text(TextContent::new("prepared content"))
+                    };
+                    session
+                        .run_with_content_with_abort_capturing_prompt_and_handoff(
+                            vec![content],
+                            None,
+                            &mut turn_system_prompt,
+                            |_| panic!("rejected input cannot dispatch provider events"),
+                            handoff,
+                        )
+                        .await
+                } else {
+                    session
+                        .run_text_with_abort_capturing_prompt_and_handoff(
+                            "prepared text".into(),
+                            None,
+                            &mut turn_system_prompt,
+                            |_| panic!("rejected input cannot dispatch provider events"),
+                            handoff,
+                        )
+                        .await
+                };
+                let error = result.expect_err("native admission refusal");
+                if invalid {
+                    assert!(matches!(error, Error::Validation(_)));
+                } else {
+                    assert!(error.is_session_persistence());
+                }
+                assert!(!handed_off.load(Ordering::SeqCst));
+                assert_eq!(session.agent.magic_keyword_scan_override, None);
+                assert!(session.agent.messages().is_empty());
+                assert_eq!(turn_system_prompt, None);
+            }
+        });
+    }
+
     #[derive(Debug)]
     struct IdleCommandProvider;
 
@@ -22388,9 +22472,32 @@ impl AgentSession {
         turn_system_prompt: &mut Option<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_text_with_abort_capturing_prompt_and_handoff(
+            input,
+            abort,
+            turn_system_prompt,
+            on_event,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Accept ownership after the final native admission check, immediately
+    /// before consuming provenance and dispatching input hooks. SDK startup
+    /// checks cannot substitute for this boundary: another transition may
+    /// quarantine provider re-entry before the native call begins.
+    pub(crate) async fn run_text_with_abort_capturing_prompt_and_handoff(
+        &mut self,
+        input: String,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: &mut Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        handoff_input: impl FnOnce(&mut Agent) + Send,
+    ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         async {
+            handoff_input(&mut self.agent);
             // Consume the one-shot provenance before extension dispatch so a
             // blocked/failed input cannot leak it into the next user turn.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
@@ -22471,13 +22578,38 @@ impl AgentSession {
         turn_system_prompt: &mut Option<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_with_content_with_abort_capturing_prompt_and_handoff(
+            content,
+            abort,
+            turn_system_prompt,
+            on_event,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Content counterpart of the native text ownership boundary above.
+    /// Invalid content consumes any prior provenance without claiming the
+    /// prepared payload or installing the incoming caller's provenance.
+    pub(crate) async fn run_with_content_with_abort_capturing_prompt_and_handoff(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: &mut Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        handoff_input: impl FnOnce(&mut Agent) + Send,
+    ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         async {
+            if let Err(error) = Self::validate_user_content_blocks(&content) {
+                self.agent.set_magic_keyword_scan_override(None);
+                return Err(error);
+            }
+            handoff_input(&mut self.agent);
             // See the text path above: provenance is one-shot even when an
             // input extension blocks before the Agent loop starts.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
-            Self::validate_user_content_blocks(&content)?;
             let (original_text, images) = Self::split_content_blocks_for_input(&content);
             let outcome = self
                 .dispatch_input_event(original_text.clone(), images)

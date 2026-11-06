@@ -462,6 +462,264 @@ fn ordinary_returned_text_waits_behind_a_recovered_native_goal_draft() {
 }
 
 #[test]
+fn rejected_recovered_input_keeps_its_first_payload_and_fifo_tail() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let provider = Arc::new(Probe::default());
+        let mut session = handle(Arc::clone(&provider));
+        let owner = session
+            .with_session(|session| session.header.id.clone())
+            .await
+            .unwrap();
+        let mut pending = detached(&mut session, &payload(), "first original @file");
+        pending.extend(detached(
+            &mut session,
+            &UserContent::Text("second payload".into()),
+            "second source",
+        ));
+        pending.extend(detached(
+            &mut session,
+            &UserContent::Text("third payload".into()),
+            "third source",
+        ));
+        let request = RestoredInput::new(uuid::Uuid::new_v4(), owner, None, pending);
+        let old_command = request.clone();
+        session
+            .session()
+            .provider_admission_gate()
+            .block("fixture requires durable session recovery".to_string());
+        let controls: TurnControlSlot = Arc::default();
+        let (events, received) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel();
+        run_restored(&mut session, request, &tx, &events, &controls).await;
+
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert!(session.session().agent.messages().is_empty());
+        let Event::Pending(returned) = received.try_recv().unwrap() else {
+            panic!("recover all unclaimed payloads");
+        };
+        {
+            let pending = returned.pending.lock().unwrap();
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|input| input.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["first original @file", "second source", "third source"]
+            );
+            same_payload(&pending[0].content, &payload());
+            same_payload(
+                &pending[1].content,
+                &UserContent::Text("second payload".into()),
+            );
+            same_payload(
+                &pending[2].content,
+                &UserContent::Text("third payload".into()),
+            );
+        }
+        assert_ne!(returned.id, old_command.id);
+        assert!(old_command.pending.lock().unwrap().is_empty());
+        assert!(received.try_recv().is_err());
+
+        // Recovery has a new one-use identity. A retained UI command cannot
+        // reacquire or duplicate any part of the returned input batch.
+        run_restored(&mut session, old_command, &tx, &events, &controls).await;
+        assert!(received.try_recv().is_err());
+        assert!(provider.requests.lock().unwrap().is_empty());
+    });
+}
+
+#[test]
+fn interrupted_restore_startup_preserves_first_input_before_native_handoff() {
+    for outcome in ["drop", "reject", "cancel"] {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(Probe::default());
+            let mut session =
+                handle(Arc::clone(&provider)).with_failover(Some(crate::sdk::FailoverOptions {
+                    chains: std::collections::HashMap::new(),
+                    available_models: Vec::new(),
+                    auth: crate::auth::AuthStorage::empty_at("unused-auth.json".into()),
+                    cli_api_key: None,
+                    cooldown_secs: 60,
+                }));
+            let owner = session
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
+            let mut pending = detached(&mut session, &payload(), "first original @file");
+            pending.extend(detached(
+                &mut session,
+                &UserContent::Text("tail payload".into()),
+                "tail source",
+            ));
+            let request = RestoredInput::new(uuid::Uuid::new_v4(), owner, None, pending);
+            let old_command = request.clone();
+            let controls: TurnControlSlot = Arc::default();
+            let (events, received) = mpsc::channel();
+            let (tx, _rx) = mpsc::channel();
+
+            // The SDK has accepted control, but primary restoration cannot
+            // finish while another provider transition holds admission.
+            let admission = session.session().provider_admission_gate();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let authority = admission
+                .acquire_transition_authority(cx.cx())
+                .await
+                .unwrap();
+            let mut replay = Box::pin(run_restored(&mut session, request, &tx, &events, &controls));
+            assert!(futures::poll!(replay.as_mut()).is_pending());
+            let control = controls.lock().unwrap().current.clone().unwrap();
+            assert!(!control.initial_input_handed_off());
+            assert!(old_command.pending.lock().unwrap().is_empty());
+            assert!(provider.requests.lock().unwrap().is_empty());
+
+            if outcome == "drop" {
+                drop(replay);
+                drop(authority);
+            } else {
+                if outcome == "reject" {
+                    admission.block("another transition could not establish durability".into());
+                } else {
+                    control.abort();
+                }
+                drop(authority);
+                replay.await;
+            }
+
+            assert!(!control.initial_input_handed_off());
+            assert!(provider.requests.lock().unwrap().is_empty());
+            assert!(session.session().agent.messages().is_empty());
+            let Event::Pending(returned) = received.try_recv().unwrap() else {
+                panic!("return input whose native handoff never occurred");
+            };
+            let pending = returned.pending.lock().unwrap();
+            assert_eq!(pending.len(), 2);
+            assert_eq!(pending[0].text, "first original @file");
+            same_payload(&pending[0].content, &payload());
+            assert_eq!(pending[1].text, "tail source");
+            same_payload(
+                &pending[1].content,
+                &UserContent::Text("tail payload".into()),
+            );
+            assert_ne!(returned.id, old_command.id);
+            assert!(old_command.pending.lock().unwrap().is_empty());
+            assert!(received.try_recv().is_err());
+        });
+    }
+}
+
+#[test]
+fn input_hook_refusal_does_not_replay_first_input_even_without_provider_events() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("consume-input.mjs");
+        std::fs::write(
+            &entry,
+            r#"export default function (pi) {
+                let handled = 0;
+                pi.on("input", () => {
+                    handled += 1;
+                    return { action: "handled", reason: "input already handled by extension" };
+                });
+                pi.registerCommand("handled-count", { handler: async () => handled });
+            }"#,
+        )
+        .unwrap();
+        let provider = Arc::new(Probe::default());
+        let mut session = handle(Arc::clone(&provider));
+        session
+            .session_mut()
+            .enable_extensions(&[], temp.path(), None, &[entry])
+            .await
+            .unwrap();
+        let manager = session.extension_manager().unwrap().clone();
+        let owner = session
+            .with_session(|session| session.header.id.clone())
+            .await
+            .unwrap();
+        let mut pending = detached(
+            &mut session,
+            &UserContent::Text("already consumed by hook".into()),
+            "first source",
+        );
+        pending.extend(detached(&mut session, &payload(), "unclaimed tail"));
+        let request = RestoredInput::new(uuid::Uuid::new_v4(), owner, None, pending);
+        let controls: TurnControlSlot = Arc::default();
+        let (events, received) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel();
+        run_restored(&mut session, request, &tx, &events, &controls).await;
+
+        assert_eq!(
+            manager
+                .execute_command("handled-count", "", 5000)
+                .await
+                .unwrap(),
+            serde_json::json!(1)
+        );
+        assert!(provider.requests.lock().unwrap().is_empty());
+        assert!(session.session().agent.messages().is_empty());
+        let Event::Pending(returned) = received.try_recv().unwrap() else {
+            panic!("return only input the hook never consumed");
+        };
+        {
+            let pending = returned.pending.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].text, "unclaimed tail");
+            same_payload(&pending[0].content, &payload());
+        }
+        assert!(received.try_recv().is_err());
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+}
+
+#[test]
+fn native_failure_after_handoff_does_not_restore_the_dispatched_first_input() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let provider = Arc::new(Probe {
+            fail: true,
+            ..Default::default()
+        });
+        let mut session = handle(Arc::clone(&provider));
+        let owner = session
+            .with_session(|session| session.header.id.clone())
+            .await
+            .unwrap();
+        let mut pending = detached(
+            &mut session,
+            &UserContent::Text("deliver first once".into()),
+            "first source",
+        );
+        pending.extend(detached(&mut session, &payload(), "unclaimed tail"));
+        let request = RestoredInput::new(uuid::Uuid::new_v4(), owner, None, pending);
+        let controls: TurnControlSlot = Arc::default();
+        let (events, received) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel();
+        run_restored(&mut session, request, &tx, &events, &controls).await;
+
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        let Event::Pending(returned) = received.try_recv().unwrap() else {
+            panic!("recover only the unclaimed tail");
+        };
+        let pending = returned.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "unclaimed tail");
+        same_payload(&pending[0].content, &payload());
+        assert!(received.try_recv().is_err());
+    });
+}
+
+#[test]
 fn dropping_an_explicit_native_resubmission_recovers_only_its_unclaimed_tail() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()

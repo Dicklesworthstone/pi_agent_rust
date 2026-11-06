@@ -391,6 +391,23 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_recoverable_turn_with_handoff(input, abort_signal, on_event, |_| {})
+            .await
+    }
+
+    /// Transfer initial input after SDK startup and the final native admission
+    /// check succeed. A rejected or abandoned startup has not dispatched the
+    /// input hooks; hosts retaining attachments can recover that input safely.
+    /// Once handed off, even an input-hook refusal may have side effects and
+    /// must not become permission to replay the input. Recovery attempts never
+    /// invoke this callback again.
+    pub(crate) async fn run_recoverable_turn_with_handoff(
+        &mut self,
+        input: Option<UserContent>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        handoff_input: impl FnOnce(&mut crate::agent::Agent) + Send,
+    ) -> Result<AssistantMessage> {
         ensure_not_aborted(&abort_signal)?;
         self.session.ensure_provider_reentry_allowed()?;
         if let Some(UserContent::Blocks(blocks)) = &input
@@ -428,21 +445,23 @@ impl AgentSessionHandle {
         let first = match input {
             Some(UserContent::Text(input)) => {
                 self.session
-                    .run_text_with_abort_capturing_prompt(
+                    .run_text_with_abort_capturing_prompt_and_handoff(
                         input,
                         Some(abort_signal.clone()),
                         &mut turn_system_prompt,
                         move |event| forwarded(event),
+                        handoff_input,
                     )
                     .await
             }
             Some(UserContent::Blocks(content)) => {
                 self.session
-                    .run_with_content_with_abort_capturing_prompt(
+                    .run_with_content_with_abort_capturing_prompt_and_handoff(
                         content,
                         Some(abort_signal.clone()),
                         &mut turn_system_prompt,
                         move |event| forwarded(event),
+                        handoff_input,
                     )
                     .await
             }

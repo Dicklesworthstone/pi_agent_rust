@@ -592,6 +592,7 @@ impl PiFtuiModel {
 struct ReplayRecovery<'a> {
     request: RestoredInput,
     events: &'a Sender<Event>,
+    first: Option<PendingInput>,
     control: Option<SessionControlHandle>,
 }
 
@@ -607,6 +608,18 @@ impl Drop for ReplayRecovery<'_> {
         if let Some(control) = &self.control {
             control.abort();
             pending.extend(control.take_pending());
+        }
+        if self
+            .control
+            .as_ref()
+            .is_none_or(|control| !control.initial_input_handed_off())
+            && let Some(first) = self.first.take()
+        {
+            // Startup may fail or be dropped before the SDK transfers the
+            // first payload to native input hooks. Return it ahead of its
+            // unclaimed tail; a dispatched input must never be replayed just
+            // because its hook, provider or final save later failed.
+            pending.insert(0, first);
         }
         if !pending.is_empty() {
             // Never refill a consumed command: a stale command clone must
@@ -634,6 +647,7 @@ pub(super) async fn run_restored(
     let mut recovery = ReplayRecovery {
         request,
         events,
+        first: None,
         control: None,
     };
     let owner = handle
@@ -668,11 +682,8 @@ pub(super) async fn run_restored(
     if pending.is_empty() {
         return;
     }
-    let first = pending.remove(0);
-    handle
-        .session_mut()
-        .agent
-        .set_magic_keyword_scan_override(Some(first.text.clone()));
+    recovery.first = Some(pending.remove(0));
+    let first = recovery.first.as_ref().expect("initial recovered input");
     let tx = agent_tx.clone();
     let progress = super::tool_progress::Bridge::new(
         Some(recovery.request.owner_session_id.clone()),
@@ -680,15 +691,15 @@ pub(super) async fn run_restored(
             let _ = tx.send(message);
         },
     );
-    let turn = handle.prompt_controlled_input(first.content.clone(), progress.callback());
+    let turn = handle.prompt_controlled_authored_input(
+        first.content.clone(),
+        first.text.clone(),
+        progress.callback(),
+    );
     let control = turn.control();
+    recovery.control = Some(control.clone());
     if let Err(error) = control.restore_pending(&mut pending) {
         drop(turn);
-        handle
-            .session_mut()
-            .agent
-            .set_magic_keyword_scan_override(None);
-        pending.insert(0, first);
         *recovery
             .request
             .pending
@@ -697,7 +708,6 @@ pub(super) async fn run_restored(
         super::report_turn_result(Err(error), agent_tx);
         return;
     }
-    recovery.control = Some(control.clone());
     controls
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -708,20 +718,6 @@ pub(super) async fn run_restored(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .current = None;
-    if matches!(&result, Err(Error::Validation(message))
-        if message.starts_with("[SESSION_CONTROL_CANCELLED] turn cancelled before execution;"))
-    {
-        handle
-            .session_mut()
-            .agent
-            .set_magic_keyword_scan_override(None);
-        recovery
-            .request
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(first);
-    }
     super::report_turn_result(result, agent_tx);
 }
 
