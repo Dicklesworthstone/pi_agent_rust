@@ -286,7 +286,7 @@ fn pax(mut bytes: &[u8]) -> Result<Pax> {
                     None
                 } else {
                     Some(decimal(value)?)
-                })
+                });
             }
             "hdrcharset" if matches!(value, b"" | b"UTF-8" | b"ISO-IR 10646 2000 UTF-8") => {}
             // Inert ownership/timestamp/comment/xattr metadata is not displayed,

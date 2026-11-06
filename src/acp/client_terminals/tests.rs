@@ -206,7 +206,7 @@ fn native_foreground_uses_shell_argv_streams_output_and_releases_the_editor_term
             "native-bash",
             json!({"command":command}),
             Some(Box::new(move |update| {
-                observed.lock().unwrap().push(update)
+                observed.lock().unwrap().push(update);
             })),
         ));
         let create = fixture
@@ -793,7 +793,7 @@ fn real_agent_permission_denial_starts_no_editor_or_local_process() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let observed = Arc::clone(&events);
         let mut turn = Box::pin(agent.run("Run the command", move |event| {
-            observed.lock().unwrap().push(event)
+            observed.lock().unwrap().push(event);
         }));
         let permission = fixture
             .await_frame(turn.as_mut(), "session/request_permission")
