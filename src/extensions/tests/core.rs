@@ -2253,9 +2253,11 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
             .sender
             .send(
                 &cx,
-                JsRuntimeCommand::ExecuteCommand {
-                    command_name: "expired-probe".to_string(),
-                    args: String::new(),
+                JsRuntimeCommand::ExecuteInteraction {
+                    interaction: ExtensionInteraction::Command {
+                        name: "expired-probe".to_string(),
+                        args: String::new(),
+                    },
                     ctx_payload: Arc::new(json!({})),
                     origin: None,
                     timeout_ms: 5_000,
@@ -2287,9 +2289,11 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
             .sender
             .send(
                 &cx,
-                JsRuntimeCommand::ExecuteCommand {
-                    command_name: "expired-probe".to_string(),
-                    args: String::new(),
+                JsRuntimeCommand::ExecuteInteraction {
+                    interaction: ExtensionInteraction::Command {
+                        name: "expired-probe".to_string(),
+                        args: String::new(),
+                    },
                     ctx_payload: Arc::new(json!({})),
                     origin: None,
                     timeout_ms: 5_000,

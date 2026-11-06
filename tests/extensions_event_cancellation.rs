@@ -520,17 +520,19 @@ mod runtime_lifetime {
                     return { content: [], details: { starts } };
                 }
             });
-            pi.registerCommand('active-command', {
-                handler: async mode => {
-                    starts++;
-                    if (mode === 'cpu_sync') { while (true) {} }
-                    await pi.tool('read', { mode });
-                    return 'command completed';
-                }
-            });
+            const run = async mode => {
+                starts++;
+                if (mode === 'cpu_sync') { while (true) {} }
+                await pi.tool('read', { mode });
+                return 'command completed';
+            };
+            pi.registerCommand('active-command', { handler: run });
+            pi.registerShortcut('ctrl+alt+k', { handler: () => run('blocked') });
+            pi.registerShortcut('ctrl+alt+c', { handler: () => run('cpu_sync') });
             pi.registerCommand('active-immediate', {
                 handler: () => 'immediate result'
             });
+            pi.registerShortcut('ctrl+alt+i', { handler: () => 'immediate result' });
             pi.on('session_before_switch', () => {
                 // A genuinely older native request must not become owned by
                 // a later, unrelated command's final hostcall flush.
@@ -580,6 +582,9 @@ mod runtime_lifetime {
             pi.on('session_switch', () => { queued++; });
             pi.registerCommand('peer-command', {
                 handler: () => { queued++; return 'peer command ran'; }
+            });
+            pi.registerShortcut('ctrl+alt+p', {
+                handler: () => { queued++; return 'peer shortcut ran'; }
             });
             pi.registerTool({
                 name: 'peer_probe', description: 'Unaffected event owner',
@@ -791,19 +796,28 @@ mod runtime_lifetime {
     }
 
     #[test]
-    fn command_cancellation_releases_native_work_and_keeps_other_extensions_callable() {
+    fn operator_handler_cancellation_releases_native_work_and_keeps_other_extensions_callable() {
         let executor = RuntimeBuilder::current_thread().build().expect("runtime");
         executor.block_on(async {
-            for drop_caller in [false, true] {
+            for (shortcut, drop_caller) in [(false, false), (false, true), (true, false), (true, true)] {
                 let mut fixture = fixture().await;
                 let (abort, signal) = pi::agent::AbortHandle::new();
-                let command = Box::pin(fixture.runtime.execute_command_with_abort(
-                    "active-command".to_string(),
-                    "blocked".to_string(),
-                    Arc::new(json!({})),
-                    60_000,
-                    Some(signal),
-                ));
+                let command = Box::pin(if shortcut {
+                    Either::Left(fixture.runtime.execute_shortcut_with_abort(
+                        "ctrl+alt+k".to_string(),
+                        Arc::new(json!({})),
+                        60_000,
+                        Some(signal),
+                    ))
+                } else {
+                    Either::Right(fixture.runtime.execute_command_with_abort(
+                        "active-command".to_string(),
+                        "blocked".to_string(),
+                        Arc::new(json!({})),
+                        60_000,
+                        Some(signal),
+                    ))
+                });
                 let pending =
                     after_native_entry(fixture.started.take().expect("admission"), command).await;
                 if drop_caller {
@@ -830,9 +844,9 @@ mod runtime_lifetime {
     }
 
     #[test]
-    fn queued_command_cancellation_does_not_wait_for_or_cancel_another_owner() {
+    fn queued_operator_handler_cancellation_does_not_wait_for_or_cancel_another_owner() {
         let executor = RuntimeBuilder::current_thread().build().expect("runtime");
-        executor.block_on(async {
+        let run = |shortcut| async move {
             let mut fixture = fixture().await;
             let event = Box::pin(fixture.runtime.dispatch_event(
                 "session_start".to_string(),
@@ -842,13 +856,22 @@ mod runtime_lifetime {
             ));
             let event = after_native_entry(fixture.started.take().expect("admission"), event).await;
             let (abort, signal) = pi::agent::AbortHandle::new();
-            let mut command = Box::pin(fixture.runtime.execute_command_with_abort(
-                "peer-command".to_string(),
-                String::new(),
-                Arc::new(json!({})),
-                60_000,
-                Some(signal),
-            ));
+            let mut command = Box::pin(if shortcut {
+                Either::Left(fixture.runtime.execute_shortcut_with_abort(
+                    "ctrl+alt+p".to_string(),
+                    Arc::new(json!({})),
+                    60_000,
+                    Some(signal),
+                ))
+            } else {
+                Either::Right(fixture.runtime.execute_command_with_abort(
+                    "peer-command".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    60_000,
+                    Some(signal),
+                ))
+            });
             assert!(futures::poll!(command.as_mut()).is_pending());
             abort.abort();
             assert!(matches!(
@@ -870,27 +893,36 @@ mod runtime_lifetime {
                 .await
                 .expect("active owner remains healthy");
             assert!(fixture.manager.shutdown(Duration::from_secs(2)).await);
+        };
+        executor.block_on(async {
+            run(false).await;
+            run(true).await;
         });
     }
 
     #[test]
-    fn synchronous_command_cpu_loop_is_bounded_before_it_returns_a_promise() {
+    fn synchronous_operator_handler_cpu_loop_is_bounded_before_it_returns_a_promise() {
         let executor = RuntimeBuilder::current_thread().build().expect("runtime");
-        executor.block_on(async {
+        let run = |shortcut| async move {
             let fixture = fixture().await;
-            let failure = timeout(
-                wall_now(),
-                Duration::from_secs(5),
-                fixture.runtime.execute_command(
+            let invocation = if shortcut {
+                Either::Left(fixture.runtime.execute_shortcut(
+                    "ctrl+alt+c".to_string(),
+                    Arc::new(json!({})),
+                    500,
+                ))
+            } else {
+                Either::Right(fixture.runtime.execute_command(
                     "active-command".to_string(),
                     "cpu_sync".to_string(),
                     Arc::new(json!({})),
                     500,
-                ),
-            )
-            .await
-            .expect("command deadline must interrupt synchronous JavaScript")
-            .expect_err("CPU loop cannot finish normally");
+                ))
+            };
+            let failure = timeout(wall_now(), Duration::from_secs(5), invocation)
+                .await
+                .expect("command deadline must interrupt synchronous JavaScript")
+                .expect_err("CPU loop cannot finish normally");
             let message = failure.to_string();
             assert!(
                 message.contains("timed out") || message.contains("interrupt"),
@@ -898,6 +930,10 @@ mod runtime_lifetime {
             );
             assert_eq!(fixture.calls.entries.load(Ordering::SeqCst), 0);
             assert_active_owner_quarantined(&fixture, 0).await;
+        };
+        executor.block_on(async {
+            run(false).await;
+            run(true).await;
         });
     }
 
@@ -937,6 +973,19 @@ mod runtime_lifetime {
             .await
             .expect("unrelated background I/O cannot delay a completed command")
             .expect("healthy immediate command");
+            assert_eq!(value, "immediate result");
+            let value = timeout(
+                wall_now(),
+                Duration::from_secs(2),
+                fixture.runtime.execute_shortcut(
+                    "ctrl+alt+i".to_string(),
+                    Arc::new(json!({})),
+                    60_000,
+                ),
+            )
+            .await
+            .expect("unrelated background I/O cannot delay a completed shortcut")
+            .expect("healthy immediate shortcut");
             assert_eq!(value, "immediate result");
             assert_eq!(fixture.calls.completions.load(Ordering::SeqCst), 0);
             assert_eq!(fixture.calls.drops.load(Ordering::SeqCst), 0);

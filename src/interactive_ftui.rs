@@ -55,7 +55,7 @@ use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
-use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
+use crate::extensions::{ExtensionInteraction, ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalog};
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
@@ -1762,6 +1762,11 @@ pub enum UiCommand {
     /// A registered extension owned this token when it was submitted. If a
     /// reload removes it, refuse instead of running a same-named template.
     RegisteredExtensionCommand { name: String, args: String },
+    /// Run a registered key handler only in the session that owned the press.
+    ExtensionShortcut {
+        key_id: String,
+        owner_session_id: String,
+    },
     /// Start a fresh session (`/new`): the driver builds a new session from
     /// the launch template with the current provider/model selection and a
     /// reset thinking level, swaps it in, and replays the (empty) history.
@@ -2766,6 +2771,79 @@ impl PiFtuiModel {
             return extension_command_name(&commands, token).map(str::to_string);
         }
         extension_command_name(&self.extension_commands, token).map(str::to_string)
+    }
+
+    fn route_extension_shortcut(&mut self, key: &ftui::KeyEvent, binding: &KeyBinding) -> bool {
+        if self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || !self.ext_queue.is_empty()
+            || self.login_pending.is_some()
+            || self.picker.is_some()
+            || self.custom_overlay_open()
+            || self.settings_pending
+            || self.suspending
+            || self.mcp_auth_request.is_some()
+        {
+            return false;
+        }
+        // Native editor bindings deliberately normalize Shift+letter to the
+        // typed character. Extension Key.shift() registrations need the actual
+        // chord; older terminal protocols convey that shift as an uppercase
+        // character without a separate modifier bit.
+        let mut shortcut = binding.clone();
+        shortcut.modifiers.shift |= key.modifiers.contains(Modifiers::SHIFT)
+            || matches!(key.code, KeyCode::Char(ch) if ch.is_uppercase());
+        let key_id = shortcut.to_string();
+        // The JS registration API protects these chords. Keep the same
+        // boundary for native descriptors and dynamically published entries.
+        if matches!(key_id.as_str(), "ctrl+c" | "ctrl+d" | "ctrl+l" | "ctrl+z") {
+            return false;
+        }
+        let registered = self
+            .extension_command_registry
+            .as_ref()
+            .is_some_and(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|manager| manager.has_shortcut(&key_id))
+            });
+        if !registered {
+            return false;
+        }
+        // The host owns Super chords. A registered chord with an extra Super
+        // must neither invoke its weaker extension binding nor fall through
+        // to the widget's modifier-insensitive Ctrl editing shortcuts.
+        if key.modifiers.contains(Modifiers::SUPER) {
+            return true;
+        }
+        let plain_text = matches!(key.code, KeyCode::Char(_))
+            && !shortcut.modifiers.ctrl
+            && !shortcut.modifiers.alt;
+        if self.state != AgentUiState::Ready
+            || self.busy.is_some()
+            || self.live_goal().is_some()
+            || self.queued_compaction.is_some()
+            || self.submit_tx.is_none()
+        {
+            // Keep ordinary mid-turn typing available. Refused modified
+            // chords must not fall through to the widget, which could treat
+            // Ctrl+Alt+K as Ctrl+K and delete part of the waiting draft.
+            return !plain_text;
+        }
+        if key.kind != ftui::KeyEventKind::Press {
+            return true;
+        }
+        let Some(owner_session_id) = self.displayed_session_id.clone() else {
+            return !plain_text;
+        };
+        self.begin_busy(format!("Running shortcut [{key_id}] ..."));
+        self.send_command(UiCommand::ExtensionShortcut {
+            key_id,
+            owner_session_id,
+        });
+        true
     }
 
     /// Whether thinking starts shown in full (`hideThinkingBlock` off) or
@@ -3995,7 +4073,11 @@ impl PiFtuiModel {
                 if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
                     let text = sanitize(&text).into_owned();
                     self.error_banner = None;
-                    self.record_history(&sanitize(&history_text));
+                    // Generated prompts have no authored history text. A
+                    // shortcut must leave recall and the parked draft intact.
+                    if !history_text.trim().is_empty() {
+                        self.record_history(&sanitize(&history_text));
+                    }
                     self.push_entry(EntryRole::User, text);
                     self.scroll_from_tail = 0;
                 }
@@ -6934,6 +7016,14 @@ impl PiFtuiModel {
                     }
                     _ => {}
                 }
+                // Match classic precedence: modal owners and configured
+                // native actions above consume their keys first. Only an
+                // otherwise unhandled press can invoke an extension handler.
+                if let Some(binding) = &binding
+                    && self.route_extension_shortcut(key, binding)
+                {
+                    return self.take_busy_tick();
+                }
                 // Configured actions above win, including reassigned default
                 // chords. A removed default must not acquire a second meaning
                 // from the widget: retired Ctrl+A otherwise selects the whole
@@ -9478,7 +9568,6 @@ fn template_prompt(
     Some(resources.expand_input(&input))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run_extension_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     name: &str,
@@ -9520,6 +9609,70 @@ async fn run_extension_command(
         )));
         return;
     }
+    run_extension_interaction(
+        handle,
+        ExtensionInteraction::Command {
+            name: name.to_string(),
+            args: args.to_string(),
+        },
+        None,
+        agent_tx,
+        turn_control,
+        turn_abort,
+    )
+    .await;
+}
+
+async fn run_extension_shortcut(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    key_id: &str,
+    owner_session_id: &str,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
+) {
+    if !handle.extension_manager().is_some_and(|manager| {
+        manager.has_shortcut(key_id) && manager.runtime().is_some()
+    }) {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Extension shortcut [{key_id}] is no longer available."
+        )));
+        return;
+    }
+    run_extension_interaction(
+        handle,
+        ExtensionInteraction::Shortcut {
+            key_id: key_id.to_string(),
+        },
+        Some(owner_session_id),
+        agent_tx,
+        turn_control,
+        turn_abort,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_extension_interaction(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    interaction: ExtensionInteraction,
+    expected_owner: Option<&str>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
+) {
+    let (label, tool_id, timeout_ms) = match &interaction {
+        ExtensionInteraction::Command { name, .. } => (
+            format!("/{name}"),
+            "ftui-ext-command",
+            EXT_COMMAND_TIMEOUT_MS,
+        ),
+        ExtensionInteraction::Shortcut { key_id } => (
+            format!("Shortcut [{key_id}]"),
+            "ftui-ext-shortcut",
+            crate::extensions::EXTENSION_SHORTCUT_BUDGET_MS,
+        ),
+    };
     let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
     let _operation_abort =
         queued_compaction::OperationAbort::publish(turn_abort, turn_control, &abort_handle);
@@ -9529,31 +9682,36 @@ async fn run_extension_command(
         futures::pin_mut!(snapshot, cancelled);
         match futures::future::select(cancelled, snapshot).await {
             futures::future::Either::Left(_) => {
-                let _ = agent_tx.send(PiMsg::System(format!("/{name} cancelled")));
+                let _ = agent_tx.send(PiMsg::System(format!("{label} cancelled")));
                 return;
             }
             futures::future::Either::Right((Ok(owner), _)) => owner,
             futures::future::Either::Right((Err(error), _)) => {
-                let _ = agent_tx.send(PiMsg::AgentError(format!("/{name}: {error}")));
+                let _ = agent_tx.send(PiMsg::AgentError(format!("{label}: {error}")));
                 return;
             }
         }
     };
+    if expected_owner.is_some_and(|expected| expected != owner) {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "{label} belongs to an earlier session; invoke it again here."
+        )));
+        return;
+    }
     let _ = agent_tx.send(PiMsg::ToolStart {
-        name: format!("/{name}"),
-        tool_id: String::from("ftui-ext-command"),
+        name: label.clone(),
+        tool_id: tool_id.to_string(),
     });
     let card_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let callback_card = Arc::clone(&card_open);
     let progress = Arc::new(Mutex::new(None::<tool_progress::Bridge>));
     let callback_progress = Arc::clone(&progress);
-    let command_name = name.to_string();
+    let callback_label = label.clone();
     let tx = agent_tx.clone();
     let result = handle
-        .execute_extension_command_with_abort(
-            name,
-            args,
-            EXT_COMMAND_TIMEOUT_MS,
+        .execute_extension_interaction_with_abort(
+            interaction,
+            timeout_ms,
             Some(abort_signal),
             move |event| {
                 use crate::agent::AgentEvent;
@@ -9562,12 +9720,12 @@ async fn run_extension_command(
                 if matches!(&event, AgentEvent::AgentStart { .. })
                     && callback_card.swap(false, std::sync::atomic::Ordering::AcqRel)
                 {
-                    // The command has requested a native turn. Finish its
+                    // The handler has requested a native turn. Finish its
                     // out-of-turn card before native lifecycle messages can
                     // settle it; the shared abort still owns the whole flow.
                     let _ = tx.send(PiMsg::ToolEnd {
-                        name: format!("/{command_name}"),
-                        tool_id: String::from("ftui-ext-command"),
+                        name: callback_label.clone(),
+                        tool_id: tool_id.to_string(),
                         is_error: false,
                         output: None,
                     });
@@ -9621,17 +9779,17 @@ async fn run_extension_command(
         .as_ref()
         .is_err_and(|error| !matches!(error, crate::error::Error::Aborted));
     let msg = match result {
-        Ok(value) if value.is_null() => PiMsg::SystemNote(format!("/{name} done")),
-        Ok(value) => PiMsg::SystemNote(format!("/{name} → {value}")),
-        Err(crate::error::Error::Aborted) => PiMsg::System(format!("/{name} cancelled")),
-        Err(err) => PiMsg::AgentError(format!("/{name}: {err}")),
+        Ok(value) if value.is_null() => PiMsg::SystemNote(format!("{label} done")),
+        Ok(value) => PiMsg::SystemNote(format!("{label} → {value}")),
+        Err(crate::error::Error::Aborted) => PiMsg::System(format!("{label} cancelled")),
+        Err(err) => PiMsg::AgentError(format!("{label}: {err}")),
     };
     // ToolEnd before the error: the AgentError sweep settles pending
     // cards, which would turn this ToolEnd into a duplicate trace line.
     if card_open.load(std::sync::atomic::Ordering::Acquire) {
         let _ = agent_tx.send(PiMsg::ToolEnd {
-            name: format!("/{name}"),
-            tool_id: String::from("ftui-ext-command"),
+            name: label,
+            tool_id: tool_id.to_string(),
             is_error,
             output: None,
         });
@@ -12486,6 +12644,17 @@ pub fn run(
                                 &name,
                                 &args,
                                 true,
+                                &agent_tx,
+                                &driver_turn_control,
+                                &driver_turn_abort,
+                            )
+                            .await;
+                        }
+                        Ok(UiCommand::ExtensionShortcut { key_id, owner_session_id }) => {
+                            run_extension_shortcut(
+                                &mut handle,
+                                &key_id,
+                                &owner_session_id,
                                 &agent_tx,
                                 &driver_turn_control,
                                 &driver_turn_abort,
@@ -27086,20 +27255,33 @@ mod tests {
                         prompt: ctx.getSystemPrompt()
                     })
                 });
-                pi.registerCommand('workflow', {
-                    handler: async () => {
-                        // Resume from native I/O before issuing the public,
-                        // intentionally fire-and-forget message APIs. Their
-                        // native actions must finish before command replay.
-                        await pi.getThinkingLevel();
-                        pi.sendUserMessage('ultrathink generated first');
-                        pi.sendMessage({
-                            customType: 'workflow-note', content: 'generated custom turn', display: true
-                        }, { triggerTurn: true });
-                        pi.sendUserMessage('generated second');
-                        return 'queued';
+                const workflow = async () => {
+                    // Resume from native I/O before issuing the public,
+                    // intentionally fire-and-forget message APIs. Their
+                    // native actions must finish before handler replay.
+                    await pi.getThinkingLevel();
+                    pi.sendUserMessage('ultrathink generated first');
+                    pi.sendMessage({
+                        customType: 'workflow-note', content: 'generated custom turn', display: true
+                    }, { triggerTurn: true });
+                    pi.sendUserMessage('generated second');
+                    return 'queued';
+                };
+                pi.registerCommand('workflow', { handler: workflow });
+                pi.registerShortcut('ctrl+alt+k', {
+                    handler: async ctx => {
+                        await workflow();
+                        return {
+                            sessionId: ctx.sessionManager.getSessionId(),
+                            hasUI: ctx.hasUI, model: ctx.model && ctx.model.id
+                        };
                     }
                 });
+                pi.registerShortcut('ctrl+a', {
+                    handler: () => { throw new Error('native cursor binding must win'); }
+                });
+                pi.registerShortcut('shift+k', { handler: () => null });
+                pi.registerShortcut('k', { handler: () => null });
             }
             "#,
         )
@@ -27314,13 +27496,244 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn escape_stops_an_extension_commands_generated_turns_without_replaying_its_tail() {
+    fn registered_shortcut_key_runs_native_turns_and_preserves_the_composer() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let (sender, receiver) = mpsc::channel();
+            let _directory = enable_native_prompt_commands(&mut handle, &sender).await;
+            let owner = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let (_unused, model) = new_model();
+            let mut model = model
+                .with_submit_channel(submit_tx)
+                .with_extension_command_registry(Arc::new(Mutex::new(
+                    handle.extension_manager().cloned(),
+                )));
+            model.displayed_session_id = Some(owner.clone());
+            model.record_history("previous authored prompt");
+            model.history_cursor = Some(0);
+            model.history_draft = "parked draft".to_string();
+            model.input.set_text("unsent draft\nwith @attachment.png");
+            let cursor = model.input.cursor();
+            let undo_count = model.input.undo_op_count();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.inject_event(key(KeyCode::Char('k'), Modifiers::CTRL | Modifiers::ALT));
+            let UiCommand::ExtensionShortcut {
+                key_id,
+                owner_session_id,
+            } = submit_rx.try_recv().expect("registered shortcut press")
+            else {
+                panic!("shortcut must route to its native driver operation");
+            };
+            assert_eq!(key_id, "ctrl+alt+k");
+            assert_eq!(owner_session_id, owner);
+            assert!(sim.model().busy.is_some());
+            run_extension_shortcut(
+                &mut handle,
+                &key_id,
+                &owner_session_id,
+                &sender,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
+            let mut report = None;
+            for message in receiver.try_iter() {
+                if let PiMsg::SystemNote(text) = &message
+                    && let Some(value) = text.strip_prefix("Shortcut [ctrl+alt+k] → ")
+                {
+                    report = Some(serde_json::from_str::<serde_json::Value>(value).unwrap());
+                }
+                sim.send(PiFtuiMsg::Agent(message));
+            }
+            let report = report.expect("shortcut receives full live context");
+            assert_eq!(report["sessionId"], owner);
+            assert_eq!(report["hasUI"], true);
+            assert_eq!(report["model"], "ftui-native-input");
+            assert_eq!(provider.calls.lock().unwrap().len(), 3);
+            assert!(!handle.session().has_pending_extension_idle_actions());
+            assert_eq!(sim.model().input.text(), "unsent draft\nwith @attachment.png");
+            assert_eq!(sim.model().input.cursor(), cursor);
+            assert_eq!(sim.model().input.undo_op_count(), undo_count);
+            assert_eq!(sim.model().input_history, ["previous authored prompt"]);
+            assert_eq!(sim.model().history_cursor, Some(0));
+            assert_eq!(sim.model().history_draft, "parked draft");
+            assert_eq!(sim.model().state, AgentUiState::Ready);
+            assert!(sim.model().busy.is_none());
+            assert!(sim.model().error_banner.is_none());
+            assert!(submit_rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn registered_shortcuts_respect_native_bindings_and_input_ownership() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let (sender, receiver) = mpsc::channel();
+            let _directory = enable_native_prompt_commands(&mut handle, &sender).await;
+            let owner = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
+            let manager = handle.extension_manager().cloned();
+            let model_for_case = || {
+                let (submit_tx, submit_rx) = mpsc::channel();
+                let (_unused, model) = new_model();
+                let mut model = model
+                    .with_submit_channel(submit_tx)
+                    .with_turn_control(Arc::default())
+                    .with_extension_command_registry(Arc::new(Mutex::new(manager.clone())));
+                model.displayed_session_id = Some(owner.clone());
+                model.input.set_text("kept draft");
+                model
+                    .input
+                    .set_cursor_position(ftui::text::CursorPosition::new(0, 2, 2));
+                (model, submit_rx)
+            };
+            for blocked in [
+                "busy", "working", "login", "settings", "ask", "extension", "release", "repeat", "super",
+            ] {
+                let (mut model, submit_rx) = model_for_case();
+                let Event::Key(mut chord) = key(KeyCode::Char('k'), Modifiers::CTRL | Modifiers::ALT)
+                else {
+                    unreachable!();
+                };
+                match blocked {
+                    "busy" => model.begin_busy("another operation"),
+                    "working" => model.state = AgentUiState::Working,
+                    "login" => {
+                        let _ = model.handle_agent(PiMsg::LoginPending {
+                            provider: Some("provider".to_string()),
+                            accepts_empty_input: false,
+                        });
+                    }
+                    "settings" => model.settings_pending = true,
+                    "ask" => {
+                        let _ = model.handle_agent(PiMsg::AskUiRequest(ask_request(
+                            "shortcut-ask",
+                            vec![question("Continue?", &["yes", "no"], false)],
+                        )));
+                    }
+                    "extension" => {
+                        let _ = model.handle_agent(PiMsg::ExtensionUiRequest(ext_request(
+                            "shortcut-input",
+                            "input",
+                            serde_json::json!({"title": "Reply"}),
+                        )));
+                    }
+                    "release" => chord.kind = ftui::KeyEventKind::Release,
+                    "repeat" => chord.kind = ftui::KeyEventKind::Repeat,
+                    _ => chord.modifiers |= Modifiers::SUPER,
+                }
+                let draft = model.input.text();
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                sim.inject_event(Event::Key(chord));
+                assert!(
+                    submit_rx.try_recv().is_err(),
+                    "shortcut leaked through {blocked}"
+                );
+                assert_eq!(sim.model().input.text(), draft, "{blocked}");
+            }
+            for (code, modifiers, expected) in [
+                (KeyCode::Char('k'), Modifiers::SHIFT, "shift+k"),
+                (KeyCode::Char('K'), Modifiers::empty(), "shift+k"),
+                (KeyCode::Char('k'), Modifiers::empty(), "k"),
+            ] {
+                let (model, submit_rx) = model_for_case();
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                sim.inject_event(key(code, modifiers));
+                assert_eq!(
+                    submit_rx.try_recv().unwrap(),
+                    UiCommand::ExtensionShortcut {
+                        key_id: expected.to_string(),
+                        owner_session_id: owner.clone(),
+                    }
+                );
+                assert_eq!(sim.model().input.text(), "kept draft");
+            }
+            let (mut model, submit_rx) = model_for_case();
+            model.state = AgentUiState::Working;
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.inject_event(key(KeyCode::Char('k'), Modifiers::empty()));
+            assert!(submit_rx.try_recv().is_err());
+            assert_eq!(
+                sim.model().input.text(),
+                "kekpt draft",
+                "ordinary mid-turn typing stays available"
+            );
+            let (model, submit_rx) = model_for_case();
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            sim.inject_event(key(KeyCode::Char('a'), Modifiers::CTRL));
+            assert!(
+                submit_rx.try_recv().is_err(),
+                "native cursor action consumes ctrl+a"
+            );
+            assert_eq!(sim.model().input.cursor().grapheme, 0);
+            let (model, submit_rx) = model_for_case();
+            let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings_from_json(
+                r#"{"openSettings": ["ctrl+alt+k"]}"#,
+            )));
+            sim.init();
+            sim.inject_event(key(KeyCode::Char('k'), Modifiers::CTRL | Modifiers::ALT));
+            assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Settings);
+            assert!(submit_rx.try_recv().is_err());
+            // Admission captured an owner and registration. Neither can be
+            // silently replaced by a session switch or a reload disabling it.
+            run_extension_shortcut(
+                &mut handle,
+                "ctrl+alt+k",
+                "previous-session",
+                &sender,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
+            assert!(receiver.try_iter().any(|message| matches!(
+                message, PiMsg::System(text) if text.contains("earlier session")
+            )));
+            handle.session_mut().extensions = None;
+            run_extension_shortcut(
+                &mut handle,
+                "ctrl+alt+k",
+                &owner,
+                &sender,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
+            assert!(receiver.try_iter().any(|message| matches!(
+                message, PiMsg::System(text) if text.contains("no longer available")
+            )));
+            assert!(provider.calls.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn escape_stops_extension_command_and_shortcut_generated_turns_without_replaying_the_tail() {
         use crate::model::Message;
 
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        runtime.block_on(async {
+        let run = |shortcut| async move {
             let provider = Arc::new(NativePromptProbe {
                 pause_after_record: true,
                 ..Default::default()
@@ -27328,18 +27741,40 @@ mod tests {
             let mut handle = native_prompt_handle(Arc::clone(&provider));
             let (sender, receiver) = mpsc::channel();
             let _directory = enable_native_prompt_commands(&mut handle, &sender).await;
+            let owner = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
             let controls: TurnControlSlot = Arc::default();
             let aborts: TurnAbortSlot = Arc::default();
-            let (_unused, model) = new_model();
+            let (_unused, mut model) = new_model();
+            model.displayed_session_id = Some(owner.clone());
             let mut sim = ProgramSimulator::new(
                 model
                     .with_turn_control(Arc::clone(&controls))
                     .with_turn_abort(Arc::clone(&aborts)),
             );
             sim.init();
-            let mut command = Box::pin(run_extension_command(
-                &mut handle, "workflow", "", true, &sender, &controls, &aborts,
-            ));
+            let mut command = Box::pin(if shortcut {
+                futures::future::Either::Left(run_extension_shortcut(
+                    &mut handle,
+                    "ctrl+alt+k",
+                    &owner,
+                    &sender,
+                    &controls,
+                    &aborts,
+                ))
+            } else {
+                futures::future::Either::Right(run_extension_command(
+                    &mut handle,
+                    "workflow",
+                    "",
+                    true,
+                    &sender,
+                    &controls,
+                    &aborts,
+                ))
+            });
             let admitted = futures::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(command.as_mut(), cx).is_pending());
                 if provider.calls.lock().unwrap().len() == 1 {
@@ -27391,20 +27826,47 @@ mod tests {
                     .iter()
                     .any(|message| matches!(message, Message::Custom(_)))
             );
+            let cancelled = if shortcut {
+                "Shortcut [ctrl+alt+k] cancelled"
+            } else {
+                "/workflow cancelled"
+            };
             assert!(receiver.try_iter().any(|message| matches!(
-                message, PiMsg::System(text) if text == "/workflow cancelled"
+                message, PiMsg::System(text) if text == cancelled
             )));
 
             // A queued command must not resurrect after terminal shutdown,
             // even when the actor and the native provider are both idle.
             abort_driver_work(Some(&aborts), Some(&controls));
-            run_extension_command(
-                &mut handle, "workflow", "", true, &sender, &controls, &aborts,
-            )
-            .await;
+            if shortcut {
+                run_extension_shortcut(
+                    &mut handle,
+                    "ctrl+alt+k",
+                    &owner,
+                    &sender,
+                    &controls,
+                    &aborts,
+                )
+                .await;
+            } else {
+                run_extension_command(
+                    &mut handle,
+                    "workflow",
+                    "",
+                    true,
+                    &sender,
+                    &controls,
+                    &aborts,
+                )
+                .await;
+            }
             assert_eq!(provider.calls.lock().unwrap().len(), 1);
             assert!(!handle.session().has_pending_extension_idle_actions());
             assert!(aborts.lock().unwrap().is_none());
+        };
+        runtime.block_on(async {
+            run(false).await;
+            run(true).await;
         });
     }
 

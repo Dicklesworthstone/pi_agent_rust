@@ -3972,11 +3972,28 @@ impl ExtensionManager {
         timeout_ms: u64,
         abort: Option<crate::agent::AbortSignal>,
     ) -> Result<Value> {
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Command {
+                name: command_name.to_string(),
+                args: args.to_string(),
+            },
+            timeout_ms,
+            abort,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_interaction_with_abort(
+        &self,
+        interaction: ExtensionInteraction,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
         let timeout_ms = self.effective_timeout(timeout_ms);
         let runtime = self
             .runtime()
             .ok_or_else(|| Error::extension("Extension runtime not configured"))?;
-        // Commands can run after ordinary session appends without a registry
+        // Handlers can run after ordinary session appends without a registry
         // change. Build their context afresh instead of reusing the lifecycle
         // cache, whose generation tracks registry mutations.
         let snapshot = self.read_snapshot();
@@ -3993,13 +4010,7 @@ impl ExtensionManager {
         };
         drop(snapshot);
         runtime
-            .execute_command_with_abort(
-                command_name.to_string(),
-                args.to_string(),
-                Arc::new(context),
-                timeout_ms,
-                abort,
-            )
+            .execute_interaction_with_abort(interaction, Arc::new(context), timeout_ms, abort)
             .await
     }
 

@@ -3702,15 +3702,48 @@ impl AgentSessionHandle {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Command {
+                name: command_name.to_string(),
+                args: args.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    /// Execute a registered shortcut with the same cancellation, generated
+    /// turns and subscriber delivery as a registered extension command.
+    pub async fn execute_extension_shortcut_with_abort(
+        &mut self,
+        key_id: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Shortcut {
+                key_id: key_id.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_extension_interaction_with_abort(
+        &mut self,
+        interaction: crate::extensions::ExtensionInteraction,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
         let on_event = self.make_combined_callback(on_event);
         self.session
-            .execute_extension_command_with_abort(
-                command_name,
-                args,
-                timeout_ms,
-                abort,
-                on_event,
-            )
+            .execute_extension_interaction_with_abort(interaction, timeout_ms, abort, on_event)
             .await
     }
 

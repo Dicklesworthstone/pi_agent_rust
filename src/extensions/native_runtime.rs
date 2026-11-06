@@ -1,9 +1,9 @@
 //! Active deterministic native descriptor extension runtime.
 
 use super::{
-    Error, ExtensionRepairEvent, ExtensionToolDef, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
-    JsExtensionSnapshot, NativeRustExtensionLoadSpec, Result, extract_slash_command_name,
-    parse_extension_tool_defs,
+    Error, ExtensionInteraction, ExtensionRepairEvent, ExtensionToolDef, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle, JsExtensionSnapshot, NativeRustExtensionLoadSpec, Result,
+    extract_slash_command_name, parse_extension_tool_defs,
 };
 use crate::tools::ToolUpdate;
 use serde::Deserialize;
@@ -833,22 +833,46 @@ impl ExtensionRuntimeHandle {
         timeout_ms: u64,
         abort: Option<crate::agent::AbortSignal>,
     ) -> Result<Value> {
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Command {
+                name: command_name,
+                args,
+            },
+            ctx_payload,
+            timeout_ms,
+            abort,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_interaction_with_abort(
+        &self,
+        interaction: ExtensionInteraction,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
         if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
         match self {
             Self::Js(runtime) => {
                 runtime
-                    .execute_command_with_abort(command_name, args, ctx_payload, timeout_ms, abort)
+                    .execute_interaction_with_abort(interaction, ctx_payload, timeout_ms, abort)
                     .await
             }
             Self::NativeRust(runtime) => {
                 let _ = ctx_payload;
-                // Native commands currently read static descriptor output;
+                // Native handlers currently read static descriptor output;
                 // they have no admitted asynchronous handler to interrupt.
-                let result = runtime
-                    .execute_command(command_name, args, timeout_ms)
-                    .await;
+                let result = match interaction {
+                    ExtensionInteraction::Command { name, args } => {
+                        runtime.execute_command(name, args, timeout_ms).await
+                    }
+                    ExtensionInteraction::Shortcut { key_id } => {
+                        runtime.execute_shortcut(key_id, timeout_ms).await
+                    }
+                };
                 if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
                     Err(Error::Aborted)
                 } else {
@@ -864,17 +888,13 @@ impl ExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
-        match self {
-            Self::Js(runtime) => {
-                runtime
-                    .execute_shortcut(key_id, ctx_payload, timeout_ms)
-                    .await
-            }
-            Self::NativeRust(runtime) => {
-                let _ = ctx_payload;
-                runtime.execute_shortcut(key_id, timeout_ms).await
-            }
-        }
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Shortcut { key_id },
+            ctx_payload,
+            timeout_ms,
+            None,
+        )
+        .await
     }
 
     pub async fn set_flag_value(

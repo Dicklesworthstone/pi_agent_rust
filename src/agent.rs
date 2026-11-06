@@ -21069,6 +21069,44 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Command {
+                name: command_name.to_string(),
+                args: args.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    /// Execute a registered keyboard handler and finish its requested turns.
+    pub async fn execute_extension_shortcut_with_abort(
+        &mut self,
+        key_id: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Shortcut {
+                key_id: key_id.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_extension_interaction_with_abort(
+        &mut self,
+        interaction: crate::extensions::ExtensionInteraction,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
         self.ensure_provider_reentry_allowed()?;
         let manager = self
             .extensions
@@ -21084,14 +21122,14 @@ impl AgentSession {
             return Err(Error::Aborted);
         }
 
-        let command_result = manager
-            .execute_command_with_abort(command_name, args, timeout_ms, abort.clone())
+        let handler_result = manager
+            .execute_interaction_with_abort(interaction, timeout_ms, abort.clone())
             .await;
         let replay_result = self
             .run_pending_idle_actions_with_abort(abort, Arc::clone(&on_event))
             .await;
 
-        match command_result {
+        match handler_result {
             Ok(value) => {
                 replay_result?;
                 Ok(value)
@@ -21099,7 +21137,7 @@ impl AgentSession {
             Err(err) => {
                 if let Err(replay_err) = replay_result {
                     tracing::warn!(
-                        "extension command follow-up replay failed after command error: {replay_err}"
+                        "extension follow-up replay failed after handler error: {replay_err}"
                     );
                 }
                 Err(err)

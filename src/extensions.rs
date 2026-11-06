@@ -10069,6 +10069,30 @@ pub const EXTENSION_COMMAND_BUDGET_MS: u64 = 30_000;
 /// Default cancellation budget for extension shortcut execution (ms).
 pub const EXTENSION_SHORTCUT_BUDGET_MS: u64 = 30_000;
 
+/// Operator-invoked extension handlers share session context, cancellation,
+/// native hostcall settlement and generated-turn ownership.
+#[derive(Debug, Clone)]
+pub(crate) enum ExtensionInteraction {
+    Command { name: String, args: String },
+    Shortcut { key_id: String },
+}
+
+impl ExtensionInteraction {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Command { .. } => "command",
+            Self::Shortcut { .. } => "shortcut",
+        }
+    }
+
+    fn route_name(&self) -> &str {
+        match self {
+            Self::Command { name, .. } => name,
+            Self::Shortcut { key_id } => key_id,
+        }
+    }
+}
+
 /// Default cancellation budget for UI dialog operations (ms).
 pub const EXTENSION_UI_BUDGET_MS: u64 = 1_000;
 
@@ -11483,23 +11507,14 @@ enum JsRuntimeCommand {
         invocation: Arc<JsToolInvocation>,
         reply: oneshot::Sender<Result<Value>>,
     },
-    ExecuteCommand {
-        command_name: String,
-        args: String,
+    ExecuteInteraction {
+        interaction: ExtensionInteraction,
         ctx_payload: Arc<Value>,
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
         started: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
-        reply: oneshot::Sender<Result<Value>>,
-    },
-    ExecuteShortcut {
-        key_id: String,
-        ctx_payload: Arc<Value>,
-        origin: Option<SessionActionOrigin>,
-        timeout_ms: u64,
-        deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
     },
     ProviderStreamSimpleStart {
@@ -12507,9 +12522,8 @@ impl JsExtensionRuntimeHandle {
                             };
                             let _ = reply.send(&cx, result);
                         }
-                        JsRuntimeCommand::ExecuteCommand {
-                            command_name,
-                            args,
+                        JsRuntimeCommand::ExecuteInteraction {
+                            interaction,
                             ctx_payload,
                             origin,
                             timeout_ms: _,
@@ -12529,72 +12543,41 @@ impl JsExtensionRuntimeHandle {
                                 let _ = reply.send(&cx, Err(Error::Aborted));
                                 continue;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "command") {
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, interaction.kind()) {
                                 Ok(timeout_ms) => timeout_ms,
                                 Err(err) => {
                                     let _ = reply.send(&cx, Err(err));
                                     continue;
                                 }
                             };
-                            let route_name = js_command_route_name(&command_name);
-                            let result = match shard_set.shard_index_for_route(
-                                &shard_set.command_owner,
-                                "command",
-                                route_name,
-                            ) {
+                            let route = match &interaction {
+                                ExtensionInteraction::Command { name, .. } => {
+                                    shard_set.shard_index_for_route(
+                                        &shard_set.command_owner,
+                                        "command",
+                                        js_command_route_name(name),
+                                    )
+                                }
+                                ExtensionInteraction::Shortcut { key_id } => {
+                                    shard_set.shard_index_for_route(
+                                        &shard_set.shortcut_owner,
+                                        "shortcut",
+                                        &key_id.trim().to_lowercase(),
+                                    )
+                                }
+                            };
+                            let result = match route {
                                 Ok(shard_index) => {
-                                    execute_extension_command_sharded(
+                                    execute_extension_interaction_sharded(
                                         &mut shard_set,
                                         &host,
                                         shard_index,
-                                        route_name,
-                                        &args,
+                                        &interaction,
                                         ctx_payload.as_ref(),
                                         origin.as_ref(),
                                         timeout_ms,
                                         deadline,
                                         &cancelled,
-                                    )
-                                    .await
-                                }
-                                Err(err) => Err(err),
-                            };
-                            let _ = reply.send(&cx, result);
-                        }
-                        JsRuntimeCommand::ExecuteShortcut {
-                            key_id,
-                            ctx_payload,
-                            origin,
-                            timeout_ms: _,
-                            deadline,
-                            reply,
-                        } => {
-                            if reply.is_closed() {
-                                continue;
-                            }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "shortcut") {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    let _ = reply.send(&cx, Err(err));
-                                    continue;
-                                }
-                            };
-                            let route_name = key_id.trim().to_ascii_lowercase();
-                            let result = match shard_set.shard_index_for_route(
-                                &shard_set.shortcut_owner,
-                                "shortcut",
-                                &route_name,
-                            ) {
-                                Ok(shard_index) => {
-                                    execute_extension_shortcut_sharded(
-                                        &mut shard_set,
-                                        &host,
-                                        shard_index,
-                                        &route_name,
-                                        ctx_payload.as_ref(),
-                                        origin.as_ref(),
-                                        timeout_ms,
-                                        deadline,
                                     )
                                     .await
                                 }
@@ -13481,18 +13464,37 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
         abort: Option<crate::agent::AbortSignal>,
     ) -> Result<Value> {
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Command {
+                name: command_name,
+                args,
+            },
+            ctx_payload,
+            timeout_ms,
+            abort,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_interaction_with_abort(
+        &self,
+        interaction: ExtensionInteraction,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
         if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
+        let kind = interaction.kind();
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
         let started = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = JsEventInvocationGuard(Arc::clone(&cancelled));
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::ExecuteCommand {
-            command_name,
-            args,
+        let command = JsRuntimeCommand::ExecuteInteraction {
+            interaction,
             ctx_payload,
             origin: self.capture_session_action_origin(),
             timeout_ms,
@@ -13552,7 +13554,7 @@ impl JsExtensionRuntimeHandle {
                     Err(Error::Aborted)
                 } else {
                     Err(Error::extension(format!(
-                        "JS extension runtime command timed out after {timeout_ms}ms"
+                        "JS extension runtime {kind} timed out after {timeout_ms}ms"
                     )))
                 }
             }
@@ -13565,39 +13567,24 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
-        let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = Cx::for_request();
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::ExecuteShortcut {
-            key_id,
-            ctx_payload,
-            origin: self.capture_session_action_origin(),
-            timeout_ms,
-            deadline,
-            reply: reply_tx,
-        };
-        let fut = async move {
-            self.sender
-                .send(&cx, command)
-                .await
-                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-            reply_rx
-                .recv(&cx)
-                .await
-                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
-        };
+        self.execute_shortcut_with_abort(key_id, ctx_payload, timeout_ms, None)
+            .await
+    }
 
-        timeout(
-            wall_now(),
-            js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+    pub async fn execute_shortcut_with_abort(
+        &self,
+        key_id: String,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Shortcut { key_id },
+            ctx_payload,
+            timeout_ms,
+            abort,
         )
         .await
-        .unwrap_or_else(|_| {
-            Err(Error::extension(format!(
-                "JS extension runtime shortcut timed out after {timeout_ms}ms"
-            )))
-        })
     }
 
     pub async fn set_flag_value(
@@ -16751,13 +16738,13 @@ async fn abort_js_tool_task(
     }
 }
 
-/// A command's public sendMessage/sendUserMessage calls are fire-and-forget.
+/// Operator handlers' public sendMessage/sendUserMessage calls are fire-and-forget.
 /// A handler can enqueue them in the tick that settles its own promise, so
 /// finish native dispatch before the session drains the resulting idle turns.
 /// A fixed settlement snapshot excludes older background calls and calls
 /// issued by future timer ticks, so neither can extend command completion.
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
-async fn await_js_command_task(
+async fn await_js_interaction_task(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     shard_index: usize,
@@ -16796,12 +16783,11 @@ async fn await_js_command_task(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_arguments, clippy::too_many_lines)]
-async fn execute_extension_command_sharded(
+async fn execute_extension_interaction_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     shard_index: usize,
-    command_name: &str,
-    args: &str,
+    interaction: &ExtensionInteraction,
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
@@ -16809,18 +16795,22 @@ async fn execute_extension_command_sharded(
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
-    let _ = remaining_js_task_timeout(deadline, "command")?;
+    let kind = interaction.kind();
+    let _ = remaining_js_task_timeout(deadline, kind)?;
     if cancelled.load(StdOrdering::Acquire) {
         return Err(Error::Aborted);
     }
     let started_at = Instant::now();
     tracing::info!(
-        event = "ext.command.start",
-        command = %command_name,
+        event = %format!("ext.{kind}.start"),
+        interaction = %interaction.route_name(),
         timeout_ms,
-        "Extension command execution start"
+        "Extension interaction execution start"
     );
-    let task_id = next_runtime_task_id("task-cmd");
+    let task_id = next_runtime_task_id(match interaction {
+        ExtensionInteraction::Command { .. } => "task-cmd",
+        ExtensionInteraction::Shortcut { .. } => "task-shortcut",
+    });
     let runtime = Rc::clone(
         &shards
             .shards
@@ -16835,11 +16825,18 @@ async fn execute_extension_command_sharded(
     let started = runtime
         .with_ctx(|ctx| {
             let global = ctx.globals();
-            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
             let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
             let ctx_js = json_to_js(&ctx, ctx_payload)?;
-            let promise: rquickjs::Value<'_> =
-                exec_fn.call((bridge_secret.as_str(), command_name, args, ctx_js))?;
+            let promise: rquickjs::Value<'_> = match interaction {
+                ExtensionInteraction::Command { name, args } => {
+                    let exec: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
+                    exec.call((bridge_secret.as_str(), name.as_str(), args.as_str(), ctx_js))?
+                }
+                ExtensionInteraction::Shortcut { key_id } => {
+                    let exec: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
+                    exec.call((bridge_secret.as_str(), key_id.as_str(), ctx_js))?
+                }
+            };
             let _task: String =
                 task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
             Ok(())
@@ -16847,7 +16844,7 @@ async fn execute_extension_command_sharded(
         .await;
     let outcome = match started {
         Ok(()) => {
-            await_js_command_task(
+            await_js_interaction_task(
                 shards,
                 host,
                 shard_index,
@@ -16860,14 +16857,14 @@ async fn execute_extension_command_sharded(
         }
         Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
-    // Commands have no cooperative guest AbortSignal contract. As with event
+    // Operator handlers have no guest AbortSignal contract. As with event
     // hooks, an unfinished or interrupted handler must lose its entire realm
     // so timers and hostcalls cannot resume after the operator cancels it.
     let result = if fence.was_interrupted() {
         Err(quarantine_runtime_shard(
             shards,
             shard_index,
-            "command cancellation or deadline interrupted JavaScript execution",
+            &format!("{kind} cancellation or deadline interrupted JavaScript execution"),
         ))
     } else {
         match outcome {
@@ -16880,7 +16877,7 @@ async fn execute_extension_command_sharded(
                     Err(quarantine_runtime_shard(
                         shards,
                         shard_index,
-                        "command cancelled or deadline elapsed during registry publication",
+                        &format!("{kind} cancelled or deadline elapsed during registry publication"),
                     ))
                 } else {
                     refreshed.and(result)
@@ -16889,12 +16886,12 @@ async fn execute_extension_command_sharded(
             JsCancellableTaskOutcome::Stopped { .. } => Err(quarantine_runtime_shard(
                 shards,
                 shard_index,
-                "command cancelled or timed out with unresolved JavaScript state",
+                &format!("{kind} cancelled or timed out with unresolved JavaScript state"),
             )),
             JsCancellableTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
                 shards,
                 shard_index,
-                &format!("command execution or runtime pump failed: {err}"),
+                &format!("{kind} execution or runtime pump failed: {err}"),
             )),
         }
     };
@@ -16903,72 +16900,11 @@ async fn execute_extension_command_sharded(
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
-        event = "ext.command.end",
-        command = %command_name,
+        event = %format!("ext.{kind}.end"),
+        interaction = %interaction.route_name(),
         duration_ms,
         is_error = is_err,
-        "Extension command execution end"
-    );
-    result
-}
-
-#[allow(clippy::future_not_send, clippy::too_many_arguments)]
-async fn execute_extension_shortcut_sharded(
-    shards: &mut JsRuntimeShardSet,
-    host: &JsRuntimeHost,
-    shard_index: usize,
-    key_id: &str,
-    ctx_payload: &Value,
-    origin: Option<&SessionActionOrigin>,
-    timeout_ms: u64,
-    deadline: Instant,
-) -> Result<Value> {
-    shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "shortcut")?;
-    let started_at = Instant::now();
-    tracing::info!(
-        event = "ext.shortcut.start",
-        key_id = %key_id,
-        timeout_ms,
-        "Extension shortcut execution start"
-    );
-    let task_id = next_runtime_task_id("task-shortcut");
-    let origin_guard = {
-        let runtime = &shards
-            .shards
-            .get(shard_index)
-            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let ctx_js = json_to_js(&ctx, ctx_payload)?;
-                let promise: rquickjs::Value<'_> =
-                    exec_fn.call((bridge_secret.as_str(), key_id, ctx_js))?;
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
-    };
-
-    let result =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await;
-    drop(origin_guard);
-    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let is_err = result.is_err();
-    tracing::info!(
-        event = "ext.shortcut.end",
-        key_id = %key_id,
-        duration_ms,
-        is_error = is_err,
-        "Extension shortcut execution end"
+        "Extension interaction execution end"
     );
     result
 }
@@ -22073,12 +22009,14 @@ export default async function(pi) {{
                     .await
                     .expect("activation response")
             } else {
-                execute_extension_command_sharded(
+                execute_extension_interaction_sharded(
                     &mut shards,
                     &host,
                     0,
-                    "native-fetch",
-                    "",
+                    &ExtensionInteraction::Command {
+                        name: "native-fetch".to_string(),
+                        args: String::new(),
+                    },
                     &json!({}),
                     None,
                     5_000,
