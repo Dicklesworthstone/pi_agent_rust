@@ -1862,6 +1862,13 @@ fn estimate_context_tokens_for_model(
     };
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
+        if matches!(msg, SessionMessage::CompactionSummary { .. }) {
+            // The retained tail precedes this record in session order, but
+            // its usage measured a request before the history was replaced.
+            // Until a newer request succeeds, count the whole live context
+            // instead of triggering another compaction with stale usage.
+            break;
+        }
         if let Some(usage) = get_assistant_usage(msg) {
             // Usage describes the request made to its original model. After a
             // switch it cannot anchor the new reader's context, even when both
@@ -5271,6 +5278,128 @@ mod tests {
         };
         assert!(prepare_compaction(&entries, settings.clone()).is_some());
         assert!(prepare_compaction_for_model(&entries, settings, "openai", "gpt-4o").is_none());
+    }
+
+    #[test]
+    fn automatic_compaction_ignores_usage_from_the_retained_pre_compaction_tail() {
+        let mut session = crate::session::Session::in_memory();
+        session.append_message(make_user_text(&distinct_words(2_000)));
+        let retained = session.append_message(make_user_text("Keep the parser decisions."));
+        let mut assistant = make_assistant_text("Duplicate IDs are rejected.", 900_000, 100_000);
+        if let SessionMessage::Assistant { message } = &mut assistant {
+            message.provider = "openai".into();
+            message.model = "gpt-4o".into();
+        }
+        session.append_message(assistant);
+        session.append_compaction(
+            "Earlier work is complete.".to_string(),
+            retained,
+            1_000_000,
+            None,
+            None,
+        );
+        session.append_message(make_user_text("Continue with the next task."));
+        let entries = session
+            .entries_for_current_path()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let settings = ResolvedCompactionSettings {
+            context_window_tokens: 128_000,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        assert!(
+            prepare_compaction_for_model(&entries, settings.clone(), "openai", "gpt-4o")
+                .is_none(),
+            "the first prompt after compaction must not reuse the retained assistant's old usage"
+        );
+
+        // Force preparation to inspect its fallback estimate. Every live
+        // message still counts, including the retained tail and summary;
+        // neither the archived source nor its old million-token usage does.
+        let prepared =
+            prepare_overflow_compaction_for_model(&entries, settings, "openai", "gpt-4o")
+                .expect("the retained earlier turn is a safe prefix");
+        let expected: u64 = [
+            "Keep the parser decisions.",
+            "Duplicate IDs are rejected.\n",
+            "Earlier work is complete.",
+            "Continue with the next task.",
+        ]
+        .into_iter()
+        .map(|text| crate::token_count::count_tokens_for_model(text, "openai", "gpt-4o"))
+        .sum();
+        assert_eq!(prepared.tokens_before, expected);
+        assert!(expected < 100);
+    }
+
+    #[test]
+    fn compaction_boundary_keeps_new_usage_authoritative() {
+        let mut old = make_assistant_text("Retained answer.", 900_000, 100_000);
+        let mut fresh = make_assistant_text("A new response.", 80_000, 2_000);
+        for assistant in [&mut old, &mut fresh] {
+            if let SessionMessage::Assistant { message } = assistant {
+                message.provider = "openai".into();
+                message.model = "gpt-4o".into();
+            }
+        }
+        let messages = vec![
+            make_user_text("Retained request."),
+            old,
+            SessionMessage::CompactionSummary {
+                summary: "Earlier work is complete.".into(),
+                tokens_before: 1_000_000,
+            },
+            make_user_text("A new request."),
+            fresh,
+            make_user_text("Continue."),
+        ];
+        let estimate = estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
+        assert_eq!(
+            estimate.tokens,
+            82_000 + crate::token_count::count_tokens_for_model("Continue.", "openai", "gpt-4o")
+        );
+        assert_eq!(estimate.last_usage_index, Some(4));
+    }
+
+    #[test]
+    fn unmeasured_or_failed_requests_after_compaction_cannot_revive_old_usage() {
+        for (stop_reason, input) in [
+            (StopReason::Stop, 0),
+            (StopReason::Aborted, 800_000),
+            (StopReason::Error, 800_000),
+        ] {
+            let mut old = make_assistant_text("Retained answer.", 900_000, 100_000);
+            let mut failed = make_assistant_text("Later response.", input, 0);
+            for assistant in [&mut old, &mut failed] {
+                if let SessionMessage::Assistant { message } = assistant {
+                    message.provider = "openai".into();
+                    message.model = "gpt-4o".into();
+                }
+            }
+            if let SessionMessage::Assistant { message } = &mut failed {
+                message.stop_reason = stop_reason;
+            }
+            let messages = vec![
+                make_user_text("Retained request."),
+                old,
+                SessionMessage::CompactionSummary {
+                    summary: String::new(),
+                    tokens_before: 1_000_000,
+                },
+                make_user_text("A new request."),
+                failed,
+                make_user_text("Retry."),
+            ];
+            let estimate =
+                estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
+            assert!((1..100).contains(&estimate.tokens));
+            assert_eq!(estimate.last_usage_index, None);
+        }
     }
 
     // ── estimate_entries_context_tokens (tokensAfter heuristic) ──────
