@@ -569,6 +569,9 @@ where
     /// always carries one; a transport close without it is a truncated
     /// stream, not a complete answer.
     saw_terminal: bool,
+    /// A later STOP cannot authorize calls from a response that hit its
+    /// output limit. Text-only truncation still retains its Length outcome.
+    saw_truncation: bool,
     content_state: reasoning::ContentState,
     usage_state: reasoning::UsageState,
     usage_observer: Option<crate::provider::UsageObserver>,
@@ -601,6 +604,7 @@ where
             started: false,
             finished: false,
             saw_terminal: false,
+            saw_truncation: false,
             content_state: reasoning::ContentState::default(),
             usage_state: reasoning::UsageState::default(),
             usage_observer: None,
@@ -789,7 +793,10 @@ where
         // Handle finish reason
         if let Some(reason) = candidate.finish_reason.as_deref() {
             self.partial.stop_reason = match reason {
-                "MAX_TOKENS" => StopReason::Length,
+                "MAX_TOKENS" => {
+                    self.saw_truncation = true;
+                    StopReason::Length
+                }
                 // Developer API and Vertex both report failed generations
                 // through finishReason, including invalid function calls.
                 // Such candidates must never dispatch otherwise valid peers.
@@ -826,6 +833,36 @@ where
                     .close(&self.partial, &mut self.pending_events);
                 return Ok(());
             }
+        }
+
+        if self.saw_truncation {
+            // A complete call object is not permission to run an unfinished
+            // batch. The agent executes calls on Length as well as ToolUse,
+            // so preserve Length only when the whole response has no calls.
+            // Inspect this candidate before publishing any of its calls;
+            // earlier streamed calls remain diagnostic content on Error.
+            let has_calls = self
+                .partial
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+                || candidate.content.as_ref().is_some_and(|content| {
+                    content
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, GeminiPart::FunctionCall { .. }))
+                });
+            if has_calls {
+                self.partial.stop_reason = StopReason::Error;
+                self.partial.error_message = Some(format!(
+                    "{} stopped generation: MAX_TOKENS; truncated function calls withheld",
+                    self.service_label()
+                ));
+                self.content_state
+                    .close(&self.partial, &mut self.pending_events);
+                return Ok(());
+            }
+            self.partial.stop_reason = StopReason::Length;
         }
 
         // Process content parts — queue all events into pending_events
@@ -2375,98 +2412,117 @@ mod tests {
         content_type: &str,
         body: &str,
     ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        spawn_test_server_replies(status_code, content_type, vec![body.to_string()])
+    }
+
+    fn spawn_test_server_replies(
+        status_code: u16,
+        content_type: &str,
+        bodies: Vec<String>,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
-        let body = body.to_string();
         let content_type = content_type.to_string();
 
         std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            // 250ms is the POLLING interval; the deadline below is the budget.
-            // Treating a timed-out read as end-of-request truncated the buffer
-            // and the header scan then failed as a malformed request rather
-            // than a slow one (bd-eg6ng).
-            socket
-                .set_read_timeout(Some(Duration::from_millis(250)))
-                .expect("set read timeout");
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-
-            let mut bytes = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        bytes.extend_from_slice(&chunk[..n]);
-                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "fixture timed out waiting for the request"
-                        );
-                    }
-                    Err(err) => panic!("{err}"),
-                }
+            for body in bodies {
+                let (socket, _) = listener.accept().expect("accept");
+                serve_test_reply(socket, status_code, &content_type, &body, &tx);
             }
-
-            let header_end = bytes
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .expect("request header boundary");
-            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let headers = parse_headers(&header_text);
-            let mut request_body = bytes[header_end + 4..].to_vec();
-
-            let content_length = headers
-                .get("content-length")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            while request_body.len() < content_length {
-                match socket.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
-                    Err(err)
-                        if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "fixture timed out waiting for the request"
-                        );
-                    }
-                    Err(err) => panic!("{err}"),
-                }
-            }
-
-            tx.send(CapturedRequest {
-                headers,
-                body: String::from_utf8_lossy(&request_body).to_string(),
-            })
-            .expect("send captured request");
-
-            let reason = match status_code {
-                401 => "Unauthorized",
-                500 => "Internal Server Error",
-                _ => "OK",
-            };
-            let response = format!(
-                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .expect("write response");
-            socket.flush().expect("flush response");
         });
 
         (format!("http://{addr}"), rx)
+    }
+
+    fn serve_test_reply(
+        mut socket: std::net::TcpStream,
+        status_code: u16,
+        content_type: &str,
+        body: &str,
+        tx: &mpsc::Sender<CapturedRequest>,
+    ) {
+        // 250ms is the POLLING interval; the deadline below is the budget.
+        // Treating a timed-out read as end-of-request truncated the buffer
+        // and the header scan then failed as a malformed request rather
+        // than a slow one (bd-eg6ng).
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("set read timeout");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match socket.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture timed out waiting for the request"
+                    );
+                }
+                Err(err) => panic!("{err}"),
+            }
+        }
+
+        let header_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request header boundary");
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+        let headers = parse_headers(&header_text);
+        let mut request_body = bytes[header_end + 4..].to_vec();
+
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while request_body.len() < content_length {
+            match socket.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture timed out waiting for the request"
+                    );
+                }
+                Err(err) => panic!("{err}"),
+            }
+        }
+
+        tx.send(CapturedRequest {
+            headers,
+            body: String::from_utf8_lossy(&request_body).to_string(),
+        })
+        .expect("send captured request");
+
+        let reason = match status_code {
+            401 => "Unauthorized",
+            500 => "Internal Server Error",
+            _ => "OK",
+        };
+        let response = format!(
+            "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .expect("write response");
+        socket.flush().expect("flush response");
     }
 
     fn parse_headers(header_text: &str) -> HashMap<String, String> {
@@ -3684,11 +3740,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_failure_or_length_is_not_overwritten_by_function_calls() {
-        for (finish, expected) in [
-            ("SAFETY", StopReason::Error),
-            ("MAX_TOKENS", StopReason::Length),
-        ] {
+    fn terminal_failure_and_truncated_calls_are_not_executable() {
+        for finish in ["SAFETY", "MAX_TOKENS"] {
             for separate_terminal_chunk in [false, true] {
                 let source = stream::empty::<std::io::Result<Vec<u8>>>();
                 let mut state = StreamState::new(
@@ -3719,8 +3772,133 @@ mod tests {
                 let StreamEvent::Done { reason, message } = state.finish_at_eof().unwrap() else {
                     panic!("expected Done");
                 };
-                assert_eq!(reason, expected);
+                assert_eq!(reason, StopReason::Error);
+                assert_eq!(message.stop_reason, StopReason::Error);
+                assert!(
+                    message
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|error| error.contains(finish))
+                );
+                // Earlier ToolCallEnd events are content previews. The final
+                // Error is the execution boundary; a rejected candidate may
+                // not publish any new call of its own.
+                assert_eq!(
+                    state
+                        .pending_events
+                        .iter()
+                        .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                        .count(),
+                    usize::from(separate_terminal_chunk)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_is_sticky_and_keeps_usage_across_google_transports() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        for (api, cloud_cli_mode) in [
+            ("google-generative-ai", false),
+            ("google-vertex", false),
+            ("google-gemini-cli", true),
+        ] {
+            for (prior_call, adjoining_call, late_call) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+                (true, true, true),
+            ] {
+                let call = json!({"functionCall": {"name": "write", "args": {
+                    "path": "must-not-be-written.txt", "content": "withheld"
+                }}});
+                let mut frames = vec![json!({"candidates": [{"content": {
+                    "parts": [{"text": "retained partial explanation"}]
+                }}]})];
+                if prior_call {
+                    frames.push(json!({"candidates": [{"content": {
+                        "parts": [call.clone()]
+                    }}]}));
+                }
+                let mut truncated = json!({"finishReason": "MAX_TOKENS"});
+                if adjoining_call {
+                    truncated["content"] = json!({"parts": [call.clone()]});
+                }
+                frames.push(json!({"candidates": [truncated]}));
+                let mut late = json!({"finishReason": "STOP"});
+                if late_call {
+                    late["content"] = json!({"parts": [call]});
+                }
+                frames.extend([
+                    json!({"candidates": [late]}),
+                    json!({"usageMetadata": {
+                        "promptTokenCount": 21,
+                        "candidatesTokenCount": 7,
+                        "thoughtsTokenCount": 3,
+                        "totalTokenCount": 31
+                    }}),
+                ]);
+                let chunks = frames
+                    .into_iter()
+                    .map(|frame| {
+                        let wire = if cloud_cli_mode {
+                            json!({"response": frame})
+                        } else {
+                            frame
+                        };
+                        Ok(format!("data: {wire}\n\n").into_bytes())
+                    })
+                    .collect::<Vec<std::io::Result<Vec<u8>>>>();
+                let events = runtime.block_on(async {
+                    let source = SseStream::new(stream::iter(chunks));
+                    let mut output = Box::pin(
+                        StreamState::new(source, "gemini-test".into(), api.into(), api.into())
+                            .into_stream(cloud_cli_mode),
+                    );
+                    let mut events = Vec::new();
+                    while let Some(event) = output.next().await {
+                        events.push(event.expect("truncation is a terminal outcome"));
+                    }
+                    assert!(output.next().await.is_none());
+                    events
+                });
+                let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                    panic!("missing terminal truncation: {api}: {events:?}");
+                };
+                let expected = if prior_call || adjoining_call || late_call {
+                    StopReason::Error
+                } else {
+                    StopReason::Length
+                };
+                assert_eq!(*reason, expected);
                 assert_eq!(message.stop_reason, expected);
+                assert_eq!(message.usage.input, 21);
+                assert_eq!(message.usage.output, 10);
+                assert_eq!(message.usage.total_tokens, 31);
+                assert!(matches!(
+                    message.content.first(),
+                    Some(ContentBlock::Text(text)) if text.text == "retained partial explanation"
+                ));
+                // Only a call streamed before truncation can have a preview.
+                // No call from the truncated or later candidate is published.
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                        .count(),
+                    usize::from(prior_call)
+                );
+                if expected == StopReason::Error {
+                    assert!(
+                        message
+                            .error_message
+                            .as_deref()
+                            .is_some_and(|error| error.contains("MAX_TOKENS"))
+                    );
+                } else {
+                    assert!(message.error_message.is_none());
+                }
             }
         }
     }
@@ -3866,26 +4044,46 @@ mod tests {
             "MALFORMED_FUNCTION_CALL",
             "UNEXPECTED_TOOL_CALL",
             "MODEL_ARMOR",
+            "MAX_TOKENS",
         ] {
-            for prior_call in [false, true] {
+            for (prior_call, adjoining_call) in
+                [(false, true), (true, false), (true, true), (false, false)]
+            {
                 let dir = tempfile::tempdir().unwrap();
                 let marker = dir.path().join("must-not-be-written.txt");
-                let candidate = serde_json::json!({"content": {"parts": [{
-                    "functionCall": {
+                let sibling = dir.path().join("sibling-must-not-be-written.txt");
+                let candidate = serde_json::json!({"content": {"parts": [
+                    {"functionCall": {
                         "name": "write",
                         "args": {"path": marker, "content": "must not execute"}
-                    }
-                }]}});
+                    }},
+                    {"functionCall": {
+                        "name": "write",
+                        "args": {"path": sibling, "content": "sibling must not execute"}
+                    }}
+                ]}});
                 let mut frames = Vec::new();
                 if prior_call {
                     frames.push(serde_json::json!({"candidates": [candidate.clone()]}));
                 }
-                let mut failed = candidate.clone();
+                let mut failed = if adjoining_call {
+                    candidate.clone()
+                } else {
+                    serde_json::json!({})
+                };
                 failed["finishReason"] = serde_json::json!(finish);
                 frames.push(serde_json::json!({"candidates": [failed]}));
+                // A later successful-looking candidate must never authorize
+                // either an earlier batch or its own parallel siblings.
                 let mut late = candidate;
                 late["finishReason"] = serde_json::json!("STOP");
                 frames.push(serde_json::json!({"candidates": [late]}));
+                frames.push(serde_json::json!({"usageMetadata": {
+                    "promptTokenCount": 21,
+                    "candidatesTokenCount": 7,
+                    "thoughtsTokenCount": 3,
+                    "totalTokenCount": 31
+                }}));
                 let body = frames
                     .iter()
                     .map(|frame| format!("data: {frame}\n\n"))
@@ -3900,6 +4098,7 @@ mod tests {
                     tools,
                     crate::agent::AgentConfig {
                         max_tool_iterations: 1,
+                        turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
                         stream_options: StreamOptions {
                             api_key: Some("test-key".to_string()),
                             ..StreamOptions::default()
@@ -3920,7 +4119,7 @@ mod tests {
                 assert_eq!(
                     message.stop_reason,
                     StopReason::Error,
-                    "{finish}/{prior_call}"
+                    "{finish}/{prior_call}/{adjoining_call}"
                 );
                 assert!(
                     message
@@ -3928,10 +4127,13 @@ mod tests {
                         .as_deref()
                         .is_some_and(|error| error.contains(finish))
                 );
+                assert_eq!(message.usage.input, 21);
+                assert_eq!(message.usage.output, 10);
+                assert_eq!(message.usage.total_tokens, 31);
                 assert_eq!(executions.load(Ordering::SeqCst), 0);
                 assert!(
-                    !marker.exists(),
-                    "a rejected tool batch must not run: {finish}/{prior_call}"
+                    !marker.exists() && !sibling.exists(),
+                    "a rejected tool batch must not run: {finish}/{prior_call}/{adjoining_call}"
                 );
                 assert!(
                     !agent
@@ -3940,6 +4142,95 @@ mod tests {
                         .any(|message| matches!(message, Message::ToolResult(_)))
                 );
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn authorized_parallel_gemini_calls_execute_writes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for separate_terminal_chunk in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("first.txt");
+            let second = dir.path().join("second.txt");
+            let mut candidate = json!({"content": {"parts": [
+                {"functionCall": {"name": "write", "args": {
+                    "path": first, "content": "first authorized write"
+                }}},
+                {"functionCall": {"name": "write", "args": {
+                    "path": second, "content": "second authorized write"
+                }}}
+            ]}});
+            if !separate_terminal_chunk {
+                candidate["finishReason"] = json!("STOP");
+            }
+            let mut frames = vec![json!({"candidates": [candidate]})];
+            if separate_terminal_chunk {
+                frames.push(json!({"candidates": [{"finishReason": "STOP"}]}));
+            }
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            let final_body = format!(
+                "data: {}\n\n",
+                json!({"candidates": [{
+                    "content": {"parts": [{"text": "Both files written."}]},
+                    "finishReason": "STOP"
+                }]})
+            );
+            let (base_url, requests) =
+                spawn_test_server_replies(200, "text/event-stream", vec![body, final_body]);
+            let provider = GeminiProvider::new("gemini-test").with_base_url(base_url);
+            let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                crate::tools::WriteTool::new(dir.path()),
+            )]);
+            let mut agent = crate::agent::Agent::new(
+                Arc::new(provider),
+                tools,
+                crate::agent::AgentConfig {
+                    max_tool_iterations: 1,
+                    turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                    stream_options: StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..StreamOptions::default()
+                    },
+                    ..crate::agent::AgentConfig::default()
+                },
+            );
+            let executions = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&executions);
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let message = runtime
+                .block_on(agent.run("Write both requested files", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
+            assert_eq!(message.stop_reason, StopReason::Stop);
+            assert_eq!(executions.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                std::fs::read_to_string(first).unwrap(),
+                "first authorized write"
+            );
+            assert_eq!(
+                std::fs::read_to_string(second).unwrap(),
+                "second authorized write"
+            );
+            assert_eq!(
+                agent
+                    .messages()
+                    .iter()
+                    .filter(|message| matches!(message, Message::ToolResult(_)))
+                    .count(),
+                2
+            );
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            let continuation = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(continuation.body.matches("functionResponse").count(), 2);
         }
     }
 
