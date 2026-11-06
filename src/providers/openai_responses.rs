@@ -662,7 +662,10 @@ where
                         // Completion metadata can precede trailing item events
                         // and usage. Finalize only at the wire boundary.
                         if !state.finish_terminal_response() {
-                            state.finish(None);
+                            state.reject_tool_response(
+                                "OpenAI Responses stream ended without response completion metadata"
+                                    .to_string(),
+                            );
                         }
                         continue;
                     }
@@ -1074,6 +1077,19 @@ enum TerminalContentSnapshot {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseOutcome {
+    Completed,
+    Incomplete(Option<String>),
+}
+
+#[derive(Clone, Copy)]
+enum ResponseTerminalEvent {
+    Completed,
+    Done,
+    Incomplete,
+}
+
 struct StreamState<S>
 where
     S: Stream<Item = std::result::Result<SseEvent, std::io::Error>> + Unpin,
@@ -1081,6 +1097,9 @@ where
     event_source: S,
     partial: AssistantMessage,
     pending_events: VecDeque<StreamEvent>,
+    /// Item completion is only a preview until the whole response authorizes
+    /// execution. A later incomplete/failed response invalidates every call.
+    completed_tool_events: VecDeque<StreamEvent>,
     started: bool,
     finished: bool,
     text_blocks: HashMap<TextKey, usize>,
@@ -1088,8 +1107,7 @@ where
     tool_calls_by_item_id: HashMap<String, ToolCallState>,
     orphan_tool_call_arguments: HashMap<String, String>,
     tool_identities: ToolIdentities,
-    terminal_response_seen: bool,
-    terminal_incomplete_reason: Option<String>,
+    terminal_outcome: Option<ResponseOutcome>,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
 }
@@ -1113,6 +1131,7 @@ where
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
             pending_events: VecDeque::new(),
+            completed_tool_events: VecDeque::new(),
             started: false,
             finished: false,
             text_blocks: HashMap::new(),
@@ -1120,8 +1139,7 @@ where
             tool_calls_by_item_id: HashMap::new(),
             orphan_tool_call_arguments: HashMap::new(),
             tool_identities: ToolIdentities::default(),
-            terminal_response_seen: false,
-            terminal_incomplete_reason: None,
+            terminal_outcome: None,
             transient_error_count: 0,
         }
     }
@@ -1135,19 +1153,45 @@ where
         }
     }
 
-    fn record_terminal_response(&mut self, incomplete_reason: Option<String>) {
-        self.terminal_response_seen = true;
-        self.terminal_incomplete_reason = incomplete_reason;
+    fn record_terminal_response(
+        &mut self,
+        response: OpenAIResponsesDonePayload,
+        event: ResponseTerminalEvent,
+    ) {
+        self.ensure_started();
+        self.partial.usage.input = response.usage.input_tokens;
+        self.partial.usage.output = response.usage.output_tokens;
+        self.partial.usage.total_tokens = response.usage.total_tokens.unwrap_or_else(|| {
+            response
+                .usage
+                .input_tokens
+                .saturating_add(response.usage.output_tokens)
+        });
+        let outcome = match response.outcome(event) {
+            Ok(outcome) => outcome,
+            Err(message) => {
+                self.reject_tool_response(message.to_string());
+                return;
+            }
+        };
+        if self
+            .terminal_outcome
+            .as_ref()
+            .is_some_and(|previous| previous != &outcome)
+        {
+            self.reject_tool_response(
+                "OpenAI Responses sent conflicting completion metadata".to_string(),
+            );
+            return;
+        }
+        self.terminal_outcome = Some(outcome);
     }
 
     fn finish_terminal_response(&mut self) -> bool {
-        if !self.terminal_response_seen {
+        let Some(outcome) = self.terminal_outcome.take() else {
             return false;
-        }
-
-        let incomplete_reason = self.terminal_incomplete_reason.take();
-        self.terminal_response_seen = false;
-        self.finish(incomplete_reason);
+        };
+        self.finish(outcome);
         true
     }
 
@@ -1384,9 +1428,19 @@ where
                     call_id,
                     name,
                     arguments,
+                    status,
                 } = item
                 {
                     self.ensure_started();
+                    if status.as_deref().is_some_and(|status| {
+                        !matches!(status, "in_progress" | "completed")
+                    }) {
+                        self.reject_tool_response(
+                            "OpenAI Responses added a function call with an invalid status"
+                                .to_string(),
+                        );
+                        return Ok(());
+                    }
                     if !self.admit_tool_event(
                         &id,
                         Some((&call_id, &name)),
@@ -1537,8 +1591,16 @@ where
                         call_id,
                         name,
                         arguments,
+                        status,
                     } => {
                         self.ensure_started();
+                        if status.as_deref().is_some_and(|status| status != "completed") {
+                            self.reject_tool_response(
+                                "OpenAI Responses did not complete a function call; local tool calls withheld"
+                                    .to_string(),
+                            );
+                            return Ok(());
+                        }
                         if !self.admit_tool_event(
                             &id,
                             Some((&call_id, &name)),
@@ -1572,17 +1634,14 @@ where
                     OpenAIResponsesOutputItemDone::Unknown => {}
                 }
             }
-            OpenAIResponsesChunk::ResponseCompleted { response }
-            | OpenAIResponsesChunk::ResponseDone { response }
-            | OpenAIResponsesChunk::ResponseIncomplete { response } => {
-                self.ensure_started();
-                self.partial.usage.input = response.usage.input_tokens;
-                self.partial.usage.output = response.usage.output_tokens;
-                self.partial.usage.total_tokens = response
-                    .usage
-                    .total_tokens
-                    .unwrap_or(response.usage.input_tokens + response.usage.output_tokens);
-                self.record_terminal_response(response.incomplete_reason());
+            OpenAIResponsesChunk::ResponseCompleted { response } => {
+                self.record_terminal_response(response, ResponseTerminalEvent::Completed);
+            }
+            OpenAIResponsesChunk::ResponseDone { response } => {
+                self.record_terminal_response(response, ResponseTerminalEvent::Done);
+            }
+            OpenAIResponsesChunk::ResponseIncomplete { response } => {
+                self.record_terminal_response(response, ResponseTerminalEvent::Incomplete);
             }
             OpenAIResponsesChunk::ResponseFailed { response } => {
                 self.ensure_started();
@@ -1781,7 +1840,7 @@ where
         };
 
         self.partial.stop_reason = StopReason::ToolUse;
-        self.pending_events.push_back(StreamEvent::ToolCallEnd {
+        self.completed_tool_events.push_back(StreamEvent::ToolCallEnd {
             content_index: tc.content_index,
             tool_call: ToolCall {
                 id: tc.call_id.clone(),
@@ -1818,6 +1877,7 @@ where
         // execution after the batch has failed validation.
         self.pending_events
             .retain(|event| !matches!(event, StreamEvent::ToolCallEnd { .. }));
+        self.completed_tool_events.clear();
         self.pending_events.push_back(StreamEvent::Error {
             reason: StopReason::Error,
             error: std::mem::take(&mut self.partial),
@@ -1825,8 +1885,7 @@ where
         self.tool_calls_by_item_id.clear();
         self.orphan_tool_call_arguments.clear();
         self.tool_identities = ToolIdentities::default();
-        self.terminal_response_seen = false;
-        self.terminal_incomplete_reason = None;
+        self.terminal_outcome = None;
         self.finished = true;
     }
 
@@ -1874,8 +1933,17 @@ where
         open_tool_calls
     }
 
-    fn finish(&mut self, incomplete_reason: Option<String>) {
+    fn finish(&mut self, outcome: ResponseOutcome) {
         if self.finished {
+            return;
+        }
+        // Completed argument JSON alone cannot authorize execution. In
+        // particular, the shared Agent accepts calls on Length as well as
+        // ToolUse, so preserve partial content as an Error on this boundary.
+        if matches!(&outcome, ResponseOutcome::Incomplete(_)) && self.partial_has_tool_call() {
+            self.reject_tool_response(
+                "OpenAI Responses output is incomplete; local tool calls withheld".to_string(),
+            );
             return;
         }
         if !self.orphan_tool_call_arguments.is_empty() {
@@ -1890,20 +1958,21 @@ where
             .open_tool_call_snapshots_in_content_order()
             .into_iter()
             .peekable();
+        let mut terminal_events = std::mem::take(&mut self.completed_tool_events);
 
         for block in self.terminal_content_snapshots() {
             match block {
                 TerminalContentSnapshot::Text {
                     content_index,
                     content,
-                } => self.pending_events.push_back(StreamEvent::TextEnd {
+                } => terminal_events.push_back(StreamEvent::TextEnd {
                     content_index,
                     content,
                 }),
                 TerminalContentSnapshot::Thinking {
                     content_index,
                     content,
-                } => self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                } => terminal_events.push_back(StreamEvent::ThinkingEnd {
                     content_index,
                     content,
                 }),
@@ -1915,6 +1984,7 @@ where
                         if self.finished {
                             return;
                         }
+                        terminal_events.append(&mut self.completed_tool_events);
                     }
                 }
             }
@@ -1927,20 +1997,31 @@ where
                 return;
             }
         }
+        terminal_events.append(&mut self.completed_tool_events);
 
-        // Infer stop reason.
-        if let Some(reason) = incomplete_reason {
-            let reason_lower = reason.to_ascii_lowercase();
-            if reason_lower.contains("max_output") || reason_lower.contains("length") {
-                self.partial.stop_reason = StopReason::Length;
-            } else if reason_lower.contains("tool") {
-                self.partial.stop_reason = StopReason::ToolUse;
-            } else if reason_lower.contains("content_filter") || reason_lower.contains("error") {
-                self.partial.stop_reason = StopReason::Error;
+        self.partial.stop_reason = match outcome {
+            ResponseOutcome::Completed if self.partial_has_tool_call() => StopReason::ToolUse,
+            ResponseOutcome::Completed => StopReason::Stop,
+            ResponseOutcome::Incomplete(Some(reason))
+                if matches!(reason.as_str(), "max_output_tokens" | "max_messages") =>
+            {
+                StopReason::Length
             }
-        } else if self.partial_has_tool_call() {
-            self.partial.stop_reason = StopReason::ToolUse;
-        }
+            ResponseOutcome::Incomplete(reason) => {
+                self.reject_tool_response(
+                    if reason.as_deref() == Some("content_filter") {
+                        "OpenAI Responses output was blocked by content filtering"
+                    } else {
+                        "OpenAI Responses output is incomplete without a supported stop reason"
+                    }
+                    .to_string(),
+                );
+                return;
+            }
+        };
+        // Publish completed calls only after the terminal outcome and every
+        // sibling call have passed validation. Preserve provider item order.
+        self.pending_events.append(&mut terminal_events);
 
         let reason = self.partial.stop_reason;
         self.pending_events.push_back(StreamEvent::Done {
@@ -2588,6 +2669,8 @@ enum OpenAIResponsesOutputItem {
         name: String,
         #[serde(default)]
         arguments: String,
+        #[serde(default)]
+        status: Option<String>,
     },
     #[serde(other)]
     Unknown,
@@ -2603,6 +2686,8 @@ enum OpenAIResponsesOutputItemDone {
         name: String,
         #[serde(default)]
         arguments: String,
+        #[serde(default)]
+        status: Option<String>,
     },
     #[serde(rename = "reasoning")]
     Reasoning {
@@ -2627,8 +2712,24 @@ struct OpenAIResponsesReasoningSummaryPart {
 #[derive(Debug, Deserialize)]
 struct OpenAIResponsesDonePayload {
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
     incomplete_details: Option<OpenAIResponsesIncompleteDetails>,
+    #[serde(default)]
+    output: Option<Vec<OpenAIResponsesTerminalItem>>,
     usage: OpenAIResponsesUsage,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAIResponsesTerminalItem {
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        #[serde(default)]
+        status: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2645,7 +2746,8 @@ struct OpenAIResponsesFailedError {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIResponsesIncompleteDetails {
-    reason: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2658,8 +2760,44 @@ struct OpenAIResponsesUsage {
 }
 
 impl OpenAIResponsesDonePayload {
-    fn incomplete_reason(&self) -> Option<String> {
-        self.incomplete_details.as_ref().map(|d| d.reason.clone())
+    fn outcome(
+        &self,
+        event: ResponseTerminalEvent,
+    ) -> std::result::Result<ResponseOutcome, &'static str> {
+        if self.output.iter().flatten().any(|item| {
+            matches!(item, OpenAIResponsesTerminalItem::FunctionCall { status }
+                if status.as_deref().is_some_and(|status| status != "completed"))
+        }) {
+            return Err(
+                "OpenAI Responses terminal output contains an unfinished function call; local tool calls withheld",
+            );
+        }
+        let incomplete = match self.status.as_deref() {
+            Some("completed") => false,
+            Some("incomplete") => true,
+            Some(_) => {
+                return Err("OpenAI Responses terminal event has a non-completing status");
+            }
+            None => {
+                matches!(event, ResponseTerminalEvent::Incomplete)
+                    || self.incomplete_details.is_some()
+            }
+        };
+        if (matches!(event, ResponseTerminalEvent::Completed) && incomplete)
+            || (matches!(event, ResponseTerminalEvent::Incomplete) && !incomplete)
+            || (!incomplete && self.incomplete_details.is_some())
+        {
+            return Err("OpenAI Responses terminal event contradicts its completion status");
+        }
+        Ok(if incomplete {
+            ResponseOutcome::Incomplete(
+                self.incomplete_details
+                    .as_ref()
+                    .and_then(|details| details.reason.clone()),
+            )
+        } else {
+            ResponseOutcome::Completed
+        })
     }
 }
 
@@ -4580,9 +4718,11 @@ mod tests {
                 .unwrap()
                 .contains("count limit")
         );
-        assert!(out.iter().any(|event| matches!(
-            event, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.id == "call_0"
-        )));
+        assert!(
+            !out.iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallEnd { .. })),
+            "a completed sibling cannot escape a response that exceeded the identity limit"
+        );
 
         let oversized_item = "x".repeat(MAX_STREAMED_TOOL_IDENTITY_BYTES + 1);
         let almost_full_item = "x".repeat(MAX_STREAMED_TOOL_IDENTITY_BYTES - 1);
@@ -5132,6 +5272,444 @@ mod tests {
         );
     }
 
+    fn terminal_response_event(
+        kind: &str,
+        status: Option<&str>,
+        incomplete_details: Option<Value>,
+    ) -> Value {
+        let mut event = completed_response_event();
+        event["type"] = json!(kind);
+        if let Some(status) = status {
+            event["response"]["status"] = json!(status);
+        }
+        if let Some(details) = incomplete_details {
+            event["response"]["incomplete_details"] = details;
+        }
+        event
+    }
+
+    fn assert_response_withholds_tools(events: &[Value], case: &str) -> AssistantMessage {
+        let mut out = collect_events(events);
+        assert!(
+            !out.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. }
+            )),
+            "{case}: no completed call may escape a rejected response"
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|event| matches!(event, StreamEvent::Error { .. }))
+                .count(),
+            1,
+            "{case}: exactly one failure terminal"
+        );
+        let Some(StreamEvent::Error { reason, error }) = out.pop() else {
+            panic!("{case}: expected a terminal error");
+        };
+        assert_eq!(reason, StopReason::Error, "{case}");
+        assert_eq!(error.stop_reason, StopReason::Error, "{case}");
+        error
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn incomplete_responses_withhold_tools_and_preserve_only_known_text_limits() {
+        for (case, details, permits_text_truncation) in [
+            ("missing details", None, false),
+            ("null details", Some(Value::Null), false),
+            ("missing reason", Some(json!({})), false),
+            ("null reason", Some(json!({"reason": null})), false),
+            (
+                "unknown reason",
+                Some(json!({"reason": "future_provider_limit"})),
+                false,
+            ),
+            (
+                "content filtering",
+                Some(json!({"reason": "content_filter"})),
+                false,
+            ),
+            (
+                "output token limit",
+                Some(json!({"reason": "max_output_tokens"})),
+                true,
+            ),
+            (
+                "message limit",
+                Some(json!({"reason": "max_messages"})),
+                true,
+            ),
+        ] {
+            for kind in ["response.incomplete", "response.done"] {
+                for with_tools in [false, true] {
+                    let label = format!("{case}/{kind}/tools={with_tools}");
+                    let mut events = vec![json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_partial",
+                        "content_index": 0,
+                        "delta": "partial answer"
+                    })];
+                    if with_tools {
+                        // One completed item and one valid open item must both
+                        // remain previews when the overall response is cut off.
+                        events.push(tool_item_event(
+                            "response.output_item.done",
+                            "completed_peer",
+                            "write",
+                            "{}",
+                        ));
+                        events.push(tool_item_event(
+                            "response.output_item.added",
+                            "open_peer",
+                            "write",
+                            "{}",
+                        ));
+                    }
+                    events.push(terminal_response_event(
+                        kind,
+                        (kind == "response.done").then_some("incomplete"),
+                        details.clone(),
+                    ));
+                    if with_tools || !permits_text_truncation {
+                        let error = assert_response_withholds_tools(&events, &label);
+                        assert!(
+                            matches!(error.content.first(),
+                                Some(ContentBlock::Text(text)) if text.text == "partial answer"),
+                            "{label}: keep the partial answer in the failure snapshot"
+                        );
+                        assert_eq!(
+                            (error.usage.input, error.usage.output, error.usage.total_tokens),
+                            (1, 1, 2),
+                            "{label}: retain usage from the observed terminal response"
+                        );
+                        continue;
+                    }
+
+                    let out = collect_events(&events);
+                    assert!(
+                        !out.iter().any(|event| matches!(
+                            event,
+                            StreamEvent::Error { .. } | StreamEvent::ToolCallEnd { .. }
+                        )),
+                        "{label}"
+                    );
+                    assert!(
+                        out.iter().any(|event| matches!(
+                            event,
+                            StreamEvent::TextEnd { content, .. } if content == "partial answer"
+                        )),
+                        "{label}"
+                    );
+                    let Some(StreamEvent::Done { reason, message }) = out.last() else {
+                        panic!("{label}: text-only truncation must remain a completed turn");
+                    };
+                    assert_eq!(*reason, StopReason::Length, "{label}");
+                    assert_eq!(message.stop_reason, StopReason::Length, "{label}");
+                    assert_eq!(message.usage.total_tokens, 2, "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unfinished_function_call_statuses_reject_every_completed_peer() {
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            for status in [
+                "in_progress",
+                "incomplete",
+                "failed",
+                "cancelled",
+                "unknown",
+                "",
+            ] {
+                if kind == "response.output_item.added" && status == "in_progress" {
+                    continue;
+                }
+                let mut unfinished = tool_item_event(kind, "unfinished", "write", "{}");
+                unfinished["item"]["status"] = json!(status);
+                assert_response_withholds_tools(
+                    &[
+                        tool_item_event("response.output_item.done", "peer", "write", "{}"),
+                        unfinished,
+                        completed_response_event(),
+                    ],
+                    &format!("{kind}/{status:?}"),
+                );
+            }
+        }
+
+        for status in [
+            "in_progress",
+            "incomplete",
+            "failed",
+            "cancelled",
+            "unknown",
+            "",
+        ] {
+            let peer = tool_item_event("response.output_item.done", "peer", "write", "{}");
+            let added =
+                tool_item_event("response.output_item.added", "unfinished", "write", "{}");
+            let mut final_item = added["item"].clone();
+            final_item["status"] = json!(status);
+            let mut terminal = completed_response_event();
+            terminal["response"]["output"] = json!([peer["item"], final_item]);
+            // No item.done exists for the second call: the authoritative
+            // response snapshot must fence terminal fallback finalization too.
+            assert_response_withholds_tools(
+                &[peer, added, terminal],
+                &format!("final output/{status:?}"),
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn invalid_or_conflicting_response_terminals_withhold_completed_calls() {
+        for kind in ["response.completed", "response.done", "response.incomplete"] {
+            for status in ["in_progress", "queued", "cancelled", "failed", "unknown", ""] {
+                assert_response_withholds_tools(
+                    &[
+                        tool_item_event("response.output_item.done", "peer", "write", "{}"),
+                        terminal_response_event(kind, Some(status), None),
+                    ],
+                    &format!("{kind}/{status:?}"),
+                );
+            }
+        }
+
+        let limit = json!({"reason": "max_output_tokens"});
+        let completed = terminal_response_event("response.completed", Some("completed"), None);
+        let incomplete = terminal_response_event(
+            "response.incomplete",
+            Some("incomplete"),
+            Some(limit.clone()),
+        );
+        for (case, terminals) in [
+            (
+                "completed event with incomplete status",
+                vec![terminal_response_event(
+                    "response.completed",
+                    Some("incomplete"),
+                    Some(limit.clone()),
+                )],
+            ),
+            (
+                "incomplete event with completed status",
+                vec![terminal_response_event(
+                    "response.incomplete",
+                    Some("completed"),
+                    None,
+                )],
+            ),
+            (
+                "completed status with incomplete details",
+                vec![terminal_response_event(
+                    "response.done",
+                    Some("completed"),
+                    Some(limit.clone()),
+                )],
+            ),
+            (
+                "completed event with incomplete details",
+                vec![terminal_response_event(
+                    "response.completed",
+                    None,
+                    Some(limit),
+                )],
+            ),
+            (
+                "completed then incomplete",
+                vec![completed.clone(), incomplete.clone()],
+            ),
+            (
+                "incomplete then completed",
+                vec![incomplete.clone(), completed],
+            ),
+            (
+                "incompatible incomplete reasons",
+                vec![
+                    incomplete,
+                    terminal_response_event(
+                        "response.done",
+                        Some("incomplete"),
+                        Some(json!({"reason": "max_messages"})),
+                    ),
+                ],
+            ),
+        ] {
+            let mut events = vec![tool_item_event(
+                "response.output_item.done",
+                "peer",
+                "write",
+                "{}",
+            )];
+            events.extend(terminals);
+            assert_response_withholds_tools(&events, case);
+        }
+    }
+
+    #[test]
+    fn provider_failure_withholds_previously_completed_tool_calls() {
+        let error = assert_response_withholds_tools(
+            &[
+                tool_item_event("response.output_item.done", "peer", "write", "{}"),
+                json!({
+                    "type": "response.failed",
+                    "response": {"error": {"message": "provider failed after the tool preview"}}
+                }),
+                tool_item_event("response.output_item.done", "after_failure", "write", "{}"),
+                completed_response_event(),
+            ],
+            "provider failure after a completed item",
+        );
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("provider failed after the tool preview")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::format_collect, clippy::too_many_lines)]
+    fn unfinished_response_batches_never_execute_write_tools_on_sse_or_ndjson() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for ndjson in [false, true] {
+            for case in [
+                "incomplete response",
+                "incomplete done item",
+                "incomplete final output item",
+                "missing completion metadata",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let marker = dir.path().join("must-not-be-written.txt");
+                let arguments =
+                    json!({"path": marker, "content": "must not execute"}).to_string();
+                let mut events = vec![tool_item_event(
+                    "response.output_item.done",
+                    "valid_peer",
+                    "write",
+                    &arguments,
+                )];
+                match case {
+                    "incomplete response" => events.push(terminal_response_event(
+                        "response.incomplete",
+                        Some("incomplete"),
+                        Some(json!({"reason": "max_output_tokens"})),
+                    )),
+                    "incomplete done item" => {
+                        let mut item = tool_item_event(
+                            "response.output_item.done",
+                            "unfinished",
+                            "write",
+                            &arguments,
+                        );
+                        item["item"]["status"] = json!("incomplete");
+                        events.push(item);
+                        events.push(completed_response_event());
+                    }
+                    "incomplete final output item" => {
+                        let added = tool_item_event(
+                            "response.output_item.added",
+                            "unfinished",
+                            "write",
+                            &arguments,
+                        );
+                        let mut item = added["item"].clone();
+                        item["status"] = json!("incomplete");
+                        let mut terminal = completed_response_event();
+                        terminal["response"]["output"] = json!([events[0]["item"], item]);
+                        events.push(added);
+                        events.push(terminal);
+                    }
+                    "missing completion metadata" => {}
+                    _ => unreachable!(),
+                }
+                let body = if ndjson {
+                    ndjson_body_from_events(&events) + "[DONE]\n"
+                } else {
+                    events
+                        .iter()
+                        .map(|event| format!("data: {event}\n\n"))
+                        .collect::<String>()
+                        + "data: [DONE]\n\n"
+                };
+                let content_type = if ndjson {
+                    "application/x-ndjson"
+                } else {
+                    "text/event-stream"
+                };
+                let (base_url, _requests) = spawn_test_server(200, content_type, &body);
+                let provider = OpenAIResponsesProvider::new("gpt-test")
+                    .with_codex_mode(ndjson)
+                    .with_base_url(base_url);
+                let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                    crate::tools::WriteTool::new(dir.path()),
+                )]);
+                let mut agent = crate::agent::Agent::new(
+                    Arc::new(provider),
+                    tools,
+                    crate::agent::AgentConfig {
+                        max_tool_iterations: 1,
+                        turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                        stream_options: StreamOptions {
+                            api_key: Some(if ndjson {
+                                build_test_jwt("acct-test")
+                            } else {
+                                "test-key".to_string()
+                            }),
+                            ..Default::default()
+                        },
+                        ..crate::agent::AgentConfig::default()
+                    },
+                );
+                let executions = Arc::new(AtomicUsize::new(0));
+                let completed_calls = Arc::new(AtomicUsize::new(0));
+                let observed_executions = Arc::clone(&executions);
+                let observed_completions = Arc::clone(&completed_calls);
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                let message = runtime
+                    .block_on(agent.run("Apply both edits", move |event| match event {
+                        crate::agent::AgentEvent::ToolExecutionStart { .. } => {
+                            observed_executions.fetch_add(1, Ordering::SeqCst);
+                        }
+                        crate::agent::AgentEvent::MessageUpdate {
+                            assistant_message_event:
+                                crate::model::AssistantMessageEvent::ToolCallEnd { .. },
+                            ..
+                        } => {
+                            observed_completions.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }))
+                    .unwrap();
+                assert_eq!(
+                    message.stop_reason,
+                    StopReason::Error,
+                    "{case}/ndjson={ndjson}"
+                );
+                assert_eq!(executions.load(Ordering::SeqCst), 0, "{case}/ndjson={ndjson}");
+                assert_eq!(
+                    completed_calls.load(Ordering::SeqCst),
+                    0,
+                    "{case}/ndjson={ndjson}"
+                );
+                assert!(
+                    !marker.exists(),
+                    "{case}/ndjson={ndjson}: no write may occur"
+                );
+                assert!(
+                    !agent
+                        .messages()
+                        .iter()
+                        .any(|message| matches!(message, Message::ToolResult(_))),
+                    "{case}/ndjson={ndjson}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_stream_reads_late_tool_call_events_after_response_completed() {
         let body = [
@@ -5499,7 +6077,7 @@ mod tests {
                 )
                 .expect("second text delta");
 
-            state.finish(None);
+            state.finish(ResponseOutcome::Completed);
 
             let terminal_end_kinds: Vec<(&'static str, usize)> = state
                 .pending_events
@@ -5617,7 +6195,7 @@ mod tests {
                 )
                 .expect("second text delta");
 
-            state.finish(None);
+            state.finish(ResponseOutcome::Completed);
 
             let terminal_event_order: Vec<(&'static str, usize)> = state
                 .pending_events
@@ -6044,7 +6622,10 @@ mod tests {
                         let msg = item.expect("SSE event");
                         if msg.data == "[DONE]" {
                             if !state.finish_terminal_response() {
-                                state.finish(None);
+                                state.reject_tool_response(
+                                    "OpenAI Responses stream ended without response completion metadata"
+                                        .to_string(),
+                                );
                             }
                             continue;
                         }
