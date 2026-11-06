@@ -74,7 +74,7 @@ fn imported_pi_ai_completion_uses_registered_target_and_real_structured_request(
     );
     let extension = harness.create_file(
         "native-completion.mjs",
-        br#"
+        br"
         import { completeSimple, getModels } from '@mariozechner/pi-ai';
         export default function(pi) {
           pi.registerCommand('native-completion', { handler: async () => {
@@ -111,7 +111,7 @@ fn imported_pi_ai_completion_uses_registered_target_and_real_structured_request(
               content:result.content, usage:result.usage};
           }});
         }
-        "#,
+        ",
     );
     let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
     registry.merge_entries(vec![ModelEntry {

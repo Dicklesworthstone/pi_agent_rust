@@ -32,7 +32,6 @@ use pi::agent::{
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
-use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::config::SettingsScope;
 use pi::extension_index::{
@@ -11805,6 +11804,7 @@ fn default_export_path(input: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi::compaction::ResolvedCompactionSettings;
     use anyhow::anyhow;
     use clap::Parser as _;
     use serde_json::json;

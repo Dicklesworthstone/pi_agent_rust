@@ -2784,8 +2784,9 @@ impl OpenAIResponsesDonePayload {
             }
         };
         if (matches!(event, ResponseTerminalEvent::Completed) && incomplete)
-            || (matches!(event, ResponseTerminalEvent::Incomplete) && !incomplete)
-            || (!incomplete && self.incomplete_details.is_some())
+            || (!incomplete
+                && (matches!(event, ResponseTerminalEvent::Incomplete)
+                    || self.incomplete_details.is_some()))
         {
             return Err("OpenAI Responses terminal event contradicts its completion status");
         }

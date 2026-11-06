@@ -1689,7 +1689,7 @@ fn minimum_success_is_separate_from_all_items_succeeding() -> Result<()> {
                 }
                 let code = if kernel == "js" {
                     format!(
-                        r#"const batch = await judgeBatch.attach({id});
+                        r"const batch = await judgeBatch.attach({id});
 const page = await batch.drain({{timeout: 0}});
 if (page.jobStatus !== {status} || page.jobFailed !== ({minimum} === 2)
     || !page.complete || page.items.length !== 2
@@ -1705,11 +1705,11 @@ const acknowledged = await batch.drain({{cursor: page.cursor, timeout: 0}});
 if (acknowledged.items.length !== 0 || !acknowledged.complete
     || acknowledged.jobStatus !== {status}
     || acknowledged.cursor.seen.join(',') !== '0,1')
-    throw new Error('acknowledged results were redelivered');"#
+    throw new Error('acknowledged results were redelivered');"
                     )
                 } else {
                     format!(
-                        r#"batch = await judge_batch.attach({id})
+                        r"batch = await judge_batch.attach({id})
 page = await batch.drain(timeout=0)
 assert page['jobStatus'] == {status} and page['jobFailed'] is ({minimum} == 2)
 assert page['complete'] and len(page['items']) == 2
@@ -1722,7 +1722,7 @@ replay = await batch.drain(timeout=0)
 assert len(replay['items']) == 2 and replay['items'][1]['error'] == page['items'][1]['error']
 acknowledged = await batch.drain(cursor=page['cursor'], timeout=0)
 assert acknowledged['items'] == [] and acknowledged['complete']
-assert acknowledged['jobStatus'] == {status} and acknowledged['cursor']['seen'] == [0, 1]"#
+assert acknowledged['jobStatus'] == {status} and acknowledged['cursor']['seen'] == [0, 1]"
                     )
                 };
                 let privacy = privacy();

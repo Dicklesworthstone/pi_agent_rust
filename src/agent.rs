@@ -10329,6 +10329,7 @@ mod extensions_integration_tests {
     use super::*;
 
     use crate::session::Session;
+    use crate::session::SessionMessage;
     use asupersync::runtime::RuntimeBuilder;
     use async_trait::async_trait;
     use futures::Stream;
@@ -12641,7 +12642,7 @@ mod extensions_integration_tests {
             let entry = directory.path().join("replace-compaction.mjs");
             std::fs::write(
                 &entry,
-                r#"
+                r"
                 export default function(pi) {
                     pi.on('session_before_compact', (event) => ({
                         compaction: {
@@ -12651,7 +12652,7 @@ mod extensions_integration_tests {
                         }
                     }));
                 }
-                "#,
+                ",
             )
             .expect("write replacement hook");
             let mut stored = Session::in_memory();
@@ -12725,7 +12726,7 @@ mod extensions_integration_tests {
                 });
                 let outcome = if overflow {
                     agent_session
-                        .compact_after_context_overflow(&AbortSignal::new(), move |event| {
+                        .compact_after_context_overflow(&AbortHandle::new().1, move |event| {
                             on_event(event);
                         })
                         .await

@@ -3093,12 +3093,12 @@ mod tests {
             );
         }
         for value in [
-            r#"[]"#,
+            r"[]",
             r#"["shake","shake"]"#,
             r#"["remote","soft","shake","remote"]"#,
             r#"["unknown"]"#,
             r#""soft""#,
-            r#"[false]"#,
+            r"[false]",
         ] {
             let content = format!(r#"{{"compaction":{{"methodOrder":{value}}}}}"#);
             assert!(
@@ -3147,7 +3147,7 @@ mod tests {
             assert_eq!(resolved.trigger_tokens(), 60_000);
         }
         for content in [
-            r#"{}"#,
+            r"{}",
             r#"{"compaction":{}}"#,
             r#"{"compaction":{"thresholdTokens":null,"thresholdPercent":null}}"#,
         ] {

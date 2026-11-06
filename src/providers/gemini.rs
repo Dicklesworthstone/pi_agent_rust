@@ -1988,7 +1988,7 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;

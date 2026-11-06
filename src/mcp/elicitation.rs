@@ -975,12 +975,10 @@ async fn visit_url(
     let name = match answer {
         Answer::Choice(choice) if choice == DECLINE => "decline",
         Answer::Choice(choice) if choice == OPENED_URL => "accept",
-        Answer::Choice(choice) if choice == OPEN_URL => {
-            if registry.open_url(&url.url).await.is_ok() {
-                "accept"
-            } else {
-                "cancel"
-            }
+        Answer::Choice(choice)
+            if choice == OPEN_URL && registry.open_url(&url.url).await.is_ok() =>
+        {
+            "accept"
         }
         _ => "cancel",
     };

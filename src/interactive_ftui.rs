@@ -27242,7 +27242,7 @@ mod tests {
         let entry = directory.path().join("commands.mjs");
         std::fs::write(
             &entry,
-            r#"
+            r"
             export default function(pi) {
                 pi.registerCommand('inspect-command', {
                     handler: (args, ctx) => ({
@@ -27283,7 +27283,7 @@ mod tests {
                 pi.registerShortcut('shift+k', { handler: () => null });
                 pi.registerShortcut('k', { handler: () => null });
             }
-            "#,
+            ",
         )
         .expect("command source");
         handle
@@ -27438,25 +27438,26 @@ mod tests {
                 ui_turns, 3,
                 "each generated turn needs a fresh progress bridge"
             );
-            let calls = provider.calls.lock().unwrap();
-            assert_eq!(
-                calls.len(), 3,
-                "the custom message also requests a native turn"
-            );
-            assert_eq!(
-                calls[0].content,
-                UserContent::Text("ultrathink generated first".into())
-            );
-            assert_eq!(
-                calls[2].content,
-                UserContent::Text("generated second".into())
-            );
-            assert!(
-                calls
-                    .iter()
-                    .all(|call| call.thinking == Some(ThinkingLevel::Low))
-            );
-            drop(calls);
+            {
+                let calls = provider.calls.lock().unwrap();
+                assert_eq!(
+                    calls.len(), 3,
+                    "the custom message also requests a native turn"
+                );
+                assert!(matches!(
+                    &calls[0].content,
+                    UserContent::Text(t) if t == "ultrathink generated first"
+                ));
+                assert!(matches!(
+                    &calls[2].content,
+                    UserContent::Text(t) if t == "generated second"
+                ));
+                assert!(
+                    calls
+                        .iter()
+                        .all(|call| call.thinking == Some(ThinkingLevel::Low))
+                );
+            }
             let messages = handle
                 .with_session(crate::session::Session::to_messages_for_current_path)
                 .await

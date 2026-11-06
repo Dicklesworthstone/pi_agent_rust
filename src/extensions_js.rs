@@ -39213,6 +39213,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .await
                 .expect("create runtime");
 
+            #[allow(clippy::literal_string_with_formatting_args)] // JS template literal, not a format string
             runtime
                 .eval(
                     r#"

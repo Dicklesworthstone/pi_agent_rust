@@ -13532,31 +13532,28 @@ impl JsExtensionRuntimeHandle {
             Box::pin(completion),
         )
         .await;
-        match completion {
-            Ok(Some(result)) => {
-                if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
-                    Err(Error::Aborted)
-                } else {
-                    result
-                }
+        if let Ok(Some(result)) = completion {
+            if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+                Err(Error::Aborted)
+            } else {
+                result
             }
-            Ok(None) | Err(_) => {
-                cancelled.store(true, StdOrdering::SeqCst);
-                if started.load(StdOrdering::SeqCst) {
-                    // Cleanup is outside the deadline wrapper. Even an abort
-                    // racing that deadline must wait for admitted native work
-                    // and its guest realm to lose their ownership first.
-                    let _ = fut.await;
-                }
-                // For a queued command, admission's matching handshake
-                // prevents execution after this immediate cancellation reply.
-                if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
-                    Err(Error::Aborted)
-                } else {
-                    Err(Error::extension(format!(
-                        "JS extension runtime {kind} timed out after {timeout_ms}ms"
-                    )))
-                }
+        } else {
+            cancelled.store(true, StdOrdering::SeqCst);
+            if started.load(StdOrdering::SeqCst) {
+                // Cleanup is outside the deadline wrapper. Even an abort
+                // racing that deadline must wait for admitted native work
+                // and its guest realm to lose their ownership first.
+                let _ = fut.await;
+            }
+            // For a queued command, admission's matching handshake
+            // prevents execution after this immediate cancellation reply.
+            if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+                Err(Error::Aborted)
+            } else {
+                Err(Error::extension(format!(
+                    "JS extension runtime {kind} timed out after {timeout_ms}ms"
+                )))
             }
         }
     }

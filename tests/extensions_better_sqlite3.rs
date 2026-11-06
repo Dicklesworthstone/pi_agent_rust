@@ -1,4 +1,4 @@
-//! Imported better-sqlite3 uses the real, capability-bound PiJS SQLite engine.
+//! Imported better-sqlite3 uses the real, capability-bound `PiJS` SQLite engine.
 
 use pi::extensions::{ExtensionPolicy, ExtensionPolicyMode, safe_canonicalize};
 use pi::extensions_js::{PiJsRuntime, PiJsRuntimeConfig};

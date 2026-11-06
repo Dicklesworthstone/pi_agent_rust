@@ -758,7 +758,7 @@ impl ControllableSession {
             let callback = move |event| on_event(&callback_control, event);
             session
                 .run_recoverable_turn_with_handoff(Some(content), signal, callback, move |_| {
-                    handoff_control.hand_off_initial_input()
+                    handoff_control.hand_off_initial_input();
                 })
                 .await
         };

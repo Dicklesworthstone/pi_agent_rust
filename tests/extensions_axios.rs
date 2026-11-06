@@ -82,7 +82,7 @@ fn axios_esm_and_require_send_real_json_form_and_binary_requests() {
     );
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
     let value = runtime.block_on(async {
-        let manager = load(&harness, r#"
+        let manager = load(&harness, r"
             import axios, { isAxiosError } from 'axios';
             import { createRequire } from 'node:module';
             export default function(pi) {
@@ -113,7 +113,7 @@ fn axios_esm_and_require_send_real_json_form_and_binary_requests() {
                   ordinaryIsError:isAxiosError({}), query:query.data};
               }});
             }
-        "#, true).await;
+        ", true).await;
         let value = manager.execute_command("axios-probe", &server.base_url(), 10_000)
             .await.expect("real Axios requests");
         assert!(manager.shutdown(Duration::from_secs(3)).await);
@@ -157,7 +157,8 @@ fn axios_errors_limits_and_pre_cancel_never_fabricate_success() {
     server.add_route("GET", "/long", MockHttpResponse::text(200, "too long"));
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
     let result = runtime.block_on(async {
-        let manager = load(&harness, r#"
+        #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
+        let manager = load(&harness, r"
             import axios from 'axios';
             export default function(pi) {
               pi.registerCommand('axios-errors', {handler: async base => {
@@ -179,7 +180,7 @@ fn axios_errors_limits_and_pre_cancel_never_fabricate_success() {
                 return {errors, accepted:accepted.status};
               }});
             }
-        "#, true).await;
+        ", true).await;
         let result = manager.execute_command("axios-errors", &server.base_url(), 10_000)
             .await.expect("Axios error handling");
         assert!(manager.shutdown(Duration::from_secs(3)).await);
@@ -209,7 +210,8 @@ fn axios_obeys_native_http_capability_denial() {
     server.add_route("GET", "/", MockHttpResponse::text(200, "must not reach server"));
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
     let result = runtime.block_on(async {
-        let manager = load(&harness, r#"
+        #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
+        let manager = load(&harness, r"
             import axios from 'axios';
             export default function(pi) {
               pi.registerCommand('axios-denied', {handler: async url => {
@@ -217,7 +219,7 @@ fn axios_obeys_native_http_capability_denial() {
                 catch (error) { return {axios:axios.isAxiosError(error), error:String(error.message)}; }
               }});
             }
-        "#, false).await;
+        ", false).await;
         let result = manager.execute_command("axios-denied", &server.base_url(), 10_000)
             .await.expect("capability denial is a request error");
         assert!(manager.shutdown(Duration::from_secs(3)).await);
