@@ -35,8 +35,14 @@ const unsupportedChecks: Array<[string, () => unknown]> = [
 ];
 
 async function consumeStream(stream: AsyncIterable<unknown>): Promise<void> {
-    for await (const _ of stream) {
-        // The host bridge must fail before yielding placeholder chunks.
+    for await (const event of stream) {
+        // Provider streams report a missing bridge as a terminal error event,
+        // never a successful placeholder completion or text chunk.
+        if (event && typeof event === "object" && "type" in event && event.type === "error") {
+            const failure = event as { error?: { errorMessage?: string } };
+            throw new Error(failure.error?.errorMessage || "Missing bridge error detail");
+        }
+        throw new Error("Unexpected successful event from an unavailable bridge");
     }
 }
 

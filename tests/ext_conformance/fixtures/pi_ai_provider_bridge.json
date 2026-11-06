@@ -16,7 +16,7 @@
         "content_contains": [
           "complete:bridge-complete-ok",
           "completeSimple:bridge-simple-ok",
-          "streamSimpleOpenAIResponses:bridge-simple-ok",
+          "streamSimpleOpenAIResponses:bridge-complete-ok",
           "getModel:mock-provider/mock-model",
           "getApiProvider:mock-provider",
           "getModels:mock-model"

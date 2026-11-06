@@ -25,9 +25,12 @@ export default function(pi: ExtensionAPI) {
             );
             const simple = await completeSimple("mock-model", "simple", { maxTokens: 4 });
             const streamChunks: string[] = [];
-            for await (const chunk of streamSimpleOpenAIResponses("mock-model", "stream")) {
-                streamChunks.push(String(chunk));
+            const stream = streamSimpleOpenAIResponses("mock-model", "stream");
+            for await (const event of stream) {
+                if (event.type === "text_delta") streamChunks.push(event.delta);
             }
+            const streamResult = await stream.result();
+            if (streamResult.stopReason !== "stop") throw new Error("Unexpected bridge stream outcome");
             const model = await getModel();
             const provider = await getApiProvider();
             const models = await getModels();

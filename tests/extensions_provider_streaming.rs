@@ -19,7 +19,10 @@
 
 use futures::StreamExt;
 use pi::agent::{Agent, AgentConfig, AgentEvent};
-use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+use pi::extensions::{
+    ExtensionAiCompletionRequest, ExtensionHostActions, ExtensionManager, ExtensionSendMessage,
+    ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle, SessionActionOrigin,
+};
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::{
     AssistantMessageEvent, ContentBlock, Message, StopReason, StreamEvent, UserContent, UserMessage,
@@ -107,6 +110,178 @@ async fn collect_events(
         }
     }
     events
+}
+
+#[derive(Default)]
+struct PiAiCompletionBridge {
+    requests: Mutex<Vec<ExtensionAiCompletionRequest>>,
+}
+
+fn pi_ai_bridge_message() -> serde_json::Value {
+    serde_json::json!({
+        "content": [
+            {"type": "thinking", "thinking": "Reasoning 🦀", "thinkingSignature": "reasoning-signature"},
+            {"type": "text", "text": "A complete tool batch.", "textSignature": "text-signature"},
+            {"type": "toolCall", "id": "call-a", "name": "write", "arguments": {
+                "path": "output.txt", "content": "kept"
+            }, "thoughtSignature": "tool-signature"},
+            {"type": "toolCall", "id": "call-b", "name": "read", "arguments": {
+                "path": "output.txt"
+            }}
+        ],
+        "api": "openai-responses",
+        "provider": "configured-provider",
+        "model": "configured-model",
+        "usage": {
+            "input": 11, "output": 7, "cacheRead": 3, "cacheWrite": 2, "totalTokens": 23,
+            "cost": {"input": 0.25, "output": 0.5, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.75}
+        },
+        "stopReason": "toolUse",
+        "timestamp": 123
+    })
+}
+
+#[async_trait::async_trait]
+impl ExtensionHostActions for PiAiCompletionBridge {
+    async fn send_message(
+        &self,
+        _: ExtensionSendMessage,
+        _: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn send_user_message(
+        &self,
+        _: ExtensionSendUserMessage,
+        _: Option<SessionActionOrigin>,
+    ) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn complete_ai(
+        &self,
+        request: ExtensionAiCompletionRequest,
+    ) -> pi::error::Result<serde_json::Value> {
+        assert!(
+            !request.simple,
+            "assistant streams must request the full native envelope"
+        );
+        self.requests.lock().unwrap().push(request);
+        let message = pi_ai_bridge_message();
+        Ok(serde_json::json!({
+            "text": "A complete tool batch.",
+            "content": message["content"],
+            "usage": message["usage"],
+            "api": message["api"],
+            "provider": message["provider"],
+            "model": message["model"],
+            "stopReason": message["stopReason"],
+            "message": message
+        }))
+    }
+}
+
+#[test]
+fn imported_pi_ai_helpers_keep_context_and_native_assistant_events() {
+    for (helper, api, with_options) in [
+        ("streamSimpleAnthropic", "anthropic-messages", true),
+        ("streamSimpleOpenAIResponses", "openai-responses", true),
+        ("streamSimpleOpenAICompletions", "openai-completions", true),
+        ("stream", "openai-responses", true),
+        ("streamSimple", "openai-responses", true),
+        ("completeSimple", "openai-responses", true),
+        ("completeSimple", "openai-responses", false),
+    ] {
+        make_runtime().block_on(async {
+            let source = r#"
+import { __HELPER__ as delegate } from "@mariozechner/pi-ai";
+export default function(pi) {
+  pi.registerProvider("bridge-probe", {
+    api: "__API__",
+    baseUrl: "https://unused.example.test",
+    models: [{ id: "bridge-model", name: "Bridge", contextWindow: 100, maxTokens: 20, input: ["text"] }],
+    streamSimple: async function* (model, context, options) {
+      if ("__HELPER__" === "completeSimple") {
+        const message = await delegate(model, context__OPTIONS__);
+        yield { type: "done", reason: message.stopReason, message };
+      } else {
+        const stream = delegate(model, context, options);
+        if (!stream || typeof stream.result !== "function") {
+          throw new Error("Named delegate did not return an AssistantMessageEventStream");
+        }
+        const message = await stream.result();
+        if (message.stopReason !== "toolUse" || message.usage.totalTokens !== 23) {
+          throw new Error("Delegate result lost terminal metadata");
+        }
+        for await (const event of stream) yield event;
+      }
+    }
+  });
+}
+"#
+            .replace("__HELPER__", helper)
+            .replace("__API__", api)
+            .replace("__OPTIONS__", if with_options { ", options" } else { "" });
+            let (_dir, manager) = load_extension(&source).await;
+            let bridge = Arc::new(PiAiCompletionBridge::default());
+            manager.set_host_actions(bridge.clone());
+            let entry = manager
+                .extension_model_entries()
+                .into_iter()
+                .find(|entry| entry.model.provider == "bridge-probe")
+                .expect("registered bridge provider");
+            let provider = create_provider(&entry, Some(&manager)).unwrap();
+            let options = StreamOptions {
+                max_tokens: Some(17),
+                temperature: Some(0.4),
+                ..basic_options()
+            };
+            let events = collect_events(provider.as_ref(), &basic_context(), &options).await;
+            assert!(events.iter().all(Result::is_ok), "{helper}: {events:?}");
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                panic!("{helper} did not complete: {events:?}");
+            };
+            assert_eq!(*reason, StopReason::ToolUse, "{helper}");
+            assert_eq!(message.stop_reason, StopReason::ToolUse);
+            assert_eq!(message.provider, "configured-provider");
+            assert_eq!(message.model, "configured-model");
+            assert_eq!(message.usage.total_tokens, 23);
+            assert_eq!(message.usage.cost.total, 0.75);
+            assert_eq!(
+                serde_json::to_value(&message.content).unwrap(),
+                pi_ai_bridge_message()["content"],
+                "{helper} must preserve all native blocks and signatures"
+            );
+            if helper != "completeSimple" {
+                assert!(matches!(
+                    events.first(),
+                    Some(Ok(StreamEvent::Start { partial })) if partial.content.is_empty()
+                ));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+                        .count(),
+                    2
+                );
+            }
+            let requests = bridge.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.model["id"], "bridge-model");
+            assert_eq!(request.model["api"], api);
+            assert_eq!(request.context["systemPrompt"], "system");
+            assert_eq!(request.context["messages"][0]["content"], "hello");
+            if with_options {
+                assert_eq!(request.options["maxTokens"], 17);
+                assert_eq!(request.options["temperature"], 0.4);
+            } else {
+                assert!(request.options.get("maxTokens").is_none());
+                assert!(request.options.get("temperature").is_none());
+            }
+        });
+    }
 }
 
 type TestProviderStream =

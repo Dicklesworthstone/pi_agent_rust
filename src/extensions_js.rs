@@ -8738,8 +8738,17 @@ function completionText(result) {
     .join("");
 }
 
-function completeSimpleArgs(model, prompt, opts) {
-  if (prompt === undefined || (prompt && typeof prompt === "object" && !Array.isArray(prompt))) {
+function completeSimpleArgs(model, prompt, opts, argumentCount) {
+  const hasModelIdentity = model && typeof model === "object" && !Array.isArray(model) &&
+    ("api" in model || "id" in model || "provider" in model || "modelId" in model);
+  const hasContext = prompt && typeof prompt === "object" && !Array.isArray(prompt) &&
+    ("messages" in prompt || "systemPrompt" in prompt || "role" in prompt ||
+      "prompt" in prompt || "input" in prompt || "message" in prompt);
+  // Keep the host shorthand completeSimple(prompt, options), but a normal
+  // Model + Context call must retain its model, messages and third argument.
+  const shorthandOptions = argumentCount < 3 && !hasModelIdentity && !hasContext &&
+    prompt && typeof prompt === "object" && !Array.isArray(prompt);
+  if (prompt === undefined || shorthandOptions) {
     return {
       model: undefined,
       prompt: model,
@@ -8810,11 +8819,12 @@ function assistantMessageFor(model, text, result) {
   const usageObj = resultObj.usage && typeof resultObj.usage === "object" ? resultObj.usage : {};
   const usageCost = usageObj.cost && typeof usageObj.cost === "object" ? usageObj.cost : {};
   return {
+    ...resultObj,
     role: "assistant",
-    content: text ? [{ type: "text", text }] : [],
-    api: modelObj.api || "",
-    provider: modelObj.provider || "",
-    model: modelObj.id || modelObj.modelId || (typeof model === "string" ? model : ""),
+    content: Array.isArray(resultObj.content) ? resultObj.content : text ? [{ type: "text", text }] : [],
+    api: resultObj.api || modelObj.api || "",
+    provider: resultObj.provider || modelObj.provider || "",
+    model: resultObj.model || modelObj.id || modelObj.modelId || (typeof model === "string" ? model : ""),
     usage: {
       input: Number(usageObj.input ?? 0),
       output: Number(usageObj.output ?? 0),
@@ -8834,7 +8844,45 @@ function assistantMessageFor(model, text, result) {
   };
 }
 
-function providerBridgeStream(name, model, context, opts = {}, simple = true) {
+function publishBridgeCompletion(stream, message) {
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    stream.push({ type: "error", reason: message.stopReason, error: message });
+    return;
+  }
+  // The completion host owns the provider request and currently returns its
+  // terminal envelope. Replay that envelope as valid assistant events; never
+  // flatten tool calls, signed reasoning or usage into a text-only reply.
+  let content = [];
+  stream.push({ type: "start", partial: { ...message, content } });
+  for (const block of message.content) {
+    const contentIndex = content.length;
+    const before = content;
+    content = before.concat([block]);
+    const partial = { ...message, content };
+    if (block.type === "text" || block.type === "thinking") {
+      const kind = block.type;
+      const value = kind === "text" ? block.text : block.thinking;
+      stream.push({
+        type: `${kind}_start`, contentIndex,
+        partial: { ...message, content: before.concat([{ ...block, [kind]: "" }]) },
+      });
+      if (value) stream.push({ type: `${kind}_delta`, contentIndex, delta: value, partial });
+      stream.push({ type: `${kind}_end`, contentIndex, content: value, partial });
+    } else if (block.type === "toolCall") {
+      stream.push({
+        type: "toolcall_start", contentIndex,
+        partial: { ...message, content: before.concat([{ ...block, arguments: {} }]) },
+      });
+      stream.push({
+        type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial,
+      });
+      stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+    }
+  }
+  stream.push({ type: "done", reason: message.stopReason, message });
+}
+
+function providerBridgeStream(name, model, context, opts = {}) {
   const stream = createAssistantMessageEventStream();
   (async () => {
     try {
@@ -8842,17 +8890,16 @@ function providerBridgeStream(name, model, context, opts = {}, simple = true) {
         model,
         context,
         options: opts || {},
-        simple,
+        // `simple` is the host's text-only response shorthand, not the public
+        // streamSimple contract. Both stream APIs need the complete message.
+        simple: false,
       });
       const text = completionText(result);
-      if (text) {
-        stream.push({ type: "text_delta", delta: text });
-      }
-      const message =
+      const envelope =
         result && typeof result === "object" && result.message && typeof result.message === "object"
           ? result.message
-          : assistantMessageFor(model, text, result);
-      stream.push({ type: "done", message });
+          : result;
+      publishBridgeCompletion(stream, assistantMessageFor(model, text, envelope));
     } catch (error) {
       const message = assistantMessageFor(model, "", {});
       message.stopReason = "error";
@@ -8869,9 +8916,9 @@ function apiProviderBridge(api) {
   return {
     api: apiId,
     stream: (model, context, opts = {}) =>
-      providerBridgeStream(`getApiProvider(${apiId}).stream`, model, context, opts, false),
+      providerBridgeStream(`getApiProvider(${apiId}).stream`, model, context, opts),
     streamSimple: (model, context, opts = {}) =>
-      providerBridgeStream(`getApiProvider(${apiId}).streamSimple`, model, context, opts, true),
+      providerBridgeStream(`getApiProvider(${apiId}).streamSimple`, model, context, opts),
   };
 }
 
@@ -8989,33 +9036,22 @@ Object.defineProperty(globalThis, "__pi_api_provider_registry_size", {
   enumerable: false,
 });
 
-async function* streamSimpleBridge(name, model, context, opts = {}) {
-  const result = await callProviderBridge(name, "completeAi", {
-    model,
-    context,
-    options: opts || {},
-    simple: true,
-  });
-  const text = completionText(result);
-  if (text) yield text;
-}
-
 export function streamSimpleAnthropic(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleAnthropic", model, context, opts);
+  return providerBridgeStream("streamSimpleAnthropic", model, context, opts);
 }
 
 export function streamSimpleOpenAIResponses(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleOpenAIResponses", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAIResponses", model, context, opts);
 }
 
 export function streamSimpleOpenAICompletions(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleOpenAICompletions", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAICompletions", model, context, opts);
 }
 
 export function stream(model, context, opts = {}) {
   const api = model && typeof model === "object" ? model.api : undefined;
   if (!api) {
-    return providerBridgeStream("stream", model, context, opts || {}, false);
+    return providerBridgeStream("stream", model, context, opts || {});
   }
   const provider = getApiProvider(api);
   if (!provider) {
@@ -9027,7 +9063,7 @@ export function stream(model, context, opts = {}) {
 export function streamSimple(model, context, opts = {}) {
   const api = model && typeof model === "object" ? model.api : undefined;
   if (!api) {
-    return providerBridgeStream("streamSimple", model, context, opts || {}, true);
+    return providerBridgeStream("streamSimple", model, context, opts || {});
   }
   const provider = getApiProvider(api);
   if (!provider) {
@@ -9057,7 +9093,7 @@ export async function complete(model, messages, opts = {}) {
 }
 
 export async function completeSimple(model, prompt, opts = {}) {
-  const args = completeSimpleArgs(model, prompt, opts);
+  const args = completeSimpleArgs(model, prompt, opts, arguments.length);
   if (!args.model || typeof args.model !== "object" || !args.model.api) {
     return await callProviderBridge("completeSimple", "completeAi", {
       model: args.model,
@@ -39270,12 +39306,23 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     globalThis.piAiFailClosed = {};
                     (async () => {
                         const ai = await import('@mariozechner/pi-ai');
+                        const rejectStream = async (name) => {
+                            const stream = ai[name]("model", "hi");
+                            const events = [];
+                            for await (const event of stream) events.push(event);
+                            const result = await stream.result();
+                            if (events.length !== 1 || events[0].type !== "error" ||
+                                result.stopReason !== "error") {
+                                throw new Error(`${name}: missing terminal bridge error`);
+                            }
+                            throw new Error(result.errorMessage);
+                        };
                         const checks = [
                             ["complete", () => ai.complete("model", [{ role: "user", content: "hi" }])],
                             ["completeSimple", () => ai.completeSimple("model", "hi")],
-                            ["streamSimpleAnthropic", async () => { for await (const _ of ai.streamSimpleAnthropic("model", "hi")) {} }],
-                            ["streamSimpleOpenAIResponses", async () => { for await (const _ of ai.streamSimpleOpenAIResponses("model", "hi")) {} }],
-                            ["streamSimpleOpenAICompletions", async () => { for await (const _ of ai.streamSimpleOpenAICompletions("model", "hi")) {} }],
+                            ["streamSimpleAnthropic", () => rejectStream("streamSimpleAnthropic")],
+                            ["streamSimpleOpenAIResponses", () => rejectStream("streamSimpleOpenAIResponses")],
+                            ["streamSimpleOpenAICompletions", () => rejectStream("streamSimpleOpenAICompletions")],
                             ["getModel", () => ai.getModel()],
                             ["getApiProvider", () => ai.getApiProvider()],
                             ["getModels", () => ai.getModels()],
@@ -39752,13 +39799,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                             { maxTokens: 12 }
                         );
                         globalThis.piAiBridge.simple = await ai.completeSimple("mock-model", "hello", { maxTokens: 4 });
+                        globalThis.piAiBridge.shorthand = await ai.completeSimple("hello", { maxTokens: 3 });
                         globalThis.piAiBridge.model = await ai.getModel();
                         globalThis.piAiBridge.provider = await ai.getApiProvider();
                         globalThis.piAiBridge.models = await ai.getModels();
                         globalThis.piAiBridge.stream = [];
-                        for await (const chunk of ai.streamSimpleOpenAIResponses("mock-model", "stream")) {
-                            globalThis.piAiBridge.stream.push(chunk);
+                        const stream = ai.streamSimpleOpenAIResponses("mock-model", "stream");
+                        for await (const event of stream) {
+                            if (event.type === "text_delta") globalThis.piAiBridge.stream.push(event.delta);
                         }
+                        globalThis.piAiBridge.streamResult = await stream.result();
                         globalThis.piAiBridge.done = true;
                     })().catch((e) => {
                         globalThis.piAiBridge.error = String((e && e.message) || e || "");
@@ -39803,16 +39853,27 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
                             if simple {
+                                assert_eq!(request.payload["context"], json!("hello"));
+                                if request.payload["model"].is_null() {
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(3));
+                                } else {
+                                    assert_eq!(request.payload["model"], json!("mock-model"));
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(4));
+                                }
                                 runtime.complete_hostcall(
                                     request.call_id,
                                     HostcallOutcome::Success(json!("bridge-simple")),
                                 );
                             } else {
-                                assert_eq!(
-                                    request.payload["context"][0]["content"],
-                                    json!("hello")
-                                );
-                                assert_eq!(request.payload["options"]["maxTokens"], json!(12));
+                                if request.payload["context"].is_array() {
+                                    assert_eq!(
+                                        request.payload["context"][0]["content"],
+                                        json!("hello")
+                                    );
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(12));
+                                } else {
+                                    assert_eq!(request.payload["context"], json!("stream"));
+                                }
                                 runtime.complete_hostcall(
                                     request.call_id,
                                     HostcallOutcome::Success(json!({
@@ -39854,10 +39915,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["error"], serde_json::Value::Null);
             assert_eq!(r["complete"]["text"], json!("bridge-complete"));
             assert_eq!(r["simple"], json!("bridge-simple"));
+            assert_eq!(r["shorthand"], json!("bridge-simple"));
             assert_eq!(r["model"]["modelId"], json!("mock-model"));
             assert_eq!(r["provider"], json!("mock-provider"));
             assert_eq!(r["models"][0]["id"], json!("mock-model"));
-            assert_eq!(r["stream"][0], json!("bridge-simple"));
+            assert_eq!(r["stream"][0], json!("bridge-complete"));
+            assert_eq!(r["streamResult"]["stopReason"], json!("stop"));
+            assert_eq!(
+                r["streamResult"]["content"][0]["text"],
+                json!("bridge-complete")
+            );
         });
     }
 
