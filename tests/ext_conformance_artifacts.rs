@@ -576,7 +576,7 @@ fn test_api_usage_matrix_npm_virtual_module_contract() {
         ("open", "stub"),
         ("commander", "stub"),
         ("chalk", "stub"),
-        ("better-sqlite3", "stub"),
+        ("better-sqlite3", "partial"),
         ("glob", "partial"),
     ] {
         let actual = matrix

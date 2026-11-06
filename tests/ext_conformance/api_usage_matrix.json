@@ -459,9 +459,9 @@
     {
       "module": "better-sqlite3",
       "extensions_using": 3,
-      "shim_status": "stub",
+      "shim_status": "partial",
       "criticality": "P3",
-      "notes": "No-op Database/Statement facade; native persistence unavailable"
+      "notes": "Real SQLite through the existing bun:sqlite engine: persistent/memory/readonly databases, prepared statements and bindings, rows/BLOBs/safe integers, transactions and nested rollback, PRAGMAs and close. ESM and createRequire share the constructor. Existing ownership, storage and write guards remain authoritative; native addons and unsupported options fail explicitly. Native integration tests await DSR qualification."
     },
     {
       "module": "diff",
@@ -631,8 +631,8 @@
     "total_virtual_modules": 62,
     "shim_completeness": {
       "real": 18,
-      "partial": 22,
-      "stub": 24,
+      "partial": 23,
+      "stub": 23,
       "external": 5,
       "error_throw": 2,
       "missing_from_corpus": 2

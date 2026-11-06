@@ -12549,6 +12549,7 @@ import * as v8 from "node:v8";
 import * as workerThreads from "node:worker_threads";
 import * as testMod from "node:test";
 import * as bunSqlite from "bun:sqlite";
+import * as betterSqlite from "better-sqlite3";
 import * as axiosModule from "axios";
 
 function __normalizeBuiltin(id) {
@@ -12666,6 +12667,7 @@ function __normalizeBuiltin(id) {
 
 const __builtinModules = {
   "bun:sqlite": bunSqlite,
+  "better-sqlite3": betterSqlite,
   "axios": axiosModule,
   "node:fs": fs,
   "node:fs/promises": fsPromises,
@@ -17801,41 +17803,7 @@ export default { parse, stringify };
 
     modules.insert(
         "better-sqlite3".to_string(),
-        compressed_js_literal!(
-            r#"
-class Statement {
-    all() { return []; }
-    get() { return undefined; }
-    run() { return { changes: 0, lastInsertRowid: 0 }; }
-}
-
-function BetterSqlite3(filename, options = {}) {
-    if (!(this instanceof BetterSqlite3)) return new BetterSqlite3(filename, options);
-    this.filename = String(filename ?? "");
-    this.options = options;
-}
-
-BetterSqlite3.prototype.prepare = function(_sql) { return new Statement(); };
-BetterSqlite3.prototype.exec = function(_sql) { return this; };
-BetterSqlite3.prototype.pragma = function(_sql) { return []; };
-BetterSqlite3.prototype.transaction = function(fn) {
-    const wrapped = (...args) => (typeof fn === "function" ? fn(...args) : undefined);
-    wrapped.immediate = wrapped;
-    wrapped.deferred = wrapped;
-    wrapped.exclusive = wrapped;
-    return wrapped;
-};
-BetterSqlite3.prototype.close = function() {};
-
-BetterSqlite3.Statement = Statement;
-BetterSqlite3.Database = BetterSqlite3;
-
-export { Statement };
-export default BetterSqlite3;
-"#
-        )
-        .trim()
-        .to_string(),
+        include_str!("extensions_js/better_sqlite3.mjs").to_string(),
     );
 
     modules.insert(
