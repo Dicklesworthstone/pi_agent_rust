@@ -840,6 +840,12 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**Interactive queued input.** In the default terminal interface, messages
+accepted as a turn finishes continue in their original order, with each
+message's prepared file contents preserved. They keep separate message
+boundaries and their own authored instructions. Aborts, failures, and run-time
+caps return unsent authored text to the editor for review before resubmission.
+
 **ACP workspace settings.** Sessions created by `pi --acp` resolve global
 settings and trusted settings from the requested workspace when creating,
 loading from disk, or forking a session. Reattaching to a running session keeps

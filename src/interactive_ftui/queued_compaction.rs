@@ -305,7 +305,7 @@ pub(super) async fn run(
     // A new live input or compaction then sees every older accepted message.
     let mut after = after.into_iter();
     if let Some(input) = after.next() {
-        let (leftover, _) = run_controlled_turn_with_pending(
+        let result = run_controlled_turn_with_pending(
             handle,
             input.content,
             Some(input.text),
@@ -317,6 +317,6 @@ pub(super) async fn run(
         .await;
         // Stops/caps and arrivals at the final boundary are returned intact
         // instead of resetting the completed turn's timer or merging content.
-        restore(&request, leftover, agent_tx);
+        restore(&request, result.into_restore_texts(), agent_tx);
     }
 }

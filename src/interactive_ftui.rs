@@ -8790,17 +8790,17 @@ async fn run_prompt_turn(
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
-    let mut next = Some((prompt, attachments));
-    while let Some((prompt, attachments)) = next.take() {
-        let (leftover, stopped) =
-            run_controlled_turn(handle, prompt, attachments, agent_tx, turn_control).await;
-        if leftover.is_empty() {
-            continue;
+    let mut result =
+        run_controlled_turn(handle, prompt, attachments, agent_tx, turn_control).await;
+    loop {
+        let count = result.pending.len() + usize::from(result.initial_restore.is_some());
+        if count == 0 {
+            return;
         }
-        let text = leftover.join("\n\n");
-        if stopped {
+        if result.stopped {
             // A cap is a pause too: starting a new turn here would reset its
             // timer and immediately resume work the user asked us to stop.
+            let text = result.into_restore_texts().join("\n\n");
             if let Ok(owner_session_id) = handle
                 .with_session(|session| session.header.id.clone())
                 .await
@@ -8810,29 +8810,60 @@ async fn run_prompt_turn(
                     text,
                 });
                 let _ = agent_tx.send(PiMsg::System(format!(
-                    "Restored {} unsent message(s) to the editor.",
-                    leftover.len()
+                    "Restored {count} unsent message(s) to the editor."
                 )));
             }
-        } else {
-            let _ = agent_tx.send(PiMsg::System(format!(
-                "Running {} message(s) sent as the last turn ended.",
-                leftover.len()
-            )));
-            next = Some((text, Vec::new()));
+            return;
         }
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Running {count} message(s) sent as the last turn ended."
+        )));
+        // These inputs were already expanded and admitted by the old turn.
+        // Keep their frozen content, order and authored keyword authority;
+        // joining their text would discard file bodies and merge messages.
+        let mut pending = result.pending.into_iter();
+        let Some(first) = pending.next() else {
+            return;
+        };
+        result = run_controlled_turn_with_pending(
+            handle,
+            first.content,
+            Some(first.text),
+            pending.collect(),
+            None,
+            agent_tx,
+            turn_control,
+        )
+        .await;
     }
 }
 
-/// One controlled turn; returns the text of inputs it never claimed and
-/// whether completion requires a pause before those inputs may run.
+/// Unclaimed native inputs remain prepared until the driver either admits
+/// them to another turn or explicitly returns their authored text for review.
+struct ControlledTurnResult {
+    pending: Vec<crate::session_control::PendingInput>,
+    initial_restore: Option<String>,
+    stopped: bool,
+}
+
+impl ControlledTurnResult {
+    fn into_restore_texts(self) -> Vec<String> {
+        self.initial_restore
+            .into_iter()
+            .chain(self.pending.into_iter().map(|input| input.text))
+            .collect()
+    }
+}
+
+/// One controlled turn; retain inputs it never claimed and report whether
+/// completion requires a pause before those inputs may run.
 async fn run_controlled_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
     attachments: Vec<crate::model::ContentBlock>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
-) -> (Vec<String>, bool) {
+) -> ControlledTurnResult {
     let content = if attachments.is_empty() {
         crate::model::UserContent::Text(prompt)
     } else {
@@ -8870,7 +8901,7 @@ async fn run_controlled_turn_with_pending(
     inherited_abort: Option<crate::agent::AbortSignal>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
-) -> (Vec<String>, bool) {
+) -> ControlledTurnResult {
     let origin = {
         let read = handle.with_session(|session| {
             (
@@ -8884,24 +8915,20 @@ async fn run_controlled_turn_with_pending(
             match futures::future::select(cancelled, read).await {
                 futures::future::Either::Left(_) => {
                     report_turn_result(Err(crate::error::Error::Aborted), agent_tx);
-                    return (
-                        initial_source
-                            .into_iter()
-                            .chain(pending.into_iter().map(|input| input.text))
-                            .collect(),
-                        true,
-                    );
+                    return ControlledTurnResult {
+                        pending,
+                        initial_restore: initial_source,
+                        stopped: true,
+                    };
                 }
                 futures::future::Either::Right((Ok(origin), _)) => Some(origin),
                 futures::future::Either::Right((Err(error), _)) => {
                     report_turn_result(Err(error), agent_tx);
-                    return (
-                        initial_source
-                            .into_iter()
-                            .chain(pending.into_iter().map(|input| input.text))
-                            .collect(),
-                        true,
-                    );
+                    return ControlledTurnResult {
+                        pending,
+                        initial_restore: initial_source,
+                        stopped: true,
+                    };
                 }
             }
         } else {
@@ -8933,13 +8960,11 @@ async fn run_controlled_turn_with_pending(
                 .set_magic_keyword_scan_override(None);
         }
         report_turn_result(Err(error), agent_tx);
-        return (
-            initial_source
-                .into_iter()
-                .chain(pending.into_iter().map(|input| input.text))
-                .collect(),
-            true,
-        );
+        return ControlledTurnResult {
+            pending,
+            initial_restore: initial_source,
+            stopped: true,
+        };
     }
     turn_control
         .lock()
@@ -8965,7 +8990,7 @@ async fn run_controlled_turn_with_pending(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .current = None;
-    let mut leftover = if control.has_yield_barrier() {
+    let pending = if control.has_yield_barrier() {
         let same_branch = handle
             .with_session(|session| {
                 origin.as_ref().is_some_and(|(id, leaf)| {
@@ -8987,24 +9012,22 @@ async fn run_controlled_turn_with_pending(
         // them to the editor. Starting them here would cross its barrier.
         Vec::new()
     } else {
-        control
-            .take_pending()
-            .into_iter()
-            .map(|input| input.text)
-            .collect()
+        control.take_pending()
     };
     // OwnedTurn guarantees this particular refusal dispatched no prompt.
     // Other failures may have delivered the first input and must not replay it.
-    if matches!(&result, Err(crate::error::Error::Validation(message))
+    let initial_restore = if matches!(&result, Err(crate::error::Error::Validation(message))
         if message.starts_with("[SESSION_CONTROL_CANCELLED] turn cancelled before execution;"))
         && let Some(source) = initial_source
     {
-        leftover.insert(0, source);
         handle
             .session_mut()
             .agent
             .set_magic_keyword_scan_override(None);
-    }
+        Some(source)
+    } else {
+        None
+    };
     // The SDK result is the durability boundary. A successful cap must stop
     // the outer continuation loop just like an abort or terminal failure.
     let stopped = match &result {
@@ -9017,7 +9040,11 @@ async fn run_controlled_turn_with_pending(
         }
     };
     report_turn_result(result, agent_tx);
-    (leftover, stopped)
+    ControlledTurnResult {
+        pending,
+        initial_restore,
+        stopped,
+    }
 }
 
 fn report_turn_result(
@@ -26529,6 +26556,113 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn late_follow_ups_keep_prepared_content_and_separate_authored_sources() {
+        use crate::model::{ContentBlock, Message, TextContent, ThinkingLevel, UserContent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let second = UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("Frozen file body: ultrathink workflowz")),
+                ContentBlock::Text(TextContent::new("Review the supplied material.")),
+            ]);
+            let third = UserContent::Text("Prepared third message.".into());
+            let expected = [
+                UserContent::Text("Initial message.".into()),
+                second.clone(),
+                third.clone(),
+            ];
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let controls: TurnControlSlot = Arc::default();
+            let published = Arc::clone(&controls);
+            let starts = Arc::new(AtomicUsize::new(0));
+            let observed_starts = Arc::clone(&starts);
+            let queued = AtomicBool::new(false);
+            handle.subscribe(move |event| match event {
+                crate::agent::AgentEvent::AgentStart { .. } => {
+                    if observed_starts.fetch_add(1, Ordering::SeqCst) == 1 {
+                        let control = published.lock().unwrap().current.clone().unwrap();
+                        assert_eq!(
+                            control.snapshot().pending_follow_up,
+                            1,
+                            "the entire accepted tail is seeded before the next turn is published"
+                        );
+                    }
+                }
+                crate::agent::AgentEvent::AgentEnd { .. }
+                    if !queued.swap(true, Ordering::SeqCst) =>
+                {
+                    // AgentEnd follows the final follow-up fetch, but the
+                    // owned turn still accepts input until its durable finish.
+                    // No sleep or scheduling race is needed to reach this seam.
+                    let control = published.lock().unwrap().current.clone().unwrap();
+                    control
+                        .follow_up_with_content(&second, "review @captured-notes.txt")
+                        .unwrap();
+                    control
+                        .follow_up_with_content(&third, "ultrathink third task")
+                        .unwrap();
+                }
+                _ => {}
+            });
+            let (tx, rx) = mpsc::channel();
+            run_prompt_turn(
+                &mut handle,
+                "Initial message.".into(),
+                Vec::new(),
+                &tx,
+                &controls,
+            )
+            .await;
+
+            assert_eq!(starts.load(Ordering::SeqCst), 2);
+            let calls = provider.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 3, "accepted messages must never be merged");
+            for (call, content) in calls.iter().zip(&expected) {
+                assert_eq!(
+                    serde_json::to_value(&call.content).unwrap(),
+                    serde_json::to_value(content).unwrap()
+                );
+            }
+            assert_eq!(calls[1].thinking, Some(ThinkingLevel::Low));
+            assert!(
+                !calls[1]
+                    .system_prompt
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("invoked `workflowz`")
+            );
+            assert_eq!(calls[2].thinking, Some(ThinkingLevel::High));
+            let recorded = handle
+                .with_session(|session| {
+                    session
+                        .to_messages_for_current_path()
+                        .into_iter()
+                        .filter_map(|message| match message {
+                            Message::User(user) => Some(user.content),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(recorded).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert!(controls.lock().unwrap().current.is_none());
+            assert!(!rx.try_iter().any(|event| matches!(
+                event,
+                PiMsg::AgentError(_) | PiMsg::RestorePendingInput { .. }
+            )));
+        });
+    }
+
+    #[test]
     fn seeded_compaction_inputs_precede_live_input_and_a_new_barrier() {
         use crate::model::{ContentBlock, TextContent, ThinkingLevel, UserContent};
 
@@ -26566,7 +26700,7 @@ mod tests {
             });
             let (tx, _rx) = mpsc::channel();
             let (_, abort) = crate::agent::AbortHandle::new();
-            let (leftover, stopped) = run_controlled_turn_with_pending(
+            let result = run_controlled_turn_with_pending(
                 &mut handle,
                 first.clone(),
                 Some("A @already-prepared.txt".into()),
@@ -26576,8 +26710,9 @@ mod tests {
                 &controls,
             )
             .await;
-            assert!(!stopped);
-            assert!(leftover.is_empty(), "the new barrier owns its held input");
+            assert!(!result.stopped);
+            assert!(result.pending.is_empty(), "the new barrier owns its held input");
+            assert!(result.initial_restore.is_none());
             let (control, barrier) = observed.lock().unwrap().take().unwrap();
             assert!(control.yield_barrier_can_run(barrier));
             let (before, after) = control.take_pending_at_barrier(barrier).unwrap();
@@ -26648,11 +26783,11 @@ mod tests {
                     assert!(futures::poll!(turn.as_mut()).is_pending());
                     abort.abort();
                 }
-                let (leftover, stopped) = turn.await;
+                let result = turn.await;
                 drop(held);
-                assert!(stopped, "{phase}");
+                assert!(result.stopped, "{phase}");
                 assert_eq!(
-                    leftover,
+                    result.into_restore_texts(),
                     ["authored A", "authored B", "authored C"],
                     "{phase}"
                 );
@@ -26699,9 +26834,9 @@ mod tests {
             // The UI may have cloned the maintenance token just before the
             // resumed native control became visible. It must still cancel it.
             late_clone.abort();
-            let (leftover, stopped) = turn.await;
-            assert!(stopped);
-            assert_eq!(leftover, ["authored B", "authored C"]);
+            let result = turn.await;
+            assert!(result.stopped);
+            assert_eq!(result.into_restore_texts(), ["authored B", "authored C"]);
             assert!(native.snapshot().finished);
             assert!(controls.lock().unwrap().current.is_none());
             assert_eq!(provider.calls.lock().unwrap().len(), 1);
