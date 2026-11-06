@@ -16050,6 +16050,7 @@ async fn maybe_auto_compact(
                         true,
                         &provider_admission,
                         "RPC auto-compaction",
+                        cx.cx(),
                     )
                     .await
                 {

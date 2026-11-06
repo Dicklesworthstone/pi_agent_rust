@@ -3227,7 +3227,14 @@ impl AgentSessionHandle {
         let messages = candidate.to_messages_for_current_path();
         let checkpoint = crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
         self.session
-            .install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "checkpoint",
+                cx.cx(),
+            )
             .await?;
         Ok(checkpoint)
     }
@@ -3319,7 +3326,14 @@ impl AgentSessionHandle {
             ));
         }
         self.session
-            .install_context_candidate(&mut guard, candidate, true, &admission, "checkpoint rewind")
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                true,
+                &admission,
+                "checkpoint rewind",
+                cx.cx(),
+            )
             .await?;
         Ok(outcome)
     }
@@ -3374,7 +3388,14 @@ impl AgentSessionHandle {
         let prepared = crate::checkpoint::rewind_to_user_entry(&mut candidate, entry_id)
             .ok_or_else(|| Error::session(format!("No user message {entry_id} on this branch")))?;
         self.session
-            .install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                true,
+                &admission,
+                "branch rewind",
+                cx.cx(),
+            )
             .await?;
         Ok(prepared)
     }
@@ -3398,7 +3419,14 @@ impl AgentSessionHandle {
             return Err(Error::session(format!("No session entry {entry_id}")));
         }
         self.session
-            .install_context_candidate(&mut guard, candidate, true, &admission, "branch switch")
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                true,
+                &admission,
+                "branch switch",
+                cx.cx(),
+            )
             .await
     }
 
@@ -3466,6 +3494,7 @@ impl AgentSessionHandle {
                 false,
                 &admission,
                 "workspace root grant",
+                cx.cx(),
             )
             .await?;
         if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots) {
@@ -3537,6 +3566,7 @@ impl AgentSessionHandle {
                 false,
                 &admission,
                 "workspace root removal",
+                cx.cx(),
             )
             .await?;
         if !workspace.replace_additional_roots_if_unchanged(&roots, roots.clone()) {

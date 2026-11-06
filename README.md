@@ -650,10 +650,12 @@ unreported/unpriced usage cannot be estimated. Spend is checkpointed with
 session saves, including normal turn completion, replacement and SDK shutdown.
 Only settled charges enter saved cost checkpoints; an in-flight estimate
 cannot permanently inflate the restored balance if its final bill is lower.
-When a saved session is replaced or shuts down, captured background requests
-retain a durable billing destination for that original session. Their final
-charges go to a separate cost journal beside the session file, without
-rewriting its transcript or racing a newly reopened session's saves. Resume
+A live `AgentSession` activates its cost journal beside the session file after
+a cost checkpoint is successfully saved and acknowledged. Later finalized
+charges become recoverable once their journal writes are acknowledged, without
+another transcript save. Replacing or shutting down that session retains the
+same journal destination for captured background requests, without rewriting
+the transcript or racing a newly reopened session's saves. Resume
 combines those charges with saved checkpoints exactly once; a reopened live
 account also imports newly arrived charges before admitting another request.
 This applies to JSONL and SQLite sessions, including the first charge arriving
@@ -674,10 +676,11 @@ to the copy. Observe final closure and save a new checkpoint before expecting a
 snapshot to be independent of its original journals. Failure to acknowledge a
 journal write blocks further requests on the affected account. If an incomplete
 save leaves primary usage and journal charges with an uncertain overlap, the
-known lower bound is retained and further requests are blocked. A crash before
-a normal checkpoint or before a final charge receives its durable acknowledgement
-can still lose uncheckpointed spend; these limits do not replace the provider's
-billing records.
+known lower bound is retained and further requests are blocked. Startup and
+provider requests before the first successful cost checkpoint do not yet have
+an active journal. A crash before that checkpoint or before a final charge
+receives its durable acknowledgement can still lose uncheckpointed spend;
+these limits do not replace the provider's billing records.
 
 ### Native Subagents and Orchestration
 

@@ -18376,21 +18376,28 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
 /// permit here; extension callbacks may already own it while awaiting Session.
 struct TurnPersistenceGuard<'a> {
     admission: &'a ProviderAdmissionGate,
+    cost_budget: Option<&'a crate::cost::CostBudget>,
     completed: bool,
 }
 
 impl Drop for TurnPersistenceGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
+            let message =
+                "turn persistence was interrupted before its durable result was observed";
             let mut reason = self
                 .admission
                 .reason
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            reason.get_or_insert_with(|| {
-                "turn persistence was interrupted before its durable result was observed"
-                    .to_string()
-            });
+            reason.get_or_insert_with(|| message.to_string());
+            drop(reason);
+            // Retained provider/tool handles share the account, but do not
+            // consult Session admission. Fence new requests there too while
+            // allowing already-owned attempts to settle their final bills.
+            if let Some(budget) = self.cost_budget {
+                budget.quarantine(message);
+            }
         }
     }
 }
@@ -18399,12 +18406,35 @@ async fn flush_turn_autosave(
     session: &mut Session,
     admission: &ProviderAdmissionGate,
     trigger: AutosaveFlushTrigger,
+    cost_account: Option<(&crate::cost::CostBudget, &asupersync::Cx)>,
 ) -> Result<()> {
+    if let Some((budget, _)) = cost_account {
+        budget
+            .checkpoint(session)
+            .inspect_err(|error| budget.quarantine(&error.to_string()))?;
+    }
     let mut guard = TurnPersistenceGuard {
         admission,
+        cost_budget: cost_account.map(|(budget, _)| budget),
         completed: false,
     };
-    let result = session.flush_autosave(trigger).await;
+    let result = session
+        .flush_autosave(trigger)
+        .await
+        .inspect_err(|error| {
+            if let Some((budget, _)) = cost_account {
+                budget.quarantine(&error.to_string());
+            }
+        })
+        .and_then(|()| {
+            // The source and its exact accounting receipt must already be saved.
+            // Finalized requests can then persist their bills independently of
+            // the next transcript checkpoint, while this session is still live.
+            if let Some((budget, owner)) = cost_account {
+                budget.acknowledge_saved_session(session, owner)?;
+            }
+            Ok(())
+        });
     // The caller handles an observed error with its original turn failure.
     // Never clear admission here: another operation may own its quarantine.
     guard.completed = true;
@@ -18443,7 +18473,7 @@ pub(crate) async fn persist_session_mutations(
     admission: &ProviderAdmissionGate,
     trigger: AutosaveFlushTrigger,
 ) -> Result<()> {
-    let persist_result = flush_turn_autosave(session, admission, trigger).await;
+    let persist_result = flush_turn_autosave(session, admission, trigger, None).await;
     finish_turn_persistence(admission, Ok(()), persist_result)
 }
 
@@ -18456,6 +18486,7 @@ mod finish_turn_persistence_tests {
         let admission = ProviderAdmissionGate::default();
         let guard = TurnPersistenceGuard {
             admission: &admission,
+            cost_budget: None,
             completed: false,
         };
         admission
@@ -18470,6 +18501,49 @@ mod finish_turn_persistence_tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // Exact quarter-dollar bill verifies settlement after cancellation.
+    fn interrupted_save_fences_retained_accounts_without_losing_inflight_bills() {
+        let admission = ProviderAdmissionGate::default();
+        let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        let retained = budget.clone();
+        let mut inflight = retained.start_attempt().unwrap();
+        let guard = TurnPersistenceGuard {
+            admission: &admission,
+            cost_budget: Some(&budget),
+            completed: false,
+        };
+        retained
+            .admit()
+            .expect("a pending save must not quarantine its account");
+        drop(guard);
+        assert!(
+            admission
+                .ensure_allowed()
+                .unwrap_err()
+                .is_session_persistence()
+        );
+        assert!(matches!(retained.start_attempt(), Err(Error::Session(_))));
+        inflight
+            .finish(0.75)
+            .expect("an admitted bill must still settle");
+        assert_eq!(retained.spent(), 0.75);
+
+        let admission = ProviderAdmissionGate::default();
+        let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        let mut guard = TurnPersistenceGuard {
+            admission: &admission,
+            cost_budget: Some(&budget),
+            completed: false,
+        };
+        guard.completed = true;
+        drop(guard);
+        admission.ensure_allowed().unwrap();
+        budget
+            .admit()
+            .expect("an observed successful save keeps the account healthy");
+    }
+
+    #[test]
     fn completed_no_op_turn_flush_preserves_existing_quarantine() {
         let admission = ProviderAdmissionGate::default();
         admission.block("an earlier save was interrupted".to_string());
@@ -18478,6 +18552,7 @@ mod finish_turn_persistence_tests {
             &mut session,
             &admission,
             AutosaveFlushTrigger::Manual,
+            None,
         ))
         .expect("an empty autosave queue needs no filesystem work");
         assert_eq!(session.autosave_metrics().flush_started, 0);
@@ -20874,6 +20949,7 @@ impl AgentSession {
         replace_context: bool,
         admission: &ProviderAdmissionGate,
         operation: &str,
+        owner: &asupersync::Cx,
     ) -> Result<()> {
         admission.ensure_allowed()?;
         let save_enabled = self.save_enabled();
@@ -20903,6 +20979,10 @@ impl AgentSession {
             self.agent.replace_messages(messages);
         }
         if save_enabled {
+            let accounting = self.agent.cost_budget().map_or(Ok(()), |budget| {
+                budget.acknowledge_saved_session(live, owner)
+            });
+            finish_turn_persistence(admission, Ok(()), accounting)?;
             admission.clear();
         }
         Ok(())
@@ -20943,8 +21023,15 @@ impl AgentSession {
         let mut candidate = guard.clone();
         crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
             .map_err(|error| Error::session(error.to_string()))?;
-        self.install_context_candidate(&mut guard, candidate, true, &admission, "retry rewind")
-            .await?;
+        self.install_context_candidate(
+            &mut guard,
+            candidate,
+            true,
+            &admission,
+            "retry rewind",
+            cx.cx(),
+        )
+        .await?;
         Ok(plan.content)
     }
 
@@ -21849,6 +21936,10 @@ impl AgentSession {
         });
         *session = candidate;
         if self.save_enabled {
+            let accounting = self.agent.cost_budget().map_or(Ok(()), |budget| {
+                budget.acknowledge_saved_session(&session, cx.cx())
+            });
+            finish_turn_persistence(&self.provider_admission, Ok(()), accounting)?;
             self.provider_admission.clear();
         }
         drop(session);
@@ -22722,13 +22813,11 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            if let Some(budget) = self.agent.cost_budget() {
-                budget.checkpoint(&mut session)?;
-            }
             let persist_result = flush_turn_autosave(
                 &mut session,
                 &self.provider_admission,
                 AutosaveFlushTrigger::Periodic,
+                self.agent.cost_budget().map(|budget| (budget, cx.cx())),
             )
             .await;
             finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
@@ -22744,13 +22833,11 @@ impl AgentSession {
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
-        if let Some(budget) = self.agent.cost_budget() {
-            budget.checkpoint(&mut session)?;
-        }
         let persist_result = flush_turn_autosave(
             &mut session,
             &self.provider_admission,
             AutosaveFlushTrigger::Periodic,
+            self.agent.cost_budget().map(|budget| (budget, cx.cx())),
         )
         .await;
         finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)
@@ -23787,6 +23874,7 @@ impl AgentSession {
                     &mut session,
                     &self.provider_admission,
                     AutosaveFlushTrigger::Manual,
+                    self.agent.cost_budget().map(|budget| (budget, cx.cx())),
                 )
                 .await;
                 finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
@@ -23898,6 +23986,7 @@ impl AgentSession {
                     &mut session,
                     &self.provider_admission,
                     AutosaveFlushTrigger::Manual,
+                    self.agent.cost_budget().map(|budget| (budget, cx.cx())),
                 )
                 .await;
                 finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
@@ -24003,6 +24092,7 @@ impl AgentSession {
                     &mut session,
                     &self.provider_admission,
                     AutosaveFlushTrigger::Manual,
+                    self.agent.cost_budget().map(|budget| (budget, cx.cx())),
                 )
                 .await;
                 finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
@@ -24318,26 +24408,29 @@ impl AgentSession {
                             );
                         }
                     }
-                    if let Some(budget) = &cost_budget
-                        && let Err(error) = budget.checkpoint(&mut session)
-                    {
-                        // Transcript rows are already queued. Return success
-                        // to advance the cursor; the final save retries the
-                        // checkpoint and reports any persistent error.
-                        tracing::warn!(%error, "mid-run cost checkpoint failed");
-                    }
                     if session.autosave_durability_mode()
-                        != crate::session::AutosaveDurabilityMode::Throughput
-                        && let Err(err) = flush_turn_autosave(
+                        == crate::session::AutosaveDurabilityMode::Throughput
+                    {
+                        if let Some(budget) = &cost_budget
+                            && let Err(error) = budget.checkpoint(&mut session)
+                        {
+                            budget.quarantine(&error.to_string());
+                            tracing::warn!(%error, "mid-run cost checkpoint failed");
+                        }
+                    } else {
+                        let persist_result = flush_turn_autosave(
                             &mut session,
                             &admission,
                             AutosaveFlushTrigger::Periodic,
+                            cost_budget.as_ref().map(|budget| (budget, cx.cx())),
                         )
-                        .await
-                    {
-                        // The rows stay queued; the run's final save retries them
-                        // and reports a failure.
-                        tracing::warn!(error = %err, "mid-run session checkpoint failed");
+                        .await;
+                        if let Err(err) = finish_turn_persistence(&admission, Ok(()), persist_result) {
+                            // The rows stay queued and the cursor advances so
+                            // the final save can retry without duplicating them.
+                            // A failed durable account cannot admit more work.
+                            tracing::warn!(error = %err, "mid-run session checkpoint failed");
+                        }
                     }
                     true
                 })
@@ -24408,16 +24501,16 @@ impl AgentSession {
             {
                 session.append_model_message(message);
             }
-            if let Some(budget) = self.agent.cost_budget() {
-                budget.checkpoint(&mut session)?;
-            }
             if self.save_enabled {
                 flush_turn_autosave(
                     &mut session,
                     &self.provider_admission,
                     AutosaveFlushTrigger::Periodic,
+                    self.agent.cost_budget().map(|budget| (budget, cx.cx())),
                 )
                 .await?;
+            } else if let Some(budget) = self.agent.cost_budget() {
+                budget.checkpoint(&mut session)?;
             }
         }
         Ok(())

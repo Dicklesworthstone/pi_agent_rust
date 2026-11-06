@@ -135,6 +135,8 @@ struct CostState {
     account: String,
     own_finalized: f64,
     imported: Writers,
+    // Canonical saved-session sinks, activated by an acknowledged live save
+    // or a committed handoff. Both retain the same absolute writer counter.
     retired: BTreeMap<std::path::PathBuf, Retirement>,
     closure_deadline: Option<Instant>,
 }
@@ -763,7 +765,7 @@ impl CostBudget {
         })
     }
 
-    fn quarantine(&self, message: &str) {
+    pub(crate) fn quarantine(&self, message: &str) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -918,6 +920,43 @@ impl CostBudget {
             }
         }
         Ok(())
+    }
+
+    /// Retain finalized charges after an acknowledged save of the live session.
+    ///
+    /// The caller must checkpoint this account, observe a successful transcript
+    /// save, and invoke this before reporting that live save as complete. A
+    /// merely prepared candidate must not activate a sink. Once activated,
+    /// provider settlement persists independently of later transcript saves,
+    /// including auxiliary work that never appends an assistant message.
+    ///
+    /// This uses the same canonical writer as retirement, so later forks and
+    /// repeated checkpoints cannot duplicate the charge or change its owner.
+    /// Remote children remain charged by their authoritative parent account.
+    pub fn acknowledge_saved_session(
+        &self,
+        session: &Session,
+        owner: &asupersync::Cx,
+    ) -> Result<()> {
+        if self.remote.is_some() {
+            return Ok(());
+        }
+        let result = if session.path.is_none() {
+            Err(Error::session(
+                "active model cost accounting requires a saved session",
+            ))
+        } else {
+            self.retire_session(session, owner)
+        };
+        if let Err(error) = &result {
+            // A mid-turn checkpoint caller may retain the transcript cursor
+            // and continue its provider loop after a persistence error. The
+            // provider's shared budget must fence that path independently of
+            // the foreground Session admission gate, even for early failures
+            // before a journal sink could be registered.
+            self.quarantine(&format!("model cost save acknowledgement failed: {error}"));
+        }
+        result
     }
 
     /// Retain final-bill persistence for a saved source used by a replacement
@@ -1825,6 +1864,402 @@ mod tests {
         assert_eq!(recorded_spend(&forked).expect("fork resume"), 10.0);
         fork.record(2.0).expect("fork work");
         assert_eq!(switched.spent(), 12.0);
+    }
+
+    mod active_saves {
+        use super::*;
+        use crate::agent::{Agent, AgentConfig, AgentSession};
+        use crate::model::{BillingUsage, ContentBlock, StopReason, StreamEvent, TextContent};
+        use crate::provider::{Context, Provider, StreamOptions};
+        use crate::session::SessionStoreKind;
+        use std::path::Path;
+
+        #[derive(Default)]
+        struct BillingProvider {
+            streams: AtomicUsize,
+            compactions: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for BillingProvider {
+            fn name(&self) -> &str {
+                "active-cost-session"
+            }
+
+            fn api(&self) -> &str {
+                "active-cost-session"
+            }
+
+            fn model_id(&self) -> &str {
+                "active-cost-session"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> Result<
+                std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>,
+            > {
+                self.streams.fetch_add(1, Ordering::SeqCst);
+                let message = AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("Completed."))],
+                    provider: self.name().to_string(),
+                    api: self.api().to_string(),
+                    model: self.model_id().to_string(),
+                    usage: Usage {
+                        cost: Cost {
+                            total: 0.5,
+                            ..Cost::default()
+                        },
+                        billing: Some(BillingUsage::ReportedTotal { usd: 0.5 }),
+                        ..Usage::default()
+                    },
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                };
+                Ok(Box::pin(futures::stream::iter([
+                    Ok(StreamEvent::Start {
+                        partial: message.clone(),
+                    }),
+                    Ok(StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message,
+                    }),
+                ])))
+            }
+
+            async fn compact_native(
+                &self,
+                _request_body: &serde_json::Value,
+                _options: &StreamOptions,
+            ) -> Result<serde_json::Value> {
+                self.compactions.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"output": [], "usage": {"cost": 1.25}}))
+            }
+        }
+
+        fn live_session(
+            session: Session,
+            budget: &CostBudget,
+            save_enabled: bool,
+        ) -> (AgentSession, Arc<BillingProvider>) {
+            let provider = Arc::new(BillingProvider::default());
+            let agent = Agent::new(
+                provider.clone(),
+                crate::tools::ToolRegistry::without_builtins(None),
+                AgentConfig {
+                    cost_budget: Some(budget.clone()),
+                    ..AgentConfig::default()
+                },
+            );
+            (
+                AgentSession::new(
+                    agent,
+                    Arc::new(asupersync::sync::Mutex::new(session)),
+                    save_enabled,
+                    crate::compaction::ResolvedCompactionSettings {
+                        enabled: false,
+                        ..crate::compaction::ResolvedCompactionSettings::default()
+                    },
+                ),
+                provider,
+            )
+        }
+
+        fn crash_after_live_save(path: &Path, run_primary: bool) -> ! {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let kind = match path.extension().and_then(std::ffi::OsStr::to_str) {
+                    Some("jsonl") => SessionStoreKind::Jsonl,
+                    #[cfg(feature = "sqlite-sessions")]
+                    Some("sqlite") => SessionStoreKind::Sqlite,
+                    _ => panic!("unsupported active-cost fixture backend"),
+                };
+                let mut stored = Session::create_with_dir_and_store(
+                    path.parent().map(Path::to_path_buf),
+                    kind,
+                );
+                stored.path = Some(path.to_path_buf());
+                stored.append_message(assistant(1.0));
+                let source_id = stored.header.id.clone();
+                let budget = CostBudget::new(None, Some(2.0), 1.0).unwrap();
+                let (mut live, provider) = live_session(stored, &budget, true);
+
+                // This production save, rather than a test-side retirement,
+                // must activate persistence for subsequent auxiliary charges.
+                live.persist_session().await.unwrap();
+                if run_primary {
+                    live.run_text("finish the response".to_string(), |_| {})
+                        .await
+                        .unwrap();
+                    live.save_and_index().await.unwrap();
+                    live.persist_session().await.unwrap();
+                }
+                let checkpoint_bytes = std::fs::read(path).unwrap();
+                live.agent
+                    .provider()
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                let expected = if run_primary { 2.75 } else { 2.25 };
+                assert_eq!(budget.spent(), expected);
+                assert_eq!(provider.streams.load(Ordering::SeqCst), usize::from(run_primary));
+                assert_eq!(provider.compactions.load(Ordering::SeqCst), 1);
+                assert_eq!(std::fs::read(path).unwrap(), checkpoint_bytes);
+                assert_eq!(live.session.try_lock().unwrap().header.id, source_id);
+                // There is deliberately no subsequent transcript checkpoint,
+                // resource shutdown, or CostState::drop before process exit.
+                std::process::exit(86)
+            })
+        }
+
+        #[test]
+        fn live_save_preserves_auxiliary_bills_across_process_exit_and_repeated_resume() {
+            const CHILD_PATH: &str = "PI_ACTIVE_COST_CRASH_SESSION";
+            const CHILD_PRIMARY: &str = "PI_ACTIVE_COST_CRASH_PRIMARY";
+            if let Some(path) = std::env::var_os(CHILD_PATH) {
+                crash_after_live_save(
+                    Path::new(&path),
+                    std::env::var_os(CHILD_PRIMARY).is_some(),
+                );
+            }
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            for extension in [
+                "jsonl",
+                #[cfg(feature = "sqlite-sessions")]
+                "sqlite",
+            ] {
+                for run_primary in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let path = directory.path().join(format!("active-cost.{extension}"));
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                    child
+                        .args([
+                            "--exact",
+                            "cost::tests::active_saves::live_save_preserves_auxiliary_bills_across_process_exit_and_repeated_resume",
+                            "--nocapture",
+                        ])
+                        .env(CHILD_PATH, &path)
+                        .env_remove(CHILD_PRIMARY);
+                    if run_primary {
+                        child.env(CHILD_PRIMARY, "1");
+                    }
+                    let output = child.output().unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(86),
+                        "active-cost child failed: {}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    runtime.block_on(async {
+                        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                        let expected = if run_primary { 2.75 } else { 2.25 };
+                        let checkpoint = latest_checkpoint(&reopened).unwrap();
+                        assert_eq!(checkpoint["spent"].as_f64(), Some(expected - 1.25));
+                        let account = checkpoint["account"].as_str().unwrap();
+                        let journal = Origin::for_session(&reopened)
+                            .unwrap()
+                            .unwrap()
+                            .read()
+                            .unwrap();
+                        assert!(
+                            !journal.writers[account].closed,
+                            "the crash must bypass the account's closing destructor"
+                        );
+                        assert_eq!(recorded_spend(&reopened).unwrap(), expected);
+
+                        let resumed = CostBudget::from_session(&reopened, None, Some(2.0)).unwrap();
+                        for _ in 0..3 {
+                            assert_eq!(resumed.refresh().unwrap().spent, expected);
+                        }
+                        assert!(matches!(resumed.admit(), Err(Error::CostCap { .. })));
+                        let (mut live, provider) = live_session(reopened, &resumed, true);
+                        for _ in 0..3 {
+                            live.persist_session().await.unwrap();
+                            let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                            assert_eq!(recorded_spend(&saved).unwrap(), expected);
+                            let replayed =
+                                CostBudget::from_session(&saved, None, Some(2.0)).unwrap();
+                            assert_eq!(replayed.spent(), expected);
+                            assert!(matches!(replayed.admit(), Err(Error::CostCap { .. })));
+                        }
+                        assert!(matches!(
+                            live.agent
+                                .provider()
+                                .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                                .await,
+                            Err(Error::CostCap { .. })
+                        ));
+                        assert_eq!(provider.compactions.load(Ordering::SeqCst), 0);
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn active_journal_preserves_the_uncheckpointed_primary_overlap_fence() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            runtime.block_on(async {
+                let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                stored.append_message(assistant(1.0));
+                let budget = CostBudget::new(None, Some(10.0), 1.0).unwrap();
+                let (mut live, _) = live_session(stored, &budget, true);
+                live.persist_session().await.unwrap();
+                live.agent
+                    .provider()
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+                let path = {
+                    let mut stored = live.session.lock(owner.cx()).await.unwrap();
+                    // A separately saved primary row has no writer identity:
+                    // recovery cannot tell whether it duplicates the bill.
+                    stored.append_message(assistant(1.25));
+                    stored.save().await.unwrap();
+                    stored.path.clone().unwrap()
+                };
+                let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                let ambiguous = CostBudget::from_session(&reopened, None, Some(10.0)).unwrap();
+                assert_eq!(ambiguous.spent(), 2.25, "retain the known lower bound");
+                assert!(matches!(
+                    ambiguous.admit(),
+                    Err(Error::Session(message)) if message.contains(RECORDED_BILLING_FAILURE)
+                ));
+                assert!(recorded_spend(&reopened).is_err());
+
+                // Only the live owner can replace that ambiguity with its
+                // exact checkpoint. Reopening must not double the primary bill.
+                live.persist_session().await.unwrap();
+                let reconciled = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert_eq!(recorded_spend(&reconciled).unwrap(), 2.25);
+            });
+        }
+
+        #[test]
+        fn failed_and_ephemeral_live_saves_do_not_activate_a_cost_sink() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let blocked = directory.path().join("not-a-directory");
+            std::fs::write(&blocked, "retain this file").unwrap();
+            runtime.block_on(async {
+                let mut stored = Session::create();
+                stored.path = Some(blocked.join("session.jsonl"));
+                let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let (mut live, provider) = live_session(stored, &budget, true);
+                assert!(live.persist_session().await.unwrap_err().is_session_persistence());
+                assert!(budget.state.lock().unwrap().retired.is_empty());
+                assert!(matches!(budget.start_attempt(), Err(Error::Session(_))));
+                assert!(
+                    live.run_text("do not dispatch".to_string(), |_| {})
+                        .await
+                        .unwrap_err()
+                        .is_session_persistence()
+                );
+                assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+                assert!(matches!(
+                    live.agent
+                        .provider()
+                        .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                        .await,
+                    Err(Error::Session(_))
+                ));
+                assert_eq!(provider.compactions.load(Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "retain this file");
+
+                let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let (mut ephemeral, _) = live_session(Session::in_memory(), &budget, false);
+                ephemeral.persist_session().await.unwrap();
+                ephemeral.save_and_index().await.unwrap();
+                ephemeral
+                    .agent
+                    .provider()
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(budget.spent(), 1.25);
+                assert!(budget.state.lock().unwrap().retired.is_empty());
+                let stored = ephemeral.session.try_lock().unwrap();
+                assert!(stored.path.is_none());
+                assert!(stored.entries.is_empty());
+            });
+        }
+
+        #[test]
+        fn only_an_acknowledged_own_checkpoint_can_activate_the_live_sink() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let mut candidate = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            budget.checkpoint(&mut candidate).unwrap();
+            runtime.block_on(candidate.save()).unwrap();
+            let origin = Origin::for_session(&candidate).unwrap().unwrap();
+            budget.record(0.5).unwrap();
+            assert!(
+                !origin.key.exists(),
+                "a raw candidate checkpoint/save must not activate a live account"
+            );
+            let unrelated = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            assert!(unrelated.acknowledge_saved_session(&candidate, owner.cx()).is_err());
+            assert!(!origin.key.exists());
+            budget.acknowledge_saved_session(&candidate, owner.cx()).unwrap();
+            assert_eq!(recorded_spend(&candidate).unwrap(), 0.5);
+            budget.record(0.25).unwrap();
+            assert_eq!(recorded_spend(&candidate).unwrap(), 0.75);
+        }
+
+        #[test]
+        fn ignored_live_acknowledgement_failures_fence_the_provider_budget() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            runtime.block_on(async {
+                for saved_without_own_receipt in [false, true] {
+                    let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                    budget.record(0.5).unwrap();
+                    let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                    if saved_without_own_receipt {
+                        stored.append_message(assistant(0.5));
+                        stored.save().await.unwrap();
+                    }
+                    // Ignore the returned error as a mid-turn checkpoint may
+                    // do to advance its already-appended message cursor.
+                    let _ = budget.acknowledge_saved_session(&stored, owner.cx());
+                    assert_eq!(budget.spent(), 0.5);
+                    assert!(budget.state.lock().unwrap().retired.is_empty());
+                    assert!(matches!(budget.admit(), Err(Error::Session(_))));
+                    assert!(matches!(budget.start_attempt(), Err(Error::Session(_))));
+                    let provider = Arc::new(BillingProvider::default());
+                    let guarded = crate::provider::guard_with_cost_budget(provider.clone(), budget);
+                    assert!(matches!(
+                        guarded
+                            .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                            .await,
+                        Err(Error::Session(_))
+                    ));
+                    assert_eq!(provider.compactions.load(Ordering::SeqCst), 0);
+                    if let Some(origin) = Origin::for_session(&stored).unwrap() {
+                        assert!(!origin.key.exists());
+                    }
+                }
+            });
+        }
     }
 
     #[test]
