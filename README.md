@@ -2339,6 +2339,13 @@ but source persistence or reconnection fails, Pi reports that the login was
 saved so the remaining problem can be repaired without mistaking it for a
 failed authorization.
 
+For a server's third-party authorization, Pi also supports MCP URL elicitation.
+The host picker shows the complete URL and destination host before you choose
+to open it in an external browser, acknowledge opening it yourself, decline,
+or cancel. The manual option works when Pi runs remotely. Pi returns your
+consent decision without reading the browser page or treating it as completed
+authorization. See [server-requested browser interactions](docs/tools/mcp-configuration.md#browser-interactions-requested-by-servers).
+
 Native settings support the OMP project-configuration switch:
 
 ```json

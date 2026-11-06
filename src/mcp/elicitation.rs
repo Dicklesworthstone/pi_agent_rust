@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 const MAX_CALLS: usize = 64;
 const MAX_REQUESTS_PER_CALL: usize = 8;
 const MAX_FORM_BYTES: usize = 32 * 1024;
+const MAX_URL_BYTES: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 16 * 1024;
 const MAX_VALUE_BYTES: usize = 4096;
 const MAX_FIELDS: usize = 16;
@@ -34,6 +35,11 @@ const OMIT: &str = "Leave this optional field out";
 const KEEP: &str = "Use the displayed value";
 const SUBMIT: &str = "Submit these values";
 const EDIT: &str = "Edit answers";
+const OPEN_URL: &str = "Open in browser";
+const OPENED_URL: &str = "I opened it myself";
+
+#[cfg(test)]
+pub(crate) type UrlOpener = Arc<dyn Fn(String) -> BoxFuture<'static, io::Result<()>> + Send + Sync>;
 
 #[cfg(test)]
 mod tests;
@@ -120,14 +126,14 @@ struct SlotState {
 
 #[derive(Clone, Copy)]
 enum RequestKind {
-    Form,
+    Elicitation,
     Sampling,
 }
 
 impl RequestKind {
     fn cancelled(self, id: &Value, related_task: Option<&str>) -> Value {
         match self {
-            Self::Form => action(id, "cancel", related_task),
+            Self::Elicitation => action(id, "cancel", related_task),
             Self::Sampling => super::sampling::rejected(id),
         }
     }
@@ -143,13 +149,15 @@ struct ServerRequest {
     authorized: bool,
 }
 
-/// Connection-owned form and sampling request routing. Both methods share
+/// Connection-owned elicitation and sampling request routing. Both methods share
 /// request IDs and one active interaction per caller. Custom transports may
 /// opt in by exposing this registry and generation-pinned server replies.
 #[derive(Default)]
 pub struct ElicitationRegistry {
     next_id: AtomicU64,
     slots: Mutex<HashMap<u64, Arc<Slot>>>,
+    #[cfg(test)]
+    url_opener: Mutex<Option<UrlOpener>>,
 }
 
 impl std::fmt::Debug for ElicitationRegistry {
@@ -203,7 +211,7 @@ impl ElicitationRegistry {
     /// caller. This never compiles schemas, invokes a UI, or performs I/O.
     #[must_use]
     pub fn route(&self, id: &Value, params: Option<&Value>, generation: u64) -> Option<Value> {
-        self.route_request(RequestKind::Form, id, params, generation)
+        self.route_request(RequestKind::Elicitation, id, params, generation)
     }
 
     /// Route sampling with the same ownership, duplicate-ID and cancellation
@@ -247,18 +255,26 @@ impl ElicitationRegistry {
                 "client request params must be an object",
             ));
         };
-        if !bounded(params, MAX_FORM_BYTES)
-            || params.get("task").is_some()
-            || (matches!(kind, RequestKind::Form)
-                && params
-                    .get("mode")
-                    .is_some_and(|mode| mode.as_str() != Some("form")))
-        {
+        if !bounded(params, MAX_FORM_BYTES) || params.get("task").is_some() {
             return Some(rpc_error(
                 id,
                 -32602,
                 "only bounded, non-task-augmented client requests are supported",
             ));
+        }
+        if matches!(kind, RequestKind::Elicitation) {
+            match params.get("mode") {
+                None => {}
+                Some(mode) if mode == "form" => {}
+                Some(mode) if mode == "url" && UrlRequest::parse(params).is_some() => {}
+                _ => {
+                    return Some(rpc_error(
+                        id,
+                        -32602,
+                        "invalid or unsupported elicitation mode or URL",
+                    ));
+                }
+            }
         }
         let related_task = match params.get("_meta") {
             None => None,
@@ -383,6 +399,21 @@ impl ElicitationRegistry {
         for waiter in waiters {
             waiter.wake();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_url_opener(&self, opener: UrlOpener) {
+        *lock(&self.url_opener) = Some(opener);
+    }
+
+    async fn open_url(&self, url: &str) -> io::Result<()> {
+        #[cfg(test)]
+        let opener = lock(&self.url_opener).clone();
+        #[cfg(test)]
+        if let Some(opener) = opener {
+            return opener(url.to_string()).await;
+        }
+        open_external_url(url).await
     }
 }
 
@@ -695,6 +726,124 @@ struct Form {
     schema: McpOutputSchema,
 }
 
+/// URL-mode requests carry no form values. The URL is exposed only to the
+/// operator's picker and the explicitly selected external browser, never to a
+/// model-facing tool result or an HTTP client owned by Pi.
+struct UrlRequest {
+    message: String,
+    url: String,
+    destination: String,
+}
+
+impl UrlRequest {
+    fn parse(params: &Value) -> Option<Self> {
+        let object = params.as_object()?;
+        if !bounded(params, MAX_FORM_BYTES)
+            || object.get("mode")?.as_str()? != "url"
+            || !only_keys(
+                object,
+                &["mode", "message", "url", "elicitationId", "_meta"],
+            )
+        {
+            return None;
+        }
+        let message = object.get("message")?.as_str()?;
+        let id = object.get("elicitationId")?.as_str()?;
+        let raw = object.get("url")?.as_str()?;
+        if message.trim().is_empty()
+            || message.len() > MAX_VALUE_BYTES
+            || id.is_empty()
+            || id.len() > 1024
+            || id.chars().any(char::is_control)
+            || raw.is_empty()
+            || raw.len() > MAX_URL_BYTES
+            // Require an ASCII URI (international names can use punycode).
+            // Controls, backslashes and markup delimiters must be encoded,
+            // so neither URL normalization nor the host UI can hide them.
+            || !raw.bytes().all(|byte| {
+                byte.is_ascii_graphic()
+                    && !matches!(byte, b'\\' | b'`' | b'<' | b'>' | b'"')
+            })
+        {
+            return None;
+        }
+        let authority = raw.split_once("://")?.1.split(['/', '?', '#']).next()?;
+        // Even empty userinfo can disappear during URL normalization.
+        if authority.is_empty() || authority.contains('@') {
+            return None;
+        }
+        let parsed = url::Url::parse(raw).ok()?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        let destination = parsed
+            .port()
+            .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
+        Some(Self {
+            message: message.to_string(),
+            url: raw.to_string(),
+            destination,
+        })
+    }
+}
+
+/// Dispatch the platform URL handler with one literal argument, never a shell
+/// command or an agent-controlled browser. The launcher is bounded and reaped;
+/// an external browser it starts belongs to the operator, not the MCP task.
+async fn open_external_url(url: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    if !owner.capabilities().io || !owner.capabilities().spawn || !owner.capabilities().time {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "browser launch is unavailable",
+        ));
+    }
+    owner.checkpoint().map_err(|_| io::ErrorKind::Interrupted)?;
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Do not attach the user's browser to a kill-on-close Windows Job or an
+    // agent process group. The existing guard owns only the launcher itself.
+    let mut child = crate::tools::ProcessGuard::new(
+        command.spawn()?,
+        crate::tools::ProcessCleanupMode::ChildOnly,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        owner.checkpoint().map_err(|_| io::ErrorKind::Interrupted)?;
+        if let Some(status) = child.try_wait_child()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other("browser launcher failed"))
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        owner.time().sleep(Duration::from_millis(20)).await;
+    }
+}
+
 impl Form {
     fn parse(params: &Value) -> Option<Self> {
         if !bounded(params, MAX_FORM_BYTES) {
@@ -747,12 +896,18 @@ enum Answer {
     Cancel,
 }
 
-async fn prompt(ask: &AskTool, id: &str, question: String, options: Vec<String>) -> Answer {
+async fn prompt(
+    ask: &AskTool,
+    id: &str,
+    header: &str,
+    question: String,
+    options: Vec<String>,
+) -> Answer {
     let request = AskRequest {
         questions: vec![AskQuestion {
             id: Some(id.to_string()),
             question,
-            header: Some("MCP form".to_string()),
+            header: Some(header.to_string()),
             options: options
                 .into_iter()
                 .map(|label| AskOption {
@@ -779,6 +934,57 @@ async fn prompt(ask: &AskTool, id: &str, question: String, options: Vec<String>)
         ([], Some(text)) if text.len() <= MAX_VALUE_BYTES => Answer::Text(text.clone()),
         _ => Answer::Cancel,
     }
+}
+
+async fn visit_url(
+    ask: Option<&AskTool>,
+    server: &str,
+    url: &UrlRequest,
+    request: &ServerRequest,
+    registry: &ElicitationRegistry,
+    current: &(dyn Fn() -> bool + Send + Sync),
+) -> Value {
+    let Some(ask) = ask else {
+        return action(&request.id, "cancel", request.related_task.as_deref());
+    };
+    let question = format!(
+        "MCP server \"{}\" asks you to continue in your external browser.\nReason: \"{}\"\n\nDestination host: {}\nFull URL:\n```text\n{}\n```\n\nOpen this URL only if you trust the destination. Enter any credentials on that page, never in this picker. Pi does not read the page or your input. Acceptance means you agreed to open the page; it does not confirm that the interaction is complete. If Pi is running remotely, open the displayed URL yourself and choose \"{OPENED_URL}\".",
+        display(server),
+        display(&url.message),
+        url.destination,
+        url.url,
+    );
+    let answer = prompt(
+        ask,
+        "mcp_url",
+        "MCP URL",
+        question,
+        vec![
+            OPEN_URL.to_string(),
+            OPENED_URL.to_string(),
+            DECLINE.to_string(),
+            CANCEL.to_string(),
+        ],
+    )
+    .await;
+    // A response queued before cancellation is not permission to navigate
+    // after the caller, trust decision, or protocol generation has changed.
+    if !current() || request.cancelled.load(Ordering::Acquire) {
+        return action(&request.id, "cancel", request.related_task.as_deref());
+    }
+    let name = match answer {
+        Answer::Choice(choice) if choice == DECLINE => "decline",
+        Answer::Choice(choice) if choice == OPENED_URL => "accept",
+        Answer::Choice(choice) if choice == OPEN_URL => {
+            if registry.open_url(&url.url).await.is_ok() {
+                "accept"
+            } else {
+                "cancel"
+            }
+        }
+        _ => "cancel",
+    };
+    action(&request.id, name, request.related_task.as_deref())
 }
 
 async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerRequest) -> Value {
@@ -846,28 +1052,29 @@ async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerReq
                         "{question}\nThe previous value did not match this field's constraints. Please correct it or decline/cancel."
                     )
                 };
-                let value = match prompt(ask, "mcp_field", question, options.clone()).await {
-                    Answer::Cancel => {
-                        return action(&request.id, "cancel", request.related_task.as_deref());
-                    }
-                    Answer::Choice(choice) if choice == CANCEL => {
-                        return action(&request.id, "cancel", request.related_task.as_deref());
-                    }
-                    Answer::Choice(choice) if choice == DECLINE => {
-                        return action(&request.id, "decline", request.related_task.as_deref());
-                    }
-                    Answer::Choice(choice) if choice == OMIT && !field.required => {
-                        content.remove(&field.name);
-                        answered = true;
-                        break;
-                    }
-                    Answer::Choice(choice) if choice == KEEP => default.clone(),
-                    Answer::Choice(choice) => selected_values
-                        .iter()
-                        .find(|(label, _)| *label == choice)
-                        .map(|(_, value)| value.clone()),
-                    Answer::Text(text) => field.input_value(&text),
-                };
+                let value =
+                    match prompt(ask, "mcp_field", "MCP form", question, options.clone()).await {
+                        Answer::Cancel => {
+                            return action(&request.id, "cancel", request.related_task.as_deref());
+                        }
+                        Answer::Choice(choice) if choice == CANCEL => {
+                            return action(&request.id, "cancel", request.related_task.as_deref());
+                        }
+                        Answer::Choice(choice) if choice == DECLINE => {
+                            return action(&request.id, "decline", request.related_task.as_deref());
+                        }
+                        Answer::Choice(choice) if choice == OMIT && !field.required => {
+                            content.remove(&field.name);
+                            answered = true;
+                            break;
+                        }
+                        Answer::Choice(choice) if choice == KEEP => default.clone(),
+                        Answer::Choice(choice) => selected_values
+                            .iter()
+                            .find(|(label, _)| *label == choice)
+                            .map(|(_, value)| value.clone()),
+                        Answer::Text(text) => field.input_value(&text),
+                    };
                 if let Some(value) = value
                     && bounded(&value, MAX_VALUE_BYTES)
                     && field.schema.accepts(&value)
@@ -892,6 +1099,7 @@ async fn fill_form(ask: &AskTool, server: &str, form: &Form, request: &ServerReq
         match prompt(
             ask,
             "mcp_review",
+            "MCP form",
             review,
             vec![
                 SUBMIT.to_string(),
@@ -989,6 +1197,7 @@ pub(crate) async fn observe<'a>(
             let response_started = Arc::clone(&responding);
             let current = Arc::clone(&current);
             let ask = ask.clone();
+            let registry = Arc::clone(&subscription.registry);
             let cancelling = !request.authorized || cancelled.load(Ordering::Acquire);
             active = Some(Active {
                 kind: request.kind,
@@ -1010,7 +1219,26 @@ pub(crate) async fn observe<'a>(
                             sampling,
                             server,
                             &active,
-                        ).await
+                        )
+                        .await
+                    } else if request.params.get("mode").and_then(Value::as_str) == Some("url") {
+                        if let Some(url) = UrlRequest::parse(&request.params) {
+                            visit_url(
+                                ask.as_ref(),
+                                server,
+                                &url,
+                                &request,
+                                &registry,
+                                current.as_ref(),
+                            )
+                            .await
+                        } else {
+                            rpc_error(
+                                &request.id,
+                                -32602,
+                                "invalid or unsupported elicitation URL",
+                            )
+                        }
                     } else if let Some(form) = Form::parse(&request.params) {
                         if let Some(ask) = ask {
                             fill_form(&ask, server, &form, &request).await

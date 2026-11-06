@@ -181,9 +181,9 @@ impl ClientRoots {
 
     fn capabilities(&self) -> Value {
         if self.roots.get().is_some() {
-            serde_json::json!({"roots": {"listChanged": false}, "tasks": {}, "elicitation": {"form": {}}, "sampling": {}})
+            serde_json::json!({"roots": {"listChanged": false}, "tasks": {}, "elicitation": {"form": {}, "url": {}}, "sampling": {}})
         } else {
-            serde_json::json!({"tasks": {}, "elicitation": {"form": {}}, "sampling": {}})
+            serde_json::json!({"tasks": {}, "elicitation": {"form": {}, "url": {}}, "sampling": {}})
         }
     }
 
@@ -725,6 +725,9 @@ fn route_stdio_message(
             if method.as_str() == Some("notifications/cancelled") {
                 roots.elicitation.cancel(object.get("params"), 0);
             }
+            // URL-elicitation completion is advisory. Ignore every such
+            // notification, including unknown/duplicate IDs: acceptance only
+            // consents to navigation and never authorizes replaying a call.
             return Ok(()); // Valid notification; the reader routes progress.
         };
         if !valid_server_request_id(id) {
@@ -5843,7 +5846,7 @@ pub(crate) mod tests {
         let roots = ClientRoots::default();
         assert_eq!(
             roots.capabilities(),
-            serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+            serde_json::json!({"tasks":{},"elicitation":{"form":{},"url":{}},"sampling":{}})
         );
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
@@ -5859,7 +5862,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             roots.capabilities(),
-            serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+            serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{},"url":{}},"sampling":{}})
         );
 
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
@@ -5901,7 +5904,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             roots.capabilities(),
-            serde_json::json!({"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+            serde_json::json!({"tasks":{},"elicitation":{"form":{},"url":{}},"sampling":{}})
         );
         assert_eq!(
             roots.response("roots/list", &serde_json::json!(1))["error"]["code"],
@@ -6008,7 +6011,7 @@ for line in sys.stdin:
                 assert_eq!(observed["initialize"]["protocolVersion"], "2025-11-25");
                 assert_eq!(
                     observed["initialize"]["capabilities"],
-                    serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+                    serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{},"url":{}},"sampling":{}})
                 );
                 let uri = observed["rootsReply"]["result"]["roots"][0]["uri"]
                     .as_str()
@@ -6555,7 +6558,7 @@ for line in sys.stdin:
             assert_eq!(frame["params"]["protocolVersion"], "2025-11-25");
             assert_eq!(
                 frame["params"]["capabilities"],
-                serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{}},"sampling":{}})
+                serde_json::json!({"roots":{"listChanged":false},"tasks":{},"elicitation":{"form":{},"url":{}},"sampling":{}})
             );
             assert!(
                 !captured[index]

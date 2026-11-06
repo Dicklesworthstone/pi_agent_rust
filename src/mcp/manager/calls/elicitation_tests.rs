@@ -36,10 +36,14 @@ def prompt(ident='form-request'):
               'requestedSchema':{'type':'object', 'properties':{
                   'name':{'type':'string','title':'Name','pattern':'^[A-Za-z]+$'}},
                   'required':['name']}}
-    if scenario == 'task':
+    if scenario.startswith('url') or scenario == 'bad-url':
+        params = {'mode':'url', 'elicitationId':'owned-url',
+                  'message':'Connect account\x1b[2J\n\u202e https://misleading.example',
+                  'url':'https://example.com/connect?state=private-flow&next=%2Faccount#step-1'}
+        if scenario == 'bad-url':
+            params['url'] = 'javascript:alert(1)'
+    if scenario in ('task','url-task'):
         params['_meta'] = {'io.modelcontextprotocol/related-task':{'taskId':'owned-form'}}
-    if scenario == 'url':
-        params.update(mode='url', url='https://example.com', elicitationId='url-form')
     if scenario == 'bad-schema':
         params['requestedSchema']['properties']['name'] = {'type':'object'}
     return {'jsonrpc':'2.0','id':ident,'method':'elicitation/create','params':params}
@@ -60,10 +64,10 @@ def exchange(frame, emit):
     if ident is None:
         return
     if method == 'initialize':
-        assert frame['params']['capabilities']['elicitation'] == {'form':{}}
+        assert frame['params']['capabilities']['elicitation'] == {'form':{},'url':{}}
         assert frame['params']['capabilities']['sampling'] == {}
         caps = {'tools':{}}
-        if scenario == 'task':
+        if scenario in ('task','url-task'):
             caps['tasks'] = {'requests':{'tools':{'call':{}}},'cancel':{}}
         value = {'protocolVersion':'2025-11-25','capabilities':caps,
                  'serverInfo':{'name':'form-peer','version':'1'}}
@@ -77,10 +81,10 @@ def exchange(frame, emit):
             emit(prompt())
             assert replied.wait(8), 'client never answered catalog elicitation'
         tool = {'name':'work','inputSchema':{'type':'object'},'description':'Interactive work'}
-        if scenario == 'task':
+        if scenario in ('task','url-task'):
             tool['execution'] = {'taskSupport':'required'}
         value = {'tools':[tool]}
-    elif method == 'tools/call' and scenario == 'task':
+    elif method == 'tools/call' and scenario in ('task','url-task'):
         assert 'task' in frame['params']
         value = {'task':{'taskId':'owned-form','status':'input_required',
                         'createdAt':'2025-11-25T10:00:00Z',
@@ -107,9 +111,17 @@ def exchange(frame, emit):
                 assert time.monotonic() < deadline, 'tool never dispatched'
                 time.sleep(0.005)
             emit(prompt())
-        elif scenario != 'task' or mode == 'http':
+        elif scenario not in ('task','url-task') or mode == 'http':
+            if scenario.startswith('url'):
+                emit({'jsonrpc':'2.0','method':'notifications/elicitation/complete',
+                      'params':{'elicitationId':'unknown'}})
             emit(prompt())
         assert replied.wait(8), 'client never answered elicitation'
+        if scenario.startswith('url'):
+            # Completion never authorizes another navigation, reply or tool call.
+            for elicitation_id in ('owned-url','owned-url','unknown'):
+                emit({'jsonrpc':'2.0','method':'notifications/elicitation/complete',
+                      'params':{'elicitationId':elicitation_id}})
         if method == 'resources/read':
             value = {'contents':[{'uri':frame['params']['uri'],'text':'resource ready'}]}
         elif method == 'prompts/get':
@@ -125,7 +137,7 @@ def exchange(frame, emit):
         else:
             value = {'content':[{'type':'text','text':'finished'}],
                      'structuredContent':{'form':form_reply}}
-        if scenario == 'task':
+        if scenario in ('task','url-task'):
             value['_meta'] = {'io.modelcontextprotocol/related-task':{'taskId':'owned-form'}}
     elif method == 'ping':
         value = {}
@@ -426,7 +438,13 @@ fn mounted_forms_validate_allow_edits_and_reply_on_all_native_transports() {
 #[test]
 fn headless_declined_and_unsupported_requests_return_no_user_content() {
     for mode in ["stdio", "http", "sse"] {
-        for scenario in ["headless", "decline", "url", "bad-schema"] {
+        for scenario in [
+            "headless",
+            "decline",
+            "url-headless",
+            "bad-url",
+            "bad-schema",
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let (manager, _peer) = fixture(temp.path(), mode, scenario);
             let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
@@ -465,7 +483,7 @@ fn headless_declined_and_unsupported_requests_return_no_user_content() {
                 .iter()
                 .find(|frame| frame["id"] == "form-request")
                 .unwrap();
-            if matches!(scenario, "url" | "bad-schema") {
+            if matches!(scenario, "bad-url" | "bad-schema") {
                 assert_eq!(response["error"]["code"], -32602);
             } else {
                 assert_eq!(
@@ -478,6 +496,126 @@ fn headless_declined_and_unsupported_requests_return_no_user_content() {
                 );
                 assert!(response["result"].get("content").is_none());
             }
+        }
+    }
+}
+
+#[test]
+fn mounted_url_elicitation_requires_operator_consent_on_all_native_transports() {
+    for mode in ["stdio", "http", "http-get", "sse"] {
+        for (scenario, choice, launch_fails, expected_action, expected_launches) in [
+            ("url", "Open in browser", false, "accept", 1),
+            ("url", "Open in browser", true, "cancel", 1),
+            ("url", "Decline request", false, "decline", 0),
+            ("url", "Cancel request", false, "cancel", 0),
+            ("url-task", "I opened it myself", false, "accept", 0),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (manager, _peer) = fixture(temp.path(), mode, scenario);
+            let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
+            let launches = Arc::new(AtomicUsize::new(0));
+            let prompts = Arc::new(AtomicUsize::new(0));
+            let prompts_in_ui = Arc::clone(&prompts);
+            let launches_in_ui = Arc::clone(&launches);
+            registry
+                .snapshot()
+                .host_ask_tool()
+                .set_handler(Arc::new(move |request| {
+                    assert!(
+                        Cx::current().is_some(),
+                        "consent belongs to the initiating caller"
+                    );
+                    assert_eq!(launches_in_ui.load(Ordering::Acquire), 0);
+                    prompts_in_ui.fetch_add(1, Ordering::Relaxed);
+                    let question = &request.questions[0];
+                    assert_eq!(question.id.as_deref(), Some("mcp_url"));
+                    assert!(question.question.contains("form-peer"));
+                    assert!(question.question.contains("Destination host: example.com"));
+                    assert!(question.question.contains(
+                        "https://example.com/connect?state=private-flow&next=%2Faccount#step-1"
+                    ));
+                    assert!(!question.question.contains('\u{1b}'));
+                    assert!(!question.question.contains('\u{202e}'));
+                    assert!(!question.question.contains("https://misleading.example"));
+                    let answer = AskAnswer {
+                        question_id: "mcp_url".to_string(),
+                        selected: vec![choice.to_string()],
+                        other: None,
+                    };
+                    Box::pin(async move {
+                        Ok(AskResponse {
+                            answers: vec![answer],
+                            dismissed: false,
+                        })
+                    })
+                }));
+            runtime().block_on(async {
+                manager.refresh_tools("form-peer").await.unwrap();
+                let entry = manager.entry("form-peer").unwrap();
+                let transport = McpManager::lock(&entry.transport).clone().unwrap();
+                let launches_in_browser = Arc::clone(&launches);
+                transport
+                    .elicitation_registry()
+                    .unwrap()
+                    .set_url_opener(Arc::new(move |url| {
+                        assert!(
+                            Cx::current().is_some(),
+                            "navigation belongs to the initiating caller"
+                        );
+                        assert_eq!(
+                            url,
+                            "https://example.com/connect?state=private-flow&next=%2Faccount#step-1"
+                        );
+                        launches_in_browser.fetch_add(1, Ordering::AcqRel);
+                        Box::pin(async move {
+                            if launch_fails {
+                                Err(std::io::Error::other("no browser"))
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    }));
+                crate::mcp::reconcile_tools(&manager, &registry);
+                let snapshot = registry.snapshot();
+                let output = snapshot
+                    .get("mcp__form-peer__work")
+                    .unwrap()
+                    .execute("url-call", json!({}), None)
+                    .await
+                    .unwrap();
+                assert!(!output.is_error);
+                assert!(
+                    !format!("{output:?}").contains("private-flow"),
+                    "URL must not enter model-visible output"
+                );
+                let _ = manager.shutdown_all().await;
+            });
+            assert_eq!(
+                prompts.load(Ordering::Relaxed),
+                1,
+                "{mode}/{scenario}/{choice}"
+            );
+            assert_eq!(launches.load(Ordering::Acquire), expected_launches);
+            let requests = frames(temp.path());
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|frame| frame["method"] == "tools/call")
+                    .count(),
+                1
+            );
+            let replies: Vec<_> = requests
+                .iter()
+                .filter(|frame| frame["id"] == "form-request")
+                .collect();
+            assert_eq!(replies.len(), 1);
+            let mut expected = json!({"action":expected_action});
+            if scenario == "url-task" {
+                expected["_meta"] =
+                    json!({"io.modelcontextprotocol/related-task":{"taskId":"owned-form"}});
+            }
+            assert_eq!(replies[0]["result"], expected);
+            assert!(!temp.path().join("peer-error").exists());
         }
     }
 }

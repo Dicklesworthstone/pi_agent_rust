@@ -8790,8 +8790,7 @@ async fn run_prompt_turn(
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
 ) {
-    let mut result =
-        run_controlled_turn(handle, prompt, attachments, agent_tx, turn_control).await;
+    let mut result = run_controlled_turn(handle, prompt, attachments, agent_tx, turn_control).await;
     loop {
         let count = result.pending.len() + usize::from(result.initial_restore.is_some());
         if count == 0 {
@@ -26711,7 +26710,10 @@ mod tests {
             )
             .await;
             assert!(!result.stopped);
-            assert!(result.pending.is_empty(), "the new barrier owns its held input");
+            assert!(
+                result.pending.is_empty(),
+                "the new barrier owns its held input"
+            );
             assert!(result.initial_restore.is_none());
             let (control, barrier) = observed.lock().unwrap().take().unwrap();
             assert!(control.yield_barrier_can_run(barrier));

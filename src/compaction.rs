@@ -5313,8 +5313,7 @@ mod tests {
 
         assert!(prepare_compaction(&entries, settings.clone()).is_none());
         assert!(
-            prepare_compaction_for_model(&entries, settings.clone(), "openai", "gpt-4o")
-                .is_none(),
+            prepare_compaction_for_model(&entries, settings.clone(), "openai", "gpt-4o").is_none(),
             "the first prompt after compaction must not reuse the retained assistant's old usage"
         );
 
@@ -5395,8 +5394,7 @@ mod tests {
                 failed,
                 make_user_text("Retry."),
             ];
-            let estimate =
-                estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
+            let estimate = estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
             assert!((1..100).contains(&estimate.tokens));
             assert_eq!(estimate.last_usage_index, None);
         }

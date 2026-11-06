@@ -133,10 +133,11 @@ from another project cannot authorize a new root even when server `cwd` is fixed
 Connections advertise task-aware result handling with `tasks: {}`. When the
 server negotiates MCP 2025-11-25 and task-augmented tool calls, mounted tools can
 wait for their remote task to finish within the original call deadline.
-Connections also advertise form elicitation with `elicitation: {"form": {}}`.
-Server prompts use the session's installed host picker. Basic text sampling
-is advertised with `sampling: {}`; generation requires the invoking Agent's
-model authority and an installed picker. URL-mode elicitation is not advertised.
+Connections also advertise form and URL elicitation with
+`elicitation: {"form": {}, "url": {}}`. Server prompts use the session's
+installed host picker; URL navigation requires explicit operator consent.
+Basic text sampling is advertised with `sampling: {}`; generation requires
+the invoking Agent's model authority and an installed picker.
 HTTP OAuth is available through the native authentication flow below.
 Configured authentication headers and credential references remain supported.
 
@@ -198,7 +199,7 @@ membership, required fields, and array limits are validated before submission.
 Defaults are offered for explicit selection. Server text and the full review
 are escaped to prevent terminal controls, misleading markup, and clickable
 server-provided links. Form mode must not request passwords, API keys, tokens,
-or payment credentials; URL mode for those interactions is not supported.
+or payment credentials; use URL mode for those interactions.
 
 Resource reads (`resources/read`) and prompt retrieval (`prompts/get`) use this
 same picker and explicit review. Tool, resource, template, and prompt listings and
@@ -216,7 +217,7 @@ when delivery of an accepted form response is uncertain.
 Unsolicited requests, ambiguous concurrent calls without task correlation, and
 requests from an obsolete session receive no user data.
 
-Admission is bounded to 64 observed requests per connection, eight form or sampling
+Admission is bounded to 64 observed requests per connection, eight form, URL, or sampling
 requests per request, 16 fields per form, 32 KiB of request data, 4 KiB per answer, and 16 KiB
 of submitted content. One replacement form can queue after its predecessor is
 cancelled or its response begins dispatch. Unsupported or oversized schemas
@@ -225,6 +226,41 @@ remote task are not supported; a form can still belong to an existing tool task.
 When all request ownership slots are occupied, a new request is rejected before
 dispatch so its forms cannot be attributed to an existing caller. Cancelling a
 catalog refresh before dispatch leaves another caller's active form intact.
+
+## Browser interactions requested by servers
+
+Pi also supports `elicitation/create` with `mode: "url"` under the
+[MCP 2025-11-25 URL elicitation protocol](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation#url-mode-elicitation-requests).
+This lets an MCP server request a third-party authorization or another
+sensitive interaction without passing passwords or tokens through Pi.
+The host picker shows the server, its reason, the destination host, and the
+complete URL before you choose:
+
+- **Open in browser** opens the URL through the operating system's external
+  browser handler. Pi does not fetch the URL, inspect its page, or read inputs.
+- **I opened it myself** accepts after you open the displayed URL in your own
+  browser. This is useful when Pi is running on a remote machine.
+- **Decline request** refuses the interaction. **Cancel request**, dismissal,
+  an unavailable picker, or a failed browser launch cancels it.
+
+Only an exact selection can open a browser; free text and
+`askPolicy: "recommended"` cannot authorize it. Requests require an absolute
+HTTPS URL of at most 4 KiB, without userinfo, whitespace, controls, or raw
+markup delimiters. International domain names must use their ASCII/punycode
+form. Invalid URL requests return an invalid-params error without showing a
+picker or launching anything. The original request's ownership, trust,
+transport generation, task correlation, and timeout apply throughout.
+
+An accepted response contains only the action and any related-task metadata,
+never the URL or user-entered content. It confirms consent to opening the page,
+not successful authorization or completion. Finish the interaction in your
+browser; the server remains responsible for continuing its pending request.
+Pi ignores optional `notifications/elicitation/complete` messages and does not
+automatically replay a tool. If the call ends or times out, retry it explicitly
+after completing the browser interaction. The separate `-32042` error-mediated
+URL workflow remains a server error; Pi currently presents URL pickers for
+direct `elicitation/create` requests only. MCP client-to-server OAuth continues
+to use `/mcp reauth`, independently of URL elicitation.
 
 ## Server-requested model replies
 
