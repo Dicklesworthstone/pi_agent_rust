@@ -3787,6 +3787,11 @@ impl PiFtuiModel {
                 // same self-limiting pattern as the bubbletea spinner gate).
                 return self.arm_heartbeat();
             }
+            PiMsg::AssistantMessageStart => {
+                // Successful response boundaries commit their streamed text;
+                // recovery can then discard only the next, incomplete attempt.
+                self.flush_stream();
+            }
             PiMsg::TextDelta(delta) => {
                 // Adversarial-content safety: agent/tool text is sanitized
                 // before it can ever reach a frame.
@@ -5211,10 +5216,8 @@ impl PiFtuiModel {
             let valid = !rest.contains(['\r', '\n'])
                 && match subcommand.as_str() {
                     "list" => name.is_none(),
-                    "trust" | "deny" | "test" => {
-                        name.is_some() && remainder.split_whitespace().count() == 1
-                    }
-                    "reauth" | "unauth" => name.is_some(),
+                    "inspect" | "trust" | "deny" | "test" | "reauth" | "unauth" => name.is_some(),
+                    "refresh" => true,
                     _ => false,
                 };
             if valid {
@@ -5249,7 +5252,7 @@ impl PiFtuiModel {
             } else {
                 self.push_entry(
                     EntryRole::Error,
-                    String::from("usage: /mcp [list|trust <name>|deny <name>|test <name>|reauth <name>|unauth <name>]"),
+                    String::from("usage: /mcp [list|inspect <name>|trust <name>|deny <name>|test <name>|refresh [name]|reauth <name>|unauth <name>]"),
                 );
             }
             return true;
@@ -7988,8 +7991,9 @@ fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
 /// vocabulary the model consumes. Pure so tests can pin the mapping.
 ///
 /// Deliberately narrow: lifecycle, streaming deltas, tool lifecycle, and
-/// error surfacing. Retry/failover/compaction events surface as system notes;
-/// everything else is dropped until its surface is ported.
+/// error surfacing. Recovery also delimits incomplete output and refreshes the
+/// active model; compaction events surface as system notes. Everything else is
+/// dropped until its surface is ported.
 #[allow(clippy::too_many_lines)] // one flat match over every agent event kind
 pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
     use crate::agent::AgentEvent as E;
@@ -7997,6 +8001,18 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
 
     match event {
         E::AgentStart { .. } => vec![PiMsg::AgentStart],
+        E::MessageStart {
+            message: crate::model::Message::Assistant(_),
+        } => vec![PiMsg::AssistantMessageStart],
+        E::MessageEnd {
+            message: crate::model::Message::Assistant(message),
+        } if !matches!(
+            message.stop_reason,
+            crate::model::StopReason::Error | crate::model::StopReason::Aborted
+        ) =>
+        {
+            vec![PiMsg::AssistantMessageStart]
+        }
         E::AgentEnd {
             messages, error, ..
         } => {
@@ -8087,11 +8103,38 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         E::AutoRetryStart {
             attempt,
             max_attempts,
-            error_message,
+            delay_ms,
             ..
-        } => vec![PiMsg::SystemNote(format!(
-            "retry {attempt}/{max_attempts}: {error_message}"
-        ))],
+        } => vec![PiMsg::ProviderRecovery {
+            message: format!(
+                "Retrying provider request ({attempt}/{max_attempts}) in {delay_ms} ms"
+            ),
+            model: None,
+            discard_incomplete: true,
+        }],
+        E::FailoverStart {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            ..
+        } => vec![PiMsg::ProviderRecovery {
+            message: format!(
+                "Provider fallback: {from_provider}/{from_model} → {to_provider}/{to_model}"
+            ),
+            model: Some((to_provider.clone(), to_model.clone())),
+            discard_incomplete: true,
+        }],
+        E::FailoverEnd {
+            provider,
+            model,
+            restored_primary: true,
+            ..
+        } => vec![PiMsg::ProviderRecovery {
+            message: format!("Primary model restored: {provider}/{model}"),
+            model: Some((provider.clone(), model.clone())),
+            discard_incomplete: false,
+        }],
         E::AutoCompactionStart { reason } => {
             vec![PiMsg::SystemNote(format!("compacting context: {reason}"))]
         }
@@ -9513,9 +9556,44 @@ async fn run_mcp_command(
         return;
     };
 
-    if subcommand == "list" {
+    run_mcp_registry_command(
+        &manager,
+        &handle.session().agent.shared_tools(),
+        subcommand,
+        name,
+        agent_tx,
+    )
+    .await;
+}
+
+/// Operate on the live session registry without sending a model prompt.
+/// Inspection does not connect, execute credential helpers, or change trust;
+/// refresh retains the manager's existing trust, timeout and restart policy.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_mcp_registry_command(
+    manager: &Arc<crate::mcp::McpManager>,
+    tools: &crate::tools::SharedToolRegistry,
+    subcommand: &str,
+    name: Option<&str>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let refresh_all = subcommand == "refresh" && name.is_none();
+    let changed = if refresh_all {
+        manager.connect_trusted().await;
+        crate::mcp::reconcile_tools(manager, tools)
+    } else {
+        0
+    };
+
+    if subcommand == "list" || refresh_all {
         let rows = manager.list();
         let mut content = String::from("MCP servers (Model Context Protocol)\n");
+        if refresh_all {
+            let _ = writeln!(
+                content,
+                "Refreshed acknowledged servers; check each server's health below.\nUpdated {changed} MCP tool definition(s) in the live session."
+            );
+        }
         if rows.is_empty() {
             content.push_str("\n  No MCP servers configured.\n");
         } else {
@@ -9541,10 +9619,34 @@ async fn run_mcp_command(
         )));
         return;
     };
+    if subcommand == "inspect" {
+        let Some(server) = manager
+            .list()
+            .into_iter()
+            .find(|server| server.name == name)
+        else {
+            let _ = agent_tx.send(PiMsg::AgentError(format!(
+                "[MCP_UNKNOWN_SERVER] unknown server {name:?}; use /mcp list"
+            )));
+            return;
+        };
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "MCP server {:?}\n  Transport: {}\n  Source: {} ({})\n  Trust: {}\n  Health: {}\n  Tools: {}",
+            server.name,
+            server.target,
+            server.source_file.display(),
+            server.provenance,
+            server.trust,
+            server.health,
+            server.tools,
+        )));
+        return;
+    }
     let outcome = match subcommand {
         "deny" => manager.deny(name).await.map(|()| Vec::new()),
         "test" => manager.test(name).await,
         "trust" => manager.trust(name).await,
+        "refresh" => manager.refresh_tools(name).await,
         _ => {
             let _ = agent_tx.send(PiMsg::AgentError(format!(
                 "unknown /mcp subcommand {subcommand:?}"
@@ -9552,14 +9654,16 @@ async fn run_mcp_command(
             return;
         }
     };
-    let changed = crate::mcp::reconcile_tools(&manager, &handle.session().agent.shared_tools());
+    // Reconcile after errors too: failed discovery or revoked trust must not
+    // leave old tool definitions installed for the next provider request.
+    let changed = crate::mcp::reconcile_tools(manager, tools);
     let message = match outcome {
         Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
         Ok(tools) => {
-            let verb = if subcommand == "test" {
-                "tested"
-            } else {
-                "trusted"
+            let verb = match subcommand {
+                "test" => "tested",
+                "refresh" => "refreshed",
+                _ => "trusted",
             };
             let mut line = format!(
                 "MCP server {name:?} {verb}: {} tool(s) available.",
@@ -9579,7 +9683,10 @@ async fn run_mcp_command(
             }
             line
         }
-        Err(err) => format!("MCP {name:?}: {err}"),
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("MCP {name:?}: {err}")));
+            return;
+        }
     };
     let _ = agent_tx.send(PiMsg::System(message));
 }
@@ -20136,6 +20243,140 @@ mod tests {
         }
     }
 
+    fn recovery_text_delta(text: &str) -> crate::agent::AgentEvent {
+        let assistant = Arc::new(crate::model::AssistantMessage::default());
+        crate::agent::AgentEvent::MessageUpdate {
+            message: crate::model::Message::Assistant(Arc::clone(&assistant)),
+            assistant_message_event: crate::model::AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: text.to_string(),
+                partial: assistant,
+            },
+        }
+    }
+
+    fn recovery_message_end(stop_reason: StopReason) -> crate::agent::AgentEvent {
+        crate::agent::AgentEvent::MessageEnd {
+            message: crate::model::Message::Assistant(Arc::new(crate::model::AssistantMessage {
+                stop_reason,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn recovery_bridge_retry_discards_only_incomplete_assistant_output() {
+        use crate::agent::AgentEvent as E;
+
+        let (bridge, receiver, mut sim) = progress_ui_fixture(Some("retry-session"));
+        bridge.observe(&recovery_text_delta("completed response"));
+        bridge.observe(&recovery_message_end(StopReason::Stop));
+        bridge.observe(&E::MessageStart {
+            message: crate::model::Message::Assistant(Arc::default()),
+        });
+        bridge.observe(&recovery_text_delta("failed fragment"));
+        bridge.observe(&recovery_message_end(StopReason::Error));
+        drain_progress_ui(&receiver, &mut sim);
+        assert_eq!(sim.model().streaming, "failed fragment");
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta(
+            "failed reasoning".to_string(),
+        )));
+
+        bridge.observe(&E::AutoRetryStart {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 250,
+            error_message: "raw provider payload must not become a retry notice".to_string(),
+        });
+        drain_progress_ui(&receiver, &mut sim);
+        assert!(sim.model().streaming.is_empty());
+        assert!(sim.model().thinking.is_empty());
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        assert_eq!(sim.model().transcript[0].text, "completed response");
+        assert_eq!(
+            sim.model().transcript[1].text,
+            "Retrying provider request (1/3) in 250 ms"
+        );
+
+        bridge.observe(&recovery_text_delta("successful retry"));
+        bridge.observe(&recovery_message_end(StopReason::Stop));
+        drain_progress_ui(&receiver, &mut sim);
+        let answers: Vec<_> = sim
+            .model()
+            .transcript
+            .iter()
+            .filter(|entry| entry.role == EntryRole::Assistant)
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(answers, ["completed response", "successful retry"]);
+    }
+
+    #[test]
+    fn recovery_bridge_fallback_and_restoration_update_the_live_model() {
+        use crate::agent::AgentEvent as E;
+
+        let (bridge, receiver, mut sim) = progress_ui_fixture(Some("fallback-session"));
+        sim.model_mut().model_names.extend([
+            ("primary/model-a".to_string(), "Primary Model".to_string()),
+            ("backup/model-b".to_string(), "Backup Model".to_string()),
+        ]);
+        sim.send(PiFtuiMsg::Agent(PiMsg::StatusSnapshot(
+            crate::interactive::FtuiStatusSnapshot {
+                model: "Primary Model".to_string(),
+                ..Default::default()
+            },
+        )));
+        bridge.observe(&recovery_text_delta("failed primary fragment"));
+        bridge.observe(&recovery_message_end(StopReason::Error));
+        bridge.observe(&E::FailoverStart {
+            from_provider: "primary".to_string(),
+            from_model: "model-a".to_string(),
+            to_provider: "backup".to_string(),
+            to_model: "model-b".to_string(),
+            class: "overload".to_string(),
+            attempt: 1,
+            chain_index: 0,
+        });
+        drain_progress_ui(&receiver, &mut sim);
+        assert!(sim.model().streaming.is_empty());
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        assert_eq!(
+            sim.model().transcript[0].text,
+            "Provider fallback: primary/model-a → backup/model-b"
+        );
+        let frame = buffer_text(sim.capture_frame(100, 12), 100, 12);
+        assert!(frame.contains("Backup Model"), "{frame}");
+
+        bridge.observe(&recovery_text_delta("successful fallback answer"));
+        bridge.observe(&E::FailoverEnd {
+            success: true,
+            provider: "backup".to_string(),
+            model: "model-b".to_string(),
+            restored_primary: false,
+        });
+        drain_progress_ui(&receiver, &mut sim);
+        assert_eq!(sim.model().transcript.len(), 1);
+        assert_eq!(sim.model().streaming, "successful fallback answer");
+
+        bridge.observe(&E::FailoverEnd {
+            success: true,
+            provider: "primary".to_string(),
+            model: "model-a".to_string(),
+            restored_primary: true,
+        });
+        drain_progress_ui(&receiver, &mut sim);
+        assert_eq!(sim.model().state, AgentUiState::Working);
+        assert!(sim.model().streaming.is_empty());
+        assert_eq!(sim.model().transcript[1].role, EntryRole::Assistant);
+        assert_eq!(sim.model().transcript[1].text, "successful fallback answer");
+        assert_eq!(
+            sim.model().transcript[2].text,
+            "Primary model restored: primary/model-a"
+        );
+        let frame = buffer_text(sim.capture_frame(100, 12), 100, 12);
+        assert!(frame.contains("Primary Model"), "{frame}");
+    }
+
     fn progress_text(text: &str) -> crate::tools::ToolOutput {
         crate::tools::ToolOutput {
             content: vec![crate::model::ContentBlock::Text(
@@ -24975,6 +25216,140 @@ mod tests {
                 .iter()
                 .any(|entry| entry.role == EntryRole::Error && entry.text.contains("usage: /mcp"))
         );
+    }
+
+    #[test]
+    fn mcp_catalog_commands_preserve_exact_server_names_without_model_dispatch() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for verb in ["inspect", "refresh", "trust", "deny", "test"] {
+            type_str(&mut sim, &format!("/mcp {verb} docs  Europe"));
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert_eq!(
+                submit_rx.try_recv().expect("native MCP command"),
+                UiCommand::Mcp {
+                    subcommand: verb.to_string(),
+                    name: Some("docs  Europe".to_string()),
+                }
+            );
+            assert!(submit_rx.try_recv().is_err(), "no model prompt follows");
+        }
+        type_str(&mut sim, "/mcp refresh");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("refresh acknowledged servers"),
+            UiCommand::Mcp {
+                subcommand: "refresh".to_string(),
+                name: None,
+            }
+        );
+        for command in ["/mcp inspect", "/mcp list extra", "/mcp unknown"] {
+            type_str(&mut sim, command);
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            assert!(submit_rx.try_recv().is_err(), "invalid operator command");
+            assert!(sim.model().transcript.last().is_some_and(|entry| {
+                entry.role == EntryRole::Error && entry.text.contains("usage: /mcp")
+            }));
+        }
+    }
+
+    #[test]
+    fn mcp_inspection_and_refresh_preserve_trust_and_hide_configuration_secrets() {
+        let temp = tempfile::tempdir().expect("MCP workspace");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("MCP endpoint");
+        listener.set_nonblocking(true).expect("nonblocking probe");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("address"));
+        let path = temp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"mcpServers": {
+                "docs  Europe": {
+                    "url": url,
+                    "headers": {"Authorization": "Bearer private-configuration-secret"}
+                },
+                "disabled": {"url": url, "enabled": false}
+            }})
+            .to_string(),
+        )
+        .expect("MCP configuration");
+        let global_dir = temp.path().join("agent");
+        let manager = Arc::new(
+            crate::mcp::McpManager::bootstrap(
+                temp.path(),
+                &global_dir,
+                std::slice::from_ref(&path),
+                true,
+            )
+            .expect("MCP registry"),
+        );
+        let tools = crate::tools::SharedToolRegistry::new(crate::tools::ToolRegistry::from_tools(
+            Vec::new(),
+        ));
+        let (sender, receiver) = mpsc::channel();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            run_mcp_registry_command(
+                &manager,
+                &tools,
+                "inspect",
+                Some("docs  Europe"),
+                &sender,
+            )
+            .await;
+            let PiMsg::System(report) = receiver.try_recv().expect("inspection") else {
+                panic!("inspection must produce the local registry report");
+            };
+            assert!(report.contains("docs  Europe"));
+            assert!(report.contains("Trust: pending"));
+            assert!(report.contains("Health: not started"));
+            assert!(report.contains(&path.display().to_string()));
+            assert!(!report.contains("private-configuration-secret"));
+            assert!(!report.contains(&url));
+
+            run_mcp_registry_command(
+                &manager,
+                &tools,
+                "refresh",
+                Some("docs  Europe"),
+                &sender,
+            )
+            .await;
+            assert!(matches!(
+                receiver.try_recv().expect("refresh refusal"),
+                PiMsg::AgentError(message) if message.contains("MCP_TRUST_PENDING")
+            ));
+            run_mcp_registry_command(&manager, &tools, "refresh", None, &sender).await;
+            assert!(matches!(
+                receiver.try_recv().expect("all-server health report"),
+                PiMsg::System(message)
+                    if message.contains("check each server's health")
+                        && message.contains("disabled")
+                        && message.contains("pending")
+            ));
+            run_mcp_registry_command(
+                &manager,
+                &tools,
+                "inspect",
+                Some("docs Europe"),
+                &sender,
+            )
+            .await;
+            assert!(matches!(
+                receiver.try_recv().expect("exact-name lookup refusal"),
+                PiMsg::AgentError(message) if message.contains("MCP_UNKNOWN_SERVER")
+            ));
+            assert!(receiver.try_recv().is_err(), "no agent turn was emitted");
+            assert!(manager.list().iter().all(|server| server.trust == "pending"));
+            assert!(tools.snapshot().tools().is_empty());
+            assert!(!global_dir.join("mcp-trust.json").exists());
+            assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+            assert!(manager.shutdown_all().await.is_empty());
+        });
     }
 
     #[test]

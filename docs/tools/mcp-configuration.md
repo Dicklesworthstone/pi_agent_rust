@@ -39,6 +39,26 @@ file definition from silently becoming active. A whole-file failure in a native
 or explicit CLI file stops discovery of lower-priority files. Warnings identify
 the file and entry that need attention.
 
+## Inspect and refresh servers in the terminal
+
+The default terminal uses the current session's MCP connections and tool registry:
+
+| Command | Result |
+| --- | --- |
+| `/mcp list` | Show configured servers, provenance, trust, and connection health. |
+| `/mcp inspect <name>` | Show one server's selected configuration file, transport type, trust, health, and tool count without connecting. |
+| `/mcp refresh <name>` | Reload a trusted server's tool catalog and update the tools available to the next model request. |
+| `/mcp refresh` | Refresh acknowledged servers within the shared startup budget and report each server's health. |
+| `/mcp test <name>` | Explicitly retry a server, including one that exhausted its automatic restart budget. |
+
+Server names preserve internal spaces: `/mcp refresh docs  Europe` selects the
+server named `docs  Europe`. Inspection omits raw URLs, command arguments, and
+credential headers. Refresh does not grant trust or re-read changed configuration
+files; restart the session to discover edited definitions. Failed discovery also
+removes obsolete tool definitions from the live registry. Pending and disabled
+servers stay inactive during a refresh of all servers, and a partial failure is
+visible in the per-server health report.
+
 ## One-shot operator commands
 
 MCP setup and inspection can run without loading an LLM provider or creating an

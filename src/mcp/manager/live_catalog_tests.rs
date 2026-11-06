@@ -171,6 +171,78 @@ fn agent(provider: &Arc<CatalogProvider>) -> Agent {
     )
 }
 
+#[cfg(feature = "ftui")]
+#[test]
+fn ftui_refresh_replaces_live_catalog_and_withdraws_failed_discovery() {
+    use crate::interactive::PiMsg;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (manager, _, state) = fixture(
+        &temp,
+        json!({"tools":[meta("echo","old_argument"),meta("removed","old")]}),
+    );
+    let registry = SharedToolRegistry::new(ToolRegistry::from_tools(Vec::new()));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    runtime().block_on(async {
+        manager.test("fixture").await.expect("initial catalog");
+        crate::mcp::reconcile_tools(&manager, &registry);
+        let previous = registry.snapshot();
+        let previous_version = registry.version();
+        *McpManager::lock(&state.catalog) =
+            json!({"tools":[meta("echo","new_argument"),meta("added","new") ]});
+        crate::interactive_ftui::run_mcp_registry_command(
+            &manager,
+            &registry,
+            "refresh",
+            Some("fixture"),
+            &sender,
+        )
+        .await;
+        assert!(matches!(
+            receiver.try_recv().expect("refresh result"),
+            PiMsg::System(message) if message.contains("refreshed: 2 tool(s)")
+        ));
+        let current = registry.snapshot();
+        assert!(registry.version() > previous_version);
+        assert!(current.get("mcp__fixture__removed").is_none());
+        assert!(current.get("mcp__fixture__added").is_some());
+        assert_eq!(
+            current.get("mcp__fixture__echo").unwrap().parameters()["required"],
+            json!(["new_argument"])
+        );
+        assert!(previous.get("mcp__fixture__removed").is_some());
+        assert_eq!(
+            previous.get("mcp__fixture__echo").unwrap().parameters()["required"],
+            json!(["old_argument"])
+        );
+        // A failed catalog refresh must withdraw the last catalog, even
+        // though this command never starts a provider request to do it later.
+        *McpManager::lock(&state.catalog) = json!({"tools":[{"name":"invalid"}]});
+        crate::interactive_ftui::run_mcp_registry_command(
+            &manager,
+            &registry,
+            "refresh",
+            Some("fixture"),
+            &sender,
+        )
+        .await;
+        assert!(matches!(
+            receiver.try_recv().expect("refresh failure"),
+            PiMsg::AgentError(message) if message.contains("MCP_PROTOCOL")
+        ));
+        assert!(registry.snapshot().tools().is_empty());
+        assert!(
+            McpManager::lock(&state.calls).is_empty(),
+            "no tool execution"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "no model turn or duplicate result"
+        );
+        assert!(manager.shutdown_all().await.is_empty());
+    });
+}
+
 #[test]
 // The guard is dropped explicitly before the next await; clippy cannot see that.
 #[allow(clippy::await_holding_lock)]
