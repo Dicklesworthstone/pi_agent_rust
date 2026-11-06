@@ -620,11 +620,8 @@ mod tests {
         let cli = crate::cli::Cli::parse_from(["pi", "--no-tools"]);
         assert_absent(&cli, &configured);
 
-        let cli = crate::cli::Cli::parse_from([
-            "pi",
-            "--tools",
-            "eval,github,security_scan,subagent",
-        ]);
+        let cli =
+            crate::cli::Cli::parse_from(["pi", "--tools", "eval,github,security_scan,subagent"]);
         let (registry, prompt) =
             selected_registry_and_prompt(&cli, &optional_tool_config(false), temp.path());
         for (_, name) in OPTIONAL_TOOL_SETTINGS {
@@ -652,7 +649,11 @@ mod tests {
                     let registered = enabled && mode != "off";
                     let discoverable = registered && mode == "discoverable";
                     assert_eq!(registry.get(name).is_some(), registered, "{name} {mode}");
-                    assert_eq!(registry.is_discoverable(name), discoverable, "{name} {mode}");
+                    assert_eq!(
+                        registry.is_discoverable(name),
+                        discoverable,
+                        "{name} {mode}"
+                    );
                     assert_eq!(
                         prompt_index_for(&cli.enabled_tools(&config), Some(&config))
                             .iter()
@@ -661,9 +662,8 @@ mod tests {
                         "{name} {mode}"
                     );
                     if discoverable {
-                        let line = one_liner(
-                            registry.get(name).expect("discoverable tool").description(),
-                        );
+                        let line =
+                            one_liner(registry.get(name).expect("discoverable tool").description());
                         assert!(prompt.contains(&format!("- {name}: {line}\n")));
                     } else if !registered {
                         assert!(!prompt.contains(&format!("- {name}:")));
@@ -690,10 +690,8 @@ mod tests {
     fn disabled_dispatcher_is_not_advertised_for_enabled_optional_tools() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut config = optional_tool_config(true);
-        config.tools.as_mut().expect("tool settings").load_mode = Some(HashMap::from([(
-            "xdev".to_string(),
-            " OFF ".to_string(),
-        )]));
+        config.tools.as_mut().expect("tool settings").load_mode =
+            Some(HashMap::from([("xdev".to_string(), " OFF ".to_string())]));
         for args in [
             vec!["pi"],
             vec!["pi", "--tools", "eval,github,security_scan,subagent"],

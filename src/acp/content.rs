@@ -612,8 +612,7 @@ mod tests {
             // Both payloads encode to four bytes. Decoded admission must still
             // distinguish a two-byte attachment from a three-byte attachment.
             for rejected in ["AQID", "AQIDBA=="] {
-                let error =
-                    super::extract_prompt_content(&[block(rejected)], &config).unwrap_err();
+                let error = super::extract_prompt_content(&[block(rejected)], &config).unwrap_err();
                 assert!(error.contains("media.maxBytes"));
             }
         }

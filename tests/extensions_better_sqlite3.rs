@@ -260,17 +260,29 @@ fn better_sqlite3_persists_across_realms_without_widening_storage_or_write_autho
         assert_eq!(saved, json!({"changed": 1, "denied": [true, true]}));
         drop(first);
         assert!(database.metadata().expect("native database").len() > 0);
-        assert!(!outside.exists(), "a storage grant must not cover its parent");
-        assert!(!missing.exists(), "fileMustExist must not create a database");
+        assert!(
+            !outside.exists(),
+            "a storage grant must not cover its parent"
+        );
+        assert!(
+            !missing.exists(),
+            "fileMustExist must not create a database"
+        );
 
         let peer = runtime(&root, "peer", None).await;
         peer.add_persistent_storage_root(storage.clone(), "owner")
             .expect("foreign owner grant");
         assert_eq!(
-            evaluate(&peer, &format!(r"
+            evaluate(
+                &peer,
+                &format!(
+                    r"
                 try {{ new Database({path}); globalThis.betterResult = false; }}
                 catch {{ globalThis.betterResult = true; }}
-            ")).await,
+            "
+                )
+            )
+            .await,
             json!(true),
             "the adapter must retain the native extension owner check"
         );
@@ -286,10 +298,16 @@ fn better_sqlite3_persists_across_realms_without_widening_storage_or_write_autho
             .add_persistent_storage_root(storage.clone(), "owner")
             .expect("restricted grant");
         assert_eq!(
-            evaluate(&restricted, &format!(r"
+            evaluate(
+                &restricted,
+                &format!(
+                    r"
                 try {{ new Database({path}); globalThis.betterResult = false; }}
                 catch {{ globalThis.betterResult = true; }}
-            ")).await,
+            "
+                )
+            )
+            .await,
             json!(true),
             "a persistent root must not bypass the write capability"
         );
@@ -299,7 +317,10 @@ fn better_sqlite3_persists_across_realms_without_widening_storage_or_write_autho
         second
             .add_persistent_storage_root(storage, "owner")
             .expect("reopened owner grant");
-        let reopened = evaluate(&second, &format!(r"
+        let reopened = evaluate(
+            &second,
+            &format!(
+                r"
             const db = new Database({path}, {{readonly: true, fileMustExist: true}});
             let writeDenied = false;
             try {{ db.prepare('INSERT INTO state VALUES (?)').run('must not write'); }}
@@ -309,7 +330,10 @@ fn better_sqlite3_persists_across_realms_without_widening_storage_or_write_autho
               writeDenied, readonly: db.readonly, memory: db.memory,
             }};
             db.close();
-        ")).await;
+        "
+            ),
+        )
+        .await;
         assert_eq!(
             reopened,
             json!({

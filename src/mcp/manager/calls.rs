@@ -455,7 +455,8 @@ impl McpManager {
         arguments: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<Value> {
-        self.call_tool_with_sampling(server, tool, arguments, on_update, None).await
+        self.call_tool_with_sampling(server, tool, arguments, on_update, None)
+            .await
     }
 
     /// The host is borrowed from this invocation, never stored in the
@@ -590,9 +591,18 @@ impl McpManager {
         on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     ) -> Result<Value> {
         self.execute_tool_call_with_sampling(
-            entry, transport, tool, arguments, timeout, output_schema,
-            task_support, expected_generation, on_update, None,
-        ).await
+            entry,
+            transport,
+            tool,
+            arguments,
+            timeout,
+            output_schema,
+            task_support,
+            expected_generation,
+            on_update,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]

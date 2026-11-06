@@ -343,7 +343,8 @@ impl MessageState {
         if wire_reason == "tool_use" && self.tool_ids.is_empty() {
             return Err(invalid("tool_use stop reason has no local tool calls"));
         }
-        let (reason, failure) = super::response_stop_outcome(wire_reason, !self.tool_ids.is_empty());
+        let (reason, failure) =
+            super::response_stop_outcome(wire_reason, !self.tool_ids.is_empty());
         self.message.stop_reason = reason;
         self.message.error_message = failure.map(str::to_string);
         self.stopped = true;

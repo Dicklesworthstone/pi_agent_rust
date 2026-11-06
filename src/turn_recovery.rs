@@ -336,7 +336,10 @@ impl TurnRecoveryState {
     }
 
     /// Content-aware entrypoint used by the common Agent loop on every surface.
-    pub(crate) fn evaluate_assistant(&mut self, message: &AssistantMessage) -> Option<RecoveryAction> {
+    pub(crate) fn evaluate_assistant(
+        &mut self,
+        message: &AssistantMessage,
+    ) -> Option<RecoveryAction> {
         if message.stop_details.is_some() || message.error_message.is_some() {
             return None;
         }
@@ -503,18 +506,19 @@ mod tests {
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
         > {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
-            self.contexts.lock().unwrap().push(context.messages.to_vec());
+            self.contexts
+                .lock()
+                .unwrap()
+                .push(context.messages.to_vec());
             let message = self
                 .replies
                 .get(index)
                 .expect("unexpected provider re-entry")
                 .clone();
-            Ok(Box::pin(futures::stream::iter([Ok(
-                StreamEvent::Done {
-                    reason: message.stop_reason,
-                    message,
-                },
-            )])))
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
+                reason: message.stop_reason,
+                message,
+            })])))
         }
     }
 
@@ -544,7 +548,9 @@ mod tests {
             ] {
                 let message = response(reason, content);
                 assert!(is_empty_assistant_response(&message));
-                assert!(context_excludes_empty_response(&Message::assistant(message)));
+                assert!(context_excludes_empty_response(&Message::assistant(
+                    message
+                )));
             }
         }
         for block in [
@@ -578,7 +584,9 @@ mod tests {
         ] {
             let message = response(StopReason::Stop, vec![block]);
             assert!(!is_empty_assistant_response(&message));
-            assert!(!context_excludes_empty_response(&Message::assistant(message)));
+            assert!(!context_excludes_empty_response(&Message::assistant(
+                message
+            )));
         }
         for reason in [
             StopReason::Length,
@@ -684,8 +692,12 @@ mod tests {
     fn native_empty_response_cap_is_a_terminal_error_without_outer_retry() {
         run(async {
             let probe = Arc::new(RecoveryProbe::new(vec![
-                response(StopReason::Stop, Vec::new());
-                usize::from(MAX_AUTO_CONTINUATIONS) + 1
+                response(
+                    StopReason::Stop,
+                    Vec::new()
+                );
+                usize::from(MAX_AUTO_CONTINUATIONS)
+                    + 1
             ]));
             let mut agent = agent(Arc::clone(&probe), AgentConfig::default());
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -738,9 +750,10 @@ mod tests {
     fn native_empty_response_respects_manual_dispatch_disable_and_cancellation() {
         run(async {
             for manual in [false, true] {
-                let probe = Arc::new(RecoveryProbe::new(vec![
-                    response(StopReason::Stop, Vec::new()),
-                ]));
+                let probe = Arc::new(RecoveryProbe::new(vec![response(
+                    StopReason::Stop,
+                    Vec::new(),
+                )]));
                 let mut agent = agent(
                     Arc::clone(&probe),
                     AgentConfig {
@@ -766,9 +779,10 @@ mod tests {
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                 assert!(!agent.messages().iter().any(recovery_nudge));
             }
-            let probe = Arc::new(RecoveryProbe::new(vec![
-                response(StopReason::Stop, Vec::new()),
-            ]));
+            let probe = Arc::new(RecoveryProbe::new(vec![response(
+                StopReason::Stop,
+                Vec::new(),
+            )]));
             let mut agent = agent(Arc::clone(&probe), AgentConfig::default());
             let (abort, signal) = AbortHandle::new();
             agent
@@ -828,7 +842,10 @@ mod tests {
                 let expected_content = serde_json::to_value(&message.content).unwrap();
                 let probe = Arc::new(RecoveryProbe::new(vec![message, completed_response()]));
                 let mut agent = agent(Arc::clone(&probe), AgentConfig::default());
-                let result = agent.run("Respect this provider terminal", |_| {}).await.unwrap();
+                let result = agent
+                    .run("Respect this provider terminal", |_| {})
+                    .await
+                    .unwrap();
                 assert_eq!(result.stop_reason, StopReason::Stop);
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                 agent.run("A new authored request", |_| {}).await.unwrap();

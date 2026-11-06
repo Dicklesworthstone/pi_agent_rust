@@ -88,11 +88,19 @@ impl Execution {
     ) -> Result<Value> {
         if !self.augmented {
             return transport
-                .request_in_task_generation("tools/call", params, timeout, dispatch, self.generation)
+                .request_in_task_generation(
+                    "tools/call",
+                    params,
+                    timeout,
+                    dispatch,
+                    self.generation,
+                )
                 .await;
         }
         self.check(manager, owner, entry, transport)?;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(task_timeout)?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(task_timeout)?;
         // Retention is a request to the server, not a new execution deadline.
         // The receiver may choose another TTL; our original timeout still wins.
         params["task"] = json!({"ttl": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)});

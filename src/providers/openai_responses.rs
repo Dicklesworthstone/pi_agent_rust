@@ -1432,9 +1432,10 @@ where
                 } = item
                 {
                     self.ensure_started();
-                    if status.as_deref().is_some_and(|status| {
-                        !matches!(status, "in_progress" | "completed")
-                    }) {
+                    if status
+                        .as_deref()
+                        .is_some_and(|status| !matches!(status, "in_progress" | "completed"))
+                    {
                         self.reject_tool_response(
                             "OpenAI Responses added a function call with an invalid status"
                                 .to_string(),
@@ -1594,7 +1595,10 @@ where
                         status,
                     } => {
                         self.ensure_started();
-                        if status.as_deref().is_some_and(|status| status != "completed") {
+                        if status
+                            .as_deref()
+                            .is_some_and(|status| status != "completed")
+                        {
                             self.reject_tool_response(
                                 "OpenAI Responses did not complete a function call; local tool calls withheld"
                                     .to_string(),
@@ -1840,15 +1844,16 @@ where
         };
 
         self.partial.stop_reason = StopReason::ToolUse;
-        self.completed_tool_events.push_back(StreamEvent::ToolCallEnd {
-            content_index: tc.content_index,
-            tool_call: ToolCall {
-                id: tc.call_id.clone(),
-                name: tc.name.clone(),
-                arguments: parsed_args.clone(),
-                thought_signature: Some(item_id.to_string()),
-            },
-        });
+        self.completed_tool_events
+            .push_back(StreamEvent::ToolCallEnd {
+                content_index: tc.content_index,
+                tool_call: ToolCall {
+                    id: tc.call_id.clone(),
+                    name: tc.name.clone(),
+                    arguments: parsed_args.clone(),
+                    thought_signature: Some(item_id.to_string()),
+                },
+            });
 
         if let Some(ContentBlock::ToolCall(block)) = self.partial.content.get_mut(tc.content_index)
         {
@@ -5380,7 +5385,11 @@ mod tests {
                             "{label}: keep the partial answer in the failure snapshot"
                         );
                         assert_eq!(
-                            (error.usage.input, error.usage.output, error.usage.total_tokens),
+                            (
+                                error.usage.input,
+                                error.usage.output,
+                                error.usage.total_tokens
+                            ),
                             (1, 1, 2),
                             "{label}: retain usage from the observed terminal response"
                         );
@@ -5449,8 +5458,7 @@ mod tests {
             "",
         ] {
             let peer = tool_item_event("response.output_item.done", "peer", "write", "{}");
-            let added =
-                tool_item_event("response.output_item.added", "unfinished", "write", "{}");
+            let added = tool_item_event("response.output_item.added", "unfinished", "write", "{}");
             let mut final_item = added["item"].clone();
             final_item["status"] = json!(status);
             let mut terminal = completed_response_event();
@@ -5468,7 +5476,14 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn invalid_or_conflicting_response_terminals_withhold_completed_calls() {
         for kind in ["response.completed", "response.done", "response.incomplete"] {
-            for status in ["in_progress", "queued", "cancelled", "failed", "unknown", ""] {
+            for status in [
+                "in_progress",
+                "queued",
+                "cancelled",
+                "failed",
+                "unknown",
+                "",
+            ] {
                 assert_response_withholds_tools(
                     &[
                         tool_item_event("response.output_item.done", "peer", "write", "{}"),
@@ -5585,8 +5600,7 @@ mod tests {
             ] {
                 let dir = tempfile::tempdir().unwrap();
                 let marker = dir.path().join("must-not-be-written.txt");
-                let arguments =
-                    json!({"path": marker, "content": "must not execute"}).to_string();
+                let arguments = json!({"path": marker, "content": "must not execute"}).to_string();
                 let mut events = vec![tool_item_event(
                     "response.output_item.done",
                     "valid_peer",
@@ -5690,7 +5704,11 @@ mod tests {
                     StopReason::Error,
                     "{case}/ndjson={ndjson}"
                 );
-                assert_eq!(executions.load(Ordering::SeqCst), 0, "{case}/ndjson={ndjson}");
+                assert_eq!(
+                    executions.load(Ordering::SeqCst),
+                    0,
+                    "{case}/ndjson={ndjson}"
+                );
                 assert_eq!(
                     completed_calls.load(Ordering::SeqCst),
                     0,

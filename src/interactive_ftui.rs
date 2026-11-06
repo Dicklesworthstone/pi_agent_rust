@@ -9631,9 +9631,10 @@ async fn run_extension_shortcut(
     turn_control: &TurnControlSlot,
     turn_abort: &TurnAbortSlot,
 ) {
-    if !handle.extension_manager().is_some_and(|manager| {
-        manager.has_shortcut(key_id) && manager.runtime().is_some()
-    }) {
+    if !handle
+        .extension_manager()
+        .is_some_and(|manager| manager.has_shortcut(key_id) && manager.runtime().is_some())
+    {
         let _ = agent_tx.send(PiMsg::System(format!(
             "Extension shortcut [{key_id}] is no longer available."
         )));
@@ -27441,7 +27442,8 @@ mod tests {
             {
                 let calls = provider.calls.lock().unwrap();
                 assert_eq!(
-                    calls.len(), 3,
+                    calls.len(),
+                    3,
                     "the custom message also requests a native turn"
                 );
                 assert!(matches!(
@@ -27480,7 +27482,11 @@ mod tests {
                 .collect();
             assert_eq!(
                 prompts,
-                ["/workflow", "ultrathink generated first", "generated second"]
+                [
+                    "/workflow",
+                    "ultrathink generated first",
+                    "generated second"
+                ]
             );
             assert!(
                 model
@@ -27561,7 +27567,10 @@ mod tests {
             assert_eq!(report["model"], "ftui-native-input");
             assert_eq!(provider.calls.lock().unwrap().len(), 3);
             assert!(!handle.session().has_pending_extension_idle_actions());
-            assert_eq!(sim.model().input.text(), "unsent draft\nwith @attachment.png");
+            assert_eq!(
+                sim.model().input.text(),
+                "unsent draft\nwith @attachment.png"
+            );
             assert_eq!(sim.model().input.cursor(), cursor);
             assert_eq!(sim.model().input.undo_op_count(), undo_count);
             assert_eq!(sim.model().input_history, ["previous authored prompt"]);
@@ -27605,10 +27614,19 @@ mod tests {
                 (model, submit_rx)
             };
             for blocked in [
-                "busy", "working", "login", "settings", "ask", "extension", "release", "repeat", "super",
+                "busy",
+                "working",
+                "login",
+                "settings",
+                "ask",
+                "extension",
+                "release",
+                "repeat",
+                "super",
             ] {
                 let (mut model, submit_rx) = model_for_case();
-                let Event::Key(mut chord) = key(KeyCode::Char('k'), Modifiers::CTRL | Modifiers::ALT)
+                let Event::Key(mut chord) =
+                    key(KeyCode::Char('k'), Modifiers::CTRL | Modifiers::ALT)
                 else {
                     unreachable!();
                 };
@@ -27688,9 +27706,10 @@ mod tests {
             );
             assert_eq!(sim.model().input.cursor().grapheme, 0);
             let (model, submit_rx) = model_for_case();
-            let mut sim = ProgramSimulator::new(model.with_keybindings(keybindings_from_json(
-                r#"{"openSettings": ["ctrl+alt+k"]}"#,
-            )));
+            let mut sim = ProgramSimulator::new(
+                model
+                    .with_keybindings(keybindings_from_json(r#"{"openSettings": ["ctrl+alt+k"]}"#)),
+            );
             sim.init();
             sim.inject_event(key(KeyCode::Char('k'), Modifiers::CTRL | Modifiers::ALT));
             assert_eq!(submit_rx.try_recv().unwrap(), UiCommand::Settings);

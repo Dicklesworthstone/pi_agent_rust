@@ -705,7 +705,14 @@ impl McpManager {
         let entry = self.entry(name)?;
         self.check_authentication_entry(&entry)?;
         let binding = self.authentication_binding(&entry)?;
-        if entry.config.headers.iter().filter(|(name, _)| !name.eq_ignore_ascii_case("authorization")).count() > 95 {
+        if entry
+            .config
+            .headers
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+            .count()
+            > 95
+        {
             return Err(tool_err(
                 "MCP_CONFIG_INVALID",
                 "managed OAuth requires room for its Authorization header; at most 95 custom headers are supported",
@@ -745,12 +752,16 @@ impl McpManager {
                     )
                 })?;
                 Self::retire_authenticated_connection(&entry);
-                let (entry, _lane) = repair.publish(self, &entry, &owner, lane).await.map_err(|error| {
-                    tool_err(
-                        "MCP_AUTH_REPAIR_FAILED",
-                        format!("login saved, but the source repair could not be completed: {error}"),
-                    )
-                })?;
+                let (entry, _lane) = repair.publish(self, &entry, &owner, lane).await.map_err(
+                    |error| {
+                        tool_err(
+                            "MCP_AUTH_REPAIR_FAILED",
+                            format!(
+                                "login saved, but the source repair could not be completed: {error}"
+                            ),
+                        )
+                    },
+                )?;
                 self.ensure_ready_in_lane(&entry).await.map_err(|error| {
                     tool_err(
                         "MCP_AUTH_RECONNECT_FAILED",

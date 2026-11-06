@@ -13483,7 +13483,10 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
         abort: Option<crate::agent::AbortSignal>,
     ) -> Result<Value> {
-        if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+        if abort
+            .as_ref()
+            .is_some_and(crate::agent::AbortSignal::is_aborted)
+        {
             return Err(Error::Aborted);
         }
         let kind = interaction.kind();
@@ -13533,7 +13536,10 @@ impl JsExtensionRuntimeHandle {
         )
         .await;
         if let Ok(Some(result)) = completion {
-            if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+            if abort
+                .as_ref()
+                .is_some_and(crate::agent::AbortSignal::is_aborted)
+            {
                 Err(Error::Aborted)
             } else {
                 result
@@ -13548,7 +13554,10 @@ impl JsExtensionRuntimeHandle {
             }
             // For a queued command, admission's matching handshake
             // prevents execution after this immediate cancellation reply.
-            if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+            if abort
+                .as_ref()
+                .is_some_and(crate::agent::AbortSignal::is_aborted)
+            {
                 Err(Error::Aborted)
             } else {
                 Err(Error::extension(format!(
@@ -16779,7 +16788,11 @@ async fn await_js_interaction_task(
     }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 async fn execute_extension_interaction_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -16874,7 +16887,9 @@ async fn execute_extension_interaction_sharded(
                     Err(quarantine_runtime_shard(
                         shards,
                         shard_index,
-                        &format!("{kind} cancelled or deadline elapsed during registry publication"),
+                        &format!(
+                            "{kind} cancelled or deadline elapsed during registry publication"
+                        ),
                     ))
                 } else {
                     refreshed.and(result)
@@ -20562,14 +20577,8 @@ async fn dispatch_shared_allowed_legacy(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            dispatch_hostcall_tool(
-                ctx.tools,
-                ctx.js_runtime,
-                &call.call_id,
-                name,
-                &call.params,
-            )
-            .await
+            dispatch_hostcall_tool(ctx.tools, ctx.js_runtime, &call.call_id, name, &call.params)
+                .await
         }
         "exec" => {
             let cmd = call
@@ -21034,16 +21043,17 @@ pub(crate) async fn dispatch_hostcall_tool<C: crate::scheduler::Clock + 'static>
         };
     }
     let progress = stream.then(|| Arc::new(NativeFactoryProgress::default()));
-    let on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>> = progress.as_ref().map(|progress| {
-        let progress = Arc::clone(progress);
-        Box::new(move |update| {
-            *progress
-                .latest
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(update);
-            progress.waker.wake();
-        }) as Box<dyn Fn(ToolUpdate) + Send + Sync>
-    });
+    let on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>> =
+        progress.as_ref().map(|progress| {
+            let progress = Arc::clone(progress);
+            Box::new(move |update| {
+                *progress
+                    .latest
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(update);
+                progress.waker.wake();
+            }) as Box<dyn Fn(ToolUpdate) + Send + Sync>
+        });
     let input = params.get("input").cloned().unwrap_or(Value::Null);
     let mut execution = if builtin {
         tool.execute_from_factory(call_id, input, cwd, options, on_update)

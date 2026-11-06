@@ -1324,7 +1324,9 @@ fn response_stop_outcome(wire_reason: &str, has_tools: bool) -> (StopReason, Opt
         ),
         "malformed_model_output" => (
             StopReason::Error,
-            Some("Bedrock malformed_model_output: invalid model response; local tool calls withheld"),
+            Some(
+                "Bedrock malformed_model_output: invalid model response; local tool calls withheld",
+            ),
         ),
         // Do not echo unknown wire strings, which may contain secrets or
         // terminal controls. These are provider failures, never normal stops.
@@ -1665,7 +1667,8 @@ mod tests {
         let mut request = Vec::new();
         let mut chunk = [0_u8; 4096];
         let header_end = loop {
-            let read = read_with_deadline(&mut socket, &mut chunk, deadline, "read Bedrock request");
+            let read =
+                read_with_deadline(&mut socket, &mut chunk, deadline, "read Bedrock request");
             assert!(read > 0, "Bedrock request ended before its headers");
             request.extend_from_slice(&chunk[..read]);
             if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -1702,7 +1705,8 @@ mod tests {
             })
             .expect("capture Bedrock request");
 
-        let response_body = serde_json::to_string(response_body).expect("serialize Bedrock response");
+        let response_body =
+            serde_json::to_string(response_body).expect("serialize Bedrock response");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
             response_body.len()
@@ -2332,7 +2336,8 @@ mod tests {
 
     fn collect_json_reply(response: Value) -> Vec<Result<StreamEvent>> {
         let (base_url, requests) = spawn_bedrock_json_server(vec![response]);
-        let provider = BedrockProvider::new("model-a").with_base_url(format!("{base_url}/converse"));
+        let provider =
+            BedrockProvider::new("model-a").with_base_url(format!("{base_url}/converse"));
         let options = StreamOptions {
             api_key: Some("fixture-bearer-token".to_string()),
             ..StreamOptions::default()
@@ -2408,7 +2413,11 @@ mod tests {
             let events = collect_json_reply(json_reply(
                 vec![
                     json!({"text": "retained explanation"}),
-                    json_tool("call-a", "write", json!({"path": "kept.txt", "content": "x"})),
+                    json_tool(
+                        "call-a",
+                        "write",
+                        json!({"path": "kept.txt", "content": "x"}),
+                    ),
                 ],
                 reason,
             ));
@@ -2544,7 +2553,11 @@ mod tests {
             &error.content[0], ContentBlock::Text(text) if text.text == "retained explanation"
         ));
         assert!(
-            error.error_message.as_deref().unwrap().contains("ambiguous tool content")
+            error
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("ambiguous tool content")
         );
     }
 
@@ -2635,22 +2648,32 @@ mod tests {
             let result = runtime
                 .block_on(async {
                     agent
-                        .run("Write the marker when the provider authorizes it.", move |event| {
-                            if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                                observed_calls.fetch_add(1, Ordering::SeqCst);
-                            }
-                        })
+                        .run(
+                            "Write the marker when the provider authorizes it.",
+                            move |event| {
+                                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                                }
+                            },
+                        )
                         .await
                 })
                 .expect("agent response");
-            assert_eq!(calls.load(Ordering::SeqCst), usize::from(authorized), "{case}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(authorized),
+                "{case}"
+            );
             assert_eq!(
                 marker.exists(),
                 authorized,
                 "{case} must respect tool authorization"
             );
             if authorized {
-                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "authorized write");
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap(),
+                    "authorized write"
+                );
                 assert_eq!(result.stop_reason, StopReason::Stop);
             } else {
                 assert_eq!(result.stop_reason, StopReason::Error, "{case}");

@@ -57,9 +57,11 @@ pub fn parse_path(path: &str) -> Result<Option<ArchivePath>> {
 fn is_archive_path(path: &str) -> bool {
     let path = Path::new(path);
     path.extension().is_some_and(|extension| {
-        ["zip", "jar", "war", "ear", "apk", "whl", "tar", "tgz", "crate"]
-            .iter()
-            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        [
+            "zip", "jar", "war", "ear", "apk", "whl", "tar", "tgz", "crate",
+        ]
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
             || (extension.eq_ignore_ascii_case("gz")
                 && path.file_stem().is_some_and(|stem| {
                     Path::new(stem)

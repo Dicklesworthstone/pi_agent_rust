@@ -219,7 +219,10 @@ done
         assert_eq!(compaction_events.len(), 2);
         assert_eq!(compaction_events[0]["type"], "manual_compaction_start");
         assert_eq!(compaction_events[1]["type"], "manual_compaction_end");
-        assert_eq!(client.compact().await.unwrap().first_kept_entry_id, "kept-2");
+        assert_eq!(
+            client.compact().await.unwrap().first_kept_entry_id,
+            "kept-2"
+        );
 
         assert!(client.handoff(Some(&"x".repeat(4097))).await.is_err());
         let mut handoff_events = Vec::new();

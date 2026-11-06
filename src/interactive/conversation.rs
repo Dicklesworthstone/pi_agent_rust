@@ -265,7 +265,12 @@ mod tests {
             },
         });
         for (id, tool_name, is_error, text) in [
-            ("first", "write", false, "\u{1b}[31m## First update\u{1b}[0m"),
+            (
+                "first",
+                "write",
+                false,
+                "\u{1b}[31m## First update\u{1b}[0m",
+            ),
             ("denied", "write", true, "must not become a reply"),
             ("other", "read", false, "must remain a tool result"),
             ("second", "write", false, "## Second update"),

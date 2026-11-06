@@ -24,10 +24,13 @@ fn json_response(status: &str, value: &Value) -> String {
 
 fn live_response(origin: &str, methods: &[String], request: &CapturedRequest) -> String {
     if request.method == "POST" && request.target == "/token" {
-        return json_response("200 OK", &json!({
-            "access_token":"managed-access", "refresh_token":"managed-refresh",
-            "token_type":"Bearer", "expires_in":3600
-        }));
+        return json_response(
+            "200 OK",
+            &json!({
+                "access_token":"managed-access", "refresh_token":"managed-refresh",
+                "token_type":"Bearer", "expires_in":3600
+            }),
+        );
     }
     if request.target != "/mcp" {
         return fixture_response(origin, methods, request);
@@ -59,7 +62,10 @@ fn live_response(origin: &str, methods: &[String], request: &CapturedRequest) ->
                 Some("tools/call") => json!({"content":[{"type":"text","text":"authenticated"}]}),
                 _ => panic!("unexpected MCP request: {rpc}"),
             };
-            json_response("200 OK", &json!({"jsonrpc":"2.0","id":rpc["id"],"result":result}))
+            json_response(
+                "200 OK",
+                &json!({"jsonrpc":"2.0","id":rpc["id"],"result":result}),
+            )
         }
         _ => panic!("unexpected HTTP method"),
     }
@@ -70,12 +76,16 @@ fn server() -> OAuthFixture {
 }
 
 fn browser(fixture: &OAuthFixture) -> Arc<dyn Fn(&str) + Send + Sync> {
-    browser_callback(Arc::new(Mutex::new(Vec::new())), format!("{}/", fixture.origin))
+    browser_callback(
+        Arc::new(Mutex::new(Vec::new())),
+        format!("{}/", fixture.origin),
+    )
 }
 
 fn acknowledge(manager: &McpManager) -> Arc<ServerEntry> {
     let entry = manager.entry("remote").expect("selected server");
-    TrustStore::load(&manager.inner.trust_path).expect("load trust")
+    TrustStore::load(&manager.inner.trust_path)
+        .expect("load trust")
         .acknowledge("remote", &manager.trust_fingerprint_for(&entry), "operator")
         .expect("acknowledge selected server");
     entry
@@ -97,9 +107,14 @@ fn file_manager(temp: &tempfile::TempDir, url: &str) -> (McpManager, PathBuf, Pa
             "untouched":{"url":format!("{url}/other"),"headers":{"Authorization":"Bearer other"}}
         }
     }).to_string()).expect("winning project definition");
-    std::fs::write(&shadow, json!({"mcpServers":{"remote":{
-        "url":"http://127.0.0.1:9/mcp", "headers":{"Authorization":"Bearer global"}
-    }}}).to_string()).expect("shadowed global definition");
+    std::fs::write(
+        &shadow,
+        json!({"mcpServers":{"remote":{
+            "url":"http://127.0.0.1:9/mcp", "headers":{"Authorization":"Bearer global"}
+        }}})
+        .to_string(),
+    )
+    .expect("shadowed global definition");
     let manager = McpManager::bootstrap(&workspace, &global, &[], true).expect("discover manager");
     assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
     acknowledge(&manager);
@@ -111,11 +126,19 @@ fn auth_snapshot(manager: &McpManager) -> Vec<(OsString, Vec<u8>)> {
     if !directory.exists() {
         return Vec::new();
     }
-    let mut files: Vec<_> = std::fs::read_dir(directory).expect("credential directory")
+    let mut files: Vec<_> = std::fs::read_dir(directory)
+        .expect("credential directory")
         .map(|entry| entry.expect("credential entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
-        .map(|path| (path.file_name().expect("credential name").to_os_string(),
-            std::fs::read(&path).expect("credential bytes")))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .map(|path| {
+            (
+                path.file_name().expect("credential name").to_os_string(),
+                std::fs::read(&path).expect("credential bytes"),
+            )
+        })
         .collect();
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
@@ -130,46 +153,119 @@ fn reauth_repairs_only_the_winning_source_and_restores_live_and_reloaded_tools()
     let old = manager.entry("remote").expect("old definition");
     let old_fingerprint = manager.trust_fingerprint_for(&old);
     runtime().block_on(async {
-        manager.refresh_tools("remote").await.expect_err("stale bearer is rejected");
-        manager.reauthenticate("remote", None, browser(&fixture)).await.expect("explicit reauth");
+        manager
+            .refresh_tools("remote")
+            .await
+            .expect_err("stale bearer is rejected");
+        manager
+            .reauthenticate("remote", None, browser(&fixture))
+            .await
+            .expect("explicit reauth");
         let current = manager.entry("remote").expect("repaired definition");
         assert!(!Arc::ptr_eq(&old, &current));
         assert!(!has_authorization(&current.config));
         assert_eq!(manager.mounted_tool_metas().len(), 1);
-        let result = manager.call_tool("remote", "echo", json!({})).await.expect("authenticated tool");
+        let result = manager
+            .call_tool("remote", "echo", json!({}))
+            .await
+            .expect("authenticated tool");
         assert_eq!(result["content"][0]["text"], "authenticated");
-        let source_value: Value = serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("source JSON");
-        assert_eq!(source_value["mcpServers"]["remote"]["headers"], json!({"X-Tenant":"workspace"}));
-        assert_eq!(source_value["mcpServers"]["remote"]["cwd"], "${workspaceFolder}");
-        assert_eq!(source_value["mcpServers"]["remote"]["oauth"]["clientId"], "fixture-public-client");
-        assert_eq!(source_value["mcpServers"]["untouched"]["headers"]["Authorization"], "Bearer other");
+        let source_value: Value =
+            serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("source JSON");
+        assert_eq!(
+            source_value["mcpServers"]["remote"]["headers"],
+            json!({"X-Tenant":"workspace"})
+        );
+        assert_eq!(
+            source_value["mcpServers"]["remote"]["cwd"],
+            "${workspaceFolder}"
+        );
+        assert_eq!(
+            source_value["mcpServers"]["remote"]["oauth"]["clientId"],
+            "fixture-public-client"
+        );
+        assert_eq!(
+            source_value["mcpServers"]["untouched"]["headers"]["Authorization"],
+            "Bearer other"
+        );
         assert_eq!(source_value["clientFlags"]["preserve"], true);
-        assert_eq!(std::fs::read(&shadow).expect("shadow after reauth"), shadow_before);
+        assert_eq!(
+            std::fs::read(&shadow).expect("shadow after reauth"),
+            shadow_before
+        );
         let trust = TrustStore::load(&manager.inner.trust_path).expect("updated trust");
-        assert_eq!(trust.decision("remote", &old_fingerprint), TrustDecision::Pending);
-        assert_eq!(trust.decision("remote", &manager.trust_fingerprint_for(&current)), TrustDecision::Acknowledged);
-        assert_eq!(trust.records()["remote"].audit.last().expect("repair audit").action, "reauthenticated");
+        assert_eq!(
+            trust.decision("remote", &old_fingerprint),
+            TrustDecision::Pending
+        );
+        assert_eq!(
+            trust.decision("remote", &manager.trust_fingerprint_for(&current)),
+            TrustDecision::Acknowledged
+        );
+        assert_eq!(
+            trust.records()["remote"]
+                .audit
+                .last()
+                .expect("repair audit")
+                .action,
+            "reauthenticated"
+        );
         manager.shutdown_all().await;
 
-        let reloaded = McpManager::bootstrap(&manager.inner.cwd, &manager.inner.global_dir, &[], true)
-            .expect("reload source");
-        assert_eq!(reloaded.refresh_tools("remote").await.expect("persisted grant after restart").len(), 1);
-        reloaded.unauthenticate("remote").await.expect("logout repaired definition");
-        reloaded.refresh_tools("remote").await.expect_err("logout cannot revive the removed bearer");
+        let reloaded =
+            McpManager::bootstrap(&manager.inner.cwd, &manager.inner.global_dir, &[], true)
+                .expect("reload source");
+        assert_eq!(
+            reloaded
+                .refresh_tools("remote")
+                .await
+                .expect("persisted grant after restart")
+                .len(),
+            1
+        );
+        reloaded
+            .unauthenticate("remote")
+            .await
+            .expect("logout repaired definition");
+        reloaded
+            .refresh_tools("remote")
+            .await
+            .expect_err("logout cannot revive the removed bearer");
         reloaded.shutdown_all().await;
     });
     let requests = fixture.captured();
-    let initializations: Vec<_> = requests.iter().filter(|request| {
-        request.target == "/mcp" && request.method == "POST"
-            && serde_json::from_slice::<Value>(&request.body).expect("RPC")["method"] == "initialize"
-    }).collect();
-    assert_eq!(initializations.len(), 3, "stale attempt, repaired session, and disk reload");
-    assert_eq!(initializations[0].headers.get("authorization").map(String::as_str), Some("Bearer expired"));
+    let initializations: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.target == "/mcp"
+                && request.method == "POST"
+                && serde_json::from_slice::<Value>(&request.body).expect("RPC")["method"]
+                    == "initialize"
+        })
+        .collect();
+    assert_eq!(
+        initializations.len(),
+        3,
+        "stale attempt, repaired session, and disk reload"
+    );
+    assert_eq!(
+        initializations[0]
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some("Bearer expired")
+    );
     assert!(initializations[1..].iter().all(|request| {
         request.headers.get("authorization").map(String::as_str) == Some("Bearer managed-access")
             && request.headers.get("x-tenant").map(String::as_str) == Some("workspace")
     }));
-    assert_eq!(requests.iter().filter(|request| request.target == "/token").count(), 1);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.target == "/token")
+            .count(),
+        1
+    );
     assert!(!requests.iter().any(|request| request.target == "/register"));
 }
 
@@ -183,30 +279,63 @@ fn client_owned_headers_are_repaired_without_creating_or_rewriting_a_config() {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&global).expect("global");
         let manager = if provenance == Provenance::Acp {
-            let servers = crate::mcp::config::parse_acp_servers(&json!({"mcpServers":[{
-                "name":"remote", "type":"http", "url":fixture.resource(),
-                "headers":[{"name":"Authorization","value":"Bearer expired"}]
-            }]}), &workspace).expect("ACP definitions").expect("ACP array");
-            McpManager::new(&workspace, &global, McpDiscovery { servers, warnings:Vec::new() })
+            let servers = crate::mcp::config::parse_acp_servers(
+                &json!({"mcpServers":[{
+                    "name":"remote", "type":"http", "url":fixture.resource(),
+                    "headers":[{"name":"Authorization","value":"Bearer expired"}]
+                }]}),
+                &workspace,
+            )
+            .expect("ACP definitions")
+            .expect("ACP array");
+            McpManager::new(
+                &workspace,
+                &global,
+                McpDiscovery {
+                    servers,
+                    warnings: Vec::new(),
+                },
+            )
         } else {
             let manager = McpManager::new(&workspace, &global, McpDiscovery::default());
-            manager.register_extension_server("remote", &json!({
-                "url":fixture.resource(), "headers":{"Authorization":"Bearer expired"},
-                "extension_id":"fixture"
-            }));
+            manager.register_extension_server(
+                "remote",
+                &json!({
+                    "url":fixture.resource(), "headers":{"Authorization":"Bearer expired"},
+                    "extension_id":"fixture"
+                }),
+            );
             manager
         };
         let entry = acknowledge(&manager);
         let original_trust = std::fs::read(&manager.inner.trust_path).expect("trust snapshot");
         runtime().block_on(async {
-            manager.reauthenticate("remote", None, browser(&fixture)).await.expect("client-owned reauth");
-            assert!(Arc::ptr_eq(&entry, &manager.entry("remote").expect("same definition")));
-            assert!(has_authorization(&entry.config), "client remains owner of its definition");
+            manager
+                .reauthenticate("remote", None, browser(&fixture))
+                .await
+                .expect("client-owned reauth");
+            assert!(Arc::ptr_eq(
+                &entry,
+                &manager.entry("remote").expect("same definition")
+            ));
+            assert!(
+                has_authorization(&entry.config),
+                "client remains owner of its definition"
+            );
             assert_eq!(manager.mounted_tool_metas().len(), 1);
-            assert_eq!(std::fs::read(&manager.inner.trust_path).expect("trust after login"), original_trust);
-            manager.unauthenticate("remote").await.expect("client-owned logout");
+            assert_eq!(
+                std::fs::read(&manager.inner.trust_path).expect("trust after login"),
+                original_trust
+            );
+            manager
+                .unauthenticate("remote")
+                .await
+                .expect("client-owned logout");
             let count = fixture.captured().len();
-            manager.refresh_tools("remote").await.expect_err("tombstone suppresses authored bearer");
+            manager
+                .refresh_tools("remote")
+                .await
+                .expect_err("tombstone suppresses authored bearer");
             assert_eq!(fixture.captured().len(), count);
             manager.shutdown_all().await;
         });
@@ -223,7 +352,8 @@ fn editing_the_source_during_browser_login_preserves_the_edit_and_previous_trust
     let (manager, source, _) = file_manager(&temp, &fixture.resource());
     let trust_before = std::fs::read(&manager.inner.trust_path).expect("trust");
     let auth_before = auth_snapshot(&manager);
-    let mut edited: Value = serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("source JSON");
+    let mut edited: Value =
+        serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("source JSON");
     edited["clientFlags"]["editedDuringLogin"] = json!(true);
     let edited = edited.to_string();
     let edit_path = source.clone();
@@ -234,14 +364,31 @@ fn editing_the_source_during_browser_login_preserves_the_edit_and_previous_trust
         callback(url);
     });
     runtime().block_on(async {
-        let error = manager.reauthenticate("remote", None, callback).await.expect_err("source changed during login");
-        assert!(error.to_string().contains("MCP_AUTH_SOURCE_CHANGED"), "{error}");
+        let error = manager
+            .reauthenticate("remote", None, callback)
+            .await
+            .expect_err("source changed during login");
+        assert!(
+            error.to_string().contains("MCP_AUTH_SOURCE_CHANGED"),
+            "{error}"
+        );
         manager.shutdown_all().await;
     });
-    assert_eq!(std::fs::read_to_string(source).expect("preserved edit"), edited);
-    assert_eq!(std::fs::read(&manager.inner.trust_path).expect("trust"), trust_before);
+    assert_eq!(
+        std::fs::read_to_string(source).expect("preserved edit"),
+        edited
+    );
+    assert_eq!(
+        std::fs::read(&manager.inner.trust_path).expect("trust"),
+        trust_before
+    );
     assert_eq!(auth_snapshot(&manager), auth_before);
-    assert!(!fixture.captured().iter().any(|request| request.target == "/token"));
+    assert!(
+        !fixture
+            .captured()
+            .iter()
+            .any(|request| request.target == "/token")
+    );
 }
 
 #[test]
@@ -256,19 +403,31 @@ fn denial_during_browser_login_prevents_grant_and_source_publication() {
     let denied_fingerprint = fingerprint.clone();
     let callback = browser(&fixture);
     let callback = Arc::new(move |url: &str| {
-        TrustStore::load(&trust_path).expect("peer trust store")
-            .deny("remote", &denied_fingerprint, "operator").expect("peer denial");
+        TrustStore::load(&trust_path)
+            .expect("peer trust store")
+            .deny("remote", &denied_fingerprint, "operator")
+            .expect("peer denial");
         callback(url);
     });
     runtime().block_on(async {
-        let error = manager.reauthenticate("remote", None, callback).await.expect_err("denied during browser flow");
+        let error = manager
+            .reauthenticate("remote", None, callback)
+            .await
+            .expect_err("denied during browser flow");
         assert!(error.to_string().contains("MCP_TRUST_DENIED"), "{error}");
         manager.shutdown_all().await;
     });
-    assert_eq!(std::fs::read(source).expect("source after denial"), source_before);
+    assert_eq!(
+        std::fs::read(source).expect("source after denial"),
+        source_before
+    );
     assert!(auth_snapshot(&manager).is_empty());
-    assert_eq!(TrustStore::load(&manager.inner.trust_path).expect("trust")
-        .decision("remote", &fingerprint), TrustDecision::Denied);
+    assert_eq!(
+        TrustStore::load(&manager.inner.trust_path)
+            .expect("trust")
+            .decision("remote", &fingerprint),
+        TrustDecision::Denied
+    );
 }
 
 fn observed_url() -> (
@@ -277,12 +436,15 @@ fn observed_url() -> (
 ) {
     let (sender, receiver) = futures::channel::oneshot::channel();
     let sender = Mutex::new(Some(sender));
-    (Arc::new(move |url: &str| {
-        let taken = sender.lock().expect("URL sender").take();
-        if let Some(sender) = taken {
-            sender.send(url.to_string()).expect("browser observer");
-        }
-    }), receiver)
+    (
+        Arc::new(move |url: &str| {
+            let taken = sender.lock().expect("URL sender").take();
+            if let Some(sender) = taken {
+                sender.send(url.to_string()).expect("browser observer");
+            }
+        }),
+        receiver,
+    )
 }
 
 #[test]
@@ -303,9 +465,17 @@ fn cancelling_a_pending_browser_flow_leaves_source_trust_and_credentials_unchang
         manager.shutdown_all().await;
     });
     assert_eq!(std::fs::read(source).expect("source"), source_before);
-    assert_eq!(std::fs::read(&manager.inner.trust_path).expect("trust"), trust_before);
+    assert_eq!(
+        std::fs::read(&manager.inner.trust_path).expect("trust"),
+        trust_before
+    );
     assert_eq!(auth_snapshot(&manager), auth_before);
-    assert!(!fixture.captured().iter().any(|request| request.target == "/token"));
+    assert!(
+        !fixture
+            .captured()
+            .iter()
+            .any(|request| request.target == "/token")
+    );
 }
 
 #[test]
@@ -322,32 +492,49 @@ fn logout_while_the_browser_waits_fences_late_login_and_never_restores_static_au
             futures::future::Either::Left((Ok(url), login)) => (url, login),
             _ => panic!("browser wait must precede logout"),
         };
-        manager.unauthenticate("remote").await.expect("explicit logout during pending login");
+        manager
+            .unauthenticate("remote")
+            .await
+            .expect("explicit logout during pending login");
         let logged_out = auth_snapshot(&manager);
         assert_eq!(logged_out.len(), 1, "logout persists a durable tombstone");
         browser(&fixture)(&url);
-        let error = login.await.expect_err("late browser login cannot overwrite logout");
+        let error = login
+            .await
+            .expect_err("late browser login cannot overwrite logout");
         assert!(error.to_string().contains("MCP_AUTH_SUPERSEDED"), "{error}");
         assert_eq!(auth_snapshot(&manager), logged_out);
         let before = fixture.captured().len();
-        manager.refresh_tools("remote").await.expect_err("static bearer remains revoked");
+        manager
+            .refresh_tools("remote")
+            .await
+            .expect_err("static bearer remains revoked");
         assert_eq!(fixture.captured().len(), before);
         manager.shutdown_all().await;
     });
     assert_eq!(std::fs::read(source).expect("source"), source_before);
-    assert_eq!(std::fs::read(&manager.inner.trust_path).expect("trust"), trust_before);
+    assert_eq!(
+        std::fs::read(&manager.inner.trust_path).expect("trust"),
+        trust_before
+    );
 }
 
 #[test]
 fn source_compare_and_swap_checks_identity_bytes_and_final_withdrawal() {
-    for change in ["same-bytes-new-file", "edited-in-place", "withdrawn-at-commit"] {
+    for change in [
+        "same-bytes-new-file",
+        "edited-in-place",
+        "withdrawn-at-commit",
+    ] {
         let temp = tempfile::tempdir().expect("fixture directory");
         let (manager, source, _) = file_manager(&temp, "http://127.0.0.1:9/mcp");
         let entry = manager.entry("remote").expect("entry");
-        let repair = SourceRepair::prepare(&entry.config, &manager.inner.cwd).expect("capture source");
+        let repair =
+            SourceRepair::prepare(&entry.config, &manager.inner.cwd).expect("capture source");
         let original = std::fs::read(&source).expect("original source");
         let expected = if change == "same-bytes-new-file" {
-            std::fs::rename(&source, source.with_extension("original.json")).expect("move original inode");
+            std::fs::rename(&source, source.with_extension("original.json"))
+                .expect("move original inode");
             std::fs::write(&source, &original).expect("replacement with identical bytes");
             original
         } else if change == "edited-in-place" {
@@ -361,13 +548,19 @@ fn source_compare_and_swap_checks_identity_bytes_and_final_withdrawal() {
         let admissions = std::sync::atomic::AtomicUsize::new(0);
         let result = repair.commit(&|| {
             if admissions.fetch_add(1, Ordering::AcqRel) == 1 {
-                return Err(super::super::tool_err("MCP_CANCELLED", "fixture withdrawal"));
+                return Err(super::super::tool_err(
+                    "MCP_CANCELLED",
+                    "fixture withdrawal",
+                ));
             }
             Ok(())
         });
         assert!(result.is_err(), "{change} must refuse source publication");
         assert!(!repair.committed.load(Ordering::Acquire));
-        assert_eq!(std::fs::read(source).expect("source after CAS refusal"), expected);
+        assert_eq!(
+            std::fs::read(source).expect("source after CAS refusal"),
+            expected
+        );
     }
 }
 
@@ -385,8 +578,14 @@ fn replacing_the_parent_directory_cannot_redirect_source_publication() {
     std::fs::create_dir(parent).expect("replacement parent");
     std::fs::write(&source, &original).expect("replacement source");
     assert!(repair.commit(&|| Ok(())).is_err());
-    assert_eq!(std::fs::read(source).expect("replacement unchanged"), original);
-    assert_eq!(std::fs::read(moved.join("mcp.json")).expect("pinned original unchanged"), original);
+    assert_eq!(
+        std::fs::read(source).expect("replacement unchanged"),
+        original
+    );
+    assert_eq!(
+        std::fs::read(moved.join("mcp.json")).expect("pinned original unchanged"),
+        original
+    );
 }
 
 #[test]
@@ -419,9 +618,14 @@ fn source_repair_preserves_authored_values_across_native_editor_and_codex_format
         std::fs::create_dir_all(&global).expect("global directory");
         std::fs::write(&source, &content).expect("authored source");
         let manager = McpManager::bootstrap(&workspace, &global, &[], true).expect("discovery");
-        assert!(manager.warnings().is_empty(), "{relative}: {:?}", manager.warnings());
+        assert!(
+            manager.warnings().is_empty(),
+            "{relative}: {:?}",
+            manager.warnings()
+        );
         let selected = manager.entry("remote").expect("selected source");
-        let repair = SourceRepair::prepare(&selected.config, &manager.inner.cwd).expect("source repair");
+        let repair =
+            SourceRepair::prepare(&selected.config, &manager.inner.cwd).expect("source repair");
         let rendered = std::str::from_utf8(&repair.rendered).expect("rendered source");
         assert!(!has_authorization(&repair.repaired));
         if std::path::Path::new(relative)
@@ -432,19 +636,36 @@ fn source_repair_preserves_authored_values_across_native_editor_and_codex_format
             assert_eq!(value["model"].as_str(), Some("preserved"));
             let server = &value["mcp_servers"]["remote"];
             assert_eq!(server["cwd"].as_str(), Some("${workspaceFolder}"));
-            assert_eq!(server["headers"]["X-Keep"].as_str(), Some("${workspaceFolder}"));
+            assert_eq!(
+                server["headers"]["X-Keep"].as_str(),
+                Some("${workspaceFolder}")
+            );
             assert!(server["headers"].get("Authorization").is_none());
             assert!(server["http_headers"].get("authorization").is_none());
-            assert_eq!(server["http_headers"]["X-Alias"].as_str(), Some("preserved"));
-            assert_eq!(value["mcp_servers"]["untouched"]["url"].as_str(), Some("http://127.0.0.1:9/other"));
+            assert_eq!(
+                server["http_headers"]["X-Alias"].as_str(),
+                Some("preserved")
+            );
+            assert_eq!(
+                value["mcp_servers"]["untouched"]["url"].as_str(),
+                Some("http://127.0.0.1:9/other")
+            );
         } else {
             let value: Value = serde_json::from_str(rendered).expect("repaired JSON");
-            let servers = value.get("mcpServers").or_else(|| value.get("servers"))
+            let servers = value
+                .get("mcpServers")
+                .or_else(|| value.get("servers"))
                 .or_else(|| value.get("mcp").and_then(|mcp| mcp.get("servers")))
                 .unwrap_or(&value);
-            assert_eq!(servers["remote"]["headers"], json!({"X-Keep":"${workspaceFolder}"}));
+            assert_eq!(
+                servers["remote"]["headers"],
+                json!({"X-Keep":"${workspaceFolder}"})
+            );
             assert_eq!(servers["remote"]["cwd"], "${workspaceFolder}");
-            assert_eq!(servers["remote"]["oauth"]["clientId"], "${CLIENT_ID:-fixture}");
+            assert_eq!(
+                servers["remote"]["oauth"]["clientId"],
+                "${CLIENT_ID:-fixture}"
+            );
             assert_eq!(servers["untouched"]["url"], "http://127.0.0.1:9/other");
             if relative.starts_with(".vscode") {
                 assert_eq!(value["inputs"], json!([{"id":"preserved"}]));
@@ -452,7 +673,10 @@ fn source_repair_preserves_authored_values_across_native_editor_and_codex_format
                 assert_eq!(value["editorSetting"], "preserved");
             }
         }
-        assert_eq!(std::fs::read_to_string(source).expect("capture is read-only"), content);
+        assert_eq!(
+            std::fs::read_to_string(source).expect("capture is read-only"),
+            content
+        );
     }
 }
 
@@ -462,10 +686,14 @@ fn a_source_disabled_or_reconfigured_before_login_must_be_reloaded() {
         let temp = tempfile::tempdir().expect("source fixture");
         let (manager, source, _) = file_manager(&temp, "http://127.0.0.1:9/mcp");
         let entry = manager.entry("remote").expect("original entry");
-        let mut value: Value = serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("JSON");
+        let mut value: Value =
+            serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("JSON");
         value["mcpServers"]["remote"][field] = replacement;
         std::fs::write(&source, value.to_string()).expect("operator edit before login");
-        assert!(SourceRepair::prepare(&entry.config, &manager.inner.cwd).is_err(), "{field} changed");
+        assert!(
+            SourceRepair::prepare(&entry.config, &manager.inner.cwd).is_err(),
+            "{field} changed"
+        );
     }
 }
 
@@ -478,20 +706,38 @@ fn explicit_cli_source_repair_leaves_project_and_user_definitions_untouched() {
     let global_before = std::fs::read(&global).expect("global snapshot");
     let cli = temp.path().join("selected-mcp.json");
     std::fs::write(&cli, &project_before).expect("explicit CLI config");
-    let manager = McpManager::bootstrap(&base.inner.cwd, &base.inner.global_dir, std::slice::from_ref(&cli), true)
-        .expect("CLI discovery");
+    let manager = McpManager::bootstrap(
+        &base.inner.cwd,
+        &base.inner.global_dir,
+        std::slice::from_ref(&cli),
+        true,
+    )
+    .expect("CLI discovery");
     let entry = acknowledge(&manager);
     assert_eq!(entry.config.provenance, Provenance::Cli);
     runtime().block_on(async {
-        manager.reauthenticate("remote", None, browser(&fixture)).await.expect("CLI source repair");
+        manager
+            .reauthenticate("remote", None, browser(&fixture))
+            .await
+            .expect("CLI source repair");
         assert_eq!(manager.mounted_tool_metas().len(), 1);
         manager.shutdown_all().await;
         base.shutdown_all().await;
     });
-    let repaired: Value = serde_json::from_slice(&std::fs::read(cli).expect("CLI source")).expect("JSON");
-    assert_eq!(repaired["mcpServers"]["remote"]["headers"], json!({"X-Tenant":"workspace"}));
-    assert_eq!(std::fs::read(project).expect("project after reauth"), project_before);
-    assert_eq!(std::fs::read(global).expect("global after reauth"), global_before);
+    let repaired: Value =
+        serde_json::from_slice(&std::fs::read(cli).expect("CLI source")).expect("JSON");
+    assert_eq!(
+        repaired["mcpServers"]["remote"]["headers"],
+        json!({"X-Tenant":"workspace"})
+    );
+    assert_eq!(
+        std::fs::read(project).expect("project after reauth"),
+        project_before
+    );
+    assert_eq!(
+        std::fs::read(global).expect("global after reauth"),
+        global_before
+    );
 }
 
 #[cfg(unix)]
@@ -501,7 +747,8 @@ fn explicit_reauth_and_logout_never_execute_the_discarded_authorization_helper()
         let temp = tempfile::tempdir().expect("fixture directory");
         let fixture = server();
         let (base, source, _) = file_manager(&temp, &fixture.resource());
-        let mut value: Value = serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("JSON");
+        let mut value: Value =
+            serde_json::from_slice(&std::fs::read(&source).expect("source")).expect("JSON");
         value["mcpServers"]["remote"]["headers"]["aUtHoRiZaTiOn"] =
             json!("$CMD:printf invoked > obsolete-helper-ran; printf 'Bearer expired'");
         std::fs::write(&source, value.to_string()).expect("authored helper definition");
@@ -511,14 +758,29 @@ fn explicit_reauth_and_logout_never_execute_the_discarded_authorization_helper()
         let marker = manager.inner.cwd.join("obsolete-helper-ran");
         runtime().block_on(async {
             if login {
-                manager.reauthenticate("remote", None, browser(&fixture)).await.expect("explicit reauth");
+                manager
+                    .reauthenticate("remote", None, browser(&fixture))
+                    .await
+                    .expect("explicit reauth");
                 assert_eq!(manager.mounted_tool_metas().len(), 1);
             } else {
-                manager.unauthenticate("remote").await.expect("explicit logout");
-                manager.refresh_tools("remote").await.expect_err("revoked static credential");
-                assert!(fixture.captured().is_empty(), "logout must precede any HTTP request");
+                manager
+                    .unauthenticate("remote")
+                    .await
+                    .expect("explicit logout");
+                manager
+                    .refresh_tools("remote")
+                    .await
+                    .expect_err("revoked static credential");
+                assert!(
+                    fixture.captured().is_empty(),
+                    "logout must precede any HTTP request"
+                );
             }
-            assert!(!marker.exists(), "discarded Authorization helper must never execute");
+            assert!(
+                !marker.exists(),
+                "discarded Authorization helper must never execute"
+            );
             manager.shutdown_all().await;
             base.shutdown_all().await;
         });
@@ -528,7 +790,10 @@ fn explicit_reauth_and_logout_never_execute_the_discarded_authorization_helper()
 async fn wait_until(owner: &AgentCx, ready: impl Fn() -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !ready() {
-        assert!(std::time::Instant::now() < deadline, "fixture synchronization deadline");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture synchronization deadline"
+        );
         owner.time().sleep(Duration::from_millis(5)).await;
     }
 }
@@ -542,9 +807,15 @@ fn queued_trust_deny_and_logout_act_on_the_repaired_entry_and_its_live_catalog()
         let original = manager.entry("remote").expect("original entry");
         runtime().block_on(async {
             let owner = AgentCx::for_current_or_request();
-            let repair = Repair::prepare(&original, &manager.inner.cwd).await.expect("source capture");
-            let lane = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&original.connect_lane), owner.cx())
-                .await.expect("hold publication lane");
+            let repair = Repair::prepare(&original, &manager.inner.cwd)
+                .await
+                .expect("source capture");
+            let lane = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&original.connect_lane),
+                owner.cx(),
+            )
+            .await
+            .expect("hold publication lane");
             let mut pending: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + '_>> =
                 match action {
                     "trust" => Box::pin(async { manager.trust("remote").await.map(|_| ()) }),
@@ -552,7 +823,10 @@ fn queued_trust_deny_and_logout_act_on_the_repaired_entry_and_its_live_catalog()
                     "logout" => Box::pin(manager.unauthenticate("remote")),
                     _ => unreachable!(),
                 };
-            assert!(futures::poll!(&mut pending).is_pending(), "operation queues behind the held lane");
+            assert!(
+                futures::poll!(&mut pending).is_pending(),
+                "operation queues behind the held lane"
+            );
             if action == "logout" {
                 let saved = Box::pin(wait_until(&owner, || !auth_snapshot(&manager).is_empty()));
                 pending = match futures::future::select(saved, pending).await {
@@ -562,36 +836,59 @@ fn queued_trust_deny_and_logout_act_on_the_repaired_entry_and_its_live_catalog()
             }
             // Simulate the admitted final phase of reauth while an operator
             // command has already captured the original immutable entry.
-            let (current, lane) = repair.publish(&manager, &original, &owner, lane).await
+            let (current, lane) = repair
+                .publish(&manager, &original, &owner, lane)
+                .await
                 .expect("publish repaired definition");
             let transport: Arc<dyn crate::mcp::transport::McpTransport> = Arc::new(
                 crate::mcp::transport::HttpTransport::new(
-                    &fixture.resource(), vec![("Authorization".to_string(), "Bearer managed-access".to_string())],
-                ).expect("already-authenticated transport"),
+                    &fixture.resource(),
+                    vec![(
+                        "Authorization".to_string(),
+                        "Bearer managed-access".to_string(),
+                    )],
+                )
+                .expect("already-authenticated transport"),
             );
             *McpManager::lock(&current.transport) = Some(Arc::clone(&transport));
-            *McpManager::lock(&current.tools_cache) = Some((std::time::Instant::now(), vec![
-                super::super::McpToolMeta {
-                    name:"echo".to_string(), description:String::new(),
-                    input_schema:json!({"type":"object"}), output_schema:None,
-                    task_support:crate::mcp::tasks::TaskSupport::Forbidden,
-                },
-            ]));
-            *McpManager::lock(&current.health) = ServerHealth::Ready { tools:1 };
+            *McpManager::lock(&current.tools_cache) = Some((
+                std::time::Instant::now(),
+                vec![super::super::McpToolMeta {
+                    name: "echo".to_string(),
+                    description: String::new(),
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                    task_support: crate::mcp::tasks::TaskSupport::Forbidden,
+                }],
+            ));
+            *McpManager::lock(&current.health) = ServerHealth::Ready { tools: 1 };
             drop(lane);
             pending.await.expect("queued lifecycle command");
             let trust = TrustStore::load(&manager.inner.trust_path).expect("current trust");
             let decision = trust.decision("remote", &manager.trust_fingerprint_for(&current));
-            assert_eq!(decision, if action == "deny" { TrustDecision::Denied } else { TrustDecision::Acknowledged });
+            assert_eq!(
+                decision,
+                if action == "deny" {
+                    TrustDecision::Denied
+                } else {
+                    TrustDecision::Acknowledged
+                }
+            );
             if action == "trust" {
                 assert!(transport.is_alive());
                 assert_eq!(manager.mounted_tool_metas().len(), 1);
             } else {
-                assert!(!transport.is_alive(), "{action} must retire the replacement transport");
+                assert!(
+                    !transport.is_alive(),
+                    "{action} must retire the replacement transport"
+                );
                 assert!(McpManager::lock(&current.tools_cache).is_none());
                 assert!(manager.mounted_tool_metas().is_empty());
                 if action == "logout" {
-                    assert!(matches!(&*McpManager::lock(&current.health), ServerHealth::AuthenticationRequired { .. }));
+                    assert!(matches!(
+                        &*McpManager::lock(&current.health),
+                        ServerHealth::AuthenticationRequired { .. }
+                    ));
                 }
             }
             manager.shutdown_all().await;
@@ -609,19 +906,31 @@ fn cancelled_publication_retains_its_connection_lane_until_the_blocking_worker_r
     let trust_before = std::fs::read(&manager.inner.trust_path).expect("trust snapshot");
     runtime().block_on(async {
         let owner = AgentCx::for_current_or_request();
-        let repair = Repair::prepare(&original, &manager.inner.cwd).await.expect("source capture");
+        let repair = Repair::prepare(&original, &manager.inner.cwd)
+            .await
+            .expect("source capture");
         let source = repair.source.as_ref().expect("file-backed repair");
         let source_lock = crate::file_lock::DirLockAt::acquire_for(
-            &source.directory, &source.name, Duration::from_secs(1),
-        ).expect("hold source publication");
-        let lane = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&original.connect_lane), owner.cx())
-            .await.expect("connection lane");
+            &source.directory,
+            &source.name,
+            Duration::from_secs(1),
+        )
+        .expect("hold source publication");
+        let lane =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&original.connect_lane), owner.cx())
+                .await
+                .expect("connection lane");
         let publication = Box::pin(repair.publish(&manager, &original, &owner, lane));
         let worker_started = Box::pin(wait_until(&owner, || {
             match manager.inner.trust_lock.try_lock() {
-                Ok(guard) => { drop(guard); false },
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
                 Err(std::sync::TryLockError::WouldBlock) => true,
-                Err(std::sync::TryLockError::Poisoned(_)) => panic!("unpoisoned fixture trust lock"),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("unpoisoned fixture trust lock")
+                }
             }
         }));
         let publication = match futures::future::select(worker_started, publication).await {
@@ -629,14 +938,25 @@ fn cancelled_publication_retains_its_connection_lane_until_the_blocking_worker_r
             _ => panic!("source lock must hold the blocking publication"),
         };
         drop(publication);
-        assert!(original.connect_lane.try_lock_owned().is_err(),
-            "cancelling the waiter must not release a worker-owned connection lane");
+        assert!(
+            original.connect_lane.try_lock_owned().is_err(),
+            "cancelling the waiter must not release a worker-owned connection lane"
+        );
         drop(source_lock);
         wait_until(&owner, || original.connect_lane.try_lock_owned().is_ok()).await;
-        assert!(Arc::ptr_eq(&original, &manager.entry("remote").expect("unpublished original")));
+        assert!(Arc::ptr_eq(
+            &original,
+            &manager.entry("remote").expect("unpublished original")
+        ));
         manager.shutdown_all().await;
     });
-    assert_eq!(std::fs::read(source_path).expect("unchanged source"), source_before);
-    assert_eq!(std::fs::read(&manager.inner.trust_path).expect("unchanged trust"), trust_before);
+    assert_eq!(
+        std::fs::read(source_path).expect("unchanged source"),
+        source_before
+    );
+    assert_eq!(
+        std::fs::read(&manager.inner.trust_path).expect("unchanged trust"),
+        trust_before
+    );
     assert!(auth_snapshot(&manager).is_empty());
 }

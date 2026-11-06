@@ -571,8 +571,7 @@ mod tests {
             lines
                 .take_while(|line| line.starts_with('|'))
                 .map(|line| {
-                    let cells: Vec<_> =
-                        line.trim_matches('|').split('|').map(str::trim).collect();
+                    let cells: Vec<_> = line.trim_matches('|').split('|').map(str::trim).collect();
                     assert_eq!(cells.len(), columns, "unexpected table row: {line}");
                     cells
                 })
@@ -609,14 +608,20 @@ mod tests {
             names.sort_unstable();
             assert_eq!(
                 names,
-                expected_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                expected_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
                 "each table must document every built-in server exactly once"
             );
         }
 
         for server in &servers {
             let name = format!("`{}`", server.name);
-            let preset = presets.iter().find(|row| row[1] == name).expect("preset row");
+            let preset = presets
+                .iter()
+                .find(|row| row[1] == name)
+                .expect("preset row");
             let root = roots.iter().find(|row| row[0] == name).expect("root row");
             let invocation = std::iter::once(server.command.as_str())
                 .chain(server.args.iter().map(String::as_str))

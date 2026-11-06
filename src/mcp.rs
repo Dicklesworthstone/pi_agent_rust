@@ -167,9 +167,10 @@ impl Tool for McpTool {
         let sampling = context.host.and_then(|host| {
             sampling::SamplingContext::capture(host, (context.snapshot_privacy)()).ok()
         });
-        let result = self.manager.call_tool_with_sampling(
-            &self.server, &self.tool_name, input, on_update, sampling,
-        ).await?;
+        let result = self
+            .manager
+            .call_tool_with_sampling(&self.server, &self.tool_name, input, on_update, sampling)
+            .await?;
         Ok(mcp_result_to_output(&result))
     }
 }

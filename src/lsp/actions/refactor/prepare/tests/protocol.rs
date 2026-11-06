@@ -292,7 +292,10 @@ fn unavailable_undo_journal_refuses_native_rename_before_any_file_changes() {
     .unwrap();
     let tool = tool.with_mutation_recorder(Some(Arc::clone(&recorder)));
     let error = run(&tool, &runtime(), input("rename")).unwrap_err();
-    assert!(error.to_string().contains("LSP_UNDO_UNAVAILABLE"), "{error}");
+    assert!(
+        error.to_string().contains("LSP_UNDO_UNAVAILABLE"),
+        "{error}"
+    );
     assert_eq!(count(temp.path(), "textDocument/rename"), 1);
     unchanged(temp.path());
     assert!(recorder.stats().durability_error.is_some());

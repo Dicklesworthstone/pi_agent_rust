@@ -649,7 +649,9 @@ mod tests {
         let recorder =
             FileMutationRecorder::open_journal(&journal, "s", std::slice::from_ref(&root), 4096)
                 .unwrap();
-        recorder.begin_files::<PathBuf>("empty", "lsp", &[]).unwrap();
+        recorder
+            .begin_files::<PathBuf>("empty", "lsp", &[])
+            .unwrap();
         recorder.commit("empty");
         assert!(!journal.exists(), "empty batches must not checkpoint");
         assert_eq!(recorder.stats().undo_depth, 0);
@@ -684,8 +686,7 @@ mod tests {
         recorder.commit("batch");
         drop(recorder);
 
-        let recorder =
-            reopen_after_drop(&journal, "s", std::slice::from_ref(&root), 4096).unwrap();
+        let recorder = reopen_after_drop(&journal, "s", std::slice::from_ref(&root), 4096).unwrap();
         let undone = recorder.undo(1, false);
         assert_eq!(undone.applied.len(), 1);
         assert_eq!(undone.applied[0].files.len(), files.len());

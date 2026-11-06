@@ -1579,9 +1579,11 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
     };
     let mode = match preparation_field(obj, "autoMode", "auto_mode") {
         None | Some(Value::Null) => AutoCompactionMode::default(),
-        Some(value) => serde_json::from_value::<AutoCompactionMode>(value.clone()).map_err(|_| {
-            Error::validation("compaction preparation: `settings.autoMode` is invalid")
-        })?,
+        Some(value) => {
+            serde_json::from_value::<AutoCompactionMode>(value.clone()).map_err(|_| {
+                Error::validation("compaction preparation: `settings.autoMode` is invalid")
+            })?
+        }
     };
     Ok(ResolvedCompactionSettings {
         enabled,
@@ -3911,7 +3913,10 @@ fn prepare_ordered_archive(
     methods: &[AutoCompactionMethod],
     privacy: &mut CompactionPrivacy,
 ) -> Result<Option<crate::compaction_snap::SnapPayload>> {
-    if methods.iter().all(|method| *method == AutoCompactionMethod::Remote) {
+    if methods
+        .iter()
+        .all(|method| *method == AutoCompactionMethod::Remote)
+    {
         return Ok(None);
     }
     let mut transcript = snap_transcript(preparation);
@@ -3952,7 +3957,10 @@ impl<'a> CompactionSummaryProjection<'a> {
             tokens_before: 0,
         })
         .ok_or_else(|| Error::session("Compaction summary has no model message"))?;
-        let mut messages = [crate::compaction_snap::attach_frames(message, payload.as_ref())];
+        let mut messages = [crate::compaction_snap::attach_frames(
+            message,
+            payload.as_ref(),
+        )];
         crate::compaction_snap::project_for_model(
             &mut messages,
             reader.accepts_images,
@@ -3988,7 +3996,9 @@ impl<'a> CompactionSummaryProjection<'a> {
                 }
             }
         }
-        Err(Error::session("Compaction projection has no summary message"))
+        Err(Error::session(
+            "Compaction projection has no summary message",
+        ))
     }
 
     fn tokens(
@@ -4004,10 +4014,8 @@ impl<'a> CompactionSummaryProjection<'a> {
         text.push_str(summary);
         text.push_str(crate::compaction_snap::COMPACTION_SUMMARY_SUFFIX);
         text.push_str(&self.source_reading);
-        Ok(retained_tokens.saturating_add(estimate_model_message_with_table(
-            &self.message,
-            self.table,
-        )))
+        Ok(retained_tokens
+            .saturating_add(estimate_model_message_with_table(&self.message, self.table)))
     }
 
     fn refresh_archive(&mut self, privacy: &mut CompactionPrivacy) -> Result<()> {
@@ -4995,7 +5003,10 @@ mod tests {
             reserve_tokens: 1_000,
             keep_recent_tokens: 100,
             threshold_tokens: Some(500),
-            method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
+            method_order: Some(vec![
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ]),
             mode: AutoCompactionMode::Aggressive,
             ..Default::default()
         };
@@ -5003,17 +5014,13 @@ mod tests {
             .expect("threshold preparation");
         assert_eq!(prep.first_kept_entry_id, "current-user");
         assert_eq!(prep.settings.keep_recent_tokens, 100);
-        let current_turn = [session_message_to_model(
-            &message_from_entry(&entries[2]).expect("current user"),
-        )
-        .expect("visible current user")];
-        let expected_tail = estimate_model_context_tokens_for_model(
-            &current_turn,
-            false,
-            None,
-            "openai",
-            "gpt-4o",
-        );
+        let current_turn =
+            [
+                session_message_to_model(&message_from_entry(&entries[2]).expect("current user"))
+                    .expect("visible current user"),
+            ];
+        let expected_tail =
+            estimate_model_context_tokens_for_model(&current_turn, false, None, "openai", "gpt-4o");
         assert!(expected_tail > u64::from(settings.keep_recent_tokens));
         assert_eq!(prep.retained_tokens, Some(expected_tail));
 
@@ -5185,7 +5192,10 @@ mod tests {
                     CompactionSummaryProjection::new(archive.clone(), reader, provider, model_id)
                         .expect("reader projection");
                 let mut privacy = CompactionPrivacy::default();
-                for summary in ["first checkpoint", "revised checkpoint with café 日本 evidence"] {
+                for summary in [
+                    "first checkpoint",
+                    "revised checkpoint with café 日本 evidence",
+                ] {
                     let mut session = crate::session::Session::in_memory();
                     session.append_message(make_user_text("old source"));
                     let kept = session.append_message(make_user_text("current request café 日本"));
@@ -5213,7 +5223,10 @@ mod tests {
                     );
                     assert_eq!(projected, installed, "reader={reader:?}, summary={summary}");
                 }
-                assert_eq!(projection.payload, archive, "budgeting cannot mutate durable source");
+                assert_eq!(
+                    projection.payload, archive,
+                    "budgeting cannot mutate durable source"
+                );
             }
         }
     }
@@ -7851,7 +7864,11 @@ mod tests {
                 .await
                 .expect("eligible provider failure advances to shake");
                 assert_eq!(result.details.mode.as_deref(), Some("shake"));
-                assert!(result.summary.contains("Root cause is a race in the scheduler"));
+                assert!(
+                    result
+                        .summary
+                        .contains("Root cause is a race in the scheduler")
+                );
                 assert!(!result.summary.contains("deterministic fallback"));
                 assert_eq!(result.first_kept_entry_id, "entry-9");
                 assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -7870,9 +7887,8 @@ mod tests {
                     });
                     let guarded = crate::provider::guard_with_cost_budget(provider.clone(), budget);
                     let mut preparation = make_preparation();
-                    preparation.settings.method_order = ordered.then(|| {
-                        vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Shake]
-                    });
+                    preparation.settings.method_order = ordered
+                        .then(|| vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Shake]);
                     let error = compact_auto(
                         preparation,
                         guarded,

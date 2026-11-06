@@ -396,7 +396,10 @@ impl ToolInvocationHost for Host {
         request: ToolSamplingRequest,
         expected_session: &str,
     ) -> Result<ToolSamplingResult> {
-        assert!(Cx::current().is_some(), "provider dispatch must keep its owner");
+        assert!(
+            Cx::current().is_some(),
+            "provider dispatch must keep its owner"
+        );
         assert_eq!(expected_session, "owning-agent-session");
         let first = {
             let mut requests = McpManager::lock(&self.requests);
@@ -444,7 +447,10 @@ async fn mount(manager: &Arc<McpManager>, registry: &SharedToolRegistry) {
 fn assert_single_reply(root: &Path) -> Value {
     let requests = frames(root);
     assert_eq!(
-        requests.iter().filter(|frame| frame["method"] == "tools/call").count(),
+        requests
+            .iter()
+            .filter(|frame| frame["method"] == "tools/call")
+            .count(),
         1,
         "originating tool must not be replayed"
     );
@@ -452,7 +458,11 @@ fn assert_single_reply(root: &Path) -> Value {
         .iter()
         .filter(|frame| frame["id"] == "sample-request")
         .collect();
-    assert_eq!(replies.len(), 1, "sampling response must be delivered exactly once");
+    assert_eq!(
+        replies.len(),
+        1,
+        "sampling response must be delivered exactly once"
+    );
     assert!(!root.join("peer-error").exists());
     replies[0].clone()
 }
@@ -466,26 +476,32 @@ fn sampling_uses_two_approvals_and_the_owning_model_on_all_native_transports() {
             let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
             let approvals = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&approvals);
-            registry.snapshot().host_ask_tool().set_handler(Arc::new(move |request| {
-                assert!(Cx::current().is_some(), "approval must keep its tool owner");
-                crate::ask::validate_request(request.clone()).unwrap();
-                let question = &request.questions[0];
-                assert!(question.question.contains("sampling-peer"));
-                assert!(!question.question.contains('\u{1b}'));
-                assert!(!question.question.contains('\u{202e}'));
-                assert!(!question.question.contains("https://"));
-                assert!(!question.question.contains("scoped-secret-"));
-                let stage = observed.fetch_add(1, Ordering::SeqCst);
-                let response = answer(&request, if stage == 0 {
-                    assert_eq!(question.id.as_deref(), Some("mcp_sample_prompt"));
-                    "Generate this reply"
-                } else {
-                    assert_eq!(stage, 1);
-                    assert_eq!(question.id.as_deref(), Some("mcp_sample_review"));
-                    "Send reply to server"
-                });
-                Box::pin(async move { Ok(response) })
-            }));
+            registry
+                .snapshot()
+                .host_ask_tool()
+                .set_handler(Arc::new(move |request| {
+                    assert!(Cx::current().is_some(), "approval must keep its tool owner");
+                    crate::ask::validate_request(request.clone()).unwrap();
+                    let question = &request.questions[0];
+                    assert!(question.question.contains("sampling-peer"));
+                    assert!(!question.question.contains('\u{1b}'));
+                    assert!(!question.question.contains('\u{202e}'));
+                    assert!(!question.question.contains("https://"));
+                    assert!(!question.question.contains("scoped-secret-"));
+                    let stage = observed.fetch_add(1, Ordering::SeqCst);
+                    let response = answer(
+                        &request,
+                        if stage == 0 {
+                            assert_eq!(question.id.as_deref(), Some("mcp_sample_prompt"));
+                            "Generate this reply"
+                        } else {
+                            assert_eq!(stage, 1);
+                            assert_eq!(question.id.as_deref(), Some("mcp_sample_review"));
+                            "Send reply to server"
+                        },
+                    );
+                    Box::pin(async move { Ok(response) })
+                }));
             let mut host = Host::new();
             if scenario == "task" {
                 host.stop_reason = StopReason::Length;
@@ -494,21 +510,27 @@ fn sampling_uses_two_approvals_and_the_owning_model_on_all_native_transports() {
                 mount(&manager, &registry).await;
                 let snapshot = registry.snapshot();
                 let tool = snapshot.get("mcp__sampling-peer__work").unwrap();
-                let output = tool.execute_with_invocation(
-                    "owned-sampling-call",
-                    json!({}),
-                    None,
-                    ToolInvocationContext {
-                        protect: &privacy_projection,
-                        host: Some(&host),
-                        snapshot_privacy: &privacy,
-                    },
-                ).await.unwrap();
+                let output = tool
+                    .execute_with_invocation(
+                        "owned-sampling-call",
+                        json!({}),
+                        None,
+                        ToolInvocationContext {
+                            protect: &privacy_projection,
+                            host: Some(&host),
+                            snapshot_privacy: &privacy,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 assert!(!output.is_error);
                 let _ = manager.shutdown_all().await;
             });
             let response = assert_single_reply(temp.path());
-            assert!(response.get("error").is_none(), "{mode}/{scenario}: {response}");
+            assert!(
+                response.get("error").is_none(),
+                "{mode}/{scenario}: {response}"
+            );
             assert_eq!(response["result"]["role"], "assistant");
             assert_eq!(response["result"]["model"], "fixture-model");
             assert_eq!(response["result"]["content"]["type"], "text");
@@ -516,11 +538,14 @@ fn sampling_uses_two_approvals_and_the_owning_model_on_all_native_transports() {
                 response["result"]["content"]["text"],
                 "Generated safely. <pi-secret:redacted>"
             );
-            assert_eq!(response["result"]["stopReason"], if scenario == "task" {
-                "maxTokens"
-            } else {
-                "endTurn"
-            });
+            assert_eq!(
+                response["result"]["stopReason"],
+                if scenario == "task" {
+                    "maxTokens"
+                } else {
+                    "endTurn"
+                }
+            );
             if scenario == "task" {
                 assert_eq!(
                     response["result"]["_meta"]["io.modelcontextprotocol/related-task"]["taskId"],
@@ -535,7 +560,10 @@ fn sampling_uses_two_approvals_and_the_owning_model_on_all_native_transports() {
             assert_eq!(request.temperature, Some(0.4));
             assert_eq!(request.messages.len(), 3);
             assert!(matches!(request.messages[0].role, ToolSamplingRole::User));
-            assert!(matches!(request.messages[1].role, ToolSamplingRole::Assistant));
+            assert!(matches!(
+                request.messages[1].role,
+                ToolSamplingRole::Assistant
+            ));
             assert_eq!(
                 request.messages[0].text,
                 "First block <pi-secret:redacted>\nSecond block"
@@ -555,30 +583,45 @@ fn unavailable_or_denied_sampling_never_discloses_a_generated_reply() {
             let approvals = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&approvals);
             if scenario != "headless" {
-                registry.snapshot().host_ask_tool().set_handler(Arc::new(move |request| {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    let review = request.questions[0].id.as_deref() == Some("mcp_sample_review");
-                    let response = answer(&request, if review {
-                        "Discard reply"
-                    } else if scenario == "decline" {
-                        "Decline request"
-                    } else {
-                        "Generate this reply"
-                    });
-                    Box::pin(async move { Ok(response) })
-                }));
+                registry
+                    .snapshot()
+                    .host_ask_tool()
+                    .set_handler(Arc::new(move |request| {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let review =
+                            request.questions[0].id.as_deref() == Some("mcp_sample_review");
+                        let response = answer(
+                            &request,
+                            if review {
+                                "Discard reply"
+                            } else if scenario == "decline" {
+                                "Decline request"
+                            } else {
+                                "Generate this reply"
+                            },
+                        );
+                        Box::pin(async move { Ok(response) })
+                    }));
             }
             let host = Host::new();
             runtime().block_on(async {
                 mount(&manager, &registry).await;
-                sample(&manager, (scenario != "no-host").then_some(&host)).await.unwrap();
+                sample(&manager, (scenario != "no-host").then_some(&host))
+                    .await
+                    .unwrap();
                 let _ = manager.shutdown_all().await;
             });
             let response = assert_single_reply(temp.path());
-            assert_eq!(response["error"]["code"], -1, "{mode}/{scenario}: {response}");
+            assert_eq!(
+                response["error"]["code"], -1,
+                "{mode}/{scenario}: {response}"
+            );
             assert!(response.get("result").is_none());
             assert!(!response.to_string().contains("Generated safely"));
-            assert_eq!(McpManager::lock(&host.requests).len(), usize::from(scenario == "discard"));
+            assert_eq!(
+                McpManager::lock(&host.requests).len(),
+                usize::from(scenario == "discard")
+            );
             if matches!(scenario, "headless" | "no-host") {
                 assert_eq!(approvals.load(Ordering::SeqCst), 0);
             }
@@ -593,9 +636,12 @@ fn nonadvertised_sampling_features_are_rejected_before_ui_or_provider_dispatch()
             let temp = tempfile::tempdir().unwrap();
             let (manager, _peer) = fixture(temp.path(), mode, scenario);
             let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
-            registry.snapshot().host_ask_tool().set_handler(Arc::new(|_| {
-                panic!("unsupported request must not acquire a user approval")
-            }));
+            registry
+                .snapshot()
+                .host_ask_tool()
+                .set_handler(Arc::new(|_| {
+                    panic!("unsupported request must not acquire a user approval")
+                }));
             let host = Host::new();
             runtime().block_on(async {
                 mount(&manager, &registry).await;
@@ -603,7 +649,10 @@ fn nonadvertised_sampling_features_are_rejected_before_ui_or_provider_dispatch()
                 let _ = manager.shutdown_all().await;
             });
             let response = assert_single_reply(temp.path());
-            assert_eq!(response["error"]["code"], -32602, "{mode}/{scenario}: {response}");
+            assert_eq!(
+                response["error"]["code"], -32602,
+                "{mode}/{scenario}: {response}"
+            );
             assert!(McpManager::lock(&host.requests).is_empty());
         }
     }
@@ -617,37 +666,61 @@ fn edits_are_reprojected_and_reviewed_before_generation_and_release() {
         let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
         let approvals = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&approvals);
-        registry.snapshot().host_ask_tool().set_handler(Arc::new(move |request| {
-            let stage = observed.fetch_add(1, Ordering::SeqCst);
-            let mut response = answer(&request, if stage < 2 {
-                "Generate this reply"
-            } else {
-                "Send reply to server"
-            });
-            if stage == 0 {
-                response.answers[0].selected.clear();
-                response.answers[0].other = Some(json!({
-                    "messages":[{"role":"user","content":{
-                        "type":"text","text":"Edited scoped-secret-777777"
-                    }}],
-                    "maxTokens":31,
-                    "temperature":0.8
-                }).to_string());
-            } else if stage == 1 {
-                assert_eq!(request.questions[0].id.as_deref(), Some("mcp_sample_prompt"));
-                assert!(request.questions[0].question.contains("Edited"));
-                assert!(!request.questions[0].question.contains("scoped-secret-777777"));
-            } else if stage == 2 {
-                response.answers[0].selected.clear();
-                response.answers[0].other = Some("Replacement scoped-secret-888888".to_string());
-            } else {
-                assert_eq!(stage, 3);
-                assert_eq!(request.questions[0].id.as_deref(), Some("mcp_sample_review"));
-                assert!(request.questions[0].question.contains("Replacement"));
-                assert!(!request.questions[0].question.contains("scoped-secret-888888"));
-            }
-            Box::pin(async move { Ok(response) })
-        }));
+        registry
+            .snapshot()
+            .host_ask_tool()
+            .set_handler(Arc::new(move |request| {
+                let stage = observed.fetch_add(1, Ordering::SeqCst);
+                let mut response = answer(
+                    &request,
+                    if stage < 2 {
+                        "Generate this reply"
+                    } else {
+                        "Send reply to server"
+                    },
+                );
+                if stage == 0 {
+                    response.answers[0].selected.clear();
+                    response.answers[0].other = Some(
+                        json!({
+                            "messages":[{"role":"user","content":{
+                                "type":"text","text":"Edited scoped-secret-777777"
+                            }}],
+                            "maxTokens":31,
+                            "temperature":0.8
+                        })
+                        .to_string(),
+                    );
+                } else if stage == 1 {
+                    assert_eq!(
+                        request.questions[0].id.as_deref(),
+                        Some("mcp_sample_prompt")
+                    );
+                    assert!(request.questions[0].question.contains("Edited"));
+                    assert!(
+                        !request.questions[0]
+                            .question
+                            .contains("scoped-secret-777777")
+                    );
+                } else if stage == 2 {
+                    response.answers[0].selected.clear();
+                    response.answers[0].other =
+                        Some("Replacement scoped-secret-888888".to_string());
+                } else {
+                    assert_eq!(stage, 3);
+                    assert_eq!(
+                        request.questions[0].id.as_deref(),
+                        Some("mcp_sample_review")
+                    );
+                    assert!(request.questions[0].question.contains("Replacement"));
+                    assert!(
+                        !request.questions[0]
+                            .question
+                            .contains("scoped-secret-888888")
+                    );
+                }
+                Box::pin(async move { Ok(response) })
+            }));
         let host = Host::new();
         runtime().block_on(async {
             mount(&manager, &registry).await;
@@ -690,32 +763,61 @@ fn owner_cancellation_releases_the_exact_prompt_or_reply_review() {
                         asupersync::time::wall_now(),
                         Duration::from_secs(7),
                         receiver.recv(owner.cx()),
-                    ).await.unwrap().unwrap();
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
                     if review {
-                        assert!(picker.respond_ui(&request.id, answer(&request.request, "Generate this reply")));
+                        assert!(picker.respond_ui(
+                            &request.id,
+                            answer(&request.request, "Generate this reply")
+                        ));
                         request = asupersync::time::timeout(
                             asupersync::time::wall_now(),
                             Duration::from_secs(7),
                             receiver.recv(owner.cx()),
-                        ).await.unwrap().unwrap();
-                        assert_eq!(request.request.questions[0].id.as_deref(), Some("mcp_sample_review"));
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            request.request.questions[0].id.as_deref(),
+                            Some("mcp_sample_review")
+                        );
                     }
                     *McpManager::lock(&cancelled_id) = Some(request.id.clone());
-                    owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel sampling owner"));
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel sampling owner"),
+                    );
                 };
                 let (result, ()) = futures::join!(sample(&manager, Some(&host)), cancel);
                 assert!(result.is_err());
                 let id = McpManager::lock(&cancelled_id).clone().unwrap();
                 assert!(!picker.channel_ui_request_is_pending(&id));
-                assert!(!picker.respond_ui(&id, AskResponse { answers: Vec::new(), dismissed: true }));
+                assert!(!picker.respond_ui(
+                    &id,
+                    AskResponse {
+                        answers: Vec::new(),
+                        dismissed: true
+                    }
+                ));
                 assert_eq!(picker.close_channel_ui(), 0);
             }));
             assert_eq!(McpManager::lock(&host.requests).len(), usize::from(review));
             let requests = frames(temp.path());
-            assert_eq!(requests.iter().filter(|frame| frame["method"] == "tools/call").count(), 1);
-            assert!(!requests.iter().any(|frame| {
-                frame["id"] == "sample-request" && frame.get("result").is_some()
-            }));
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|frame| frame["method"] == "tools/call")
+                    .count(),
+                1
+            );
+            assert!(
+                !requests.iter().any(|frame| {
+                    frame["id"] == "sample-request" && frame.get("result").is_some()
+                })
+            );
         }
     }
 }
@@ -726,14 +828,20 @@ fn server_cancellation_drops_pending_generation_and_can_request_a_replacement() 
         let temp = tempfile::tempdir().unwrap();
         let (manager, _peer) = fixture(temp.path(), mode, "cancel-generation");
         let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
-        registry.snapshot().host_ask_tool().set_handler(Arc::new(|request| {
-            let response = answer(&request, if request.questions[0].id.as_deref() == Some("mcp_sample_prompt") {
-                "Generate this reply"
-            } else {
-                "Send reply to server"
-            });
-            Box::pin(async move { Ok(response) })
-        }));
+        registry
+            .snapshot()
+            .host_ask_tool()
+            .set_handler(Arc::new(|request| {
+                let response = answer(
+                    &request,
+                    if request.questions[0].id.as_deref() == Some("mcp_sample_prompt") {
+                        "Generate this reply"
+                    } else {
+                        "Send reply to server"
+                    },
+                );
+                Box::pin(async move { Ok(response) })
+            }));
         let mut host = Host::new();
         host.stall_first = Some(temp.path().join("sample-started"));
         runtime().block_on(async {
@@ -746,7 +854,10 @@ fn server_cancellation_drops_pending_generation_and_can_request_a_replacement() 
         let response = assert_single_reply(temp.path());
         assert_eq!(response["result"]["content"]["type"], "text");
         let requests = frames(temp.path());
-        let cancelled: Vec<_> = requests.iter().filter(|frame| frame["id"] == "cancelled-sample").collect();
+        let cancelled: Vec<_> = requests
+            .iter()
+            .filter(|frame| frame["id"] == "cancelled-sample")
+            .collect();
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0]["error"]["code"], -1);
         assert!(cancelled[0].get("result").is_none());
@@ -767,20 +878,32 @@ fn changing_the_model_or_live_session_invalidates_an_approved_prompt_or_reply() 
             let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
             let host = Arc::new(Host::new());
             let changed_host = Arc::clone(&host);
-            registry.snapshot().host_ask_tool().set_handler(Arc::new(move |request| {
-                let is_review = request.questions[0].id.as_deref() == Some("mcp_sample_review");
-                if is_review == review {
-                    if changed == "model" {
-                        changed_host.model_changed.store(true, Ordering::SeqCst);
-                    } else {
-                        // The frozen model/options descriptor stays identical;
-                        // only the separately checked live session changes.
-                        changed_host.live_session_changed.store(true, Ordering::SeqCst);
+            registry
+                .snapshot()
+                .host_ask_tool()
+                .set_handler(Arc::new(move |request| {
+                    let is_review = request.questions[0].id.as_deref() == Some("mcp_sample_review");
+                    if is_review == review {
+                        if changed == "model" {
+                            changed_host.model_changed.store(true, Ordering::SeqCst);
+                        } else {
+                            // The frozen model/options descriptor stays identical;
+                            // only the separately checked live session changes.
+                            changed_host
+                                .live_session_changed
+                                .store(true, Ordering::SeqCst);
+                        }
                     }
-                }
-                let response = answer(&request, if is_review { "Send reply to server" } else { "Generate this reply" });
-                Box::pin(async move { Ok(response) })
-            }));
+                    let response = answer(
+                        &request,
+                        if is_review {
+                            "Send reply to server"
+                        } else {
+                            "Generate this reply"
+                        },
+                    );
+                    Box::pin(async move { Ok(response) })
+                }));
             runtime().block_on(async {
                 mount(&manager, &registry).await;
                 sample(&manager, Some(host.as_ref())).await.unwrap();
@@ -799,7 +922,12 @@ fn sampling_shares_form_request_ids_and_requires_an_unambiguous_live_caller() {
     let registry = Arc::new(crate::mcp::elicitation::ElicitationRegistry::default());
     let params = json!({"messages":[{"role":"user","content":{"type":"text","text":"hello"}}],"maxTokens":1});
     let denied = |id: &str, generation| {
-        assert_eq!(registry.route_sampling(&json!(id), Some(&params), generation).unwrap()["error"]["code"], -1);
+        assert_eq!(
+            registry
+                .route_sampling(&json!(id), Some(&params), generation)
+                .unwrap()["error"]["code"],
+            -1
+        );
     };
     denied("unsolicited", 7);
     let dispatch = Arc::new(RequestDispatch::new());
@@ -813,13 +941,33 @@ fn sampling_shares_form_request_ids_and_requires_an_unambiguous_live_caller() {
     denied("ambiguous", 7);
     drop(other);
     let form = json!({"message":"choose","requestedSchema":{"type":"object"}});
-    assert!(registry.route(&json!("shared-id"), Some(&form), 7).is_none());
-    assert!(registry.route_sampling(&json!("shared-id"), Some(&params), 7).is_none());
-    assert!(registry.route_sampling(&json!("shared-id"), None, 7).is_none());
+    assert!(
+        registry
+            .route(&json!("shared-id"), Some(&form), 7)
+            .is_none()
+    );
+    assert!(
+        registry
+            .route_sampling(&json!("shared-id"), Some(&params), 7)
+            .is_none()
+    );
+    assert!(
+        registry
+            .route_sampling(&json!("shared-id"), None, 7)
+            .is_none()
+    );
     denied("overlapping", 7);
     registry.cancel(Some(&json!({"requestId":"shared-id"})), 7);
-    assert!(registry.route_sampling(&json!("replacement"), Some(&params), 7).is_none());
-    assert!(registry.route(&json!("replacement"), Some(&json!({"mode":"url"})), 7).is_none());
+    assert!(
+        registry
+            .route_sampling(&json!("replacement"), Some(&params), 7)
+            .is_none()
+    );
+    assert!(
+        registry
+            .route(&json!("replacement"), Some(&json!({"mode":"url"})), 7)
+            .is_none()
+    );
     drop(first);
     denied("closed", 7);
 }
@@ -831,20 +979,32 @@ fn context_requests_never_acquire_the_tools_sampling_authority() {
             let temp = tempfile::tempdir().unwrap();
             let (manager, _peer) = fixture(temp.path(), mode, "accept");
             let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
-            registry.snapshot().host_ask_tool().set_handler(Arc::new(|_| {
-                panic!("context forms do not grant context requests model authority")
-            }));
+            registry
+                .snapshot()
+                .host_ask_tool()
+                .set_handler(Arc::new(|_| {
+                    panic!("context forms do not grant context requests model authority")
+                }));
             runtime().block_on(async {
                 mount(&manager, &registry).await;
                 if method == "resources/read" {
-                    manager.read_resource("sampling-peer", "opaque://resource").await.unwrap();
+                    manager
+                        .read_resource("sampling-peer", "opaque://resource")
+                        .await
+                        .unwrap();
                 } else {
-                    manager.get_prompt("sampling-peer", "prompt", None).await.unwrap();
+                    manager
+                        .get_prompt("sampling-peer", "prompt", None)
+                        .await
+                        .unwrap();
                 }
                 let _ = manager.shutdown_all().await;
             });
             let requests = frames(temp.path());
-            let replies: Vec<_> = requests.iter().filter(|frame| frame["id"] == "sample-request").collect();
+            let replies: Vec<_> = requests
+                .iter()
+                .filter(|frame| frame["id"] == "sample-request")
+                .collect();
             assert_eq!(replies.len(), 1);
             assert_eq!(replies[0]["error"]["code"], -1);
             assert!(!temp.path().join("peer-error").exists());
@@ -854,9 +1014,12 @@ fn context_requests_never_acquire_the_tools_sampling_authority() {
     let temp = tempfile::tempdir().unwrap();
     let (manager, _peer) = fixture(temp.path(), "stdio", "context-overlap");
     let registry = SharedToolRegistry::new(ToolRegistry::without_builtins(None));
-    registry.snapshot().host_ask_tool().set_handler(Arc::new(|_| {
-        panic!("an uncorrelated context request cannot borrow the tool's sampling approvals")
-    }));
+    registry
+        .snapshot()
+        .host_ask_tool()
+        .set_handler(Arc::new(|_| {
+            panic!("an uncorrelated context request cannot borrow the tool's sampling approvals")
+        }));
     let host = Host::new();
     runtime().block_on(async {
         mount(&manager, &registry).await;

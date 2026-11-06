@@ -117,9 +117,9 @@ fn optional_object<'a>(
     parent
         .get(key)
         .map(|value| {
-            value
-                .as_object()
-                .ok_or_else(|| invalid("known task capability or execution field must be an object"))
+            value.as_object().ok_or_else(|| {
+                invalid("known task capability or execution field must be an object")
+            })
         })
         .transpose()
 }
@@ -509,7 +509,13 @@ mod tests {
 
     #[test]
     fn creation_receipts_can_observe_fast_terminal_or_input_required_states() {
-        for status in ["working", "input_required", "completed", "failed", "cancelled"] {
+        for status in [
+            "working",
+            "input_required",
+            "completed",
+            "failed",
+            "cancelled",
+        ] {
             let receipt = json!({"task":task(status)});
             let parsed = Task::from_create_result(&receipt).unwrap();
             assert_eq!(parsed.status.as_str(), status);
@@ -603,7 +609,13 @@ mod tests {
                 let terminal = Task::from_status_result(&task(status), previous).unwrap();
                 assert!(terminal.status.is_terminal());
                 assert!(Task::from_status_result(&task(status), &terminal).is_ok());
-                for other in ["working", "input_required", "completed", "failed", "cancelled"] {
+                for other in [
+                    "working",
+                    "input_required",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                ] {
                     if other != status {
                         assert!(Task::from_status_result(&task(other), &terminal).is_err());
                     }

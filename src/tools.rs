@@ -397,13 +397,8 @@ pub trait Tool: Send + Sync {
             )));
         };
         validate_builtin_factory_options(self.name(), options, &[])?;
-        let input = rebase_builtin_factory_input(
-            self.name(),
-            input,
-            cwd,
-            configured_cwd,
-            workspace,
-        )?;
+        let input =
+            rebase_builtin_factory_input(self.name(), input, cwd, configured_cwd, workspace)?;
         self.execute(tool_call_id, input, on_update).await
     }
 
@@ -6369,7 +6364,9 @@ impl ToolRegistry {
             if automatic_allowed("recall") {
                 tools.push(Box::new(
                     crate::memory::RecallTool::new(std::sync::Arc::clone(&store))
-                        .with_cass_history(config.is_some_and(|cfg| cfg.memory_backend() == "cass")),
+                        .with_cass_history(
+                            config.is_some_and(|cfg| cfg.memory_backend() == "cass"),
+                        ),
                 ));
             }
             if automatic_allowed("reflect") {
@@ -9907,9 +9904,9 @@ impl Tool for BashTool {
         let mut tool = self.clone();
         tool.cwd = builtin_factory_cwd("bash", cwd, &self.cwd, &WorkspaceHandle::default())?;
         if let Some(prefix) = options.get("commandPrefix") {
-            let prefix = prefix.as_str().ok_or_else(|| {
-                Error::validation("bash factory commandPrefix must be a string")
-            })?;
+            let prefix = prefix
+                .as_str()
+                .ok_or_else(|| Error::validation("bash factory commandPrefix must be a string"))?;
             if !prefix.is_empty()
                 && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
             {
@@ -27673,46 +27670,98 @@ mod known_tool_name_tests {
             let recorder = Arc::new(crate::undo::FileMutationRecorder::default());
             let mut registry = ToolRegistry::with_mutation_recorder(
                 &["read", "write", "edit", "grep", "find", "ls"],
-                root.path(), None, Some(Arc::clone(&recorder)), None,
+                root.path(),
+                None,
+                Some(Arc::clone(&recorder)),
+                None,
             );
             for name in ["read", "write", "edit", "grep", "find", "ls"] {
-                registry.push(catalog_tool(name, "extension wrapper", ToolOrigin::Extension));
+                registry.push(catalog_tool(
+                    name,
+                    "extension wrapper",
+                    ToolOrigin::Extension,
+                ));
             }
             let registry = registry.clone_shallow();
-            assert_eq!(registry.get("read").unwrap().origin(), ToolOrigin::Extension);
+            assert_eq!(
+                registry.get("read").unwrap().origin(),
+                ToolOrigin::Extension
+            );
             let options = serde_json::json!({});
             let cwd = sub.to_str();
-            registry.get_factory_tool("write").unwrap().execute_from_factory(
-                "factory-write", serde_json::json!({"path":"note.txt", "content":"alpha\nbeta\n"}),
-                cwd, &options, None,
-            ).await.unwrap();
-            let read = registry.get_factory_tool("read").unwrap().execute_from_factory(
-                "factory-read", serde_json::json!({"path":"note.txt", "offset":2, "limit":1}),
-                cwd, &serde_json::json!({"autoResizeImages":false}), None,
-            ).await.unwrap();
+            registry
+                .get_factory_tool("write")
+                .unwrap()
+                .execute_from_factory(
+                    "factory-write",
+                    serde_json::json!({"path":"note.txt", "content":"alpha\nbeta\n"}),
+                    cwd,
+                    &options,
+                    None,
+                )
+                .await
+                .unwrap();
+            let read = registry
+                .get_factory_tool("read")
+                .unwrap()
+                .execute_from_factory(
+                    "factory-read",
+                    serde_json::json!({"path":"note.txt", "offset":2, "limit":1}),
+                    cwd,
+                    &serde_json::json!({"autoResizeImages":false}),
+                    None,
+                )
+                .await
+                .unwrap();
             assert!(get_text(&read.content).contains("beta"));
             assert!(!get_text(&read.content).contains("alpha"));
-            registry.get_factory_tool("edit").unwrap().execute_from_factory(
-                "factory-edit", serde_json::json!({"path":"note.txt", "oldText":"alpha", "newText":"changed"}),
-                cwd, &options, None,
-            ).await.unwrap();
-            assert_eq!(std::fs::read_to_string(sub.join("note.txt")).unwrap(), "changed\nbeta\n");
-            assert_eq!(std::fs::read_to_string(root.path().join("note.txt")).unwrap(), "root stays intact\n");
+            registry
+                .get_factory_tool("edit")
+                .unwrap()
+                .execute_from_factory(
+                    "factory-edit",
+                    serde_json::json!({"path":"note.txt", "oldText":"alpha", "newText":"changed"}),
+                    cwd,
+                    &options,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+                "changed\nbeta\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+                "root stays intact\n"
+            );
             for (name, input) in [
                 ("grep", serde_json::json!({"pattern":"changed"})),
                 ("find", serde_json::json!({"pattern":"*.txt"})),
                 ("ls", serde_json::json!({})),
             ] {
-                let output = registry.get_factory_tool(name).unwrap().execute_from_factory(
-                    name, input, cwd, &options, None,
-                ).await.unwrap();
-                assert!(get_text(&output.content).contains("note.txt"), "{name}: {output:?}");
+                let output = registry
+                    .get_factory_tool(name)
+                    .unwrap()
+                    .execute_from_factory(name, input, cwd, &options, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    get_text(&output.content).contains("note.txt"),
+                    "{name}: {output:?}"
+                );
             }
             assert_eq!(recorder.stats().undo_depth, 2);
             assert_eq!(recorder.undo(1, false).applied.len(), 1);
-            assert_eq!(std::fs::read_to_string(sub.join("note.txt")).unwrap(), "alpha\nbeta\n");
+            assert_eq!(
+                std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+                "alpha\nbeta\n"
+            );
             assert_eq!(recorder.undo(1, false).applied.len(), 1);
-            assert_eq!(std::fs::read_to_string(sub.join("note.txt")).unwrap(), "original\n");
+            assert_eq!(
+                std::fs::read_to_string(sub.join("note.txt")).unwrap(),
+                "original\n"
+            );
         });
     }
 
@@ -27725,24 +27774,53 @@ mod known_tool_name_tests {
             let mut workspace = WorkspaceHandle::single(root.path());
             workspace.add_root(outside.path());
             let registry = ToolRegistry::with_mutation_recorder(
-                &["read"], root.path(), None, None, Some(&workspace),
+                &["read"],
+                root.path(),
+                None,
+                None,
+                Some(&workspace),
             );
             let read = registry.get_factory_tool("read").unwrap();
             let input = serde_json::json!({"path":"secret.txt"});
             let options = serde_json::json!({});
-            read.execute_from_factory("allowed", input.clone(), outside.path().to_str(), &options, None)
-                .await.unwrap();
+            read.execute_from_factory(
+                "allowed",
+                input.clone(),
+                outside.path().to_str(),
+                &options,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(workspace.remove_root(outside.path()));
-            assert!(read.execute_from_factory("revoked", input, outside.path().to_str(), &options, None)
-                .await.is_err());
+            assert!(
+                read.execute_from_factory(
+                    "revoked",
+                    input,
+                    outside.path().to_str(),
+                    &options,
+                    None
+                )
+                .await
+                .is_err()
+            );
             assert!(registry.get_factory_tool("write").is_none());
             let mut disabled = ToolRegistry::without_builtins(None);
             disabled.push(Box::new(ReadTool::new(root.path())));
             assert!(disabled.get_factory_tool("read").is_none());
-            assert!(read.execute_from_factory(
-                "unsupported", serde_json::json!({"path":"missing.txt"}), None,
-                &serde_json::json!({"operations":{}}), None,
-            ).await.unwrap_err().to_string().contains("not supported"));
+            assert!(
+                read.execute_from_factory(
+                    "unsupported",
+                    serde_json::json!({"path":"missing.txt"}),
+                    None,
+                    &serde_json::json!({"operations":{}}),
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+            );
         });
     }
 
@@ -27783,9 +27861,14 @@ mod known_tool_name_tests {
             std::fs::create_dir(&sub).unwrap();
             let config: Config = serde_json::from_value(serde_json::json!({
                 "bash":{"persistent":false, "pty":"off"}
-            })).unwrap();
+            }))
+            .unwrap();
             let mut registry = ToolRegistry::new(&["bash"], root.path(), Some(&config));
-            registry.push(catalog_tool("bash", "extension wrapper", ToolOrigin::Extension));
+            registry.push(catalog_tool(
+                "bash",
+                "extension wrapper",
+                ToolOrigin::Extension,
+            ));
             let bash = registry.get_factory_tool("bash").unwrap();
             let result = bash.execute_from_factory(
                 "shell", serde_json::json!({"command":"printf '%s\\n' \"$PI_FACTORY_VALUE\"; pwd", "timeout":5}),
@@ -27794,18 +27877,37 @@ mod known_tool_name_tests {
             assert!(!result.is_error, "{result:?}");
             let text = get_text(&result.content);
             assert!(text.contains("factory-executed"), "{text}");
-            assert!(text.contains(std::fs::canonicalize(&sub).unwrap().to_str().unwrap()), "{text}");
-            assert!(!text.contains("printf"), "A factory must execute, not echo its command");
-            let failed = bash.execute_from_factory(
-                "shell-error", serde_json::json!({"command":"exit 7", "timeout":5}),
-                None, &serde_json::json!({}), None,
-            ).await.unwrap();
+            assert!(
+                text.contains(std::fs::canonicalize(&sub).unwrap().to_str().unwrap()),
+                "{text}"
+            );
+            assert!(
+                !text.contains("printf"),
+                "A factory must execute, not echo its command"
+            );
+            let failed = bash
+                .execute_from_factory(
+                    "shell-error",
+                    serde_json::json!({"command":"exit 7", "timeout":5}),
+                    None,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .await
+                .unwrap();
             assert!(failed.is_error, "{failed:?}");
             let outside = tempfile::tempdir().unwrap();
-            assert!(bash.execute_from_factory(
-                "outside", serde_json::json!({"command":"pwd"}), outside.path().to_str(),
-                &serde_json::json!({}), None,
-            ).await.is_err());
+            assert!(
+                bash.execute_from_factory(
+                    "outside",
+                    serde_json::json!({"command":"pwd"}),
+                    outside.path().to_str(),
+                    &serde_json::json!({}),
+                    None,
+                )
+                .await
+                .is_err()
+            );
         });
     }
 
@@ -28140,7 +28242,14 @@ mod known_tool_name_tests {
         };
         for selected in [&[][..], &["read"][..]] {
             let registry = ToolRegistry::with_builtin_tool_policy(
-                selected, &cwd, Some(&config), None, None, false, None, false,
+                selected,
+                &cwd,
+                Some(&config),
+                None,
+                None,
+                false,
+                None,
+                false,
             );
             assert_eq!(
                 names(&registry),
@@ -28167,7 +28276,14 @@ mod known_tool_name_tests {
             "manage_skill",
         ];
         let registry = ToolRegistry::with_builtin_tool_policy(
-            &selected, &cwd, Some(&config), None, None, false, None, false,
+            &selected,
+            &cwd,
+            Some(&config),
+            None,
+            None,
+            false,
+            None,
+            false,
         );
         let mut expected = selected
             .iter()
@@ -28238,7 +28354,10 @@ mod known_tool_name_tests {
             assert!(legacy.get(name).is_some(), "legacy automatic tool: {name}");
         }
         for name in ["eval", "github", "security_scan", "subagent"] {
-            assert!(legacy.get(name).is_none(), "unselected optional tool: {name}");
+            assert!(
+                legacy.get(name).is_none(),
+                "unselected optional tool: {name}"
+            );
         }
         std::fs::write(root.join("completed"), "ok").expect("fixture completion marker");
     }

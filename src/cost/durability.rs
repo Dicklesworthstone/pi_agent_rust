@@ -401,7 +401,9 @@ impl Origin {
         };
         let metadata = std::fs::symlink_metadata(&source)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(Error::session("late model cost source must be a regular file"));
+            return Err(Error::session(
+                "late model cost source must be a regular file",
+            ));
         }
         let parent = source
             .parent()
@@ -410,7 +412,9 @@ impl Origin {
         let directory = open_directory(&parent)?;
         let directory_identity = FileIdentity::of_open_file(&directory)?;
         if FileIdentity::of_path_nofollow(&parent)? != directory_identity {
-            return Err(Error::session("late model cost directory changed during open"));
+            return Err(Error::session(
+                "late model cost directory changed during open",
+            ));
         }
         // Include the session ID in the filename: reusing a source pathname for
         // a different session cannot inherit or poison its predecessor's ledger.
@@ -500,7 +504,11 @@ impl Origin {
         #[cfg(not(unix))]
         let file = {
             let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(create).create(create).truncate(false);
+            options
+                .read(true)
+                .write(create)
+                .create(create)
+                .truncate(false);
             #[cfg(windows)]
             {
                 use std::os::windows::fs::OpenOptionsExt as _;
@@ -510,7 +518,9 @@ impl Origin {
         };
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(Error::session("late model cost journal must be a regular file"));
+            return Err(Error::session(
+                "late model cost journal must be a regular file",
+            ));
         }
         #[cfg(windows)]
         {
@@ -526,7 +536,11 @@ impl Origin {
                 return Err(Error::session("late model cost journal has multiple links"));
             }
             let access = crate::platform::UNIX_ACCESS_READ
-                | if create { crate::platform::UNIX_ACCESS_WRITE } else { 0 };
+                | if create {
+                    crate::platform::UNIX_ACCESS_WRITE
+                } else {
+                    0
+                };
             crate::platform::EffectiveModeAccessContext::current()?.ensure(
                 &metadata,
                 &self.parent.join(name),
@@ -559,7 +573,9 @@ impl Origin {
         let mut bytes = Vec::new();
         file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-            return Err(Error::session("late model cost journal exceeds its size limit"));
+            return Err(Error::session(
+                "late model cost journal exceeds its size limit",
+            ));
         }
         let journal: Journal = serde_json::from_slice(&bytes)?;
         if !matches!(journal.version, 1 | 2)
@@ -582,7 +598,9 @@ impl Origin {
         remaining(deadline)?;
         let encoded = serde_json::to_vec(journal)?;
         if encoded.len() as u64 > MAX_JOURNAL_BYTES {
-            return Err(Error::session("late model cost journal exceeds its size limit"));
+            return Err(Error::session(
+                "late model cost journal exceeds its size limit",
+            ));
         }
         self.validate_directory()?;
         #[cfg(unix)]
@@ -799,7 +817,9 @@ pub(super) fn settlement_deadline(deadline: Option<Instant>) -> Instant {
 fn remaining(deadline: Instant) -> Result<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(Error::session("late model cost persistence deadline expired"));
+        return Err(Error::session(
+            "late model cost persistence deadline expired",
+        ));
     }
     Ok(remaining)
 }

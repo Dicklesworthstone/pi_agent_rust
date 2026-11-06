@@ -234,11 +234,7 @@ pub(super) async fn load(
         super::arm_acp_prewalk(&mut state, options)
             .await
             .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
-        let mcp_state = super::mcp::prepare(
-            &cwd,
-            &state.global_dir,
-            supplied.unwrap_or_default(),
-        );
+        let mcp_state = super::mcp::prepare(&cwd, &state.global_dir, supplied.unwrap_or_default());
         if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
             super::mcp::mount(agent.session_mut(), mcp_state);
         }

@@ -486,15 +486,19 @@ fn exercise_model_freeze(
         );
         assert!(
             fixture
-                .call(json!({"operation":"worker_send", "workerId":id, "task":"valid",
-                    "model":{"role":"tiny"}}))
+                .call(
+                    json!({"operation":"worker_send", "workerId":id, "task":"valid",
+                    "model":{"role":"tiny"}})
+                )
                 .await
                 .is_err()
         );
         assert!(
             fixture
-                .call(json!({"operation":"pool_push", "poolId":pool, "tasks":["valid"],
-                    "model":{"role":"tiny"}}))
+                .call(
+                    json!({"operation":"pool_push", "poolId":pool, "tasks":["valid"],
+                    "model":{"role":"tiny"}})
+                )
                 .await
                 .is_err()
         );

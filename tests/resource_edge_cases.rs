@@ -489,7 +489,12 @@ fn universal_skills_follow_ancestors_to_git_root_and_ignore_root_markdown() {
         .find(|skill| skill.name == "shared")
         .expect("shared skill");
     assert_eq!(shared.file_path, nearest);
-    assert!(result.skills.iter().any(|skill| skill.file_path == root_only));
+    assert!(
+        result
+            .skills
+            .iter()
+            .any(|skill| skill.file_path == root_only)
+    );
     assert!(!result.skills.iter().any(|skill| skill.name == "loose"));
     assert!(!result.skills.iter().any(|skill| skill.name == "outside"));
     assert_eq!(

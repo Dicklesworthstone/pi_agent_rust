@@ -217,7 +217,12 @@ impl ElicitationRegistry {
     /// Route sampling with the same ownership, duplicate-ID and cancellation
     /// rules as forms. A transport reader never receives a provider handle.
     #[must_use]
-    pub fn route_sampling(&self, id: &Value, params: Option<&Value>, generation: u64) -> Option<Value> {
+    pub fn route_sampling(
+        &self,
+        id: &Value,
+        params: Option<&Value>,
+        generation: u64,
+    ) -> Option<Value> {
         self.route_request(RequestKind::Sampling, id, params, generation)
     }
 
@@ -231,11 +236,7 @@ impl ElicitationRegistry {
         if !matches!(id, Value::Number(_) | Value::String(_))
             || id.as_str().is_some_and(|id| id.len() > 1024)
         {
-            return Some(rpc_error(
-                &Value::Null,
-                -32600,
-                "invalid client request id",
-            ));
+            return Some(rpc_error(&Value::Null, -32600, "invalid client request id"));
         }
         let slots = lock(&self.slots);
         for slot in slots.values() {
@@ -1180,7 +1181,9 @@ pub(crate) async fn observe<'a>(
             && (completed.is_some() || pending.cancelled.load(Ordering::Acquire))
         {
             // Replacing this future drops AskTool's pending-reply lease.
-            let response = pending.kind.cancelled(&pending.id, pending.related_task.as_deref());
+            let response = pending
+                .kind
+                .cancelled(&pending.id, pending.related_task.as_deref());
             pending.future =
                 Box::pin(async move { send_response(transport, response, generation).await });
             pending.cancelling = true;
@@ -1206,7 +1209,9 @@ pub(crate) async fn observe<'a>(
                 cancelling,
                 future: Box::pin(async move {
                     let mut response = if cancelling {
-                        request.kind.cancelled(&request.id, request.related_task.as_deref())
+                        request
+                            .kind
+                            .cancelled(&request.id, request.related_task.as_deref())
                     } else if matches!(request.kind, RequestKind::Sampling) {
                         let active = || current() && !request.cancelled.load(Ordering::Acquire);
                         super::sampling::respond(
@@ -1254,7 +1259,9 @@ pub(crate) async fn observe<'a>(
                         return Err(failure("elicitation caller changed before its response"));
                     }
                     if request.cancelled.load(Ordering::Acquire) {
-                        response = request.kind.cancelled(&request.id, request.related_task.as_deref());
+                        response = request
+                            .kind
+                            .cancelled(&request.id, request.related_task.as_deref());
                     }
                     response_started.store(true, Ordering::Release);
                     send_response(transport, response, generation).await

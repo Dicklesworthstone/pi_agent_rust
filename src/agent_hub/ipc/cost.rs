@@ -206,12 +206,18 @@ impl AttemptLedger {
             return Ok(budget.snapshot());
         }
         if attempt <= self.retired_through
-            || self.settled.iter().any(|receipt| receipt.attempt == attempt)
+            || self
+                .settled
+                .iter()
+                .any(|receipt| receipt.attempt == attempt)
         {
             return Err(ipc_error("COST_SETTLED", "cost attempt is already settled"));
         }
         if self.active.len() >= MAX_ACTIVE_ATTEMPTS {
-            return Err(ipc_error("COST_LIMIT", "too many active child cost attempts"));
+            return Err(ipc_error(
+                "COST_LIMIT",
+                "too many active child cost attempts",
+            ));
         }
         let charge = budget.start_attempt()?;
         self.active.insert(
@@ -237,7 +243,11 @@ impl AttemptLedger {
         if sequence == 0 {
             return Err(ipc_error("COST_INPUT", "invalid cost attempt sequence"));
         }
-        if let Some(receipt) = self.settled.iter().find(|receipt| receipt.attempt == attempt) {
+        if let Some(receipt) = self
+            .settled
+            .iter()
+            .find(|receipt| receipt.attempt == attempt)
+        {
             if sequence < receipt.sequence {
                 return Ok(budget.snapshot());
             }
@@ -251,7 +261,10 @@ impl AttemptLedger {
             return Ok(budget.snapshot());
         }
         if sequence == active.sequence || amount < active.amount {
-            return Err(ipc_error("COST_PROTOCOL", "conflicting partial cost receipt"));
+            return Err(ipc_error(
+                "COST_PROTOCOL",
+                "conflicting partial cost receipt",
+            ));
         }
         active.charge.observe(amount)?;
         active.sequence = sequence;
@@ -270,7 +283,11 @@ impl AttemptLedger {
         if let Some(amount) = amount {
             validate_amount(amount)?;
         }
-        if let Some(receipt) = self.settled.iter().find(|receipt| receipt.attempt == attempt) {
+        if let Some(receipt) = self
+            .settled
+            .iter()
+            .find(|receipt| receipt.attempt == attempt)
+        {
             if sequence < receipt.sequence
                 || (sequence == receipt.sequence && amount == receipt.amount)
             {
@@ -534,7 +551,11 @@ impl RemoteBudget {
             ));
         }
         let limit = Instant::now() + SETTLEMENT_LIMIT;
-        let result = self.exchange_owned(None, operation, deadline.map_or(limit, |end| end.min(limit)));
+        let result = self.exchange_owned(
+            None,
+            operation,
+            deadline.map_or(limit, |end| end.min(limit)),
+        );
         if result.is_err() {
             // One failed bounded cleanup exchange is enough. Other attempts
             // retain their parent-owned partial charges until channel teardown.
@@ -827,7 +848,9 @@ mod tests {
             _: &crate::provider::Context<'_>,
             _: &crate::provider::StreamOptions,
         ) -> Result<
-            std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>,
+            >,
         > {
             let mut partial = crate::model::AssistantMessage::default();
             partial.usage.cost.total = 0.75;
@@ -944,8 +967,7 @@ mod tests {
         }
         for _ in 0..2 {
             assert_eq!(
-                send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}))
-                    ["status"],
+                send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}))["status"],
                 "ok"
             );
         }
@@ -958,8 +980,7 @@ mod tests {
         }
         send(json!({"operation":"observe", "attempt":7, "sequence":2, "amount":3.0}));
         assert_eq!(
-            send(json!({"operation":"finish", "attempt":7, "sequence":3, "amount":8.0}))
-                ["status"],
+            send(json!({"operation":"finish", "attempt":7, "sequence":3, "amount":8.0}))["status"],
             "error"
         );
         assert_eq!(
@@ -967,8 +988,7 @@ mod tests {
             "error"
         );
         assert_eq!(
-            send(json!({"operation":"finish", "attempt":99, "sequence":1, "amount":4.0}))
-                ["status"],
+            send(json!({"operation":"finish", "attempt":99, "sequence":1, "amount":4.0}))["status"],
             "error"
         );
         assert_eq!(parent.spent(), 0.75);

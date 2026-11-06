@@ -972,7 +972,10 @@ impl TrustStore {
         // source replacement from the corresponding trust write.
         commit_source()?;
         let previous = self.servers.get(name).cloned().ok_or_else(|| {
-            Error::tool("mcp", "[MCP_AUTH_SUPERSEDED] the MCP trust record disappeared")
+            Error::tool(
+                "mcp",
+                "[MCP_AUTH_SUPERSEDED] the MCP trust record disappeared",
+            )
         })?;
         let mut repaired = previous.clone();
         let at = now_iso();
@@ -1529,9 +1532,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("trust directory");
         let path = temp.path().join("trust.json");
         let mut operator = TrustStore::load(&path).expect("initial store");
-        operator.acknowledge("remote", "authored", "operator").expect("acknowledgement");
+        operator
+            .acknowledge("remote", "authored", "operator")
+            .expect("acknowledgement");
         let mut stale = TrustStore::load(&path).expect("pre-browser snapshot");
-        operator.deny("remote", "authored", "operator").expect("intervening denial");
+        operator
+            .deny("remote", "authored", "operator")
+            .expect("intervening denial");
         let published = std::sync::atomic::AtomicBool::new(false);
         let result = stale.repair_authorization("remote", "authored", "repaired", || {
             published.store(true, std::sync::atomic::Ordering::Release);
@@ -1540,8 +1547,14 @@ mod tests {
         assert!(result.is_err());
         assert!(!published.load(std::sync::atomic::Ordering::Acquire));
         let final_store = TrustStore::load(&path).expect("durable denial");
-        assert_eq!(final_store.decision("remote", "authored"), TrustDecision::Denied);
-        assert_eq!(final_store.decision("remote", "repaired"), TrustDecision::Pending);
+        assert_eq!(
+            final_store.decision("remote", "authored"),
+            TrustDecision::Denied
+        );
+        assert_eq!(
+            final_store.decision("remote", "repaired"),
+            TrustDecision::Pending
+        );
     }
 
     #[test]
@@ -1549,20 +1562,44 @@ mod tests {
         let temp = tempfile::tempdir().expect("trust directory");
         let path = temp.path().join("trust.json");
         let mut store = TrustStore::load(&path).expect("store");
-        store.acknowledge("remote", "authored", "operator").expect("acknowledgement");
+        store
+            .acknowledge("remote", "authored", "operator")
+            .expect("acknowledgement");
         let before = std::fs::read(&path).expect("trust snapshot");
-        store.repair_authorization("remote", "authored", "repaired", || {
-            Err(Error::tool("mcp", "[MCP_AUTH_SOURCE_CHANGED] fixture source edit"))
-        }).expect_err("source CAS failed");
+        store
+            .repair_authorization("remote", "authored", "repaired", || {
+                Err(Error::tool(
+                    "mcp",
+                    "[MCP_AUTH_SOURCE_CHANGED] fixture source edit",
+                ))
+            })
+            .expect_err("source CAS failed");
         assert_eq!(std::fs::read(&path).expect("unchanged trust"), before);
-        assert_eq!(store.decision("remote", "authored"), TrustDecision::Acknowledged);
-        store.repair_authorization("remote", "authored", "repaired", || Ok(()))
+        assert_eq!(
+            store.decision("remote", "authored"),
+            TrustDecision::Acknowledged
+        );
+        store
+            .repair_authorization("remote", "authored", "repaired", || Ok(()))
             .expect("explicit header-only repair");
         let reloaded = TrustStore::load(&path).expect("repaired trust");
-        assert_eq!(reloaded.decision("remote", "authored"), TrustDecision::Pending);
-        assert_eq!(reloaded.decision("remote", "repaired"), TrustDecision::Acknowledged);
+        assert_eq!(
+            reloaded.decision("remote", "authored"),
+            TrustDecision::Pending
+        );
+        assert_eq!(
+            reloaded.decision("remote", "repaired"),
+            TrustDecision::Acknowledged
+        );
         assert_eq!(reloaded.records()["remote"].audit.len(), 2);
-        assert_eq!(reloaded.records()["remote"].audit.last().expect("audit").action, "reauthenticated");
+        assert_eq!(
+            reloaded.records()["remote"]
+                .audit
+                .last()
+                .expect("audit")
+                .action,
+            "reauthenticated"
+        );
     }
 
     #[test]

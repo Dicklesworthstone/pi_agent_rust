@@ -2196,8 +2196,7 @@ impl PackageManager {
                 &project.skills,
                 true,
             ));
-            for universal_dir in
-                project_universal_skill_dirs(&self.cwd, roots.home_dir.as_deref())
+            for universal_dir in project_universal_skill_dirs(&self.cwd, roots.home_dir.as_deref())
             {
                 skill_roots.push((
                     universal_dir,
@@ -2210,12 +2209,7 @@ impl PackageManager {
                 ));
             }
         }
-        skill_roots.push((
-            user_skills,
-            user_metadata.clone(),
-            &global.skills,
-            true,
-        ));
+        skill_roots.push((user_skills, user_metadata.clone(), &global.skills, true));
         if let Some(home) = &roots.home_dir {
             skill_roots.push((
                 home.join(".agents").join("skills"),
@@ -3071,10 +3065,7 @@ fn canonical_identity_path(path: &Path) -> PathBuf {
 /// nearest ancestor carrying `.git`; otherwise it is bounded by path depth and
 /// stops at the filesystem root. The user's global `~/.agents/skills` root is
 /// kept out of this project list so it retains user-scope provenance.
-pub(crate) fn project_universal_skill_dirs(
-    cwd: &Path,
-    home_dir: Option<&Path>,
-) -> Vec<PathBuf> {
+pub(crate) fn project_universal_skill_dirs(cwd: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
     let git_root = cwd
         .ancestors()
         .take(MAX_PROJECT_SKILL_ANCESTORS)

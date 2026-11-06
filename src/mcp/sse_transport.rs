@@ -868,22 +868,25 @@ impl McpTransport for SseTransport {
         // so cleanup cannot address a replacement transport or refresh a grant.
         // Its eventual SSE reply is not interpreted as an acknowledged outcome.
         let state = Arc::clone(&self.state);
-        spawn_task_cleanup(async move { state.post(&frame, HTTP_CANCEL_TIMEOUT, None, false).await });
+        spawn_task_cleanup(
+            async move { state.post(&frame, HTTP_CANCEL_TIMEOUT, None, false).await },
+        );
     }
 
     fn progress_registry(&self) -> Option<&Arc<ProgressRegistry>> {
         Some(&self.state.progress)
     }
 
-    fn elicitation_registry(
-        &self,
-    ) -> Option<&Arc<crate::mcp::elicitation::ElicitationRegistry>> {
+    fn elicitation_registry(&self) -> Option<&Arc<crate::mcp::elicitation::ElicitationRegistry>> {
         Some(&self.state.roots.elicitation)
     }
 
     async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
         if generation != 0 || !self.is_alive() {
-            return Err(tool_err("MCP_TRANSPORT_CLOSED", "elicitation connection is closed"));
+            return Err(tool_err(
+                "MCP_TRANSPORT_CLOSED",
+                "elicitation connection is closed",
+            ));
         }
         HttpTransport::run_with_deadline(
             self.state.post(&response, DEFAULT_MCP_TIMEOUT, None, true),
@@ -1443,11 +1446,8 @@ mod tests {
                 if !fixture.captured().is_empty() {
                     break;
                 }
-                asupersync::time::sleep(
-                    asupersync::time::wall_now(),
-                    Duration::from_millis(10),
-                )
-                .await;
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
             }
         }));
         let requests = fixture.captured();

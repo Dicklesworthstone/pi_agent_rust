@@ -26846,8 +26846,8 @@ export default function init(pi) {
         let runtime_handle = runtime.handle();
 
         runtime.block_on(Box::pin(async move {
-            let prose = "Archived decisions require preserving the reasoning and evidence.\n"
-                .repeat(2_000);
+            let prose =
+                "Archived decisions require preserving the reasoning and evidence.\n".repeat(2_000);
             let summary = Some("causal auto-compaction summary".to_string());
             for (case, methods, bulky_tool_output, reply, expected_calls, expected_mode) in [
                 (
@@ -27090,16 +27090,21 @@ export default function init(pi) {
                     );
                     continue;
                 };
-                assert!(events[1].get("errorMessage").is_none(), "{case}: {events:?}");
-                assert_eq!(events[1]["result"]["details"]["mode"], expected_mode, "{case}");
+                assert!(
+                    events[1].get("errorMessage").is_none(),
+                    "{case}: {events:?}"
+                );
+                assert_eq!(
+                    events[1]["result"]["details"]["mode"], expected_mode,
+                    "{case}"
+                );
                 assert_eq!(events[1]["result"]["tokensBefore"], 80_000, "{case}");
                 assert!(
                     events[1]["result"]["tokensAfter"].as_u64().unwrap() < 2_000,
                     "{case}",
                 );
                 assert_eq!(
-                    events[1]["result"]["firstKeptEntryId"],
-                    first_kept_entry_id,
+                    events[1]["result"]["firstKeptEntryId"], first_kept_entry_id,
                     "{case}",
                 );
                 assert_eq!(compaction_count, 1, "{case}");
@@ -27178,7 +27183,8 @@ export default function init(pi) {
                 let path = stored.path.clone().expect("session path");
                 let before = std::fs::read(&path).expect("initial bytes");
                 let requests = Arc::new(Mutex::new(Vec::new()));
-                let mut options = build_test_rpc_options(&handle, directory.path().join("auth.json"));
+                let mut options =
+                    build_test_rpc_options(&handle, directory.path().join("auth.json"));
                 options.config = serde_json::from_value(json!({
                     "compaction": {
                         "enabled": true, "mode": "snapcompact", "methodOrder": ["soft"],
@@ -27282,7 +27288,8 @@ export default function init(pi) {
                 for next_vision in [true, false] {
                     live.agent.set_model_accepts_images(next_vision);
                     let request = live.agent.request_context_json();
-                    let wire = serde_json::to_string(&request["messages"]).expect("request context");
+                    let wire =
+                        serde_json::to_string(&request["messages"]).expect("request context");
                     assert_eq!(wire.contains("image/png"), next_vision && !blocked);
                     assert_eq!(
                         wire.contains("ARCHIVE-READER-PROBE"),

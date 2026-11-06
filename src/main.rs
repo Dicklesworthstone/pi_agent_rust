@@ -2795,9 +2795,9 @@ async fn run(
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             enabled_tools: ftui_enabled_tools,
-            tool_factory: cli.no_implicit_tools.then(|| {
-                Arc::new(pi::sdk::ExplicitBuiltinTools) as Arc<dyn pi::sdk::ToolFactory>
-            }),
+            tool_factory: cli
+                .no_implicit_tools
+                .then(|| Arc::new(pi::sdk::ExplicitBuiltinTools) as Arc<dyn pi::sdk::ToolFactory>),
             out_default_enabled: true,
             thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
             include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
@@ -3420,7 +3420,9 @@ async fn run(
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);
-        agent_session.agent.set_keyword_model(&selection.model_entry);
+        agent_session
+            .agent
+            .set_keyword_model(&selection.model_entry);
         agent_session
             .agent
             .set_tool_call_dialect(selection.model_entry.tool_call_dialect());
@@ -11804,9 +11806,9 @@ fn default_export_path(input: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::compaction::ResolvedCompactionSettings;
     use anyhow::anyhow;
     use clap::Parser as _;
+    use pi::compaction::ResolvedCompactionSettings;
     use serde_json::json;
     use tempfile::TempDir;
 

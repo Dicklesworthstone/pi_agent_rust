@@ -1712,7 +1712,10 @@ mod tests {
     #[test]
     fn optional_tools_remain_disabled_unless_configured() {
         let cli = Cli::parse_from(["pi"]);
-        for config in [crate::config::Config::default(), optional_tool_config(false)] {
+        for config in [
+            crate::config::Config::default(),
+            optional_tool_config(false),
+        ] {
             assert_eq!(
                 cli.enabled_tools(&config),
                 crate::xdev::default_enabled_tools()
@@ -1745,10 +1748,7 @@ mod tests {
             crate::xdev::default_enabled_tools()
         );
 
-        for args in [
-            vec!["pi", "--tools", "read"],
-            vec!["pi", "--tools=read"],
-        ] {
+        for args in [vec!["pi", "--tools", "read"], vec!["pi", "--tools=read"]] {
             let cli = Cli::parse_from(args);
             assert_eq!(cli.enabled_tools(&config), ["read"]);
         }
@@ -1775,7 +1775,12 @@ mod tests {
             vec!["pi", "--tools", ""],
             vec!["pi", "--tools=,"],
             vec!["pi", "--no-tools"],
-            vec!["pi", "--no-tools", "--tools", "eval,github,security_scan,subagent"],
+            vec![
+                "pi",
+                "--no-tools",
+                "--tools",
+                "eval,github,security_scan,subagent",
+            ],
         ] {
             let cli = Cli::parse_from(args);
             assert!(cli.enabled_tools(&config).is_empty());
@@ -1810,7 +1815,11 @@ mod tests {
         for (_, name) in OPTIONAL_TOOL_SETTINGS {
             assert!(registry.get(name).is_some(), "{name} must be registered");
             assert_eq!(
-                registry.tools().iter().filter(|tool| tool.name() == name).count(),
+                registry
+                    .tools()
+                    .iter()
+                    .filter(|tool| tool.name() == name)
+                    .count(),
                 1,
                 "{name} must be registered once"
             );
@@ -1842,8 +1851,7 @@ mod tests {
                     .expect("load mode config");
                 let enabled = cli.enabled_tools(&config);
                 assert!(!enabled.contains(&name), "{setting}");
-                let registry =
-                    crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+                let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
                 assert!(registry.get(name).is_none(), "{name}");
             }
         }
@@ -1886,10 +1894,8 @@ mod tests {
                 args.push(flag);
             }
             args.push("inspect");
-            let parsed = parse_with_extension_flags(
-                args.into_iter().map(str::to_string).collect(),
-            )
-            .expect("native tool policy must survive the real parser");
+            let parsed = parse_with_extension_flags(args.into_iter().map(str::to_string).collect())
+                .expect("native tool policy must survive the real parser");
             assert!(parsed.cli.no_implicit_tools);
             assert_eq!(parsed.cli.tools.as_deref(), Some("read"));
             assert_eq!(parsed.cli.message_args(), ["inspect"]);
@@ -1934,8 +1940,7 @@ mod tests {
         let cli = Cli::parse_from(["pi"]);
         let enabled = cli.enabled_tools(&config);
         assert!(!enabled.contains(&"bash"));
-        let registry =
-            crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+        let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
         assert!(registry.get("bash").is_none());
 
         let defaults = crate::xdev::default_enabled_tools().join(",");
@@ -1943,8 +1948,7 @@ mod tests {
             let cli = Cli::parse_from(["pi", "--tools", explicit]);
             let enabled = cli.enabled_tools(&config);
             assert!(enabled.contains(&"bash"));
-            let registry =
-                crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+            let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
             assert!(registry.get("bash").is_some());
             if explicit == defaults.as_str() {
                 assert_eq!(enabled, crate::xdev::default_enabled_tools());
@@ -1963,11 +1967,15 @@ mod tests {
             let cli = Cli::parse_from(["pi"]);
             let enabled = cli.enabled_tools(&config);
             assert!(!enabled.contains(&name), "{name}");
-            let registry =
-                crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+            let registry = crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
             assert!(registry.get(name).is_none(), "{name}");
             assert!(!registry.tools().iter().any(|tool| tool.name() == name));
-            assert!(!registry.discoverable_index().iter().any(|(tool, _)| tool == name));
+            assert!(
+                !registry
+                    .discoverable_index()
+                    .iter()
+                    .any(|(tool, _)| tool == name)
+            );
 
             let explicit = format!("read,{name}");
             let cli = Cli::parse_from(["pi", "--tools", explicit.as_str()]);
@@ -1986,7 +1994,10 @@ mod tests {
         let cli = Cli::parse_from(["pi"]);
         let mut config = optional_tool_config(true);
         let expected = cli.enabled_tools(&config);
-        assert!(expected.contains(&"subagent"), "default Off is not a settings veto");
+        assert!(
+            expected.contains(&"subagent"),
+            "default Off is not a settings veto"
+        );
         config.tools.as_mut().expect("tool settings").load_mode = Some(
             ["bash", "eval", "github", "security_scan", "subagent"]
                 .into_iter()

@@ -2816,7 +2816,10 @@ impl AgentSessionHandle {
                         }
                         Err(err) => {
                             let warning = format!("failed to flush session autosave: {err}");
-                            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                            tracing::warn!(
+                                event = "sdk.session.shutdown.autosave_failed",
+                                "{warning}"
+                            );
                             report.fail(warning);
                         }
                     }
@@ -7277,13 +7280,9 @@ mod tests {
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
         let cli = Cli::try_parse_from(["pi"]).expect("default CLI");
-        let untrusted_registry = default_tool_registry(
-            &cli.enabled_tools(&untrusted),
-            &cwd,
-            &untrusted,
-        );
-        let trusted_registry =
-            default_tool_registry(&cli.enabled_tools(&trusted), &cwd, &trusted);
+        let untrusted_registry =
+            default_tool_registry(&cli.enabled_tools(&untrusted), &cwd, &untrusted);
+        let trusted_registry = default_tool_registry(&cli.enabled_tools(&trusted), &cwd, &trusted);
         for name in ["eval", "github", "security_scan", "subagent"] {
             assert!(untrusted_registry.get(name).is_none(), "untrusted {name}");
             assert!(trusted_registry.get(name).is_some(), "trusted {name}");
@@ -7330,10 +7329,22 @@ mod tests {
             };
             let handle = run_async(create_agent_session(options)).expect("create SDK session");
             for name in OPTIONAL {
-                assert_eq!(handle.has_tool(name), expected, "{name}, config={configured}");
+                assert_eq!(
+                    handle.has_tool(name),
+                    expected,
+                    "{name}, config={configured}"
+                );
             }
             if no_builtins {
-                assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
+                assert!(
+                    handle
+                        .session()
+                        .agent
+                        .shared_tools()
+                        .snapshot()
+                        .tools()
+                        .is_empty()
+                );
             }
             let shutdown = run_async(handle.shutdown_owned_resources());
             assert!(shutdown.completed_cleanly());
@@ -7789,8 +7800,7 @@ mod tests {
             name: "tts",
             endpoint,
         }));
-        let handle =
-            run_async(create_agent_session(options)).expect("native media SDK session");
+        let handle = run_async(create_agent_session(options)).expect("native media SDK session");
         assert_eq!(
             handle.session().agent.stream_options().api_key.as_deref(),
             Some(MEDIA_CHAT_KEY)
@@ -8424,9 +8434,8 @@ printf sdk-owned-command-key
                 .to_string(),
             )
             .expect("global automatic tool settings");
-            options.tool_factory = strict.then(|| {
-                Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>
-            });
+            options.tool_factory =
+                strict.then(|| Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>);
             options.enabled_tools =
                 selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
             let handle = run_async(create_agent_session(options)).expect("create SDK session");
@@ -8542,12 +8551,16 @@ printf sdk-owned-command-key
         const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
         for changed_surface in ["settings", "extension"] {
             let (_tmp, mut options) = guarded_optional_tool_fixture(true);
-            let cwd = options.working_directory.clone().expect("fixture workspace");
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
             let extension_path = cwd.join(".pi/extensions/trust_guard.js");
             options.extension_paths = vec![extension_path.clone()];
             assert!(!options.workspace_trusted, "the captured grant must win");
             let probe = cwd.join("still_live.txt");
-            std::fs::write(&probe, "the admitted session is still usable").expect("write read probe");
+            std::fs::write(&probe, "the admitted session is still usable")
+                .expect("write read probe");
             let handle = run_async(create_agent_session(options.clone()))
                 .expect("construct originally admitted session");
             assert!(handle.extension_manager().is_some());
@@ -8605,7 +8618,10 @@ printf sdk-owned-command-key
         );
         let handle = run_async(create_agent_session(options)).expect("create denied session");
         for name in ["eval", "github", "security_scan", "subagent"] {
-            assert!(!handle.has_tool(name), "captured denial must exclude {name}");
+            assert!(
+                !handle.has_tool(name),
+                "captured denial must exclude {name}"
+            );
         }
         assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
     }
@@ -8618,7 +8634,10 @@ printf sdk-owned-command-key
         };
 
         let (tmp, mut options) = guarded_optional_tool_fixture(true);
-        let cwd = options.working_directory.clone().expect("fixture workspace");
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
         let global_dir = tmp.path().join("global");
         let agents = cwd.join(".pi/agents");
         std::fs::create_dir_all(&agents).expect("project agent directory");
@@ -8809,7 +8828,11 @@ printf sdk-owned-command-key
         assert_eq!(initial.out.as_ref().unwrap().enabled, Some(true));
         assert!(options.out_enabled.is_none());
 
-        std::fs::write(cwd.join(".pi/settings.json"), r#"{"out":{"enabled":false}}"#).unwrap();
+        std::fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"out":{"enabled":false}}"#,
+        )
+        .unwrap();
         let rebuilt_options = options.clone();
         assert!(options.out_enabled.is_none());
         let mut rebuilt = load_session_config(&cwd, &global_dir, None, true).unwrap();
@@ -10357,7 +10380,10 @@ printf sdk-owned-command-key
             keep_recent_tokens: 4_321,
             threshold_tokens: Some(20_000),
             threshold_percent: Some(50.0),
-            method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
+            method_order: Some(vec![
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ]),
             mode: crate::compaction::AutoCompactionMode::default(),
             render_mode: crate::compaction::CompactionRenderMode::default(),
         };
@@ -10631,8 +10657,7 @@ printf sdk-owned-command-key
                 assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
                 let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
                 assert!(
-                    (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs()
-                        < f64::EPSILON
+                    (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
                 );
                 let resumed = budget.for_replacement(&reopened, false).unwrap();
                 assert!(!resumed.same_tree(&budget));
@@ -10824,9 +10849,7 @@ printf sdk-owned-command-key
             drop(prepared);
             budget.record(0.5).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
-            assert!(
-                (crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON
-            );
+            assert!((crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON);
 
             let prepared = handle.preflight_replacement().await.unwrap();
             let mut next = saving_handle(tmp.path());
@@ -10849,9 +10872,7 @@ printf sdk-owned-command-key
             assert!(handle.shutdown_owned_resources().await.completed_cleanly());
             budget.record(0.5).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
-            assert!(
-                (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
-            );
+            assert!((crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON);
         });
     }
 

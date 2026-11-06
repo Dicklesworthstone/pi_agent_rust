@@ -41,9 +41,16 @@ impl<'a> SamplingContext<'a> {
     ) -> Result<Self> {
         let model = host.sampling_model()?;
         if model.provider.is_empty() || model.model.is_empty() || model.session_id.is_empty() {
-            return Err(Error::tool("mcp", "sampling requires an active model and session"));
+            return Err(Error::tool(
+                "mcp",
+                "sampling requires an active model and session",
+            ));
         }
-        Ok(Self { host, model, privacy })
+        Ok(Self {
+            host,
+            model,
+            privacy,
+        })
     }
 
     fn is_current(&self) -> bool {
@@ -58,11 +65,19 @@ impl<'a> SamplingContext<'a> {
 }
 
 fn invalid(id: &Value) -> Value {
-    rpc_error(id, -32602, "sampling requires a bounded text-only prompt, no tools or context, and no nonempty stop sequences")
+    rpc_error(
+        id,
+        -32602,
+        "sampling requires a bounded text-only prompt, no tools or context, and no nonempty stop sequences",
+    )
 }
 
 pub(super) fn rejected(id: &Value) -> Value {
-    rpc_error(id, -1, "sampling was declined, cancelled, or is unavailable for this caller")
+    rpc_error(
+        id,
+        -1,
+        "sampling was declined, cancelled, or is unavailable for this caller",
+    )
 }
 
 fn text_content(value: &Value) -> Option<String> {
@@ -74,9 +89,11 @@ fn text_content(value: &Value) -> Option<String> {
         object.get("text")?.as_str()
     }
     match value {
-        Value::Array(values) if !values.is_empty() && values.len() <= MAX_MESSAGES => {
-            values.iter().map(block).collect::<Option<Vec<_>>>().map(|parts| parts.join("\n"))
-        }
+        Value::Array(values) if !values.is_empty() && values.len() <= MAX_MESSAGES => values
+            .iter()
+            .map(block)
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| parts.join("\n")),
         Value::Object(_) => block(value).map(str::to_string),
         _ => None,
     }
@@ -88,18 +105,20 @@ fn model_preferences(value: &Value) -> bool {
     };
     for key in ["costPriority", "speedPriority", "intelligencePriority"] {
         if object.get(key).is_some_and(|value| {
-            value.as_f64().is_none_or(|number| !(0.0..=1.0).contains(&number))
+            value
+                .as_f64()
+                .is_none_or(|number| !(0.0..=1.0).contains(&number))
         }) {
             return false;
         }
     }
     object.get("hints").is_none_or(|value| {
         value.as_array().is_some_and(|hints| {
-            hints.len() <= MAX_MESSAGES && hints.iter().all(|hint| {
-                hint.as_object().is_some_and(|hint| {
-                    hint.get("name").is_none_or(Value::is_string)
+            hints.len() <= MAX_MESSAGES
+                && hints.iter().all(|hint| {
+                    hint.as_object()
+                        .is_some_and(|hint| hint.get("name").is_none_or(Value::is_string))
                 })
-            })
         })
     })
 }
@@ -109,15 +128,22 @@ fn parse(params: &Value, model: &ToolSamplingModel) -> Option<ToolSamplingReques
         return None;
     }
     let object = params.as_object()?;
-    if object.contains_key("tools") || object.contains_key("toolChoice")
+    if object.contains_key("tools")
+        || object.contains_key("toolChoice")
         || object.contains_key("task")
-        || object.get("includeContext").is_some_and(|value| value.as_str() != Some("none"))
-        || object.get("stopSequences").is_some_and(|value| {
-            value.as_array().is_none_or(|values| !values.is_empty())
-        })
-        || object.get("metadata").is_some_and(|value| !value.is_object())
+        || object
+            .get("includeContext")
+            .is_some_and(|value| value.as_str() != Some("none"))
+        || object
+            .get("stopSequences")
+            .is_some_and(|value| value.as_array().is_none_or(|values| !values.is_empty()))
+        || object
+            .get("metadata")
+            .is_some_and(|value| !value.is_object())
         || object.get("_meta").is_some_and(|value| !value.is_object())
-        || object.get("modelPreferences").is_some_and(|value| !model_preferences(value))
+        || object
+            .get("modelPreferences")
+            .is_some_and(|value| !model_preferences(value))
     {
         return None;
     }
@@ -145,38 +171,61 @@ fn parse(params: &Value, model: &ToolSamplingModel) -> Option<ToolSamplingReques
     if messages.is_empty() || messages.len() > MAX_MESSAGES {
         return None;
     }
-    let messages = messages.iter().map(|message| {
-        let role = match message.get("role")?.as_str()? {
-            "user" => ToolSamplingRole::User,
-            "assistant" => ToolSamplingRole::Assistant,
-            _ => return None,
-        };
-        Some(ToolSamplingMessage { role, text: text_content(message.get("content")?)? })
-    }).collect::<Option<Vec<_>>>()?;
-    Some(ToolSamplingRequest { system_prompt, messages, max_tokens, temperature })
+    let messages = messages
+        .iter()
+        .map(|message| {
+            let role = match message.get("role")?.as_str()? {
+                "user" => ToolSamplingRole::User,
+                "assistant" => ToolSamplingRole::Assistant,
+                _ => return None,
+            };
+            Some(ToolSamplingMessage {
+                role,
+                text: text_content(message.get("content")?)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ToolSamplingRequest {
+        system_prompt,
+        messages,
+        max_tokens,
+        temperature,
+    })
 }
 
 fn protect(request: &mut ToolSamplingRequest, privacy: &AuxiliaryPrivacySnapshot) -> Result<()> {
-    let parts: Vec<&str> = request.system_prompt.iter().map(String::as_str)
-        .chain(request.messages.iter().map(|message| message.text.as_str())).collect();
+    let parts: Vec<&str> = request
+        .system_prompt
+        .iter()
+        .map(String::as_str)
+        .chain(request.messages.iter().map(|message| message.text.as_str()))
+        .collect();
     let projected = privacy.project_inputs(&parts)?;
     let mut projected = projected.into_iter();
     if let Some(system_prompt) = request.system_prompt.as_mut() {
-        *system_prompt = projected.next().ok_or_else(|| Error::tool("mcp", "sampling privacy projection failed"))?;
+        *system_prompt = projected
+            .next()
+            .ok_or_else(|| Error::tool("mcp", "sampling privacy projection failed"))?;
     }
     for message in &mut request.messages {
-        message.text = projected.next().ok_or_else(|| Error::tool("mcp", "sampling privacy projection failed"))?;
+        message.text = projected
+            .next()
+            .ok_or_else(|| Error::tool("mcp", "sampling privacy projection failed"))?;
     }
     Ok(())
 }
 
 fn prompt_value(request: &ToolSamplingRequest) -> Value {
-    let messages: Vec<Value> = request.messages.iter().map(|message| {
-        json!({"role":match &message.role {
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|message| {
+            json!({"role":match &message.role {
             ToolSamplingRole::User => "user",
             ToolSamplingRole::Assistant => "assistant",
         }, "content":{"type":"text", "text":message.text}})
-    }).collect();
+        })
+        .collect();
     let mut value = json!({"messages":messages,"maxTokens":request.max_tokens});
     if let Some(system_prompt) = &request.system_prompt {
         value["systemPrompt"] = json!(system_prompt);
@@ -194,23 +243,32 @@ enum Answer {
 }
 
 async fn prompt(ask: &AskTool, id: &str, question: String, choices: [&str; 2]) -> Answer {
-    let request = AskRequest { questions: vec![AskQuestion {
-        id: Some(id.to_string()),
-        question,
-        header: Some("MCP sampling".to_string()),
-        options: choices.into_iter().map(|label| AskOption {
-            label: label.to_string(), description: None,
-        }).collect(),
-        recommended: None,
-        multi: false,
-    }] };
+    let request = AskRequest {
+        questions: vec![AskQuestion {
+            id: Some(id.to_string()),
+            question,
+            header: Some("MCP sampling".to_string()),
+            options: choices
+                .into_iter()
+                .map(|label| AskOption {
+                    label: label.to_string(),
+                    description: None,
+                })
+                .collect(),
+            recommended: None,
+            multi: false,
+        }],
+    };
     let Ok(response) = ask.prompt_installed(request).await else {
         return Answer::Cancel;
     };
     if response.dismissed || response.answers.len() != 1 || response.answers[0].question_id != id {
         return Answer::Cancel;
     }
-    match (response.answers[0].selected.as_slice(), response.answers[0].other.as_ref()) {
+    match (
+        response.answers[0].selected.as_slice(),
+        response.answers[0].other.as_ref(),
+    ) {
         ([choice], None) => Answer::Choice(choice.clone()),
         ([], Some(text)) if text.len() <= MAX_REPLY_BYTES => Answer::Edit(text.clone()),
         _ => Answer::Cancel,
@@ -242,8 +300,12 @@ pub(super) async fn respond(
     if privacy.capture_json(params).is_err() || protect(&mut request, &privacy).is_err() {
         return rejected(id);
     }
-    let origin = format!("MCP server \"{}\" requests a model reply using {} / {}.\nGeneration uses this session's cost budget. Model preferences are advisory; server metadata and your conversation are not sent.\nControls, markup, and URL punctuation are escaped for display.",
-        display(server), display(&sampling.model.provider), display(&sampling.model.model));
+    let origin = format!(
+        "MCP server \"{}\" requests a model reply using {} / {}.\nGeneration uses this session's cost budget. Model preferences are advisory; server metadata and your conversation are not sent.\nControls, markup, and URL punctuation are escaped for display.",
+        display(server),
+        display(&sampling.model.provider),
+        display(&sampling.model.model)
+    );
     let mut approved = false;
     for _ in 0..4 {
         if !current() || !sampling.is_current() {
@@ -253,7 +315,10 @@ pub(super) async fn respond(
         if !bounded(&value, MAX_REQUEST_BYTES) {
             return invalid(id);
         }
-        let question = format!("{origin}\n\nReview the complete provider prompt and effective settings below. Generate spends tokens and produces a private draft; another review controls whether the server receives it. Use Other to replace this JSON prompt, then review it again.\n\n{}", display(&value.to_string()));
+        let question = format!(
+            "{origin}\n\nReview the complete provider prompt and effective settings below. Generate spends tokens and produces a private draft; another review controls whether the server receives it. Use Other to replace this JSON prompt, then review it again.\n\n{}",
+            display(&value.to_string())
+        );
         match prompt(ask, "mcp_sample_prompt", question, [GENERATE, DECLINE]).await {
             Answer::Choice(choice) if choice == GENERATE => {
                 approved = true;
@@ -266,7 +331,8 @@ pub(super) async fn respond(
                 let Some(mut edited) = parse(&value, &sampling.model) else {
                     return invalid(id);
                 };
-                if privacy.capture_json(&value).is_err() || protect(&mut edited, &privacy).is_err() {
+                if privacy.capture_json(&value).is_err() || protect(&mut edited, &privacy).is_err()
+                {
                     return rejected(id);
                 }
                 request = edited;
@@ -277,12 +343,21 @@ pub(super) async fn respond(
     if !approved || !current() || !sampling.is_current() {
         return rejected(id);
     }
-    if sampling.host.check_sampling_session(&sampling.model.session_id).await.is_err()
-        || !current() || !sampling.is_current()
+    if sampling
+        .host
+        .check_sampling_session(&sampling.model.session_id)
+        .await
+        .is_err()
+        || !current()
+        || !sampling.is_current()
     {
         return rejected(id);
     }
-    let Ok(result) = sampling.host.sample(request, &sampling.model.session_id).await else {
+    let Ok(result) = sampling
+        .host
+        .sample(request, &sampling.model.session_id)
+        .await
+    else {
         // Provider errors may contain authentication, endpoints, or request
         // details. The server receives only a bounded, non-secret refusal.
         return rpc_error(id, -1, "sampling could not produce an approved text reply");
@@ -305,12 +380,21 @@ pub(super) async fn respond(
         if text.len() > MAX_REPLY_BYTES || !current() || !sampling.is_current() {
             return rejected(id);
         }
-        let question = format!("{origin}\n\nReview the complete reply below (stop reason: {stop_reason}). Send releases exactly this text to the server. Discard withholds it; generation costs have already been charged. Use Other to replace the reply text, then review it again.\n\n{}", display(&text));
+        let question = format!(
+            "{origin}\n\nReview the complete reply below (stop reason: {stop_reason}). Send releases exactly this text to the server. Discard withholds it; generation costs have already been charged. Use Other to replace the reply text, then review it again.\n\n{}",
+            display(&text)
+        );
         match prompt(ask, "mcp_sample_review", question, [SEND, DISCARD]).await {
             Answer::Choice(choice) if choice == SEND => {
-                if !current() || !sampling.is_current()
-                    || sampling.host.check_sampling_session(&sampling.model.session_id).await.is_err()
-                    || !current() || !sampling.is_current()
+                if !current()
+                    || !sampling.is_current()
+                    || sampling
+                        .host
+                        .check_sampling_session(&sampling.model.session_id)
+                        .await
+                        .is_err()
+                    || !current()
+                    || !sampling.is_current()
                 {
                     return rejected(id);
                 }

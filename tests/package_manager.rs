@@ -305,8 +305,7 @@ fn resolve_with_roots_disabled_alias_does_not_hide_enabled_user_skill() {
 fn resolve_with_roots_universal_alias_ignores_root_markdown() {
     use std::os::unix::fs::symlink;
 
-    let harness =
-        TestHarness::new("resolve_with_roots_universal_alias_ignores_root_markdown");
+    let harness = TestHarness::new("resolve_with_roots_universal_alias_ignores_root_markdown");
     let (manager, roots) = isolated_skill_roots(&harness);
     let nested = roots.project_base_dir.join("skills/nested");
     create_resolver_skill(&harness, "project/.pi/skills/nested/standalone.md");
@@ -351,10 +350,7 @@ fn resolve_with_roots_discovers_universal_skill_ancestors_only_to_git_root() {
         &harness,
         "repo/crates/app/src/.agents/skills/local/SKILL.md",
     );
-    let near = create_resolver_skill(
-        &harness,
-        "repo/crates/app/.agents/skills/near/SKILL.md",
-    );
+    let near = create_resolver_skill(&harness, "repo/crates/app/.agents/skills/near/SKILL.md");
     let root = create_resolver_skill(&harness, "repo/.agents/skills/root/SKILL.md");
     create_resolver_skill(&harness, ".agents/skills/outside/SKILL.md");
     create_resolver_skill(&harness, "repo/.agents/skills/loose.md");

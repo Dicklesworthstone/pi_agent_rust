@@ -6654,11 +6654,10 @@ impl Session {
         path_entries: &[SessionEntry],
         first_kept_entry_id: &str,
     ) -> Result<Vec<Message>> {
-        if !path_entries.iter().any(|entry| {
-            entry
-                .base_id()
-                .is_some_and(|id| id == first_kept_entry_id)
-        }) {
+        if !path_entries
+            .iter()
+            .any(|entry| entry.base_id().is_some_and(|id| id == first_kept_entry_id))
+        {
             return Err(Error::session(
                 "Compaction retained-context projection references an unknown cut point",
             ));
@@ -14399,11 +14398,20 @@ mod tests {
             entries_before,
         );
         assert_eq!(session.leaf_id, leaf_before);
-        assert_eq!(session.autosave_metrics().pending_mutations, mutations_before);
+        assert_eq!(
+            session.autosave_metrics().pending_mutations,
+            mutations_before
+        );
         assert!(Session::messages_retained_after_compaction(&path, "missing").is_err());
         assert!(Session::messages_retained_after_compaction(&[], &first_kept).is_err());
 
-        session.append_compaction("installed summary".to_string(), first_kept, 1000, None, None);
+        session.append_compaction(
+            "installed summary".to_string(),
+            first_kept,
+            1000,
+            None,
+            None,
+        );
         let installed = session.to_messages_for_current_path();
         assert_eq!(
             serde_json::to_value(&installed[1..]).expect("serialize installed tail"),

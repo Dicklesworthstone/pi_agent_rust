@@ -2236,7 +2236,11 @@ mod tests {
                     std::iter::once(OsString::from("pi")).chain(args),
                 )
                 .expect("native child CLI");
-                assert!(cli.no_implicit_tools, "{} lost its tool ceiling", agent.name);
+                assert!(
+                    cli.no_implicit_tools,
+                    "{} lost its tool ceiling",
+                    agent.name
+                );
                 let selected = cli.enabled_tools(&config);
                 let registry = if cli.builtin_tools_disabled() {
                     crate::tools::ToolRegistry::without_builtins(Some(&config))

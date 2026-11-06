@@ -43,7 +43,10 @@ fn source_io() -> crate::error::Error {
 }
 
 fn has_authorization(config: &ConfiguredServer) -> bool {
-    config.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    config
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
 }
 
 pub(super) fn binding_for(
@@ -53,10 +56,15 @@ pub(super) fn binding_for(
     global_dir: &Path,
 ) -> Result<AuthBinding> {
     let mut repaired = config.clone();
-    repaired.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+    repaired
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
     let identity = repaired.fingerprint_for_workspace(cwd, workspace);
     let url = config.url.as_deref().ok_or_else(|| {
-        super::tool_err("MCP_AUTH_UNSUPPORTED", "OAuth requires an HTTP MCP endpoint")
+        super::tool_err(
+            "MCP_AUTH_UNSUPPORTED",
+            "OAuth requires an HTTP MCP endpoint",
+        )
     })?;
     let binding = AuthBinding::new(global_dir, &identity, url)?;
     Ok(if has_authorization(config) {
@@ -71,10 +79,7 @@ pub(super) struct Repair {
 }
 
 impl Repair {
-    pub(super) async fn prepare(
-        entry: &Arc<ServerEntry>,
-        workspace: &Path,
-    ) -> Result<Arc<Self>> {
+    pub(super) async fn prepare(entry: &Arc<ServerEntry>, workspace: &Path) -> Result<Arc<Self>> {
         let config = entry.config.clone();
         let workspace = workspace.to_path_buf();
         asupersync::runtime::spawn_blocking(move || {
@@ -91,7 +96,9 @@ impl Repair {
     }
 
     pub(super) fn check_unchanged(&self) -> Result<()> {
-        self.source.as_ref().map_or(Ok(()), SourceRepair::check_unchanged)
+        self.source
+            .as_ref()
+            .map_or(Ok(()), SourceRepair::check_unchanged)
     }
 
     /// Called with the connection lane held and the old transport retired.
@@ -108,7 +115,9 @@ impl Repair {
             return Ok((Arc::clone(entry), lane));
         }
         let repair = Arc::clone(self);
-        let manager = McpManager { inner: Arc::clone(&manager.inner) };
+        let manager = McpManager {
+            inner: Arc::clone(&manager.inner),
+        };
         let entry = Arc::clone(entry);
         let owner = owner.clone();
         let abandoned = Arc::new(AtomicBool::new(false));
@@ -120,11 +129,15 @@ impl Repair {
                 super::catalog::check_request_owner(&owner)?;
                 manager.check_running()?;
                 if worker_abandoned.load(Ordering::Acquire) {
-                    return Err(super::tool_err("MCP_CANCELLED", "MCP source repair was cancelled"));
+                    return Err(super::tool_err(
+                        "MCP_CANCELLED",
+                        "MCP source repair was cancelled",
+                    ));
                 }
                 if !Arc::ptr_eq(&manager.entry(&entry.config.name)?, &entry) {
                     return Err(super::tool_err(
-                        "MCP_AUTH_SUPERSEDED", "the MCP server definition changed during authentication",
+                        "MCP_AUTH_SUPERSEDED",
+                        "the MCP server definition changed during authentication",
                     ));
                 }
                 Ok(())
@@ -133,7 +146,8 @@ impl Repair {
             let source = repair.source.as_ref().ok_or_else(source_changed)?;
             let expected = manager.trust_fingerprint_for(&entry);
             let repaired_fingerprint = source.repaired.fingerprint_for_workspace(
-                &entry.effective_cwd(&manager.inner.cwd), &manager.inner.cwd,
+                &entry.effective_cwd(&manager.inner.cwd),
+                &manager.inner.cwd,
             );
             let replacement = Arc::new(ServerEntry {
                 config: source.repaired.clone(),
@@ -149,7 +163,9 @@ impl Repair {
             let _local_trust = McpManager::lock(&manager.inner.trust_lock);
             let mut store = TrustStore::load(&manager.inner.trust_path)?;
             let persisted = store.repair_authorization(
-                &entry.config.name, &expected, &repaired_fingerprint,
+                &entry.config.name,
+                &expected,
+                &repaired_fingerprint,
                 || source.commit(&check),
             );
             // After publication the in-memory definition must agree with the
@@ -157,9 +173,13 @@ impl Repair {
             // fingerprint remains subject to the durable trust decision.
             if source.committed.load(Ordering::Acquire) {
                 let mut servers = McpManager::lock(&manager.inner.servers);
-                if !servers.get(&entry.config.name).is_some_and(|current| Arc::ptr_eq(current, &entry)) {
+                if !servers
+                    .get(&entry.config.name)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
                     return Err(super::tool_err(
-                        "MCP_AUTH_SUPERSEDED", "the MCP server changed after its source repair committed",
+                        "MCP_AUTH_SUPERSEDED",
+                        "the MCP server changed after its source repair committed",
                     ));
                 }
                 servers.insert(entry.config.name.clone(), Arc::clone(&replacement));
@@ -201,28 +221,42 @@ impl SourceRepair {
         let target = std::fs::canonicalize(&source).map_err(|_| source_changed())?;
         let parent = target.parent().ok_or_else(source_changed)?.to_path_buf();
         #[cfg(unix)]
-        let name = target.file_name().ok_or_else(source_changed)?.to_os_string();
+        let name = target
+            .file_name()
+            .ok_or_else(source_changed)?
+            .to_os_string();
         #[cfg(unix)]
         let directory = crate::mcp::trust::open_trust_directory_nofollow(&parent, false)
             .map_err(|_| source_changed())?;
         #[cfg(windows)]
-        let (_, directories) = crate::mcp::trust::open_or_create_windows_trust_parent(&target, false)
-            .map_err(|_| source_changed())?;
+        let (_, directories) =
+            crate::mcp::trust::open_or_create_windows_trust_parent(&target, false)
+                .map_err(|_| source_changed())?;
         let original = {
             #[cfg(unix)]
-            { open_source(&directory, &name)? }
+            {
+                open_source(&directory, &name)?
+            }
             #[cfg(not(unix))]
-            { open_source(&target)? }
+            {
+                open_source(&target)?
+            }
         };
         let identity = FileIdentity::of_open_file(&original).map_err(|_| source_changed())?;
         let content = read_source(&original)?;
         let text = std::str::from_utf8(&content).map_err(|_| source_changed())?;
-        let (rendered, repaired) = crate::mcp::config::authorization_repair_document(
-            config, workspace, text,
-        ).map_err(|_| source_changed())?;
+        let (rendered, repaired) =
+            crate::mcp::config::authorization_repair_document(config, workspace, text)
+                .map_err(|_| source_changed())?;
         let repair = Self {
-            source, target, parent, identity, original, content,
-            rendered: rendered.into_bytes(), repaired,
+            source,
+            target,
+            parent,
+            identity,
+            original,
+            content,
+            rendered: rendered.into_bytes(),
+            repaired,
             committed: AtomicBool::new(false),
             #[cfg(unix)]
             name,
@@ -268,26 +302,42 @@ impl SourceRepair {
     #[cfg(unix)]
     fn commit(&self, check: &impl Fn() -> Result<()>) -> Result<()> {
         let _lock = crate::file_lock::DirLockAt::acquire_for(
-            &self.directory, &self.name, SOURCE_LOCK_TIMEOUT,
-        ).map_err(|_| source_io())?;
+            &self.directory,
+            &self.name,
+            SOURCE_LOCK_TIMEOUT,
+        )
+        .map_err(|_| source_io())?;
         self.check_unchanged()?;
         check()?;
         let name = OsString::from(format!(".pi-mcp-reauth-{}.tmp", uuid::Uuid::new_v4()));
         let descriptor = rustix::fs::openat(
-            &self.directory, &name,
-            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::EXCL | rustix::fs::OFlags::NOFOLLOW
+            &self.directory,
+            &name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        ).map_err(|_| source_io())?;
+        )
+        .map_err(|_| source_io())?;
         let mut temp = SourceTemp {
             file: File::from(descriptor),
             directory: self.directory.try_clone().map_err(|_| source_io())?,
-            name, persisted: false,
+            name,
+            persisted: false,
         };
-        temp.file.set_permissions(self.original.metadata().map_err(|_| source_io())?.permissions())
+        temp.file
+            .set_permissions(
+                self.original
+                    .metadata()
+                    .map_err(|_| source_io())?
+                    .permissions(),
+            )
             .map_err(|_| source_io())?;
-        temp.file.write_all(&self.rendered).map_err(|_| source_io())?;
+        temp.file
+            .write_all(&self.rendered)
+            .map_err(|_| source_io())?;
         temp.file.sync_all().map_err(|_| source_io())?;
         self.check_unchanged()?;
         check()?;
@@ -306,7 +356,13 @@ impl SourceRepair {
         self.check_unchanged()?;
         check()?;
         let mut temp = tempfile::NamedTempFile::new_in(&self.parent).map_err(|_| source_io())?;
-        temp.as_file().set_permissions(self.original.metadata().map_err(|_| source_io())?.permissions())
+        temp.as_file()
+            .set_permissions(
+                self.original
+                    .metadata()
+                    .map_err(|_| source_io())?
+                    .permissions(),
+            )
             .map_err(|_| source_io())?;
         temp.write_all(&self.rendered).map_err(|_| source_io())?;
         temp.as_file().sync_all().map_err(|_| source_io())?;
@@ -326,11 +382,15 @@ impl SourceRepair {
 #[cfg(unix)]
 fn open_source(directory: &File, name: &std::ffi::OsStr) -> Result<File> {
     let descriptor = rustix::fs::openat(
-        directory, name,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
-    ).map_err(|_| source_changed())?;
+    )
+    .map_err(|_| source_changed())?;
     Ok(File::from(descriptor))
 }
 
@@ -341,7 +401,9 @@ fn open_source(path: &Path) -> Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(0x0020_0000).share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+        options
+            .custom_flags(0x0020_0000)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
     }
     options.open(path).map_err(|_| source_changed())
 }
@@ -359,7 +421,8 @@ fn read_source(file: &File) -> Result<Vec<u8>> {
         }
     }
     let mut bytes = Vec::new();
-    file.take((MAX_MCP_CONFIG_BYTES + 1) as u64).read_to_end(&mut bytes)
+    file.take((MAX_MCP_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|_| source_changed())?;
     if bytes.len() > MAX_MCP_CONFIG_BYTES {
         return Err(source_changed());

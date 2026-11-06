@@ -902,10 +902,7 @@ impl CostBudget {
             .is_some_and(|existing| existing == &data);
         if !unchanged {
             let active_leaf = session.leaf_id().map(str::to_owned);
-            session.append_custom_entry(
-                CHECKPOINT_TYPE.to_string(),
-                Some(data),
-            );
+            session.append_custom_entry(CHECKPOINT_TYPE.to_string(), Some(data));
             // Accounting belongs to the retained session tree, outside the
             // selected conversation. A failed assistant must remain the leaf
             // so retry/failover can abandon its output without refunding the
@@ -1059,7 +1056,8 @@ impl CostAttempt {
         }
         if !cost.is_finite() || cost < 0.0 {
             self.invalid_usage = true;
-            self.budget.quarantine("provider returned invalid model cost");
+            self.budget
+                .quarantine("provider returned invalid model cost");
             return Err(Error::session("provider returned invalid model cost"));
         }
         if cost <= self.known_cost {
@@ -1493,9 +1491,7 @@ fn recorded_account(session: &Session, journal: Option<&Journal>) -> Result<(f64
             observed = coverage;
         }
     }
-    if !checkpoint_found
-        && let Some(journal) = journal
-    {
+    if !checkpoint_found && let Some(journal) = journal {
         spent = add_cost(spent, journal.uncovered(&observed));
     }
     Ok((spent, observed, false))
@@ -1730,7 +1726,10 @@ mod tests {
         assert_eq!(provisional.pending, 2.0);
         assert!(matches!(
             budget.admit(),
-            Err(Error::CostCap { spent: 2.0, cap: 2.0 })
+            Err(Error::CostCap {
+                spent: 2.0,
+                cap: 2.0
+            })
         ));
         assert!(
             budget.take_warning().is_none(),
@@ -1867,7 +1866,11 @@ mod tests {
         budget.record(1.0).unwrap();
         assert_eq!(resumed.refresh().unwrap().spent, 9.5);
         assert_eq!(recorded_spend(&reopened).unwrap(), 9.5);
-        assert_eq!(budget.spent(), 9.0, "imported or inherited fees are not own charges");
+        assert_eq!(
+            budget.spent(),
+            9.0,
+            "imported or inherited fees are not own charges"
+        );
     }
 
     #[test]

@@ -5088,11 +5088,8 @@ fn deliver_oauth_callback(
 fn spawn_owned_oauth_callback(
     listener: std::net::TcpListener,
     port: u16,
-    serve: impl FnOnce(
-        std::net::TcpStream,
-        &std::sync::mpsc::Sender<String>,
-        &Mutex<OAuthCallbackIo>,
-    ) + Send
+    serve: impl FnOnce(std::net::TcpStream, &std::sync::mpsc::Sender<String>, &Mutex<OAuthCallbackIo>)
+    + Send
     + 'static,
 ) -> Result<OAuthCallbackServer> {
     listener
@@ -7351,9 +7348,8 @@ mod tests {
     fn oauth_callback_drop_interrupts_an_accepted_stalled_peer() {
         let (server, _) = start_oauth_callback_server_random_port().expect("callback server");
         let io = Arc::clone(&server.io);
-        let mut peer =
-            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port))
-                .expect("connect callback peer");
+        let mut peer = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port))
+            .expect("connect callback peer");
         peer.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
         // Establish acceptance before cancelling, so this covers the blocking
@@ -7403,9 +7399,8 @@ mod tests {
     fn oauth_callback_delivers_after_the_existing_browser_response() {
         let (server, _) = start_oauth_callback_server_random_port().expect("callback server");
         let io = Arc::clone(&server.io);
-        let mut peer =
-            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port))
-                .expect("connect callback peer");
+        let mut peer = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, server.port))
+            .expect("connect callback peer");
         peer.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
         peer.write_all(b"GET /callback?code=example&state=test HTTP/1.1\r\n")
@@ -7420,7 +7415,8 @@ mod tests {
         // Match CLI ownership: it drops the server immediately after receiving.
         drop(server);
         let mut response = String::new();
-        peer.read_to_string(&mut response).expect("browser response");
+        peer.read_to_string(&mut response)
+            .expect("browser response");
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("Authorization successful"));
         assert!(response.contains("You can close this browser tab and return to Pi Agent."));

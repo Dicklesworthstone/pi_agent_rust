@@ -3574,8 +3574,8 @@ mod tests {
         let viewport = (ta.scroll_anchor.get(), ta.scroll_left.get());
         for range in [
             Range { start: 4, end: 1 },
-            2..4, // Inside the CJK scalar.
-            4..5, // Between a base character and its combining mark.
+            2..4,  // Inside the CJK scalar.
+            4..5,  // Between a base character and its combining mark.
             7..14, // Inside the emoji ZWJ cluster.
             0..text.len() + 1,
             text.len() + 1..text.len() + 1,

@@ -799,7 +799,9 @@ mod runtime_lifetime {
     fn operator_handler_cancellation_releases_native_work_and_keeps_other_extensions_callable() {
         let executor = RuntimeBuilder::current_thread().build().expect("runtime");
         executor.block_on(async {
-            for (shortcut, drop_caller) in [(false, false), (false, true), (true, false), (true, true)] {
+            for (shortcut, drop_caller) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let mut fixture = fixture().await;
                 let (abort, signal) = pi::agent::AbortHandle::new();
                 let command = Box::pin(if shortcut {

@@ -336,7 +336,10 @@ fn get_channel_authentication_rejection_prevents_catalog_publication() {
 fn operator_authentication_requires_trust_even_with_static_authorization() {
     for headers in [
         Vec::new(),
-        vec![("aUtHoRiZaTiOn".to_string(), "Bearer explicit-fixture".to_string())],
+        vec![(
+            "aUtHoRiZaTiOn".to_string(),
+            "Bearer explicit-fixture".to_string(),
+        )],
     ] {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let server = AuthHttpServer::start(None, 401, 405);

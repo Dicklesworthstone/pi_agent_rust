@@ -29018,16 +29018,28 @@ mod tests {
             let mut ids = std::collections::HashSet::new();
             for request in requests {
                 let HostcallKind::BuiltinTool { name } = &request.kind else {
-                    panic!("factory used the ordinary override lookup: {:?}", request.kind);
+                    panic!(
+                        "factory used the ordinary override lookup: {:?}",
+                        request.kind
+                    );
                 };
                 assert!(ids.insert(request.call_id.clone()));
                 assert_eq!(request.payload["cwd"], json!("/workspace/sub"));
                 assert_eq!(request.payload["stream"], json!(true));
                 assert_eq!(request.params_for_hash()["builtin"], json!(true));
-                assert_eq!(request.params_for_hash()["input"]["path"], json!("file.txt"));
+                assert_eq!(
+                    request.params_for_hash()["input"]["path"],
+                    json!("file.txt")
+                );
                 match name.as_str() {
-                    "read" => assert_eq!(request.payload["options"], json!({"autoResizeImages":false})),
-                    "bash" => assert_eq!(request.payload["options"], json!({"commandPrefix":"export FOO=bar"})),
+                    "read" => assert_eq!(
+                        request.payload["options"],
+                        json!({"autoResizeImages":false})
+                    ),
+                    "bash" => assert_eq!(
+                        request.payload["options"],
+                        json!({"commandPrefix":"export FOO=bar"})
+                    ),
                     _ => assert_eq!(request.payload["options"], json!({})),
                 }
                 runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
@@ -29035,18 +29047,27 @@ mod tests {
                     chunk: json!({"content":[{"type":"text", "text":"progress"}], "details":{"partial":true}}),
                     is_final: false,
                 });
-                runtime.complete_hostcall(request.call_id, HostcallOutcome::Success(json!({
-                    "content":[{"type":"text", "text":format!("executed {name}")}],
-                    "details":{"native":true}, "isError":name == "bash",
-                })));
+                runtime.complete_hostcall(
+                    request.call_id,
+                    HostcallOutcome::Success(json!({
+                        "content":[{"type":"text", "text":format!("executed {name}")}],
+                        "details":{"native":true}, "isError":name == "bash",
+                    })),
+                );
             }
             drain_until_idle(&runtime, &clock).await;
             let probe = get_global_json(&runtime, "factoryProbe").await;
             assert_eq!(probe["done"], json!(true), "{probe}");
             assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
-            assert_eq!(probe["names"], json!(["read", "grep", "find", "ls", "write", "edit", "bash"]));
+            assert_eq!(
+                probe["names"],
+                json!(["read", "grep", "find", "ls", "write", "edit", "bash"])
+            );
             assert_eq!(probe["updates"].as_array().unwrap().len(), 7, "{probe}");
-            assert_eq!(probe["values"][0]["content"][0]["text"], json!("executed read"));
+            assert_eq!(
+                probe["values"][0]["content"][0]["text"],
+                json!("executed read")
+            );
             assert_eq!(probe["values"][6]["isError"], json!(true));
             assert_eq!(probe["values"][6]["details"]["native"], json!(true));
         });
@@ -29084,9 +29105,14 @@ mod tests {
             assert_eq!(probe["aborted"], json!("stopped"), "{probe}");
             assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
             assert_eq!(probe["errors"].as_array().unwrap().len(), 5);
-            assert!(probe["errors"].as_array().unwrap().iter().all(|error| {
-                error.as_str().unwrap().starts_with("TypeError:")
-            }), "{probe}");
+            assert!(
+                probe["errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|error| { error.as_str().unwrap().starts_with("TypeError:") }),
+                "{probe}"
+            );
         });
     }
 
@@ -29095,7 +29121,9 @@ mod tests {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
             let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
-            runtime.eval(r"
+            runtime
+                .eval(
+                    r"
                 globalThis.factoryProbe = { done: false, updates: [] };
                 globalThis.factoryAbort = new AbortController();
                 import('@mariozechner/pi-coding-agent').then((mod) =>
@@ -29104,20 +29132,39 @@ mod tests {
                   .then(() => { factoryProbe.resolved = true; })
                   .catch((error) => { factoryProbe.error = String(error); })
                   .finally(() => { factoryProbe.done = true; });
-            ").await.unwrap();
+            ",
+                )
+                .await
+                .unwrap();
             drain_until_idle(&runtime, &clock).await;
             let request = runtime.drain_hostcall_requests().pop_front().unwrap();
-            runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
-                sequence: 0, chunk: json!({"content":[], "details":{"before":true}}), is_final: false,
-            });
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"content":[], "details":{"before":true}}),
+                    is_final: false,
+                },
+            );
             drain_until_idle(&runtime, &clock).await;
-            runtime.eval("factoryAbort.abort('caller stopped');").await.unwrap();
+            runtime
+                .eval("factoryAbort.abort('caller stopped');")
+                .await
+                .unwrap();
             drain_until_idle(&runtime, &clock).await;
             assert!(!runtime.is_hostcall_active(&request.call_id));
-            runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
-                sequence: 1, chunk: json!({"content":[], "details":{"late":true}}), is_final: false,
-            });
-            runtime.complete_hostcall(request.call_id, HostcallOutcome::Success(json!({"content":[]})));
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 1,
+                    chunk: json!({"content":[], "details":{"late":true}}),
+                    is_final: false,
+                },
+            );
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(json!({"content":[]})),
+            );
             drain_until_idle(&runtime, &clock).await;
             let probe = get_global_json(&runtime, "factoryProbe").await;
             assert_eq!(probe["done"], json!(true), "{probe}");

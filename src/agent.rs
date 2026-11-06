@@ -3179,7 +3179,9 @@ impl Agent {
         let mut messages = messages.to_vec();
         messages.retain(|message| match message {
             Message::Custom(custom) => !context_excluded_custom_message(custom),
-            Message::Assistant(_) => !crate::turn_recovery::context_excludes_empty_response(message),
+            Message::Assistant(_) => {
+                !crate::turn_recovery::context_excludes_empty_response(message)
+            }
             _ => true,
         });
         apply_image_input_policy(
@@ -9358,9 +9360,9 @@ fn pi_ai_context_tools(context: &Value) -> Result<Vec<ToolDef>> {
     let Some(value) = context.get("tools").filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
-    let tools = value.as_array().ok_or_else(|| {
-        Error::validation("pi-ai completion context.tools must be an array")
-    })?;
+    let tools = value
+        .as_array()
+        .ok_or_else(|| Error::validation("pi-ai completion context.tools must be an array"))?;
     tools
         .iter()
         .enumerate()
@@ -12480,7 +12482,9 @@ mod extensions_integration_tests {
                 .cost_budget()
                 .is_some_and(|shared| shared.same_tree(&budget))
         );
-        budget.record(1.0).expect("sibling exhausts the shared account");
+        budget
+            .record(1.0)
+            .expect("sibling exhausts the shared account");
         let result = futures::executor::block_on(provider.stream(&Context::default(), &options));
         assert!(matches!(result, Err(Error::CostCap { .. })));
     }
@@ -12736,7 +12740,9 @@ mod extensions_integration_tests {
                 };
                 let error = outcome.expect_err("automatic policy rejects extension replacement");
                 assert!(
-                    error.to_string().contains("does not accept extension replacement"),
+                    error
+                        .to_string()
+                        .contains("does not accept extension replacement"),
                     "overflow={overflow}: {error}",
                 );
                 {
@@ -12753,7 +12759,11 @@ mod extensions_integration_tests {
                         } if message.contains("does not accept extension replacement")
                     ));
                 }
-                assert!(!agent_session.extensions_is_compacting.load(Ordering::SeqCst));
+                assert!(
+                    !agent_session
+                        .extensions_is_compacting
+                        .load(Ordering::SeqCst)
+                );
                 let stored = session.lock(cx.cx()).await.expect("stored session");
                 assert!(source == SessionEditSnapshot::capture(&stored).expect("final snapshot"));
                 assert_eq!(
@@ -12857,9 +12867,10 @@ mod extensions_integration_tests {
 
         let automatic: Arc<dyn Provider> = Arc::new(AutomaticCompactionProvider {
             inner: Arc::clone(&current),
-            entry: state.registry.as_ref().and_then(|registry| {
-                registry.find(current.name(), current.model_id())
-            }),
+            entry: state
+                .registry
+                .as_ref()
+                .and_then(|registry| registry.find(current.name(), current.model_id())),
             auth: state.auth.as_deref().cloned(),
             explicit_key: None,
         });
@@ -21308,7 +21319,8 @@ impl AgentSession {
             if let Some(prep) = prep.as_mut()
                 && prep.settings.method_order.is_some()
             {
-                self.agent.refresh_compaction_retained_tokens(prep, &entries)?;
+                self.agent
+                    .refresh_compaction_retained_tokens(prep, &entries)?;
             }
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
@@ -21709,7 +21721,9 @@ impl AgentSession {
             session.ensure_full_v2_hydration_before_save()?;
             session.ensure_entry_ids();
         }
-        if let Some(origin) = install_guard.as_ref().and_then(|guard| guard.origin.as_ref())
+        if let Some(origin) = install_guard
+            .as_ref()
+            .and_then(|guard| guard.origin.as_ref())
             && !self.compaction_origin_matches_session(origin, &session).0
         {
             return Err(Error::session(
@@ -21876,9 +21890,7 @@ impl AgentSession {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
             Ok(details) => Some(match result.snap_payload.as_ref() {
-                Some(payload) => {
-                    crate::compaction_snap::payload_to_details(Some(details), payload)
-                }
+                Some(payload) => crate::compaction_snap::payload_to_details(Some(details), payload),
                 None => details,
             }),
             Err(err) => {
@@ -22014,7 +22026,8 @@ impl AgentSession {
             if let Some(prep) = prep.as_mut()
                 && prep.settings.method_order.is_some()
             {
-                self.agent.refresh_compaction_retained_tokens(prep, &entries)?;
+                self.agent
+                    .refresh_compaction_retained_tokens(prep, &entries)?;
             }
             let install_guard = overflow.then(|| CompactionInstallGuard {
                 origin: Some(self.compaction_origin_for_session(&session)),

@@ -24,19 +24,42 @@ fn take(subscription: &Subscription) -> Poll<ServerRequest> {
 #[test]
 fn unsolicited_queued_ambiguous_old_and_overlapping_prompts_do_not_acquire_an_owner() {
     let registry = Arc::new(ElicitationRegistry::default());
-    assert_eq!(registry.route(&json!(1), Some(&params()), 7).unwrap()["result"]["action"], "cancel");
+    assert_eq!(
+        registry.route(&json!(1), Some(&params()), 7).unwrap()["result"]["action"],
+        "cancel"
+    );
     let dispatch = Arc::new(RequestDispatch::new());
     let queued = registry.subscribe(Arc::clone(&dispatch), 7, false).unwrap();
-    assert_eq!(registry.route(&json!(2), Some(&params()), 7).unwrap()["result"]["action"], "cancel");
+    assert_eq!(
+        registry.route(&json!(2), Some(&params()), 7).unwrap()["result"]["action"],
+        "cancel"
+    );
     assert!(dispatch.claim());
-    assert_eq!(registry.route(&json!(3), Some(&params()), 8).unwrap()["result"]["action"], "cancel");
+    assert_eq!(
+        registry.route(&json!(3), Some(&params()), 8).unwrap()["result"]["action"],
+        "cancel"
+    );
     let other = admitted(&registry, false);
-    assert_eq!(registry.route(&json!(4), Some(&params()), 7).unwrap()["result"]["action"], "cancel");
+    assert_eq!(
+        registry.route(&json!(4), Some(&params()), 7).unwrap()["result"]["action"],
+        "cancel"
+    );
     drop(other);
     assert!(registry.route(&json!(5), Some(&params()), 7).is_none());
-    assert!(registry.route(&json!(5), Some(&params()), 7).is_none(), "duplicate must not receive a second reply");
-    assert!(registry.route(&json!(5), Some(&json!({"mode":"url"})), 7).is_none(), "malformed duplicate must not race the original answer");
-    assert_eq!(registry.route(&json!(6), Some(&params()), 7).unwrap()["result"]["action"], "cancel");
+    assert!(
+        registry.route(&json!(5), Some(&params()), 7).is_none(),
+        "duplicate must not receive a second reply"
+    );
+    assert!(
+        registry
+            .route(&json!(5), Some(&json!({"mode":"url"})), 7)
+            .is_none(),
+        "malformed duplicate must not race the original answer"
+    );
+    assert_eq!(
+        registry.route(&json!(6), Some(&params()), 7).unwrap()["result"]["action"],
+        "cancel"
+    );
     assert!(matches!(take(&queued), Poll::Ready(request) if request.authorized));
     queued.complete();
     drop(queued);
@@ -75,13 +98,21 @@ fn cancelled_form_and_request_count_are_bounded_per_owner() {
         assert!(registry.route(&json!(id), Some(&params()), 7).is_none());
         registry.cancel(Some(&json!({"requestId":id})), 8);
         registry.cancel(Some(&json!({"requestId":id})), 7);
-        let Poll::Ready(request) = take(&subscription) else { panic!("queued form") };
+        let Poll::Ready(request) = take(&subscription) else {
+            panic!("queued form")
+        };
         assert!(request.cancelled.load(Ordering::Acquire));
         subscription.complete();
     }
-    assert_eq!(registry.route(&json!(100), Some(&params()), 7).unwrap()["result"]["action"], "cancel");
+    assert_eq!(
+        registry.route(&json!(100), Some(&params()), 7).unwrap()["result"]["action"],
+        "cancel"
+    );
     for params in [json!({"mode":"url"}), json!({"task":{"ttl":10}})] {
-        assert_eq!(registry.route(&json!(101), Some(&params), 7).unwrap()["error"]["code"], -32602);
+        assert_eq!(
+            registry.route(&json!(101), Some(&params), 7).unwrap()["error"]["code"],
+            -32602
+        );
     }
 }
 
@@ -98,12 +129,23 @@ fn form_contract_enforces_formats_patterns_enums_arrays_and_primitive_limits() {
     }})).expect("primitive form");
     let valid = json!({"email":"person@example.com", "count":7, "code":"AB", "color":"g", "tags":["x","y"]});
     assert!(form.schema.accepts(&valid));
-    for (field, invalid) in [("email",json!("no-at-sign")), ("count",json!(7.5)), ("code",json!("abc")), ("color",json!("Green")), ("tags",json!(["z"]))] {
+    for (field, invalid) in [
+        ("email", json!("no-at-sign")),
+        ("count", json!(7.5)),
+        ("code", json!("abc")),
+        ("color", json!("Green")),
+        ("tags", json!(["z"])),
+    ] {
         let mut invalid_form = valid.clone();
         invalid_form[field] = invalid;
         assert!(!form.schema.accepts(&invalid_form), "{field}");
     }
-    for schema in [json!({"type":"object"}), json!({"type":"string","$ref":"https://example.com/schema"}), json!({"type":"array","items":{"type":"object"}}), json!({"type":"integer","default":"7"})] {
+    for schema in [
+        json!({"type":"object"}),
+        json!({"type":"string","$ref":"https://example.com/schema"}),
+        json!({"type":"array","items":{"type":"object"}}),
+        json!({"type":"integer","default":"7"}),
+    ] {
         assert!(Field::parse("field", &schema, true).is_none());
     }
     let escaped = display("\u{1b}[2J\n\u{202e}[click](https://example.com) person@example.com");
@@ -120,12 +162,20 @@ struct ReplyTransport {
 
 #[async_trait]
 impl McpTransport for ReplyTransport {
-    async fn request(&self, _: &str, _: Value, _: Duration) -> Result<Value> { unreachable!() }
-    async fn notify(&self, _: &str, _: Value) -> Result<()> { unreachable!() }
-    fn is_alive(&self) -> bool { true }
+    async fn request(&self, _: &str, _: Value, _: Duration) -> Result<Value> {
+        unreachable!()
+    }
+    async fn notify(&self, _: &str, _: Value) -> Result<()> {
+        unreachable!()
+    }
+    fn is_alive(&self) -> bool {
+        true
+    }
     fn abort(&self) {}
     async fn close(&self) {}
-    fn diagnostics_tail(&self) -> String { String::new() }
+    fn diagnostics_tail(&self) -> String {
+        String::new()
+    }
     async fn respond_to_server_request(&self, response: Value, generation: u64) -> Result<()> {
         assert_eq!(generation, 7);
         lock(&self.replies).push(response);
@@ -135,11 +185,14 @@ impl McpTransport for ReplyTransport {
         let mut polls = 0;
         poll_fn(|task| {
             polls += 1;
-            if polls > 2 { Poll::Ready(()) } else {
+            if polls > 2 {
+                Poll::Ready(())
+            } else {
                 task.waker().wake_by_ref();
                 Poll::Pending
             }
-        }).await;
+        })
+        .await;
         Ok(())
     }
 }
@@ -149,7 +202,10 @@ fn final_result_cancels_an_accepted_unshown_form_and_does_not_duplicate_inflight
     for early in [true, false] {
         let registry = Arc::new(ElicitationRegistry::default());
         let subscription = admitted(&registry, false);
-        let native = Arc::new(ReplyTransport { replies: Mutex::new(Vec::new()), received: AtomicBool::new(false) });
+        let native = Arc::new(ReplyTransport {
+            replies: Mutex::new(Vec::new()),
+            received: AtomicBool::new(false),
+        });
         let transport: Arc<dyn McpTransport> = native.clone();
         let ask = AskTool::new(AskPolicy::Recommended);
         let questions = Arc::new(AtomicUsize::new(0));
@@ -160,23 +216,54 @@ fn final_result_cancels_an_accepted_unshown_form_and_does_not_duplicate_inflight
             let review = question.id.as_deref() == Some("mcp_review");
             let answer = AskAnswer {
                 question_id: question.id.clone().unwrap(),
-                selected: if review { vec![SUBMIT.to_string()] } else { Vec::new() },
+                selected: if review {
+                    vec![SUBMIT.to_string()]
+                } else {
+                    Vec::new()
+                },
                 other: (!review).then(|| "answer".to_string()),
             };
-            Box::pin(async move { Ok(AskResponse { answers: vec![answer], dismissed: false }) })
+            Box::pin(async move {
+                Ok(AskResponse {
+                    answers: vec![answer],
+                    dismissed: false,
+                })
+            })
         }));
         let operation = async {
             assert!(registry.route(&json!("form"), Some(&params()), 7).is_none());
             if !early {
-                poll_fn(|_| if native.received.load(Ordering::Acquire) { Poll::Ready(()) } else { Poll::Pending }).await;
+                poll_fn(|_| {
+                    if native.received.load(Ordering::Acquire) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
             }
             Ok(json!({"content":[]}))
         };
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(observe(operation, Some(subscription), Some(ask), "peer", &transport, None, || true)).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(observe(
+                operation,
+                Some(subscription),
+                Some(ask),
+                "peer",
+                &transport,
+                None,
+                || true,
+            ))
+            .unwrap();
         let replies = lock(&native.replies);
         assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0]["result"]["action"], if early { "cancel" } else { "accept" });
+        assert_eq!(
+            replies[0]["result"]["action"],
+            if early { "cancel" } else { "accept" }
+        );
         assert_eq!(questions.load(Ordering::Relaxed), if early { 0 } else { 2 });
         assert!(lock(&registry.slots).is_empty());
     }
@@ -186,15 +273,37 @@ fn final_result_cancels_an_accepted_unshown_form_and_does_not_duplicate_inflight
 fn headless_recommended_policy_never_supplies_server_form_values() {
     let registry = Arc::new(ElicitationRegistry::default());
     let subscription = admitted(&registry, false);
-    let native = Arc::new(ReplyTransport { replies: Mutex::new(Vec::new()), received: AtomicBool::new(false) });
+    let native = Arc::new(ReplyTransport {
+        replies: Mutex::new(Vec::new()),
+        received: AtomicBool::new(false),
+    });
     let transport: Arc<dyn McpTransport> = native.clone();
     let operation = async {
         assert!(registry.route(&json!(1), Some(&params()), 7).is_none());
-        poll_fn(|_| if native.received.load(Ordering::Acquire) { Poll::Ready(()) } else { Poll::Pending }).await;
+        poll_fn(|_| {
+            if native.received.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
         Ok(json!({"content":[]}))
     };
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    runtime.block_on(observe(operation, Some(subscription), Some(AskTool::new(AskPolicy::Recommended)), "peer", &transport, None, || true)).unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(observe(
+            operation,
+            Some(subscription),
+            Some(AskTool::new(AskPolicy::Recommended)),
+            "peer",
+            &transport,
+            None,
+            || true,
+        ))
+        .unwrap();
     assert_eq!(lock(&native.replies)[0]["result"]["action"], "cancel");
     assert!(lock(&native.replies)[0]["result"].get("content").is_none());
 }

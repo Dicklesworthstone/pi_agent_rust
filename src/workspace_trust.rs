@@ -588,8 +588,9 @@ impl WorkspaceTrustGuard {
     /// Returns an actionable restart error if the workspace or trust changed.
     pub fn validate_workspace(&self, cwd: &Path) -> Result<()> {
         if workspace_key(cwd) != self.origin_key {
-            return Err(self
-                .restart_required("the requested workspace differs from the launch workspace"));
+            return Err(
+                self.restart_required("the requested workspace differs from the launch workspace")
+            );
         }
         self.validate_origin()
     }
@@ -601,9 +602,7 @@ impl WorkspaceTrustGuard {
     /// valid, its scoped surface changed, or current policy cannot be read.
     pub fn validate_origin(&self) -> Result<()> {
         if workspace_key(&self.origin) != self.origin_key {
-            return Err(
-                self.restart_required("the launch workspace path now resolves elsewhere"),
-            );
+            return Err(self.restart_required("the launch workspace path now resolves elsewhere"));
         }
         if !self.trusted {
             return Ok(());
@@ -647,12 +646,15 @@ impl WorkspaceTrustGuard {
             && (self.source == TrustSource::EnvOverride
                 || (inputs.env_override.is_none() && inputs.trust_all_workspaces)));
         if !universal
-            && current.surface.as_ref().map(|surface| surface.digest.as_str())
+            && current
+                .surface
+                .as_ref()
+                .map(|surface| surface.digest.as_str())
                 != self.surface_digest.as_deref()
         {
-            return Err(self.restart_required(
-                "the project configuration or executable resources changed",
-            ));
+            return Err(
+                self.restart_required("the project configuration or executable resources changed")
+            );
         }
         Ok(())
     }
@@ -1764,13 +1766,9 @@ mod tests {
                 original.surface.as_ref().expect("original surface").digest,
                 changed.surface.as_ref().expect("changed surface").digest
             );
-            let ignored = Config::load_with_roots_and_project_trust(
-                None,
-                &global_dir,
-                &cwd,
-                changed.trusted,
-            )
-            .expect("load without untrusted project settings");
+            let ignored =
+                Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, changed.trusted)
+                    .expect("load without untrusted project settings");
             assert!(!cli.enabled_tools(&ignored).contains(&name));
 
             let approved = establish(
@@ -1808,9 +1806,8 @@ mod tests {
         );
         // Startup reads trustAllWorkspaces from operator-controlled settings
         // before allowing any project settings into the effective config.
-        let global =
-            Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
-                .expect("load operator-controlled settings");
+        let global = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+            .expect("load operator-controlled settings");
         let state = establish(
             &cwd,
             &store_path,

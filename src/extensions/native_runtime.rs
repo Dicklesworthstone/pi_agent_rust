@@ -852,7 +852,10 @@ impl ExtensionRuntimeHandle {
         timeout_ms: u64,
         abort: Option<crate::agent::AbortSignal>,
     ) -> Result<Value> {
-        if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+        if abort
+            .as_ref()
+            .is_some_and(crate::agent::AbortSignal::is_aborted)
+        {
             return Err(Error::Aborted);
         }
         match self {
@@ -873,7 +876,10 @@ impl ExtensionRuntimeHandle {
                         runtime.execute_shortcut(key_id, timeout_ms).await
                     }
                 };
-                if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+                if abort
+                    .as_ref()
+                    .is_some_and(crate::agent::AbortSignal::is_aborted)
+                {
                     Err(Error::Aborted)
                 } else {
                     result

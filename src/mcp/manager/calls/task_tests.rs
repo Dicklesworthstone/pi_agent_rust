@@ -248,7 +248,11 @@ async fn wait_for_task_cancel(root: &Path) {
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         asupersync::time::sleep(now, Duration::from_millis(10)).await;
     }
-    assert_eq!(count(root, "tasks/cancel"), 1, "owned cleanup was not delivered");
+    assert_eq!(
+        count(root, "tasks/cancel"),
+        1,
+        "owned cleanup was not delivered"
+    );
 }
 
 #[test]
@@ -281,26 +285,39 @@ fn mounted_task_tools_await_real_results_and_keep_progress_over_stdio_and_http()
                 assert_eq!(count(temp.path(), "tasks/cancel"), 0);
                 assert_eq!(
                     count(temp.path(), "tasks/get"),
-                    if matches!(scenario, "instant" | "input") { 0 } else { 2 }
+                    if matches!(scenario, "instant" | "input") {
+                        0
+                    } else {
+                        2
+                    }
                 );
                 let _ = manager.shutdown_all().await;
             });
             let updates = McpManager::lock(&updates);
             assert!(!updates.is_empty());
-            assert!(updates.iter().any(|update| update.details.as_ref().is_some_and(|details| {
-                details["mcpTask"]["status"].is_string()
-            })));
+            assert!(updates.iter().any(|update| {
+                update
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details["mcpTask"]["status"].is_string())
+            }));
             if !matches!(scenario, "instant" | "input") {
-                assert!(updates.iter().any(|update| {
-                    update.details.as_ref().is_some_and(|details| {
-                        details["mcpProgress"]["progress"].is_number()
-                    })
-                }), "the original progress token stopped routing after task creation");
+                assert!(
+                    updates.iter().any(|update| {
+                        update
+                            .details
+                            .as_ref()
+                            .is_some_and(|details| details["mcpProgress"]["progress"].is_number())
+                    }),
+                    "the original progress token stopped routing after task creation"
+                );
             }
             for update in updates.iter() {
-                if let Some(message) = update.details.as_ref().and_then(|details| {
-                    details["mcpTask"]["statusMessage"].as_str()
-                }) {
+                if let Some(message) = update
+                    .details
+                    .as_ref()
+                    .and_then(|details| details["mcpTask"]["statusMessage"].as_str())
+                {
                     assert!(!message.chars().any(char::is_control));
                     assert!(!message.contains('\u{202e}'));
                     assert!(message.contains("\\u{1b}"));
@@ -318,7 +335,12 @@ fn task_negotiation_keeps_ordinary_calls_ordinary_and_rejects_unsupported_requir
         runtime().block_on(async {
             let result = manager.call_tool("task-peer", "work", json!({})).await;
             if scenario == "required-unavailable" {
-                assert!(result.unwrap_err().to_string().contains("MCP_TASK_UNSUPPORTED"));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("MCP_TASK_UNSUPPORTED")
+                );
                 assert_eq!(count(temp.path(), "tools/call"), 0);
             } else {
                 assert_eq!(result.unwrap()["structuredContent"]["count"], 7);
@@ -334,8 +356,13 @@ fn task_negotiation_keeps_ordinary_calls_ordinary_and_rejects_unsupported_requir
 #[test]
 fn task_contract_failures_never_replay_the_originating_tool_call() {
     for scenario in [
-        "bad-receipt", "missing-id", "wrong-status", "wrong-result", "bad-schema",
-        "server-error", "expired",
+        "bad-receipt",
+        "missing-id",
+        "wrong-status",
+        "wrong-result",
+        "bad-schema",
+        "server-error",
+        "expired",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let (manager, _peer) = fixture(temp.path(), "http", scenario);
@@ -355,7 +382,10 @@ fn task_contract_failures_never_replay_the_originating_tool_call() {
             }
             assert_eq!(count(temp.path(), "tools/call"), 1);
             let calls = frames(temp.path());
-            for frame in calls.iter().filter(|frame| frame["method"] == "tasks/cancel") {
+            for frame in calls
+                .iter()
+                .filter(|frame| frame["method"] == "tasks/cancel")
+            {
                 assert_eq!(frame["params"]["taskId"], "owned-task");
             }
             if matches!(scenario, "bad-schema" | "server-error" | "missing-id") {
@@ -381,26 +411,37 @@ fn task_wait_keeps_the_initial_deadline_and_cancellation_owner() {
             }
         };
         runtime.block_on(async {
-            let result = owner.with_current(async {
-                let entry = manager.entry("task-peer").unwrap();
-                let (transport, contract) = manager
-                    .prepare_tool_call(&owner, &entry, "work", Duration::from_secs(5))
-                    .await
-                    .unwrap();
-                manager.execute_tool_call(
-                    &entry,
-                    &transport,
-                    "work",
-                    &json!({}),
-                    Duration::from_millis(200),
-                    contract.output_schema,
-                    contract.task_support,
-                    contract.transport_generation,
-                    Some(&callback),
-                ).await
-            }).await;
+            let result = owner
+                .with_current(async {
+                    let entry = manager.entry("task-peer").unwrap();
+                    let (transport, contract) = manager
+                        .prepare_tool_call(&owner, &entry, "work", Duration::from_secs(5))
+                        .await
+                        .unwrap();
+                    manager
+                        .execute_tool_call(
+                            &entry,
+                            &transport,
+                            "work",
+                            &json!({}),
+                            Duration::from_millis(200),
+                            contract.output_schema,
+                            contract.task_support,
+                            contract.transport_generation,
+                            Some(&callback),
+                        )
+                        .await
+                })
+                .await;
             let message = result.unwrap_err().to_string();
-            assert!(message.contains(if cancel { "MCP_CANCELLED" } else { "MCP_TIMEOUT" }), "{message}");
+            assert!(
+                message.contains(if cancel {
+                    "MCP_CANCELLED"
+                } else {
+                    "MCP_TIMEOUT"
+                }),
+                "{message}"
+            );
             wait_for_task_cancel(temp.path()).await;
             assert_eq!(count(temp.path(), "tools/call"), 1);
             assert_eq!(count(temp.path(), "tasks/get"), 0);

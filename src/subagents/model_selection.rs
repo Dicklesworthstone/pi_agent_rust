@@ -430,32 +430,63 @@ mod tests {
             retry: Some(crate::config::RetrySettings {
                 fallback_chains: Some(std::collections::HashMap::from([
                     ("task".to_string(), vec![]),
-                    ("default".to_string(), vec!["openai/alternate:low".to_string()]),
+                    (
+                        "default".to_string(),
+                        vec!["openai/alternate:low".to_string()],
+                    ),
                 ])),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let mut tool = SubagentTool::with_paths(
-            dir.path().to_path_buf(), dir.path().join("global"), dir.path().join("unused-child"),
-        ).with_model_config(Some(config)).with_role_model_selection(Some((
-            crate::models::ModelRole::Task, "openai/primary".to_string(),
+            dir.path().to_path_buf(),
+            dir.path().join("global"),
+            dir.path().join("unused-child"),
+        )
+        .with_model_config(Some(config))
+        .with_role_model_selection(Some((
+            crate::models::ModelRole::Task,
+            "openai/primary".to_string(),
         )));
         let mut agent = super::super::tan_agent_definition();
         let deadline = Deadline::for_request(None, None).unwrap();
-        let (selection, frozen) = prepare_worker(&tool, &json!({}), &agent, dir.path(), deadline).unwrap();
+        let (selection, frozen) =
+            prepare_worker(&tool, &json!({}), &agent, dir.path(), deadline).unwrap();
         assert!(selection.is_none());
-        tool.model_config.as_mut().unwrap().retry.as_mut().unwrap().fallback_chains.as_mut().unwrap()
+        tool.model_config
+            .as_mut()
+            .unwrap()
+            .retry
+            .as_mut()
+            .unwrap()
+            .fallback_chains
+            .as_mut()
+            .unwrap()
             .insert("task".to_string(), vec!["openai/later".to_string()]);
         let policy: crate::failover::ChildFallbackPolicy = frozen.parse().unwrap();
-        assert!(policy.chain("openai", "primary", &[]).unwrap().entries.is_empty());
+        assert!(
+            policy
+                .chain("openai", "primary", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         let args = super::super::with_fallback_policy_args(
-            super::super::worker_args(&agent, tool.role_model_spec.as_deref(), None, selection.as_ref()),
+            super::super::worker_args(
+                &agent,
+                tool.role_model_spec.as_deref(),
+                None,
+                selection.as_ref(),
+            ),
             Some(&frozen),
         );
         assert_eq!(args[0], "--subagent-fallback-policy");
         assert_eq!(args[1], frozen.as_str());
-        assert!(args.windows(2).any(|pair| pair[0] == "--mode" && pair[1] == "rpc"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--mode" && pair[1] == "rpc")
+        );
         // An explicit definition pin to the same ID does not inherit task.
         agent.model = Some("openai/primary".to_string());
         let (_, pinned) = prepare_worker(&tool, &json!({}), &agent, dir.path(), deadline).unwrap();

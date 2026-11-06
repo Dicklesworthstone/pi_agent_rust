@@ -287,7 +287,11 @@ mod tests {
             let previous_default = jsonschema::options().build(&schema).unwrap();
             let tool = McpOutputSchema::compile(&schema).unwrap();
             assert_eq!(tool.accepts(&invalid), previous_default.is_valid(&invalid));
-            assert!(!McpOutputSchema::compile_form(&schema).unwrap().accepts(&invalid));
+            assert!(
+                !McpOutputSchema::compile_form(&schema)
+                    .unwrap()
+                    .accepts(&invalid)
+            );
         }
     }
 

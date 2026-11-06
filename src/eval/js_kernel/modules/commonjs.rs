@@ -37,10 +37,7 @@ impl ModuleDef for CommonJsModule {
     }
 }
 
-pub(super) fn declare<'js>(
-    ctx: &Ctx<'js>,
-    name: &str,
-) -> rquickjs::Result<Module<'js, Declared>> {
+pub(super) fn declare<'js>(ctx: &Ctx<'js>, name: &str) -> rquickjs::Result<Module<'js, Declared>> {
     let loader: Function<'js> = ctx.globals().get(ENGINE_SLOT)?;
     let module = Module::declare_def::<CommonJsModule, _>(ctx.clone(), name)?;
     let metadata = module.meta()?;
@@ -79,7 +76,8 @@ impl ModuleFiles {
                     Some(ModuleLanguage::Json) => "json",
                     _ => {
                         return Err(
-                            "EVAL_COMMONJS_FORMAT: require accepts CommonJS or JSON, not ESM".into(),
+                            "EVAL_COMMONJS_FORMAT: require accepts CommonJS or JSON, not ESM"
+                                .into(),
                         );
                     }
                 };
@@ -116,7 +114,9 @@ impl ModuleFiles {
             module_language(Path::new(&path)),
             Some(ModuleLanguage::CommonJs | ModuleLanguage::Json)
         ) {
-            return Err("EVAL_COMMONJS_FORMAT: synchronous require cannot load an ES module".into());
+            return Err(
+                "EVAL_COMMONJS_FORMAT: synchronous require cannot load an ES module".into(),
+            );
         }
         Ok(identity)
     }

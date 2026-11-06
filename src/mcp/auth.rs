@@ -183,9 +183,9 @@ impl AuthBinding {
     }
 
     fn applies(&self, record: &Record) -> bool {
-        self.static_fingerprint.as_ref().is_none_or(|fingerprint| {
-            record.static_fingerprint.as_ref() == Some(fingerprint)
-        })
+        self.static_fingerprint
+            .as_ref()
+            .is_none_or(|fingerprint| record.static_fingerprint.as_ref() == Some(fingerprint))
     }
 
     /// Called in the manager's blocking construction phase. A revoked record
@@ -381,9 +381,10 @@ impl AuthBinding {
             revision: nonce(),
             revoked: true,
             credentials: None,
-            static_fingerprint: self.static_fingerprint.clone().or_else(|| {
-                previous.and_then(|record| record.static_fingerprint)
-            }),
+            static_fingerprint: self
+                .static_fingerprint
+                .clone()
+                .or_else(|| previous.and_then(|record| record.static_fingerprint)),
         };
         let mut store = AuthStorage::empty_at(self.path.clone());
         store.set(
@@ -633,9 +634,10 @@ impl AuthBinding {
             revision: nonce(),
             revoked: false,
             credentials: Some(credentials),
-            static_fingerprint: self.static_fingerprint.clone().or_else(|| {
-                old.and_then(|record| record.static_fingerprint)
-            }),
+            static_fingerprint: self
+                .static_fingerprint
+                .clone()
+                .or_else(|| old.and_then(|record| record.static_fingerprint)),
         };
         let binding = self.clone();
         asupersync::runtime::spawn_blocking(move || {
@@ -2982,15 +2984,30 @@ mod tests {
         let resource = "http://127.0.0.1:9/mcp";
         let ordinary = AuthBinding::new(temp.path(), identity, resource).expect("ordinary binding");
         let first = record(&ordinary);
-        ordinary.write_sync(None, first.clone(), None).expect("existing managed login");
-        let authored = AuthBinding::new(temp.path(), identity, resource).expect("authored binding")
+        ordinary
+            .write_sync(None, first.clone(), None)
+            .expect("existing managed login");
+        let authored = AuthBinding::new(temp.path(), identity, resource)
+            .expect("authored binding")
             .for_static_authorization("authored-first".to_string())
             .with_static_authorization(Some("Bearer configured-first".to_string()));
-        assert!(!authored.has_managed_record().expect("unrelated managed login"));
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
+        assert!(
+            !authored
+                .has_managed_record()
+                .expect("unrelated managed login")
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
         runtime.block_on(async {
-            assert_eq!(authored.authorization_header(false).await.expect("configured header").as_deref(),
-                Some("Bearer configured-first"));
+            assert_eq!(
+                authored
+                    .authorization_header(false)
+                    .await
+                    .expect("configured header")
+                    .as_deref(),
+                Some("Bearer configured-first")
+            );
         });
         let takeover = Record {
             epoch: "explicit-takeover".to_string(),
@@ -2998,46 +3015,102 @@ mod tests {
             static_fingerprint: Some("authored-first".to_string()),
             ..first.clone()
         };
-        ordinary.write_sync(Some((first.epoch, first.revision)), takeover, None).expect("explicit takeover");
+        ordinary
+            .write_sync(Some((first.epoch, first.revision)), takeover, None)
+            .expect("explicit takeover");
         runtime.block_on(async {
-            assert!(authored.authorization_header(false).await.expect_err("retire prior session")
-                .to_string().contains("MCP_AUTH_CHANGED"));
-            let fresh = AuthBinding::new(temp.path(), identity, resource).expect("fresh binding")
+            assert!(
+                authored
+                    .authorization_header(false)
+                    .await
+                    .expect_err("retire prior session")
+                    .to_string()
+                    .contains("MCP_AUTH_CHANGED")
+            );
+            let fresh = AuthBinding::new(temp.path(), identity, resource)
+                .expect("fresh binding")
                 .for_static_authorization("authored-first".to_string());
             assert!(fresh.has_managed_record().expect("matching takeover"));
-            assert_eq!(fresh.authorization_header(false).await.expect("managed header").as_deref(),
-                Some("Bearer old-access"));
-            let edited = AuthBinding::new(temp.path(), identity, resource).expect("edited binding")
+            assert_eq!(
+                fresh
+                    .authorization_header(false)
+                    .await
+                    .expect("managed header")
+                    .as_deref(),
+                Some("Bearer old-access")
+            );
+            let edited = AuthBinding::new(temp.path(), identity, resource)
+                .expect("edited binding")
                 .for_static_authorization("authored-second".to_string())
                 .with_static_authorization(Some("Bearer configured-second".to_string()));
-            assert!(!edited.has_managed_record().expect("different authored credentials"));
-            assert_eq!(edited.authorization_header(false).await.expect("new authored header").as_deref(),
-                Some("Bearer configured-second"));
+            assert!(
+                !edited
+                    .has_managed_record()
+                    .expect("different authored credentials")
+            );
+            assert_eq!(
+                edited
+                    .authorization_header(false)
+                    .await
+                    .expect("new authored header")
+                    .as_deref(),
+                Some("Bearer configured-second")
+            );
         });
     }
 
     #[test]
     fn logout_after_source_repair_retains_the_marker_that_suppresses_the_old_header() {
         let temp = tempfile::tempdir().expect("credential directory");
-        let binding = AuthBinding::new(temp.path(), "header-free-definition", "http://127.0.0.1:9/mcp")
-            .expect("repaired binding");
+        let binding = AuthBinding::new(
+            temp.path(),
+            "header-free-definition",
+            "http://127.0.0.1:9/mcp",
+        )
+        .expect("repaired binding");
         let mut login = record(&binding);
         login.static_fingerprint = Some("original-authored-header".to_string());
-        binding.write_sync(None, login, None).expect("takeover login");
+        binding
+            .write_sync(None, login, None)
+            .expect("takeover login");
         let admit: Admission = Arc::new(|| Ok(()));
-        binding.forget_sync(&admit).expect("logout from repaired configuration");
-        let tombstone = binding.read_sync().expect("stored logout").expect("tombstone");
+        binding
+            .forget_sync(&admit)
+            .expect("logout from repaired configuration");
+        let tombstone = binding
+            .read_sync()
+            .expect("stored logout")
+            .expect("tombstone");
         assert!(tombstone.revoked);
-        assert_eq!(tombstone.static_fingerprint.as_deref(), Some("original-authored-header"));
-        let old_definition = AuthBinding::new(temp.path(), "header-free-definition", "http://127.0.0.1:9/mcp")
-            .expect("old definition")
-            .for_static_authorization("original-authored-header".to_string())
-            .with_static_authorization(Some("Bearer stale".to_string()));
-        assert!(old_definition.has_managed_record().expect("logout owns the old header"));
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().expect("runtime");
+        assert_eq!(
+            tombstone.static_fingerprint.as_deref(),
+            Some("original-authored-header")
+        );
+        let old_definition = AuthBinding::new(
+            temp.path(),
+            "header-free-definition",
+            "http://127.0.0.1:9/mcp",
+        )
+        .expect("old definition")
+        .for_static_authorization("original-authored-header".to_string())
+        .with_static_authorization(Some("Bearer stale".to_string()));
+        assert!(
+            old_definition
+                .has_managed_record()
+                .expect("logout owns the old header")
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
         runtime.block_on(async {
-            assert!(old_definition.authorization_header(false).await.expect_err("no static fallback after logout")
-                .to_string().contains("MCP_AUTH_REQUIRED"));
+            assert!(
+                old_definition
+                    .authorization_header(false)
+                    .await
+                    .expect_err("no static fallback after logout")
+                    .to_string()
+                    .contains("MCP_AUTH_REQUIRED")
+            );
         });
     }
 

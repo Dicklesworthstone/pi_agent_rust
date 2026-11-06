@@ -1490,7 +1490,12 @@ pub fn discover(
             continue;
         }
         match resolve_configured_server(
-            name.clone(), raw, provenance, source_file.clone(), cwd, enabled,
+            name.clone(),
+            raw,
+            provenance,
+            source_file.clone(),
+            cwd,
+            enabled,
         ) {
             Ok(config) => servers.push(config),
             Err(reason) => warnings.push(ConfigWarning {
@@ -1563,7 +1568,11 @@ fn resolve_configured_server(
                 return Err("cwd must not be empty".to_string());
             }
             let path = PathBuf::from(value);
-            Ok(canonical_cwd(&if path.is_absolute() { path } else { cwd.join(path) }))
+            Ok(canonical_cwd(&if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }))
         })
         .transpose()?;
     let config = ConfiguredServer {
@@ -1592,14 +1601,23 @@ pub(super) fn authorization_repair_document(
     workspace: &Path,
     content: &str,
 ) -> Result<(String, ConfiguredServer), String> {
-    let changed = || "the selected MCP definition changed; reload it before reauthenticating".to_string();
+    let changed =
+        || "the selected MCP definition changed; reload it before reauthenticating".to_string();
     let parse_selected = |text: &str| -> Result<ConfiguredServer, String> {
         let mut selection = ServerSelection::default();
-        let entries = parse_server_map(&selected.source_file, selected.provenance, text, &mut selection)?;
+        let entries = parse_server_map(
+            &selected.source_file,
+            selected.provenance,
+            text,
+            &mut selection,
+        )?;
         if selection.invalid || selection.disabled.contains(&selected.name) {
             return Err(changed());
         }
-        let raw = parse_server(&selected.name, entries.get(&selected.name).ok_or_else(changed)?)?;
+        let raw = parse_server(
+            &selected.name,
+            entries.get(&selected.name).ok_or_else(changed)?,
+        )?;
         let enabled = !selection.disabled.contains(&selected.name)
             && raw.disabled != Some(true)
             && (raw.enabled != Some(false) || selection.enabled.contains(&selected.name));
@@ -1607,8 +1625,12 @@ pub(super) fn authorization_repair_document(
             return Err(changed());
         }
         resolve_configured_server(
-            selected.name.clone(), raw, selected.provenance,
-            selected.source_file.clone(), workspace, enabled,
+            selected.name.clone(),
+            raw,
+            selected.provenance,
+            selected.source_file.clone(),
+            workspace,
+            enabled,
         )
     };
     let fingerprint = |config: &ConfiguredServer| {
@@ -1619,12 +1641,20 @@ pub(super) fn authorization_repair_document(
         return Err(changed());
     }
     let mut repaired = selected.clone();
-    repaired.headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
-    let mut rendered = if selected.source_file.extension().is_some_and(|extension| extension == "toml") {
+    repaired
+        .headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+    let mut rendered = if selected
+        .source_file
+        .extension()
+        .is_some_and(|extension| extension == "toml")
+    {
         let mut value: toml::Value = toml::from_str(content).map_err(|_| changed())?;
-        let server = value.get_mut("mcp_servers")
+        let server = value
+            .get_mut("mcp_servers")
             .and_then(|servers| servers.get_mut(&selected.name))
-            .and_then(toml::Value::as_table_mut).ok_or_else(changed)?;
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(changed)?;
         // Both spellings may coexist. Preserve every unrelated entry and keep
         // the authoritative headers table even when it becomes empty.
         for field in ["headers", "http_headers"] {
@@ -1635,26 +1665,39 @@ pub(super) fn authorization_repair_document(
         toml::to_string_pretty(&value).map_err(|_| changed())?
     } else {
         let mut value: Value = serde_json::from_str(content).map_err(|_| changed())?;
-        let vscode = selected.source_file.ends_with(Path::new(".vscode/mcp.json"));
+        let vscode = selected
+            .source_file
+            .ends_with(Path::new(".vscode/mcp.json"));
         let servers = if value.get("mcpServers").is_some() {
             value.get_mut("mcpServers")
         } else if vscode && value.get("servers").is_some() {
             value.get_mut("servers")
-        } else if vscode && value.get("mcp").and_then(|mcp| mcp.get("servers")).is_some() {
+        } else if vscode
+            && value
+                .get("mcp")
+                .and_then(|mcp| mcp.get("servers"))
+                .is_some()
+        {
             value.get_mut("mcp").and_then(|mcp| mcp.get_mut("servers"))
         } else {
             Some(&mut value)
-        }.and_then(Value::as_object_mut).ok_or_else(changed)?;
-        let headers = servers.get_mut(&selected.name)
+        }
+        .and_then(Value::as_object_mut)
+        .ok_or_else(changed)?;
+        let headers = servers
+            .get_mut(&selected.name)
             .and_then(|server| server.get_mut("headers"))
-            .and_then(Value::as_object_mut).ok_or_else(changed)?;
+            .and_then(Value::as_object_mut)
+            .ok_or_else(changed)?;
         headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
         serde_json::to_string_pretty(&value).map_err(|_| changed())?
     };
     if !rendered.ends_with('\n') {
         rendered.push('\n');
     }
-    if rendered.len() > MAX_MCP_CONFIG_BYTES || fingerprint(&parse_selected(&rendered)?) != fingerprint(&repaired) {
+    if rendered.len() > MAX_MCP_CONFIG_BYTES
+        || fingerprint(&parse_selected(&rendered)?) != fingerprint(&repaired)
+    {
         return Err(changed());
     }
     Ok((rendered, repaired))

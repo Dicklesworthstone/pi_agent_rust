@@ -5,12 +5,13 @@ mod common;
 
 use common::{TestHarness, run_async};
 use pi::compaction::{
-    AutoCompactionMethod, CompactionPreparation, CompactionPrivacy, CompactionReader, CompactionResult,
-    SEMANTIC_COMPACTION_QUALITY_SCHEMA, SemanticCompactionLossClass, SemanticCompactionMarker,
-    SemanticCompactionMarkerKind, SemanticCompactionMarkerObservation, SemanticCompactionMarkerSeverity,
-    SemanticCompactionQualityVerdict, SemanticCompactionQualityView, compact, compact_auto,
-    evaluate_semantic_compaction_quality, prepare_compaction,
-    semantic_compaction_quality_report_to_jsonl, semantic_compaction_quality_report_to_value,
+    AutoCompactionMethod, CompactionPreparation, CompactionPrivacy, CompactionReader,
+    CompactionResult, SEMANTIC_COMPACTION_QUALITY_SCHEMA, SemanticCompactionLossClass,
+    SemanticCompactionMarker, SemanticCompactionMarkerKind, SemanticCompactionMarkerObservation,
+    SemanticCompactionMarkerSeverity, SemanticCompactionQualityVerdict,
+    SemanticCompactionQualityView, compact, compact_auto, evaluate_semantic_compaction_quality,
+    prepare_compaction, semantic_compaction_quality_report_to_jsonl,
+    semantic_compaction_quality_report_to_value,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, ImageContent, Message, StopReason, TextContent,
@@ -1283,7 +1284,10 @@ fn automatic_snapcompact_acceptance_uses_the_active_readers_archive_budget() {
                 keep_recent_tokens: 1,
                 threshold_tokens: Some(1000),
                 render_mode: pi::compaction::CompactionRenderMode::SnapCompact,
-                method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
+                method_order: Some(vec![
+                    AutoCompactionMethod::Shake,
+                    AutoCompactionMethod::Soft,
+                ]),
                 ..Default::default()
             };
             let preparation = pi::compaction::prepare_compaction_for_model(
@@ -1313,18 +1317,33 @@ fn automatic_snapcompact_acceptance_uses_the_active_readers_archive_budget() {
             if reader.accepts_images || reader.source_text_budget.is_none() {
                 let error = result.expect_err("the actual archive still exceeds the trigger");
                 assert!(error.to_string().contains("reclaimed insufficient context"));
-                assert_eq!(provider.prompts().len(), 1, "Soft must be attempted after Shake");
+                assert_eq!(
+                    provider.prompts().len(),
+                    1,
+                    "Soft must be attempted after Shake"
+                );
                 continue;
             }
 
             let result = result.expect("a bounded text reading permits local compaction");
             assert_eq!(result.details.mode.as_deref(), Some("shake"));
             assert!(provider.prompts().is_empty());
-            let payload = result.snap_payload.as_ref().expect("retained source archive");
+            let payload = result
+                .snap_payload
+                .as_ref()
+                .expect("retained source archive");
             assert!(!payload.frames.is_empty());
-            assert!(payload.source_text.as_deref().expect("source").contains(&source));
+            assert!(
+                payload
+                    .source_text
+                    .as_deref()
+                    .expect("source")
+                    .contains(&source)
+            );
             let details = pi::compaction_snap::payload_to_details(
-                Some(pi::compaction::compaction_details_to_value(&result.details).expect("details")),
+                Some(
+                    pi::compaction::compaction_details_to_value(&result.details).expect("details"),
+                ),
                 payload,
             );
             session.append_compaction(
@@ -1341,7 +1360,10 @@ fn automatic_snapcompact_acceptance_uses_the_active_readers_archive_budget() {
                 provider.name(),
                 provider.model_id(),
             );
-            assert!(installed_tokens < 1000, "installed {installed_tokens} tokens");
+            assert!(
+                installed_tokens < 1000,
+                "installed {installed_tokens} tokens"
+            );
         }
     });
 }
@@ -1359,13 +1381,16 @@ fn automatic_snapcompact_rescreens_cached_archive_after_a_rejected_summary() {
             extra_patterns: None,
         }));
         let mut preparation = privacy_preparation();
-        preparation.messages_to_summarize = vec![user_text(format!("earlier bare echo: {discovered}"))];
+        preparation.messages_to_summarize =
+            vec![user_text(format!("earlier bare echo: {discovered}"))];
         preparation.is_split_turn = false;
         preparation.turn_prefix_messages.clear();
         preparation.settings.render_mode = pi::compaction::CompactionRenderMode::SnapCompact;
         preparation.settings.threshold_tokens = Some(2000);
-        preparation.settings.method_order =
-            Some(vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Shake]);
+        preparation.settings.method_order = Some(vec![
+            AutoCompactionMethod::Soft,
+            AutoCompactionMethod::Shake,
+        ]);
         let before = pi::compaction::compaction_preparation_to_value(&preparation);
         let result = compact_auto(
             preparation.clone(),
@@ -1386,7 +1411,10 @@ fn automatic_snapcompact_rescreens_cached_archive_after_a_rejected_summary() {
         assert!(!source.contains(discovered));
         assert!(source.contains("<pi-secret:redacted>"));
         assert_eq!(payload.frames, pi::compaction_snap::render_frames(source));
-        assert_eq!(pi::compaction::compaction_preparation_to_value(&preparation), before);
+        assert_eq!(
+            pi::compaction::compaction_preparation_to_value(&preparation),
+            before
+        );
     });
 }
 
@@ -1401,9 +1429,8 @@ fn compaction_block_policy_checks_all_split_fields_before_the_first_request() {
             for ordered in [false, true] {
                 let provider = Arc::new(ScriptedProvider::new(["must not dispatch"]));
                 let mut prep = privacy_preparation();
-                prep.settings.method_order = ordered.then(|| {
-                    vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]
-                });
+                prep.settings.method_order =
+                    ordered.then(|| vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]);
                 let mut custom = None;
                 match location {
                     0 => prep.messages_to_summarize = vec![user_text("ACME-123456")],

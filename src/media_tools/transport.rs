@@ -106,10 +106,10 @@ impl Transport {
                 &owner,
                 remaining_timeout(tool, started, timeout)?,
             )
-                .await?
-                .into_result(provider)
-                .map_err(|error| Error::tool(tool, error.to_string()))?
-                .ok_or_else(|| missing_key(tool, provider))?
+            .await?
+            .into_result(provider)
+            .map_err(|error| Error::tool(tool, error.to_string()))?
+            .ok_or_else(|| missing_key(tool, provider))?
         } else {
             resolve_key(tool, provider, None, |name| std::env::var(name).ok())?
         };

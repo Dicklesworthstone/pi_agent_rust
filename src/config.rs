@@ -1485,7 +1485,10 @@ impl Config {
             keep_recent_tokens: self.compaction_keep_recent_tokens(),
             threshold_tokens: self.compaction.as_ref().and_then(|c| c.threshold_tokens),
             threshold_percent: self.compaction.as_ref().and_then(|c| c.threshold_percent),
-            method_order: self.compaction.as_ref().and_then(|c| c.method_order.clone()),
+            method_order: self
+                .compaction
+                .as_ref()
+                .and_then(|c| c.method_order.clone()),
             mode: self.compaction_mode(),
             render_mode: self.compaction_render_mode(),
         }
@@ -3639,7 +3642,11 @@ mod tests {
     const OPTIONAL_TOOL_SETTINGS: [(&str, &str, &str); 4] = [
         ("eval", "enableEval", "enable_eval"),
         ("github", "enableGithub", "enable_github"),
-        ("security_scan", "enableSecurityScan", "enable_security_scan"),
+        (
+            "security_scan",
+            "enableSecurityScan",
+            "enable_security_scan",
+        ),
         ("subagent", "enableSubagent", "enable_subagent"),
     ];
 
@@ -3909,8 +3916,7 @@ mod tests {
         let global_dir = temp.path().join("global");
         let path = global_dir.join("settings.json");
 
-        let missing =
-            Config::load_with_roots(None, &global_dir, &cwd).expect("missing settings");
+        let missing = Config::load_with_roots(None, &global_dir, &cwd).expect("missing settings");
         assert_optional_tool_selection(&missing, &[]);
         for content in [
             r"{}",
@@ -3918,8 +3924,7 @@ mod tests {
             r#"{"tools":{"loadMode":{"eval":"essential","github":"essential","security_scan":"essential","subagent":"essential"}}}"#,
         ] {
             write_file(&path, content);
-            let config =
-                Config::load_with_roots(None, &global_dir, &cwd).expect("load defaults");
+            let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load defaults");
             assert_optional_tool_selection(&config, &[]);
         }
 
@@ -3975,13 +3980,9 @@ mod tests {
                     }})
                     .to_string(),
                 );
-                let trusted = Config::load_with_roots_and_project_trust(
-                    None,
-                    &global_dir,
-                    &cwd,
-                    true,
-                )
-                .expect("trusted project settings");
+                let trusted =
+                    Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+                        .expect("trusted project settings");
                 let expected: Vec<&str> = names
                     .iter()
                     .copied()
@@ -4002,13 +4003,9 @@ mod tests {
                 assert_eq!(modes.get("read").map(String::as_str), Some("essential"));
                 assert_eq!(modes.get("ast_grep").map(String::as_str), Some("essential"));
 
-                let untrusted = Config::load_with_roots_and_project_trust(
-                    None,
-                    &global_dir,
-                    &cwd,
-                    false,
-                )
-                .expect("global settings only");
+                let untrusted =
+                    Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                        .expect("global settings only");
                 assert_optional_tool_selection(
                     &untrusted,
                     if global_enabled { &names } else { &[] },
@@ -4042,13 +4039,9 @@ mod tests {
                 for value in [json!("true"), json!(1), json!([]), json!({})] {
                     let content = json!({"tools":{(key):value}}).to_string();
                     write_file(&global_path, &content);
-                    let error = Config::load_with_roots_and_project_trust(
-                        None,
-                        &global_dir,
-                        &cwd,
-                        false,
-                    )
-                    .expect_err("invalid global setting must fail");
+                    let error =
+                        Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                            .expect_err("invalid global setting must fail");
                     assert!(
                         error
                             .to_string()
@@ -4057,25 +4050,17 @@ mod tests {
 
                     write_file(&global_path, "{}");
                     write_file(&project_path, &content);
-                    let error = Config::load_with_roots_and_project_trust(
-                        None,
-                        &global_dir,
-                        &cwd,
-                        true,
-                    )
-                    .expect_err("invalid trusted project setting must fail");
+                    let error =
+                        Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+                            .expect_err("invalid trusted project setting must fail");
                     assert!(
                         error
                             .to_string()
                             .contains(project_path.to_str().expect("UTF-8 path"))
                     );
-                    let ignored = Config::load_with_roots_and_project_trust(
-                        None,
-                        &global_dir,
-                        &cwd,
-                        false,
-                    )
-                    .expect("untrusted project settings must not be parsed");
+                    let ignored =
+                        Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                            .expect("untrusted project settings must not be parsed");
                     assert_optional_tool_selection(&ignored, &[]);
                 }
             }

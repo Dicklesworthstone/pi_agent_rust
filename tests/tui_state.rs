@@ -3451,7 +3451,8 @@ fn tui_state_slash_settings_quiet_startup_persists_and_overrides_global() {
 
 #[test]
 fn tui_state_slash_settings_optional_tools_persist_for_new_sessions() {
-    let harness = TestHarness::new("tui_state_slash_settings_optional_tools_persist_for_new_sessions");
+    let harness =
+        TestHarness::new("tui_state_slash_settings_optional_tools_persist_for_new_sessions");
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
@@ -3459,7 +3460,11 @@ fn tui_state_slash_settings_optional_tools_persist_for_new_sessions() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "tools.enableEval: off (new session)");
     assert_after_contains(&harness, &step, "tools.enableGithub: off (new session)");
-    assert_after_contains(&harness, &step, "tools.enableSecurityScan: off (new session)");
+    assert_after_contains(
+        &harness,
+        &step,
+        "tools.enableSecurityScan: off (new session)",
+    );
     assert_after_contains(&harness, &step, "tools.enableSubagent: off (new session)");
 
     // Summary(0), Theme(1), Steering(2), FollowUp(3), EnableEval(4).

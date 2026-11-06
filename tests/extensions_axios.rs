@@ -16,11 +16,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
-async fn load(
-    harness: &common::TestHarness,
-    source: &str,
-    allow_http: bool,
-) -> ExtensionManager {
+async fn load(harness: &common::TestHarness, source: &str, allow_http: bool) -> ExtensionManager {
     let entry = harness.create_file("axios-extension.mjs", source.as_bytes());
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], harness.temp_dir(), None));
@@ -68,7 +64,11 @@ fn header<'a>(request: &'a common::harness::MockHttpRequest, name: &str) -> &'a 
 fn axios_esm_and_require_send_real_json_form_and_binary_requests() {
     let harness = common::TestHarness::new("axios_real_http");
     let server = harness.start_mock_http_server();
-    server.add_route("POST", "/api/items", MockHttpResponse::json(201, &json!({"saved": 17})));
+    server.add_route(
+        "POST",
+        "/api/items",
+        MockHttpResponse::json(201, &json!({"saved": 17})),
+    );
     server.add_route("POST", "/api/form", MockHttpResponse::text(200, "accepted"));
     server.add_route("GET", "/api/query", MockHttpResponse::text(200, "queried"));
     server.add_route(
@@ -76,11 +76,16 @@ fn axios_esm_and_require_send_real_json_form_and_binary_requests() {
         "/api/binary",
         MockHttpResponse {
             status: 200,
-            headers: vec![("Content-Type".to_string(), "application/octet-stream".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
             body: vec![0, 255, 1, 128],
         },
     );
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let value = runtime.block_on(async {
         let manager = load(&harness, r"
             import axios, { isAxiosError } from 'axios';
@@ -135,27 +140,49 @@ fn axios_esm_and_require_send_real_json_form_and_binary_requests() {
     let url = url::Url::parse(&format!("{}{}", server.base_url(), requests[0].path)).unwrap();
     assert_eq!(url.path(), "/api/items");
     assert_eq!(
-        url.query_pairs().map(|(key, value)| (key.into_owned(), value.into_owned())).collect::<Vec<_>>(),
-        vec![("q".to_string(), "two words".to_string()),
-            ("tags[]".to_string(), "a".to_string()), ("tags[]".to_string(), "b".to_string())]
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("q".to_string(), "two words".to_string()),
+            ("tags[]".to_string(), "a".to_string()),
+            ("tags[]".to_string(), "b".to_string())
+        ]
     );
-    assert_eq!(serde_json::from_slice::<Value>(&requests[0].body).unwrap(), json!({"name":"λ","count":2}));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+        json!({"name":"λ","count":2})
+    );
     assert_eq!(header(&requests[0], "content-type"), "application/json");
     assert_eq!(header(&requests[0], "x-default"), "kept");
     assert_eq!(header(&requests[0], "x-request"), "kept");
     assert_eq!(header(&requests[0], "x-order"), "second,first");
-    let form = url::form_urlencoded::parse(&requests[1].body).into_owned().collect::<Vec<_>>();
-    assert_eq!(form, vec![("grant_type".to_string(), "token exchange".to_string()),
-        ("scopes[]".to_string(), "read".to_string()), ("scopes[]".to_string(), "write".to_string())]);
+    let form = url::form_urlencoded::parse(&requests[1].body)
+        .into_owned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        form,
+        vec![
+            ("grant_type".to_string(), "token exchange".to_string()),
+            ("scopes[]".to_string(), "read".to_string()),
+            ("scopes[]".to_string(), "write".to_string())
+        ]
+    );
 }
 
 #[test]
 fn axios_errors_limits_and_pre_cancel_never_fabricate_success() {
     let harness = common::TestHarness::new("axios_errors");
     let server = harness.start_mock_http_server();
-    server.add_route("GET", "/missing", MockHttpResponse::json(404, &json!({"missing":true})));
+    server.add_route(
+        "GET",
+        "/missing",
+        MockHttpResponse::json(404, &json!({"missing":true})),
+    );
     server.add_route("GET", "/long", MockHttpResponse::text(200, "too long"));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let result = runtime.block_on(async {
         #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
         let manager = load(&harness, r"
@@ -200,15 +227,25 @@ fn axios_errors_limits_and_pre_cancel_never_fabricate_success() {
     }
     assert_eq!(errors[4]["code"], "ERR_BAD_REQUEST");
     assert_eq!(errors[5]["code"], "ERR_NOT_SUPPORT");
-    assert_eq!(server.requests().len(), 3, "cancelled and rejected inputs perform no HTTP");
+    assert_eq!(
+        server.requests().len(),
+        3,
+        "cancelled and rejected inputs perform no HTTP"
+    );
 }
 
 #[test]
 fn axios_obeys_native_http_capability_denial() {
     let harness = common::TestHarness::new("axios_denied_http");
     let server = harness.start_mock_http_server();
-    server.add_route("GET", "/", MockHttpResponse::text(200, "must not reach server"));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    server.add_route(
+        "GET",
+        "/",
+        MockHttpResponse::text(200, "must not reach server"),
+    );
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     let result = runtime.block_on(async {
         #[allow(clippy::literal_string_with_formatting_args)] // JS object literal, not a format string
         let manager = load(&harness, r"
@@ -226,6 +263,13 @@ fn axios_obeys_native_http_capability_denial() {
         result
     });
     assert_eq!(result["axios"], true);
-    assert!(result["error"].as_str().is_some_and(|message| message.to_ascii_lowercase().contains("denied")));
-    assert!(server.requests().is_empty(), "Axios must reuse host HTTP policy");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|message| message.to_ascii_lowercase().contains("denied"))
+    );
+    assert!(
+        server.requests().is_empty(),
+        "Axios must reuse host HTTP policy"
+    );
 }
