@@ -8563,14 +8563,41 @@ impl ExtensionCompactionModelState {
         mut stream_options: StreamOptions,
         options: &ExtensionCompactionOptions,
     ) -> Result<(Arc<dyn Provider>, StreamOptions)> {
-        let (provider_id, model_id) = options.model.as_ref().map_or_else(
+        stream_options.thinking_level = Some(
+            options
+                .thinking_level
+                .or(stream_options.thinking_level)
+                .unwrap_or(crate::model::ThinkingLevel::High),
+        );
+        self.resolve_model(
+            current_provider,
+            stream_options,
+            options
+                .model
+                .as_ref()
+                .map(|model| (model.provider.as_str(), model.id.as_str())),
+            "compact",
+        )
+    }
+
+    /// Nested extension requests use the same trusted registry, credential
+    /// refresh, and cost account as compaction. Request-provided model metadata
+    /// never supplies an endpoint, authorization header, or credential.
+    fn resolve_model(
+        &self,
+        current_provider: Arc<dyn Provider>,
+        mut stream_options: StreamOptions,
+        requested: Option<(&str, &str)>,
+        operation: &str,
+    ) -> Result<(Arc<dyn Provider>, StreamOptions)> {
+        let (provider_id, model_id) = requested.map_or_else(
             || (current_provider.name(), current_provider.model_id()),
-            |model| (model.provider.trim(), model.id.trim()),
+            |(provider, model)| (provider.trim(), model.trim()),
         );
         if provider_id.is_empty() || model_id.is_empty() {
-            return Err(Error::validation(
-                "compact: model provider and id must be non-empty strings",
-            ));
+            return Err(Error::validation(format!(
+                "{operation}: model provider and id must be non-empty strings"
+            )));
         }
         let entry = self
             .registry
@@ -8585,20 +8612,18 @@ impl ExtensionCompactionModelState {
             .iter()
             .any(|id| id == resolved_provider)
         {
-            return Err(Error::validation(
-                "compact: extension streamSimple models cannot be called from a compaction hook",
-            ));
+            return Err(Error::validation(format!(
+                "{operation}: extension streamSimple models cannot be called recursively"
+            )));
         }
 
         let same_provider = resolved_provider == current_provider.name();
         let same_model = same_provider && resolved_model == current_provider.model_id();
-        let requested_thinking = options
-            .thinking_level
-            .or(stream_options.thinking_level)
-            .unwrap_or(crate::model::ThinkingLevel::High);
-        stream_options.thinking_level = Some(entry.as_ref().map_or(requested_thinking, |entry| {
-            entry.clamp_thinking_level(requested_thinking)
-        }));
+        stream_options.thinking_level = stream_options.thinking_level.map(|level| {
+            entry
+                .as_ref()
+                .map_or(level, |entry| entry.clamp_thinking_level(level))
+        });
         // The normal provider hook can itself be the extension awaiting this
         // request. The summary engine also clears it for ordinary callers.
         stream_options.before_provider_request = None;
@@ -8609,7 +8634,7 @@ impl ExtensionCompactionModelState {
 
         let mut entry = entry.ok_or_else(|| {
             Error::validation(format!(
-                "compact: model {provider_id}/{model_id} is not registered"
+                "{operation}: model {provider_id}/{model_id} is not registered"
             ))
         })?;
         let explicit = self.explicit_key(&entry.model.provider);
@@ -8646,7 +8671,7 @@ impl ExtensionCompactionModelState {
             && !Self::has_registered_header_auth(&entry, provider.as_ref())
         {
             return Err(Error::auth(format!(
-                "compact: missing credentials for {}/{}",
+                "{operation}: missing credentials for {}/{}",
                 entry.model.provider, entry.model.id
             )));
         }
@@ -8821,7 +8846,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
 
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
-        let (provider, mut stream_options, credentials) = {
+        let (provider, stream_options, models) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
@@ -8832,9 +8857,17 @@ impl ExtensionHostActions for AgentSessionHostActions {
             )
         };
 
-        apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let context = build_pi_ai_completion_context(&request)?;
-        credentials.refresh_current_key(provider.as_ref(), &mut stream_options)?;
+        let requested = pi_ai_completion_model(&request.model, provider.as_ref())?;
+        let (provider, mut stream_options) = models.resolve_model(
+            provider,
+            stream_options,
+            requested
+                .as_ref()
+                .map(|(provider, model)| (provider.as_str(), model.as_str())),
+            "pi-ai completion",
+        )?;
+        apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let provider_name = provider.name().to_string();
         let mut events = provider.stream(&context, &stream_options).await?;
         let mut streamed_text = String::new();
@@ -9211,6 +9244,42 @@ fn pi_ai_model_registry_values(registry: &ModelRegistry) -> Vec<Value> {
         .collect()
 }
 
+fn pi_ai_completion_model(
+    model: &Value,
+    current: &dyn Provider,
+) -> Result<Option<(String, String)>> {
+    let (provider, id) = match model {
+        Value::Null => return Ok(None),
+        Value::String(id) => (current.name(), id.as_str()),
+        Value::Object(model) => {
+            let id = model
+                .get("id")
+                .or_else(|| model.get("modelId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::validation("pi-ai completion model.id must be a non-empty string")
+                })?;
+            let provider = model.get("provider").map_or(Ok(current.name()), |value| {
+                value.as_str().ok_or_else(|| {
+                    Error::validation("pi-ai completion model.provider must be a non-empty string")
+                })
+            })?;
+            (provider, id)
+        }
+        _ => {
+            return Err(Error::validation(
+                "pi-ai completion model must be a model object or model ID string",
+            ));
+        }
+    };
+    if provider.trim().is_empty() || id.trim().is_empty() {
+        return Err(Error::validation(
+            "pi-ai completion model provider and id must be non-empty strings",
+        ));
+    }
+    Ok(Some((provider.trim().to_string(), id.trim().to_string())))
+}
+
 fn apply_pi_ai_completion_options(
     options: &Value,
     stream_options: &mut StreamOptions,
@@ -9261,11 +9330,11 @@ fn build_pi_ai_completion_context(
     let mut system_prompts = Vec::new();
     let mut messages = Vec::new();
     collect_pi_ai_context_messages(&request.context, &mut system_prompts, &mut messages)?;
+    let tools = pi_ai_context_tools(&request.context)?;
 
     if messages.is_empty() {
         return Err(Error::validation(
-            "@mariozechner/pi-ai completion requires at least one user or assistant message"
-                .to_string(),
+            "@mariozechner/pi-ai completion requires at least one context message".to_string(),
         ));
     }
 
@@ -9281,8 +9350,52 @@ fn build_pi_ai_completion_context(
             Some(system_prompt)
         },
         messages,
-        Vec::new(),
+        tools,
     ))
+}
+
+fn pi_ai_context_tools(context: &Value) -> Result<Vec<ToolDef>> {
+    let Some(value) = context.get("tools").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let tools = value.as_array().ok_or_else(|| {
+        Error::validation("pi-ai completion context.tools must be an array")
+    })?;
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::validation(format!(
+                        "pi-ai completion tool {index} requires a non-empty name"
+                    ))
+                })?;
+            let description = tool.get("description").map_or(Ok(""), |value| {
+                value.as_str().ok_or_else(|| {
+                    Error::validation(format!(
+                        "pi-ai completion tool {name:?} description must be a string"
+                    ))
+                })
+            })?;
+            let parameters = tool
+                .get("parameters")
+                .filter(|value| value.is_object())
+                .ok_or_else(|| {
+                    Error::validation(format!(
+                        "pi-ai completion tool {name:?} parameters must be a JSON schema object"
+                    ))
+                })?;
+            Ok(ToolDef {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: parameters.clone(),
+            })
+        })
+        .collect()
 }
 
 fn collect_pi_ai_context_messages(
@@ -9308,7 +9421,10 @@ fn collect_pi_ai_context_messages(
                 system_prompts.push(system);
             }
 
-            if let Some(items) = map.get("messages").and_then(Value::as_array) {
+            if let Some(value) = map.get("messages") {
+                let items = value.as_array().ok_or_else(|| {
+                    Error::validation("pi-ai completion context.messages must be an array")
+                })?;
                 for item in items {
                     push_pi_ai_message(item, system_prompts, messages)?;
                 }
@@ -9340,32 +9456,75 @@ fn push_pi_ai_message(
         return Ok(());
     };
 
-    let role = map
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("user")
-        .trim()
-        .to_ascii_lowercase();
-    let content = map
-        .get("content")
-        .or_else(|| map.get("text"))
-        .and_then(pi_ai_text_from_value)
-        .unwrap_or_default();
-
-    match role.as_str() {
+    let role = map.get("role").map_or(Ok("user"), |value| {
+        value.as_str().ok_or_else(|| {
+            Error::validation("pi-ai completion context message role must be a string")
+        })
+    })?;
+    let role = role.trim().to_ascii_lowercase();
+    let role = match role.as_str() {
         "system" => {
-            if !content.trim().is_empty() {
+            if let Some(content) = map
+                .get("content")
+                .or_else(|| map.get("text"))
+                .and_then(pi_ai_text_from_value)
+                .filter(|text| !text.trim().is_empty())
+            {
                 system_prompts.push(content);
             }
+            return Ok(());
         }
-        "user" => push_pi_ai_user_message(&content, messages),
-        "assistant" => push_pi_ai_assistant_message(&content, messages),
+        "user" => "user",
+        "assistant" => "assistant",
+        "toolresult" => "toolResult",
         other => {
             return Err(Error::validation(format!(
                 "@mariozechner/pi-ai completion does not support {other:?} context messages"
             )));
         }
+    };
+
+    // Keep the native message wire format intact, including signatures,
+    // provider identity, and tool-result details. Supply defaults only for
+    // metadata omitted by shorthand history messages.
+    let mut normalized = map.clone();
+    normalized.insert("role".to_string(), Value::String(role.to_string()));
+    normalized
+        .entry("timestamp")
+        .or_insert_with(|| json!(Utc::now().timestamp_millis()));
+    let content = map
+        .get("content")
+        .or_else(|| map.get("text"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let content = match content {
+        Value::String(text) if role != "user" => json!([{"type": "text", "text": text}]),
+        Value::Object(block) if block.contains_key("type") => {
+            Value::Array(vec![Value::Object(block)])
+        }
+        value => value,
+    };
+    normalized.insert("content".to_string(), content);
+    if role == "assistant" {
+        for (key, default) in [
+            ("api", json!("")),
+            ("provider", json!("")),
+            ("model", json!("")),
+            ("usage", json!(Usage::default())),
+            ("stopReason", json!("stop")),
+        ] {
+            normalized.entry(key).or_insert(default);
+        }
+    } else if role == "toolResult" {
+        normalized.entry("isError").or_insert(Value::Bool(false));
     }
+    let message = serde_json::from_value(Value::Object(normalized)).map_err(|err| {
+        Error::validation(format!(
+            "pi-ai completion has an invalid {role} context message: {err}"
+        ))
+    })?;
+    messages.push(message);
     Ok(())
 }
 
@@ -9373,15 +9532,6 @@ fn push_pi_ai_user_message(text: &str, messages: &mut Vec<Message>) {
     messages.push(Message::User(UserMessage {
         content: UserContent::Text(text.to_string()),
         timestamp: Utc::now().timestamp_millis(),
-    }));
-}
-
-fn push_pi_ai_assistant_message(text: &str, messages: &mut Vec<Message>) {
-    messages.push(Message::assistant(AssistantMessage {
-        content: vec![ContentBlock::Text(TextContent::new(text.to_string()))],
-        timestamp: Utc::now().timestamp_millis(),
-        stop_details: None,
-        ..AssistantMessage::default()
     }));
 }
 
@@ -11656,6 +11806,7 @@ mod extensions_integration_tests {
     pub(super) struct PiAiCapturedProviderContext {
         pub(super) system_prompt: Option<String>,
         pub(super) messages: Vec<Message>,
+        pub(super) tools: Vec<ToolDef>,
         pub(super) options: StreamOptions,
     }
 
@@ -11693,6 +11844,7 @@ mod extensions_integration_tests {
                 .push(PiAiCapturedProviderContext {
                     system_prompt: context.system_prompt.as_ref().map(ToString::to_string),
                     messages: context.messages.iter().cloned().collect(),
+                    tools: context.tools.iter().cloned().collect(),
                     options: options.clone(),
                 });
             let final_message = AssistantMessage {
@@ -11818,6 +11970,255 @@ mod extensions_integration_tests {
                 1,
                 "quarantine must reject before provider.stream"
             );
+        });
+    }
+
+    fn pi_ai_host_actions(
+        provider: Arc<dyn Provider>,
+        options: StreamOptions,
+        models: ExtensionCompactionModelState,
+    ) -> AgentSessionHostActions {
+        AgentSessionHostActions {
+            session: Arc::new(Mutex::new(Session::in_memory())),
+            injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+            is_streaming: Arc::new(AtomicBool::new(false)),
+            is_turn_active: Arc::new(AtomicBool::new(false)),
+            pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+            ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+                provider,
+                stream_options: options,
+                models: Vec::new(),
+                compaction_models: models,
+                compaction_privacy: Arc::new(StdMutex::new(
+                    compaction::CompactionPrivacy::default(),
+                )),
+            })),
+            provider_admission: ProviderAdmissionGate::default(),
+            session_action_admission: SessionActionAdmissionGate::default(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_host_actions_complete_ai_preserves_structured_history_and_tools() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let actions = pi_ai_host_actions(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                StreamOptions {
+                    api_key: Some("host-managed-key".to_string()),
+                    before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                        |_| {
+                            Box::pin(async {
+                                panic!("nested completion must not re-enter the extension hook")
+                            })
+                        },
+                    )),
+                    ..StreamOptions::default()
+                },
+                ExtensionCompactionModelState::default(),
+            );
+            let history = json!([
+                {"role": "user", "timestamp": 11, "content": [
+                    {"type": "text", "text": "Inspect this image"},
+                    {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+                    {"type": "media", "data": "YXVkaW8=", "mimeType": "audio/wav", "name": "clip.wav"}
+                ]},
+                {"role": "assistant", "timestamp": 12, "api": "anthropic-messages",
+                 "provider": "history-provider", "model": "history-model", "usage": Usage::default(),
+                 "stopReason": "toolUse", "content": [
+                    {"type": "thinking", "thinking": "Signed reasoning", "thinkingSignature": "thinking-sig"},
+                    {"type": "redacted_thinking", "data": "opaque-reasoning"},
+                    {"type": "text", "text": "Looking up the caption", "textSignature": "text-sig"},
+                    {"type": "toolCall", "id": "lookup-1", "name": "lookup", "arguments": {"key": "caption"},
+                     "thoughtSignature": "tool-sig"}
+                ]},
+                {"role": "toolResult", "timestamp": 13, "toolCallId": "lookup-1", "toolName": "lookup",
+                 "isError": false, "details": {"source": "extension"}, "content": [
+                    {"type": "text", "text": "A caption"},
+                    {"type": "image", "data": "cmVzdWx0", "mimeType": "image/png"}
+                ]}
+            ]);
+            let tools = json!([{"name": "lookup", "description": "Find a stored caption", "parameters": {
+                "type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]
+            }}]);
+            actions
+                .complete_ai(ExtensionAiCompletionRequest {
+                    model: Value::Null,
+                    context: json!({
+                        "systemPrompt": "Keep signatures", "messages": history, "tools": tools
+                    }),
+                    options: json!({"maxTokens": 73, "temperature": 0.25}),
+                    simple: false,
+                })
+                .await
+                .expect("structured completion");
+
+            let calls = calls.lock().expect("captured provider request");
+            assert_eq!(calls.len(), 1);
+            let captured = &calls[0];
+            assert_eq!(serde_json::to_value(&captured.messages).unwrap(), history);
+            assert_eq!(captured.system_prompt.as_deref(), Some("Keep signatures"));
+            assert_eq!(captured.tools.len(), 1);
+            assert_eq!(captured.tools[0].name, "lookup");
+            assert_eq!(captured.tools[0].description, "Find a stored caption");
+            assert_eq!(captured.tools[0].parameters, tools[0]["parameters"]);
+            assert_eq!(captured.options.api_key.as_deref(), Some("host-managed-key"));
+            assert_eq!(captured.options.max_tokens, Some(73));
+            assert_eq!(captured.options.temperature, Some(0.25));
+            assert_eq!(captured.options.thinking_level, None);
+            assert!(captured.options.before_provider_request.is_none());
+        });
+    }
+
+    #[test]
+    fn agent_host_actions_complete_ai_keeps_current_model_shorthands() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let actions = pi_ai_host_actions(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                StreamOptions::default(),
+                ExtensionCompactionModelState::default(),
+            );
+            for model in [
+                Value::Null,
+                json!("capture-model"),
+                json!({"id": "capture-model"}),
+                json!({"provider": "capturing-provider", "modelId": "capture-model"}),
+            ] {
+                let result = actions
+                    .complete_ai(ExtensionAiCompletionRequest {
+                        model,
+                        context: json!([
+                            "plain prompt", {"role": "assistant", "content": "plain reply"}
+                        ]),
+                        options: json!({}),
+                        simple: true,
+                    })
+                    .await
+                    .expect("current-model shorthand");
+                assert_eq!(result, "captured");
+            }
+            let calls = calls.lock().expect("captured requests");
+            assert_eq!(calls.len(), 4);
+            for call in calls.iter() {
+                assert!(matches!(
+                    &call.messages[0],
+                    Message::User(UserMessage { content: UserContent::Text(text), .. })
+                        if text == "plain prompt"
+                ));
+                assert!(matches!(
+                    &call.messages[1], Message::Assistant(message)
+                        if pi_ai_assistant_text(message) == "plain reply"
+                ));
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_host_actions_complete_ai_rejects_invalid_context_and_targets_before_dispatch() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+            registry.merge_entries(vec![
+                compaction_override_entry("completion-private", "requires-key", true),
+                compaction_override_entry("completion-js", "js-model", false),
+            ]);
+            let actions = pi_ai_host_actions(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                StreamOptions {
+                    api_key: Some("source-key".to_string()),
+                    ..StreamOptions::default()
+                },
+                ExtensionCompactionModelState {
+                    registry: Some(Arc::new(registry)),
+                    js_provider_ids: vec!["completion-js".to_string()],
+                    ..ExtensionCompactionModelState::default()
+                },
+            );
+            for (model, expected) in [
+                (json!([]), "model object"),
+                (json!({}), "model.id"),
+                (json!({"id": ""}), "non-empty"),
+                (
+                    json!({"provider": false, "id": "capture-model"}),
+                    "model.provider",
+                ),
+                (json!("unregistered-model"), "not registered"),
+                (
+                    json!({"provider": "other-provider", "id": "capture-model"}),
+                    "not registered",
+                ),
+                (
+                    json!({"provider": "completion-private", "id": "requires-key"}),
+                    "missing credentials",
+                ),
+                (
+                    json!({"provider": "completion-js", "id": "js-model"}),
+                    "recursively",
+                ),
+            ] {
+                let error = actions
+                    .complete_ai(ExtensionAiCompletionRequest {
+                        model,
+                        context: json!("do not dispatch"),
+                        options: json!({}),
+                        simple: false,
+                    })
+                    .await
+                    .expect_err("explicit invalid model must not fall back to current");
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected error: {error}"
+                );
+            }
+            for context in [
+                json!({"messages": "not an array"}),
+                json!({"messages": [{"role": false, "content": "invalid role"}]}),
+                json!({"messages": [{"role": "user", "content": [{"type": "image", "mimeType": "image/png"}]}]}),
+                json!({"messages": [{"role": "assistant", "content": [{"type": "toolCall", "id": "missing-name"}]}]}),
+                json!({"messages": [{"role": "toolResult", "content": "missing tool identity"}]}),
+                json!({"messages": ["prompt"], "tools": {"name": "bad"}}),
+                json!({"messages": ["prompt"], "tools": [{"name": "lookup", "parameters": "invalid"}]}),
+            ] {
+                actions
+                    .complete_ai(ExtensionAiCompletionRequest {
+                        model: Value::Null,
+                        context,
+                        options: json!({}),
+                        simple: false,
+                    })
+                    .await
+                    .expect_err("malformed context must not be flattened or silently dropped");
+            }
+            actions
+                .ai_completion
+                .lock()
+                .expect("host state")
+                .compaction_models
+                .js_provider_ids
+                .push("capturing-provider".to_string());
+            let error = actions
+                .complete_ai(ExtensionAiCompletionRequest {
+                    model: Value::Null,
+                    context: json!("current JS provider would recurse"),
+                    options: json!({}),
+                    simple: false,
+                })
+                .await
+                .expect_err("same-model JS recursion must also be rejected");
+            assert!(error.to_string().contains("recursively"));
+            assert!(calls.lock().expect("captured requests").is_empty());
         });
     }
 
@@ -12019,6 +12420,68 @@ mod extensions_integration_tests {
             thinking_level: Some(crate::model::ThinkingLevel::Max),
             ..ExtensionCompactionOptions::default()
         }
+    }
+
+    #[test]
+    fn pi_ai_model_override_keeps_target_auth_and_the_live_cost_account() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "completion-target",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fresh-target-key".to_string(),
+            },
+        );
+        let mut entry = compaction_override_entry("completion-target", "target-model", true);
+        entry.api_key = Some("outdated-catalog-key".to_string());
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![entry]);
+        let models = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            auth: Some(Arc::new(auth)),
+            ..ExtensionCompactionModelState::default()
+        };
+        let budget = crate::cost::CostBudget::new(None, Some(2.0), 1.0).expect("account");
+        let current = crate::provider::guard_with_cost_budget(
+            Arc::new(PiAiCaptureProvider {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            budget.clone(),
+        );
+        let (provider, mut options) = models
+            .resolve_model(
+                current,
+                StreamOptions {
+                    api_key: Some("private-source-key".to_string()),
+                    headers: std::collections::HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer private-source-header".to_string(),
+                    )]),
+                    max_tokens: Some(8192),
+                    ..StreamOptions::default()
+                },
+                Some(("completion-target", "target-model")),
+                "pi-ai completion",
+            )
+            .expect("registered target");
+        assert_eq!(provider.name(), "completion-target");
+        assert_eq!(provider.model_id(), "target-model");
+        assert_eq!(options.api_key.as_deref(), Some("fresh-target-key"));
+        assert_eq!(options.headers["x-target-route"], "target-only");
+        assert!(!options.headers.contains_key("Authorization"));
+        assert_eq!(options.max_tokens, Some(2048));
+        assert_eq!(options.thinking_level, None);
+        apply_pi_ai_completion_options(&json!({"maxTokens": 91}), &mut options)
+            .expect("completion options after model resolution");
+        assert_eq!(options.max_tokens, Some(91));
+        assert!(
+            provider
+                .cost_budget()
+                .is_some_and(|shared| shared.same_tree(&budget))
+        );
+        budget.record(1.0).expect("sibling exhausts the shared account");
+        let result = futures::executor::block_on(provider.stream(&Context::default(), &options));
+        assert!(matches!(result, Err(Error::CostCap { .. })));
     }
 
     #[test]
