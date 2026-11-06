@@ -19176,6 +19176,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.hostcall_tracker.borrow().pending_count()
     }
 
+    /// Snapshot outstanding native calls without draining or changing admission.
+    pub(crate) fn pending_hostcall_ids(&self) -> HashSet<String> {
+        self.hostcall_tracker.borrow().pending.clone()
+    }
+
     /// Snapshot queue depth/backpressure counters for diagnostics.
     pub fn hostcall_queue_telemetry(&self) -> HostcallQueueTelemetry {
         self.hostcall_queue.borrow().snapshot()

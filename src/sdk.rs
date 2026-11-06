@@ -3689,6 +3689,31 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// Execute a registered command and finish any turns it requests through
+    /// `sendUserMessage` or `sendMessage(..., { triggerTurn: true })`.
+    /// Subscribers, typed hooks and the supplied callback receive those turns
+    /// through the same event fan-out as ordinary SDK prompts. Keep polling
+    /// after requesting cancellation so handler and turn cleanup can finish.
+    pub async fn execute_extension_command_with_abort(
+        &mut self,
+        command_name: &str,
+        args: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .execute_extension_command_with_abort(
+                command_name,
+                args,
+                timeout_ms,
+                abort,
+                on_event,
+            )
+            .await
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session

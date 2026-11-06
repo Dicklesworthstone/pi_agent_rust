@@ -821,17 +821,39 @@ impl ExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_command_with_abort(command_name, args, ctx_payload, timeout_ms, None)
+            .await
+    }
+
+    pub async fn execute_command_with_abort(
+        &self,
+        command_name: String,
+        args: String,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
         match self {
             Self::Js(runtime) => {
                 runtime
-                    .execute_command(command_name, args, ctx_payload, timeout_ms)
+                    .execute_command_with_abort(command_name, args, ctx_payload, timeout_ms, abort)
                     .await
             }
             Self::NativeRust(runtime) => {
                 let _ = ctx_payload;
-                runtime
+                // Native commands currently read static descriptor output;
+                // they have no admitted asynchronous handler to interrupt.
+                let result = runtime
                     .execute_command(command_name, args, timeout_ms)
-                    .await
+                    .await;
+                if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+                    Err(Error::Aborted)
+                } else {
+                    result
+                }
             }
         }
     }

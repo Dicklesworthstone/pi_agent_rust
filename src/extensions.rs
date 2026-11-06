@@ -11490,6 +11490,8 @@ enum JsRuntimeCommand {
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
+        started: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<Value>>,
     },
     ExecuteShortcut {
@@ -12512,9 +12514,19 @@ impl JsExtensionRuntimeHandle {
                             origin,
                             timeout_ms: _,
                             deadline,
+                            started,
+                            cancelled,
                             reply,
                         } => {
                             if reply.is_closed() {
+                                continue;
+                            }
+                            // Pair with the caller's cancellation handshake:
+                            // either it observes this admission and drains us,
+                            // or we observe cancellation before entering JS.
+                            started.store(true, StdOrdering::SeqCst);
+                            if cancelled.load(StdOrdering::SeqCst) {
+                                let _ = reply.send(&cx, Err(Error::Aborted));
                                 continue;
                             }
                             let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "command") {
@@ -12541,6 +12553,7 @@ impl JsExtensionRuntimeHandle {
                                         origin.as_ref(),
                                         timeout_ms,
                                         deadline,
+                                        &cancelled,
                                     )
                                     .await
                                 }
@@ -13456,8 +13469,26 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_command_with_abort(command_name, args, ctx_payload, timeout_ms, None)
+            .await
+    }
+
+    pub async fn execute_command_with_abort(
+        &self,
+        command_name: String,
+        args: String,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = JsEventInvocationGuard(Arc::clone(&cancelled));
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteCommand {
             command_name,
@@ -13466,6 +13497,8 @@ impl JsExtensionRuntimeHandle {
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
             reply: reply_tx,
         };
         let fut = async move {
@@ -13479,17 +13512,51 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(
+        futures::pin_mut!(fut);
+        let completion = async {
+            let Some(abort) = &abort else {
+                return Some(fut.as_mut().await);
+            };
+            let stopped = abort.wait();
+            futures::pin_mut!(stopped);
+            match futures::future::select(stopped, fut.as_mut()).await {
+                futures::future::Either::Left(_) => None,
+                futures::future::Either::Right((result, _)) => Some(result),
+            }
+        };
+        let completion = timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            Box::pin(completion),
         )
-        .await
-        .unwrap_or_else(|_| {
-            Err(Error::extension(format!(
-                "JS extension runtime command timed out after {timeout_ms}ms"
-            )))
-        })
+        .await;
+        match completion {
+            Ok(Some(result)) => {
+                if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+                    Err(Error::Aborted)
+                } else {
+                    result
+                }
+            }
+            Ok(None) | Err(_) => {
+                cancelled.store(true, StdOrdering::SeqCst);
+                if started.load(StdOrdering::SeqCst) {
+                    // Cleanup is outside the deadline wrapper. Even an abort
+                    // racing that deadline must wait for admitted native work
+                    // and its guest realm to lose their ownership first.
+                    let _ = fut.await;
+                }
+                // For a queued command, admission's matching handshake
+                // prevents execution after this immediate cancellation reply.
+                if abort.as_ref().is_some_and(crate::agent::AbortSignal::is_aborted) {
+                    Err(Error::Aborted)
+                } else {
+                    Err(Error::extension(format!(
+                        "JS extension runtime command timed out after {timeout_ms}ms"
+                    )))
+                }
+            }
+        }
     }
 
     pub async fn execute_shortcut(
@@ -16684,7 +16751,51 @@ async fn abort_js_tool_task(
     }
 }
 
+/// A command's public sendMessage/sendUserMessage calls are fire-and-forget.
+/// A handler can enqueue them in the tick that settles its own promise, so
+/// finish native dispatch before the session drains the resulting idle turns.
+/// A fixed settlement snapshot excludes older background calls and calls
+/// issued by future timer ticks, so neither can extend command completion.
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
+async fn await_js_command_task(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    previous_hostcalls: &HashSet<String>,
+) -> JsCancellableTaskOutcome {
+    let outcome =
+        await_js_cancellable_task(shards, host, shard_index, task_id, cancelled, deadline).await;
+    let JsCancellableTaskOutcome::Finished(result) = outcome else {
+        return outcome;
+    };
+    let outstanding: Vec<_> = shards.shards[shard_index]
+        .runtime
+        .pending_hostcall_ids()
+        .difference(previous_hostcalls)
+        .cloned()
+        .collect();
+    loop {
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            return JsCancellableTaskOutcome::Stopped { settled: true };
+        }
+        let shard = &mut shards.shards[shard_index];
+        if outstanding
+            .iter()
+            .all(|call_id| !shard.runtime.is_hostcall_active(call_id))
+        {
+            return JsCancellableTaskOutcome::Finished(result);
+        }
+        if let Err(err) = pump_active_runtime_shard(shard, host).await {
+            return JsCancellableTaskOutcome::Fault(err);
+        }
+        extension_wait_cooperate(deadline).await;
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_extension_command_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -16695,9 +16806,13 @@ async fn execute_extension_command_sharded(
     origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
     deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "command")?;
+    let _ = remaining_js_task_timeout(deadline, "command")?;
+    if cancelled.load(StdOrdering::Acquire) {
+        return Err(Error::Aborted);
+    }
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.command.start",
@@ -16706,33 +16821,84 @@ async fn execute_extension_command_sharded(
         "Extension command execution start"
     );
     let task_id = next_runtime_task_id("task-cmd");
-    let origin_guard = {
-        let runtime = &shards
+    let runtime = Rc::clone(
+        &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let ctx_js = json_to_js(&ctx, ctx_payload)?;
-                let promise: rquickjs::Value<'_> =
-                    exec_fn.call((bridge_secret.as_str(), command_name, args, ctx_js))?;
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
+            .runtime,
+    );
+    let previous_hostcalls = runtime.pending_hostcall_ids();
+    let origin_guard = runtime.enter_session_action_origin(origin.cloned());
+    let fence = runtime.enter_execution_fence(Arc::clone(cancelled), deadline);
+    let bridge_secret = runtime.bridge_secret().to_string();
+    let started = runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let ctx_js = json_to_js(&ctx, ctx_payload)?;
+            let promise: rquickjs::Value<'_> =
+                exec_fn.call((bridge_secret.as_str(), command_name, args, ctx_js))?;
+            let _task: String =
+                task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+            Ok(())
+        })
+        .await;
+    let outcome = match started {
+        Ok(()) => {
+            await_js_command_task(
+                shards,
+                host,
+                shard_index,
+                &task_id,
+                cancelled,
+                deadline,
+                &previous_hostcalls,
+            )
+            .await
+        }
+        Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
-
-    let result =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await;
+    // Commands have no cooperative guest AbortSignal contract. As with event
+    // hooks, an unfinished or interrupted handler must lose its entire realm
+    // so timers and hostcalls cannot resume after the operator cancels it.
+    let result = if fence.was_interrupted() {
+        Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            "command cancellation or deadline interrupted JavaScript execution",
+        ))
+    } else {
+        match outcome {
+            JsCancellableTaskOutcome::Finished(result) => {
+                let refreshed = refresh_runtime_shard_snapshot(shards, shard_index).await;
+                if fence.was_interrupted()
+                    || cancelled.load(StdOrdering::Acquire)
+                    || Instant::now() >= deadline
+                {
+                    Err(quarantine_runtime_shard(
+                        shards,
+                        shard_index,
+                        "command cancelled or deadline elapsed during registry publication",
+                    ))
+                } else {
+                    refreshed.and(result)
+                }
+            }
+            JsCancellableTaskOutcome::Stopped { .. } => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                "command cancelled or timed out with unresolved JavaScript state",
+            )),
+            JsCancellableTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("command execution or runtime pump failed: {err}"),
+            )),
+        }
+    };
+    drop(fence);
     drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
@@ -21917,6 +22083,7 @@ export default async function(pi) {{
                     None,
                     5_000,
                     js_runtime_request_deadline(5_000),
+                    &Arc::new(AtomicBool::new(false)),
                 )
                 .await
                 .expect("command response without starving native I/O")

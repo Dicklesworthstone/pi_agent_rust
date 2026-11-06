@@ -9284,6 +9284,7 @@ async fn run_typed_prompt(
     auto_resize_images: bool,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
 ) {
     // Startup text reaches the driver before the editor's slash router.
     // Resolve live extension ownership before expanding a same-name template
@@ -9292,7 +9293,16 @@ async fn run_typed_prompt(
         registered_prompt_command(&extension_commands_for_catalog(manager), &prompt)
     });
     if let Some((name, args)) = registered {
-        run_extension_command(handle, cwd, &name, &args, true, agent_tx).await;
+        run_extension_command(
+            handle,
+            &name,
+            &args,
+            true,
+            agent_tx,
+            turn_control,
+            turn_abort,
+        )
+        .await;
         return;
     }
     let workspace = handle.workspace();
@@ -9468,13 +9478,15 @@ fn template_prompt(
     Some(resources.expand_input(&input))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_extension_command(
-    handle: &crate::sdk::AgentSessionHandle,
-    cwd: &std::path::Path,
+    handle: &mut crate::sdk::AgentSessionHandle,
     name: &str,
     args: &str,
     expected_registration: bool,
     agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
 ) {
     let unavailable = |extensions_enabled| {
         if expected_registration {
@@ -9502,42 +9514,128 @@ async fn run_extension_command(
         let _ = agent_tx.send(PiMsg::System(unavailable(true)));
         return;
     };
-    let Some(runtime) = manager.runtime() else {
+    if manager.runtime().is_none() {
         let _ = agent_tx.send(PiMsg::System(format!(
             "Extension command '/{name}' is not available (runtime not enabled)"
         )));
         return;
+    }
+    let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
+    let _operation_abort =
+        queued_compaction::OperationAbort::publish(turn_abort, turn_control, &abort_handle);
+    let owner = {
+        let snapshot = handle.with_session(|session| session.header.id.clone());
+        let cancelled = abort_signal.wait();
+        futures::pin_mut!(snapshot, cancelled);
+        match futures::future::select(cancelled, snapshot).await {
+            futures::future::Either::Left(_) => {
+                let _ = agent_tx.send(PiMsg::System(format!("/{name} cancelled")));
+                return;
+            }
+            futures::future::Either::Right((Ok(owner), _)) => owner,
+            futures::future::Either::Right((Err(error), _)) => {
+                let _ = agent_tx.send(PiMsg::AgentError(format!("/{name}: {error}")));
+                return;
+            }
+        }
     };
     let _ = agent_tx.send(PiMsg::ToolStart {
         name: format!("/{name}"),
         tool_id: String::from("ftui-ext-command"),
     });
-    let ctx_payload = serde_json::json!({
-        "cwd": cwd.display().to_string(),
-        "hasUI": true,
-    });
-    let result = runtime
-        .execute_command(
-            name.to_string(),
-            args.to_string(),
-            Arc::new(ctx_payload),
+    let card_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let callback_card = Arc::clone(&card_open);
+    let progress = Arc::new(Mutex::new(None::<tool_progress::Bridge>));
+    let callback_progress = Arc::clone(&progress);
+    let command_name = name.to_string();
+    let tx = agent_tx.clone();
+    let result = handle
+        .execute_extension_command_with_abort(
+            name,
+            args,
             EXT_COMMAND_TIMEOUT_MS,
+            Some(abort_signal),
+            move |event| {
+                use crate::agent::AgentEvent;
+                use crate::model::{Message, UserContent};
+
+                if matches!(&event, AgentEvent::AgentStart { .. })
+                    && callback_card.swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    // The command has requested a native turn. Finish its
+                    // out-of-turn card before native lifecycle messages can
+                    // settle it; the shared abort still owns the whole flow.
+                    let _ = tx.send(PiMsg::ToolEnd {
+                        name: format!("/{command_name}"),
+                        tool_id: String::from("ftui-ext-command"),
+                        is_error: false,
+                        output: None,
+                    });
+                }
+                if let AgentEvent::MessageStart { message } = &event {
+                    match message {
+                        Message::User(user) => {
+                            let text = match &user.content {
+                                UserContent::Text(text) => text.clone(),
+                                UserContent::Blocks(blocks) => prompt_display("", blocks),
+                            };
+                            let _ = tx.send(PiMsg::UserInputSubmitted {
+                                owner_session_id: owner.clone(),
+                                text,
+                                // Extension-authored input is visible but
+                                // must not replace the user's command history.
+                                history_text: String::new(),
+                            });
+                        }
+                        Message::Custom(custom) if custom.display => {
+                            let _ = tx.send(PiMsg::SystemNote(custom.content.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut progress = callback_progress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let bridge = progress.get_or_insert_with(|| {
+                    let tx = tx.clone();
+                    tool_progress::Bridge::new(Some(owner.clone()), move |message| {
+                        let _ = tx.send(message);
+                    })
+                });
+                bridge.observe(&event);
+                if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                    // One command can request several turns. Each gets its
+                    // own progress scope; AgentEnd retires only that turn.
+                    drop(progress.take());
+                }
+            },
         )
         .await;
-    let is_error = result.is_err();
+    drop(
+        progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+    );
+    let is_error = result
+        .as_ref()
+        .is_err_and(|error| !matches!(error, crate::error::Error::Aborted));
     let msg = match result {
         Ok(value) if value.is_null() => PiMsg::SystemNote(format!("/{name} done")),
         Ok(value) => PiMsg::SystemNote(format!("/{name} → {value}")),
+        Err(crate::error::Error::Aborted) => PiMsg::System(format!("/{name} cancelled")),
         Err(err) => PiMsg::AgentError(format!("/{name}: {err}")),
     };
     // ToolEnd before the error: the AgentError sweep settles pending
     // cards, which would turn this ToolEnd into a duplicate trace line.
-    let _ = agent_tx.send(PiMsg::ToolEnd {
-        name: format!("/{name}"),
-        tool_id: String::from("ftui-ext-command"),
-        is_error,
-        output: None,
-    });
+    if card_open.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = agent_tx.send(PiMsg::ToolEnd {
+            name: format!("/{name}"),
+            tool_id: String::from("ftui-ext-command"),
+            is_error,
+            output: None,
+        });
+    }
     let _ = agent_tx.send(msg);
 }
 
@@ -12178,6 +12276,7 @@ pub fn run(
                                 auto_resize_images,
                                 &agent_tx,
                                 &driver_turn_control,
+                                &driver_turn_abort,
                             )
                             .await;
                         }
@@ -12365,18 +12464,33 @@ pub fn run(
                                     auto_resize_images,
                                     &agent_tx,
                                     &driver_turn_control,
+                                    &driver_turn_abort,
                                 )
                                 .await;
                             } else {
                                 run_extension_command(
-                                    &handle, &bash_cwd, &name, &args, false, &agent_tx,
+                                    &mut handle,
+                                    &name,
+                                    &args,
+                                    false,
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                    &driver_turn_abort,
                                 )
                                 .await;
                             }
                         }
                         Ok(UiCommand::RegisteredExtensionCommand { name, args }) => {
-                            run_extension_command(&handle, &bash_cwd, &name, &args, true, &agent_tx)
-                                .await;
+                            run_extension_command(
+                                &mut handle,
+                                &name,
+                                &args,
+                                true,
+                                &agent_tx,
+                                &driver_turn_control,
+                                &driver_turn_abort,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
                             auto_title.cancel_pending();
@@ -22666,7 +22780,16 @@ mod tests {
             else {
                 panic!("registered /plan must precede the built-in");
             };
-            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            run_extension_command(
+                &mut handle,
+                &name,
+                &args,
+                true,
+                &agent_tx,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
             assert!(
                 agent_rx.try_iter().any(|message| {
                     matches!(message, PiMsg::SystemNote(text)
@@ -22737,7 +22860,16 @@ mod tests {
                 message,
                 PiMsg::System(text) if text.starts_with("Reloaded")
             )));
-            run_extension_command(&handle, cwd.path(), "Plan", "still live", true, &agent_tx).await;
+            run_extension_command(
+                &mut handle,
+                "Plan",
+                "still live",
+                true,
+                &agent_tx,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
             assert!(agent_rx.try_iter().any(|message| matches!(
                 message,
                 PiMsg::SystemNote(text) if text.contains(r#""args":"still live""#)
@@ -22801,7 +22933,16 @@ mod tests {
             else {
                 panic!("reloaded /status must precede the built-in");
             };
-            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            run_extension_command(
+                &mut handle,
+                &name,
+                &args,
+                true,
+                &agent_tx,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
             assert!(model.route_slash_command("/plan status"));
             assert_eq!(
                 submit_rx
@@ -22869,7 +23010,16 @@ mod tests {
             let UiCommand::RegisteredExtensionCommand { name, args } = stale else {
                 panic!("queued registration retains strict dispatch");
             };
-            run_extension_command(&handle, cwd.path(), &name, &args, true, &agent_tx).await;
+            run_extension_command(
+                &mut handle,
+                &name,
+                &args,
+                true,
+                &agent_tx,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
             let stale_replies = agent_rx.try_iter().collect::<Vec<_>>();
             assert!(
                 !stale_replies
@@ -26915,6 +27065,349 @@ mod tests {
         )
     }
 
+    async fn enable_native_prompt_commands(
+        handle: &mut crate::sdk::AgentSessionHandle,
+        sender: &Sender<PiMsg>,
+    ) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("command workspace");
+        let entry = directory.path().join("commands.mjs");
+        std::fs::write(
+            &entry,
+            r#"
+            export default function(pi) {
+                pi.registerCommand('inspect-command', {
+                    handler: (args, ctx) => ({
+                        args, cwd: ctx.cwd, hasUI: ctx.hasUI,
+                        sessionId: ctx.sessionManager.getSessionId(),
+                        entries: ctx.sessionManager.getEntries().length,
+                        branch: ctx.sessionManager.getBranch().length,
+                        model: ctx.model && ctx.model.id,
+                        catalog: ctx.modelRegistry.find('ftui-native-input', 'ftui-native-input'),
+                        prompt: ctx.getSystemPrompt()
+                    })
+                });
+                pi.registerCommand('workflow', {
+                    handler: async () => {
+                        // Resume from native I/O before issuing the public,
+                        // intentionally fire-and-forget message APIs. Their
+                        // native actions must finish before command replay.
+                        await pi.getThinkingLevel();
+                        pi.sendUserMessage('ultrathink generated first');
+                        pi.sendMessage({
+                            customType: 'workflow-note', content: 'generated custom turn', display: true
+                        }, { triggerTurn: true });
+                        pi.sendUserMessage('generated second');
+                        return 'queued';
+                    }
+                });
+            }
+            "#,
+        )
+        .expect("command source");
+        handle
+            .session_mut()
+            .agent
+            .set_system_prompt(Some("command system prompt".to_string()));
+        handle
+            .session_mut()
+            .enable_extensions(&[], directory.path(), None, &[entry])
+            .await
+            .expect("real extension runtime");
+        let manager = handle.extension_manager().expect("command manager");
+        manager.set_ui_handler(Arc::new(FtuiExtensionUiHandler::new(sender.clone())));
+        manager.set_extension_models(vec![serde_json::json!({
+            "provider": "ftui-native-input", "id": "ftui-native-input",
+            "name": "Command model", "api": "test", "contextWindow": 100_000,
+            "maxTokens": 1024, "input": ["text"], "reasoning": true
+        })]);
+        directory
+    }
+
+    #[test]
+    fn extension_commands_receive_current_session_and_model_context() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(provider);
+            let (sender, receiver) = mpsc::channel();
+            let directory = enable_native_prompt_commands(&mut handle, &sender).await;
+            let controls: TurnControlSlot = Arc::default();
+            let aborts: TurnAbortSlot = Arc::default();
+            for ordinal in 0..2 {
+                let (owner, entries) = handle
+                    .with_session(|session| (session.header.id.clone(), session.entries.len()))
+                    .await
+                    .unwrap();
+                run_extension_command(
+                    &mut handle,
+                    "inspect-command",
+                    "Keep  These ARGs",
+                    true,
+                    &sender,
+                    &controls,
+                    &aborts,
+                )
+                .await;
+                let report = receiver
+                    .try_iter()
+                    .find_map(|message| match message {
+                        PiMsg::SystemNote(text) => text
+                            .strip_prefix("/inspect-command → ")
+                            .map(|value| serde_json::from_str::<serde_json::Value>(value).unwrap()),
+                        _ => None,
+                    })
+                    .expect("command must receive and return its complete context");
+                assert_eq!(report["args"], "Keep  These ARGs");
+                assert_eq!(report["hasUI"], true);
+                assert_eq!(report["cwd"], directory.path().display().to_string());
+                assert_eq!(report["sessionId"], owner);
+                assert_eq!(report["entries"], entries);
+                assert_eq!(report["branch"], entries);
+                assert_eq!(report["model"], "ftui-native-input");
+                assert_eq!(report["catalog"]["name"], "Command model");
+                assert_eq!(report["prompt"], "command system prompt");
+                assert!(aborts.lock().unwrap().is_none());
+                if ordinal == 0 {
+                    // An ordinary append does not republish the extension
+                    // registry. The second command must still see this row.
+                    handle.session_store().try_lock().unwrap().append_message(
+                        crate::session::SessionMessage::User {
+                            content: crate::model::UserContent::Text("new history".into()),
+                            timestamp: Some(1),
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ftui_extension_command_runs_all_requested_turns_and_notifies_subscribers() {
+        use crate::agent::AgentEvent;
+        use crate::model::{Message, ThinkingLevel, UserContent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let (sender, receiver) = mpsc::channel();
+            let _directory = enable_native_prompt_commands(&mut handle, &sender).await;
+            let owner = handle
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
+            let starts = Arc::new(AtomicUsize::new(0));
+            let ends = Arc::new(AtomicUsize::new(0));
+            let subscriber_starts = Arc::clone(&starts);
+            let subscriber_ends = Arc::clone(&ends);
+            handle.subscribe(move |event| match event {
+                AgentEvent::AgentStart { .. } => {
+                    subscriber_starts.fetch_add(1, Ordering::SeqCst);
+                }
+                AgentEvent::AgentEnd { .. } => {
+                    subscriber_ends.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            });
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let (_unused, model) = new_model();
+            let mut model = model
+                .with_submit_channel(submit_tx)
+                .with_extension_command_registry(Arc::new(Mutex::new(
+                    handle.extension_manager().cloned(),
+                )));
+            model.displayed_session_id = Some(owner);
+            model.input.set_text("/workflow");
+            model.submit_input();
+            let UiCommand::RegisteredExtensionCommand { name, args } =
+                submit_rx.try_recv().unwrap()
+            else {
+                panic!("live command routing");
+            };
+            run_extension_command(
+                &mut handle,
+                &name,
+                &args,
+                true,
+                &sender,
+                &Arc::default(),
+                &Arc::default(),
+            )
+            .await;
+            let mut ui_turns = 0;
+            for message in receiver.try_iter() {
+                if let PiMsg::FtuiToolProgress(tool_progress::Event::Message { message, .. }) =
+                    &message
+                    && matches!(&**message, PiMsg::AgentDone { .. })
+                {
+                    ui_turns += 1;
+                }
+                let _ = model.handle_agent(message);
+            }
+            assert_eq!(starts.load(Ordering::SeqCst), 3);
+            assert_eq!(ends.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                ui_turns, 3,
+                "each generated turn needs a fresh progress bridge"
+            );
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(
+                calls.len(), 3,
+                "the custom message also requests a native turn"
+            );
+            assert_eq!(
+                calls[0].content,
+                UserContent::Text("ultrathink generated first".into())
+            );
+            assert_eq!(
+                calls[2].content,
+                UserContent::Text("generated second".into())
+            );
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| call.thinking == Some(ThinkingLevel::Low))
+            );
+            drop(calls);
+            let messages = handle
+                .with_session(crate::session::Session::to_messages_for_current_path)
+                .await
+                .unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::Assistant(_)))
+                    .count(),
+                3
+            );
+            assert!(messages.iter().any(|message| matches!(
+                message, Message::Custom(custom) if custom.content == "generated custom turn"
+            )));
+            let prompts: Vec<_> = model
+                .transcript
+                .iter()
+                .filter(|entry| entry.role == EntryRole::User)
+                .map(|entry| entry.text.as_str())
+                .collect();
+            assert_eq!(
+                prompts,
+                ["/workflow", "ultrathink generated first", "generated second"]
+            );
+            assert!(
+                model
+                    .transcript
+                    .iter()
+                    .any(|entry| entry.text == "generated custom turn")
+            );
+            assert_eq!(model.input_history, ["/workflow"]);
+            assert_eq!(model.state, AgentUiState::Ready);
+            assert!(model.error_banner.is_none());
+            assert!(!handle.session().has_pending_extension_idle_actions());
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn escape_stops_an_extension_commands_generated_turns_without_replaying_its_tail() {
+        use crate::model::Message;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(NativePromptProbe {
+                pause_after_record: true,
+                ..Default::default()
+            });
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let (sender, receiver) = mpsc::channel();
+            let _directory = enable_native_prompt_commands(&mut handle, &sender).await;
+            let controls: TurnControlSlot = Arc::default();
+            let aborts: TurnAbortSlot = Arc::default();
+            let (_unused, model) = new_model();
+            let mut sim = ProgramSimulator::new(
+                model
+                    .with_turn_control(Arc::clone(&controls))
+                    .with_turn_abort(Arc::clone(&aborts)),
+            );
+            sim.init();
+            let mut command = Box::pin(run_extension_command(
+                &mut handle, "workflow", "", true, &sender, &controls, &aborts,
+            ));
+            let admitted = futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(command.as_mut(), cx).is_pending());
+                if provider.calls.lock().unwrap().len() == 1 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                admitted,
+            )
+            .await
+            .expect("command must enter its generated provider turn");
+            for message in receiver.try_iter() {
+                sim.send(PiFtuiMsg::Agent(message));
+            }
+            let token = aborts
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("command retains abort authority");
+            sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+            assert!(token.signal().is_aborted());
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                command,
+            )
+            .await
+            .expect("cancellation must finish the command workflow");
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            assert!(aborts.lock().unwrap().is_none());
+            assert!(!handle.session().has_pending_extension_idle_actions());
+            let messages = handle
+                .with_session(crate::session::Session::to_messages_for_current_path)
+                .await
+                .unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::User(_)))
+                    .count(),
+                1
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Custom(_)))
+            );
+            assert!(receiver.try_iter().any(|message| matches!(
+                message, PiMsg::System(text) if text == "/workflow cancelled"
+            )));
+
+            // A queued command must not resurrect after terminal shutdown,
+            // even when the actor and the native provider are both idle.
+            abort_driver_work(Some(&aborts), Some(&controls));
+            run_extension_command(
+                &mut handle, "workflow", "", true, &sender, &controls, &aborts,
+            )
+            .await;
+            assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            assert!(!handle.session().has_pending_extension_idle_actions());
+            assert!(aborts.lock().unwrap().is_none());
+        });
+    }
+
     fn detached_follow_ups(
         inputs: &[(crate::model::UserContent, &str)],
     ) -> Vec<crate::session_control::PendingInput> {
@@ -27880,6 +28373,7 @@ mod tests {
                 false,
                 &agent_tx,
                 &control,
+                &Arc::default(),
             )
             .await;
             assert!(provider.calls.lock().expect("provider calls").is_empty());
@@ -27959,6 +28453,7 @@ mod tests {
                     false,
                     &tx,
                     &control,
+                    &Arc::default(),
                 )
                 .await;
             }

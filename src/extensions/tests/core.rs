@@ -2262,6 +2262,8 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
                     deadline: Instant::now()
                         .checked_sub(Duration::from_millis(1))
                         .expect("past deadline"),
+                    started: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     reply: expired_tx,
                 },
             )
@@ -2292,6 +2294,8 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
                     origin: None,
                     timeout_ms: 5_000,
                     deadline: js_runtime_request_deadline(5_000),
+                    started: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     reply: abandoned_tx,
                 },
             )

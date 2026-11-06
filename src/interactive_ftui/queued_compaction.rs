@@ -183,12 +183,16 @@ fn restore(request: &QueuedCompaction, text: Vec<String>, agent_tx: &Sender<PiMs
 /// Hold cancellation authority through session admission, installation,
 /// transcript refresh and the resumed native turn. Publication shares the
 /// runtime's shutdown fence; no operation may start after that fence closes.
-struct OperationAbort<'a> {
+pub(super) struct OperationAbort<'a> {
     slot: &'a TurnAbortSlot,
 }
 
 impl<'a> OperationAbort<'a> {
-    fn publish(slot: &'a TurnAbortSlot, controls: &TurnControlSlot, abort: &AbortHandle) -> Self {
+    pub(super) fn publish(
+        slot: &'a TurnAbortSlot,
+        controls: &TurnControlSlot,
+        abort: &AbortHandle,
+    ) -> Self {
         let state = controls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

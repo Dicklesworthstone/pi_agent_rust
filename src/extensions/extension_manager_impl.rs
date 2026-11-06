@@ -3959,16 +3959,46 @@ impl ExtensionManager {
         args: &str,
         timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_command_with_abort(command_name, args, timeout_ms, None)
+            .await
+    }
+
+    /// Run a command against the current session, with cancellation owned by
+    /// the caller until the runtime has stopped any admitted handler.
+    pub async fn execute_command_with_abort(
+        &self,
+        command_name: &str,
+        args: &str,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
         let timeout_ms = self.effective_timeout(timeout_ms);
         let runtime = self
             .runtime()
             .ok_or_else(|| Error::extension("Extension runtime not configured"))?;
+        // Commands can run after ordinary session appends without a registry
+        // change. Build their context afresh instead of reusing the lifecycle
+        // cache, whose generation tracks registry mutations.
+        let snapshot = self.read_snapshot();
+        let context = Self::build_ctx_payload(&snapshot);
+        let context = if let Some(abort) = &abort {
+            let cancelled = abort.wait();
+            futures::pin_mut!(context, cancelled);
+            match futures::future::select(cancelled, context).await {
+                futures::future::Either::Left(_) => return Err(Error::Aborted),
+                futures::future::Either::Right((context, _)) => context,
+            }
+        } else {
+            context.await
+        };
+        drop(snapshot);
         runtime
-            .execute_command(
+            .execute_command_with_abort(
                 command_name.to_string(),
                 args.to_string(),
-                Arc::new(json!({})),
+                Arc::new(context),
                 timeout_ms,
+                abort,
             )
             .await
     }

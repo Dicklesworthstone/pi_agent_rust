@@ -520,6 +520,22 @@ mod runtime_lifetime {
                     return { content: [], details: { starts } };
                 }
             });
+            pi.registerCommand('active-command', {
+                handler: async mode => {
+                    starts++;
+                    if (mode === 'cpu_sync') { while (true) {} }
+                    await pi.tool('read', { mode });
+                    return 'command completed';
+                }
+            });
+            pi.registerCommand('active-immediate', {
+                handler: () => 'immediate result'
+            });
+            pi.on('session_before_switch', () => {
+                // A genuinely older native request must not become owned by
+                // a later, unrelated command's final hostcall flush.
+                pi.tool('read', { mode: 'blocked' }).catch(() => {});
+            });
             pi.on('session_start', async event => {
                 starts++;
                 if (event.mode === 'cpu_sync') { while (true) {} }
@@ -562,6 +578,9 @@ mod runtime_lifetime {
             let queued = 0;
             pi.on('session_start', () => { starts++; });
             pi.on('session_switch', () => { queued++; });
+            pi.registerCommand('peer-command', {
+                handler: () => { queued++; return 'peer command ran'; }
+            });
             pi.registerTool({
                 name: 'peer_probe', description: 'Unaffected event owner',
                 parameters: { type: 'object' },
@@ -748,6 +767,10 @@ mod runtime_lifetime {
     }
 
     async fn assert_only_active_owner_quarantined(fixture: &Fixture) {
+        assert_active_owner_quarantined(fixture, 1).await;
+    }
+
+    async fn assert_active_owner_quarantined(fixture: &Fixture, completed_starts: usize) {
         let completed = probe(&fixture.runtime, "completed_probe")
             .await
             .expect("a completed owner must remain callable");
@@ -758,13 +781,170 @@ mod runtime_lifetime {
             .await
             .expect_err("the unfinished owner must be quarantined");
         // ubs:ignore[rust.panic.assert-macros] -- cfg(test) owner-isolation invariant.
-        assert_eq!(completed["details"]["starts"], 1);
+        assert_eq!(completed["details"]["starts"], completed_starts);
         // ubs:ignore[rust.panic.assert-macros] -- cfg(test) owner-isolation invariant.
         assert_eq!(peer["details"], json!({ "starts": 0, "queued": 0 }));
         // ubs:ignore[rust.panic.assert-macros] -- cfg(test) quarantine regression invariant.
         assert!(active.to_string().contains("quarantin"), "{active}");
         // ubs:ignore[rust.panic.assert-macros] -- cfg(test) teardown regression invariant.
         assert!(fixture.manager.shutdown(Duration::from_secs(2)).await);
+    }
+
+    #[test]
+    fn command_cancellation_releases_native_work_and_keeps_other_extensions_callable() {
+        let executor = RuntimeBuilder::current_thread().build().expect("runtime");
+        executor.block_on(async {
+            for drop_caller in [false, true] {
+                let mut fixture = fixture().await;
+                let (abort, signal) = pi::agent::AbortHandle::new();
+                let command = Box::pin(fixture.runtime.execute_command_with_abort(
+                    "active-command".to_string(),
+                    "blocked".to_string(),
+                    Arc::new(json!({})),
+                    60_000,
+                    Some(signal),
+                ));
+                let pending =
+                    after_native_entry(fixture.started.take().expect("admission"), command).await;
+                if drop_caller {
+                    drop(pending);
+                    probe(&fixture.runtime, "peer_probe")
+                        .await
+                        .expect("caller drop must stop the blocked native dispatch");
+                } else {
+                    abort.abort();
+                    let failure = timeout(wall_now(), Duration::from_secs(5), pending)
+                        .await
+                        .expect("Escape must not wait for the 60-second command deadline")
+                        .expect_err("command cancellation");
+                    assert!(matches!(failure, Error::Aborted));
+                }
+                // In the explicit-abort case these counts are inspected
+                // before another actor request or shutdown can provide cleanup.
+                assert_eq!(fixture.calls.entries.load(Ordering::SeqCst), 1);
+                assert_eq!(fixture.calls.completions.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.calls.drops.load(Ordering::SeqCst), 1);
+                assert_active_owner_quarantined(&fixture, 0).await;
+            }
+        });
+    }
+
+    #[test]
+    fn queued_command_cancellation_does_not_wait_for_or_cancel_another_owner() {
+        let executor = RuntimeBuilder::current_thread().build().expect("runtime");
+        executor.block_on(async {
+            let mut fixture = fixture().await;
+            let event = Box::pin(fixture.runtime.dispatch_event(
+                "session_start".to_string(),
+                json!({ "mode": "gate" }),
+                Arc::new(json!({})),
+                60_000,
+            ));
+            let event = after_native_entry(fixture.started.take().expect("admission"), event).await;
+            let (abort, signal) = pi::agent::AbortHandle::new();
+            let mut command = Box::pin(fixture.runtime.execute_command_with_abort(
+                "peer-command".to_string(),
+                String::new(),
+                Arc::new(json!({})),
+                60_000,
+                Some(signal),
+            ));
+            assert!(futures::poll!(command.as_mut()).is_pending());
+            abort.abort();
+            assert!(matches!(
+                timeout(wall_now(), Duration::from_secs(2), command)
+                    .await
+                    .expect("queued cancellation cannot depend on the active event"),
+                Err(Error::Aborted)
+            ));
+            assert_eq!(fixture.calls.completions.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.calls.drops.load(Ordering::SeqCst), 0);
+            fixture.release.take().expect("release").send(()).unwrap();
+            timeout(wall_now(), Duration::from_secs(5), event)
+                .await
+                .expect("original event remains live")
+                .expect("event completes");
+            let peer = probe(&fixture.runtime, "peer_probe").await.unwrap();
+            assert_eq!(peer["details"], json!({ "starts": 1, "queued": 0 }));
+            probe(&fixture.runtime, "active_probe")
+                .await
+                .expect("active owner remains healthy");
+            assert!(fixture.manager.shutdown(Duration::from_secs(2)).await);
+        });
+    }
+
+    #[test]
+    fn synchronous_command_cpu_loop_is_bounded_before_it_returns_a_promise() {
+        let executor = RuntimeBuilder::current_thread().build().expect("runtime");
+        executor.block_on(async {
+            let fixture = fixture().await;
+            let failure = timeout(
+                wall_now(),
+                Duration::from_secs(5),
+                fixture.runtime.execute_command(
+                    "active-command".to_string(),
+                    "cpu_sync".to_string(),
+                    Arc::new(json!({})),
+                    500,
+                ),
+            )
+            .await
+            .expect("command deadline must interrupt synchronous JavaScript")
+            .expect_err("CPU loop cannot finish normally");
+            let message = failure.to_string();
+            assert!(
+                message.contains("timed out") || message.contains("interrupt"),
+                "{message}"
+            );
+            assert_eq!(fixture.calls.entries.load(Ordering::SeqCst), 0);
+            assert_active_owner_quarantined(&fixture, 0).await;
+        });
+    }
+
+    #[test]
+    fn completed_command_does_not_wait_for_older_background_native_work() {
+        let executor = RuntimeBuilder::current_thread().build().expect("runtime");
+        executor.block_on(async {
+            let mut fixture = fixture().await;
+            fixture
+                .runtime
+                .dispatch_event(
+                    "session_before_switch".to_string(),
+                    json!({}),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("start background native work");
+            timeout(
+                wall_now(),
+                Duration::from_secs(5),
+                fixture.started.take().unwrap(),
+            )
+            .await
+            .expect("background call admitted")
+            .expect("admission signal");
+            let value = timeout(
+                wall_now(),
+                Duration::from_secs(2),
+                fixture.runtime.execute_command(
+                    "active-immediate".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    60_000,
+                ),
+            )
+            .await
+            .expect("unrelated background I/O cannot delay a completed command")
+            .expect("healthy immediate command");
+            assert_eq!(value, "immediate result");
+            assert_eq!(fixture.calls.completions.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.calls.drops.load(Ordering::SeqCst), 0);
+            probe(&fixture.runtime, "active_probe")
+                .await
+                .expect("owner remains callable");
+            assert!(fixture.manager.shutdown(Duration::from_secs(2)).await);
+        });
     }
 
     #[test]

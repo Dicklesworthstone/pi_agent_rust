@@ -20533,9 +20533,12 @@ impl AgentSession {
 
         self.run_pending_idle_actions_with_abort(abort.clone(), Arc::clone(&on_event))
             .await?;
+        if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
         let command_result = manager
-            .execute_command(command_name, args, timeout_ms)
+            .execute_command_with_abort(command_name, args, timeout_ms, abort.clone())
             .await;
         let replay_result = self
             .run_pending_idle_actions_with_abort(abort, Arc::clone(&on_event))
@@ -23011,6 +23014,12 @@ impl AgentSession {
 
         let source_scope = SessionInputSourceGuard::new(self, InputSource::Extension);
         for action in actions {
+            // Cancellation owns the entire command workflow, including its
+            // not-yet-started generated turns. Never persist another prompt
+            // or run its hooks after the operator has stopped the command.
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                return Err(Error::Aborted);
+            }
             match action {
                 PendingIdleAction::CustomMessage(message) => {
                     let handler = Arc::clone(&on_event);
@@ -23037,6 +23046,9 @@ impl AgentSession {
                         })
                         .await?;
                 }
+            }
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                return Err(Error::Aborted);
             }
         }
         Ok(())
