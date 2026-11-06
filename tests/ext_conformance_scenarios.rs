@@ -1838,6 +1838,7 @@ impl HostcallInterceptor for MockSpecInterceptor {
             HostcallKind::Session { .. }
             | HostcallKind::Events { .. }
             | HostcallKind::Tool { .. }
+            | HostcallKind::BuiltinTool { .. }
             | HostcallKind::Log => None,
         }
     }

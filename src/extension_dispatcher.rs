@@ -1167,7 +1167,7 @@ fn is_shadow_safe_request(request: &HostcallRequest) -> bool {
     match &request.kind {
         HostcallKind::Session { op } => shadow_safe_session_op(op),
         HostcallKind::Events { op } => shadow_safe_events_op(op),
-        HostcallKind::Tool { name } => shadow_safe_tool(name),
+        HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => shadow_safe_tool(name),
         HostcallKind::Http
         | HostcallKind::Exec { .. }
         | HostcallKind::Ui { .. }
@@ -1212,7 +1212,7 @@ fn io_uring_force_compat_from_env() -> bool {
 fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
     match kind {
         HostcallKind::Http => HostcallIoHint::IoHeavy,
-        HostcallKind::Tool { name } => {
+        HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
             let name = name.trim();
             if name.eq_ignore_ascii_case("read")
                 || name.eq_ignore_ascii_case("write")
@@ -1250,7 +1250,7 @@ fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
 
 const fn resource_operation_kind(kind: &HostcallKind) -> ResourceOperationKind {
     match kind {
-        HostcallKind::Tool { .. } => ResourceOperationKind::Tool,
+        HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => ResourceOperationKind::Tool,
         HostcallKind::Exec { .. } => ResourceOperationKind::Exec,
         HostcallKind::Http => ResourceOperationKind::Http,
         HostcallKind::Session { .. } => ResourceOperationKind::Session,
@@ -1263,7 +1263,7 @@ const fn resource_operation_kind(kind: &HostcallKind) -> ResourceOperationKind {
 fn estimated_hostcall_output_bytes(request: &HostcallRequest) -> u64 {
     match &request.kind {
         HostcallKind::Exec { .. } => crate::tools::READ_TOOL_MAX_BYTES,
-        HostcallKind::Tool { name } => {
+        HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
             let name = name.trim();
             if name.eq_ignore_ascii_case("bash") {
                 crate::tools::READ_TOOL_MAX_BYTES
@@ -1371,6 +1371,7 @@ fn clone_payload_object_without_two_keys(
 
 fn protocol_params_from_request(request: &HostcallRequest) -> Value {
     match &request.kind {
+        HostcallKind::BuiltinTool { .. } => request.params_for_hash(),
         HostcallKind::Tool { name } => {
             let mut object = serde_json::Map::with_capacity(2);
             object.insert("name".to_string(), Value::String(name.clone()));
@@ -2014,7 +2015,7 @@ fn llc_miss_proxy(total_depth: usize, overflow_depth: usize, overflow_rejected_t
 
 const fn hostcall_kind_label(kind: &HostcallKind) -> &'static str {
     match kind {
-        HostcallKind::Tool { .. } => "tool",
+        HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => "tool",
         HostcallKind::Exec { .. } => "exec",
         HostcallKind::Http => "http",
         HostcallKind::Session { .. } => "session",
@@ -2453,6 +2454,17 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         }
 
         match &request.kind {
+            HostcallKind::BuiltinTool { name } => {
+                let registry = self.tool_registry.snapshot();
+                crate::extensions::dispatch_hostcall_tool(
+                    &registry,
+                    Some(self.js_runtime()),
+                    &request.call_id,
+                    name,
+                    &request.params_for_hash(),
+                )
+                .await
+            }
             HostcallKind::Tool { name } => {
                 self.dispatch_tool(&request.call_id, name, request.payload.clone())
                     .await
@@ -2892,6 +2904,17 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         message: "host_call tool requires params.name".to_string(),
                     };
                 };
+                if payload.params.get("builtin").is_some() {
+                    let registry = self.tool_registry.snapshot();
+                    return crate::extensions::dispatch_hostcall_tool(
+                        &registry,
+                        Some(self.js_runtime()),
+                        &payload.call_id,
+                        name,
+                        &payload.params,
+                    )
+                    .await;
+                }
                 let input = payload
                     .params
                     .get("input")

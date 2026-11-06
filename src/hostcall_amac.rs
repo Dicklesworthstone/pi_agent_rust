@@ -89,7 +89,7 @@ impl AmacGroupKey {
                     Self::EventWrite
                 }
             }
-            HostcallKind::Tool { .. } => Self::Tool,
+            HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => Self::Tool,
             HostcallKind::Exec { .. } => Self::Exec,
             HostcallKind::Http => Self::Http,
             HostcallKind::Ui { .. } => Self::Ui,

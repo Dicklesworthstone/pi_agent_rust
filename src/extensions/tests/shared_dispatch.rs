@@ -58,6 +58,52 @@ pub(super) fn deny_all_policy() -> ExtensionPolicy {
 }
 
 #[test]
+fn shared_dispatch_native_factory_enforces_capability_and_enabled_tool_policy() {
+    let dir = tempdir().expect("tempdir");
+    let tools = ToolRegistry::new(&["write"], dir.path(), None);
+    let disabled = ToolRegistry::without_builtins(None);
+    let http = HttpConnector::with_defaults();
+    let allowed = permissive_policy();
+    let denied = deny_all_policy();
+    let request = crate::extensions_js::HostcallRequest {
+        call_id: "factory-write".to_string(),
+        kind: crate::extensions_js::HostcallKind::BuiltinTool {
+            name: "write".to_string(),
+        },
+        payload: json!({
+            "cwd":dir.path(), "options":{}, "stream":false,
+            "input":{"path":"factory.txt", "content":"native write"}
+        }),
+        trace_id: 0,
+        extension_id: Some("ext.test".to_string()),
+    };
+    let call = hostcall_request_to_payload(&request);
+    assert_eq!(call.capability, "write");
+    assert_eq!(call.params["builtin"], json!(true));
+    run_async(async {
+        let denied_ctx = test_host_call_context(&tools, &http, &denied);
+        let result = dispatch_host_call_shared(&denied_ctx, call.clone()).await;
+        assert!(result.is_error);
+        assert!(!dir.path().join("factory.txt").exists());
+
+        let disabled_ctx = test_host_call_context(&disabled, &http, &allowed);
+        let result = dispatch_host_call_shared(&disabled_ctx, call.clone()).await;
+        assert!(result.is_error);
+        assert!(result.error.unwrap().message.contains("not enabled"));
+        assert!(!dir.path().join("factory.txt").exists());
+
+        let allowed_ctx = test_host_call_context(&tools, &http, &allowed);
+        let result = dispatch_host_call_shared(&allowed_ctx, call).await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("factory.txt")).unwrap(),
+            "native write"
+        );
+        assert!(result.output["content"].is_array());
+    });
+}
+
+#[test]
 fn shared_dispatch_unknown_tool_returns_invalid_request() {
     let dir = tempdir().expect("tempdir");
     let tools = ToolRegistry::new(&[], dir.path(), None);

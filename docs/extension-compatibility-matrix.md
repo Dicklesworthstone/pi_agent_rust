@@ -178,11 +178,30 @@ The Pi SDK virtual module provides the primary extension API surface.
 | `VERSION`, `DEFAULT_MAX_LINES`, `DEFAULT_MAX_BYTES` | Constants | Runtime constants |
 | `truncateHead`, `truncateTail` | Functions | Content truncation |
 | `parseSessionEntries`, `convertToLlm`, `serializeConversation` | Functions | Session data utilities |
-| `createBashTool`, `createReadTool`, `createWriteTool`, etc. | Functions | Tool factory functions |
+| `createBashTool`, `createReadTool`, `createWriteTool`, `createEditTool`, `createGrepTool`, `createFindTool`, `createLsTool` | Functions | Execute the enabled native tools; retain original implementations when an extension overrides the same name |
+| `createReadOnlyTools` | Function | Creates read, grep, find, and ls tools; accepts `{ read: { autoResizeImages } }` |
 | `getAgentDir`, `copyToClipboard` | Functions | System utilities |
 | `highlightCode`, `getLanguageFromPath` | Functions | Code display helpers |
 | `AssistantMessageComponent`, `ToolExecutionComponent`, `UserMessageComponent` | Classes | Message rendering |
 | `SessionManager` | Class | Session state management |
+
+Tool factories accept `execute(toolCallId, input, signal?, onUpdate?)` and return
+the native result, including content, details, and error status. Host errors
+reject the promise. `signal` cancels the pending host request; progress callbacks
+receive ordered native snapshots and stop after cancellation or completion.
+The host assigns a unique internal call ID so delegated file mutations keep
+their normal undo history.
+
+File-tool paths resolve relative to the factory's `cwd` within the host's
+admitted workspace. The original workspace policy remains active, including
+later removal of additional roots. Bash factory directories must be within the
+host's original working tree. Bash factories stay in the foreground and retain
+the configured shell, command prefix, and mediation rules.
+
+Supported factory options are `read.autoResizeImages` and `bash.commandPrefix`.
+Custom `operations`, Bash `spawnHook`, and other unsupported options fail
+explicitly before execution. Factories do not enable tools excluded by host
+configuration or bypass extension capability policy.
 
 ### Pi AI SDK (`@mariozechner/pi-ai`)
 

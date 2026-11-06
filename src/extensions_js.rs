@@ -196,6 +196,8 @@ fn compat_env_fallback_value(key: &str, env: &HashMap<String, String>) -> Option
 pub enum HostcallKind {
     /// pi.tool(name, input) - invoke a tool
     Tool { name: String },
+    /// Imported tool factory delegation to an admitted native implementation.
+    BuiltinTool { name: String },
     /// pi.exec(cmd, args) - execute a shell command
     Exec { cmd: String },
     /// pi.http(request) - make an HTTP request
@@ -312,7 +314,7 @@ impl HostcallRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self.kind {
-            HostcallKind::Tool { .. } => "tool",
+            HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => "tool",
             HostcallKind::Exec { .. } => "exec",
             HostcallKind::Http => "http",
             HostcallKind::Session { .. } => "session",
@@ -325,7 +327,9 @@ impl HostcallRequest {
     #[must_use]
     pub fn required_capability(&self) -> &'static str {
         match &self.kind {
-            HostcallKind::Tool { name } => builtin_tool_required_capability(name),
+            HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
+                builtin_tool_required_capability(name)
+            }
             HostcallKind::Exec { .. } => "exec",
             HostcallKind::Http => "http",
             HostcallKind::Session { .. } => "session",
@@ -345,7 +349,7 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Http => HostcallIoHint::IoHeavy,
             HostcallKind::Exec { .. } => HostcallIoHint::CpuBound,
-            HostcallKind::Tool { name } => {
+            HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
                 let name = name.trim();
                 if name.eq_ignore_ascii_case("read")
                     || name.eq_ignore_ascii_case("write")
@@ -397,6 +401,12 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Tool { name } => {
                 serde_json::json!({ "name": name, "input": self.payload.clone() })
+            }
+            HostcallKind::BuiltinTool { name } => {
+                let mut params = self.payload.as_object().cloned().unwrap_or_default();
+                params.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                params.insert("builtin".to_string(), serde_json::Value::Bool(true));
+                serde_json::Value::Object(params)
             }
             HostcallKind::Exec { cmd } => canonical_exec_params(cmd, &self.payload),
             HostcallKind::Http | HostcallKind::Log => self.payload.clone(),
@@ -9930,7 +9940,43 @@ export class CustomEditor {
   }
 }
 
-export function createBashTool(_cwd, _opts = {}) {
+function builtinToolExecute(name, cwd, opts, supported = {}) {
+  if (cwd !== undefined && (typeof cwd !== "string" || !cwd || cwd.includes("\0"))) {
+    throw new TypeError(`${name} factory cwd must be a non-empty path`);
+  }
+  if (!opts || typeof opts !== "object" || Array.isArray(opts) ||
+      (Object.getPrototypeOf(opts) !== Object.prototype && Object.getPrototypeOf(opts) !== null)) {
+    throw new TypeError(`${name} factory options must be an object`);
+  }
+  const options = Object.create(null);
+  for (const key of Reflect.ownKeys(opts)) {
+    if (typeof key !== "string" || !Object.prototype.hasOwnProperty.call(supported, key)) {
+      throw new TypeError(`${name} factory option '${String(key)}' is not supported by the native host`);
+    }
+    const value = opts[key];
+    if (value === undefined) continue;
+    if (typeof value !== supported[key]) {
+      throw new TypeError(`${name} factory option '${key}' must be a ${supported[key]}`);
+    }
+    options[key] = value;
+  }
+  return async function execute(_id, params, signal, onUpdate) {
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new TypeError(`${name} tool input must be an object`);
+    }
+    if (onUpdate !== undefined && onUpdate !== null && typeof onUpdate !== "function") {
+      throw new TypeError(`${name} tool onUpdate must be a function`);
+    }
+    if (typeof __pi_builtin_tool_hostcall !== "function") {
+      throw new Error("Native tool factory delegation is unavailable in this runtime");
+    }
+    const metadata = { options, stream: typeof onUpdate === "function" };
+    if (cwd !== undefined) metadata.cwd = cwd;
+    return __pi_builtin_tool_hostcall(name, params, metadata, signal, onUpdate);
+  };
+}
+
+export function createBashTool(cwd, opts = {}) {
   return {
     name: "bash",
     label: "bash",
@@ -9939,17 +9985,15 @@ export function createBashTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         command: { type: "string", description: "The bash command to execute" },
-        timeout: { type: "number", description: "Optional timeout in seconds" },
+        timeout: { type: "integer", minimum: 0, description: "Optional timeout in seconds; 0 disables the timeout" },
       },
       required: ["command"],
     },
-    async execute(_id, params) {
-      return { content: [{ type: "text", text: String(params?.command ?? "") }], details: {} };
-    },
+    execute: builtinToolExecute("bash", cwd, opts, { commandPrefix: "string" }),
   };
 }
 
-export function createReadTool(_cwd, _opts = {}) {
+export function createReadTool(cwd, opts = {}) {
   return {
     name: "read",
     label: "read",
@@ -9958,18 +10002,16 @@ export function createReadTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         path: { type: "string", description: "The path to the file to read" },
-        offset: { type: "number", description: "Line offset to start reading from (0-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read" },
+        offset: { type: "integer", minimum: 1, description: "Line number to start reading from (1-indexed)" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of lines to read" },
       },
       required: ["path"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("read", cwd, opts, { autoResizeImages: "boolean" }),
   };
 }
 
-export function createLsTool(_cwd, _opts = {}) {
+export function createLsTool(cwd, opts = {}) {
   return {
     name: "ls",
     label: "ls",
@@ -9977,17 +10019,16 @@ export function createLsTool(_cwd, _opts = {}) {
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "The path to list" },
+        path: { type: "string", description: "The path to list (default: factory working directory)" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of entries" },
       },
-      required: ["path"],
+      required: [],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("ls", cwd, opts),
   };
 }
 
-export function createGrepTool(_cwd, _opts = {}) {
+export function createGrepTool(cwd, opts = {}) {
   return {
     name: "grep",
     label: "grep",
@@ -10000,13 +10041,11 @@ export function createGrepTool(_cwd, _opts = {}) {
       },
       required: ["pattern"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("grep", cwd, opts),
   };
 }
 
-export function createFindTool(_cwd, _opts = {}) {
+export function createFindTool(cwd, opts = {}) {
   return {
     name: "find",
     label: "find",
@@ -10016,25 +10055,28 @@ export function createFindTool(_cwd, _opts = {}) {
       properties: {
         pattern: { type: "string", description: "The file name or glob pattern to match" },
         path: { type: "string", description: "The path to search in" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of results" },
       },
       required: ["pattern"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("find", cwd, opts),
   };
 }
 
 export function createReadOnlyTools(cwd, opts = {}) {
+  if (!opts || typeof opts !== "object" || Array.isArray(opts) ||
+      Reflect.ownKeys(opts).some((key) => key !== "read")) {
+    throw new TypeError("createReadOnlyTools options support only the read configuration");
+  }
   return [
-    createGrepTool(cwd, opts),
-    createFindTool(cwd, opts),
-    createReadTool(cwd, opts),
-    createLsTool(cwd, opts),
+    createReadTool(cwd, opts.read),
+    createGrepTool(cwd),
+    createFindTool(cwd),
+    createLsTool(cwd),
   ];
 }
 
-export function createWriteTool(_cwd, _opts = {}) {
+export function createWriteTool(cwd, opts = {}) {
   return {
     name: "write",
     label: "write",
@@ -10047,13 +10089,11 @@ export function createWriteTool(_cwd, _opts = {}) {
       },
       required: ["path", "content"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("write", cwd, opts),
   };
 }
 
-export function createEditTool(_cwd, _opts = {}) {
+export function createEditTool(cwd, opts = {}) {
   return {
     name: "edit",
     label: "edit",
@@ -10067,9 +10107,7 @@ export function createEditTool(_cwd, _opts = {}) {
       },
       required: ["path", "oldText", "newText"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("edit", cwd, opts),
   };
 }
 
@@ -20179,7 +20217,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 // Install native functions that return call_ids
                 // These are wrapped by JS to create Promises
 
-                // __pi_tool_native(name, input) -> call_id
+                // __pi_tool_native(name, input, factory_options?) -> call_id
                 global.set(
                     "__pi_tool_native",
                     Func::from({
@@ -20191,9 +20229,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
                               name: String,
-                              input: Value<'_>|
+                              input: Value<'_>,
+                              factory: Opt<Value<'_>>|
                               -> rquickjs::Result<String> {
-                            let payload = js_to_json(&input)?;
+                            let input = js_to_json(&input)?;
+                            let (kind, payload) = match factory.0 {
+                                Some(options) if !options.is_undefined() && !options.is_null() => {
+                                    let mut options = js_to_json(&options)?;
+                                    let Some(params) = options.as_object_mut() else {
+                                        return Err(rquickjs::Error::new_into_js_message(
+                                            "factory",
+                                            "options",
+                                            "Tool factory metadata must be an object",
+                                        ));
+                                    };
+                                    params.insert("input".to_string(), input);
+                                    (HostcallKind::BuiltinTool { name }, options)
+                                }
+                                _ => (HostcallKind::Tool { name }, input),
+                            };
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
@@ -20212,7 +20266,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
-                                kind: HostcallKind::Tool { name },
+                                kind,
                                 payload,
                                 trace_id,
                                 extension_id,
@@ -24999,6 +25053,11 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
 
         if (pending.stream) {
             pending.stream.pushChunk(outcome.chunk, outcome.isFinal);
+        } else if (pending.onUpdate && !outcome.isFinal) {
+            // Tool progress is an ordered snapshot. Deliver it before a
+            // following completion can settle and retire the callback.
+            try { pending.onUpdate(outcome.chunk); }
+            catch (error) { console.error('Tool onUpdate error:', error); }
         } else if (pending.onChunk) {
             const chunk = outcome.chunk;
             const isFinal = outcome.isFinal;
@@ -25124,14 +25183,15 @@ function __pi_make_hostcall(nativeFn) {
     };
 }
 
-// Only compaction generation is abortable through this Promise wrapper.
+// Abortable generation and native tool execution share request retirement.
 // Session mutation hostcalls retain their admitted transaction lifetime.
-function __pi_compact_hostcall(payload, signal) {
+function __pi_abortable_hostcall(start, signal, label, onUpdate) {
     return new Promise((resolve, reject) => {
-        if (typeof signal.aborted !== 'boolean' ||
+        const hasSignal = signal !== undefined && signal !== null;
+        if (hasSignal && (typeof signal.aborted !== 'boolean' ||
             typeof signal.addEventListener !== 'function' ||
-            typeof signal.removeEventListener !== 'function') {
-            throw new TypeError('compact: signal must be an AbortSignal');
+            typeof signal.removeEventListener !== 'function')) {
+            throw new TypeError(`${label}: signal must be an AbortSignal`);
         }
         let callId = null;
         let settled = false;
@@ -25168,15 +25228,17 @@ function __pi_compact_hostcall(payload, signal) {
             finish(reject, reason);
         };
         try {
-            if (signal.aborted) {
+            if (hasSignal && signal.aborted) {
                 finish(reject, abortReason());
                 return;
             }
-            listening = true;
-            signal.addEventListener('abort', onAbort);
-            if (signal.aborted) onAbort();
+            if (hasSignal) {
+                listening = true;
+                signal.addEventListener('abort', onAbort);
+                if (signal.aborted) onAbort();
+            }
             if (settled) return;
-            callId = __pi_events_native('compact', payload);
+            callId = start();
             // Payload getters can abort while the native bridge captures the
             // request, before its call ID has been returned to this closure.
             if (settled) {
@@ -25186,14 +25248,37 @@ function __pi_compact_hostcall(payload, signal) {
             __pi_pending_hostcalls.set(callId, {
                 resolve: (value) => finish(resolve, value),
                 reject: (error) => finish(reject, error),
+                onUpdate: typeof onUpdate === 'function'
+                    ? (chunk) => {
+                        if (!settled) onUpdate(chunk);
+                    }
+                    : undefined,
                 extensionId: __pi_get_current_extension_id()
             });
-            if (signal.aborted) onAbort();
+            if (hasSignal && signal.aborted) onAbort();
         } catch (error) {
             cancelNative();
             finish(reject, error);
         }
     });
+}
+
+function __pi_compact_hostcall(payload, signal) {
+    return __pi_abortable_hostcall(
+        () => __pi_events_native('compact', payload), signal, 'compact'
+    );
+}
+
+function __pi_builtin_tool_hostcall(name, input, metadata, signal, onUpdate) {
+    const owner = __pi_get_current_extension_id();
+    const publish = typeof onUpdate === 'function'
+        ? (update) => owner
+            ? __pi_with_extension_sync(owner, () => onUpdate(update))
+            : onUpdate(update)
+        : undefined;
+    return __pi_abortable_hostcall(
+        () => __pi_tool_native(name, input, metadata), signal, name, publish
+    );
 }
 
 function __pi_make_streaming_hostcall(nativeFn, ...args) {
@@ -28260,6 +28345,15 @@ Object.defineProperty(globalThis, '__pi_get_current_extension_id', {
     enumerable: false,
 });
 
+// Public module adapter: every call still crosses the native capability and
+// enabled-tool gates. No privileged lifecycle operation is exposed here.
+Object.defineProperty(globalThis, '__pi_builtin_tool_hostcall', {
+    value: __pi_builtin_tool_hostcall,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+});
+
 for (const name of Object.getOwnPropertyNames(globalThis)) {
     if (!name.startsWith('__pi_')) continue;
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -28425,11 +28519,16 @@ mod tests {
     /// 251_512 -> 256_684 (+144 inventory/reset, +635 tool dispatch,
     /// +4_393 private lifetime controls). The pinned real-subagent source
     /// diagnostic and native lifecycle regressions cover these edits.
+    ///
+    /// Native tool factory delegation adds 1_640 bridge bytes (259_969 ->
+    /// 261_609) and 1_832 trimmed coding-agent module bytes (29_584 -> 31_416).
+    /// These baselines include earlier source drift from the prior receipts;
+    /// only the two sources changed by this feature are re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            256_684,
-            "2f2004075b71ba724fcda8d3be81183324eb27e34cc35027e8b9013bcfe92096",
+            261_609,
+            "fc46d7ab3f31ba0d1fdacebb34dcbdf2e52c32a3220b53150c7ff52b5b72ce2d",
         ),
         (
             "node:fs",
@@ -28451,11 +28550,11 @@ mod tests {
             21_108,
             "b35c1978b8bb6c50571e4b4c31f12582380a1b024d3dfe0ac918681ee65e882a",
         ),
-        // Re-pinned with public compaction options and the nine-argument API.
+        // Re-pinned with native tool factory execution.
         (
             "@mariozechner/pi-coding-agent",
-            29_603,
-            "90cd8ffeb6ad50922ad4e5923efe2ede8e5d68f8d8507655fdc3ae989704968e",
+            31_416,
+            "7b445ed9b02ea58abd24b614b5f3a0a1d48fb2f10929975bd07eefc2d81b2550",
         ),
         (
             "@mariozechner/pi-tui",
@@ -28939,6 +29038,143 @@ mod tests {
             // The explicit host payload model wins over sessionState.model;
             // with neither present, ctx.model is undefined (upstream parity).
             assert_eq!(probe["modelAbsent"], json!("undefined"));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factories_delegate_all_tools_and_preserve_results() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, updates: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    const tools = [
+                        ...mod.createReadOnlyTools('/workspace/sub', { read: { autoResizeImages: false } }),
+                        mod.createWriteTool('/workspace/sub'), mod.createEditTool('/workspace/sub'),
+                        mod.createBashTool('/workspace/sub', { commandPrefix: 'export FOO=bar' }),
+                    ];
+                    factoryProbe.names = tools.map((tool) => tool.name);
+                    factoryProbe.values = await Promise.all(tools.map((tool) => tool.execute(
+                        'extension-id', { path: 'file.txt', command: 'printf real', pattern: 'text',
+                            content: 'body', oldText: 'before', newText: 'after' },
+                        undefined, (update) => factoryProbe.updates.push({ name: tool.name, update })
+                    )));
+                }).catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 7);
+            let mut ids = std::collections::HashSet::new();
+            for request in requests {
+                let HostcallKind::BuiltinTool { name } = &request.kind else {
+                    panic!("factory used the ordinary override lookup: {:?}", request.kind);
+                };
+                assert!(ids.insert(request.call_id.clone()));
+                assert_eq!(request.payload["cwd"], json!("/workspace/sub"));
+                assert_eq!(request.payload["stream"], json!(true));
+                assert_eq!(request.params_for_hash()["builtin"], json!(true));
+                assert_eq!(request.params_for_hash()["input"]["path"], json!("file.txt"));
+                match name.as_str() {
+                    "read" => assert_eq!(request.payload["options"], json!({"autoResizeImages":false})),
+                    "bash" => assert_eq!(request.payload["options"], json!({"commandPrefix":"export FOO=bar"})),
+                    _ => assert_eq!(request.payload["options"], json!({})),
+                }
+                runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"content":[{"type":"text", "text":"progress"}], "details":{"partial":true}}),
+                    is_final: false,
+                });
+                runtime.complete_hostcall(request.call_id, HostcallOutcome::Success(json!({
+                    "content":[{"type":"text", "text":format!("executed {name}")}],
+                    "details":{"native":true}, "isError":name == "bash",
+                })));
+            }
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            assert_eq!(probe["names"], json!(["read", "grep", "find", "ls", "write", "edit", "bash"]));
+            assert_eq!(probe["updates"].as_array().unwrap().len(), 7, "{probe}");
+            assert_eq!(probe["values"][0]["content"][0]["text"], json!("executed read"));
+            assert_eq!(probe["values"][6]["isError"], json!(true));
+            assert_eq!(probe["values"][6]["details"]["native"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factories_reject_unsupported_options_and_pre_abort() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, errors: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    for (const create of [
+                        () => mod.createReadTool('/workspace', { operations: {} }),
+                        () => mod.createWriteTool('/workspace', { operations: {} }),
+                        () => mod.createEditTool('/workspace', { operations: {} }),
+                        () => mod.createBashTool('/workspace', { spawnHook() {} }),
+                        () => mod.createReadTool('/workspace', { autoResizeImages: 'false' }),
+                    ]) {
+                        try { create(); factoryProbe.errors.push('accepted'); }
+                        catch (error) { factoryProbe.errors.push(String(error)); }
+                    }
+                    try {
+                        await mod.createWriteTool('/workspace').execute('pre-abort',
+                            { path: 'must-not-exist', content: 'no' }, AbortSignal.abort('stopped'));
+                    } catch (error) { factoryProbe.aborted = error; }
+                }).catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            assert!(runtime.drain_hostcall_requests().is_empty());
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["aborted"], json!("stopped"), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            assert_eq!(probe["errors"].as_array().unwrap().len(), 5);
+            assert!(probe["errors"].as_array().unwrap().iter().all(|error| {
+                error.as_str().unwrap().starts_with("TypeError:")
+            }), "{probe}");
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factory_abort_retires_host_work_and_progress() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, updates: [] };
+                globalThis.factoryAbort = new AbortController();
+                import('@mariozechner/pi-coding-agent').then((mod) =>
+                    mod.createBashTool('/workspace').execute('cancelled', { command: 'slow' },
+                        factoryAbort.signal, (update) => factoryProbe.updates.push(update)))
+                  .then(() => { factoryProbe.resolved = true; })
+                  .catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            let request = runtime.drain_hostcall_requests().pop_front().unwrap();
+            runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
+                sequence: 0, chunk: json!({"content":[], "details":{"before":true}}), is_final: false,
+            });
+            drain_until_idle(&runtime, &clock).await;
+            runtime.eval("factoryAbort.abort('caller stopped');").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            assert!(!runtime.is_hostcall_active(&request.call_id));
+            runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
+                sequence: 1, chunk: json!({"content":[], "details":{"late":true}}), is_final: false,
+            });
+            runtime.complete_hostcall(request.call_id, HostcallOutcome::Success(json!({"content":[]})));
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], json!("caller stopped"), "{probe}");
+            assert_eq!(probe["resolved"], serde_json::Value::Null);
+            assert_eq!(probe["updates"].as_array().unwrap().len(), 1, "{probe}");
         });
     }
 

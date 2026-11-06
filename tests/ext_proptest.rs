@@ -118,7 +118,7 @@ proptest! {
         let req = request(kind.clone(), payload);
         let cap = req.required_capability();
         match kind {
-            HostcallKind::Tool { .. } => prop_assert!(matches!(
+            HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => prop_assert!(matches!(
                 cap,
                 "read" | "write" | "exec" | "tool"
             )),

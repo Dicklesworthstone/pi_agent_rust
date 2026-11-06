@@ -1000,6 +1000,13 @@ Pi supports two extension runtime families with capability-gated host connectors
 - Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
 - Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
 
+Imported `createReadTool`, `createWriteTool`, `createEditTool`, `createBashTool`,
+`createGrepTool`, `createFindTool`, and `createLsTool` factories execute the host's
+enabled native tools, including when an extension wraps the same tool name.
+They preserve file undo recording, capability checks, workspace boundaries,
+cancellation, and progress callbacks. Supported factory settings and limitations
+are listed in the [extension compatibility matrix](docs/extension-compatibility-matrix.md).
+
 ### Credential-Aware Model Selection
 
 - `/model` (or `Ctrl+L`) opens a selector focused on models that are ready to run with current credentials.

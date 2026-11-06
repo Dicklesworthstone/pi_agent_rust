@@ -19993,20 +19993,44 @@ async fn dispatch_shared_allowed_fast(
 ) -> HostcallOutcome {
     match opcode {
         CommonHostcallOpcode::ToolRead => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "read", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "read",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::ToolWrite => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "write", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "write",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::ToolEdit => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "edit", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "edit",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::ToolBash => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "bash", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "bash",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetName => {
             let Some(ref manager) = ctx.manager else {
@@ -20439,8 +20463,14 @@ async fn dispatch_shared_allowed_legacy(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, name, input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                name,
+                &call.params,
+            )
+            .await
         }
         "exec" => {
             let cmd = call
@@ -20834,21 +20864,125 @@ async fn dispatch_hostcall_with_runtime(
     host_result_to_outcome(result)
 }
 
-#[allow(clippy::future_not_send)]
-async fn dispatch_hostcall_tool(
+/// One replaceable progress snapshot bounds memory while JavaScript is busy.
+#[derive(Default)]
+struct NativeFactoryProgress {
+    latest: Mutex<Option<ToolUpdate>>,
+    waker: futures::task::AtomicWaker,
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub(crate) async fn dispatch_hostcall_tool<C: crate::scheduler::Clock + 'static>(
     tools: &ToolRegistry,
+    runtime: Option<&PiJsRuntime<C>>,
     call_id: &str,
     name: &str,
-    payload: Value,
+    params: &Value,
 ) -> HostcallOutcome {
-    let Some(tool) = tools.get(name) else {
+    let builtin = params.get("builtin") == Some(&Value::Bool(true));
+    if params
+        .get("builtin")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return HostcallOutcome::Error {
             code: "invalid_request".to_string(),
-            message: format!("Unknown tool: {name}"),
+            message: "Tool builtin selector must be a boolean".to_string(),
+        };
+    }
+    let tool = if builtin {
+        tools.get_factory_tool(name)
+    } else {
+        tools.get(name)
+    };
+    let Some(tool) = tool else {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: if builtin {
+                format!("Native tool factory '{name}' is not enabled by this host")
+            } else {
+                format!("Unknown tool: {name}")
+            },
         };
     };
-
-    match tool.execute(call_id, payload, None).await {
+    let empty_options = json!({});
+    let options = params.get("options").unwrap_or(&empty_options);
+    let cwd = params.get("cwd").and_then(Value::as_str);
+    let stream = builtin && params.get("stream") == Some(&Value::Bool(true));
+    if builtin
+        && (params.get("cwd").is_some_and(|value| !value.is_string())
+            || params
+                .get("stream")
+                .is_some_and(|value| !value.is_boolean())
+            || !options.is_object()
+            || params.as_object().is_some_and(|object| {
+                object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "name" | "input" | "builtin" | "cwd" | "options" | "stream"
+                    )
+                })
+            }))
+    {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "Invalid native tool factory options".to_string(),
+        };
+    }
+    if stream && runtime.is_none() {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "Tool factory progress requires a JavaScript runtime".to_string(),
+        };
+    }
+    let progress = stream.then(|| Arc::new(NativeFactoryProgress::default()));
+    let on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>> = progress.as_ref().map(|progress| {
+        let progress = Arc::clone(progress);
+        Box::new(move |update| {
+            *progress
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(update);
+            progress.waker.wake();
+        }) as Box<dyn Fn(ToolUpdate) + Send + Sync>
+    });
+    let input = params.get("input").cloned().unwrap_or(Value::Null);
+    let mut execution = if builtin {
+        tool.execute_from_factory(call_id, input, cwd, options, on_update)
+    } else {
+        tool.execute(call_id, input, on_update)
+    };
+    let mut sequence = 0_u64;
+    let output = if let Some(progress) = progress {
+        futures::future::poll_fn(|task_cx| {
+            progress.waker.register(task_cx.waker());
+            let output = execution.as_mut().poll(task_cx);
+            let update = progress
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(update) = update
+                && let Some(runtime) = runtime
+                && runtime.is_hostcall_active(call_id)
+                && let Ok(chunk) = serde_json::to_value(update)
+            {
+                runtime.complete_hostcall(
+                    call_id,
+                    HostcallOutcome::StreamChunk {
+                        sequence,
+                        chunk,
+                        is_final: false,
+                    },
+                );
+                sequence = sequence.saturating_add(1);
+            }
+            output
+        })
+        .await
+    } else {
+        execution.await
+    };
+    match output {
         Ok(output) => match serde_json::to_value(output) {
             Ok(value) => HostcallOutcome::Success(value),
             Err(err) => HostcallOutcome::Error {

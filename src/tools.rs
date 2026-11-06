@@ -371,6 +371,42 @@ pub trait Tool: Send + Sync {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput>;
 
+    /// Native filesystem authority available to imported tool factories.
+    /// A same-named extension or MCP tool cannot acquire this by registration.
+    #[doc(hidden)]
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        None
+    }
+
+    /// Delegate an imported factory to the admitted native implementation.
+    /// Relative paths are rebased, but the tool's configured cwd and live
+    /// workspace remain authoritative for access checks and root revocation.
+    #[doc(hidden)]
+    async fn execute_from_factory(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        cwd: Option<&str>,
+        options: &serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let Some((configured_cwd, workspace)) = self.builtin_factory_context() else {
+            return Err(Error::validation(format!(
+                "Tool '{}' is not an admitted native factory target",
+                self.name()
+            )));
+        };
+        validate_builtin_factory_options(self.name(), options, &[])?;
+        let input = rebase_builtin_factory_input(
+            self.name(),
+            input,
+            cwd,
+            configured_cwd,
+            workspace,
+        )?;
+        self.execute(tool_call_id, input, on_update).await
+    }
+
     /// Execute with this invocation's live auxiliary-provider privacy policy.
     /// Tools making a second model request use `protect` on complete source
     /// fields before formatting or truncation. Ordinary tools retain their
@@ -5772,6 +5808,9 @@ impl ToolLoadPolicy {
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
+    /// Initially admitted native implementations, retained independently of
+    /// same-named extension wrappers. Factories never construct disabled tools.
+    factory_tools: Vec<Arc<dyn Tool>>,
     /// Extension tools shelved by `setActiveTools`; restored when a later
     /// call names them again.
     inactive: Vec<Arc<dyn Tool>>,
@@ -5850,6 +5889,98 @@ pub fn unselectable_tool_names(requested: &[&str]) -> Vec<(String, &'static str)
                 .map(|(_, how)| ((*name).to_string(), *how))
         })
         .collect()
+}
+
+fn retained_factory_tools(tools: &[Arc<dyn Tool>]) -> Vec<Arc<dyn Tool>> {
+    tools
+        .iter()
+        .filter(|tool| {
+            tool.origin() == ToolOrigin::BuiltIn
+                && matches!(
+                    tool.name(),
+                    "read" | "write" | "edit" | "bash" | "grep" | "find" | "ls"
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+fn validate_builtin_factory_options(
+    name: &str,
+    options: &serde_json::Value,
+    allowed: &[&str],
+) -> Result<()> {
+    let Some(options) = options.as_object() else {
+        return Err(Error::validation(format!(
+            "{name} factory options must be an object"
+        )));
+    };
+    if let Some(key) = options.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(Error::validation(format!(
+            "{name} factory option '{key}' is not supported by the native host"
+        )));
+    }
+    Ok(())
+}
+
+fn builtin_factory_cwd(
+    name: &str,
+    requested: Option<&str>,
+    configured: &Path,
+    workspace: &WorkspaceHandle,
+) -> Result<PathBuf> {
+    let Some(requested) = requested else {
+        return Ok(configured.to_path_buf());
+    };
+    if requested.is_empty() || requested.contains('\0') {
+        return Err(Error::validation("Factory cwd must be a non-empty path"));
+    }
+    let path = resolve_path(requested, configured);
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        Error::validation(format!("Cannot resolve {name} factory cwd: {error}"))
+    })?;
+    enforce_cwd_scope(&canonical, configured, name, workspace)?;
+    if !canonical.is_dir() {
+        return Err(Error::validation("Factory cwd must be a directory"));
+    }
+    Ok(canonical)
+}
+
+fn rebase_builtin_factory_input(
+    name: &str,
+    mut input: serde_json::Value,
+    cwd: Option<&str>,
+    configured: &Path,
+    workspace: &WorkspaceHandle,
+) -> Result<serde_json::Value> {
+    // The native tool already resolves its default cwd. Rebasing here would
+    // apply a relative configured cwd twice (project/project/file).
+    if cwd.is_none() {
+        return Ok(input);
+    }
+    let cwd = builtin_factory_cwd(name, cwd, configured, workspace)?;
+    let Some(params) = input.as_object_mut() else {
+        return Err(Error::validation("Tool input must be an object"));
+    };
+    let path = match params.get("path") {
+        Some(serde_json::Value::String(path)) => path.as_str(),
+        None if matches!(name, "grep" | "find" | "ls") => ".",
+        // Preserve the native tool's required-field and type errors.
+        _ => return Ok(input),
+    };
+    // Native resource URLs and remote selectors keep their own routing. Local
+    // relative paths, including archive/document selectors, use the factory cwd.
+    if !crate::url_router::has_scheme(path) {
+        let path = resolve_to_cwd(path, &cwd);
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::validation("Factory path cannot be represented as UTF-8"))?;
+        params.insert(
+            "path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+    }
+    Ok(input)
 }
 
 impl ToolRegistry {
@@ -6382,8 +6513,11 @@ impl ToolRegistry {
         }
 
         let builtins_disabled = !allow_implicit_tools && enabled.is_empty();
+        let tools: Vec<Arc<dyn Tool>> = tools.into_iter().map(Arc::from).collect();
+        let factory_tools = retained_factory_tools(&tools);
         let mut registry = Self {
-            tools: tools.into_iter().map(Arc::from).collect(),
+            tools,
+            factory_tools,
             inactive: Vec::new(),
             job_session_scope,
             model_scope,
@@ -6434,8 +6568,11 @@ impl ToolRegistry {
             tool.bind_text_file_client_scope(text_file_client_scope.clone());
             tool.bind_terminal_client_scope(terminal_client_scope.clone());
         }
+        let tools: Vec<Arc<dyn Tool>> = tools.into_iter().map(Arc::from).collect();
+        let factory_tools = retained_factory_tools(&tools);
         Self {
-            tools: tools.into_iter().map(Arc::from).collect(),
+            tools,
+            factory_tools,
             inactive: Vec::new(),
             job_session_scope,
             model_scope,
@@ -6460,6 +6597,7 @@ impl ToolRegistry {
     pub fn clone_shallow(&self) -> Self {
         Self {
             tools: self.tools.clone(),
+            factory_tools: self.factory_tools.clone(),
             inactive: self.inactive.clone(),
             job_session_scope: self.job_session_scope.clone(),
             model_scope: self.model_scope.clone(),
@@ -6878,6 +7016,18 @@ impl ToolRegistry {
             .map(|tool| &**tool)
     }
 
+    /// The original admitted implementation behind an imported factory.
+    /// Dynamic registrations cannot add authority to this retained set.
+    pub(crate) fn get_factory_tool(&self, name: &str) -> Option<&dyn Tool> {
+        if self.builtins_disabled || !self.load_policy.admits(name) {
+            return None;
+        }
+        self.factory_tools
+            .iter()
+            .find(|tool| tool.name() == name)
+            .map(|tool| &**tool)
+    }
+
     pub(crate) fn set_text_file_client(&self, client: Arc<dyn TextFileClient>) -> Result<()> {
         self.text_file_client_scope.set(client)
     }
@@ -7099,6 +7249,7 @@ struct ReadInput {
     rendered: bool,
 }
 
+#[derive(Clone)]
 pub struct ReadTool {
     cwd: PathBuf,
     text_file_client: TextFileClientScope,
@@ -7581,6 +7732,25 @@ fn window_read_output(
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReadTool {
+    async fn execute_from_factory(
+        &self,
+        tool_call_id: &str,
+        input: serde_json::Value,
+        cwd: Option<&str>,
+        options: &serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        validate_builtin_factory_options("read", options, &["autoResizeImages"])?;
+        let mut tool = self.clone();
+        if let Some(value) = options.get("autoResizeImages") {
+            tool.auto_resize = value.as_bool().ok_or_else(|| {
+                Error::validation("read factory autoResizeImages must be a boolean")
+            })?;
+        }
+        let input = rebase_builtin_factory_input("read", input, cwd, &self.cwd, &self.workspace)?;
+        tool.execute(tool_call_id, input, on_update).await
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -8413,6 +8583,7 @@ struct BashInput {
     background: Option<bool>,
 }
 
+#[derive(Clone)]
 pub struct BashTool {
     cwd: PathBuf,
     shell_path: Option<String>,
@@ -9724,6 +9895,38 @@ impl BashTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for BashTool {
+    async fn execute_from_factory(
+        &self,
+        tool_call_id: &str,
+        mut input: serde_json::Value,
+        cwd: Option<&str>,
+        options: &serde_json::Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        validate_builtin_factory_options("bash", options, &["commandPrefix"])?;
+        let mut tool = self.clone();
+        tool.cwd = builtin_factory_cwd("bash", cwd, &self.cwd, &WorkspaceHandle::default())?;
+        if let Some(prefix) = options.get("commandPrefix") {
+            let prefix = prefix.as_str().ok_or_else(|| {
+                Error::validation("bash factory commandPrefix must be a string")
+            })?;
+            if !prefix.is_empty()
+                && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
+            {
+                // Keep the host's shell prefix and mediation intact. The
+                // extension prefix is part of the command they inspect.
+                let command = format!("{prefix}\n{command}");
+                input["command"] = serde_json::Value::String(command);
+            }
+        }
+        // The factory contract returns the completed command. Background
+        // promotion would end streaming and abandon the supplied AbortSignal.
+        if let Some(params) = input.as_object_mut() {
+            params.insert("background".to_string(), serde_json::Value::Bool(false));
+        }
+        tool.execute(tool_call_id, input, on_update).await
+    }
+
     fn name(&self) -> &str {
         "bash"
     }
@@ -12687,6 +12890,10 @@ impl HashlineEditTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn prewalk_evidence(
         &self,
         input: &serde_json::Value,
@@ -13121,6 +13328,10 @@ fn ends_with_read_truncation_notice(content: &str) -> bool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn prewalk_evidence(
         &self,
         input: &serde_json::Value,
@@ -14605,6 +14816,10 @@ fn rg_exit_failure(status: std::process::ExitStatus, stderr: &str) -> Option<Str
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GrepTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn name(&self) -> &str {
         "grep"
     }
@@ -15511,6 +15726,10 @@ impl FindTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for FindTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn name(&self) -> &str {
         "find"
     }
@@ -16276,6 +16495,10 @@ impl LsTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for LsTool {
+    fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
+        Some((&self.cwd, &self.workspace))
+    }
+
     fn name(&self) -> &str {
         "ls"
     }
@@ -27356,6 +27579,17 @@ mod known_tool_name_tests {
     use super::*;
     use serde_json::Value;
 
+    fn get_text(content: &[ContentBlock]) -> String {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     struct CatalogTool {
         name: &'static str,
         description: &'static str,
@@ -27426,6 +27660,153 @@ mod known_tool_name_tests {
             panic!("discovery must return JSON text");
         };
         serde_json::from_str(&text.text).expect("discovery description")
+    }
+
+    #[test]
+    fn imported_factories_use_native_tools_after_overrides_and_share_undo() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(root.path().join("note.txt"), "root stays intact\n").unwrap();
+            std::fs::write(sub.join("note.txt"), "original\n").unwrap();
+            let recorder = Arc::new(crate::undo::FileMutationRecorder::default());
+            let mut registry = ToolRegistry::with_mutation_recorder(
+                &["read", "write", "edit", "grep", "find", "ls"],
+                root.path(), None, Some(Arc::clone(&recorder)), None,
+            );
+            for name in ["read", "write", "edit", "grep", "find", "ls"] {
+                registry.push(catalog_tool(name, "extension wrapper", ToolOrigin::Extension));
+            }
+            let registry = registry.clone_shallow();
+            assert_eq!(registry.get("read").unwrap().origin(), ToolOrigin::Extension);
+            let options = serde_json::json!({});
+            let cwd = sub.to_str();
+            registry.get_factory_tool("write").unwrap().execute_from_factory(
+                "factory-write", serde_json::json!({"path":"note.txt", "content":"alpha\nbeta\n"}),
+                cwd, &options, None,
+            ).await.unwrap();
+            let read = registry.get_factory_tool("read").unwrap().execute_from_factory(
+                "factory-read", serde_json::json!({"path":"note.txt", "offset":2, "limit":1}),
+                cwd, &serde_json::json!({"autoResizeImages":false}), None,
+            ).await.unwrap();
+            assert!(get_text(&read.content).contains("beta"));
+            assert!(!get_text(&read.content).contains("alpha"));
+            registry.get_factory_tool("edit").unwrap().execute_from_factory(
+                "factory-edit", serde_json::json!({"path":"note.txt", "oldText":"alpha", "newText":"changed"}),
+                cwd, &options, None,
+            ).await.unwrap();
+            assert_eq!(std::fs::read_to_string(sub.join("note.txt")).unwrap(), "changed\nbeta\n");
+            assert_eq!(std::fs::read_to_string(root.path().join("note.txt")).unwrap(), "root stays intact\n");
+            for (name, input) in [
+                ("grep", serde_json::json!({"pattern":"changed"})),
+                ("find", serde_json::json!({"pattern":"*.txt"})),
+                ("ls", serde_json::json!({})),
+            ] {
+                let output = registry.get_factory_tool(name).unwrap().execute_from_factory(
+                    name, input, cwd, &options, None,
+                ).await.unwrap();
+                assert!(get_text(&output.content).contains("note.txt"), "{name}: {output:?}");
+            }
+            assert_eq!(recorder.stats().undo_depth, 2);
+            assert_eq!(recorder.undo(1, false).applied.len(), 1);
+            assert_eq!(std::fs::read_to_string(sub.join("note.txt")).unwrap(), "alpha\nbeta\n");
+            assert_eq!(recorder.undo(1, false).applied.len(), 1);
+            assert_eq!(std::fs::read_to_string(sub.join("note.txt")).unwrap(), "original\n");
+        });
+    }
+
+    #[test]
+    fn imported_factories_preserve_disabled_tools_and_live_workspace_revocation() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+            let mut workspace = WorkspaceHandle::single(root.path());
+            workspace.add_root(outside.path());
+            let registry = ToolRegistry::with_mutation_recorder(
+                &["read"], root.path(), None, None, Some(&workspace),
+            );
+            let read = registry.get_factory_tool("read").unwrap();
+            let input = serde_json::json!({"path":"secret.txt"});
+            let options = serde_json::json!({});
+            read.execute_from_factory("allowed", input.clone(), outside.path().to_str(), &options, None)
+                .await.unwrap();
+            assert!(workspace.remove_root(outside.path()));
+            assert!(read.execute_from_factory("revoked", input, outside.path().to_str(), &options, None)
+                .await.is_err());
+            assert!(registry.get_factory_tool("write").is_none());
+            let mut disabled = ToolRegistry::without_builtins(None);
+            disabled.push(Box::new(ReadTool::new(root.path())));
+            assert!(disabled.get_factory_tool("read").is_none());
+            assert!(read.execute_from_factory(
+                "unsupported", serde_json::json!({"path":"missing.txt"}), None,
+                &serde_json::json!({"operations":{}}), None,
+            ).await.unwrap_err().to_string().contains("not supported"));
+        });
+    }
+
+    #[test]
+    fn imported_factory_default_cwd_resolves_relative_registry_paths_once() {
+        asupersync::test_utils::run_test(|| async {
+            let current = std::env::current_dir().unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("factory-relative-")
+                .tempdir_in(&current)
+                .unwrap();
+            let relative = Path::new(".").join(root.path().file_name().unwrap());
+            std::fs::write(root.path().join("note.txt"), "relative cwd works\n").unwrap();
+            let registry = ToolRegistry::new(&["read"], &relative, None);
+            let output = registry
+                .get_factory_tool("read")
+                .unwrap()
+                .execute_from_factory(
+                    "relative-read",
+                    serde_json::json!({"path":"note.txt"}),
+                    None,
+                    &serde_json::json!({}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text(&output.content).contains("relative cwd works"));
+            assert_eq!(std::env::current_dir().unwrap(), current);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_bash_factory_executes_prefix_in_cwd_and_preserves_failures() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let sub = root.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "bash":{"persistent":false, "pty":"off"}
+            })).unwrap();
+            let mut registry = ToolRegistry::new(&["bash"], root.path(), Some(&config));
+            registry.push(catalog_tool("bash", "extension wrapper", ToolOrigin::Extension));
+            let bash = registry.get_factory_tool("bash").unwrap();
+            let result = bash.execute_from_factory(
+                "shell", serde_json::json!({"command":"printf '%s\\n' \"$PI_FACTORY_VALUE\"; pwd", "timeout":5}),
+                sub.to_str(), &serde_json::json!({"commandPrefix":"export PI_FACTORY_VALUE=factory-executed"}), None,
+            ).await.unwrap();
+            assert!(!result.is_error, "{result:?}");
+            let text = get_text(&result.content);
+            assert!(text.contains("factory-executed"), "{text}");
+            assert!(text.contains(std::fs::canonicalize(&sub).unwrap().to_str().unwrap()), "{text}");
+            assert!(!text.contains("printf"), "A factory must execute, not echo its command");
+            let failed = bash.execute_from_factory(
+                "shell-error", serde_json::json!({"command":"exit 7", "timeout":5}),
+                None, &serde_json::json!({}), None,
+            ).await.unwrap();
+            assert!(failed.is_error, "{failed:?}");
+            let outside = tempfile::tempdir().unwrap();
+            assert!(bash.execute_from_factory(
+                "outside", serde_json::json!({"command":"pwd"}), outside.path().to_str(),
+                &serde_json::json!({}), None,
+            ).await.is_err());
+        });
     }
 
     #[test]
