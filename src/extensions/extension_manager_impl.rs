@@ -5461,7 +5461,7 @@ impl ExtensionManager {
 fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
     let obj = result.as_object()?;
 
-    let output = obj
+    let mut output = obj
         .get("output")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -5479,11 +5479,51 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // A hook has already executed its command. Invalid optional metadata must
+    // not discard its result and cause the caller to execute the command again.
+    let capture = obj.get("capture").and_then(|value| {
+        serde_json::from_value::<crate::tools::BashCapture>(value.clone())
+            .ok()
+            .or_else(|| {
+                // A malformed optional detail must not erase a known capture
+                // limitation or restore a contradictory full-output claim.
+                let fields = value.as_object()?;
+                let capture = crate::tools::BashCapture {
+                    output_complete: fields
+                        .get("outputComplete")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    artifact_truncated: fields
+                        .get("artifactTruncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    artifact_error: fields
+                        .get("artifactError")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    artifact_path: fields
+                        .get("artifactPath")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                };
+                (!capture.is_complete()).then_some(capture)
+            })
+    });
+    if let Some(capture) = &capture
+        && !capture.is_complete()
+    {
+        capture.append_notice(&mut output);
+    }
     let full_output_path = obj
         .get("fullOutputPath")
         .or_else(|| obj.get("full_output_path"))
         .and_then(Value::as_str)
-        .map(ToString::to_string);
+        .map(ToString::to_string)
+        .filter(|_| {
+            capture
+                .as_ref()
+                .is_none_or(crate::tools::BashCapture::is_complete)
+        });
     let cancellation = obj.get("cancellation").and_then(Value::as_object);
     let cancellation_reason = cancellation
         .and_then(|details| details.get("reason"))
@@ -5509,5 +5549,152 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         truncated,
         full_output_path,
         truncation: None,
+        capture,
     })
+}
+
+#[cfg(test)]
+mod user_bash_result_tests {
+    use super::user_bash_result;
+    use serde_json::json;
+
+    #[test]
+    fn incomplete_capture_never_advertises_a_full_output_path() {
+        for (output_complete, artifact_truncated, artifact_error) in [
+            (false, false, None),
+            (true, true, None),
+            (true, false, Some("disk full")),
+        ] {
+            let result = user_bash_result(&json!({
+                "output": "retained command output",
+                "exitCode": 0,
+                "fullOutputPath": "retained.log",
+                "capture": {
+                    "outputComplete": output_complete,
+                    "artifactTruncated": artifact_truncated,
+                    "artifactError": artifact_error,
+                    "artifactPath": "retained.log"
+                }
+            }))
+            .expect("capture limitations must preserve the executed hook result");
+
+            assert!(result.full_output_path.is_none());
+            assert!(result.output.starts_with("retained command output"));
+            assert!(result.output.contains("[Command capture:"));
+            assert_eq!(
+                result
+                    .output
+                    .contains("[Output capture stopped before all readers finished"),
+                !output_complete
+            );
+            let capture = result.capture.expect("typed capture metadata");
+            assert_eq!(capture.output_complete, output_complete);
+            assert_eq!(capture.artifact_truncated, artifact_truncated);
+            assert_eq!(capture.artifact_error.as_deref(), artifact_error);
+            assert_eq!(capture.artifact_path.as_deref(), Some("retained.log"));
+        }
+    }
+
+    #[test]
+    fn complete_capture_keeps_full_output_and_defaults_optional_fields() {
+        let result = user_bash_result(&json!({
+            "output": "complete command output",
+            "fullOutputPath": "complete.log",
+            "capture": {
+                "outputComplete": true,
+                "futureCaptureDetail": "ignored"
+            }
+        }))
+        .expect("complete hook result");
+
+        assert_eq!(result.output, "complete command output");
+        assert_eq!(result.full_output_path.as_deref(), Some("complete.log"));
+        let capture = result.capture.expect("recognized capture metadata");
+        assert!(capture.output_complete);
+        assert!(!capture.artifact_truncated);
+        assert!(capture.artifact_error.is_none());
+        assert!(capture.artifact_path.is_none());
+    }
+
+    #[test]
+    fn known_capture_limits_survive_malformed_optional_metadata() {
+        for (supplied_capture, complete, truncated, error, path) in [
+            (
+                json!({"outputComplete": false, "artifactPath": false}),
+                false,
+                false,
+                None,
+                None,
+            ),
+            (
+                json!({"artifactTruncated": true, "artifactPath": 5}),
+                true,
+                true,
+                None,
+                None,
+            ),
+            (
+                json!({
+                    "outputComplete": "unknown",
+                    "artifactError": "disk full",
+                    "artifactPath": "partial.log"
+                }),
+                true,
+                false,
+                Some("disk full"),
+                Some("partial.log"),
+            ),
+        ] {
+            let result = user_bash_result(&json!({
+                "output": "hook already ran",
+                "fullOutputPath": "claimed-full.log",
+                "capture": supplied_capture
+            }))
+            .expect("partly malformed metadata must preserve the executed hook result");
+
+            assert!(result.full_output_path.is_none());
+            assert!(result.output.starts_with("hook already ran"));
+            assert!(result.output.contains("[Command capture:"));
+            let capture = result.capture.expect("known capture limitation");
+            assert_eq!(capture.output_complete, complete);
+            assert_eq!(capture.artifact_truncated, truncated);
+            assert_eq!(capture.artifact_error.as_deref(), error);
+            assert_eq!(capture.artifact_path.as_deref(), path);
+        }
+    }
+
+    #[test]
+    fn absent_or_malformed_capture_keeps_the_executed_hook_result() {
+        for capture in [
+            None,
+            Some(json!(null)),
+            Some(json!("unknown capture format")),
+            Some(json!([])),
+            Some(json!({"futureCaptureDetail": true})),
+            Some(json!({"outputComplete": "yes"})),
+            Some(json!({"outputComplete": true, "artifactTruncated": "yes"})),
+            Some(json!({"outputComplete": true, "artifactError": 5})),
+            Some(json!({"outputComplete": true, "artifactPath": false})),
+        ] {
+            let mut supplied = json!({
+                "output": "hook already ran",
+                "exit_code": 23,
+                "cancelled": true,
+                "truncated": true,
+                "full_output_path": "hook.log"
+            });
+            if let Some(capture) = capture {
+                supplied["capture"] = capture;
+            }
+            let result = user_bash_result(&supplied)
+                .expect("optional metadata must not cause command re-execution");
+
+            assert_eq!(result.output, "hook already ran");
+            assert_eq!(result.exit_code, 23);
+            assert!(result.cancelled);
+            assert!(result.truncated);
+            assert_eq!(result.full_output_path.as_deref(), Some("hook.log"));
+            assert!(result.capture.is_none());
+        }
+    }
 }

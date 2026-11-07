@@ -104,8 +104,10 @@ stop. Dropping the tool call retires those readers even if a descendant has
 escaped the process group and still holds an output descriptor, or the output
 queue is full. After the command exits, the runner allows up to five seconds
 for remaining output, then stops the readers and returns the output already
-accepted. The PTY backend uses a separate blocking reader and does not yet
-provide this reader-retirement guarantee for an escaped writer.
+accepted. If readers did not reach EOF before that cutoff, the result reports
+incomplete capture even if the command itself exited successfully. The PTY
+backend uses a separate blocking reader and does not yet provide this
+reader-retirement guarantee for an escaped writer.
 
 Managed foreground commands share the eight-job concurrency budget with
 background commands. If admission is refused because that budget is full,
@@ -132,9 +134,16 @@ Truncated artifacts and incomplete pipe capture are reported explicitly in
 the output and structured details. A partial artifact is labeled with its
 real retained path and is not advertised as a complete `fullOutputPath`.
 The `capture` details report `outputComplete`, `artifactTruncated`,
-`artifactError`, and `artifactPath` for incomplete managed capture. Inspect
-the retained artifact for its prefix and the result/job tail for its latest
-output.
+`artifactError`, and `artifactPath` for managed and direct foreground calls,
+including PTY calls. `outputComplete: false` means capture stopped before all
+readers finished and makes the tool result an error, independently of the
+command's exit status. A storage cap or artifact failure alone preserves the
+command's success status and reports the retention limit in `capture`.
+Complete capture with ordinary display truncation keeps its `fullOutputPath`;
+partial artifacts never use that field or the `fullCommandOutput` role.
+Streaming updates also stop advertising a full artifact once a cap or
+artifact failure is known. Inspect the retained artifact for its prefix and
+the result/job tail for its latest output.
 
 ## Persistent shell state
 

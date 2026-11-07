@@ -692,10 +692,22 @@ mod foreground_pipe_ownership {
                 drop(pending);
             } else {
                 let output = pending.await.expect("foreground completion");
-                assert!(!output.is_error, "{}", first_text(&output));
-                assert!(first_text(&output).contains("foreground-root-ready"));
-                assert!(first_text(&output).contains("escaped-stdout-ready"));
-                assert!(first_text(&output).contains("escaped-stderr-ready"));
+                let text = first_text(&output);
+                assert!(
+                    output.is_error,
+                    "incomplete capture must be reported: {text}"
+                );
+                assert!(text.contains("foreground-root-ready"));
+                assert!(text.contains("escaped-stdout-ready"));
+                assert!(text.contains("escaped-stderr-ready"));
+                assert!(text.contains("Command capture:"), "{text}");
+                assert!(!text.contains("Full output:"), "{text}");
+                let details = output.details.as_ref().expect("capture details");
+                assert!(details.get("fullOutputPath").is_none());
+                assert_eq!(details["capture"]["outputComplete"], false);
+                assert_eq!(details["capture"]["artifactTruncated"], false);
+                assert!(details["capture"]["artifactError"].is_null());
+                assert!(details["capture"]["artifactPath"].is_null());
             }
             assert!(
                 writer.is_live(),

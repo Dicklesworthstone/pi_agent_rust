@@ -8602,6 +8602,44 @@ pub struct BashRunResult {
     pub truncated: bool,
     pub full_output_path: Option<String>,
     pub truncation: Option<TruncationResult>,
+    pub capture: Option<BashCapture>,
+}
+
+/// Capture limitations are separate from the command's exit status and from
+/// truncating the displayed tail. A capped artifact can accompany complete EOF.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashCapture {
+    pub output_complete: bool,
+    #[serde(default)]
+    pub artifact_truncated: bool,
+    #[serde(default)]
+    pub artifact_error: Option<String>,
+    #[serde(default)]
+    pub artifact_path: Option<String>,
+}
+
+impl BashCapture {
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.output_complete && !self.artifact_truncated && self.artifact_error.is_none()
+    }
+
+    pub(crate) fn append_notice(&self, output: &mut String) {
+        if !self.output_complete {
+            output.push_str(
+                "\n\n[Output capture stopped before all readers finished; output may be missing.]",
+            );
+        }
+        let _ = write!(
+            output,
+            "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
+             Retained artifact: {}]",
+            self.output_complete,
+            self.artifact_truncated,
+            self.artifact_error.as_deref().unwrap_or("none"),
+            self.artifact_path.as_deref().unwrap_or("unavailable"),
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -9251,11 +9289,13 @@ async fn run_bash_command_with_state(
                 .timer_driver()
                 .map_or_else(wall_now, |timer| timer.now());
             if now >= drain_deadline {
+                bash_output.output_complete = false;
                 break;
             }
             if allow_drain_cancellation && cx.checkpoint().is_err() {
                 cancelled = true;
                 cancellation_reason.get_or_insert(BashCancellationReason::AmbientCancellation);
+                bash_output.output_complete = false;
                 break;
             }
             sleep(now, tick).await;
@@ -9314,6 +9354,7 @@ fn assemble_bash_run_result(
     timeout_secs: Option<u64>,
 ) -> BashRunResult {
     drop(bash_output.temp_file.take());
+    let capture = bash_output.capture_details();
 
     let raw_output = concat_chunks(&bash_output.chunks);
     let full_output = String::from_utf8_lossy(&raw_output).into_owned();
@@ -9339,7 +9380,9 @@ fn assemble_bash_run_result(
 
     let mut full_output_path = None;
     if truncation.truncated {
-        if let Some(path) = bash_output.temp_file_path.as_ref() {
+        if capture.is_none()
+            && let Some(path) = bash_output.temp_file_path.as_ref()
+        {
             full_output_path = Some(path.display().to_string());
         }
 
@@ -9349,20 +9392,13 @@ fn assemble_bash_run_result(
             .saturating_add(1);
         let end_line = truncation.total_lines;
 
-        let display_path = bash_output
-            .partial_output_path
+        let display_path = capture
             .as_ref()
-            .map(|path| path.display().to_string())
+            .and_then(|details| details.artifact_path.clone())
             .or_else(|| full_output_path.clone())
             .unwrap_or_else(|| "unavailable".to_string());
-        let file_limit_hit = bash_output.total_bytes > BASH_FILE_LIMIT_BYTES;
-        let output_qualifier = if bash_output.partial_output_path.is_some() {
+        let output_qualifier = if capture.is_some() {
             "Partial output artifact".to_string()
-        } else if file_limit_hit {
-            format!(
-                "Partial output (capped at {})",
-                format_size(BASH_FILE_LIMIT_BYTES)
-            )
         } else {
             "Full output".to_string()
         };
@@ -9388,6 +9424,10 @@ fn assemble_bash_run_result(
                 format_size(DEFAULT_MAX_BYTES)
             );
         }
+    }
+
+    if let Some(details) = &capture {
+        details.append_notice(&mut output_text);
     }
 
     if timed_out {
@@ -9420,6 +9460,7 @@ fn assemble_bash_run_result(
         } else {
             None
         },
+        capture,
     }
 }
 
@@ -9622,10 +9663,18 @@ pub(crate) async fn run_bash_command_pty(
                 .timer_driver()
                 .map_or_else(wall_now, |timer| timer.now());
             if now >= drain_deadline {
+                bash_output.output_complete = false;
                 break;
             }
             sleep(now, tick).await;
         }
+    }
+
+    if bash_output.output_complete && pty_thread.join().is_err() {
+        let message =
+            bash_capture_error_message("The bash PTY output reader panicked", &bash_output);
+        bash_output.abandon_spill_file();
+        return Err(Error::tool("bash", message));
     }
 
     // Reap the child to avoid zombies (belt-and-suspenders with try_wait).
@@ -9838,6 +9887,9 @@ impl BashTool {
             && !snapshot.artifact_truncated
             && snapshot.artifact_error.is_none();
         let mut state = BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2));
+        state.output_complete = snapshot.output_complete;
+        state.artifact_truncated = snapshot.artifact_truncated;
+        state.artifact_error.clone_from(&snapshot.artifact_error);
         state.total_bytes = snapshot.output_bytes;
         state.last_byte_was_newline = snapshot.output_tail.ends_with('\n');
         state.line_count = snapshot.output_lines.saturating_sub(usize::from(
@@ -9878,40 +9930,26 @@ impl BashTool {
         {
             text.text.push_str("\n\nCommand cancelled");
         }
-        if !capture_complete {
-            let warning = format!(
-                "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
-                 Retained artifact: {}]",
-                snapshot.output_complete,
-                snapshot.artifact_truncated,
-                snapshot.artifact_error.as_deref().unwrap_or("none"),
-                snapshot.artifact_path,
-            );
-            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
-                text.text.push_str(&warning);
-            }
-            output.is_error |= !snapshot.output_complete;
-            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
-            details["capture"] = serde_json::json!({
-                "outputComplete": snapshot.output_complete,
-                "artifactTruncated": snapshot.artifact_truncated,
-                "artifactError": snapshot.artifact_error,
-                "artifactPath": snapshot.artifact_path,
-            });
-        }
         Ok(output)
     }
 
     fn bash_result_output(&self, tool_call_id: &str, result: BashRunResult) -> Result<ToolOutput> {
         let mut details_map = serde_json::Map::new();
+        let full_output_path = result
+            .full_output_path
+            .as_deref()
+            .filter(|_| result.capture.as_ref().is_none_or(BashCapture::is_complete));
         if let Some(truncation) = result.truncation.as_ref() {
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
         }
-        if let Some(path) = result.full_output_path.as_ref() {
+        if let Some(path) = full_output_path {
             details_map.insert(
                 "fullOutputPath".to_string(),
-                serde_json::Value::String(path.clone()),
+                serde_json::Value::String(path.to_string()),
             );
+        }
+        if let Some(capture) = &result.capture {
+            details_map.insert("capture".to_string(), serde_json::to_value(capture)?);
         }
         if let Some(reason) = result.cancellation_reason {
             details_map.insert(
@@ -9928,7 +9966,7 @@ impl BashTool {
         let mut details = details;
         let mut output_text = result.output;
 
-        if let Some(path) = result.full_output_path.as_deref() {
+        if let Some(path) = full_output_path {
             attach_text_artifact_from_path_if_needed_with_root(
                 self.artifact_root.as_deref(),
                 &mut output_text,
@@ -9940,7 +9978,12 @@ impl BashTool {
             );
         }
 
-        let is_error = result.cancelled || result.exit_code != 0;
+        let is_error = result.cancelled
+            || result.exit_code != 0
+            || result
+                .capture
+                .as_ref()
+                .is_some_and(|capture| !capture.output_complete);
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
@@ -17169,6 +17212,9 @@ struct BashOutputState {
     chunks_bytes: usize,
     max_chunks_bytes: usize,
     spill_failed: bool,
+    output_complete: bool,
+    artifact_truncated: bool,
+    artifact_error: Option<String>,
 }
 
 impl BashOutputState {
@@ -17186,7 +17232,33 @@ impl BashOutputState {
             chunks_bytes: 0,
             max_chunks_bytes,
             spill_failed: false,
+            output_complete: true,
+            artifact_truncated: false,
+            artifact_error: None,
         }
+    }
+
+    fn capture_details(&self) -> Option<BashCapture> {
+        if self.output_complete
+            && !self.artifact_truncated
+            && self.artifact_error.is_none()
+            && !self.spill_failed
+        {
+            return None;
+        }
+        Some(BashCapture {
+            output_complete: self.output_complete,
+            artifact_truncated: self.artifact_truncated,
+            artifact_error: self.artifact_error.clone().or_else(|| {
+                self.spill_failed
+                    .then(|| "The Bash output artifact could not be retained".to_string())
+            }),
+            artifact_path: self
+                .partial_output_path
+                .as_ref()
+                .or(self.temp_file_path.as_ref())
+                .map(|path| path.display().to_string()),
+        })
     }
 
     fn abandon_spill_file(&mut self) {
@@ -17285,11 +17357,17 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                                     tracing::warn!(
                                         "Temp file identity mismatch (possible TOCTOU attack)"
                                     );
+                                    state.artifact_error = Some(
+                                        "Bash output artifact identity changed before capture"
+                                            .to_string(),
+                                    );
                                     identity_match = false;
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to stat temp file: {e}");
+                                state.artifact_error =
+                                    Some(format!("Failed to verify Bash output artifact: {e}"));
                                 identity_match = false;
                             }
                         }
@@ -17301,6 +17379,8 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                         for existing in &state.chunks {
                             if let Err(e) = file.write_all(existing).await {
                                 tracing::warn!("Failed to flush bash chunk to temp file: {e}");
+                                state.artifact_error =
+                                    Some(format!("Failed to flush Bash output artifact: {e}"));
                                 failed_flush = true;
                                 break;
                             }
@@ -17319,12 +17399,16 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                 }
                 Err(e) => {
                     tracing::warn!("Failed to open temp file async: {e}");
+                    state.artifact_error =
+                        Some(format!("Failed to open Bash output artifact: {e}"));
                     state.temp_file_path = Some(path);
                     state.abandon_spill_file();
                 }
             }
         } else {
             state.spill_failed = true;
+            state.artifact_error =
+                Some("Failed to create or verify the Bash output artifact".to_string());
         }
     }
 
@@ -17334,12 +17418,14 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
         if state.total_bytes <= BASH_FILE_LIMIT_BYTES {
             if let Err(e) = file.write_all(&chunk).await {
                 tracing::warn!("Failed to write bash chunk to temp file: {e}");
+                state.artifact_error = Some(format!("Failed to write Bash output artifact: {e}"));
                 abandon_spill_file = true;
             }
         } else {
             // Hard limit reached. Stop writing and close the file to release the FD.
             if !state.spill_failed {
                 tracing::warn!("Bash output exceeded hard limit; stopping file log");
+                state.artifact_truncated = true;
                 close_spill_file = true;
             }
         }
@@ -17416,7 +17502,11 @@ fn emit_bash_update(
         if truncation.truncated {
             details_map.insert("truncation".into(), serde_json::to_value(&truncation)?);
         }
-        if let Some(path) = state.temp_file_path.as_ref() {
+        let mut content = truncation.content;
+        if let Some(capture) = state.capture_details() {
+            capture.append_notice(&mut content);
+            details_map.insert("capture".into(), serde_json::to_value(capture)?);
+        } else if let Some(path) = state.temp_file_path.as_ref() {
             details_map.insert(
                 "fullOutputPath".into(),
                 serde_json::Value::String(path.display().to_string()),
@@ -17424,7 +17514,7 @@ fn emit_bash_update(
         }
 
         callback(ToolUpdate {
-            content: vec![ContentBlock::Text(TextContent::new(truncation.content))],
+            content: vec![ContentBlock::Text(TextContent::new(content))],
             details: Some(details),
         });
     }
@@ -19280,6 +19370,10 @@ impl Tool for HashlineEditTool {
 #[cfg(test)]
 #[path = "tools/notebook_tests.rs"]
 mod notebook_tool_tests;
+
+#[cfg(test)]
+#[path = "tools/bash_capture_tests.rs"]
+mod bash_capture_tests;
 
 #[cfg(test)]
 mod tests {
