@@ -95,6 +95,18 @@ cancelled through `jobs`; owner-scoped shutdown still terminates its jobs.
 Timeout and cancellation use the existing TERM/KILL escalation and reap
 discipline.
 
+Direct foreground commands check timeout and cancellation between bounded
+output batches, including when stdout or stderr is continuously busy. The
+same batching applies to PTY commands and to the final output drain.
+
+For the direct pipe runner, the tool owns both output readers until they
+stop. Dropping the tool call retires those readers even if a descendant has
+escaped the process group and still holds an output descriptor, or the output
+queue is full. After the command exits, the runner allows up to five seconds
+for remaining output, then stops the readers and returns the output already
+accepted. The PTY backend uses a separate blocking reader and does not yet
+provide this reader-retirement guarantee for an escaped writer.
+
 Managed foreground commands share the eight-job concurrency budget with
 background commands. If admission is refused because that budget is full,
 automatic mode uses the direct foreground runner. That fallback occurs
