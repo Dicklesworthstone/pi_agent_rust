@@ -839,6 +839,7 @@ impl Provider for AnthropicProvider {
             self.model.clone(),
             self.api().to_string(),
             self.name().to_string(),
+            options.usage_observer.clone(),
         ))
     }
 }
@@ -863,6 +864,7 @@ where
     done: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 impl<S> StreamState<S>
@@ -896,7 +898,20 @@ where
             tool_accums: HashMap::new(),
             done: false,
             transient_error_count: 0,
+            usage_observer: None,
         }
+    }
+
+    fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
+        self.usage_observer = observer;
+        self
+    }
+
+    fn observe_usage(&self) -> Result<()> {
+        if let Some(observer) = &self.usage_observer {
+            observer.observe(&self.partial.usage)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -906,7 +921,7 @@ where
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
-                Ok(Some(self.handle_message_start(message)))
+                self.handle_message_start(message).map(Some)
             }
             AnthropicStreamEvent::ContentBlockStart {
                 index,
@@ -941,16 +956,18 @@ where
         }
     }
 
-    fn handle_message_start(&mut self, message: AnthropicMessageStart) -> StreamEvent {
+    fn handle_message_start(&mut self, message: AnthropicMessageStart) -> Result<StreamEvent> {
         if let Some(usage) = message.usage {
             self.partial.usage.input = usage.input;
+            self.partial.usage.output = usage.output;
             self.partial.usage.cache_read = usage.cache_read.unwrap_or(0);
             self.partial.usage.cache_write = usage.cache_write.unwrap_or(0);
             self.recompute_total_tokens();
+            self.observe_usage()?;
         }
-        StreamEvent::Start {
+        Ok(StreamEvent::Start {
             partial: self.partial.clone(),
-        }
+        })
     }
 
     fn handle_content_block_start(
@@ -1149,6 +1166,29 @@ where
         delta: &AnthropicMessageDelta,
         usage: Option<AnthropicDeltaUsage>,
     ) -> Result<()> {
+        if let Some(usage) = usage {
+            // Anthropic reports cumulative snapshots, including corrected input
+            // and cache counts after server-side tools. Missing fields preserve
+            // prior evidence; an explicit zero is a real correction. Publish
+            // this bill before validating other fields or waiting for another
+            // public event so cancellation and malformed completion metadata
+            // cannot erase already acknowledged spend.
+            if let Some(input) = usage.input_tokens {
+                self.partial.usage.input = input;
+            }
+            if let Some(output) = usage.output_tokens {
+                self.partial.usage.output = output;
+            }
+            if let Some(cache_read) = usage.cache_read_input_tokens {
+                self.partial.usage.cache_read = cache_read;
+            }
+            if let Some(cache_write) = usage.cache_creation_input_tokens {
+                self.partial.usage.cache_write = cache_write;
+            }
+            self.recompute_total_tokens();
+            self.observe_usage()?;
+        }
+
         if let Some(stop_reason) = delta.stop_reason.as_deref() {
             self.partial.stop_reason = match stop_reason {
                 "end_turn" | "stop_sequence" => StopReason::Stop,
@@ -1167,11 +1207,6 @@ where
                 }
             };
             self.partial.stop_details.clone_from(&delta.stop_details);
-        }
-
-        if let Some(u) = usage {
-            self.partial.usage.output = u.output_tokens;
-            self.recompute_total_tokens();
         }
 
         Ok(())
@@ -1358,6 +1393,8 @@ struct AnthropicMessageStart {
 struct AnthropicUsage {
     #[serde(rename = "input_tokens")]
     input: u64,
+    #[serde(default, rename = "output_tokens")]
+    output: u64,
     #[serde(default, rename = "cache_read_input_tokens")]
     cache_read: Option<u64>,
     #[serde(default, rename = "cache_creation_input_tokens")]
@@ -1366,7 +1403,14 @@ struct AnthropicUsage {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicDeltaUsage {
-    output_tokens: u64,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 /// Content block type from `content_block_start`.
