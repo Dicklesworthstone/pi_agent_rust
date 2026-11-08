@@ -936,6 +936,7 @@ impl PiApp {
         }
         match msg {
             PiMsg::HandoffFinished { .. }
+            | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
             | PiMsg::BashFinished { .. } => return None,
             PiMsg::System(message) | PiMsg::AgentError(message)

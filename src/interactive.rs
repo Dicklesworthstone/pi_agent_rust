@@ -2285,6 +2285,11 @@ pub enum PiMsg {
         request_id: String,
         event: Box<Self>,
     },
+    /// Only the matching FTUI compaction may release its operation owner.
+    CompactionFinished {
+        request_id: String,
+        event: Box<Self>,
+    },
     /// The FTUI Bash request owns its lane until execution and history work end.
     BashFinished { request_id: String },
     /// Update last user message content (input transform/redaction).

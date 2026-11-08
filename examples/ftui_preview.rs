@@ -28,6 +28,12 @@ fn main() -> std::io::Result<()> {
 
     // Scripted fake agent: one streamed reply per submitted prompt.
     thread::spawn(move || {
+        let _ = agent_tx.send(PiMsg::ConversationReset {
+            session_id: String::from("ftui-preview"),
+            messages: Vec::new(),
+            usage: Default::default(),
+            status: None,
+        });
         for command in submit_rx {
             let prompt = match command {
                 UiCommand::Prompt(prompt) => prompt,
@@ -57,10 +63,13 @@ fn main() -> std::io::Result<()> {
                     let _ = agent_tx.send(PiMsg::System(note));
                     continue;
                 }
-                UiCommand::Compact { .. } => {
-                    let _ = agent_tx.send(PiMsg::System(String::from(
-                        "(fake agent) would compact the conversation",
-                    )));
+                UiCommand::Compact { request, .. } | UiCommand::Shake { request } => {
+                    let _ = agent_tx.send(PiMsg::CompactionFinished {
+                        request_id: request.id().to_string(),
+                        event: Box::new(PiMsg::System(String::from(
+                            "(fake agent) would compact the conversation",
+                        ))),
+                    });
                     continue;
                 }
                 other => {

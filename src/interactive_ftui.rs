@@ -1661,6 +1661,39 @@ impl PartialEq for HandoffRequest {
 
 impl Eq for HandoffRequest {}
 
+/// Manual compaction retains its cancellation and session owner from UI
+/// admission until the driver publishes the matching terminal result.
+#[derive(Debug, Clone)]
+pub struct CompactionRequest {
+    id: String,
+    owner_session_id: String,
+    abort: crate::agent::AbortHandle,
+}
+
+impl CompactionRequest {
+    fn new(owner_session_id: String) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner_session_id,
+            abort: crate::agent::AbortHandle::new().0,
+        }
+    }
+
+    /// Correlation ID to echo in the driver's `CompactionFinished` event.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl PartialEq for CompactionRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.owner_session_id == other.owner_session_id
+    }
+}
+
+impl Eq for CompactionRequest {}
+
 /// MCP authentication keeps its exact cancellation and session owner while
 /// earlier commands finish in the sequential driver.
 #[derive(Debug, Clone)]
@@ -1755,7 +1788,10 @@ pub enum UiCommand {
     /// Compact the conversation (`/compact [focus]`): the driver runs
     /// compaction, with any focus text as summary instructions, and replays
     /// the rewritten history into the transcript.
-    Compact { instructions: Option<String> },
+    Compact {
+        instructions: Option<String>,
+        request: CompactionRequest,
+    },
     /// Compact after the owning turn yields, before later queued input.
     QueuedCompact(QueuedCompaction),
     /// Generate and install a continuation brief without changing sessions.
@@ -1765,7 +1801,7 @@ pub enum UiCommand {
     },
     /// OMP `/shake` (also `/compact shake`): compact by dropping bulky tool
     /// output from the older span, with no model summary.
-    Shake,
+    Shake { request: CompactionRequest },
     /// Control read-only planning and session-bound review (`/plan`).
     /// The driver retains the exact displayed proposal, not the UI command.
     Plan { action: String },
@@ -2195,6 +2231,8 @@ pub struct PiFtuiModel {
     turn_control: Option<TurnControlSlot>,
     /// One manual compaction ordered inside the active turn's input queue.
     queued_compaction: Option<QueuedCompaction>,
+    /// An idle compaction keeps Escape authority even before driver dequeue.
+    compaction_request: Option<CompactionRequest>,
     /// The admitted shell request, retained until its matching terminal event.
     bash_request: Option<BashRequest>,
     /// `/btw` availability. The driver prepares every side question against
@@ -2643,6 +2681,7 @@ impl PiFtuiModel {
             turn_abort: None,
             turn_control: None,
             queued_compaction: None,
+            compaction_request: None,
             bash_request: None,
             btw_client: None,
             term: (80, 24),
@@ -3306,6 +3345,7 @@ impl PiFtuiModel {
             && !self.settings_pending
             && !self.suspending
             && !self.handoff_in_progress()
+            && self.compaction_request.is_none()
             && self.mcp_auth_request.is_none()
             && self.bash_request.is_none()
     }
@@ -3869,6 +3909,27 @@ impl PiFtuiModel {
             self.drain_deferred_notes();
             return command;
         }
+        if let PiMsg::CompactionFinished { request_id, event } = msg {
+            if self
+                .compaction_request
+                .as_ref()
+                .map(|request| request.id.as_str())
+                != Some(request_id.as_str())
+            {
+                return Cmd::none();
+            }
+            self.compaction_request = None;
+            self.busy = None;
+            self.dismiss_pending_interactions();
+            self.flush_stream();
+            self.state = AgentUiState::Ready;
+            self.current_tool = None;
+            self.thinking.clear();
+            self.settle_pending_cards();
+            let command = self.handle_agent(*event);
+            self.drain_deferred_notes();
+            return command;
+        }
         if let PiMsg::FtuiToolProgress(event) = msg {
             return self.handle_tool_progress(event);
         }
@@ -3879,6 +3940,7 @@ impl PiFtuiModel {
         // what settles it).
         if self.mcp_auth_request.is_none()
             && self.bash_request.is_none()
+            && self.compaction_request.is_none()
             && self.busy.as_ref().is_some_and(|op| op.handoff.is_none())
             && !matches!(
                 msg,
@@ -3897,11 +3959,13 @@ impl PiFtuiModel {
         }
         match msg {
             PiMsg::HandoffFinished { .. }
+            | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
             | PiMsg::BashFinished { .. }
             | PiMsg::FtuiToolProgress(_) => return Cmd::none(),
             PiMsg::AgentError(message)
                 if self.handoff_in_progress()
+                    || self.compaction_request.is_some()
                     || self.mcp_auth_request.is_some()
                     || self.bash_request.is_some() =>
             {
@@ -4030,6 +4094,7 @@ impl PiFtuiModel {
                 ..
             } => {
                 let operation_running = self.handoff_in_progress()
+                    || self.compaction_request.is_some()
                     || self.mcp_auth_request.is_some()
                     || self.bash_request.is_some();
                 if !operation_running {
@@ -4321,6 +4386,7 @@ impl PiFtuiModel {
                 self.settings_snapshot = Some(snapshot);
                 if self.state == AgentUiState::Ready
                     && !self.handoff_in_progress()
+                    && self.compaction_request.is_none()
                     && self.active_ask.is_none()
                     && self.active_ext.is_none()
                     && self.login_pending.is_none()
@@ -4328,7 +4394,8 @@ impl PiFtuiModel {
                     self.open_settings_picker();
                 }
             }
-            PiMsg::MessagePicker { .. } if self.handoff_in_progress() => {}
+            PiMsg::MessagePicker { .. }
+                if self.handoff_in_progress() || self.compaction_request.is_some() => {}
             PiMsg::MessagePicker { fork, messages } => {
                 if messages.is_empty() {
                     self.push_entry(
@@ -4499,6 +4566,13 @@ impl PiFtuiModel {
     /// turn is starting or ending) becomes the next prompt instead.
     fn submit_mid_turn(&mut self, follow_up: bool) {
         if self.login_pending.is_some() {
+            return;
+        }
+        if self.compaction_request.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Compaction is still running; press Escape to cancel it."),
+            );
             return;
         }
         if self.bash_request.is_some() {
@@ -4879,6 +4953,13 @@ impl PiFtuiModel {
     }
 
     fn submit_owned_input(&mut self) {
+        if self.compaction_request.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Compaction is still running; press Escape to cancel it."),
+            );
+            return;
+        }
         if self.bash_request.is_some() {
             self.push_entry(
                 EntryRole::Error,
@@ -4942,6 +5023,17 @@ impl PiFtuiModel {
         // pasted terminal controls can otherwise hide a registered command.
         let clean = sanitize(trimmed).into_owned();
         let token = clean.split_whitespace().next().unwrap_or("");
+        if (token.eq_ignore_ascii_case("/compact") || token.eq_ignore_ascii_case("/shake"))
+            && self.registered_extension_command(token).is_none()
+            && (self.displayed_session_id.is_none()
+                || (self.busy.is_some() && self.state != AgentUiState::Working))
+        {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Wait for the current operation to finish before compacting; this command stays in the editor."),
+            );
+            return;
+        }
         if token.eq_ignore_ascii_case("/handoff")
             && self.registered_extension_command(token).is_none()
             && (self.busy.is_some() || self.state == AgentUiState::Working)
@@ -5340,22 +5432,18 @@ impl PiFtuiModel {
         }
         let canon = clean.to_ascii_lowercase();
         if canon == "/shake" || canon == "/compact shake" {
-            self.begin_busy("shaking conversation ...");
-            self.send_command(UiCommand::Shake);
+            self.start_compaction_command(clean, true, None);
             return true;
         }
         if let Some(focus) = strip_command(clean, "/compact") {
             // OMP parseCompactArgs: text after `/compact` is focus for the
             // summary (it used to fall through to "not implemented").
             let focus = focus.trim();
-            self.push_entry(
-                EntryRole::System,
-                String::from("compacting conversation ..."),
+            self.start_compaction_command(
+                clean,
+                false,
+                (!focus.is_empty()).then(|| focus.to_string()),
             );
-            self.begin_busy("compacting conversation ...");
-            self.send_command(UiCommand::Compact {
-                instructions: (!focus.is_empty()).then(|| focus.to_string()),
-            });
             return true;
         }
         if let Some(rest) = strip_command(clean, "/undo") {
@@ -6173,6 +6261,49 @@ impl PiFtuiModel {
         });
     }
 
+    fn start_compaction_command(
+        &mut self,
+        command: &str,
+        shake: bool,
+        instructions: Option<String>,
+    ) {
+        let Some(owner_session_id) = self.displayed_session_id.clone() else {
+            self.input.set_text(command);
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Wait for the session to finish loading before compacting."),
+            );
+            return;
+        };
+        let request = CompactionRequest::new(owner_session_id);
+        let work = if shake {
+            UiCommand::Shake {
+                request: request.clone(),
+            }
+        } else {
+            UiCommand::Compact {
+                instructions,
+                request: request.clone(),
+            }
+        };
+        if !self.try_send_command(work) {
+            self.input.set_text(command);
+            self.push_entry(
+                EntryRole::Error,
+                String::from("The agent driver is no longer available."),
+            );
+            return;
+        }
+        self.compaction_request = Some(request);
+        let label = if shake {
+            "shaking conversation ..."
+        } else {
+            "compacting conversation ..."
+        };
+        self.begin_busy(label);
+        self.push_entry(EntryRole::System, label.to_string());
+    }
+
     fn handoff_in_progress(&self) -> bool {
         self.busy.as_ref().is_some_and(|op| op.handoff.is_some())
     }
@@ -6180,9 +6311,14 @@ impl PiFtuiModel {
     /// Cancel an operator command that uses the driver's shared abort lane.
     fn abort_driver_operation(&mut self) -> bool {
         let abort = self
-            .bash_request
+            .compaction_request
             .as_ref()
             .map(|request| request.abort.clone())
+            .or_else(|| {
+                self.bash_request
+                    .as_ref()
+                    .map(|request| request.abort.clone())
+            })
             .or_else(|| {
                 self.mcp_auth_request
                     .as_ref()
@@ -6230,6 +6366,9 @@ impl PiFtuiModel {
     fn abort_before_quit(&mut self) {
         self.abort_handoff();
         if let Some(request) = &self.bash_request {
+            request.abort.abort();
+        }
+        if let Some(request) = &self.compaction_request {
             request.abort.abort();
         }
         abort_driver_work(self.turn_abort.as_ref(), self.turn_control.as_ref());
@@ -6860,7 +6999,9 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::CursorUp))
                     .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
-                if (self.handoff_in_progress() || self.bash_request.is_some())
+                if (self.handoff_in_progress()
+                    || self.compaction_request.is_some()
+                    || self.bash_request.is_some())
                     && matches!(
                         action,
                         Some(
@@ -10372,45 +10513,71 @@ async fn run_prewalk_command(
 /// Handle `/compact` in the driver: run compaction with events translated to
 /// the UI, then replay the rewritten history into the transcript.
 /// `/compact`, or with `shake` OMP's `/shake` (drop bulky tool output, no
-/// model summary).
+/// model summary). The admitted request owns cancellation through the
+/// persistence boundary; only its terminal reply releases the UI owner.
 async fn run_compact_command(
     handle: &mut crate::sdk::AgentSessionHandle,
     shake: bool,
     instructions: Option<&str>,
+    request: CompactionRequest,
     agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
 ) {
-    // ubs:ignore Sender clone per command — the event callback must own its sender
-    let tx = agent_tx.clone();
-    let owner_session_id = handle
-        .with_session(|session| session.header.id.clone())
-        .await
-        .ok();
-    let progress = tool_progress::Bridge::new(owner_session_id, move |msg| {
-        let _ = tx.send(msg);
-    });
-    let on_event = progress.callback();
-    let result = if shake {
-        handle.shake(on_event).await
-    } else {
-        handle.compact(instructions, on_event).await
-    };
-    drop(progress);
+    let _operation_abort =
+        queued_compaction::OperationAbort::publish(turn_abort, turn_control, &request.abort);
+    let signal = request.abort.signal();
     let (label, done) = if shake {
         ("shake", "conversation shaken: bulky tool output dropped")
     } else {
         ("compact", "conversation compacted")
     };
-    match result {
-        Ok(true) => send_conversation_reset(handle, agent_tx, done).await,
-        Ok(false) => {
-            let _ = agent_tx.send(PiMsg::System(format!(
-                "Nothing to {label}: there is too little history since the last compaction"
-            )));
+    let owner = {
+        let read = handle.with_session(|session| session.header.id.clone());
+        let cancelled = signal.wait();
+        futures::pin_mut!(read, cancelled);
+        match futures::future::select(cancelled, read).await {
+            futures::future::Either::Left(_) => Err(crate::error::Error::Aborted),
+            futures::future::Either::Right((result, _)) => result,
         }
-        Err(err) => {
-            let _ = agent_tx.send(PiMsg::AgentError(format!("{label}: {err}")));
+    };
+    let event = match owner {
+        Ok(owner) if owner == request.owner_session_id => {
+            // ubs:ignore Sender clone per command — the callback owns its sender
+            let tx = agent_tx.clone();
+            let progress = tool_progress::Bridge::new(Some(owner), move |msg| {
+                let _ = tx.send(msg);
+            });
+            let on_event = progress.callback();
+            let result = if shake {
+                handle.shake_with_abort(signal, on_event).await
+            } else {
+                handle
+                    .compact_with_abort(instructions, signal, on_event)
+                    .await
+            };
+            drop(progress);
+            match result {
+                // Once installation commits, refresh the durable result even
+                // if Escape arrives late; never report it as uninstalled.
+                Ok(true) => conversation_reset_message(handle, done).await,
+                Ok(false) => PiMsg::System(format!(
+                    "Nothing to {label}: there is too little history since the last compaction"
+                )),
+                Err(crate::error::Error::Aborted) => PiMsg::System(format!("{label} cancelled")),
+                Err(err) => PiMsg::AgentError(format!("{label}: {err}")),
+            }
         }
-    }
+        Ok(_) => PiMsg::AgentError(format!(
+            "{label} cancelled: the session changed before it started"
+        )),
+        Err(crate::error::Error::Aborted) => PiMsg::System(format!("{label} cancelled")),
+        Err(error) => PiMsg::AgentError(format!("{label} unavailable: {error}")),
+    };
+    let _ = agent_tx.send(PiMsg::CompactionFinished {
+        request_id: request.id,
+        event: Box::new(event),
+    });
 }
 
 fn report_replacement_shutdown_failure(
@@ -11904,6 +12071,13 @@ async fn send_conversation_reset(
     agent_tx: &Sender<PiMsg>,
     status: &str,
 ) {
+    let _ = agent_tx.send(conversation_reset_message(handle, status).await);
+}
+
+async fn conversation_reset_message(
+    handle: &crate::sdk::AgentSessionHandle,
+    status: &str,
+) -> PiMsg {
     match handle
         .with_session(|session| {
             let session_id = session.header.id.clone();
@@ -11912,17 +12086,13 @@ async fn send_conversation_reset(
         })
         .await
     {
-        Ok((session_id, messages, usage)) => {
-            let _ = agent_tx.send(PiMsg::ConversationReset {
-                session_id,
-                messages,
-                usage,
-                status: Some(status.to_string()),
-            });
-        }
-        Err(err) => {
-            let _ = agent_tx.send(PiMsg::AgentError(format!("conversation snapshot: {err}")));
-        }
+        Ok((session_id, messages, usage)) => PiMsg::ConversationReset {
+            session_id,
+            messages,
+            usage,
+            status: Some(status.to_string()),
+        },
+        Err(err) => PiMsg::AgentError(format!("conversation snapshot: {err}")),
     }
 }
 
@@ -12741,12 +12911,18 @@ pub fn run(
                             )
                             .await;
                         }
-                        Ok(UiCommand::Compact { instructions }) => {
+                        Ok(UiCommand::Compact {
+                            instructions,
+                            request,
+                        }) => {
                             run_compact_command(
                                 &mut handle,
                                 false,
                                 instructions.as_deref(),
+                                request,
                                 &agent_tx,
+                                &driver_turn_control,
+                                &driver_turn_abort,
                             )
                             .await;
                         }
@@ -12757,13 +12933,23 @@ pub fn run(
                                 &agent_tx,
                                 &driver_turn_control,
                                 &driver_turn_abort,
-                            ).await;
+                            )
+                            .await;
                         }
                         Ok(UiCommand::Handoff { focus, request }) => {
                             run_handoff_command(&mut handle, &focus, request, &agent_tx).await;
                         }
-                        Ok(UiCommand::Shake) => {
-                            run_compact_command(&mut handle, true, None, &agent_tx).await;
+                        Ok(UiCommand::Shake { request }) => {
+                            run_compact_command(
+                                &mut handle,
+                                true,
+                                None,
+                                request,
+                                &agent_tx,
+                                &driver_turn_control,
+                                &driver_turn_abort,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::Plan { action }) => {
                             plans.run(&mut handle, &action, &agent_tx).await;
@@ -22841,15 +23027,22 @@ mod tests {
     fn slash_compact_routes_command() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.displayed_session_id = Some("compact-owner".into());
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         type_str(&mut sim, "/compact");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(
-            submit_rx.try_recv().expect("routed"),
-            UiCommand::Compact { instructions: None }
-        );
+        let UiCommand::Compact {
+            instructions,
+            request,
+        } = submit_rx.try_recv().expect("routed")
+        else {
+            panic!("compact route");
+        };
+        assert!(instructions.is_none());
+        assert_eq!(request.owner_session_id, "compact-owner");
+        assert!(!request.abort.signal().is_aborted());
         assert!(
             sim.model()
                 .transcript
@@ -22903,24 +23096,37 @@ mod tests {
     /// As in OMP and on the classic stack, the text steers the summary.
     #[test]
     fn slash_compact_passes_focus_text_as_instructions() {
-        for (typed, routed) in [
+        for (typed, expected_instructions, shake) in [
             (
                 "/compact keep the Auth decision",
-                UiCommand::Compact {
-                    instructions: Some(String::from("keep the Auth decision")),
-                },
+                Some("keep the Auth decision"),
+                false,
             ),
-            ("/COMPACT", UiCommand::Compact { instructions: None }),
-            ("/compact shake", UiCommand::Shake),
+            ("/COMPACT", None, false),
+            ("/compact shake", None, true),
+            ("/shake", None, true),
         ] {
             let (_agent_tx, rx) = mpsc::channel();
             let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-            let mut sim =
-                ProgramSimulator::new(PiFtuiModel::new(rx).with_submit_channel(submit_tx));
+            let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+            model.displayed_session_id = Some("compact-owner".into());
+            let mut sim = ProgramSimulator::new(model);
             sim.init();
             type_str(&mut sim, typed);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            assert_eq!(submit_rx.try_recv().ok(), Some(routed), "{typed}");
+            let request = match submit_rx.try_recv().expect("compact command") {
+                UiCommand::Compact {
+                    instructions,
+                    request,
+                } if !shake => {
+                    assert_eq!(instructions.as_deref(), expected_instructions, "{typed}");
+                    request
+                }
+                UiCommand::Shake { request } if shake => request,
+                command => panic!("unexpected route for {typed}: {command:?}"),
+            };
+            assert_eq!(request.owner_session_id, "compact-owner");
+            assert!(!request.abort.signal().is_aborted());
         }
     }
 
@@ -23905,13 +24111,25 @@ mod tests {
     fn omp_info_commands_and_aliases_route_to_the_driver() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        model.displayed_session_id = Some("command-owner".into());
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         let mut send = |text: &str| {
             type_str(&mut sim, text);
             sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-            submit_rx.try_recv().expect("routed")
+            let command = submit_rx.try_recv().expect("routed");
+            let reply = match &command {
+                UiCommand::Compact { request, .. } | UiCommand::Shake { request } => {
+                    PiMsg::CompactionFinished {
+                        request_id: request.id.clone(),
+                        event: Box::new(PiMsg::System("done".into())),
+                    }
+                }
+                _ => PiMsg::System("done".into()),
+            };
+            sim.send(PiFtuiMsg::Agent(reply));
+            command
         };
         for (text, expected) in [
             ("/tools", info_commands::InfoCommand::Tools),
@@ -23937,7 +24155,7 @@ mod tests {
         );
         assert_eq!(send("/fresh"), UiCommand::Fresh);
         assert_eq!(send("/retry"), UiCommand::Retry);
-        assert_eq!(send("/shake"), UiCommand::Shake);
+        assert!(matches!(send("/shake"), UiCommand::Shake { .. }));
         assert_eq!(
             send("/template"),
             UiCommand::Info(info_commands::InfoCommand::Templates)
@@ -23949,7 +24167,7 @@ mod tests {
                 args: String::from("src/a.rs")
             }
         );
-        assert_eq!(send("/compact shake"), UiCommand::Shake);
+        assert!(matches!(send("/compact shake"), UiCommand::Shake { .. }));
         assert_eq!(
             send("/checkpoint before-refactor risky part"),
             UiCommand::Checkpoint {
@@ -28645,6 +28863,347 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(prompts, 1, "delivered A is not restored or replayed");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn idle_compaction_keeps_escape_authority_before_driver_dequeue() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for command in [
+                "/compact",
+                "/compact keep decisions",
+                "/compact shake",
+                "/shake",
+            ] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = native_prompt_handle(Arc::clone(&provider));
+                let owner = handle
+                    .with_session(|session| session.header.id.clone())
+                    .await
+                    .unwrap();
+                let controls: TurnControlSlot = Arc::default();
+                let aborts: TurnAbortSlot = Arc::default();
+                let (tx, rx) = mpsc::channel();
+                let (_ui_tx, ui_rx) = mpsc::channel();
+                let (submit_tx, submit_rx) = mpsc::channel();
+                let mut model = PiFtuiModel::new(ui_rx)
+                    .with_submit_channel(submit_tx)
+                    .with_turn_control(Arc::clone(&controls))
+                    .with_turn_abort(Arc::clone(&aborts));
+                model.displayed_session_id = Some(owner);
+                let mut sim = ProgramSimulator::new(model);
+                sim.init();
+                type_str(&mut sim, command);
+                sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+                let (shake, instructions, request) = match submit_rx.try_recv().unwrap() {
+                    UiCommand::Compact {
+                        instructions,
+                        request,
+                    } => (false, instructions, request),
+                    UiCommand::Shake { request } => (true, None, request),
+                    command => panic!("unexpected compaction route: {command:?}"),
+                };
+                let signal = request.abort.signal();
+                // A previous turn and unrelated notices can arrive after UI
+                // admission. None may retire this operation's cancellation.
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+                sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+                    usage: None,
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                }));
+                sim.send(PiFtuiMsg::Agent(PiMsg::System("unrelated notice".into())));
+                sim.send(PiFtuiMsg::Agent(PiMsg::CompactionFinished {
+                    request_id: "obsolete-request".into(),
+                    event: Box::new(PiMsg::System("stale completion".into())),
+                }));
+                assert!(sim.model().compaction_request.is_some());
+                assert!(sim.model().busy.is_some());
+                assert!(
+                    !sim.model()
+                        .transcript
+                        .iter()
+                        .any(|entry| entry.text == "stale completion")
+                );
+                type_str(&mut sim, "waiting draft");
+                sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+                assert_eq!(sim.model().input.text(), "waiting draft");
+                assert!(submit_rx.try_recv().is_err());
+                sim.inject_event(key(KeyCode::F(2), Modifiers::empty()));
+                assert!(submit_rx.try_recv().is_err());
+                // The driver slot is not installed yet. Escape still reaches
+                // the admitted request, even if an earlier command used it.
+                *aborts.lock().unwrap() = Some(crate::agent::AbortHandle::new().0);
+                *aborts.lock().unwrap() = None;
+                sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                assert!(signal.is_aborted(), "{command}");
+                assert!(sim.model().compaction_request.is_some());
+                run_compact_command(
+                    &mut handle,
+                    shake,
+                    instructions.as_deref(),
+                    request,
+                    &tx,
+                    &controls,
+                    &aborts,
+                )
+                .await;
+                assert!(provider.calls.lock().unwrap().is_empty());
+                assert!(aborts.lock().unwrap().is_none());
+                for event in rx.try_iter() {
+                    sim.send(PiFtuiMsg::Agent(event));
+                }
+                assert!(sim.model().compaction_request.is_none());
+                assert!(sim.model().busy.is_none());
+                assert_eq!(sim.model().state, AgentUiState::Ready);
+                assert_eq!(sim.model().input.text(), "waiting draft");
+                let cancelled = if shake {
+                    "shake cancelled"
+                } else {
+                    "compact cancelled"
+                };
+                assert!(
+                    sim.model()
+                        .transcript
+                        .iter()
+                        .any(|entry| entry.text == cancelled)
+                );
+            }
+        });
+    }
+
+    fn idle_compaction_handle(provider: Arc<NativePromptProbe>) -> crate::sdk::AgentSessionHandle {
+        use crate::model::{AssistantMessage, ContentBlock, TextContent, UserContent};
+        use crate::session::SessionMessage;
+
+        let mut stored = crate::session::Session::in_memory();
+        for index in 0..3 {
+            stored.append_message(SessionMessage::User {
+                content: UserContent::Text(format!("question {index} ").repeat(100)),
+                timestamp: Some(index),
+            });
+            stored.append_message(SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "answer {index}"
+                    )))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            });
+        }
+        let mut agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::from_tools(Vec::new()),
+            crate::agent::AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        crate::sdk::AgentSessionHandle::from_session_with_listeners(
+            crate::agent::AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(stored)),
+                false,
+                crate::compaction::ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens: 1,
+                    ..crate::compaction::ResolvedCompactionSettings::default()
+                },
+            ),
+            crate::sdk::EventListeners::default(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn idle_compaction_cancels_session_admission_and_summary_on_escape_or_shutdown() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (shake, lock_session) in [(false, true), (true, true), (false, false)] {
+                for shutdown in [false, true] {
+                    let provider = Arc::new(NativePromptProbe {
+                        pause_after_record: true,
+                        ..NativePromptProbe::default()
+                    });
+                    let mut handle = idle_compaction_handle(Arc::clone(&provider));
+                    let store = handle.session_store();
+                    let before =
+                        crate::agent::SessionEditSnapshot::capture(&store.try_lock().unwrap())
+                            .unwrap();
+                    let owner = handle
+                        .with_session(|session| session.header.id.clone())
+                        .await
+                        .unwrap();
+                    let request = CompactionRequest::new(owner.clone());
+                    let controls: TurnControlSlot = Arc::default();
+                    let aborts: TurnAbortSlot = Arc::default();
+                    let (tx, rx) = mpsc::channel();
+                    let (_ui_tx, ui_rx) = mpsc::channel();
+                    let mut model = PiFtuiModel::new(ui_rx)
+                        .with_turn_control(Arc::clone(&controls))
+                        .with_turn_abort(Arc::clone(&aborts));
+                    model.displayed_session_id = Some(owner);
+                    model.compaction_request = Some(request.clone());
+                    model.begin_busy("compacting conversation ...");
+                    let mut sim = ProgramSimulator::new(model);
+                    sim.init();
+                    let held = lock_session.then(|| store.try_lock().unwrap());
+                    let mut operation = Box::pin(run_compact_command(
+                        &mut handle,
+                        shake,
+                        Some("retain decisions"),
+                        request,
+                        &tx,
+                        &controls,
+                        &aborts,
+                    ));
+                    assert!(futures::poll!(operation.as_mut()).is_pending());
+                    assert_eq!(
+                        provider.calls.lock().unwrap().len(),
+                        usize::from(!lock_session)
+                    );
+                    let signal = aborts.lock().unwrap().as_ref().unwrap().signal();
+                    if shutdown {
+                        sim.model_mut().abort_before_quit();
+                    } else {
+                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                    }
+                    assert!(signal.is_aborted());
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(5),
+                        operation,
+                    )
+                    .await
+                    .expect("compaction cancellation must not wait for its blocked source");
+                    drop(held);
+                    assert!(
+                        crate::agent::SessionEditSnapshot::capture(&store.try_lock().unwrap())
+                            .unwrap()
+                            == before
+                    );
+                    assert!(aborts.lock().unwrap().is_none());
+                    assert_eq!(
+                        provider.calls.lock().unwrap().len(),
+                        usize::from(!lock_session)
+                    );
+                    for event in rx.try_iter() {
+                        sim.send(PiFtuiMsg::Agent(event));
+                    }
+                    assert!(sim.model().compaction_request.is_none());
+                    assert!(sim.model().busy.is_none());
+                    assert!(handle.session().ensure_provider_reentry_allowed().is_ok());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn idle_compaction_checks_session_owner_and_shutdown_but_keeps_a_late_commit() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for phase in ["replaced", "shutdown", "installed"] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = idle_compaction_handle(Arc::clone(&provider));
+                let store = handle.session_store();
+                let before =
+                    crate::agent::SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                let owner = handle
+                    .with_session(|session| session.header.id.clone())
+                    .await
+                    .unwrap();
+                let request = CompactionRequest::new(if phase == "replaced" {
+                    "previous-session".into()
+                } else {
+                    owner.clone()
+                });
+                let request_id = request.id.clone();
+                let late_abort = request.abort.clone();
+                if phase == "installed" {
+                    let abort = late_abort.clone();
+                    handle.subscribe(move |event| {
+                        if matches!(
+                            event,
+                            crate::agent::AgentEvent::ManualCompactionEnd {
+                                result: Some(_),
+                                aborted: false,
+                                ..
+                            }
+                        ) {
+                            abort.abort();
+                        }
+                    });
+                }
+                let controls: TurnControlSlot = Arc::default();
+                let aborts: TurnAbortSlot = Arc::default();
+                if phase == "shutdown" {
+                    abort_driver_work(Some(&aborts), Some(&controls));
+                }
+                let (tx, rx) = mpsc::channel();
+                run_compact_command(
+                    &mut handle,
+                    false,
+                    Some("preserve decisions"),
+                    request,
+                    &tx,
+                    &controls,
+                    &aborts,
+                )
+                .await;
+                assert!(aborts.lock().unwrap().is_none());
+                let events = rx.try_iter().collect::<Vec<_>>();
+                let terminal = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        PiMsg::CompactionFinished {
+                            request_id: id,
+                            event,
+                        } => {
+                            assert_eq!(id, &request_id);
+                            Some(event.as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(terminal.len(), 1);
+                if phase == "installed" {
+                    assert!(late_abort.signal().is_aborted());
+                    assert!(matches!(
+                        terminal[0], PiMsg::ConversationReset { session_id, .. }
+                            if session_id == &owner
+                    ));
+                    assert_eq!(provider.calls.lock().unwrap().len(), 1);
+                    assert!(store.try_lock().unwrap().entries.iter().any(|entry| {
+                        matches!(entry, crate::session::SessionEntry::Compaction(_))
+                    }));
+                } else {
+                    assert!(provider.calls.lock().unwrap().is_empty());
+                    assert!(
+                        crate::agent::SessionEditSnapshot::capture(&store.try_lock().unwrap())
+                            .unwrap()
+                            == before
+                    );
+                    if phase == "replaced" {
+                        assert!(matches!(
+                            terminal[0], PiMsg::AgentError(message)
+                                if message.contains("session changed")
+                        ));
+                    } else {
+                        assert!(late_abort.signal().is_aborted());
+                        assert!(matches!(
+                            terminal[0], PiMsg::System(message)
+                                if message == "compact cancelled"
+                        ));
+                    }
+                }
+            }
         });
     }
 
