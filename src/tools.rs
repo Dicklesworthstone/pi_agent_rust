@@ -8650,9 +8650,10 @@ enum BashPipeFrame {
 
 const BASH_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Own every foreground pipe reader until it has stopped. These workers only
-/// read nonblocking pipes and publish to a cancellation-aware bounded channel;
-/// neither an escaped writer nor a full output queue can prevent retirement.
+/// Own foreground pipe readers and Unix PTY readers until they have stopped.
+/// These workers only read nonblocking descriptors and publish to a
+/// cancellation-aware bounded channel; neither an escaped writer nor a full
+/// output queue can prevent retirement.
 #[derive(Default)]
 struct BashPipePumps {
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -8723,6 +8724,45 @@ fn prepare_bash_pipe(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(reader)?;
     rustix::fs::fcntl_setfl(reader, flags | rustix::fs::OFlags::NONBLOCK)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_bash_pty_master(master: &dyn portable_pty::MasterPty) -> Result<()> {
+    use std::os::fd::{AsRawFd, RawFd};
+
+    // MasterPty exposes only a raw descriptor. Keep its owner borrowed while
+    // filedescriptor safely duplicates it into an owned, AsFd-capable handle.
+    struct BorrowedMaster<'a> {
+        _master: &'a dyn portable_pty::MasterPty,
+        fd: RawFd,
+    }
+
+    impl AsRawFd for BorrowedMaster<'_> {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    let fd = master.as_raw_fd().ok_or_else(|| {
+        Error::tool(
+            "bash",
+            "The PTY backend does not expose its master descriptor",
+        )
+    })?;
+    let borrowed = BorrowedMaster {
+        _master: master,
+        fd,
+    };
+    let duplicate = filedescriptor::FileDescriptor::dup(&borrowed)
+        .map_err(|error| Error::tool("bash", format!("Failed to duplicate PTY master: {error}")))?;
+    // Duplicates share status flags. Keep portable-pty's actual reader so its
+    // Unix adapter still translates the terminal's EIO-at-close into EOF.
+    prepare_bash_pipe(&duplicate).map_err(|error| {
+        Error::tool(
+            "bash",
+            format!("Failed to make PTY reader nonblocking: {error}"),
+        )
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -9516,6 +9556,8 @@ pub(crate) async fn run_bash_command_pty(
             pixel_height: 0,
         })
         .map_err(|e| Error::tool("bash", format!("Failed to allocate PTY: {e}")))?;
+    #[cfg(unix)]
+    prepare_bash_pty_master(pair.master.as_ref())?;
 
     let mut pty_cmd = CommandBuilder::new(shell);
     pty_cmd.arg("-c");
@@ -9544,8 +9586,20 @@ pub(crate) async fn run_bash_command_pty(
         .master
         .try_clone_reader()
         .map_err(|e| Error::tool("bash", format!("Failed to clone PTY reader: {e}")))?;
+    // On Unix the cloned reader owns the master endpoint. Retaining a second
+    // master would keep the terminal alive after the reader has retired.
+    // ConPTY's master also owns the console control object and must stay alive.
+    #[cfg(unix)]
+    drop(pair.master);
 
     let (tx, mut rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
+    #[cfg(unix)]
+    let mut pty_pumps = {
+        let mut pumps = BashPipePumps::default();
+        pumps.spawn(reader, "pty", tx)?;
+        pumps
+    };
+    #[cfg(not(unix))]
     let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx, None));
 
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
@@ -9641,20 +9695,11 @@ pub(crate) async fn run_bash_command_pty(
                 emit_bash_update(&bash_output, on_update)?;
             }
 
-            if pty_thread.is_finished() {
-                // No producer remains, so this terminal tail is bounded by
-                // the channel capacity rather than the child's output rate.
-                let mut got_tail = false;
-                while let Ok(frame) = rx.try_recv() {
-                    if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
-                        let _ = child.kill();
-                        return Err(err);
-                    }
-                    got_tail = true;
-                }
-                if got_tail {
-                    emit_bash_update(&bash_output, on_update)?;
-                }
+            #[cfg(unix)]
+            let reader_finished = pty_pumps.is_finished();
+            #[cfg(not(unix))]
+            let reader_finished = pty_thread.is_finished();
+            if reader_finished {
                 break;
             }
 
@@ -9670,11 +9715,34 @@ pub(crate) async fn run_bash_command_pty(
         }
     }
 
-    if bash_output.output_complete && pty_thread.join().is_err() {
-        let message =
-            bash_capture_error_message("The bash PTY output reader panicked", &bash_output);
-        bash_output.abandon_spill_file();
-        return Err(Error::tool("bash", message));
+    // Unix retirement is bounded even while an escaped descendant holds the
+    // slave open. Other backends expose an opaque blocking reader, so they can
+    // only be joined after EOF; a cutoff still reports incomplete capture.
+    #[cfg(unix)]
+    let reader_joined = Some(pty_pumps.stop_and_join());
+    #[cfg(not(unix))]
+    let reader_joined = if bash_output.output_complete {
+        Some(pty_thread.join().is_ok())
+    } else {
+        None
+    };
+    if let Some(succeeded) = reader_joined {
+        // There is no producer left. Preserve every accepted frame, including
+        // terminal errors, before returning the bounded final tail.
+        let mut got_tail = false;
+        while let Ok(frame) = rx.try_recv() {
+            ingest_bash_pipe_frame(frame, &mut bash_output).await?;
+            got_tail = true;
+        }
+        if got_tail {
+            emit_bash_update(&bash_output, on_update)?;
+        }
+        if !succeeded {
+            let message =
+                bash_capture_error_message("The bash PTY output reader panicked", &bash_output);
+            bash_output.abandon_spill_file();
+            return Err(Error::tool("bash", message));
+        }
     }
 
     // Reap the child to avoid zombies (belt-and-suspenders with try_wait).
@@ -17035,8 +17103,8 @@ fn send_bash_pipe_frame(
     stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> bool {
     let Some(stop) = stop else {
-        // The PTY backend still supplies an opaque blocking reader. Keep its
-        // existing transport here; it cannot be safely joined by the pipe guard.
+        // Non-Unix PTY backends still supply opaque blocking readers. Keep
+        // their transport here; the owned pump guard cannot safely join them.
         return tx.send(frame).is_ok();
     };
     loop {
@@ -24285,9 +24353,11 @@ mod tests {
     mod bash_pipe_pump_ownership {
         use super::*;
 
+        type ReadResult = std::result::Result<usize, std::io::ErrorKind>;
+
         struct RetirementProbe<R> {
             reader: R,
-            first_read: Option<mpsc::Sender<()>>,
+            first_read: Option<mpsc::Sender<ReadResult>>,
             retired: mpsc::Sender<()>,
         }
 
@@ -24295,7 +24365,7 @@ mod tests {
             fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
                 let result = self.reader.read(buffer);
                 if let Some(first_read) = self.first_read.take() {
-                    let _ = first_read.send(());
+                    let _ = first_read.send(result.as_ref().copied().map_err(std::io::Error::kind));
                 }
                 result
             }
@@ -24309,7 +24379,11 @@ mod tests {
 
         fn observed_reader<R>(
             reader: R,
-        ) -> (RetirementProbe<R>, mpsc::Receiver<()>, mpsc::Receiver<()>) {
+        ) -> (
+            RetirementProbe<R>,
+            mpsc::Receiver<ReadResult>,
+            mpsc::Receiver<()>,
+        ) {
             let (first_read, started) = mpsc::channel();
             let (retired, retirement) = mpsc::channel();
             (
@@ -24394,6 +24468,53 @@ mod tests {
                 drop(rx);
             });
             assert!(read_started.is_ok(), "idle read did not return WouldBlock");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn dropping_owner_retires_idle_pty_reader_while_slave_stays_open() {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .expect("native PTY endpoints");
+            prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
+            let reader = pair.master.try_clone_reader().expect("native PTY reader");
+            drop(pair.master);
+            let (reader, started, retirement) = observed_reader(reader);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let mut pumps = BashPipePumps::default();
+            pumps.spawn(reader, "pty", tx).expect("start PTY reader");
+            let read_started = started.recv_timeout(Duration::from_secs(5));
+
+            assert_retirement_without_releasing_dependencies(pumps, &retirement, || {
+                drop(pair.slave);
+                drop(rx);
+            });
+            assert_eq!(
+                read_started,
+                Ok(Err(std::io::ErrorKind::WouldBlock)),
+                "the native reader clone must inherit nonblocking mode"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn closed_pty_slave_is_clean_eof_instead_of_a_capture_error() {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .expect("native PTY endpoints");
+            prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
+            let reader = pair.master.try_clone_reader().expect("native PTY reader");
+            drop(pair.master);
+            drop(pair.slave);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let mut pumps = BashPipePumps::default();
+            pumps.spawn(reader, "pty", tx).expect("start PTY reader");
+            let terminal_frame = rx.recv_timeout(Duration::from_secs(5));
+            assert!(pumps.stop_and_join(), "PTY reader panicked");
+            assert!(
+                matches!(terminal_frame, Err(mpsc::RecvTimeoutError::Disconnected)),
+                "closing the slave must end capture without an EIO frame: {terminal_frame:?}"
+            );
         }
     }
 

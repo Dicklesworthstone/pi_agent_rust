@@ -473,6 +473,11 @@ harness = false
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
 
+# portable-pty already uses this version. Its safe descriptor duplication lets
+# foreground PTY readers become nonblocking while retaining terminal EOF handling.
+[target.'cfg(unix)'.dependencies]
+filedescriptor = "=0.8.3"
+
 # FreeBSD: third-party libs live under /usr/local and rquickjs-sys doesn't
 # ship pre-generated bindings for this target, so regenerate at build time
 # via the `bindgen` feature (uses /usr/bin/clang from the base system).

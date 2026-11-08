@@ -334,6 +334,42 @@ fn pty_always_grants_a_tty() {
 }
 
 #[test]
+fn pty_preserves_stdout_stderr_order_through_clean_eof() {
+    let case = "pty_preserves_stdout_stderr_order_through_clean_eof";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let tool = bash_tool(
+        &root,
+        Some(BashSettings {
+            persistent: Some(false),
+            ..pty_settings("always")
+        }),
+    );
+    let output = block_on_local(tool.execute(
+        "ordered-pty",
+        json!({
+            "command": "for ((i=0; i<128; i++)); do printf 'out-%s\\n' \"$i\"; printf 'err-%s\\n' \"$i\" >&2; done",
+            "background": false,
+        }),
+        None,
+    ))
+    .expect("ordered PTY execution");
+    let expected: String = (0..128)
+        .map(|index| format!("out-{index}\nerr-{index}\n"))
+        .collect();
+    assert_eq!(first_text(&output).replace("\r\n", "\n"), expected);
+    assert!(!output.is_error, "normal terminal EOF is not a read error");
+    assert!(
+        output
+            .details
+            .as_ref()
+            .is_none_or(|details| details.get("capture").is_none()),
+        "complete PTY output must not acquire incomplete-capture metadata"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
 fn pty_off_keeps_pipes() {
     let case = "pty_off_keeps_pipes";
     let harness = TestHarness::new(case);
@@ -438,11 +474,13 @@ fn pty_timeout_still_kills() {
 // process tree. No process-count baseline or "kill -0 failed" heuristic is
 // involved: the escaped writer stays alive until its two first post-retirement
 // writes have reported whether the actual stdout/stderr readers were closed.
+// PTY cases also identify the exact master through Linux's tty-index fdinfo;
+// terminal hangup alone can make a slave write fail while a master leaks.
 #[cfg(target_os = "linux")]
 mod foreground_pipe_ownership {
     use super::*;
     use std::fmt::Write as _;
-    use std::io::{self, Write};
+    use std::io::{self, IsTerminal as _, Write};
     use std::os::unix::process::CommandExt as _;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
@@ -475,6 +513,26 @@ mod foreground_pipe_ownership {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn terminal_master_count(terminal_index: u32) -> usize {
+        std::fs::read_dir("/proc/self/fdinfo")
+            .expect("enumerate the owning process's descriptors")
+            .map(|entry| {
+                let path = entry.expect("descriptor metadata entry").path();
+                let metadata = match std::fs::read_to_string(&path) {
+                    Ok(metadata) => metadata,
+                    // Other runtime descriptors can close during enumeration.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return 0,
+                    Err(error) => panic!("cannot read {}: {error}", path.display()),
+                };
+                usize::from(metadata.lines().any(|line| {
+                    line.strip_prefix("tty-index:").is_some_and(|index| {
+                        index.trim().parse::<u32>().expect("numeric PTY index") == terminal_index
+                    })
+                }))
+            })
+            .sum()
     }
 
     /// This process starts under the real `BashTool`, then transfers the writer
@@ -520,6 +578,24 @@ mod foreground_pipe_ownership {
             assert!(Instant::now() < deadline, "writer was not adopted");
             std::thread::sleep(Duration::from_millis(5));
         }
+        let use_pty = io::stdout().is_terminal();
+        if use_pty {
+            let terminal = std::fs::read_link("/proc/self/fd/1").expect("writer's terminal path");
+            assert_eq!(
+                std::fs::read_link("/proc/self/fd/2").expect("writer's stderr terminal"),
+                terminal,
+                "both output descriptors must belong to the same PTY"
+            );
+            assert_eq!(terminal.parent(), Some(Path::new("/dev/pts")));
+            let index = terminal
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("PTY index")
+                .parse::<u32>()
+                .expect("numeric PTY index");
+            std::fs::write(root.join("writer.tty-index"), index.to_string())
+                .expect("terminal identity");
+        }
         io::stdout()
             .write_all(b"escaped-stdout-ready\n")
             .expect("initial stdout");
@@ -536,14 +612,25 @@ mod foreground_pipe_ownership {
 
         // A leaked blocking pump accepts the first write, then notices its
         // disconnected channel. Retrying until EPIPE would hide that leak.
+        // A PTY slave reports EIO on hangup; the owner separately checks that
+        // its exact master descriptor has retired, not just that hangup occurred.
         // Include a newline so stdout's LineWriter attempts the OS write now.
-        let stdout = io::stdout().write_all(b"x\n").map_err(|error| error.kind());
-        let stderr = io::stderr().write_all(b"y\n").map_err(|error| error.kind());
+        let stdout = io::stdout().write_all(b"x\n");
+        let stderr = io::stderr().write_all(b"y\n");
+        let is_closed = |result: &io::Result<()>| {
+            result.as_ref().is_err_and(|error| {
+                if use_pty {
+                    error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+                } else {
+                    error.kind() == io::ErrorKind::BrokenPipe
+                }
+            })
+        };
         std::fs::write(
             root.join("result.json"),
             serde_json::to_vec(&json!({
-                "stdout_closed": stdout == Err(io::ErrorKind::BrokenPipe),
-                "stderr_closed": stderr == Err(io::ErrorKind::BrokenPipe),
+                "stdout_closed": is_closed(&stdout),
+                "stderr_closed": is_closed(&stderr),
                 "stdout_result": format!("{stdout:?}"),
                 "stderr_result": format!("{stderr:?}"),
             }))
@@ -611,7 +698,7 @@ mod foreground_pipe_ownership {
         }
     }
 
-    fn run_case(root: &Path, mode: &str) {
+    fn run_case(root: &Path, mode: &str, use_pty: bool) {
         // Linux treats any nonzero argument as true. rustix 1.1 represents
         // this prctl argument as Option<Pid>, so Some(1) enables the attribute.
         rustix::process::set_child_subreaper(rustix::process::Pid::from_raw(1))
@@ -622,18 +709,23 @@ mod foreground_pipe_ownership {
             std::process::id(),
             quoted(&executable),
         );
-        if mode == "drop" {
-            write!(
-                command,
-                "; while [ ! -e {} ]; do sleep 0.02; done",
-                quoted(&root.join("release"))
-            )
-            .expect("fixture command");
-        }
+        // Keep the controlling shell alive until readiness and the exact PTY
+        // master have both been witnessed, even in the normal-return case.
+        let exit_gate = if mode == "drop" {
+            "release"
+        } else {
+            "allow-root-exit"
+        };
+        write!(
+            command,
+            "; while [ ! -e {} ]; do sleep 0.02; done",
+            quoted(&root.join(exit_gate))
+        )
+        .expect("fixture command");
         let tool = bash_tool(
             root,
             Some(BashSettings {
-                pty: Some("off".to_string()),
+                pty: Some(if use_pty { "always" } else { "off" }.to_string()),
                 persistent: Some(false),
                 mediation: Some("off".to_string()),
                 ..Default::default()
@@ -649,7 +741,7 @@ mod foreground_pipe_ownership {
         };
         block_on_local(async {
             let mut pending = Box::pin(tool.execute(
-                "foreground-pipe-owner",
+                "foreground-output-owner",
                 json!({"command": command, "background": false, "timeout": 30}),
                 Some(Box::new(move |update| {
                     if update.content.iter().any(|block| {
@@ -663,7 +755,7 @@ mod foreground_pipe_ownership {
             loop {
                 assert!(
                     futures::poll!(&mut pending).is_pending(),
-                    "Bash returned before the held-pipe boundary"
+                    "Bash returned before the held-output boundary"
                 );
                 if ready.load(Ordering::Acquire) && root.join("writer.ready").exists() {
                     break;
@@ -688,30 +780,59 @@ mod foreground_pipe_ownership {
                 writer.is_live(),
                 "fixture writer must be alive before retirement"
             );
+            let terminal_index = use_pty.then(|| {
+                let index = std::fs::read_to_string(root.join("writer.tty-index"))
+                    .expect("writer terminal identity")
+                    .parse::<u32>()
+                    .expect("numeric writer terminal identity");
+                assert!(
+                    terminal_master_count(index) > 0,
+                    "the owning process must hold this PTY master before retirement"
+                );
+                index
+            });
+            let retirement_started = Instant::now();
             if mode == "drop" {
                 drop(pending);
             } else {
+                std::fs::write(root.join(exit_gate), b"exit").expect("release controlling shell");
                 let output = pending.await.expect("foreground completion");
                 let text = first_text(&output);
-                assert!(
-                    output.is_error,
-                    "incomplete capture must be reported: {text}"
-                );
                 assert!(text.contains("foreground-root-ready"));
                 assert!(text.contains("escaped-stdout-ready"));
                 assert!(text.contains("escaped-stderr-ready"));
-                assert!(text.contains("Command capture:"), "{text}");
                 assert!(!text.contains("Full output:"), "{text}");
-                let details = output.details.as_ref().expect("capture details");
-                assert!(details.get("fullOutputPath").is_none());
-                assert_eq!(details["capture"]["outputComplete"], false);
-                assert_eq!(details["capture"]["artifactTruncated"], false);
-                assert!(details["capture"]["artifactError"].is_null());
-                assert!(details["capture"]["artifactPath"].is_null());
+                if !use_pty {
+                    assert!(
+                        output.is_error,
+                        "incomplete capture must be reported: {text}"
+                    );
+                    assert!(text.contains("Command capture:"), "{text}");
+                    let details = output.details.as_ref().expect("capture details");
+                    assert!(details.get("fullOutputPath").is_none());
+                    assert_eq!(details["capture"]["outputComplete"], false);
+                    assert_eq!(details["capture"]["artifactTruncated"], false);
+                    assert!(details["capture"]["artifactError"].is_null());
+                    assert!(details["capture"]["artifactPath"].is_null());
+                }
+            }
+            assert!(
+                retirement_started.elapsed() < Duration::from_secs(10),
+                "foreground retirement exceeded its bounded output drain"
+            );
+            if let Some(index) = terminal_index {
+                // Linux retains this devpts index until the last endpoint
+                // closes. The live writer pins its slave, so another PTY
+                // cannot reuse the identity and turn this into a false result.
+                assert_eq!(
+                    terminal_master_count(index),
+                    0,
+                    "the tool returned while still owning this PTY's master"
+                );
             }
             assert!(
                 writer.is_live(),
-                "Bash cleanup must not replace pipe retirement by killing the escaped writer"
+                "Bash cleanup must not replace reader retirement by killing the escaped writer"
             );
             std::fs::write(root.join("probe"), b"probe").expect("probe reader closure");
             wait_for_file(&root.join("report.ready"), Duration::from_secs(5));
@@ -721,7 +842,7 @@ mod foreground_pipe_ownership {
             .expect("decode writer report");
             assert!(
                 writer.is_live(),
-                "writer must remain alive after its pipe probes"
+                "writer must remain alive after its endpoint probes"
             );
             assert_eq!(report["stdout_closed"], true, "{mode}: {report}");
             assert_eq!(report["stderr_closed"], true, "{mode}: {report}");
@@ -745,15 +866,16 @@ mod foreground_pipe_ownership {
         }
     }
 
-    fn run_isolated_case(test_name: &str, mode: &str) {
+    fn run_isolated_case(test_name: &str, mode: &str, use_pty: bool) {
         if std::env::var(CASE_ENV).ok().as_deref() == Some(mode) {
             let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("isolated fixture root"));
-            run_case(&root, mode);
+            run_case(&root, mode, use_pty);
             return;
         }
         let harness = TestHarness::new(test_name);
-        let root = harness.temp_path("pipe-owner");
-        std::fs::create_dir_all(&root).expect("pipe lifecycle fixture");
+        let backend = if use_pty { "pty" } else { "pipe" };
+        let root = harness.temp_path(format!("{backend}-owner"));
+        std::fs::create_dir_all(&root).expect("output lifecycle fixture");
         let child = Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", test_name, "--nocapture"])
             .env(CASE_ENV, mode)
@@ -761,7 +883,7 @@ mod foreground_pipe_ownership {
             .stdin(Stdio::null())
             .process_group(0)
             .spawn()
-            .expect("isolated pipe lifecycle regression");
+            .expect("isolated output lifecycle regression");
         let mut process = CaseProcess {
             child,
             root: root.clone(),
@@ -777,18 +899,18 @@ mod foreground_pipe_ownership {
                 process.reaped = true;
                 assert!(
                     status.success(),
-                    "foreground {mode} lifecycle failed: {status}"
+                    "foreground {backend} {mode} lifecycle failed: {status}"
                 );
                 harness.record_artifact(
-                    format!("foreground-{mode}-writer.json"),
+                    format!("foreground-{backend}-{mode}-writer.json"),
                     &root.join("result.json"),
                 );
-                finish_case(&harness, &format!("foreground-pipe-{mode}"));
+                finish_case(&harness, &format!("foreground-{backend}-{mode}"));
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "foreground {mode} lifecycle stalled"
+                "foreground {backend} {mode} lifecycle stalled"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -799,6 +921,7 @@ mod foreground_pipe_ownership {
         run_isolated_case(
             "foreground_pipe_ownership::dropping_foreground_future_closes_escaped_output_readers",
             "drop",
+            false,
         );
     }
 
@@ -807,6 +930,25 @@ mod foreground_pipe_ownership {
         run_isolated_case(
             "foreground_pipe_ownership::completed_foreground_call_closes_escaped_output_readers",
             "exit",
+            false,
+        );
+    }
+
+    #[test]
+    fn dropping_foreground_pty_future_closes_escaped_output_reader() {
+        run_isolated_case(
+            "foreground_pipe_ownership::dropping_foreground_pty_future_closes_escaped_output_reader",
+            "drop",
+            true,
+        );
+    }
+
+    #[test]
+    fn completed_foreground_pty_call_closes_escaped_output_reader() {
+        run_isolated_case(
+            "foreground_pipe_ownership::completed_foreground_pty_call_closes_escaped_output_reader",
+            "exit",
+            true,
         );
     }
 }

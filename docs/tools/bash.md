@@ -99,14 +99,16 @@ Direct foreground commands check timeout and cancellation between bounded
 output batches, including when stdout or stderr is continuously busy. The
 same batching applies to PTY commands and to the final output drain.
 
-For the direct pipe runner, the tool owns both output readers until they
-stop. Dropping the tool call retires those readers even if a descendant has
-escaped the process group and still holds an output descriptor, or the output
-queue is full. After the command exits, the runner allows up to five seconds
-for remaining output, then stops the readers and returns the output already
-accepted. If readers did not reach EOF before that cutoff, the result reports
-incomplete capture even if the command itself exited successfully. The PTY
-backend uses a separate blocking reader and does not yet provide this
+For the direct pipe runner and Unix PTY runner, the tool owns its output
+readers until they stop. Dropping the tool call retires those readers even if
+a descendant has escaped the process group and still holds an output
+descriptor, or the output queue is full. After the command exits, the runner
+allows up to five seconds for remaining output, then stops the readers and
+returns the output already accepted. If readers did not reach EOF before that
+cutoff, the result reports incomplete capture even if the command itself
+exited successfully. Unix PTY retirement also closes the master endpoint,
+even when a descendant retains the terminal's slave endpoint. The Windows
+ConPTY backend still exposes a blocking reader and does not yet provide this
 reader-retirement guarantee for an escaped writer.
 
 Managed foreground commands share the eight-job concurrency budget with

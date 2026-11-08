@@ -5807,6 +5807,7 @@ dependencies = [
  "ctrlc",
  "dirs",
  "enable-ansi-support",
+ "filedescriptor",
  "filetime",
  "flate2",
  "fs4",
