@@ -1922,6 +1922,10 @@ impl PiApp {
         self.bash_running = true;
         self.agent_state = AgentState::ToolRunning;
         self.current_tool = Some("bash".to_string());
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        // Escape can arrive before the worker is first polled. Publish the
+        // same latched signal that will guard hook admission and shell spawn.
+        self.abort_handle = Some(abort_handle);
         self.history.push(raw_message.to_string());
 
         self.input.reset();
@@ -1939,25 +1943,33 @@ impl PiApp {
         let completion_runtime_handle = runtime_handle.clone();
 
         runtime_handle.spawn_with_cx(move |_command_cx| async move {
-            let override_result = match extensions {
-                Some(manager) => {
-                    manager
-                        .dispatch_user_bash(&command, exclude_from_context, &cwd)
-                        .await
+            let override_result = if abort_signal.is_aborted() {
+                Err(crate::error::Error::Aborted)
+            } else {
+                match extensions {
+                    Some(manager) => {
+                        manager
+                            .dispatch_user_bash(&command, exclude_from_context, &cwd)
+                            .await
+                    }
+                    None => Ok(None),
                 }
-                None => Ok(None),
             };
 
             let result = match override_result {
                 Ok(Some(result)) => Ok(result),
                 Ok(None) => {
-                    crate::tools::run_bash_command(
+                    let mut abort_requested = || abort_signal.is_aborted();
+                    crate::tools::run_bash_command_with_control_timeout(
                         &cwd,
                         shell_path.as_deref(),
                         command_prefix.as_deref(),
                         &command,
                         None,
-                        None,
+                        crate::tools::BashRunControl {
+                            abort_requested: &mut abort_requested,
+                            drain_timeout: std::time::Duration::from_secs(5),
+                        },
                     )
                     .await
                 }
@@ -1978,6 +1990,9 @@ impl PiApp {
                     // `!` output reaches the model with the next prompt, and
                     // `!!` output is kept in the session but never sent.
                     let mut extra = HashMap::new();
+                    if let Some(capture) = &result.capture {
+                        extra.insert("capture".to_string(), serde_json::json!(capture));
+                    }
                     if exclude_from_context {
                         extra.insert("excludeFromContext".to_string(), Value::Bool(true));
                         display.push_str("\n\n[Output excluded from model context]");
@@ -2000,12 +2015,12 @@ impl PiApp {
                     );
                 }
                 Err(err) => {
-                    spawn_bash_completion(
-                        &completion_runtime_handle,
-                        event_tx,
-                        None,
-                        format!("Bash command failed: {err}"),
-                    );
+                    let display = if matches!(err, crate::error::Error::Aborted) {
+                        "Bash command cancelled".to_string()
+                    } else {
+                        format!("Bash command failed: {err}")
+                    };
+                    spawn_bash_completion(&completion_runtime_handle, event_tx, None, display);
                 }
             }
         });
@@ -6395,6 +6410,106 @@ mod tests {
         );
         let _ = app.handle_pi_message(terminal);
         assert!(matches!(app.agent_state, AgentState::Idle));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escape_cancels_user_bash_and_keeps_its_result_owner_until_history_is_recorded() {
+        let temp = TempDir::new().expect("workspace");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let command = "printf before-abort; printf '%s' \"$$\" > shell.pid; \
+            sleep 15 & printf '%s' \"$!\" > child.pid; wait; printf leaked > leaked.txt";
+        let _ = app.submit_bash_command(&format!("!!{command}"), command.to_string(), true);
+        let signal = app
+            .abort_handle
+            .as_ref()
+            .expect("admitted abort handle")
+            .signal();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::fs::read_to_string(temp.path().join("child.pid"))
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline, "shell must start");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Delayed provider/background messages do not own this shell's abort
+        // handle, and a new foreground submission must preserve its draft.
+        for message in [
+            PiMsg::System("background notice".to_string()),
+            PiMsg::AgentError("background error".to_string()),
+            PiMsg::AgentDone {
+                usage: None,
+                stop_reason: crate::model::StopReason::Stop,
+                error_message: None,
+            },
+        ] {
+            let _ = app.handle_pi_message(message);
+            assert!(app.bash_running);
+            assert!(app.abort_handle.is_some());
+            assert_eq!(app.agent_state, AgentState::ToolRunning);
+        }
+        app.input.set_value("/new");
+        let _ = app.submit_message("/new");
+        assert_eq!(app.input.value(), "/new");
+        let _ = app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+        assert!(signal.is_aborted());
+
+        let terminal = loop {
+            match event_rx.try_recv() {
+                Ok(message @ PiMsg::BashResult { .. }) => break message,
+                Ok(message) => {
+                    let _ = app.handle_pi_message(message);
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("cancelled Bash did not settle: {error}"),
+            }
+        };
+        assert!(app.bash_running, "UI owner stays live until its terminal");
+        assert!(app.abort_handle.is_some());
+        let store = session.try_lock().expect("completed history");
+        let records: Vec<_> = store
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(message) => match &message.message {
+                    SessionMessage::BashExecution {
+                        output,
+                        cancelled,
+                        extra,
+                        ..
+                    } => Some((output, cancelled, extra)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].0.contains("before-abort"));
+        assert_eq!(*records[0].1, Some(true));
+        assert_eq!(records[0].2["excludeFromContext"], true);
+        drop(records);
+        drop(store);
+        assert!(!temp.path().join("leaked.txt").exists());
+        for name in ["shell.pid", "child.pid"] {
+            let pid = std::fs::read_to_string(temp.path().join(name)).expect("started process");
+            let running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
+            });
+            assert!(!running, "cancelled process is still running: {pid}");
+        }
+        let _ = app.handle_pi_message(terminal);
+        assert!(!app.bash_running);
+        assert!(app.abort_handle.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.messages.last().unwrap().content.contains("cancelled"));
     }
 
     #[cfg(unix)]

@@ -37,11 +37,18 @@ fn main() -> std::io::Result<()> {
                     )));
                     continue;
                 }
-                UiCommand::Bash { command, exclude } => {
+                UiCommand::Bash {
+                    command,
+                    exclude,
+                    request,
+                } => {
                     let note = if exclude { " (display-only)" } else { "" };
                     let _ = agent_tx.send(PiMsg::System(format!(
                         "(fake agent) would run{note}: {command}"
                     )));
+                    let _ = agent_tx.send(PiMsg::BashFinished {
+                        request_id: request.id().to_string(),
+                    });
                     continue;
                 }
                 UiCommand::ResumeSession { path } => {

@@ -9148,12 +9148,33 @@ pub(crate) async fn run_bash_command_with_control(
     command: &str,
     control: BashRunControl<'_>,
 ) -> Result<BashRunResult> {
-    run_bash_command_with_state(
+    run_bash_command_with_control_timeout(
         cwd,
         shell_path,
         command_prefix,
         command,
         Some(0),
+        control,
+    )
+    .await
+}
+
+/// Run with per-command cancellation and the foreground timeout convention:
+/// `None` keeps the default, `Some(0)` is unlimited, and other values are seconds.
+pub(crate) async fn run_bash_command_with_control_timeout(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    control: BashRunControl<'_>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_state(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
         None,
         None,
         Some(control),

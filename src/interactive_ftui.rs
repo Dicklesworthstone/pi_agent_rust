@@ -1688,6 +1688,37 @@ impl PartialEq for McpAuthRequest {
 
 impl Eq for McpAuthRequest {}
 
+/// A shell command retains cancellation from UI admission through driver
+/// completion, including the time before its first status event arrives.
+#[derive(Debug, Clone)]
+pub struct BashRequest {
+    id: String,
+    abort: crate::agent::AbortHandle,
+}
+
+impl BashRequest {
+    fn new() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            abort: crate::agent::AbortHandle::new().0,
+        }
+    }
+
+    /// Correlation ID to echo in the driver's terminal `BashFinished` event.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl PartialEq for BashRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for BashRequest {}
+
 /// Command from the UI to the agent driver.
 ///
 /// The seed of the bubbletea stack's input-routing chain: prompts run agent
@@ -1713,7 +1744,11 @@ pub enum UiCommand {
     /// Run a shell command and record it in the session, starting no turn.
     /// `!cmd` (exclude=false) output reaches the model with the next prompt;
     /// `!!cmd` (exclude=true) output is kept but never sent.
-    Bash { command: String, exclude: bool },
+    Bash {
+        command: String,
+        exclude: bool,
+        request: BashRequest,
+    },
     /// Resume a saved session (`/resume` picker): the driver swaps its
     /// session handle and replays the conversation into the transcript.
     ResumeSession { path: String },
@@ -2160,6 +2195,8 @@ pub struct PiFtuiModel {
     turn_control: Option<TurnControlSlot>,
     /// One manual compaction ordered inside the active turn's input queue.
     queued_compaction: Option<QueuedCompaction>,
+    /// The admitted shell request, retained until its matching terminal event.
+    bash_request: Option<BashRequest>,
     /// `/btw` availability. The driver prepares every side question against
     /// its live transcript and remembered credentials after the active turn.
     btw_client: Option<Arc<crate::btw::BtwClient>>,
@@ -2606,6 +2643,7 @@ impl PiFtuiModel {
             turn_abort: None,
             turn_control: None,
             queued_compaction: None,
+            bash_request: None,
             btw_client: None,
             term: (80, 24),
             term_size_known: false,
@@ -3269,6 +3307,7 @@ impl PiFtuiModel {
             && !self.suspending
             && !self.handoff_in_progress()
             && self.mcp_auth_request.is_none()
+            && self.bash_request.is_none()
     }
 
     /// Invalidation is permanent: returning from a modal to identical text
@@ -3765,6 +3804,23 @@ impl PiFtuiModel {
         {
             self.queued_compaction = None;
         }
+        if let PiMsg::BashFinished { request_id } = msg {
+            if self
+                .bash_request
+                .as_ref()
+                .map(|request| request.id.as_str())
+                != Some(request_id.as_str())
+            {
+                return Cmd::none();
+            }
+            self.bash_request = None;
+            self.busy = None;
+            return self.handle_agent(PiMsg::AgentDone {
+                usage: None,
+                stop_reason: crate::model::StopReason::Stop,
+                error_message: None,
+            });
+        }
         if let PiMsg::McpAuthFinished {
             request_id,
             message,
@@ -3822,6 +3878,7 @@ impl PiFtuiModel {
         // extension command's own tool card (its ToolEnd/System reply is
         // what settles it).
         if self.mcp_auth_request.is_none()
+            && self.bash_request.is_none()
             && self.busy.as_ref().is_some_and(|op| op.handoff.is_none())
             && !matches!(
                 msg,
@@ -3841,9 +3898,12 @@ impl PiFtuiModel {
         match msg {
             PiMsg::HandoffFinished { .. }
             | PiMsg::McpAuthFinished { .. }
+            | PiMsg::BashFinished { .. }
             | PiMsg::FtuiToolProgress(_) => return Cmd::none(),
             PiMsg::AgentError(message)
-                if self.handoff_in_progress() || self.mcp_auth_request.is_some() =>
+                if self.handoff_in_progress()
+                    || self.mcp_auth_request.is_some()
+                    || self.bash_request.is_some() =>
             {
                 // An unrelated background failure must not dismiss a native
                 // before-compaction hook's active question or capability card.
@@ -3969,8 +4029,10 @@ impl PiFtuiModel {
                 error_message,
                 ..
             } => {
-                let handoff_running = self.handoff_in_progress() || self.mcp_auth_request.is_some();
-                if !handoff_running {
+                let operation_running = self.handoff_in_progress()
+                    || self.mcp_auth_request.is_some()
+                    || self.bash_request.is_some();
+                if !operation_running {
                     self.dismiss_pending_interactions();
                 }
                 self.flush_stream();
@@ -3984,7 +4046,7 @@ impl PiFtuiModel {
                         usage.input, usage.output, usage.total_tokens
                     ));
                 }
-                if handoff_running {
+                if operation_running {
                     return Cmd::none();
                 }
                 self.state = AgentUiState::Ready;
@@ -4439,6 +4501,13 @@ impl PiFtuiModel {
         if self.login_pending.is_some() {
             return;
         }
+        if self.bash_request.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Bash is still running; press Escape to cancel it."),
+            );
+            return;
+        }
         if self.mcp_auth_request.is_some() {
             self.push_entry(
                 EntryRole::Error,
@@ -4810,6 +4879,13 @@ impl PiFtuiModel {
     }
 
     fn submit_owned_input(&mut self) {
+        if self.bash_request.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                String::from("Bash is still running; press Escape to cancel it."),
+            );
+            return;
+        }
         if self.mcp_auth_request.is_some() {
             self.push_entry(
                 EntryRole::Error,
@@ -4924,10 +5000,21 @@ impl PiFtuiModel {
             if command.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("usage: !<command>"));
             } else {
-                self.send_command(UiCommand::Bash {
+                let request = BashRequest::new();
+                self.bash_request = Some(request.clone());
+                self.begin_busy("Running bash (Escape to cancel) ...");
+                if !self.try_send_command(UiCommand::Bash {
                     command: command.to_string(),
                     exclude,
-                });
+                    request,
+                }) {
+                    self.bash_request = None;
+                    self.busy = None;
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from("Bash unavailable: the agent driver has stopped."),
+                    );
+                }
             }
             return;
         }
@@ -6043,6 +6130,10 @@ impl PiFtuiModel {
     }
 
     fn send_command(&self, command: UiCommand) {
+        let _ = self.try_send_command(command);
+    }
+
+    fn try_send_command(&self, command: UiCommand) -> bool {
         if let Some(tx) = &self.submit_tx {
             if let Some(slot) = &self.turn_control {
                 let mut state = slot
@@ -6054,8 +6145,9 @@ impl PiFtuiModel {
             }
             // A dead agent loop is not a UI error; the transcript echo above
             // still shows what was typed.
-            let _ = tx.send(command);
+            return tx.send(command).is_ok();
         }
+        false
     }
 
     /// Arm the busy indicator for a long out-of-turn driver operation
@@ -6088,9 +6180,14 @@ impl PiFtuiModel {
     /// Cancel an operator command that uses the driver's shared abort lane.
     fn abort_driver_operation(&mut self) -> bool {
         let abort = self
-            .mcp_auth_request
+            .bash_request
             .as_ref()
             .map(|request| request.abort.clone())
+            .or_else(|| {
+                self.mcp_auth_request
+                    .as_ref()
+                    .map(|request| request.abort.clone())
+            })
             .or_else(|| {
                 self.turn_abort.as_ref().and_then(|slot| {
                     slot.lock()
@@ -6132,6 +6229,9 @@ impl PiFtuiModel {
     /// provider stream, tool call, or independently admitted handoff.
     fn abort_before_quit(&mut self) {
         self.abort_handoff();
+        if let Some(request) = &self.bash_request {
+            request.abort.abort();
+        }
         abort_driver_work(self.turn_abort.as_ref(), self.turn_control.as_ref());
     }
 
@@ -6760,7 +6860,7 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::CursorUp))
                     .or_else(|| pick(AppAction::CursorDown));
                 let page = self.body_height().saturating_sub(1).max(1);
-                if self.handoff_in_progress()
+                if (self.handoff_in_progress() || self.bash_request.is_some())
                     && matches!(
                         action,
                         Some(
@@ -6774,7 +6874,9 @@ impl PiFtuiModel {
                 {
                     self.push_entry(
                         EntryRole::Error,
-                        String::from("Handoff is still running; press Escape to cancel it."),
+                        String::from(
+                            "The current operation is still running; press Escape to cancel it.",
+                        ),
                     );
                     return Cmd::none();
                 }
@@ -11854,36 +11956,47 @@ async fn run_bash_ui_command(
     command: &str,
     exclude: bool,
     extensions: Option<&crate::extensions::ExtensionManager>,
+    abort_signal: &crate::agent::AbortSignal,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<crate::session::SessionMessage> {
-    // Bracket the run with AgentStart/AgentDone (submit_bash_command
-    // parity: bubbletea flips to ToolRunning so the status region shows the
-    // running tool and the editor gates input). Without AgentStart the
-    // model stays Ready and "running bash" never renders.
+    // Start the running status immediately. The driver publishes the matching
+    // BashFinished only after saving the returned record, so cancellation and
+    // foreground admission stay owned through history completion.
     let _ = agent_tx.send(PiMsg::AgentStart);
     let _ = agent_tx.send(PiMsg::ToolStart {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
     });
-    let hooked = match extensions {
-        Some(manager) => manager.dispatch_user_bash(command, exclude, cwd).await,
-        None => Ok(None),
+    let hooked = if abort_signal.is_aborted() {
+        Err(crate::error::Error::Aborted)
+    } else {
+        match extensions {
+            Some(manager) => manager.dispatch_user_bash(command, exclude, cwd).await,
+            None => Ok(None),
+        }
     };
     let result = match hooked {
         Ok(Some(result)) => Ok(result),
         Ok(None) => {
-            crate::tools::run_bash_command(
+            let mut abort_requested = || abort_signal.is_aborted();
+            crate::tools::run_bash_command_with_control_timeout(
                 cwd,
                 shell.path.as_deref(),
                 shell.command_prefix.as_deref(),
                 command,
                 None,
-                None,
+                crate::tools::BashRunControl {
+                    abort_requested: &mut abort_requested,
+                    drain_timeout: Duration::from_secs(5),
+                },
             )
             .await
         }
         Err(err) => Err(err),
     };
+    let is_error = result
+        .as_ref()
+        .map_or(true, |result| result.cancelled || result.exit_code != 0);
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -11896,6 +12009,9 @@ async fn run_bash_ui_command(
             );
             let mut shown = display;
             let mut extra = std::collections::HashMap::new();
+            if let Some(capture) = &result.capture {
+                extra.insert("capture".to_string(), serde_json::json!(capture));
+            }
             if exclude {
                 shown.push_str("\n\n[Output excluded from model context]");
                 extra.insert(
@@ -11925,7 +12041,12 @@ async fn run_bash_ui_command(
                 is_error: true,
                 output: None,
             });
-            let _ = agent_tx.send(PiMsg::AgentError(format!("bash: {err}")));
+            let message = if matches!(err, crate::error::Error::Aborted) {
+                String::from("Bash command cancelled")
+            } else {
+                format!("bash: {err}")
+            };
+            let _ = agent_tx.send(PiMsg::AgentError(message));
             None
         }
     };
@@ -11933,18 +12054,52 @@ async fn run_bash_ui_command(
         let _ = agent_tx.send(PiMsg::ToolEnd {
             name: String::from("bash"),
             tool_id: String::from("ftui-bash"),
-            is_error: false,
+            is_error,
             // BashResult already folded the display into the card; a second
             // detail here would duplicate it.
             output: None,
         });
     }
-    let _ = agent_tx.send(PiMsg::AgentDone {
-        usage: None,
-        stop_reason: crate::model::StopReason::Stop,
-        error_message: None,
-    });
     output
+}
+
+/// Keep the cancellation owner published until output is recorded and the
+/// matching terminal event is queued. Shutdown seals the same publication lane.
+#[allow(clippy::too_many_arguments)]
+async fn run_bash_driver_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    request: BashRequest,
+    command: &str,
+    exclude: bool,
+    cwd: &std::path::Path,
+    shell: &BashUiShell,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
+) {
+    let _operation_abort =
+        queued_compaction::OperationAbort::publish(turn_abort, turn_control, &request.abort);
+    let abort_signal = request.abort.signal();
+    let extensions = handle.extension_manager().cloned();
+    if let Some(record) = run_bash_ui_command(
+        cwd,
+        shell,
+        command,
+        exclude,
+        extensions.as_ref(),
+        &abort_signal,
+        agent_tx,
+    )
+    .await
+        && let Err(err) = handle.record_bash_execution(record).await
+    {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "The command ran, but its result could not be saved to the session: {err}",
+        )));
+    }
+    let _ = agent_tx.send(PiMsg::BashFinished {
+        request_id: request.id,
+    });
 }
 
 /// Create the driver's agent session with the extension UI surface
@@ -12569,26 +12724,22 @@ pub fn run(
                                 }
                             }
                         }
-                        Ok(UiCommand::Bash { command, exclude }) => {
+                        Ok(UiCommand::Bash { command, exclude, request }) => {
                             // OMP's bash runner records the run and starts no
                             // turn: `!` output reaches the model with the next
                             // prompt, `!!` output is kept but never sent.
-                            let extensions = handle.extension_manager().cloned();
-                            if let Some(record) = run_bash_ui_command(
-                                &bash_cwd,
-                                &bash_shell,
+                            run_bash_driver_command(
+                                &mut handle,
+                                request,
                                 &command,
                                 exclude,
-                                extensions.as_ref(),
+                                &bash_cwd,
+                                &bash_shell,
                                 &agent_tx,
+                                &driver_turn_control,
+                                &driver_turn_abort,
                             )
-                            .await
-                                && let Err(err) = handle.record_bash_execution(record).await
-                            {
-                                let _ = agent_tx.send(PiMsg::AgentError(format!(
-                                    "The command ran, but its result could not be saved to the session: {err}",
-                                )));
-                            }
+                            .await;
                         }
                         Ok(UiCommand::Compact { instructions }) => {
                             run_compact_command(
@@ -13623,12 +13774,14 @@ mod tests {
                 .expect("start prepared session");
             template.workspace = handle.workspace();
             let (agent_tx, agent_rx) = mpsc::channel();
+            let (_, abort_signal) = crate::agent::AbortHandle::new();
             let output = run_bash_ui_command(
                 &bound,
                 &BashUiShell::default(),
                 "cat probe.txt && printf shell-completed > shell-result.txt",
                 true,
                 None,
+                &abort_signal,
                 &agent_tx,
             )
             .await;
@@ -22469,12 +22622,14 @@ mod tests {
             .build()
             .expect("runtime");
         let (agent_tx, _agent_rx) = mpsc::channel();
+        let (_, abort_signal) = crate::agent::AbortHandle::new();
         let output = runtime.block_on(run_bash_ui_command(
             dir.path(),
             &shell,
             "echo \"value=$PI_GH182\"",
             false,
             None,
+            &abort_signal,
             &agent_tx,
         ));
         let Some(crate::session::SessionMessage::BashExecution { output, extra, .. }) = output
@@ -22489,6 +22644,7 @@ mod tests {
             "true",
             true,
             None,
+            &abort_signal,
             &agent_tx,
         ));
         let Some(crate::session::SessionMessage::BashExecution { extra, .. }) = excluded else {
@@ -22513,6 +22669,7 @@ mod tests {
             "true",
             false,
             None,
+            &abort_signal,
             &agent_tx,
         ));
         assert!(output.is_none());
@@ -25419,6 +25576,235 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn escape_stops_native_bash_and_records_one_cancelled_execution() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(NativePromptProbe::default());
+        let mut handle = native_prompt_handle(Arc::clone(&provider));
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (_unused_tx, model_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let aborts: TurnAbortSlot = Arc::default();
+        let controls: TurnControlSlot = Arc::default();
+        let model = PiFtuiModel::new(model_rx)
+            .with_submit_channel(submit_tx)
+            .with_turn_abort(Arc::clone(&aborts))
+            .with_turn_control(Arc::clone(&controls));
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let shell_command = "printf before-abort; printf '%s' \"$$\" > shell.pid; \
+            sleep 15 & printf '%s' \"$!\" > child.pid; wait; printf leaked > leaked.txt";
+        type_str(&mut sim, &format!("!!{shell_command}"));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let UiCommand::Bash {
+            command,
+            exclude,
+            request,
+        } = submit_rx.try_recv().unwrap()
+        else {
+            panic!("expected queued shell command");
+        };
+        let signal = request.abort.signal();
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cancel = async {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while std::fs::read_to_string(directory.path().join("child.pid"))
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .is_none()
+                {
+                    assert!(Instant::now() < deadline, "shell must start");
+                    asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5))
+                        .await;
+                }
+                for event in agent_rx.try_iter() {
+                    sim.send(PiFtuiMsg::Agent(event));
+                }
+                assert_eq!(sim.model().state, AgentUiState::Working);
+                sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                assert!(signal.is_aborted());
+            };
+            let shell = BashUiShell::default();
+            let run = run_bash_driver_command(
+                &mut handle,
+                request,
+                &command,
+                exclude,
+                directory.path(),
+                &shell,
+                &agent_tx,
+                &controls,
+                &aborts,
+            );
+            futures::join!(run, cancel);
+        });
+        assert!(sim.model().bash_request.is_some());
+        assert!(aborts.lock().unwrap().is_none(), "driver retired its slot");
+        assert!(provider.calls.lock().unwrap().is_empty());
+        let session_store = handle.session_store();
+        let store = session_store.try_lock().unwrap();
+        let records = store
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::session::SessionEntry::Message(message) => match &message.message {
+                    crate::session::SessionMessage::BashExecution {
+                        output,
+                        cancelled,
+                        extra,
+                        ..
+                    } => Some((output, cancelled, extra)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].0.contains("before-abort"));
+        assert_eq!(*records[0].1, Some(true));
+        assert_eq!(records[0].2["excludeFromContext"], true);
+        drop(records);
+        drop(store);
+        assert!(!directory.path().join("leaked.txt").exists());
+        for name in ["shell.pid", "child.pid"] {
+            let pid =
+                std::fs::read_to_string(directory.path().join(name)).expect("started process");
+            let running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
+            });
+            assert!(!running, "cancelled process is still running: {pid}");
+        }
+        for event in agent_rx.try_iter() {
+            sim.send(PiFtuiMsg::Agent(event));
+        }
+        assert!(sim.model().bash_request.is_none());
+        assert!(sim.model().busy.is_none());
+        assert_eq!(sim.model().state, AgentUiState::Ready);
+        assert!(sim.model().transcript.iter().any(|entry| {
+            entry
+                .detail
+                .as_ref()
+                .is_some_and(|text| text.contains("command cancelled"))
+        }));
+    }
+
+    #[test]
+    fn queued_bash_keeps_exact_cancellation_and_terminal_ownership() {
+        for cancellation in ["escape", "ctrl-c", "quit", "shutdown-fence"] {
+            let directory = tempfile::tempdir().expect("workspace");
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let (_unused_tx, model_rx) = mpsc::channel();
+            let (submit_tx, submit_rx) = mpsc::channel();
+            let aborts: TurnAbortSlot = Arc::default();
+            let controls: TurnControlSlot = Arc::default();
+            let model = PiFtuiModel::new(model_rx)
+                .with_submit_channel(submit_tx)
+                .with_turn_abort(Arc::clone(&aborts))
+                .with_turn_control(Arc::clone(&controls));
+            let mut sim = ProgramSimulator::new(model);
+            sim.init();
+            type_str(&mut sim, "!printf must-not-run > native-started");
+            sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            let UiCommand::Bash {
+                command,
+                exclude,
+                request,
+            } = submit_rx.try_recv().unwrap()
+            else {
+                panic!("expected queued shell command");
+            };
+            let signal = request.abort.signal();
+            let (older_abort, older_signal) = crate::agent::AbortHandle::new();
+            *aborts.lock().unwrap() = Some(older_abort);
+            for event in [
+                PiMsg::BashFinished {
+                    request_id: "older-shell".to_string(),
+                },
+                PiMsg::System("previous command finished".to_string()),
+                PiMsg::AgentError("unrelated background error".to_string()),
+                PiMsg::AgentDone {
+                    usage: None,
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                },
+            ] {
+                sim.send(PiFtuiMsg::Agent(event));
+                assert_eq!(sim.model().bash_request.as_ref().unwrap().id, request.id);
+                assert!(sim.model().busy.is_some());
+            }
+            sim.model_mut().input.set_text("keep this draft");
+            sim.model_mut().submit_input();
+            assert_eq!(sim.model().input.text(), "keep this draft");
+            assert!(submit_rx.try_recv().is_err());
+            // These all happen before the Bash driver emits AgentStart.
+            match cancellation {
+                "escape" => {
+                    sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                }
+                "ctrl-c" => {
+                    sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
+                }
+                "quit" => sim.model_mut().abort_before_quit(),
+                _ => abort_driver_work(Some(&aborts), Some(&controls)),
+            }
+            if matches!(cancellation, "escape" | "ctrl-c") {
+                assert!(signal.is_aborted());
+                assert!(
+                    !older_signal.is_aborted(),
+                    "cancel targets the queued Bash owner"
+                );
+            }
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(run_bash_driver_command(
+                &mut handle,
+                request,
+                &command,
+                exclude,
+                directory.path(),
+                &BashUiShell::default(),
+                &agent_tx,
+                &controls,
+                &aborts,
+            ));
+            assert!(
+                signal.is_aborted(),
+                "shutdown also fences queued publication"
+            );
+            assert!(!directory.path().join("native-started").exists());
+            assert!(
+                handle
+                    .session_store()
+                    .try_lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert!(provider.calls.lock().unwrap().is_empty());
+            assert!(
+                sim.model().bash_request.is_some(),
+                "await matching terminal"
+            );
+            for event in agent_rx.try_iter() {
+                sim.send(PiFtuiMsg::Agent(event));
+            }
+            assert!(sim.model().bash_request.is_none());
+            assert!(sim.model().busy.is_none());
+            assert_eq!(sim.model().state, AgentUiState::Ready);
+            assert_eq!(sim.model().input.text(), "keep this draft");
+        }
+    }
+
     #[test]
     fn bang_routes_bash_command_and_result_renders() {
         let (_agent_tx, rx) = mpsc::channel();
@@ -25428,23 +25814,38 @@ mod tests {
         sim.init();
         type_str(&mut sim, "!echo hi");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(
-            submit_rx.try_recv().expect("routed"),
-            UiCommand::Bash {
-                command: "echo hi".into(),
-                exclude: false,
-            }
-        );
+        let UiCommand::Bash {
+            command,
+            exclude,
+            request,
+        } = submit_rx.try_recv().expect("routed")
+        else {
+            panic!("expected Bash command");
+        };
+        assert_eq!(command, "echo hi");
+        assert!(!exclude);
+        sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
+            display: "$ echo hi\nhi".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::BashFinished {
+            request_id: request.id,
+        }));
         // `!!` runs display-only (excluded from model context).
         type_str(&mut sim, "!!ls");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(
-            submit_rx.try_recv().expect("routed"),
-            UiCommand::Bash {
-                command: "ls".into(),
-                exclude: true,
-            }
-        );
+        let UiCommand::Bash {
+            command,
+            exclude,
+            request,
+        } = submit_rx.try_recv().expect("routed")
+        else {
+            panic!("expected excluded Bash command");
+        };
+        assert_eq!(command, "ls");
+        assert!(exclude);
+        sim.send(PiFtuiMsg::Agent(PiMsg::BashFinished {
+            request_id: request.id,
+        }));
         // Bare `!` errors locally.
         type_str(&mut sim, "!");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
@@ -25456,10 +25857,7 @@ mod tests {
                 .any(|e| e.role == EntryRole::Error && e.text.contains("usage: !")),
             "bare-bang usage error missing"
         );
-        // A BashResult renders into the transcript as a system entry.
-        sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
-            display: "$ echo hi\nhi".into(),
-        }));
+        // The completed BashResult remains in the transcript.
         let rendered = buffer_text(sim.capture_frame(40, 10), 40, 10);
         assert!(
             rendered.contains("echo hi"),

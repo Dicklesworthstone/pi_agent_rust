@@ -935,10 +935,13 @@ impl PiApp {
             self.finish_handoff_ui();
         }
         match msg {
-            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return None,
+            PiMsg::HandoffFinished { .. }
+            | PiMsg::McpAuthFinished { .. }
+            | PiMsg::BashFinished { .. } => return None,
             PiMsg::System(message) | PiMsg::AgentError(message)
                 if self.handoff_request_id.is_some()
                     || self.mcp_auth_request_id.is_some()
+                    || self.bash_running
                     || self.login_attempt.is_some() =>
             {
                 // Background notices cannot release an operator request's
@@ -1215,7 +1218,10 @@ impl PiApp {
                     add_usage(&mut self.total_usage, u);
                 }
 
-                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() {
+                if self.handoff_request_id.is_some()
+                    || self.mcp_auth_request_id.is_some()
+                    || self.bash_running
+                {
                     // A delayed terminal from an earlier turn may finalize its
                     // display, but it does not own this handoff's cancellation
                     // handle, hook dialogs, or foreground admission state.
@@ -1508,8 +1514,13 @@ impl PiApp {
             }
             PiMsg::BashResult { display } => {
                 self.bash_running = false;
+                self.abort_handle = None;
+                self.status_message = None;
                 self.current_tool = None;
+                self.current_tool_id = None;
+                self.current_tool_summary.clear();
                 self.agent_state = AgentState::Idle;
+                self.invalidate_input_cards_for_turn_end();
 
                 // `!cmd` output is raw terminal bytes; strip escapes/controls
                 // before it enters the transcript (bd-p45xh).
@@ -3737,6 +3748,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
         if self.handoff_request_id.is_some() {
             self.status_message = Some("Handoff is still running; Escape cancels it".to_string());
+            return None;
+        }
+        if self.bash_running {
+            self.status_message = Some("Bash is still running; Escape cancels it".to_string());
             return None;
         }
 

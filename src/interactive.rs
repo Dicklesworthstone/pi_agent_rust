@@ -2285,6 +2285,8 @@ pub enum PiMsg {
         request_id: String,
         event: Box<Self>,
     },
+    /// The FTUI Bash request owns its lane until execution and history work end.
+    BashFinished { request_id: String },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
     /// Display driver-submitted input that did not pass through the editor.
