@@ -323,12 +323,14 @@ pub(super) fn project(
     messages: &[Message],
     privacy: &AuxiliaryPrivacySnapshot,
 ) -> String {
-    let selected = &messages[messages.len().saturating_sub(MAX_MESSAGES)..];
-    let Some(privacy) = discovered_privacy(name, model, selected, privacy) else {
+    let Some(privacy) = discovered_privacy(name, model, messages, privacy) else {
         // An uninspected hidden field may contain the original assignment for
         // a visible bare echo. Withhold the whole snapshot on any scan limit.
         return encode(withheld());
     };
+    // A display tail is not a privacy boundary: older assignments must still
+    // protect visible echoes when the primary agent's vault is disabled.
+    let selected = &messages[messages.len().saturating_sub(MAX_MESSAGES)..];
     let mut retained = Vec::new();
     let mut input_bytes = name.len().saturating_add(model.len());
     let mut omitted = messages.len() > MAX_MESSAGES;
@@ -536,6 +538,62 @@ mod tests {
         let encoded = project("session", "model", &messages, &privacy());
         assert_masked(&encoded, secret);
         assert!(encoded.contains(OMITTED));
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap()["omitted"],
+            true
+        );
+    }
+
+    #[test]
+    fn hidden_assignment_before_the_display_tail_protects_a_visible_echo() {
+        let secret = "olderHiddenCredentialValue123456";
+        for source in [
+            tool(Vec::new(), Some(json!({"api_key": secret}))),
+            custom(&format!("API_KEY={secret}"), None),
+        ] {
+            let mut messages = vec![source];
+            messages.extend((0..MAX_MESSAGES).map(|_| user("Ordinary historical message.")));
+            messages.push(echo(secret));
+
+            // privacy() uses secrets.mode=off and an empty live-agent vault.
+            // Discovery must include the hidden source outside the shown tail.
+            let encoded = project("session", "model", &messages, &privacy());
+            assert_masked(&encoded, secret);
+            let snapshot = serde_json::from_str::<Value>(&encoded).unwrap();
+            assert_eq!(snapshot["messages"].as_array().unwrap().len(), MAX_MESSAGES);
+            assert_eq!(snapshot["omitted"], true);
+            assert!(!encoded.contains("private-extension-note"));
+            assert!(!encoded.contains("private-call-id"));
+        }
+    }
+
+    #[test]
+    fn history_outside_the_display_tail_still_obeys_complete_source_bounds() {
+        let secret = "unscannedOlderCredentialValue123456";
+        for source in [
+            user(format!("{}\nAPI_KEY={secret}", "x".repeat(MAX_INPUT_BYTES))),
+            custom(
+                "",
+                Some(Value::Array(vec![Value::Null; MAX_DISCOVERY_ITEMS + 1])),
+            ),
+        ] {
+            let mut messages = vec![source];
+            messages.extend((0..MAX_MESSAGES).map(|_| user("Ordinary message.")));
+            messages.push(echo(secret));
+
+            let encoded = project("session", "model", &messages, &privacy());
+            assert!(encoded.contains("Conversation withheld"));
+            assert!(!encoded.contains(secret));
+            assert!(!encoded.contains("Visible reply echoes"));
+        }
+
+        // Individually small messages must also share one discovery budget.
+        // The visible 48-message tail fits, but the complete source does not.
+        let messages = (0..100)
+            .map(|_| user("x".repeat(3 * 1024)))
+            .collect::<Vec<_>>();
+        let encoded = project("session", "model", &messages, &privacy());
+        assert!(encoded.contains("Conversation withheld"));
         assert_eq!(
             serde_json::from_str::<Value>(&encoded).unwrap()["omitted"],
             true
