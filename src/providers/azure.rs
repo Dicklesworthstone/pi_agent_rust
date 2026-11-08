@@ -394,77 +394,9 @@ impl Provider for AzureOpenAIProvider {
         let api = self.api().to_string();
         let provider = self.name().to_string();
 
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                loop {
-                    if let Some(event) = state.pending_events.pop_front() {
-                        return Some((Ok(event), state));
-                    }
-                    // A terminal frame can enqueue block-end events before Done.
-                    // Drain that queue even after the transport is finished.
-                    if state.done {
-                        return None;
-                    }
-
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            // Azure also sends "[DONE]" as final message
-                            if msg.data.trim() == "[DONE]" {
-                                state.finish_response();
-                                continue;
-                            }
-
-                            if let Err(e) = state.process_event(&msg.data) {
-                                state.done = true;
-                                return Some((Err(e), state));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
-                            // Skip them and keep reading the stream, but cap
-                            // consecutive occurrences to avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.done = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        // A clean transport EOF is not a successful Azure
-                        // OpenAI completion unless [DONE] was observed. The
-                        // agent loop retains partial content on this error.
-                        None => {
-                            state.done = true;
-                            return Some((
-                                Err(Error::api(
-                                    "Azure OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
-                                )),
-                                state,
-                            ));
-                        }
-                    }
-                }
-            },
-        );
+        let stream = StreamState::new(event_source, model, api, provider)
+            .with_usage_observer(options.usage_observer.clone())
+            .into_stream();
 
         Ok(Box::pin(stream))
     }
@@ -488,6 +420,7 @@ where
     finalized: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 struct ToolCallState {
@@ -522,7 +455,84 @@ where
             done: false,
             finalized: false,
             transient_error_count: 0,
+            usage_observer: None,
         }
+    }
+
+    fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
+        self.usage_observer = observer;
+        self
+    }
+
+    fn into_stream(self) -> impl Stream<Item = Result<StreamEvent>> {
+        stream::unfold(self, |mut state| async move {
+            loop {
+                if let Some(event) = state.pending_events.pop_front() {
+                    return Some((Ok(event), state));
+                }
+                // A terminal frame can enqueue block-end events before Done.
+                // Drain that queue even after the transport is finished.
+                if state.done {
+                    return None;
+                }
+
+                match state.event_source.next().await {
+                    Some(Ok(msg)) => {
+                        state.transient_error_count = 0;
+                        // Azure also sends "[DONE]" as final message
+                        if msg.data.trim() == "[DONE]" {
+                            state.finish_response();
+                            continue;
+                        }
+
+                        if let Err(e) = state.process_event(&msg.data) {
+                            state.done = true;
+                            return Some((Err(e), state));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // WriteZero, WouldBlock, and TimedOut errors are treated as transient.
+                        // Skip them and keep reading the stream, but cap
+                        // consecutive occurrences to avoid infinite loops.
+                        const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
+                        if e.kind() == std::io::ErrorKind::WriteZero
+                            || e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut
+                        {
+                            state.transient_error_count += 1;
+                            if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
+                                tracing::warn!(
+                                    kind = ?e.kind(),
+                                    count = state.transient_error_count,
+                                    "Transient error in SSE stream, continuing"
+                                );
+                                continue;
+                            }
+                            tracing::warn!(
+                                kind = ?e.kind(),
+                                "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
+                                 consecutive attempts, treating as fatal"
+                            );
+                        }
+                        state.done = true;
+                        let err = Error::sse(&e);
+                        return Some((Err(err), state));
+                    }
+                    // A clean transport EOF is not a successful Azure
+                    // OpenAI completion unless [DONE] was observed. The
+                    // agent loop retains partial content on this error.
+                    None => {
+                        state.done = true;
+                        return Some((
+                            Err(Error::api(
+                                "Azure OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
+                            )),
+                            state,
+                        ));
+                    }
+                }
+            }
+        })
     }
 
     fn record_error(&mut self, message: String) {
@@ -665,9 +675,21 @@ where
 
         // Process usage if present
         if let Some(usage) = chunk.usage {
-            self.partial.usage.input = usage.prompt_tokens;
+            let cached = usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or(0);
+            // Azure includes cache hits in prompt_tokens; Pi's input bucket
+            // excludes them so pricing never charges both input and cache rates.
+            self.partial.usage.input = usage.prompt_tokens.saturating_sub(cached);
+            self.partial.usage.cache_read = cached;
             self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
             self.partial.usage.total_tokens = usage.total_tokens;
+            // Usage-only frames need not emit a public event. Acknowledge the
+            // cumulative amount before another read can stall or be cancelled.
+            if let Some(observer) = &self.usage_observer {
+                observer.observe(&self.partial.usage)?;
+            }
         }
 
         if let Some(error) = chunk.error {
@@ -990,6 +1012,14 @@ struct AzureUsage {
     completion_tokens: Option<u64>,
     #[allow(dead_code)]
     total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<AzurePromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AzurePromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 // ============================================================================
@@ -1742,6 +1772,73 @@ mod tests {
             captured.headers.get("api-key").map(String::as_str),
             Some("azure-test-key")
         );
+    }
+
+    #[test]
+    fn test_stream_cache_discount_controls_shared_spend_admission() {
+        for (cached, input, expected_cost, exhausted) in [
+            (Some(1500), 500, 0.002_15, false),
+            (None, 2000, 0.004_4, true),
+        ] {
+            let mut usage = json!({
+                "prompt_tokens": 2000,
+                "completion_tokens": 100,
+                "total_tokens": 2100,
+            });
+            if let Some(cached) = cached {
+                usage["prompt_tokens_details"] = json!({"cached_tokens": cached});
+            }
+            let response = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"answer\"}},\"finish_reason\":\"stop\"}}]}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{usage}}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            let (url, captured) = spawn_test_server(200, "text/event-stream", &response);
+            let priced = std::sync::Arc::new(crate::providers::PricedProvider {
+                inner: std::sync::Arc::new(
+                    AzureOpenAIProvider::new("contoso", "billing-fixture").with_endpoint_url(url),
+                ),
+                cost: crate::provider::ModelCost {
+                    input: 2.0,
+                    output: 4.0,
+                    cache_read: 0.5,
+                    ..crate::provider::ModelCost::default()
+                },
+            });
+            let budget = crate::cost::CostBudget::new(None, Some(0.003), 0.0).unwrap();
+            let provider = crate::provider::guard_with_cost_budget(priced, budget.clone());
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let context = Context::default();
+                let options = StreamOptions {
+                    api_key: Some("azure-test-key".to_string()),
+                    ..Default::default()
+                };
+                let mut events = provider.stream(&context, &options).await.unwrap();
+                let mut done = 0;
+                while let Some(event) = events.next().await {
+                    if let StreamEvent::Done { message, .. } = event.expect("stream event") {
+                        done += 1;
+                        assert_eq!(message.usage.input, input);
+                        assert_eq!(message.usage.cache_read, cached.unwrap_or(0));
+                        assert_eq!(message.usage.output, 100);
+                        assert_eq!(message.usage.total_tokens, 2100);
+                        assert!((message.usage.cost.total - expected_cost).abs() < 1e-12);
+                    }
+                }
+                assert_eq!(done, 1);
+                if exhausted {
+                    assert!(matches!(
+                        provider.stream(&context, &options).await,
+                        Err(Error::CostCap { .. })
+                    ));
+                }
+            });
+            assert!((budget.spent() - expected_cost).abs() < 1e-12);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert_eq!(budget.admit().is_err(), exhausted);
+            assert!(captured.recv_timeout(Duration::from_secs(2)).is_ok());
+        }
     }
 
     #[test]

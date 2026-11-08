@@ -1,5 +1,12 @@
 use super::{AssistantMessage, ContentBlock, SseStream, StopReason, StreamEvent, StreamState};
+use crate::provider::{Context, ModelCost, Provider, StreamOptions};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 
 type TestState = StreamState<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>;
 
@@ -321,6 +328,251 @@ fn trailing_usage_and_terminal_event_order_are_preserved() {
         assert_eq!(message.usage.output, 3);
         assert_eq!(message.usage.total_tokens, 15);
     }
+}
+
+#[test]
+fn trailing_cached_usage_keeps_exclusive_input_buckets_and_context_total() {
+    let mut state = state();
+    feed(&mut state, json!({"content": "answer"}), Some("stop"));
+    state
+        .process_event(
+            r#"{"choices":[],"usage":{"prompt_tokens":2000,"completion_tokens":100,"total_tokens":2100,"prompt_tokens_details":{"cached_tokens":1500}}}"#,
+        )
+        .unwrap();
+    let message = done_message(&mut state);
+    assert_eq!(message.usage.input, 500);
+    assert_eq!(message.usage.cache_read, 1500);
+    assert_eq!(message.usage.output, 100);
+    assert_eq!(message.usage.total_tokens, 2100);
+    assert_eq!(message.usage.input + message.usage.cache_read, 2000);
+}
+
+#[test]
+fn missing_or_null_cache_details_do_not_reuse_an_earlier_snapshot() {
+    for details in [
+        None,
+        Some(Value::Null),
+        Some(json!({})),
+        Some(json!({"cached_tokens": null})),
+        Some(json!({"cached_tokens": 0})),
+    ] {
+        let mut state = state();
+        state
+            .process_event(
+                r#"{"choices":[],"usage":{"prompt_tokens":2000,"completion_tokens":100,"total_tokens":2100,"prompt_tokens_details":{"cached_tokens":1500}}}"#,
+            )
+            .unwrap();
+        let mut usage = json!({"prompt_tokens":2000,"completion_tokens":100,"total_tokens":2100});
+        if let Some(details) = details {
+            usage["prompt_tokens_details"] = details;
+        }
+        state
+            .process_event(&json!({"choices": [], "usage": usage}).to_string())
+            .unwrap();
+        let message = done_message(&mut state);
+        assert_eq!(message.usage.input, 2000);
+        assert_eq!(message.usage.cache_read, 0);
+        assert_eq!(message.usage.total_tokens, 2100);
+    }
+}
+
+#[test]
+fn oversized_cached_counts_cannot_underflow_input() {
+    let mut state = state();
+    state
+        .process_event(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":250}}}"#,
+        )
+        .unwrap();
+    let message = done_message(&mut state);
+    assert_eq!(message.usage.input, 0);
+    assert_eq!(message.usage.cache_read, 250);
+    assert_eq!(message.usage.total_tokens, 105);
+}
+
+struct UsageSource {
+    chunks: VecDeque<std::io::Result<Vec<u8>>>,
+    pending_at_end: bool,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Stream for UsageSource {
+    type Item = std::io::Result<Vec<u8>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.chunks.pop_front() {
+            Poll::Ready(Some(chunk))
+        } else if self.pending_at_end {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
+impl Drop for UsageSource {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+struct UsageWireProvider {
+    response: Mutex<Option<Vec<std::io::Result<Vec<u8>>>>>,
+    pending_at_end: bool,
+    dropped: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Provider for UsageWireProvider {
+    fn name(&self) -> &str {
+        "azure"
+    }
+
+    fn api(&self) -> &str {
+        "azure-openai"
+    }
+
+    fn model_id(&self) -> &str {
+        "billing-fixture"
+    }
+
+    fn model_cost(&self) -> Option<ModelCost> {
+        Some(ModelCost {
+            input: 1_000_000.0,
+            output: 2_000_000.0,
+            cache_read: 500_000.0,
+            ..ModelCost::default()
+        })
+    }
+
+    async fn stream(
+        &self,
+        _: &Context<'_>,
+        options: &StreamOptions,
+    ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>
+    {
+        let source = UsageSource {
+            chunks: self
+                .response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one wire request")
+                .into(),
+            pending_at_end: self.pending_at_end,
+            dropped: Arc::clone(&self.dropped),
+        };
+        Ok(Box::pin(
+            StreamState::new(
+                SseStream::new(source),
+                self.model_id().to_string(),
+                self.api().to_string(),
+                self.name().to_string(),
+            )
+            .with_usage_observer(options.usage_observer.clone())
+            .into_stream(),
+        ))
+    }
+}
+
+fn guarded_usage_wire(
+    chunks: Vec<std::io::Result<Vec<u8>>>,
+    pending_at_end: bool,
+) -> (Arc<dyn Provider>, crate::cost::CostBudget, Arc<AtomicBool>) {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = Arc::new(UsageWireProvider {
+        response: Mutex::new(Some(chunks)),
+        pending_at_end,
+        dropped: Arc::clone(&dropped),
+    });
+    let budget = crate::cost::CostBudget::new(None, Some(13.0), 0.0).unwrap();
+    (
+        crate::provider::guard_with_cost_budget(provider, budget.clone()),
+        budget,
+        dropped,
+    )
+}
+
+fn cached_usage_wire() -> Vec<u8> {
+    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n".to_vec()
+}
+
+#[test]
+fn usage_only_pending_stream_accounts_before_any_event_and_survives_cancellation() {
+    futures::executor::block_on(async {
+        let (provider, budget, dropped) = guarded_usage_wire(vec![Ok(cached_usage_wire())], true);
+        let mut events = provider
+            .stream(&Context::default(), &StreamOptions::default())
+            .await
+            .unwrap();
+        assert!(events.next().now_or_never().is_none());
+        assert_eq!(budget.snapshot().pending, 14.0);
+        assert_eq!(budget.spent(), 0.0);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(matches!(
+            provider
+                .stream(&Context::default(), &StreamOptions::default())
+                .await,
+            Err(crate::error::Error::CostCap { .. })
+        ));
+
+        drop(events);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(budget.spent(), 14.0);
+        assert_eq!(budget.snapshot().pending, 0.0);
+    });
+}
+
+#[test]
+fn duplicate_trailing_usage_survives_success_and_stream_failures_without_double_billing() {
+    futures::executor::block_on(async {
+        for outcome in ["done", "transport", "parser", "eof"] {
+            let mut chunks = vec![
+                Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec()),
+                Ok(cached_usage_wire()),
+                Ok(cached_usage_wire()),
+            ];
+            match outcome {
+                "done" => chunks.push(Ok(b"data: [DONE]\n\n".to_vec())),
+                "transport" => chunks.push(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "fixture reset",
+                ))),
+                "parser" => chunks.push(Ok(b"data: {broken json}\n\n".to_vec())),
+                _ => {}
+            }
+            let (provider, budget, dropped) = guarded_usage_wire(chunks, false);
+            let mut events = provider
+                .stream(&Context::default(), &StreamOptions::default())
+                .await
+                .unwrap();
+            let mut done = 0;
+            let mut errors = 0;
+            for _ in 0..12 {
+                let Some(event) = events.next().now_or_never().expect("finite ready source") else {
+                    break;
+                };
+                match event {
+                    Ok(StreamEvent::Done { message, .. }) => {
+                        done += 1;
+                        assert_eq!(message.usage.input, 4);
+                        assert_eq!(message.usage.cache_read, 8);
+                        assert_eq!(message.usage.output, 3);
+                        assert_eq!(message.usage.total_tokens, 15);
+                        assert_eq!(message.usage.cost.total, 14.0);
+                    }
+                    Err(_) => errors += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(done, usize::from(outcome == "done"), "{outcome}");
+            assert_eq!(errors, usize::from(outcome != "done"), "{outcome}");
+            drop(events);
+            assert!(dropped.load(Ordering::SeqCst), "{outcome}");
+            assert_eq!(budget.spent(), 14.0, "{outcome}");
+            assert_eq!(budget.snapshot().pending, 0.0, "{outcome}");
+        }
+    });
 }
 
 #[test]
