@@ -4569,7 +4569,7 @@ pub async fn run(
                 }
 
                 let run_id = uuid::Uuid::new_v4().to_string();
-                let (abort_tx, abort_rx) = oneshot::channel();
+                let (abort_tx, mut abort_rx) = oneshot::channel();
                 let origin_session_id = {
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
@@ -4598,23 +4598,31 @@ pub async fn run(
                 let extensions = rpc_extension_manager.clone();
 
                 runtime_handle.spawn(async move {
-                    // A `user_bash` hook may run the command itself (OMP's
-                    // bash runner consults it for every user command).
-                    let hooked = match &extensions {
-                        Some(manager) => manager.dispatch_user_bash(&command, false, &cwd).await,
-                        None => None,
-                    };
-                    let result = match hooked {
-                        Some(result) => Ok(result),
-                        None => {
-                            run_bash_rpc(
-                                &cwd,
-                                shell_path.as_deref(),
-                                command_prefix.as_deref(),
-                                &command,
-                                abort_rx,
-                            )
-                            .await
+                    // Hooks can execute the command themselves. A queued abort
+                    // must stop before that dispatch, not only before the
+                    // native fallback. Consuming the signal here terminates
+                    // this request; a later abort stays queued for fallback.
+                    let result = if abort_rx.try_recv().is_ok() || bash_cx.checkpoint().is_err() {
+                        Ok(crate::tools::bash_cancelled_before_start(None))
+                    } else {
+                        let hooked = match &extensions {
+                            Some(manager) => manager.dispatch_user_bash(&command, false, &cwd).await,
+                            None => None,
+                        };
+                        match hooked {
+                            // Once a hook has run, keep its actual result.
+                            // Cancellation must not replace or replay effects.
+                            Some(result) => Ok(result),
+                            None => {
+                                run_bash_rpc(
+                                    &cwd,
+                                    shell_path.as_deref(),
+                                    command_prefix.as_deref(),
+                                    &command,
+                                    abort_rx,
+                                )
+                                .await
+                            }
                         }
                     };
 
@@ -20000,6 +20008,154 @@ mod tests {
             assert_eq!(saved.3.get("capture"), Some(&capture));
             drop(in_tx);
             assert!(server.await.is_ok());
+        }));
+    }
+
+    #[test]
+    fn rpc_queued_bash_abort_skips_hook_effects_and_delivers_both_responses_at_eof() {
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for queued_abort in [false, true] {
+                let temp = tempfile::tempdir().expect("workspace");
+                let workspace = temp.path().canonicalize().expect("canonical workspace");
+                let extension_path = workspace.join("queued-bash.mjs");
+                std::fs::write(
+                    &extension_path,
+                    r#"export default function init(pi) {
+                        pi.on("user_bash", async () => {
+                            await pi.session("appendEntry", {
+                                customType: "rpc-bash-hook-entered",
+                                data: { executed: true }
+                            });
+                            return { result: {
+                                output: "hook completed", exitCode: 37,
+                                cancelled: false, truncated: false
+                            } };
+                        });
+                    }"#,
+                )
+                .expect("write observable user_bash hook");
+                let mut stored = Session::in_memory();
+                stored.header.cwd = workspace.display().to_string();
+                let mut agent_session = build_test_agent_session(stored);
+                agent_session
+                    .enable_extensions(&[], &workspace, None, &[extension_path])
+                    .await
+                    .expect("enable user_bash hook");
+                let session_store = Arc::clone(&agent_session.session);
+                let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
+                options.working_directory = Some(workspace.clone());
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(
+                        &cx,
+                        json!({
+                            "id": "queued-bash", "type": "bash",
+                            "command": "printf native > native-command-started",
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .expect("queue bash");
+                if queued_abort {
+                    in_tx
+                        .send(
+                            &cx,
+                            r#"{"id":"queued-abort","type":"abort_bash"}"#.to_string(),
+                        )
+                        .await
+                        .expect("queue abort before bash task is polled");
+                }
+                // Both inputs and EOF are ready before the current-thread
+                // runtime can first poll the spawned bash task. The control
+                // case proves the hook is installed and its write observable.
+                drop(in_tx);
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    Box::pin(run(agent_session, options, in_rx, out_tx)),
+                )
+                .await
+                .expect("EOF must drain queued bash")
+                .expect("RPC server result");
+
+                let responses = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .filter(|event| event["type"] == "response")
+                    .collect::<Vec<_>>();
+                let commands = responses
+                    .iter()
+                    .map(|response| response["command"].as_str().expect("response command"))
+                    .collect::<Vec<_>>();
+                if queued_abort {
+                    assert_eq!(commands, ["abort_bash", "bash"]);
+                    assert_ok(&responses[0], "abort_bash");
+                    assert_eq!(responses[0]["id"], "queued-abort");
+                } else {
+                    assert_eq!(commands, ["bash"]);
+                }
+                let response = responses.last().expect("terminal bash response after EOF");
+                assert_ok(response, "bash");
+                assert_eq!(response["id"], "queued-bash");
+                assert_eq!(response["data"]["cancelled"], queued_abort);
+                assert_eq!(
+                    response["data"]["exitCode"],
+                    if queued_abort { -1 } else { 37 }
+                );
+                assert_eq!(
+                    response["data"]["output"],
+                    if queued_abort {
+                        "(no output)"
+                    } else {
+                        "hook completed"
+                    }
+                );
+                assert!(
+                    !workspace.join("native-command-started").exists(),
+                    "neither a completed hook nor queued abort may run the native command"
+                );
+
+                let stored = session_store.lock(&cx).await.expect("completed session");
+                let hook_writes = stored
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry, SessionEntry::Custom(custom)
+                        if custom.custom_type == "rpc-bash-hook-entered")
+                    })
+                    .count();
+                assert_eq!(
+                    hook_writes,
+                    usize::from(!queued_abort),
+                    "hook dispatch side effect"
+                );
+                let executions = stored
+                    .entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let SessionEntry::Message(entry) = entry else {
+                            return None;
+                        };
+                        let SessionMessage::BashExecution { cancelled, .. } = &entry.message else {
+                            return None;
+                        };
+                        Some(*cancelled)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    executions,
+                    [Some(queued_abort)],
+                    "record one terminal execution"
+                );
+            }
         }));
     }
 

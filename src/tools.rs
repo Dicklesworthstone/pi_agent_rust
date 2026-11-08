@@ -9125,6 +9125,20 @@ pub(crate) struct BashRunControl<'a> {
     pub drain_timeout: Duration,
 }
 
+/// Report cancellation before any shell or extension hook has started.
+/// The caller supplies a normalized timeout: `None` means unlimited execution.
+#[must_use]
+pub(crate) fn bash_cancelled_before_start(timeout_secs: Option<u64>) -> BashRunResult {
+    assemble_bash_run_result(
+        BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2)),
+        Some(-1),
+        false,
+        true,
+        Some(BashCancellationReason::AmbientCancellation),
+        timeout_secs,
+    )
+}
+
 /// Run an explicitly controlled command without the foreground tool's default
 /// execution timeout or persistent shell transaction.
 pub(crate) async fn run_bash_command_with_control(
@@ -9168,9 +9182,6 @@ async fn run_bash_command_with_state(
     let drain_timeout = control
         .as_ref()
         .map_or(Duration::from_secs(5), |control| control.drain_timeout);
-    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
-    let mut bash_output = BashOutputState::new(max_chunks_bytes);
-    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
 
     // A request cancelled while queued must not launch a command with side
     // effects. Keep this before shell resolution and process creation.
@@ -9179,15 +9190,12 @@ async fn run_bash_command_with_state(
         .is_some_and(|control| (control.abort_requested)())
         || cx.checkpoint().is_err()
     {
-        return Ok(assemble_bash_run_result(
-            bash_output,
-            Some(-1),
-            false,
-            true,
-            Some(BashCancellationReason::AmbientCancellation),
-            timeout_secs,
-        ));
+        return Ok(bash_cancelled_before_start(timeout_secs));
     }
+    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
+    let mut bash_output = BashOutputState::new(max_chunks_bytes);
+    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
+
     let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),

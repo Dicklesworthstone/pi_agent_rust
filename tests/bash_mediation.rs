@@ -333,6 +333,7 @@ fn pty_always_grants_a_tty() {
     finish_case(&harness, case);
 }
 
+#[cfg(unix)]
 #[test]
 fn pty_preserves_stdout_stderr_order_through_clean_eof() {
     let case = "pty_preserves_stdout_stderr_order_through_clean_eof";

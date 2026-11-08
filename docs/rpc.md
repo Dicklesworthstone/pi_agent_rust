@@ -139,9 +139,10 @@ Send `abort_bash` to request cancellation while its response is pending:
 
 `abort_bash` acknowledges the request, including when no command is active.
 The terminal execution result arrives separately under the original `bash`
-request ID. A `user_bash` extension hook runs first and may supply that result;
-the native execution and cancellation guarantees below apply to the fallback
-runner, not to work performed by an extension hook.
+request ID. Already queued cancellation is checked before a `user_bash`
+extension hook can run. Otherwise, that hook runs first and may supply the
+result. An abort does not interrupt an already-running hook; the native
+execution and cancellation guarantees below apply to the fallback runner.
 
 Native RPC Bash uses the configured `shell_path` and `shell_command_prefix`
 in Pi's runtime working directory, with the shared proxy and non-interactive
