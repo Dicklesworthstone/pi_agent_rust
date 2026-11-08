@@ -45,6 +45,11 @@ enum Operation {
         sequence: u64,
         amount: f64,
     },
+    ObserveAuthoritative {
+        attempt: u64,
+        sequence: u64,
+        amount: f64,
+    },
     Finish {
         attempt: u64,
         sequence: u64,
@@ -131,6 +136,25 @@ impl CostRemoteAttempt for RemoteAttempt {
         })
     }
 
+    fn observe_authoritative(&mut self, cost: f64) -> Result<CostSnapshot> {
+        if self.finished {
+            return Err(ipc_error("COST_SETTLED", "model cost attempt is settled"));
+        }
+        validate_amount(cost)?;
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| ipc_error("COST_LIMIT", "cost attempt sequence exhausted"))?;
+        // Cleanup must retain this correction, including zero. An ambiguous
+        // exchange is never replayed; the owning parent retains its receipt.
+        self.known_cost = cost;
+        self.parent.exchange(Operation::ObserveAuthoritative {
+            attempt: self.attempt,
+            sequence: self.sequence,
+            amount: cost,
+        })
+    }
+
     fn finish(&mut self, cost: Option<f64>, deadline: Option<Instant>) -> Result<CostSnapshot> {
         if self.finished {
             return Err(ipc_error("COST_SETTLED", "model cost attempt is settled"));
@@ -169,6 +193,7 @@ struct ActiveAttempt {
     charge: CostAttempt,
     sequence: u64,
     amount: f64,
+    authoritative: bool,
 }
 
 struct SettledReceipt {
@@ -226,18 +251,30 @@ impl AttemptLedger {
                 charge,
                 sequence: 0,
                 amount: 0.0,
+                authoritative: false,
             },
         );
         Ok(budget.snapshot())
     }
 
-    #[allow(clippy::float_cmp)] // Identical receipts must replay exactly, without charging again.
     fn observe(
         &mut self,
         budget: &CostBudget,
         attempt: u64,
         sequence: u64,
         amount: f64,
+    ) -> Result<CostSnapshot> {
+        self.observe_snapshot(budget, attempt, sequence, amount, false)
+    }
+
+    #[allow(clippy::float_cmp)] // Receipt identity includes the amount and observation kind.
+    fn observe_snapshot(
+        &mut self,
+        budget: &CostBudget,
+        attempt: u64,
+        sequence: u64,
+        amount: f64,
+        authoritative: bool,
     ) -> Result<CostSnapshot> {
         validate_amount(amount)?;
         if sequence == 0 {
@@ -257,18 +294,27 @@ impl AttemptLedger {
             .active
             .get_mut(&attempt)
             .ok_or_else(|| ipc_error("COST_UNKNOWN", "cost attempt is not owned by this child"))?;
-        if sequence < active.sequence || (sequence == active.sequence && amount == active.amount) {
+        if sequence < active.sequence
+            || (sequence == active.sequence
+                && amount == active.amount
+                && authoritative == active.authoritative)
+        {
             return Ok(budget.snapshot());
         }
-        if sequence == active.sequence || amount < active.amount {
+        if sequence == active.sequence || (!authoritative && amount < active.amount) {
             return Err(ipc_error(
                 "COST_PROTOCOL",
                 "conflicting partial cost receipt",
             ));
         }
-        active.charge.observe(amount)?;
+        if authoritative {
+            active.charge.observe_authoritative(amount)?;
+        } else {
+            active.charge.observe(amount)?;
+        }
         active.sequence = sequence;
         active.amount = amount;
+        active.authoritative = authoritative;
         Ok(budget.snapshot())
     }
 
@@ -465,6 +511,11 @@ pub(super) fn dispatch_authenticated(
                 sequence,
                 amount,
             } => attempts.observe(budget, attempt, sequence, amount),
+            Operation::ObserveAuthoritative {
+                attempt,
+                sequence,
+                amount,
+            } => attempts.observe_snapshot(budget, attempt, sequence, amount, true),
             Operation::Finish {
                 attempt,
                 sequence,
@@ -950,6 +1001,107 @@ mod tests {
     }
 
     #[test]
+    fn corrected_bills_cross_nested_channels_before_settlement_and_survive_retirement() {
+        for corrected in [0.0, 0.25] {
+            let owner = AgentCx::for_testing_with_io();
+            let _current = owner.cx().clone().set_current_restricted();
+            let root = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let mut sibling = root.start_attempt().unwrap();
+            sibling.observe(0.25).unwrap();
+            let (middle_remote, _middle_server) = serve_budget(&root);
+            let middle = CostBudget::remote(Arc::new(middle_remote)).unwrap();
+            let (leaf_remote, leaf_server) = serve_budget(&middle);
+            let leaf = CostBudget::remote(Arc::new(leaf_remote)).unwrap();
+            let mut attempt = leaf.start_attempt().unwrap();
+            attempt.observe(1.0).unwrap();
+            assert_eq!(root.snapshot().pending, 1.25);
+            assert!(matches!(root.admit(), Err(Error::CostCap { .. })));
+
+            attempt.observe_authoritative(corrected).unwrap();
+            assert_eq!(root.spent(), 0.0);
+            assert_eq!(root.snapshot().pending, corrected + 0.25);
+            assert_eq!(middle.snapshot().pending, corrected + 0.25);
+            assert_eq!(leaf.snapshot().pending, corrected + 0.25);
+            root.admit().unwrap();
+
+            drop(leaf_server);
+            assert_eq!(root.spent(), corrected);
+            assert_eq!(root.snapshot().pending, 0.25);
+            drop(attempt);
+            assert_eq!(root.spent(), corrected);
+            drop(sibling);
+            assert_eq!(root.spent(), corrected + 0.25);
+            assert_eq!(root.snapshot().pending, 0.0);
+        }
+    }
+
+    #[test]
+    fn correction_receipts_order_both_kinds_and_cannot_reopen_settled_attempts() {
+        let parent = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        let (remote, _server) = serve_budget(&parent);
+        let send = |operation: serde_json::Value| {
+            exchange_frame(
+                remote.address,
+                &json!({"version": VERSION, "token": remote.token, "cost": operation}),
+            )
+        };
+        assert_eq!(send(json!({"operation":"begin", "attempt":7}))["status"], "ok");
+        assert_eq!(
+            send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}))["status"],
+            "ok"
+        );
+        let correction = json!({
+            "operation":"observeAuthoritative", "attempt":7, "sequence":2, "amount":0.25
+        });
+        assert_eq!(send(correction.clone())["status"], "ok");
+        let revision = parent.snapshot().revision;
+        assert_eq!(send(correction)["status"], "ok");
+        assert_eq!(parent.snapshot().revision, revision);
+        assert_eq!(
+            send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}))["status"],
+            "ok"
+        );
+        assert_eq!(
+            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":1, "amount":9.0}))["status"],
+            "ok"
+        );
+        for conflicting in [
+            json!({"operation":"observe", "attempt":7, "sequence":2, "amount":0.25}),
+            json!({"operation":"observeAuthoritative", "attempt":7, "sequence":2, "amount":0.0}),
+            json!({"operation":"observe", "attempt":7, "sequence":3, "amount":0.0}),
+            json!({"operation":"observeAuthoritative", "attempt":99, "sequence":1, "amount":0.0}),
+            json!({"operation":"observeAuthoritative", "attempt":7, "sequence":0, "amount":0.0}),
+        ] {
+            assert_eq!(send(conflicting)["status"], "error");
+            assert_eq!(parent.snapshot().pending, 0.25);
+        }
+        assert_eq!(
+            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":3, "amount":0.0}))["status"],
+            "ok"
+        );
+        assert_eq!(parent.snapshot().pending, 0.0);
+        assert_eq!(parent.spent(), 0.0);
+        assert_eq!(
+            send(json!({"operation":"finish", "attempt":7, "sequence":4, "amount":0.0}))["status"],
+            "ok"
+        );
+        assert_eq!(
+            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":3, "amount":2.0}))["status"],
+            "ok"
+        );
+        assert_eq!(
+            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":4, "amount":0.0}))["status"],
+            "error"
+        );
+        assert_eq!(
+            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":5, "amount":2.0}))["status"],
+            "error"
+        );
+        assert_eq!(parent.spent(), 0.0);
+        assert_eq!(parent.snapshot().pending, 0.0);
+    }
+
+    #[test]
     fn socket_attempt_receipts_are_idempotent_and_cannot_reopen_settled_charges() {
         let parent = CostBudget::new(None, Some(10.0), 0.0).unwrap();
         let (remote, _server) = serve_budget(&parent);
@@ -1083,6 +1235,11 @@ mod tests {
     impl CostRemoteAttempt for DeadlineRecordingAttempt {
         fn observe(&mut self, cost: f64) -> Result<CostSnapshot> {
             self.charge.observe(cost)?;
+            Ok(self.budget.snapshot())
+        }
+
+        fn observe_authoritative(&mut self, cost: f64) -> Result<CostSnapshot> {
+            self.charge.observe_authoritative(cost)?;
             Ok(self.budget.snapshot())
         }
 

@@ -480,20 +480,21 @@ impl CostAccounting {
                 .expect("active cost attempt")
                 .observe(f64::NAN);
         }
-        self.remember_cost(
-            usage.cost.total,
-            authoritative && (usage.cost.total > 0.0 || usage.has_explicit_billing()),
-        );
+        let authoritative =
+            authoritative && (usage.cost.total > 0.0 || usage.has_explicit_billing());
+        self.remember_cost(usage.cost.total, authoritative);
         if terminal {
             Ok(())
         } else {
             // The parent must own known partial usage before this stream can
             // be interrupted or its child process reaped. Terminal billing
             // replaces this estimate rather than charging it a second time.
-            self.attempt
-                .as_mut()
-                .expect("active cost attempt")
-                .observe(self.known_cost)
+            let attempt = self.attempt.as_mut().expect("active cost attempt");
+            if authoritative {
+                attempt.observe_authoritative(self.known_cost)
+            } else {
+                attempt.observe(self.known_cost)
+            }
         }
     }
 
@@ -1896,6 +1897,82 @@ mod tests {
                 observer: Mutex::new(None),
                 drops: Arc::new(AtomicUsize::new(0)),
             })
+        }
+
+        #[test]
+        fn authoritative_observer_updates_admission_while_the_public_stream_is_pending() {
+            struct PendingBill {
+                observer: Mutex<Option<UsageObserver>>,
+            }
+
+            #[async_trait]
+            impl Provider for PendingBill {
+                fn name(&self) -> &str {
+                    "pending-bill"
+                }
+                fn api(&self) -> &str {
+                    "test"
+                }
+                fn model_id(&self) -> &str {
+                    "observed"
+                }
+                async fn stream(
+                    &self,
+                    _context: &Context<'_>,
+                    options: &StreamOptions,
+                ) -> crate::error::Result<BoxedProviderStream> {
+                    *self.observer.lock().unwrap() = options.usage_observer.clone();
+                    Ok(Box::pin(futures::stream::pending()))
+                }
+            }
+
+            futures::executor::block_on(async {
+                for corrected in [0.0, 0.25] {
+                    let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
+                    let mut sibling = budget.start_attempt().unwrap();
+                    sibling.observe(0.5).unwrap();
+                    let probe = Arc::new(PendingBill {
+                        observer: Mutex::new(None),
+                    });
+                    let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                    let mut stream = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    let observer = probe.observer.lock().unwrap().clone().unwrap();
+                    observer.observe(&cost_message(2.0, 0).usage).unwrap();
+                    assert_eq!(budget.snapshot().pending, 2.5);
+                    assert!(matches!(budget.admit(), Err(crate::error::Error::CostCap { .. })));
+
+                    observer
+                        .observe_authoritative(&mut crate::model::Usage::default())
+                        .unwrap();
+                    assert_eq!(budget.snapshot().pending, 2.5, "unknown pricing is not a refund");
+                    let mut bill = crate::model::Usage {
+                        billing: Some(crate::model::BillingUsage::ReportedTotal {
+                            total: corrected,
+                        }),
+                        ..Default::default()
+                    };
+                    observer.observe_authoritative(&mut bill).unwrap();
+                    assert_eq!(bill.cost.total, corrected);
+                    assert_eq!(budget.snapshot().pending, corrected + 0.5);
+                    assert_eq!(budget.spent(), 0.0);
+                    budget.admit().unwrap();
+                    let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                    assert!(stream.as_mut().poll_next(&mut cx).is_pending());
+
+                    drop(stream);
+                    assert_eq!(budget.spent(), corrected);
+                    assert_eq!(budget.snapshot().pending, 0.5);
+                    let revision = budget.snapshot().revision;
+                    observer.observe(&cost_message(9.0, 0).usage).unwrap();
+                    observer.observe_authoritative(&mut bill).unwrap();
+                    assert_eq!(budget.snapshot().revision, revision);
+                    drop(sibling);
+                    assert_eq!(budget.spent(), corrected + 0.5);
+                }
+            });
         }
 
         fn assert_closed(probe: &Probe, budget: &crate::cost::CostBudget, cost: f64) {

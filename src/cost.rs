@@ -120,6 +120,10 @@ pub trait CostRemote: Send + Sync {
 /// outlive work cancellation, but cannot admit another request or alter limits.
 pub trait CostRemoteAttempt: Send {
     fn observe(&mut self, cost: f64) -> Result<CostSnapshot>;
+    /// Replace this live attempt's provisional amount with an acknowledged bill.
+    /// Implementations must order corrections with ordinary observations and
+    /// retain the corrected amount if the owning channel is later cancelled.
+    fn observe_authoritative(&mut self, cost: f64) -> Result<CostSnapshot>;
     /// `None` reports invalid billing and quarantines the owning account while
     /// retaining the last valid partial charge. This operation is never replayed.
     /// A supplied deadline bounds cleanup of a group of owned attempts, so
@@ -1089,9 +1093,24 @@ pub struct CostAttempt {
 }
 
 impl CostAttempt {
+    /// Retain the highest acknowledged provisional estimate for this request.
     pub fn observe(&mut self, cost: f64) -> Result<()> {
+        self.observe_snapshot(cost, false)
+    }
+
+    /// Correct this request's pending amount without settling or releasing its
+    /// ownership. A later drop charges the corrected bill exactly once.
+    pub fn observe_authoritative(&mut self, cost: f64) -> Result<()> {
+        self.observe_snapshot(cost, true)
+    }
+
+    #[allow(clippy::float_cmp)] // Identical cumulative snapshots require no new receipt.
+    fn observe_snapshot(&mut self, cost: f64, authoritative: bool) -> Result<()> {
         if self.settled {
             return Err(Error::session("model cost attempt is already settled"));
+        }
+        if self.invalid_usage {
+            return Err(Error::session("provider returned invalid model cost"));
         }
         if !cost.is_finite() || cost < 0.0 {
             self.invalid_usage = true;
@@ -1099,7 +1118,7 @@ impl CostAttempt {
                 .quarantine("provider returned invalid model cost");
             return Err(Error::session("provider returned invalid model cost"));
         }
-        if cost <= self.known_cost {
+        if cost == self.known_cost || (!authoritative && cost < self.known_cost) {
             return Ok(());
         }
         self.known_cost = cost;
@@ -1117,7 +1136,14 @@ impl CostAttempt {
                 *entry = cost;
                 state.changed()
             }
-            AttemptSource::Remote(remote) => self.budget.accept_remote(remote.observe(cost)),
+            AttemptSource::Remote(remote) => {
+                let result = if authoritative {
+                    remote.observe_authoritative(cost)
+                } else {
+                    remote.observe(cost)
+                };
+                self.budget.accept_remote(result)
+            }
         }
     }
 
@@ -1800,6 +1826,63 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_usage_corrects_only_its_owned_pending_charge_before_settlement() {
+        for corrected in [0.0, 0.25, 3.0] {
+            let budget = CostBudget::new(None, Some(2.0), 0.0).unwrap();
+            let mut first = budget.start_attempt().unwrap();
+            let mut sibling = budget.start_attempt().unwrap();
+            sibling.observe(0.5).unwrap();
+            first.observe(2.0).unwrap();
+            assert!(matches!(budget.admit(), Err(Error::CostCap { .. })));
+            let old = budget.snapshot();
+
+            first.observe_authoritative(corrected).unwrap();
+            let current = budget.snapshot();
+            assert_eq!(current.spent, 0.0, "a correction is not settlement");
+            assert_eq!(current.pending, corrected + 0.5);
+            assert!(current.revision > old.revision);
+            assert_eq!(budget.admit().is_ok(), corrected < 1.5);
+            first.observe_authoritative(corrected).unwrap();
+            assert_eq!(budget.snapshot().revision, current.revision);
+            budget.accept_remote(Ok(old)).unwrap();
+            assert_eq!(budget.snapshot().pending, corrected + 0.5);
+
+            first.observe(corrected / 2.0).unwrap();
+            assert_eq!(budget.snapshot().pending, corrected + 0.5);
+            drop(first);
+            assert_eq!(budget.spent(), corrected);
+            assert_eq!(budget.snapshot().pending, 0.5);
+            drop(sibling);
+            assert_eq!(budget.spent(), corrected + 0.5);
+            assert_eq!(budget.snapshot().pending, 0.0);
+        }
+    }
+
+    #[test]
+    fn invalid_corrections_cannot_refund_known_usage_or_reopen_a_settled_attempt() {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let mut attempt = budget.start_attempt().unwrap();
+            attempt.observe(2.0).unwrap();
+            assert!(attempt.observe_authoritative(invalid).is_err());
+            assert!(attempt.observe_authoritative(0.0).is_err());
+            assert_eq!(budget.snapshot().pending, 2.0);
+            assert!(budget.admit().is_err());
+            drop(attempt);
+            assert_eq!(budget.spent(), 2.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(budget.admit().is_err());
+        }
+
+        let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        let mut attempt = budget.start_attempt().unwrap();
+        attempt.finish(0.5).unwrap();
+        assert!(attempt.observe_authoritative(0.0).is_err());
+        assert_eq!(budget.spent(), 0.5);
+        assert_eq!(budget.snapshot().pending, 0.0);
+    }
+
+    #[test]
     fn dropped_attempts_preserve_known_usage_and_invalid_bills_do_not_refund_it() {
         let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
         let mut first = budget.start_attempt().unwrap();
@@ -1912,7 +1995,7 @@ mod tests {
                             total: 0.5,
                             ..Cost::default()
                         },
-                        billing: Some(BillingUsage::ReportedTotal { usd: 0.5 }),
+                        billing: Some(BillingUsage::ReportedTotal { total: 0.5 }),
                         ..Usage::default()
                     },
                     stop_reason: StopReason::Stop,
