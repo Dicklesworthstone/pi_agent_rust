@@ -595,6 +595,7 @@ impl Provider for OpenAIResponsesProvider {
             self.model.clone(),
             self.api().to_string(),
             self.name().to_string(),
+            options.usage_observer.clone(),
         ))
     }
 }
@@ -619,6 +620,7 @@ fn wire_stream<S>(
     model: String,
     api: String,
     provider: String,
+    usage_observer: Option<crate::provider::UsageObserver>,
 ) -> EventStream
 where
     S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
@@ -628,7 +630,8 @@ where
     } else {
         ResponsesEventStream::Sse(SseStream::new(source))
     };
-    let state = StreamState::new(event_source, model, api, provider);
+    let mut state = StreamState::new(event_source, model, api, provider);
+    state.usage_observer = usage_observer;
     let output = stream::unfold(Some(state), |active| async move {
         let mut state = active?;
         let mut ready_events = 0;
@@ -1110,6 +1113,9 @@ where
     terminal_outcome: Option<ResponseOutcome>,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    /// Billing must reach the session account when it arrives, even while
+    /// trailing response items delay the public terminal event.
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 impl<S> StreamState<S>
@@ -1141,6 +1147,7 @@ where
             tool_identities: ToolIdentities::default(),
             terminal_outcome: None,
             transient_error_count: 0,
+            usage_observer: None,
         }
     }
 
@@ -1157,21 +1164,14 @@ where
         &mut self,
         response: OpenAIResponsesDonePayload,
         event: ResponseTerminalEvent,
-    ) {
+    ) -> Result<()> {
         self.ensure_started();
-        self.partial.usage.input = response.usage.input_tokens;
-        self.partial.usage.output = response.usage.output_tokens;
-        self.partial.usage.total_tokens = response.usage.total_tokens.unwrap_or_else(|| {
-            response
-                .usage
-                .input_tokens
-                .saturating_add(response.usage.output_tokens)
-        });
+        self.record_usage(&response.usage)?;
         let outcome = match response.outcome(event) {
             Ok(outcome) => outcome,
             Err(message) => {
                 self.reject_tool_response(message.to_string());
-                return;
+                return Ok(());
             }
         };
         if self
@@ -1182,9 +1182,28 @@ where
             self.reject_tool_response(
                 "OpenAI Responses sent conflicting completion metadata".to_string(),
             );
-            return;
+            return Ok(());
         }
         self.terminal_outcome = Some(outcome);
+        Ok(())
+    }
+
+    fn record_usage(&mut self, usage: &OpenAIResponsesUsage) -> Result<()> {
+        // Replace the complete snapshot, including any earlier locally priced
+        // cost. Reusing that cost would mistake an estimate for a wire bill
+        // and prevent a later cumulative update from changing it.
+        self.partial.usage = Usage {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            total_tokens: usage
+                .total_tokens
+                .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.output_tokens)),
+            ..Usage::default()
+        };
+        if let Some(observer) = &self.usage_observer {
+            observer.observe_authoritative(&mut self.partial.usage)?;
+        }
+        Ok(())
     }
 
     fn finish_terminal_response(&mut self) -> bool {
@@ -1639,16 +1658,19 @@ where
                 }
             }
             OpenAIResponsesChunk::ResponseCompleted { response } => {
-                self.record_terminal_response(response, ResponseTerminalEvent::Completed);
+                self.record_terminal_response(response, ResponseTerminalEvent::Completed)?;
             }
             OpenAIResponsesChunk::ResponseDone { response } => {
-                self.record_terminal_response(response, ResponseTerminalEvent::Done);
+                self.record_terminal_response(response, ResponseTerminalEvent::Done)?;
             }
             OpenAIResponsesChunk::ResponseIncomplete { response } => {
-                self.record_terminal_response(response, ResponseTerminalEvent::Incomplete);
+                self.record_terminal_response(response, ResponseTerminalEvent::Incomplete)?;
             }
             OpenAIResponsesChunk::ResponseFailed { response } => {
                 self.ensure_started();
+                if let Some(usage) = &response.usage {
+                    self.record_usage(usage)?;
+                }
                 self.partial.stop_reason = StopReason::Error;
                 self.partial.error_message = Some(
                     response
@@ -2741,6 +2763,8 @@ enum OpenAIResponsesTerminalItem {
 struct OpenAIResponsesFailedPayload {
     #[serde(default)]
     error: Option<OpenAIResponsesFailedError>,
+    #[serde(default)]
+    usage: Option<OpenAIResponsesUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7328,6 +7352,7 @@ mod tests {
                     model.into(),
                     api.into(),
                     provider.into(),
+                    None,
                 ),
                 observation,
             )
@@ -7370,6 +7395,265 @@ mod tests {
                 "type": "response.completed",
                 "response": {"usage": {"input_tokens": input, "output_tokens": output, "total_tokens": input + output}}
             })
+        }
+
+        struct UsageHttpFixture {
+            provider: Arc<dyn Provider>,
+            budget: crate::cost::CostBudget,
+            options: StreamOptions,
+            requests: mpsc::Receiver<CapturedRequest>,
+        }
+
+        impl UsageHttpFixture {
+            fn new(mode: Mode, body: Vec<u8>, limit: f64) -> Self {
+                let content_type = if mode.ndjson {
+                    "application/x-ndjson"
+                } else {
+                    "text/event-stream"
+                };
+                let body = String::from_utf8(body).expect("UTF-8 fixture body");
+                let (base_url, requests) = spawn_test_server(200, content_type, &body);
+                let (model, api, provider) = mode.identity();
+                let transport = OpenAIResponsesProvider::new(model)
+                    .with_base_url(base_url)
+                    .with_provider_name(provider)
+                    .with_api_name(api)
+                    .with_codex_mode(mode.codex);
+                let provider = Arc::new(crate::providers::PricedProvider {
+                    inner: Arc::new(transport),
+                    cost: crate::provider::ModelCost {
+                        audio: None,
+                        input: 1_000_000.0,
+                        output: 1_000_000.0,
+                        cache_read: 1_000_000.0,
+                        cache_write: 1_000_000.0,
+                    },
+                });
+                let budget = crate::cost::CostBudget::new(None, Some(limit), 0.0).unwrap();
+                Self {
+                    provider: crate::provider::guard_with_cost_budget(provider, budget.clone()),
+                    budget,
+                    options: StreamOptions {
+                        api_key: Some(build_test_jwt("usage-fixture-account")),
+                        ..StreamOptions::default()
+                    },
+                    requests,
+                }
+            }
+
+            fn assert_request(&self) {
+                self.requests
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("real HTTP request");
+            }
+        }
+
+        #[test]
+        fn http_usage_reserves_before_public_terminal_and_survives_drop() {
+            for mode in MODES {
+                let fixture = UsageHttpFixture::new(mode, mode.events(&[completion(7, 3)]), 9.0);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    let Some(Ok(StreamEvent::Start { partial })) = output.next().await else {
+                        panic!("expected Start for {mode:?}");
+                    };
+                    mode.assert_identity(&partial);
+                    // Start is cloned before the completion frame's usage is
+                    // applied; only the private observer can reserve this bill.
+                    assert_eq!(partial.usage.total_tokens, 0);
+                    assert_eq!(partial.usage.cost.total, 0.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                    assert_eq!(fixture.budget.spent(), 0.0);
+                    assert!(matches!(
+                        fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 10.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                });
+                fixture.assert_request();
+            }
+        }
+
+        #[test]
+        fn http_failed_responses_preserve_optional_and_previously_reported_usage() {
+            for mode in MODES {
+                for usage_source in ["failure", "earlier", "none"] {
+                    let mut failure = json!({
+                        "type": "response.failed",
+                        "response": {"error": {"message": "fixture failure"}}
+                    });
+                    let mut frames = Vec::new();
+                    if usage_source == "failure" {
+                        failure["response"]["usage"] =
+                            completion(7, 3)["response"]["usage"].clone();
+                    } else if usage_source == "earlier" {
+                        frames.push(completion(7, 3));
+                    }
+                    frames.extend([failure, completion(99, 99)]);
+                    let expected = if usage_source == "none" { 0.0 } else { 10.0 };
+                    let fixture = UsageHttpFixture::new(mode, mode.events(&frames), 9.0);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            output.next().await,
+                            Some(Ok(StreamEvent::Start { .. }))
+                        ));
+                        assert_eq!(fixture.budget.snapshot().pending, expected);
+                        let Some(Ok(StreamEvent::Error { error, .. })) = output.next().await else {
+                            panic!("expected failure for {mode:?}/{usage_source}");
+                        };
+                        mode.assert_identity(&error);
+                        assert_eq!(error.error_message.as_deref(), Some("fixture failure"));
+                        assert_eq!(error.usage.cost.total, expected);
+                        assert_eq!(fixture.budget.spent(), expected);
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        assert!(matches!(output.next().now_or_never(), Some(None)));
+                        drop(output);
+                        assert_eq!(fixture.budget.spent(), expected);
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_semantic_rejection_keeps_usage_from_the_same_frame() {
+            for mode in MODES {
+                for invalid_status in ["in_progress", "incomplete"] {
+                    let mut frame = completion(7, 3);
+                    frame["response"]["status"] = json!(invalid_status);
+                    let fixture = UsageHttpFixture::new(
+                        mode,
+                        mode.events(&[frame, completion(99, 99)]),
+                        9.0,
+                    );
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        let Some(Ok(StreamEvent::Start { partial })) = output.next().await else {
+                            panic!("expected Start for {mode:?}/{invalid_status}");
+                        };
+                        assert_eq!(partial.usage.total_tokens, 0);
+                        assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                        let Some(Ok(StreamEvent::Error { error, .. })) = output.next().await else {
+                            panic!("invalid completion must remain rejected");
+                        };
+                        assert_eq!((error.usage.input, error.usage.output), (7, 3));
+                        assert_eq!(error.usage.cost.total, 10.0);
+                        assert_eq!(fixture.budget.spent(), 10.0);
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        assert!(matches!(output.next().now_or_never(), Some(None)));
+                        drop(output);
+                        assert_eq!(fixture.budget.spent(), 10.0);
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_decode_error_after_usage_settles_the_acknowledged_bill() {
+            for mode in MODES {
+                let mut body = mode.events(&[completion(7, 3)]);
+                body.extend(mode.frame("{"));
+                body.extend(mode.events(&[completion(99, 99)]));
+                let fixture = UsageHttpFixture::new(mode, body, 9.0);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                    let error = output.next().await.unwrap().expect_err("invalid JSON");
+                    assert!(error.to_string().contains("JSON parse error"));
+                    assert_eq!(fixture.budget.spent(), 10.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    assert!(matches!(output.next().now_or_never(), Some(None)));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 10.0);
+                });
+                fixture.assert_request();
+            }
+        }
+
+        #[test]
+        fn http_cumulative_usage_reprices_updates_and_settles_repeated_metadata_once() {
+            for mode in MODES {
+                let mut body = mode.events(&[
+                    completion(7, 3),
+                    completion(7, 3),
+                    completion(17, 9),
+                    completion(17, 9),
+                    text_delta("late text"),
+                ]);
+                body.extend(mode.frame("[DONE]"));
+                let fixture = UsageHttpFixture::new(mode, body, 25.0);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::TextStart { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 26.0);
+                    assert_eq!(fixture.budget.spent(), 0.0);
+                    assert!(matches!(
+                        fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    let events = terminal_events(&mut output).await;
+                    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                        panic!("expected completion for {mode:?}");
+                    };
+                    mode.assert_identity(message);
+                    assert_eq!((message.usage.input, message.usage.output), (17, 9));
+                    assert_eq!(message.usage.cost.total, 26.0);
+                    assert_eq!(fixture.budget.spent(), 26.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    assert!(matches!(output.next().now_or_never(), Some(None)));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 26.0);
+                });
+                fixture.assert_request();
+            }
         }
 
         fn text_delta(text: &str) -> Value {
