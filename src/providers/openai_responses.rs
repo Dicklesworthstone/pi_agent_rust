@@ -6,8 +6,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, BillingTokenCounts, BillingUsage, ContentBlock, Message, StopReason, StreamEvent,
-    TextContent, ThinkingContent, ToolCall, Usage, UserContent,
+    AssistantMessage, BillingTokenCounts, BillingUsage, ContentBlock, Message, StopReason,
+    StreamEvent, TextContent, ThinkingContent, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -2902,7 +2902,11 @@ impl OpenAIResponsesUsage {
         if let Some(lifetimes) =
             details.and_then(|details| details.cache_write_tokens_details.as_ref())
         {
-            if lifetimes.ttl_30m_tokens.checked_add(lifetimes.ttl_12h_tokens) != Some(written) {
+            if lifetimes
+                .ttl_30m_tokens
+                .checked_add(lifetimes.ttl_12h_tokens)
+                != Some(written)
+            {
                 return Err(inconsistent);
             }
             if lifetimes.ttl_12h_tokens > 0 {
@@ -7615,8 +7619,7 @@ mod tests {
                         "cached_tokens": 60, "cache_write_tokens": 30
                     });
                     if lifetime_details {
-                        frame["response"]["usage"]["input_tokens_details"]
-                            ["cache_write_tokens_details"] =
+                        frame["response"]["usage"]["input_tokens_details"]["cache_write_tokens_details"] =
                             json!({"ttl_30m_tokens": 30, "ttl_12h_tokens": 0});
                     }
                     let fixture = UsageHttpFixture::with_rates(
@@ -7725,10 +7728,7 @@ mod tests {
                             fixture.budget.admit().unwrap();
                         } else {
                             assert!(!message.usage.has_explicit_billing());
-                            assert!(matches!(
-                                fixture.budget.admit(),
-                                Err(Error::CostCap { .. })
-                            ));
+                            assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
                         }
                         assert_eq!(fixture.budget.spent(), expected);
                         assert_eq!(fixture.budget.snapshot().pending, 0.0);
@@ -7830,10 +7830,7 @@ mod tests {
                         ));
                         assert_eq!(message.usage.cost.total, 2.5);
                         assert_eq!(fixture.budget.spent(), 2.5);
-                        assert!(matches!(
-                            fixture.budget.admit(),
-                            Err(Error::CostCap { .. })
-                        ));
+                        assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
                     });
                     fixture.assert_request();
                 }
@@ -7930,11 +7927,8 @@ mod tests {
                 for invalid_status in ["in_progress", "incomplete"] {
                     let mut frame = completion(7, 3);
                     frame["response"]["status"] = json!(invalid_status);
-                    let fixture = UsageHttpFixture::new(
-                        mode,
-                        mode.events(&[frame, completion(99, 99)]),
-                        9.0,
-                    );
+                    let fixture =
+                        UsageHttpFixture::new(mode, mode.events(&[frame, completion(99, 99)]), 9.0);
                     let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
                     runtime.block_on(async {
                         let mut output = fixture

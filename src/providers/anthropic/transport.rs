@@ -436,7 +436,13 @@ pub(super) fn response_stream(
     usage_observer: Option<crate::provider::UsageObserver>,
 ) -> EventStream {
     let response = AgentHttpResponse::from_response(AgentCx::for_current_or_request(), response);
-    wire_stream(response.bytes_stream(), model, api, provider, usage_observer)
+    wire_stream(
+        response.bytes_stream(),
+        model,
+        api,
+        provider,
+        usage_observer,
+    )
 }
 
 /// Metadata and heartbeat frames do not yield a public event. Even if the
@@ -1846,7 +1852,12 @@ mod tests {
             _context: &Context<'_>,
             options: &StreamOptions,
         ) -> Result<EventStream> {
-            let source = self.source.lock().unwrap().take().expect("one wire request");
+            let source = self
+                .source
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one wire request");
             Ok(wire_stream(
                 source,
                 self.model_id().into(),
@@ -1904,12 +1915,8 @@ mod tests {
                         "output_tokens": 11
                     }}),
                 ];
-                let (provider, budget, dropped) = guarded_usage_wire(
-                    api,
-                    provider_name,
-                    vec![Ok(wire_bytes(frames))],
-                    true,
-                );
+                let (provider, budget, dropped) =
+                    guarded_usage_wire(api, provider_name, vec![Ok(wire_bytes(frames))], true);
                 let mut output = provider
                     .stream(&Context::default(), &StreamOptions::default())
                     .await
@@ -1993,15 +2000,9 @@ mod tests {
                         .unwrap();
                     let events = output.collect::<Vec<_>>().await;
                     if outcome == "done" {
-                        assert!(matches!(
-                            events.last(),
-                            Some(Ok(StreamEvent::Done { .. }))
-                        ));
+                        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { .. }))));
                     } else if outcome == "provider_error" {
-                        assert!(matches!(
-                            events.last(),
-                            Some(Ok(StreamEvent::Error { .. }))
-                        ));
+                        assert!(matches!(events.last(), Some(Ok(StreamEvent::Error { .. }))));
                     } else {
                         assert_terminal_error(&events);
                     }

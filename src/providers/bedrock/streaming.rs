@@ -1586,7 +1586,12 @@ mod tests {
             _context: &ProviderContext<'_>,
             options: &StreamOptions,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            let source = self.source.lock().unwrap().take().expect("one wire request");
+            let source = self
+                .source
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one wire request");
             Ok(from_bytes(
                 source,
                 self.model_id().into(),
@@ -1621,10 +1626,8 @@ mod tests {
     #[test]
     fn metadata_reserves_usage_before_eof_and_drop_settles_the_bill() {
         futures::executor::block_on(async {
-            let (provider, budget, dropped) = guarded_usage_wire(
-                vec![Ok([start(), stop(), usage_metadata()].concat())],
-                true,
-            );
+            let (provider, budget, dropped) =
+                guarded_usage_wire(vec![Ok([start(), stop(), usage_metadata()].concat())], true);
             let context = ProviderContext::default();
             let options = StreamOptions::default();
             let mut output = provider.stream(&context, &options).await.unwrap();
@@ -1651,7 +1654,12 @@ mod tests {
     fn acknowledged_metadata_survives_terminal_and_transport_failures_once() {
         futures::executor::block_on(async {
             for outcome in [
-                "done", "refused", "transport", "parser", "truncated", "exception",
+                "done",
+                "refused",
+                "transport",
+                "parser",
+                "truncated",
+                "exception",
             ] {
                 let reason = if outcome == "refused" {
                     "content_filtered"
