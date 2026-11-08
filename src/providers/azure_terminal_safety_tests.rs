@@ -390,6 +390,33 @@ fn oversized_cached_counts_cannot_underflow_input() {
     assert_eq!(message.usage.total_tokens, 105);
 }
 
+#[test]
+fn legacy_null_audio_and_optional_completion_counts_remain_compatible() {
+    for completion in [None, Some(Value::Null), Some(json!(0))] {
+        let mut usage = json!({
+            "prompt_tokens": 100,
+            "total_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": null, "audio_tokens": null},
+            "completion_tokens_details": {"audio_tokens": null},
+        });
+        if let Some(completion) = completion {
+            usage["completion_tokens"] = completion;
+        }
+        let mut state = state().with_model_cost(Some(usage_rates()));
+        state
+            .process_event(&json!({"choices": [], "usage": usage}).to_string())
+            .unwrap();
+        let mut message = done_message(&mut state);
+        usage_rates().price_usage(&mut message.usage).unwrap();
+        assert_eq!(message.usage.input, 100);
+        assert_eq!(message.usage.output, 0);
+        assert_eq!(message.usage.cache_read, 0);
+        assert_eq!(message.usage.cache_write, 0);
+        assert_eq!(message.usage.total_tokens, 100);
+        assert_eq!(message.usage.cost.total, 100.0);
+    }
+}
+
 struct UsageSource {
     chunks: VecDeque<std::io::Result<Vec<u8>>>,
     pending_at_end: bool,
@@ -420,6 +447,7 @@ struct UsageWireProvider {
     response: Mutex<Option<Vec<std::io::Result<Vec<u8>>>>>,
     pending_at_end: bool,
     dropped: Arc<AtomicBool>,
+    rates: Option<ModelCost>,
 }
 
 #[async_trait::async_trait]
@@ -437,12 +465,7 @@ impl Provider for UsageWireProvider {
     }
 
     fn model_cost(&self) -> Option<ModelCost> {
-        Some(ModelCost {
-            input: 1_000_000.0,
-            output: 2_000_000.0,
-            cache_read: 500_000.0,
-            ..ModelCost::default()
-        })
+        self.rates.clone()
     }
 
     async fn stream(
@@ -469,6 +492,7 @@ impl Provider for UsageWireProvider {
                 self.api().to_string(),
                 self.name().to_string(),
             )
+            .with_model_cost(self.rates.clone())
             .with_usage_observer(options.usage_observer.clone())
             .into_stream(),
         ))
@@ -479,13 +503,33 @@ fn guarded_usage_wire(
     chunks: Vec<std::io::Result<Vec<u8>>>,
     pending_at_end: bool,
 ) -> (Arc<dyn Provider>, crate::cost::CostBudget, Arc<AtomicBool>) {
+    guarded_usage_wire_with_rates(chunks, pending_at_end, Some(usage_rates()), 13.0)
+}
+
+fn usage_rates() -> ModelCost {
+    ModelCost {
+        input: 1_000_000.0,
+        output: 2_000_000.0,
+        cache_read: 500_000.0,
+        cache_write: 3_000_000.0,
+        ..ModelCost::default()
+    }
+}
+
+fn guarded_usage_wire_with_rates(
+    chunks: Vec<std::io::Result<Vec<u8>>>,
+    pending_at_end: bool,
+    rates: Option<ModelCost>,
+    cap: f64,
+) -> (Arc<dyn Provider>, crate::cost::CostBudget, Arc<AtomicBool>) {
     let dropped = Arc::new(AtomicBool::new(false));
     let provider = Arc::new(UsageWireProvider {
         response: Mutex::new(Some(chunks)),
         pending_at_end,
         dropped: Arc::clone(&dropped),
+        rates,
     });
-    let budget = crate::cost::CostBudget::new(None, Some(13.0), 0.0).unwrap();
+    let budget = crate::cost::CostBudget::new(None, Some(cap), 0.0).unwrap();
     (
         crate::provider::guard_with_cost_budget(provider, budget.clone()),
         budget,
@@ -495,6 +539,11 @@ fn guarded_usage_wire(
 
 fn cached_usage_wire() -> Vec<u8> {
     b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n".to_vec()
+}
+
+fn usage_wire(usage: &str) -> Vec<u8> {
+    // Do not round-trip through Value: duplicate fields are billing evidence.
+    format!("data: {{\"choices\":[],\"usage\":{usage}}}\n\n").into_bytes()
 }
 
 #[test]
@@ -572,6 +621,649 @@ fn duplicate_trailing_usage_survives_success_and_stream_failures_without_double_
             assert_eq!(budget.spent(), 14.0, "{outcome}");
             assert_eq!(budget.snapshot().pending, 0.0, "{outcome}");
         }
+    });
+}
+
+#[test]
+fn cache_writes_are_exclusive_and_acknowledged_before_cancellation() {
+    futures::executor::block_on(async {
+        for lifetimes in [
+            None,
+            Some(json!({"ttl_30m_tokens": 30, "ttl_12h_tokens": 0})),
+        ] {
+            let mut usage = json!({
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+            });
+            if let Some(lifetimes) = lifetimes {
+                usage["prompt_tokens_details"]["cache_write_tokens_details"] = lifetimes;
+            }
+            for complete in [false, true] {
+                let frame = usage_wire(&usage.to_string());
+                let mut chunks = vec![Ok(frame.clone()), Ok(frame)];
+                if complete {
+                    chunks.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                }
+                let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+                    chunks,
+                    !complete,
+                    Some(usage_rates()),
+                    149.0,
+                );
+                let mut events = provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                if complete {
+                    let mut done = 0;
+                    while let Some(event) = events.next().await {
+                        if let StreamEvent::Done { message, .. } = event.unwrap() {
+                            done += 1;
+                            assert_eq!(message.usage.input, 10);
+                            assert_eq!(message.usage.cache_read, 60);
+                            assert_eq!(message.usage.cache_write, 30);
+                            assert_eq!(message.usage.output, 10);
+                            assert_eq!(message.usage.total_tokens, 110);
+                            assert_eq!(message.usage.cost.input, 10.0);
+                            assert_eq!(message.usage.cost.cache_read, 30.0);
+                            assert_eq!(message.usage.cost.cache_write, 90.0);
+                            assert_eq!(message.usage.cost.output, 20.0);
+                            assert_eq!(message.usage.cost.total, 150.0);
+                        }
+                    }
+                    assert_eq!(done, 1);
+                } else {
+                    assert!(events.next().now_or_never().is_none());
+                    assert_eq!(budget.snapshot().pending, 150.0);
+                    assert_eq!(budget.spent(), 0.0);
+                }
+                assert!(matches!(
+                    provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await,
+                    Err(crate::error::Error::CostCap { .. })
+                ));
+                drop(events);
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert_eq!(budget.spent(), 150.0);
+            }
+        }
+    });
+}
+
+#[test]
+fn invalid_or_unpriceable_usage_quarantines_the_budget_without_losing_prior_spend() {
+    let invalid = [
+        "[0]",
+        "[7]",
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":[8]}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"completion_tokens_details":[0]}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1,"cache_write_tokens_details":[1,0]}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":3}}"#,
+        r#"{"prompt_tokens":18446744073709551615,"completion_tokens":0,"total_tokens":18446744073709551615,"prompt_tokens_details":{"cached_tokens":18446744073709551615,"cache_write_tokens":1}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":1,"total_tokens":10}"#,
+        r#"{"prompt_tokens":18446744073709551615,"completion_tokens":1,"total_tokens":0}"#,
+        r#"{"prompt_tokens":10,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":null}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":-1}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1.5}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":"1"}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":0}}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1,"cache_write_tokens_details":{"ttl_30m_tokens":18446744073709551615,"ttl_12h_tokens":2}}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1,"cache_write_tokens_details":{"ttl_30m_tokens":1}}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1,"cache_write_tokens_details":{"ttl_30m_tokens":1,"ttl_12h_tokens":0,"ttl_24h_tokens":1}}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"cache_write_tokens":1,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":1}}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"prompt_tokens_details":{"audio_tokens":1}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11,"completion_tokens_details":{"audio_tokens":1}}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":null}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":-1}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":"0"}"#,
+        r#"{"prompt_tokens":10,"prompt_tokens":1,"completion_tokens":0,"total_tokens":10}"#,
+        r#"{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":10,"cost":0}"#,
+    ];
+    futures::executor::block_on(async {
+        for invalid in invalid {
+            let acknowledged = b"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n".to_vec();
+            let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+                vec![
+                    Ok(acknowledged),
+                    Ok(usage_wire(invalid)),
+                    Ok(b"data: [DONE]\n\n".to_vec()),
+                ],
+                false,
+                Some(usage_rates()),
+                100.0,
+            );
+            let mut events = provider
+                .stream(&Context::default(), &StreamOptions::default())
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.next().await,
+                Some(Ok(StreamEvent::Start { .. }))
+            ));
+            assert_eq!(budget.snapshot().pending, 14.0);
+            assert!(
+                matches!(
+                    events.next().await,
+                    Some(Err(crate::error::Error::Session(_)))
+                ),
+                "accepted {invalid}"
+            );
+            assert!(events.next().await.is_none());
+            drop(events);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(budget.spent(), 14.0, "lost prior bill for {invalid}");
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(
+                budget.admit(),
+                Err(crate::error::Error::Session(_))
+            ));
+            assert!(matches!(
+                provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await,
+                Err(crate::error::Error::Session(_))
+            ));
+        }
+    });
+}
+
+#[test]
+fn cache_writes_need_a_positive_configured_rate_or_an_explicit_bill() {
+    futures::executor::block_on(async {
+        for rates in [
+            None,
+            Some(ModelCost::default()),
+            Some(ModelCost {
+                cache_write: 0.0,
+                ..usage_rates()
+            }),
+            Some(ModelCost {
+                cache_write: -1.0,
+                ..usage_rates()
+            }),
+            Some(ModelCost {
+                cache_write: f64::INFINITY,
+                ..usage_rates()
+            }),
+            Some(ModelCost {
+                cache_write: f64::NAN,
+                ..usage_rates()
+            }),
+        ] {
+            for bill in [None, Some(0.0), Some(5.0)] {
+                let mut usage = json!({
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "total_tokens": 110,
+                    "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+                });
+                if let Some(bill) = bill {
+                    usage["cost"] = json!(bill);
+                }
+                let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+                    vec![
+                        Ok(usage_wire(&usage.to_string())),
+                        Ok(b"data: [DONE]\n\n".to_vec()),
+                    ],
+                    false,
+                    rates.clone(),
+                    100.0,
+                );
+                let mut events = provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                let mut done = 0;
+                let mut errors = 0;
+                while let Some(event) = events.next().await {
+                    match event {
+                        Ok(StreamEvent::Done { message, .. }) => {
+                            done += 1;
+                            assert_eq!(message.usage.cost.total, bill.unwrap());
+                            assert!(matches!(
+                                message.usage.billing,
+                                Some(crate::model::BillingUsage::ReportedTotal { .. })
+                            ));
+                        }
+                        Ok(StreamEvent::Start { .. }) => {}
+                        Err(crate::error::Error::Session(_)) => errors += 1,
+                        event => panic!("unexpected event: {event:?}"),
+                    }
+                }
+                assert_eq!(done, usize::from(bill.is_some()));
+                assert_eq!(errors, usize::from(bill.is_none()));
+                drop(events);
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(budget.spent(), bill.unwrap_or(0.0));
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert_eq!(budget.admit().is_ok(), bill.is_some());
+            }
+        }
+    });
+}
+
+#[test]
+fn reported_bills_price_usage_when_counts_or_lifetimes_cannot() {
+    futures::executor::block_on(async {
+        for mut usage in [
+            json!({"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 11}}),
+            json!({"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10,
+                "prompt_tokens_details": {"cache_write_tokens": 5,
+                    "cache_write_tokens_details": {"ttl_30m_tokens": 2, "ttl_12h_tokens": 3}}}),
+            json!({"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11,
+                "prompt_tokens_details": {"audio_tokens": 2},
+                "completion_tokens_details": {"audio_tokens": 1}}),
+            json!({"prompt_tokens": "unknown"}),
+        ] {
+            for bill in [0.0, 7.0] {
+                usage["cost"] = json!(bill);
+                let (provider, budget, _) = guarded_usage_wire_with_rates(
+                    vec![
+                        Ok(usage_wire(&usage.to_string())),
+                        Ok(b"data: [DONE]\n\n".to_vec()),
+                    ],
+                    false,
+                    Some(usage_rates()),
+                    6.0,
+                );
+                let mut events = provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                let mut done = 0;
+                while let Some(event) = events.next().await {
+                    if let StreamEvent::Done { message, .. } = event.unwrap() {
+                        done += 1;
+                        assert_eq!(message.usage.cost.total, bill);
+                        assert!(matches!(
+                            message.usage.billing,
+                            Some(crate::model::BillingUsage::ReportedTotal { total }) if total == bill
+                        ));
+                    }
+                }
+                assert_eq!(done, 1);
+                assert_eq!(budget.spent(), bill);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert_eq!(budget.admit().is_ok(), bill < 6.0);
+            }
+        }
+    });
+}
+
+#[test]
+fn explicit_zero_bill_refunds_pending_spend_but_unknown_price_counts_do_not() {
+    futures::executor::block_on(async {
+        for rates in [None, Some(usage_rates())] {
+            for bill in [None, Some(0.0)] {
+                for complete in [false, true] {
+                    let first = b"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10,\"cost\":20}}\n\n".to_vec();
+                    let mut usage = json!({
+                        "prompt_tokens": 10,
+                        "completion_tokens": 0,
+                        "total_tokens": 10,
+                    });
+                    if let Some(bill) = bill {
+                        usage["cost"] = json!(bill);
+                    }
+                    let mut chunks = vec![Ok(first), Ok(usage_wire(&usage.to_string()))];
+                    if complete {
+                        chunks.push(Ok(b"data: [DONE]\n\n".to_vec()));
+                    }
+                    let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+                        chunks,
+                        !complete,
+                        rates.clone(),
+                        15.0,
+                    );
+                    let mut events = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        events.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert_eq!(budget.snapshot().pending, 20.0);
+                    assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::CostCap { .. })
+                    ));
+                    let expected = bill.unwrap_or(if rates.is_some() { 10.0 } else { 20.0 });
+                    if complete {
+                        assert!(matches!(
+                            events.next().await,
+                            Some(Ok(StreamEvent::Done { .. }))
+                        ));
+                        assert!(events.next().await.is_none());
+                    } else {
+                        assert!(events.next().now_or_never().is_none());
+                        assert_eq!(budget.snapshot().pending, expected);
+                    }
+                    assert_eq!(budget.admit().is_ok(), expected < 15.0);
+                    drop(events);
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert_eq!(budget.spent(), expected);
+                    assert_eq!(budget.snapshot().pending, 0.0);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn factory_passes_configured_write_rates_to_native_usage_normalization() {
+    const CHILD_ROOT: &str = "PI_AZURE_FACTORY_USAGE_CHILD";
+    const COMPLETE: &str = "AZURE_FACTORY_USAGE_COMPLETE";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        check_factory_write_usage(&std::path::PathBuf::from(root));
+        eprintln!("{COMPLETE}");
+        return;
+    }
+
+    // Isolate VCR and Azure environment settings from concurrent unit tests.
+    // Playback mode cannot fall through to an actual Azure network request.
+    let dir = tempfile::tempdir().expect("factory usage fixture");
+    write_factory_usage_fixture(dir.path());
+    let log_path = dir.path().join("child.log");
+    let log = std::fs::File::create(&log_path).expect("child diagnostics");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "providers::azure::terminal_safety_tests::factory_passes_configured_write_rates_to_native_usage_normalization",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, dir.path())
+        .env("VCR_MODE", "playback")
+        .env("VCR_CASSETTE_DIR", dir.path())
+        .env("PI_VCR_TEST_NAME", "azure_factory_write_usage")
+        .env("VCR_CHUNK_DELAY_MS", "0")
+        .env("PI_CODING_AGENT_DIR", dir.path().join("global"))
+        .env("AZURE_OPENAI_RESOURCE", "contoso")
+        .env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+        .env_remove("AZURE_OPENAI_DEPLOYMENT")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("clone child diagnostics"))
+        .stderr(log)
+        .spawn()
+        .expect("isolated Azure factory regression");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(format!("polling child failed: {error}")),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                break Err("child exceeded its 30-second deadline".to_string());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let trace = std::fs::read_to_string(&log_path).expect("read child diagnostics");
+    let status = result.unwrap_or_else(|reason| panic!("{reason}\n{trace}"));
+    assert!(status.success(), "Azure factory regression failed:\n{trace}");
+    assert!(
+        trace.contains(COMPLETE),
+        "child did not execute the test:\n{trace}"
+    );
+}
+
+fn write_factory_usage_fixture(root: &std::path::Path) {
+    let mut models = Vec::new();
+    let mut interactions = Vec::new();
+    for id in ["configured", "omitted", "zero-rate", "explicit-free"] {
+        let mut cost = json!({"input": 1_000_000, "output": 2_000_000, "cacheRead": 500_000});
+        if id == "configured" {
+            cost["cacheWrite"] = json!(3_000_000);
+        } else if id != "omitted" {
+            cost["cacheWrite"] = json!(0);
+        }
+        models.push(json!({"id": id, "cost": cost}));
+        let mut usage = json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+            "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+        });
+        if id == "explicit-free" {
+            usage["cost"] = json!(0);
+        }
+        interactions.push(json!({
+            "request": {
+                "method": "POST",
+                "url": format!("https://contoso.openai.azure.com/openai/deployments/{id}/chat/completions?api-version=2024-12-01-preview"),
+                "headers": [],
+            },
+            "response": {
+                "status": 200,
+                "headers": [["content-type", "text/event-stream"]],
+                "body_chunks": [
+                    String::from_utf8(usage_wire(&usage.to_string())).unwrap(),
+                    "data: [DONE]\n\n",
+                ],
+            },
+        }));
+    }
+    let config = json!({"providers": {"azure-openai": {
+        "api": "azure-openai",
+        "baseUrl": "https://contoso.openai.azure.com",
+        "models": models,
+    }}});
+    std::fs::write(root.join("models.json"), serde_json::to_vec(&config).unwrap())
+        .expect("write models fixture");
+    let cassette = json!({
+        "version": "1.0",
+        "test_name": "azure_factory_write_usage",
+        "recorded_at": "2026-11-08T00:00:00Z",
+        "interactions": interactions,
+    });
+    std::fs::write(
+        root.join("azure_factory_write_usage.json"),
+        serde_json::to_vec(&cassette).unwrap(),
+    )
+    .expect("write playback fixture");
+}
+
+fn check_factory_write_usage(root: &std::path::Path) {
+    let registry = crate::models::ModelRegistry::load_with_credential_resolver(
+        Some(root.join("models.json")),
+        |_| None,
+    );
+    assert!(registry.error().is_none(), "{:?}", registry.error());
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for (id, bill) in [
+            ("configured", Some(150.0)),
+            ("omitted", None),
+            ("zero-rate", None),
+            ("explicit-free", Some(0.0)),
+        ] {
+            let entry = registry.find("azure-openai", id).expect("fixture model");
+            let transport = crate::providers::create_provider(&entry, None).expect("Azure factory");
+            let budget = crate::cost::CostBudget::new(None, Some(149.0), 0.0).unwrap();
+            let provider = crate::provider::guard_with_cost_budget(transport, budget.clone());
+            let context = Context::default();
+            let options = StreamOptions {
+                api_key: Some("azure-fixture-key".to_string()),
+                ..StreamOptions::default()
+            };
+            let mut events = provider.stream(&context, &options).await.unwrap();
+            let mut done = 0;
+            let mut errors = 0;
+            while let Some(event) = events.next().await {
+                match event {
+                    Ok(StreamEvent::Done { message, .. }) => {
+                        done += 1;
+                        assert_eq!(message.usage.input, 10, "{id}");
+                        assert_eq!(message.usage.cache_write, 30, "{id}");
+                        assert_eq!(message.usage.cache_read, 60, "{id}");
+                        assert_eq!(message.usage.total_tokens, 110, "{id}");
+                        assert_eq!(message.usage.cost.total, bill.unwrap(), "{id}");
+                    }
+                    Ok(StreamEvent::Start { .. }) => {}
+                    Err(crate::error::Error::Session(_)) => errors += 1,
+                    event => panic!("unexpected {id} event: {event:?}"),
+                }
+            }
+            assert_eq!(done, usize::from(bill.is_some()), "{id}");
+            assert_eq!(errors, usize::from(bill.is_none()), "{id}");
+            assert_eq!(budget.spent(), bill.unwrap_or(0.0), "{id}");
+            assert_eq!(budget.snapshot().pending, 0.0, "{id}");
+            match bill {
+                None => assert!(matches!(
+                    budget.admit(),
+                    Err(crate::error::Error::Session(_))
+                )),
+                Some(total) if total >= 149.0 => {
+                    assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::CostCap { .. })
+                    ));
+                }
+                Some(_) => assert!(budget.admit().is_ok()),
+            }
+        }
+    });
+}
+
+#[test]
+fn duplicate_outer_usage_fields_quarantine_spend_even_when_one_is_null() {
+    let duplicate = [
+        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":10},"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":0}}"#,
+        r#"{"choices":[],"usage":null,"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":0}}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10,"cost":0},"usage":null}"#,
+        r#"{"choices":[],"usage":null,"usage":null}"#,
+    ];
+    futures::executor::block_on(async {
+        for frame in duplicate {
+            let acknowledged = b"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n".to_vec();
+            let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+                vec![
+                    Ok(acknowledged),
+                    Ok(format!("data: {frame}\n\n").into_bytes()),
+                    Ok(b"data: [DONE]\n\n".to_vec()),
+                ],
+                false,
+                Some(usage_rates()),
+                100.0,
+            );
+            let mut events = provider
+                .stream(&Context::default(), &StreamOptions::default())
+                .await
+                .unwrap();
+            assert!(matches!(
+                events.next().await,
+                Some(Ok(StreamEvent::Start { .. }))
+            ));
+            assert_eq!(budget.snapshot().pending, 14.0);
+            assert!(
+                matches!(
+                    events.next().await,
+                    Some(Err(crate::error::Error::Session(_)))
+                ),
+                "accepted duplicate envelope {frame}"
+            );
+            assert!(events.next().await.is_none());
+            drop(events);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(budget.spent(), 14.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(
+                budget.admit(),
+                Err(crate::error::Error::Session(_))
+            ));
+        }
+    });
+}
+
+#[test]
+fn valid_bills_survive_malformed_choices_or_error_siblings() {
+    futures::executor::block_on(async {
+        for sibling in [
+            r#""choices":null"#,
+            r#""choices":{}"#,
+            r#""choices":[{"delta":"invalid"}]"#,
+            r#""error":"invalid""#,
+        ] {
+            for bill in [0.0, 7.0] {
+                let acknowledged = b"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10,\"cost\":20}}\n\n".to_vec();
+                let usage = json!({
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "total_tokens": 10,
+                    "cost": bill,
+                });
+                let frame = format!("data: {{{sibling},\"usage\":{usage}}}\n\n").into_bytes();
+                let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+                    vec![Ok(acknowledged), Ok(frame)],
+                    false,
+                    Some(usage_rates()),
+                    15.0,
+                );
+                let mut events = provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    events.next().await,
+                    Some(Ok(StreamEvent::Start { .. }))
+                ));
+                assert_eq!(budget.snapshot().pending, 20.0);
+                let error = events.next().await.unwrap().unwrap_err();
+                assert!(error.to_string().contains("JSON parse error"), "{error}");
+                assert!(events.next().await.is_none());
+                drop(events);
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(budget.spent(), bill, "{sibling}");
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert!(budget.admit().is_ok());
+            }
+        }
+    });
+}
+
+#[test]
+fn missing_or_null_usage_envelopes_preserve_acknowledged_spend() {
+    futures::executor::block_on(async {
+        let acknowledged = b"data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10,\"cost\":20}}\n\n".to_vec();
+        let (provider, budget, dropped) = guarded_usage_wire_with_rates(
+            vec![
+                Ok(acknowledged),
+                Ok(b"data: {\"choices\":[]}\n\n".to_vec()),
+                Ok(b"data: {\"choices\":[],\"usage\":null}\n\n".to_vec()),
+            ],
+            true,
+            Some(usage_rates()),
+            15.0,
+        );
+        let mut events = provider
+            .stream(&Context::default(), &StreamOptions::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(StreamEvent::Start { .. }))
+        ));
+        assert!(events.next().now_or_never().is_none());
+        assert_eq!(budget.snapshot().pending, 20.0);
+        drop(events);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(budget.spent(), 20.0);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert!(matches!(
+            budget.admit(),
+            Err(crate::error::Error::CostCap { .. })
+        ));
     });
 }
 

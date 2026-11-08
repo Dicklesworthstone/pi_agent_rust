@@ -32,6 +32,34 @@ This rule is guarded by `tests/traceability_staleness.rs::native_provider_module
 
 Extension-provided providers route through the extension provider bridge in `src/providers/mod.rs`; they are intentionally excluded from the native module count because they are discovered at runtime.
 
+## Azure Usage and Cache-Write Pricing
+
+Azure Chat Completions usage keeps ordinary input, cache reads, and cache writes
+in separate billing buckets while preserving the provider's context-token total.
+The native adapter reads `prompt_tokens_details.cache_write_tokens` and uses the
+selected model's `cost.cacheWrite` rate in USD per million tokens. Writes are
+subtracted from ordinary input before pricing. The rate must be finite and
+positive when writes are reported; Pi does not infer an Azure deployment's price
+from its name or multiply its input rate. This follows the
+[Azure usage fields](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/prompt-caching)
+and [OpenAI cache billing semantics](https://developers.openai.com/api/docs/guides/prompt-caching).
+
+The legacy model catalog stores both an omitted write rate and an explicitly
+zero write rate as `0`, so neither proves that reported writes are free. If a
+compatible endpoint supplies a finite, nonnegative USD `usage.cost`, that bill
+is authoritative, including zero. Complete priced snapshots and explicit bills
+replace earlier pending estimates before stream cancellation or completion.
+Positive token counts with unknown prices cannot erase an earlier USD charge.
+
+The catalog's single write rate covers ordinary 30-minute writes. A reported
+12-hour write component, unknown lifetime breakdown, audio usage, or inconsistent
+token partition requires an explicit bill; otherwise cost accounting becomes
+unavailable and refuses further model requests while retaining acknowledged
+spend. Missing or null legacy cache-read details still mean zero cached tokens.
+The adapter does not translate the generic cache-retention preference into Azure
+request fields: Azure's supported controls depend on the model and API, and
+minimum cache lifetime differs from maximum retention policy.
+
 ## Gateway Reasoning Discovery
 
 `--fetch-models <provider> --refresh-models --persist-models` retains an

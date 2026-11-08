@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 
+mod usage;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -102,6 +104,7 @@ pub struct AzureOpenAIProvider {
     /// Deployment names are arbitrary; use the registry's model capability,
     /// never the deployment name, to select reasoning request fields.
     reasoning: bool,
+    model_cost: Option<crate::provider::ModelCost>,
 }
 
 impl AzureOpenAIProvider {
@@ -120,6 +123,7 @@ impl AzureOpenAIProvider {
             endpoint_url_override: None,
             compat: None,
             reasoning: false,
+            model_cost: None,
         }
     }
 
@@ -131,6 +135,13 @@ impl AzureOpenAIProvider {
     #[must_use]
     pub const fn with_reasoning(mut self, reasoning: bool) -> Self {
         self.reasoning = reasoning;
+        self
+    }
+
+    /// Bind usage normalization to the selected deployment's configured rates.
+    #[must_use]
+    pub fn with_model_cost(mut self, cost: crate::provider::ModelCost) -> Self {
+        self.model_cost = Some(cost);
         self
     }
 
@@ -301,6 +312,13 @@ impl Provider for AzureOpenAIProvider {
         &self.deployment
     }
 
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        self.model_cost
+            .as_ref()
+            .filter(|cost| cost.is_priced())
+            .cloned()
+    }
+
     async fn stream(
         &self,
         context: &Context<'_>,
@@ -395,6 +413,7 @@ impl Provider for AzureOpenAIProvider {
         let provider = self.name().to_string();
 
         let stream = StreamState::new(event_source, model, api, provider)
+            .with_model_cost(self.model_cost.clone())
             .with_usage_observer(options.usage_observer.clone())
             .into_stream();
 
@@ -421,6 +440,7 @@ where
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
     usage_observer: Option<crate::provider::UsageObserver>,
+    model_cost: Option<crate::provider::ModelCost>,
 }
 
 struct ToolCallState {
@@ -456,7 +476,13 @@ where
             finalized: false,
             transient_error_count: 0,
             usage_observer: None,
+            model_cost: None,
         }
+    }
+
+    fn with_model_cost(mut self, cost: Option<crate::provider::ModelCost>) -> Self {
+        self.model_cost = cost;
+        self
     }
 
     fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
@@ -670,27 +696,24 @@ where
 
     #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: AzureStreamChunk = serde_json::from_str(data)
-            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
-
-        // Process usage if present
-        if let Some(usage) = chunk.usage {
-            let cached = usage
-                .prompt_tokens_details
-                .and_then(|details| details.cached_tokens)
-                .unwrap_or(0);
-            // Azure includes cache hits in prompt_tokens; Pi's input bucket
-            // excludes them so pricing never charges both input and cache rates.
-            self.partial.usage.input = usage.prompt_tokens.saturating_sub(cached);
-            self.partial.usage.cache_read = cached;
-            self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
-            self.partial.usage.total_tokens = usage.total_tokens;
+        // A valid bill must survive malformed content in the same frame.
+        if let Some(usage) = usage::from_chunk(data, self.model_cost.as_ref()) {
+            // Replace the whole snapshot: an earlier catalog estimate must
+            // never be mistaken for a provider-reported bill on the next frame.
+            self.partial.usage = usage;
             // Usage-only frames need not emit a public event. Acknowledge the
             // cumulative amount before another read can stall or be cancelled.
             if let Some(observer) = &self.usage_observer {
-                observer.observe(&self.partial.usage)?;
+                if self.partial.usage.has_explicit_billing() {
+                    observer.observe_authoritative(&mut self.partial.usage)?;
+                } else {
+                    observer.observe(&self.partial.usage)?;
+                }
             }
         }
+
+        let chunk: AzureStreamChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         if let Some(error) = chunk.error {
             let message = error
@@ -961,8 +984,6 @@ struct AzureStreamChunk {
     #[serde(default)]
     choices: Vec<AzureChoice>,
     #[serde(default)]
-    usage: Option<AzureUsage>,
-    #[serde(default)]
     error: Option<AzureStreamError>,
 }
 
@@ -1002,24 +1023,6 @@ struct AzureFunctionDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(clippy::struct_field_names)]
-struct AzureUsage {
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    #[allow(dead_code)]
-    total_tokens: u64,
-    #[serde(default)]
-    prompt_tokens_details: Option<AzurePromptTokensDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AzurePromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
 }
 
 // ============================================================================

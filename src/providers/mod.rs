@@ -1393,6 +1393,7 @@ fn create_transport_provider(
                     .with_endpoint_url(runtime.endpoint_url)
                     .with_compat(entry.compat.clone())
                     .with_reasoning(entry.model.reasoning)
+                    .with_model_cost(entry.model.cost.clone())
                     .with_client(client),
             ))
         }
