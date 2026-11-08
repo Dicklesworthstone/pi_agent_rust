@@ -218,6 +218,7 @@ struct OpenBlock {
 
 struct MessageState {
     message: AssistantMessage,
+    usage_observer: Option<crate::provider::UsageObserver>,
     pending: VecDeque<StreamEvent>,
     open: BTreeMap<u64, OpenBlock>,
     seen: BTreeSet<u64>,
@@ -231,7 +232,11 @@ struct MessageState {
 }
 
 impl MessageState {
-    fn new(model: String, provider: String) -> Self {
+    fn new(
+        model: String,
+        provider: String,
+        usage_observer: Option<crate::provider::UsageObserver>,
+    ) -> Self {
         Self {
             message: AssistantMessage {
                 api: "bedrock-converse-stream".to_string(),
@@ -240,6 +245,7 @@ impl MessageState {
                 timestamp: chrono::Utc::now().timestamp_millis(),
                 ..AssistantMessage::default()
             },
+            usage_observer,
             pending: VecDeque::new(),
             open: BTreeMap::new(),
             seen: BTreeSet::new(),
@@ -396,6 +402,12 @@ impl MessageState {
                 ..Usage::default()
             };
             self.metadata_seen = true;
+            // Metadata has no public event, and EOF can be delayed or fail.
+            // Publish the acknowledged bill while the request still owns the
+            // transport so cancellation or dropping the stream cannot erase it.
+            if let Some(observer) = &self.usage_observer {
+                observer.observe(&self.message.usage)?;
+            }
             return Ok(());
         }
         if self.stopped {
@@ -686,6 +698,7 @@ pub(super) fn from_bytes(
     model: String,
     provider: String,
     secrets: Vec<String>,
+    usage_observer: Option<crate::provider::UsageObserver>,
 ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
     struct State {
         source: Option<ByteStream>,
@@ -697,7 +710,7 @@ pub(super) fn from_bytes(
     let state = State {
         source: Some(source),
         decoder: Decoder::default(),
-        message: MessageState::new(model, provider),
+        message: MessageState::new(model, provider, usage_observer),
         secrets,
         finished: false,
     };
@@ -752,6 +765,7 @@ pub(super) fn from_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{Context as ProviderContext, Provider, StreamOptions};
     use futures::FutureExt as _;
     use serde_json::json;
     use std::sync::{
@@ -817,6 +831,7 @@ mod tests {
                 "model-a".to_string(),
                 "provider-a".to_string(),
                 Vec::new(),
+                None,
             )
             .collect(),
         )
@@ -873,7 +888,7 @@ mod tests {
     fn text_delta_arrives_while_the_response_is_still_open() {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send(Ok([start(), text()].concat())).unwrap();
-        let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new());
+        let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new(), None);
         for expected in ["start", "text_start", "delta"] {
             let item = output
                 .next()
@@ -1139,6 +1154,7 @@ mod tests {
                 "m".into(),
                 "custom-bedrock".into(),
                 vec!["secret-key-canary".into()],
+                None,
             )
             .collect(),
         );
@@ -1180,6 +1196,7 @@ mod tests {
             "m".into(),
             "p".into(),
             Vec::new(),
+            None,
         );
         assert!(output.next().now_or_never().unwrap().unwrap().is_err());
         assert!(dropped.load(Ordering::SeqCst));
@@ -1197,6 +1214,7 @@ mod tests {
             "m".into(),
             "p".into(),
             Vec::new(),
+            None,
         );
         assert!(output.next().now_or_never().is_none());
         drop(output);
@@ -1486,6 +1504,7 @@ mod tests {
             "m".into(),
             "p".into(),
             Vec::new(),
+            None,
         );
         for _ in 0..2 {
             assert!(output.next().now_or_never().unwrap().unwrap().is_ok());
@@ -1506,6 +1525,216 @@ mod tests {
                 "totalTokens": 35
             }}),
         )
+    }
+
+    struct UsageWireProbe {
+        chunks: VecDeque<std::io::Result<Vec<u8>>>,
+        pending: bool,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for UsageWireProbe {
+        type Item = std::io::Result<Vec<u8>>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                Poll::Ready(Some(chunk))
+            } else if self.pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for UsageWireProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct UsageWireProvider {
+        source: std::sync::Mutex<Option<ByteStream>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for UsageWireProvider {
+        fn name(&self) -> &str {
+            "amazon-bedrock"
+        }
+
+        fn api(&self) -> &str {
+            "bedrock-converse-stream"
+        }
+
+        fn model_id(&self) -> &str {
+            "bedrock-usage-fixture"
+        }
+
+        fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+            Some(crate::provider::ModelCost {
+                audio: None,
+                input: 1_000_000.0,
+                output: 1_000_000.0,
+                cache_read: 1_000_000.0,
+                cache_write: 1_000_000.0,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _context: &ProviderContext<'_>,
+            options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            let source = self.source.lock().unwrap().take().expect("one wire request");
+            Ok(from_bytes(
+                source,
+                self.model_id().into(),
+                self.name().into(),
+                Vec::new(),
+                options.usage_observer.clone(),
+            ))
+        }
+    }
+
+    fn guarded_usage_wire(
+        chunks: Vec<std::io::Result<Vec<u8>>>,
+        pending: bool,
+    ) -> (Arc<dyn Provider>, crate::cost::CostBudget, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let source = UsageWireProbe {
+            chunks: chunks.into(),
+            pending,
+            dropped: Arc::clone(&dropped),
+        };
+        let provider = Arc::new(UsageWireProvider {
+            source: std::sync::Mutex::new(Some(Box::pin(source))),
+        });
+        let budget = crate::cost::CostBudget::new(None, Some(34.0), 0.0).unwrap();
+        (
+            crate::provider::guard_with_cost_budget(provider, budget.clone()),
+            budget,
+            dropped,
+        )
+    }
+
+    #[test]
+    fn metadata_reserves_usage_before_eof_and_drop_settles_the_bill() {
+        futures::executor::block_on(async {
+            let (provider, budget, dropped) = guarded_usage_wire(
+                vec![Ok([start(), stop(), usage_metadata()].concat())],
+                true,
+            );
+            let context = ProviderContext::default();
+            let options = StreamOptions::default();
+            let mut output = provider.stream(&context, &options).await.unwrap();
+            assert!(matches!(
+                output.next().await,
+                Some(Ok(StreamEvent::Start { .. }))
+            ));
+            assert!(output.next().now_or_never().is_none());
+            assert_eq!(budget.snapshot().pending, 35.0);
+            assert_eq!(budget.spent(), 0.0);
+            assert!(!dropped.load(Ordering::SeqCst));
+            assert!(matches!(
+                provider.stream(&context, &options).await,
+                Err(Error::CostCap { .. })
+            ));
+            drop(output);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert_eq!(budget.spent(), 35.0);
+        });
+    }
+
+    #[test]
+    fn acknowledged_metadata_survives_terminal_and_transport_failures_once() {
+        futures::executor::block_on(async {
+            for outcome in [
+                "done", "refused", "transport", "parser", "truncated", "exception",
+            ] {
+                let reason = if outcome == "refused" {
+                    "content_filtered"
+                } else {
+                    "end_turn"
+                };
+                let mut chunks = vec![Ok([
+                    start(),
+                    event("messageStop", &json!({"stopReason": reason})),
+                    usage_metadata(),
+                ]
+                .concat())];
+                match outcome {
+                    "transport" => chunks.push(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "fixture transport failure",
+                    ))),
+                    "parser" => chunks.push(Ok(vec![0; 12])),
+                    "truncated" => chunks.push(Ok(vec![0])),
+                    "exception" => {
+                        let mut headers = Vec::new();
+                        header(":message-type", "exception", &mut headers);
+                        header(":exception-type", "internalServerException", &mut headers);
+                        chunks.push(Ok(raw_frame(&headers, br#"{"message":"fixture"}"#)));
+                    }
+                    _ => {}
+                }
+                let (provider, budget, dropped) = guarded_usage_wire(chunks, false);
+                let mut output = provider
+                    .stream(&ProviderContext::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    output.next().await,
+                    Some(Ok(StreamEvent::Start { .. }))
+                ));
+                match output.next().await.unwrap() {
+                    Ok(StreamEvent::Done { message, .. }) => {
+                        assert_eq!(outcome, "done");
+                        assert_eq!(message.usage.cost.total, 35.0);
+                    }
+                    Ok(StreamEvent::Error { error, .. }) => {
+                        assert_eq!(outcome, "refused");
+                        assert_eq!(error.usage.cost.total, 35.0);
+                    }
+                    Err(_) => assert!(!matches!(outcome, "done" | "refused")),
+                    event => panic!("expected terminal outcome, got {event:?}"),
+                }
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(budget.spent(), 35.0);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert!(output.next().now_or_never().unwrap().is_none());
+                drop(output);
+                assert_eq!(budget.spent(), 35.0);
+            }
+        });
+    }
+
+    #[test]
+    fn rejected_usage_metadata_does_not_fabricate_a_bill() {
+        futures::executor::block_on(async {
+            for frames in [
+                vec![start(), usage_metadata()],
+                vec![
+                    start(),
+                    stop(),
+                    event("metadata", &json!({"usage": {"inputTokens": -1}})),
+                ],
+            ] {
+                let (provider, budget, dropped) =
+                    guarded_usage_wire(vec![Ok(frames.concat())], false);
+                let events: Vec<_> = provider
+                    .stream(&ProviderContext::default(), &StreamOptions::default())
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await;
+                assert!(events.last().unwrap().is_err());
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(budget.spent(), 0.0);
+                assert_eq!(budget.snapshot().pending, 0.0);
+            }
+        });
     }
 
     fn terminal_failure(result: &[Result<StreamEvent>]) -> &AssistantMessage {
@@ -1679,7 +1908,7 @@ mod tests {
         ]
         .concat()))
             .unwrap();
-        let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new());
+        let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new(), None);
         for _ in 0..4 {
             let item = output.next().now_or_never().unwrap().unwrap().unwrap();
             assert!(!matches!(

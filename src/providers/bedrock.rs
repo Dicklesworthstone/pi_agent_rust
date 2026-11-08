@@ -794,6 +794,7 @@ impl Provider for BedrockProvider {
                 self.model.clone(),
                 self.provider_name.clone(),
                 response_secrets,
+                options.usage_observer.clone(),
             ));
         }
 
@@ -809,14 +810,26 @@ impl Provider for BedrockProvider {
                     format!("Failed to read Bedrock response: {detail}"),
                 )
             })?;
+        let parse_error = |err| {
+            let response_snippet = bedrock_error_snippet(&response_text, &response_secrets);
+            Error::provider(
+                self.name(),
+                format!("Failed to parse Bedrock response: {err}\nData: {response_snippet}"),
+            )
+        };
+        // A valid billing envelope survives an invalid output shape as well
+        // as a caller dropping the returned stream before its first poll.
+        // Keep typed decoding: a Value round-trip would silently discard
+        // duplicate billing fields before the response could reject them.
+        if let Some(observer) = &options.usage_observer {
+            let envelope: BedrockUsageEnvelope =
+                serde_json::from_str(&response_text).map_err(parse_error)?;
+            if let Some(usage) = &envelope.usage {
+                observer.observe(&convert_usage(usage))?;
+            }
+        }
         let parsed: BedrockConverseResponse =
-            serde_json::from_str(&response_text).map_err(|err| {
-                let response_snippet = bedrock_error_snippet(&response_text, &response_secrets);
-                Error::provider(
-                    self.name(),
-                    format!("Failed to parse Bedrock response: {err}\nData: {response_snippet}"),
-                )
-            })?;
+            serde_json::from_str(&response_text).map_err(parse_error)?;
         if parsed.output.is_none() || parsed.stop_reason.is_none() {
             return Err(Error::provider(
                 self.name(),
@@ -1154,6 +1167,13 @@ fn convert_tool(tool: &ToolDef) -> BedrockToolDef {
             },
         },
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BedrockUsageEnvelope {
+    #[serde(default)]
+    usage: Option<BedrockUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2357,6 +2377,114 @@ mod tests {
             .recv_timeout(FIXTURE_BUDGET)
             .expect("real HTTP request");
         events
+    }
+
+    fn guarded_json_provider(base_url: &str) -> (Arc<dyn Provider>, crate::cost::CostBudget) {
+        let provider = Arc::new(crate::providers::PricedProvider {
+            inner: Arc::new(
+                BedrockProvider::new("model-a").with_base_url(format!("{base_url}/converse")),
+            ),
+            cost: crate::provider::ModelCost {
+                audio: None,
+                input: 1_000_000.0,
+                output: 1_000_000.0,
+                cache_read: 1_000_000.0,
+                cache_write: 1_000_000.0,
+            },
+        });
+        let budget = crate::cost::CostBudget::new(None, Some(34.0), 0.0).unwrap();
+        (
+            crate::provider::guard_with_cost_budget(provider, budget.clone()),
+            budget,
+        )
+    }
+
+    #[test]
+    fn json_usage_survives_unpolled_streams_and_invalid_output_shapes() {
+        for outcome in ["drop", "refused", "missing_output", "invalid_output"] {
+            let reason = if outcome == "refused" {
+                "content_filtered"
+            } else {
+                "end_turn"
+            };
+            let mut response = json_reply(vec![json!({"text": "answer"})], reason);
+            match outcome {
+                "missing_output" => response["output"] = Value::Null,
+                "invalid_output" => response["output"] = json!({"message": false}),
+                _ => {}
+            }
+            let (base_url, requests) = spawn_bedrock_json_server(vec![response]);
+            let (provider, budget) = guarded_json_provider(&base_url);
+            let options = StreamOptions {
+                api_key: Some("fixture-bearer-token".to_string()),
+                ..StreamOptions::default()
+            };
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            runtime.block_on(async {
+                let result = provider.stream(&Context::default(), &options).await;
+                if matches!(outcome, "drop" | "refused") {
+                    let output = result.expect("JSON response stream");
+                    assert_eq!(budget.snapshot().pending, 35.0);
+                    assert_eq!(budget.spent(), 0.0);
+                    assert!(matches!(
+                        provider.stream(&Context::default(), &options).await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    drop(output);
+                } else {
+                    assert!(result.is_err(), "invalid JSON output must remain rejected");
+                }
+                assert_eq!(budget.spent(), 35.0);
+                assert_eq!(budget.snapshot().pending, 0.0);
+            });
+            requests
+                .recv_timeout(FIXTURE_BUDGET)
+                .expect("real HTTP request");
+        }
+    }
+
+    #[test]
+    fn json_setup_usage_and_public_events_settle_one_bill() {
+        let response = json_reply(vec![json!({"text": "answer"})], "end_turn");
+        let (base_url, requests) = spawn_bedrock_json_server(vec![response]);
+        let (provider, budget) = guarded_json_provider(&base_url);
+        let options = StreamOptions {
+            api_key: Some("fixture-bearer-token".to_string()),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let events: Vec<_> = provider
+                .stream(&Context::default(), &options)
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+                panic!("expected Done: {events:?}");
+            };
+            assert_eq!(message.usage.cost.total, 35.0);
+            assert_eq!(budget.spent(), 35.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+        });
+        requests
+            .recv_timeout(FIXTURE_BUDGET)
+            .expect("real HTTP request");
+    }
+
+    #[test]
+    fn json_usage_envelope_rejects_ambiguous_billing_fields() {
+        for response in [
+            r#"{"usage":{"inputTokens":7,"inputTokens":0}}"#,
+            r#"{"usage":{"inputTokens":7},"usage":null}"#,
+        ] {
+            assert!(serde_json::from_str::<BedrockUsageEnvelope>(response).is_err());
+            assert!(serde_json::from_str::<BedrockConverseResponse>(response).is_err());
+        }
     }
 
     fn assert_json_failure(events: &[Result<StreamEvent>]) -> &AssistantMessage {
