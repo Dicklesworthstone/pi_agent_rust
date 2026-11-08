@@ -401,6 +401,12 @@ fn literal_detections<'a>(
 }
 
 impl SecretVault {
+    /// Borrow remembered values for an in-process privacy projection. This
+    /// never serializes the vault or makes its reversible values an artifact.
+    pub(crate) fn known_values(&self) -> impl Iterator<Item = &str> {
+        self.by_value.keys().map(String::as_str)
+    }
+
     fn placeholder_for(&mut self, value: &str, _label: &str) -> String {
         if let Some(existing) = self.by_value.get(value) {
             return existing.clone();

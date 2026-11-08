@@ -5,8 +5,8 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, TokenKind, WebFrameType, WebRemoteManager,
-    WebRemoteSettings, render_half_block_qr,
+    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind, WebFrameType,
+    WebRemoteManager, WebRemoteSettings, render_half_block_qr,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -60,10 +60,10 @@ fn test_web_client_authentication_and_capacity() {
     };
 
     let manager = WebRemoteManager::new(settings);
-    manager.issue_token("tok-alpha", TokenKind::Steer);
-    manager.issue_token("tok-beta", TokenKind::View);
-    manager.issue_token("tok-gamma", TokenKind::Steer);
-    manager.issue_token("tok-delta", TokenKind::View);
+    manager.issue_token("tok-alpha", TokenKind::Steer).unwrap();
+    manager.issue_token("tok-beta", TokenKind::View).unwrap();
+    manager.issue_token("tok-gamma", TokenKind::Steer).unwrap();
+    manager.issue_token("tok-delta", TokenKind::View).unwrap();
 
     // Connect viewer 1
     let v1 = manager.connect_client("viewer-1", "127.0.0.1:4001", Some("tok-alpha"));
@@ -92,6 +92,27 @@ fn test_web_client_authentication_and_capacity() {
         v4.as_ref()
             .err()
             .is_some_and(|e| e.contains("maximum viewer capacity"))
+    );
+
+    manager.issue_token("tok-epsilon", TokenKind::Steer).unwrap();
+    assert!(
+        manager
+            .connect_client("viewer-1", "127.0.0.1:4006", Some("tok-epsilon"))
+            .unwrap_err()
+            .contains("already connected")
+    );
+    assert_eq!(manager.clients().len(), 3);
+    manager.disconnect_client("viewer-2");
+    let retried = manager
+        .connect_client("viewer-4", "127.0.0.1:4005", Some("tok-delta"))
+        .expect("capacity rejection leaves the token unused");
+    assert!(retried.is_view_only);
+    manager.disconnect_client("viewer-3");
+    assert!(
+        manager
+            .connect_client("viewer-5", "127.0.0.1:4006", Some("tok-epsilon"))
+            .is_ok(),
+        "duplicate identity rejection must not consume another credential"
     );
 
     finish_case(&harness, "web_client_auth_capacity");
@@ -134,9 +155,15 @@ fn test_input_arbitration_and_audit_ledger() {
     let manager = WebRemoteManager::new(settings);
     let _ = manager.connect_client("remote-peer-1", "100.64.0.1:52110", None);
 
-    // Peer 1 takes control
+    // The first peer also needs a decision from the local operator.
     let control_1 = manager.request_takeover("remote-peer-1");
-    assert_eq!(control_1, Ok(ControlMode::RemoteControlling));
+    assert_eq!(control_1, Ok(ControlMode::TakeoverPendingApproval));
+    assert!(manager.authorize_input("remote-peer-1", 1).is_err());
+    assert_eq!(
+        manager.approve_takeover("remote-peer-1"),
+        Ok(ControlMode::RemoteControlling)
+    );
+    let first_epoch = manager.authorize_input("remote-peer-1", 1).unwrap();
 
     let _ = manager.connect_client("remote-peer-2", "100.64.0.2:52112", None);
 
@@ -146,10 +173,22 @@ fn test_input_arbitration_and_audit_ledger() {
 
     // Peer 1 releases control
     manager.release_control("remote-peer-1");
+    assert!(!manager.input_authorized("remote-peer-1", first_epoch));
 
-    // Peer 2 requests control again -> granted
+    // Releasing the previous controller does not approve a waiting peer.
     let control_2_now = manager.request_takeover("remote-peer-2");
-    assert_eq!(control_2_now, Ok(ControlMode::RemoteControlling));
+    assert_eq!(control_2_now, Ok(ControlMode::TakeoverPendingApproval));
+    assert!(manager.authorize_input("remote-peer-2", 1).is_err());
+    assert_eq!(
+        manager.approve_takeover("remote-peer-2"),
+        Ok(ControlMode::RemoteControlling)
+    );
+    assert!(manager.authorize_input("remote-peer-2", 1).is_ok());
+    assert!(manager.authorize_input("remote-peer-2", 1).is_err());
+    let queued_epoch = manager.authorize_input("remote-peer-2", 2).unwrap();
+    manager.disconnect_client("remote-peer-2");
+    assert!(!manager.input_authorized("remote-peer-2", queued_epoch));
+    assert!(manager.approve_takeover("remote-peer-2").is_err());
 
     // Verify audit log has proper schema and records
     let logs = manager.audit_log();
@@ -171,25 +210,28 @@ fn test_embedded_web_client_security_posture() {
         "embedded client HTML must not be empty"
     );
 
-    // Verify CSP header presence and strict rules
+    // The server supplies CSP headers; executable code must use the allowed
+    // same-origin asset instead of an inline script blocked by that policy.
     assert!(
-        EMBEDDED_WEB_CLIENT_HTML.contains("Content-Security-Policy"),
-        "must define strict Content-Security-Policy"
+        EMBEDDED_WEB_CLIENT_HTML.contains("<script src=\"/client.js\" defer></script>"),
+        "client must load its same-origin script asset"
     );
     assert!(
-        EMBEDDED_WEB_CLIENT_HTML.contains("default-src 'self'"),
-        "CSP must restrict default sources to self"
+        !EMBEDDED_WEB_CLIENT_HTML.contains("<script>"),
+        "client must not require inline script execution"
     );
+    assert!(!EMBEDDED_WEB_CLIENT_JS.is_empty());
 
-    // Verify zero persistent storage usage (no localStorage, indexedDB)
-    assert!(
-        !EMBEDDED_WEB_CLIENT_HTML.contains("localStorage"),
-        "client must not store session content in localStorage"
-    );
-    assert!(
-        !EMBEDDED_WEB_CLIENT_HTML.contains("indexedDB"),
-        "client must not store session content in indexedDB"
-    );
+    for asset in [EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS] {
+        assert!(
+            !asset.contains("localStorage"),
+            "client must not store session content in localStorage"
+        );
+        assert!(
+            !asset.contains("indexedDB"),
+            "client must not store session content in indexedDB"
+        );
+    }
 
     finish_case(&harness, "web_client_security");
 }

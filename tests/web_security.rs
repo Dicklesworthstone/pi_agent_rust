@@ -5,8 +5,8 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, WebFrameType, WebRemoteManager,
-    WebRemoteSettings,
+    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind, WebRemoteBridge,
+    WebRemoteManager, WebRemoteSettings,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -50,20 +50,24 @@ fn test_threat_model_document_exists_and_valid() {
 fn test_canary_secrets_obfuscation_in_web_frames() {
     let harness = TestHarness::new("canary_secrets_obfuscation");
 
-    let manager = WebRemoteManager::new(WebRemoteSettings::default());
-
-    // Canary raw secret payload
+    let bridge = WebRemoteBridge::new(WebRemoteSettings::default());
     let raw_secret = "sk-live-99887766554433221100aabbccddeeff";
-    let placeholder = "[SECRET_OPENAI_KEY_1]";
-
-    // Text with substituted placeholder
-    let safe_content = format!("Connecting using OpenAI key {placeholder}...");
-    assert!(!safe_content.contains(raw_secret));
-
-    let frame = manager.next_frame(WebFrameType::Patch, 80, 24, &safe_content);
+    bridge.set_secrets(vec![raw_secret.to_string()]);
+    let pairing_token = bridge.manager().generate_token(TokenKind::View).unwrap();
+    assert!(bridge.publish_text(
+        120,
+        24,
+        format!("Connecting using OpenAI key {raw_secret}...\nPairing {pairing_token}")
+    ));
+    let frame = bridge.frame_after(0).expect("sanitized published frame");
     assert_eq!(frame.schema, "pi.web.frame.v1");
     assert!(!frame.data.contains(raw_secret));
-    assert!(frame.data.contains(placeholder));
+    assert!(!frame.data.contains(&pairing_token));
+    assert!(frame.data.contains("Connecting using OpenAI key"));
+    assert!(frame.data.contains('*'));
+    let wire = serde_json::to_string(&*frame).unwrap();
+    assert!(!wire.contains(raw_secret));
+    assert!(!wire.contains(&pairing_token));
 
     finish_case(&harness, "canary_secrets_obfuscation");
 }
@@ -77,22 +81,47 @@ fn test_remote_mutating_action_requires_local_approval() {
         bind_mode: BindMode::Tailscale,
         view_only: false,
         max_viewers: 2,
-        require_auth_token: false,
+        require_auth_token: true,
         enable_audit_log: true,
     };
 
     let manager = WebRemoteManager::new(settings);
-    let _ = manager.connect_client("remote-user", "100.64.0.5:40001", None);
+    let token = manager.generate_token(TokenKind::Steer).unwrap();
+    manager
+        .connect_client("remote-user", "100.64.0.5:40001", Some(&token))
+        .unwrap();
 
-    // Initial state: Remote user does not have control until requested and granted
+    // A browser request cannot grant itself the first control lease.
     let takeover_result = manager.request_takeover("remote-user");
-    assert_eq!(takeover_result, Ok(ControlMode::RemoteControlling));
+    assert_eq!(takeover_result, Ok(ControlMode::TakeoverPendingApproval));
+    assert!(manager.authorize_input("remote-user", 1).is_err());
+    assert!(
+        manager
+            .audit_log()
+            .iter()
+            .all(|entry| entry.event_type != "takeover_granted")
+    );
+
+    assert_eq!(
+        manager.approve_takeover("remote-user"),
+        Ok(ControlMode::RemoteControlling)
+    );
+    let epoch = manager.authorize_input("remote-user", 1).unwrap();
+    assert!(manager.input_authorized("remote-user", epoch));
+    assert!(manager.authorize_input("remote-user", 1).is_err());
+    manager.revoke_control();
+    assert!(!manager.input_authorized("remote-user", epoch));
+    assert!(manager.authorize_input("remote-user", 2).is_err());
 
     // Audit logs record takeover grant with provenance
     let logs = manager.audit_log();
     assert!(logs.iter().any(
-        |e| e.event_type == "takeover_granted" && e.client_id.as_deref() == Some("remote-user")
+        |e| e.event_type == "takeover_granted"
+            && e.client_id.as_deref() == Some("remote-user")
+            && e.details.get("actor").map(String::as_str) == Some("local_operator")
     ));
+    assert!(!serde_json::to_string(&logs).unwrap().contains(&token));
+    assert!(!format!("{manager:?}").contains(&token));
 
     finish_case(&harness, "remote_approval_gate");
 }
@@ -102,10 +131,12 @@ fn test_static_zero_browser_persistence_audit() {
     let harness = TestHarness::new("zero_browser_persistence_audit");
 
     // Static analysis over all embedded client assets
-    assert!(!EMBEDDED_WEB_CLIENT_HTML.contains("localStorage"));
-    assert!(!EMBEDDED_WEB_CLIENT_HTML.contains("sessionStorage"));
-    assert!(!EMBEDDED_WEB_CLIENT_HTML.contains("indexedDB"));
-    assert!(!EMBEDDED_WEB_CLIENT_HTML.contains("openDatabase"));
+    for asset in [EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS] {
+        assert!(!asset.contains("localStorage"));
+        assert!(!asset.contains("sessionStorage"));
+        assert!(!asset.contains("indexedDB"));
+        assert!(!asset.contains("openDatabase"));
+    }
 
     finish_case(&harness, "zero_browser_persistence_audit");
 }

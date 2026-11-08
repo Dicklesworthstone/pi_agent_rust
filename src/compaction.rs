@@ -333,6 +333,19 @@ pub struct CompactionPrivacy {
 }
 
 impl CompactionPrivacy {
+    /// The remote renderer shares this already-refreshed privacy snapshot;
+    /// credentials stay in process and never enter the frame protocol.
+    pub(crate) fn remote_frame_protection(&self) -> (Vec<String>, Vec<regex::Regex>, bool) {
+        (
+            self.known_secrets
+                .known_values()
+                .map(str::to_string)
+                .collect(),
+            self.policy.extra_patterns.clone(),
+            self.policy.mode == crate::secrets::SecretsMode::Block,
+        )
+    }
+
     #[must_use]
     pub fn from_settings(settings: Option<&crate::secrets::SecretsSettings>) -> Self {
         Self::with_vault(settings, &crate::secrets::SecretVault::default())
