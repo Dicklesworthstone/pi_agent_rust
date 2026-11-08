@@ -812,6 +812,13 @@ future and send `RpcControlHandle::abort()` instead. Continue consuming through
 its terminal `agent_end`; the control method confirms dispatch, while the prompt
 stream reports the completed turn.
 
+For a pending Bash request, send `RpcControlHandle::abort_bash()` and keep polling
+`bash()` or `bash_with_events()` through its terminal Bash response. The returned
+`RpcBashResult` reports cancellation, exit status, retained output, and any capture
+limitations. This allows the same client to handle subsequent requests after the
+command has settled. Dropping the Bash future invokes connection cleanup just as
+dropping any other in-flight request does.
+
 `shutdown()` and client destruction stop the owned subprocess and join its pipe
 workers and reaper, including a reap started by earlier future cancellation.
 Unix subprocesses get a private process group; Windows subprocesses enter the
@@ -822,25 +829,60 @@ fails, explicit shutdown reports the error and retains cleanup ownership for a
 retry instead of waiting on pipe workers that may still be blocked.
 
 
-### Mid-turn RPC control
+### Control during RPC operations
 
-Call `RpcTransportClient::control_handle()` before starting a subprocess prompt
-when another thread, event loop, or the prompt's live callback may need to steer
-or abort it. The cloned `RpcControlHandle` shares the serialized stdin writer,
-request-id allocator, and connection lifetime. The prompt remains the **only
-consumer of parsed response frames**, so concurrent control never races a
-second consumer over the RPC event stream.
+Call `RpcTransportClient::control_handle()` before starting a subprocess prompt,
+Bash command, compaction, or handoff when another thread, event loop, or live
+callback may need to control it or answer a host UI request. The cloned
+`RpcControlHandle` shares the serialized stdin writer, request-id allocator, and
+connection lifetime. The pending operation remains the **only consumer of parsed
+response frames**, so concurrent control never races a second consumer over the
+RPC event stream.
 
-`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write a complete
-command to the pipe and return its SDK-owned request id. These control methods
-can wait on pipe backpressure; the async request and prompt methods use the I/O
-workers described above. A successful control return means
+| Host action | Control-handle method |
+| --- | --- |
+| Steer or queue a follow-up during a prompt | `steer(message)`, `follow_up(message)` |
+| Abort a prompt, compaction, or handoff | `abort()` |
+| Cancel the pending Bash command | `abort_bash()` |
+| Reply to an extension UI request | `extension_ui_response(request_id, request_generation, response)` |
+| Answer or dismiss a question card | `ask_response(request_id, response)` |
+
+These methods synchronously write a complete command to the pipe and return its
+SDK-owned request id. They can wait on pipe backpressure; the async request and
+prompt methods use the I/O workers described above. A successful control return means
 the command was dispatched to the subprocess pipe; it does not claim the RPC
 server accepted or completed the operation. Its acknowledgement is consumed by
-the prompt's single reader. Use the ordinary `RpcTransportClient` methods when
-you need an acknowledgement and no prompt currently owns the read lane.
+the pending operation's single reader and is not forwarded to its event callback.
+An expired UI reply can receive `resolved: false`, and a mismatched generation
+can receive an RPC error, even though control dispatch succeeded. Use the ordinary
+`RpcTransportClient` methods when you need an acknowledgement and no pending
+operation currently owns the read lane.
 
 The control lane and ordinary requests use one atomic id sequence and one mutexed
 writer, preventing duplicate IDs or interleaved JSON lines. Holding a control
 handle does not keep the child process alive after the owning client shuts down
 or an in-flight exchange is dropped; subsequent writes then fail.
+
+### Bash commands with live hook UI
+
+`RpcTransportClient::bash_with_events(command, on_event)` forwards non-response
+frames while awaiting the terminal Bash result. This lets hosts display and
+answer `extension_ui_request` and `ask_request` events raised by `user_bash`
+hooks. Clone a control handle before starting the command and retain it in your
+UI event loop, or use it directly from the callback. The existing `bash(command)`
+convenience method discards these events; use the event-capable method when hooks
+may need host input.
+
+For extension replies, echo the event's exact `id` and `requestGeneration` through
+`control.extension_ui_response(...)`. For question cards, pass the event's `id`
+and the user's explicit answers or dismissal to `control.ask_response(...)`.
+The ID returned by either control method belongs to the dispatched response
+command and is separate from the UI request ID. A reused UI request ID still
+requires the generation from the particular event the user answered.
+
+Keep polling the Bash future while the UI is active and after sending a reply or
+abort. Only the terminal Bash response completes the request; UI acknowledgements
+and unrelated lifecycle events do not. The live callback does not promise output
+chunks from the shell process. Captured output arrives in `RpcBashResult`, whose
+optional `capture` metadata distinguishes complete capture from partial output,
+artifact truncation, and artifact failures.

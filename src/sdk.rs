@@ -1309,13 +1309,13 @@ impl Drop for RpcOperation {
     }
 }
 
-/// Write-only control lane for a running RPC prompt.
+/// Write-only control lane for a running RPC operation.
 ///
-/// The prompt task remains the sole consumer of parsed stdout frames. A cloned
-/// control handle may be used from another thread or from a live event callback to dispatch steer,
-/// follow-up, or abort requests while that prompt is still active. Dispatch
-/// success means the command was written and flushed, not that the subprocess
-/// acknowledged or completed it.
+/// The pending operation remains the sole consumer of parsed stdout frames.
+/// A cloned control handle may be used from another thread or a live event
+/// callback to steer a prompt, abort a prompt or Bash command, or answer a UI
+/// request. Dispatch success means the command was written and flushed, not
+/// that the subprocess acknowledged or completed it.
 #[derive(Clone)]
 pub struct RpcControlHandle {
     owner: Arc<RpcSubprocessOwner>,
@@ -1359,6 +1359,16 @@ impl RpcControlHandle {
 
     pub fn abort(&self) -> Result<String> {
         self.send("abort", Map::new())
+    }
+
+    /// Request cancellation of the pending RPC Bash command without borrowing
+    /// its response reader. Keep polling the Bash future until its terminal
+    /// result arrives so the connection remains usable.
+    ///
+    /// Returns the dispatch ID after writing and flushing the command, not an
+    /// acknowledgement that the command was cancelled.
+    pub fn abort_bash(&self) -> Result<String> {
+        self.send("abort_bash", Map::new())
     }
 }
 
@@ -1598,8 +1608,9 @@ impl RpcTransportClient {
         })
     }
 
-    /// Clone a write-only lane that remains usable while `prompt*`, `compact*`,
-    /// or `handoff*` borrows this client for its single response consumer.
+    /// Clone a write-only lane that remains usable while `prompt*`, `bash*`,
+    /// `compact*`, or `handoff*` borrows this client for its single response
+    /// consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
@@ -1849,12 +1860,35 @@ impl RpcTransportClient {
         self.request_typed("export_html", payload).await
     }
 
+    /// Execute a Bash command and await its terminal result. Use
+    /// [`Self::bash_with_events`] when extension hooks may request host UI.
+    /// A cloned control handle can abort this request while it is pending.
     pub async fn bash(&mut self, command: impl Into<String>) -> Result<RpcBashResult> {
-        let mut payload = Map::new();
-        payload.insert("command".to_string(), Value::String(command.into()));
-        self.request_typed("bash", payload).await
+        self.bash_with_events(command, |_| {}).await
     }
 
+    /// Execute Bash while forwarding live non-response frames, including UI
+    /// and question requests from `user_bash` hooks. Clone [`Self::control_handle`]
+    /// before starting, then use its UI response helpers or
+    /// [`RpcControlHandle::abort_bash`] from this callback or another thread.
+    ///
+    /// Keep polling until the terminal Bash response arrives. Control dispatch
+    /// does not replace that response, and dropping this future closes the
+    /// connection. The callback does not imply that Bash output is streamed;
+    /// captured output and its completeness are returned in [`RpcBashResult`].
+    pub async fn bash_with_events(
+        &mut self,
+        command: impl Into<String>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcBashResult> {
+        let mut payload = Map::new();
+        payload.insert("command".to_string(), Value::String(command.into()));
+        let data = self.request_with_events("bash", payload, on_event).await?;
+        Self::parse_response_data(data, "bash")
+    }
+
+    /// Send an acknowledged cancellation request when this client is idle.
+    /// Use [`RpcControlHandle::abort_bash`] while a Bash future owns the client.
     pub async fn abort_bash(&mut self) -> Result<()> {
         self.request_no_data("abort_bash", Map::new()).await
     }
@@ -4798,6 +4832,202 @@ mod tests {
                 serde_json::to_value(result).expect("bash response"),
                 payload
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod rpc_bash_control {
+        use super::*;
+        use crate::ask::{AskAnswer, AskResponse};
+
+        fn bridge(script: &str, cwd: Option<PathBuf>) -> RpcTransportClient {
+            RpcTransportClient::connect(RpcTransportOptions {
+                binary_path: PathBuf::from("/bin/bash"),
+                args: vec!["-c".to_string(), script.to_string()],
+                cwd,
+            })
+            .expect("spawn Bash protocol fixture")
+        }
+
+        #[test]
+        fn control_aborts_pending_bash_and_preserves_the_connection() {
+            let directory = tempdir().expect("fixture directory");
+            let mut client = bridge(
+                r#"
+IFS= read -r -t 5 command || exit 1
+printf '%s\n' "$command" > command.json
+: > ready
+IFS= read -r -t 5 control || exit 1
+printf '%s\n' "$control" > control.json
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"abort_bash","success":true}'
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"bash","success":true,"data":{"output":"retained tail","exitCode":130,"cancelled":true,"truncated":true,"fullOutputPath":null,"capture":{"outputComplete":false,"artifactTruncated":true,"artifactPath":"partial-output.log"}}}'
+IFS= read -r -t 5 query || exit 1
+printf '{"type":"response","id":"rpc-3","command":"probe","success":true,"data":%s}\n' "$query"
+"#,
+                Some(directory.path().to_path_buf()),
+            );
+            let control = client.control_handle();
+            let abort_control = control.clone();
+            let ready = directory.path().join("ready");
+            let aborter = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture must receive Bash before abort is dispatched"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                abort_control.abort_bash()
+            });
+
+            let result = run_async(client.bash("long-running-command"))
+                .expect("Bash must finish after control dispatch");
+            assert_eq!(
+                aborter
+                    .join()
+                    .expect("abort thread")
+                    .expect("abort dispatched"),
+                "rpc-2"
+            );
+            assert!(result.cancelled);
+            assert_eq!(result.exit_code, 130);
+            assert_eq!(result.output, "retained tail");
+            assert_eq!(
+                result.capture,
+                Some(crate::tools::BashCapture {
+                    output_complete: false,
+                    artifact_truncated: true,
+                    artifact_error: None,
+                    artifact_path: Some("partial-output.log".to_string()),
+                })
+            );
+            for (name, expected) in [
+                (
+                    "command.json",
+                    serde_json::json!({
+                        "type": "bash", "id": "rpc-1", "command": "long-running-command",
+                    }),
+                ),
+                (
+                    "control.json",
+                    serde_json::json!({"type": "abort_bash", "id": "rpc-2"}),
+                ),
+            ] {
+                let actual: Value = serde_json::from_slice(
+                    &std::fs::read(directory.path().join(name)).expect("recorded pipe frame"),
+                )
+                .expect("recorded JSON");
+                assert_eq!(actual, expected);
+            }
+            let next = run_async(client.request("probe", Map::new()))
+                .expect("cancelled Bash leaves the response lane usable");
+            assert_eq!(next, serde_json::json!({"type": "probe", "id": "rpc-3"}));
+            client.shutdown().expect("shutdown fixture");
+            assert!(control.abort_bash().is_err(), "shutdown revokes control");
+        }
+
+        #[test]
+        fn bash_events_allow_ui_and_ask_replies_without_stealing_the_result() {
+            let mut client = bridge(
+                r#"
+IFS= read -r -t 5 command || exit 1
+printf '{"type":"fixture_command","frame":%s}\n' "$command"
+printf '%s\n' '{"type":"extension_ui_request","id":"hook-confirm","requestGeneration":41,"method":"confirm","title":"Continue hook?"}'
+IFS= read -r -t 5 reply || exit 1
+printf '{"type":"fixture_reply","frame":%s}\n' "$reply"
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"extension_ui_response","success":true,"data":{"resolved":false}}'
+printf '%s\n' '{"type":"extension_ui_request","id":"hook-confirm","requestGeneration":42,"method":"confirm","title":"Continue replacement hook?"}'
+IFS= read -r -t 5 reply || exit 1
+printf '{"type":"fixture_reply","frame":%s}\n' "$reply"
+printf '%s\n' '{"type":"response","id":"rpc-3","command":"extension_ui_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"ask_request","id":"hook-location","questions":[{"id":"location","question":"Where should the hook run?","options":[{"label":"sandbox"},{"label":"workspace"}]}]}'
+IFS= read -r -t 5 reply || exit 1
+printf '{"type":"fixture_reply","frame":%s}\n' "$reply"
+printf '%s\n' '{"type":"response","id":"rpc-4","command":"ask_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"bash","success":true,"data":{"output":"hook completed","exitCode":0,"cancelled":false,"truncated":false,"fullOutputPath":null}}'
+IFS= read -r -t 5 query || exit 1
+printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":%s}\n' "$query"
+"#,
+                None,
+            );
+            let control = client.control_handle();
+            let mut control_ids = Vec::new();
+            let mut events = Vec::new();
+            let result = run_async(client.bash_with_events("hook-command", |event| {
+                match event["type"].as_str() {
+                    Some("extension_ui_request") => {
+                        control_ids.push(
+                            control
+                                .extension_ui_response(
+                                    event["id"].as_str().expect("UI request ID"),
+                                    event["requestGeneration"].as_u64().expect("UI generation"),
+                                    RpcExtensionUiResponse::Confirmed { confirmed: true },
+                                )
+                                .expect("dispatch explicit UI reply"),
+                        );
+                    }
+                    Some("ask_request") => {
+                        control_ids.push(
+                            control
+                                .ask_response(
+                                    event["id"].as_str().expect("question request ID"),
+                                    AskResponse {
+                                        answers: vec![AskAnswer {
+                                            question_id: "location".to_string(),
+                                            selected: vec!["sandbox".to_string()],
+                                            other: None,
+                                        }],
+                                        dismissed: false,
+                                    },
+                                )
+                                .expect("dispatch explicit question reply"),
+                        );
+                    }
+                    _ => {}
+                }
+                events.push(event);
+            }))
+            .expect("Bash hook finishes only after all host replies arrive");
+
+            assert_eq!(result.output, "hook completed");
+            assert_eq!(result.exit_code, 0);
+            assert!(!result.cancelled);
+            assert_eq!(control_ids, ["rpc-2", "rpc-3", "rpc-4"]);
+            assert_eq!(
+                events[0]["frame"],
+                serde_json::json!({"type": "bash", "id": "rpc-1", "command": "hook-command"})
+            );
+            let replies = events
+                .iter()
+                .filter(|event| event["type"] == "fixture_reply")
+                .map(|event| event["frame"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                replies,
+                vec![
+                    serde_json::json!({
+                        "type": "extension_ui_response", "id": "rpc-2",
+                        "requestId": "hook-confirm", "requestGeneration": 41,
+                        "confirmed": true,
+                    }),
+                    serde_json::json!({
+                        "type": "extension_ui_response", "id": "rpc-3",
+                        "requestId": "hook-confirm", "requestGeneration": 42,
+                        "confirmed": true,
+                    }),
+                    serde_json::json!({
+                        "type": "ask_response", "id": "rpc-4",
+                        "requestId": "hook-location",
+                        "answers": [{"questionId": "location", "selected": ["sandbox"]}],
+                    }),
+                ]
+            );
+            assert!(events.iter().all(|event| event["type"] != "response"));
+            let next = run_async(client.request("probe", Map::new()))
+                .expect("UI acknowledgements must not corrupt the next request");
+            assert_eq!(next, serde_json::json!({"type": "probe", "id": "rpc-5"}));
+            client.shutdown().expect("shutdown fixture");
         }
     }
 
