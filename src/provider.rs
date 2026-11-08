@@ -208,9 +208,19 @@ fn native_compaction_usage(
     use crate::model::{BillingTokenCounts, BillingUsage, Usage};
 
     #[derive(Deserialize)]
+    struct CacheWriteDetails {
+        ttl_30m_tokens: u64,
+        ttl_12h_tokens: u64,
+    }
+
+    #[derive(Deserialize)]
     struct InputDetails {
         #[serde(default)]
         cached_tokens: u64,
+        #[serde(default)]
+        cache_write_tokens: u64,
+        #[serde(default)]
+        cache_write_tokens_details: Option<CacheWriteDetails>,
         #[serde(default)]
         audio_tokens: u64,
     }
@@ -263,15 +273,46 @@ fn native_compaction_usage(
         .input_tokens_details
         .as_ref()
         .map_or(0, |details| details.cached_tokens);
+    let written = usage
+        .input_tokens_details
+        .as_ref()
+        .map_or(0, |details| details.cache_write_tokens);
+    let Some(ordinary_input) = usage
+        .input_tokens
+        .checked_sub(cached)
+        .and_then(|remaining| remaining.checked_sub(written))
+    else {
+        return Some(unavailable(
+            "Native compaction reported inconsistent cache usage",
+        ));
+    };
     let Some(total) = usage.input_tokens.checked_add(usage.output_tokens) else {
         return Some(unavailable(
             "Native compaction reported inconsistent token usage",
         ));
     };
-    if cached > usage.input_tokens || usage.total_tokens.is_some_and(|reported| reported != total) {
+    if usage.total_tokens.is_some_and(|reported| reported != total) {
         return Some(unavailable(
             "Native compaction reported inconsistent token usage",
         ));
+    }
+    if let Some(details) = usage
+        .input_tokens_details
+        .as_ref()
+        .and_then(|details| details.cache_write_tokens_details.as_ref())
+    {
+        if details.ttl_30m_tokens.checked_add(details.ttl_12h_tokens) != Some(written) {
+            return Some(unavailable(
+                "Native compaction reported inconsistent cache write lifetimes",
+            ));
+        }
+        // The catalog has one write rate. Longer-retention writes need a
+        // distinct rate, so only an explicit bill above can price them safely.
+        if details.ttl_12h_tokens > 0 {
+            return Some(unavailable(
+                "Native compaction long-retention cache writes require a billed total",
+            ));
+        }
     }
     if usage
         .input_tokens_details
@@ -290,15 +331,16 @@ fn native_compaction_usage(
         ));
     }
     let text = BillingTokenCounts {
-        input: usage.input_tokens - cached,
+        input: ordinary_input,
         output: usage.output_tokens,
         cache_read: cached,
-        cache_write: 0,
+        cache_write: written,
     };
     Some(Usage {
         input: text.input,
         output: text.output,
         cache_read: cached,
+        cache_write: written,
         total_tokens: total,
         // Known prices or genuinely zero work establish a final bill. Unknown
         // prices do not turn positive token counts into an authoritative zero
@@ -2324,6 +2366,42 @@ mod tests {
                 }),
                 serde_json::json!({
                     "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 41}
+                }),
+                serde_json::json!({
+                    "input_tokens": u64::MAX, "output_tokens": 0,
+                    "input_tokens_details": {"cached_tokens": u64::MAX, "cache_write_tokens": 1}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cache_write_tokens": -1}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cache_write_tokens": null}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cache_write_tokens": 30,
+                        "cache_write_tokens_details": {"ttl_30m_tokens": 29, "ttl_12h_tokens": 0}}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cache_write_tokens": 30,
+                        "cache_write_tokens_details": {"ttl_30m_tokens": 20, "ttl_12h_tokens": 10}}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
+                    "input_tokens_details": {"cache_write_tokens": 30,
+                        "cache_write_tokens_details": {"ttl_30m_tokens": 30}}
+                }),
+                serde_json::json!({
+                    "input_tokens": u64::MAX, "output_tokens": 0,
+                    "input_tokens_details": {"cache_write_tokens": u64::MAX,
+                        "cache_write_tokens_details": {"ttl_30m_tokens": u64::MAX, "ttl_12h_tokens": 1}}
+                }),
+                serde_json::json!({
+                    "input_tokens": 100, "output_tokens": 2,
                     "input_tokens_details": {"audio_tokens": 10}
                 }),
                 serde_json::json!({
@@ -2375,10 +2453,10 @@ mod tests {
     #[test]
     fn native_compaction_billed_total_does_not_require_a_token_partition() {
         futures::executor::block_on(async {
-            for total in [0.0, 0.5] {
+            for (total, long_retention) in [(0.0, false), (0.5, false), (0.0, true), (0.5, true)] {
                 let budget = crate::cost::CostBudget::new(None, Some(0.25), 0.0).unwrap();
                 let mut probe = spend_probe(vec![], Some(ModelCost::default()));
-                let response = serde_json::json!({
+                let mut response = serde_json::json!({
                     "output": [{"type": "compaction", "encrypted_content": "retained"}],
                     "usage": {
                         "input_tokens": "unknown",
@@ -2386,6 +2464,15 @@ mod tests {
                         "cost": total
                     }
                 });
+                if long_retention {
+                    response["usage"] = serde_json::json!({
+                        "input_tokens": 100,
+                        "output_tokens": 2,
+                        "input_tokens_details": {"cache_write_tokens": 30,
+                            "cache_write_tokens_details": {"ttl_30m_tokens": 20, "ttl_12h_tokens": 10}},
+                        "cost": total
+                    });
+                }
                 Arc::get_mut(&mut probe).unwrap().native_response = Some(response.clone());
                 let provider = guard_with_cost_budget(probe.clone(), budget.clone());
                 let actual = provider
@@ -2436,6 +2523,58 @@ mod tests {
                 Err(crate::error::Error::CostCap { .. })
             ));
             assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn native_compaction_prices_exclusive_input_and_cache_write_buckets() {
+        futures::executor::block_on(async {
+            for include_lifetime in [false, true] {
+                let mut details = serde_json::json!({
+                    "cached_tokens": 60,
+                    "cache_write_tokens": 30
+                });
+                if include_lifetime {
+                    details["cache_write_tokens_details"] = serde_json::json!({
+                        "ttl_30m_tokens": 30,
+                        "ttl_12h_tokens": 0
+                    });
+                }
+                let response = serde_json::json!({"usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 10,
+                    "total_tokens": 110,
+                    "input_tokens_details": details
+                }});
+                let budget = crate::cost::CostBudget::new(None, Some(205.0), 0.0).unwrap();
+                let mut probe = spend_probe(
+                    vec![],
+                    Some(ModelCost {
+                        input: 2_000_000.0,
+                        output: 4_000_000.0,
+                        cache_read: 1_000_000.0,
+                        cache_write: 3_000_000.0,
+                        audio: None,
+                    }),
+                );
+                Arc::get_mut(&mut probe).unwrap().native_response = Some(response.clone());
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                let actual = provider
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(actual, response, "native replay payload is unchanged");
+                // 10 ordinary inputs, 10 outputs, 60 reads, and 30 writes.
+                assert_eq!(budget.spent(), 210.0);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert!(matches!(
+                    provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await,
+                    Err(crate::error::Error::CostCap { .. })
+                ));
+                assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
         });
     }
 

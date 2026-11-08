@@ -6,8 +6,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
-    ToolCall, Usage, UserContent,
+    AssistantMessage, BillingTokenCounts, BillingUsage, ContentBlock, Message, StopReason, StreamEvent,
+    TextContent, ThinkingContent, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -1192,14 +1192,7 @@ where
         // Replace the complete snapshot, including any earlier locally priced
         // cost. Reusing that cost would mistake an estimate for a wire bill
         // and prevent a later cumulative update from changing it.
-        self.partial.usage = Usage {
-            input: usage.input_tokens,
-            output: usage.output_tokens,
-            total_tokens: usage
-                .total_tokens
-                .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.output_tokens)),
-            ..Usage::default()
-        };
+        self.partial.usage = usage.normalized();
         if let Some(observer) = &self.usage_observer {
             observer.observe_authoritative(&mut self.partial.usage)?;
         }
@@ -2786,6 +2779,153 @@ struct OpenAIResponsesUsage {
     output_tokens: u64,
     #[serde(default)]
     total_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAIResponsesInputTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OpenAIResponsesOutputTokensDetails>,
+    #[serde(default, deserialize_with = "deserialize_reported_cost")]
+    cost: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct OpenAIResponsesInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+    #[serde(default)]
+    audio_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens_details: Option<OpenAIResponsesCacheWriteTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesCacheWriteTokensDetails {
+    ttl_30m_tokens: u64,
+    ttl_12h_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesOutputTokensDetails {
+    #[serde(default)]
+    audio_tokens: u64,
+}
+
+/// Missing cost is different from a supplied null or another invalid bill.
+/// Keep the outer usage object typed so duplicate known fields still fail.
+fn deserialize_reported_cost<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+impl OpenAIResponsesUsage {
+    fn normalized(&self) -> Usage {
+        let unavailable = |reason: &str| Usage {
+            billing: Some(BillingUsage::Unavailable {
+                reason: reason.to_string(),
+            }),
+            ..Usage::default()
+        };
+        let reported_total = if let Some(cost) = &self.cost {
+            let Some(total) = cost
+                .as_f64()
+                .filter(|total| total.is_finite() && *total >= 0.0)
+            else {
+                return unavailable("OpenAI Responses reported an invalid billed total");
+            };
+            Some(total)
+        } else {
+            None
+        };
+        let mut usage = match self.token_usage() {
+            Ok(usage) => usage,
+            Err(reason) => {
+                // A trustworthy USD bill can enforce a spending cap even when
+                // the token partition cannot be priced with catalog rates.
+                return reported_total.map_or_else(
+                    || unavailable(reason),
+                    |total| Usage {
+                        billing: Some(BillingUsage::ReportedTotal { total }),
+                        cost: crate::model::Cost {
+                            total,
+                            ..Default::default()
+                        },
+                        ..Usage::default()
+                    },
+                );
+            }
+        };
+        if let Some(total) = reported_total {
+            usage.cost.total = total;
+        }
+        // Positive token counts alone do not establish a zero-dollar bill for
+        // an unknown-price model. Leave those snapshots on legacy pricing so
+        // they cannot refund earlier acknowledged USD through default rates.
+        if reported_total.is_some() || usage.total_tokens == 0 {
+            usage.billing = Some(BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input: usage.input,
+                    output: usage.output,
+                    cache_read: usage.cache_read,
+                    cache_write: usage.cache_write,
+                },
+                audio: BillingTokenCounts::default(),
+                reported_total,
+            });
+        }
+        usage
+    }
+
+    fn token_usage(&self) -> std::result::Result<Usage, &'static str> {
+        let inconsistent = "OpenAI Responses reported inconsistent token usage";
+        let total = self
+            .input_tokens
+            .checked_add(self.output_tokens)
+            .ok_or(inconsistent)?;
+        if self.total_tokens.is_some_and(|reported| reported != total) {
+            return Err(inconsistent);
+        }
+        let details = self.input_tokens_details.as_ref();
+        let cached = details.map_or(0, |details| details.cached_tokens);
+        let written = details.map_or(0, |details| details.cache_write_tokens);
+        // Responses counts include cache reads and writes in input_tokens.
+        // ModelCost prices exclusive buckets; neither is an additive fee.
+        let input = cached
+            .checked_add(written)
+            .and_then(|cache| self.input_tokens.checked_sub(cache))
+            .ok_or(inconsistent)?;
+        if let Some(lifetimes) =
+            details.and_then(|details| details.cache_write_tokens_details.as_ref())
+        {
+            if lifetimes.ttl_30m_tokens.checked_add(lifetimes.ttl_12h_tokens) != Some(written) {
+                return Err(inconsistent);
+            }
+            if lifetimes.ttl_12h_tokens > 0 {
+                return Err("OpenAI Responses 12-hour cache writes require a billed total");
+            }
+        }
+        if details.is_some_and(|details| details.audio_tokens > 0)
+            || self
+                .output_tokens_details
+                .as_ref()
+                .is_some_and(|details| details.audio_tokens > 0)
+        {
+            return Err("OpenAI Responses audio usage requires a billed total");
+        }
+        Ok(Usage {
+            input,
+            output: self.output_tokens,
+            cache_read: cached,
+            cache_write: written,
+            total_tokens: total,
+            ..Usage::default()
+        })
+    }
 }
 
 impl OpenAIResponsesDonePayload {
@@ -7406,6 +7546,26 @@ mod tests {
 
         impl UsageHttpFixture {
             fn new(mode: Mode, body: Vec<u8>, limit: f64) -> Self {
+                Self::with_rates(
+                    mode,
+                    body,
+                    limit,
+                    Some(crate::provider::ModelCost {
+                        audio: None,
+                        input: 1_000_000.0,
+                        output: 1_000_000.0,
+                        cache_read: 1_000_000.0,
+                        cache_write: 1_000_000.0,
+                    }),
+                )
+            }
+
+            fn with_rates(
+                mode: Mode,
+                body: Vec<u8>,
+                limit: f64,
+                rates: Option<crate::provider::ModelCost>,
+            ) -> Self {
                 let content_type = if mode.ndjson {
                     "application/x-ndjson"
                 } else {
@@ -7419,16 +7579,14 @@ mod tests {
                     .with_provider_name(provider)
                     .with_api_name(api)
                     .with_codex_mode(mode.codex);
-                let provider = Arc::new(crate::providers::PricedProvider {
-                    inner: Arc::new(transport),
-                    cost: crate::provider::ModelCost {
-                        audio: None,
-                        input: 1_000_000.0,
-                        output: 1_000_000.0,
-                        cache_read: 1_000_000.0,
-                        cache_write: 1_000_000.0,
-                    },
-                });
+                let provider: Arc<dyn Provider> = if let Some(cost) = rates {
+                    Arc::new(crate::providers::PricedProvider {
+                        inner: Arc::new(transport),
+                        cost,
+                    })
+                } else {
+                    Arc::new(transport)
+                };
                 let budget = crate::cost::CostBudget::new(None, Some(limit), 0.0).unwrap();
                 Self {
                     provider: crate::provider::guard_with_cost_budget(provider, budget.clone()),
@@ -7445,6 +7603,240 @@ mod tests {
                 self.requests
                     .recv_timeout(Duration::from_secs(30))
                     .expect("real HTTP request");
+            }
+        }
+
+        #[test]
+        fn http_usage_prices_exclusive_input_cache_read_and_cache_write_buckets() {
+            for mode in MODES {
+                for lifetime_details in [false, true] {
+                    let mut frame = completion(100, 10);
+                    frame["response"]["usage"]["input_tokens_details"] = json!({
+                        "cached_tokens": 60, "cache_write_tokens": 30
+                    });
+                    if lifetime_details {
+                        frame["response"]["usage"]["input_tokens_details"]
+                            ["cache_write_tokens_details"] =
+                            json!({"ttl_30m_tokens": 30, "ttl_12h_tokens": 0});
+                    }
+                    let fixture = UsageHttpFixture::with_rates(
+                        mode,
+                        mode.events(&[frame]),
+                        100.0,
+                        Some(crate::provider::ModelCost {
+                            audio: None,
+                            input: 1_000_000.0,
+                            output: 2_000_000.0,
+                            cache_read: 250_000.0,
+                            cache_write: 1_250_000.0,
+                        }),
+                    );
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("expected completed cache usage for {mode:?}");
+                        };
+                        let usage = &message.usage;
+                        assert_eq!(
+                            (
+                                usage.input,
+                                usage.output,
+                                usage.cache_read,
+                                usage.cache_write,
+                                usage.total_tokens
+                            ),
+                            (10, 10, 60, 30, 110)
+                        );
+                        assert_eq!(
+                            (
+                                usage.cost.input,
+                                usage.cost.output,
+                                usage.cost.cache_read,
+                                usage.cost.cache_write
+                            ),
+                            (10.0, 20.0, 15.0, 37.5)
+                        );
+                        assert_eq!(usage.cost.total, 82.5);
+                        assert_eq!(fixture.budget.spent(), 82.5);
+                        fixture.budget.admit().unwrap();
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_reported_and_zero_bills_replace_estimates_without_refunding_unknown_prices() {
+            for mode in MODES {
+                for case in ["reported", "zero_bill", "zero_work", "unpriced"] {
+                    let mut first = completion(7, 3);
+                    first["response"]["usage"]["cost"] = json!(10.0);
+                    let mut last = if case == "zero_work" {
+                        completion(0, 0)
+                    } else {
+                        completion(200, 100)
+                    };
+                    let expected = match case {
+                        "reported" => {
+                            last["response"]["usage"]["cost"] = json!(2.5);
+                            2.5
+                        }
+                        "zero_bill" => {
+                            last["response"]["usage"]["cost"] = json!(0.0);
+                            0.0
+                        }
+                        "zero_work" => 0.0,
+                        _ => 10.0,
+                    };
+                    let rates = (case != "unpriced").then_some(crate::provider::ModelCost {
+                        audio: None,
+                        input: 1_000_000.0,
+                        output: 1_000_000.0,
+                        cache_read: 1_000_000.0,
+                        cache_write: 1_000_000.0,
+                    });
+                    let fixture =
+                        UsageHttpFixture::with_rates(mode, mode.events(&[first, last]), 9.0, rates);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            output.next().await,
+                            Some(Ok(StreamEvent::Start { .. }))
+                        ));
+                        assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("expected completed bill for {mode:?}/{case}");
+                        };
+                        if case != "unpriced" {
+                            assert_eq!(message.usage.cost.total, expected);
+                            assert!(message.usage.has_explicit_billing());
+                            fixture.budget.admit().unwrap();
+                        } else {
+                            assert!(!message.usage.has_explicit_billing());
+                            assert!(matches!(
+                                fixture.budget.admit(),
+                                Err(Error::CostCap { .. })
+                            ));
+                        }
+                        assert_eq!(fixture.budget.spent(), expected);
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        drop(output);
+                        assert_eq!(fixture.budget.spent(), expected);
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_invalid_billing_quarantines_followups_without_losing_prior_spend() {
+            let invalid = [
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 5}}),
+                json!({"input_tokens": u64::MAX, "output_tokens": 0, "input_tokens_details": {"cached_tokens": u64::MAX, "cache_write_tokens": 1}}),
+                json!({"input_tokens": u64::MAX, "output_tokens": 1}),
+                json!({"input_tokens": 10, "output_tokens": 1, "total_tokens": 10}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": 1, "ttl_12h_tokens": 1}}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": u64::MAX, "ttl_12h_tokens": 1}}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": 0, "ttl_12h_tokens": 5}}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"audio_tokens": 1}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "output_tokens_details": {"audio_tokens": 1}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": null}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": -1}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": "0"}),
+            ];
+            for mode in MODES {
+                for usage in &invalid {
+                    let frame = json!({"type": "response.completed", "response": {"usage": usage}});
+                    let fixture = UsageHttpFixture::new(
+                        mode,
+                        mode.events(&[completion(7, 3), frame, completion(0, 0)]),
+                        100.0,
+                    );
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            output.next().await,
+                            Some(Ok(StreamEvent::Start { .. }))
+                        ));
+                        let error = output.next().await.unwrap().expect_err("invalid billing");
+                        assert!(
+                            error.to_string().contains("cost accounting"),
+                            "{usage}: {error}"
+                        );
+                        assert_eq!(fixture.budget.spent(), 10.0, "{usage}");
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        assert!(
+                            fixture.budget.admit().is_err(),
+                            "invalid bill reopened budget: {usage}"
+                        );
+                        assert!(
+                            fixture
+                                .provider
+                                .stream(&Context::default(), &fixture.options)
+                                .await
+                                .is_err()
+                        );
+                        assert!(matches!(output.next().now_or_never(), Some(None)));
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_explicit_bill_accounts_for_unpriceable_token_partitions() {
+            for mode in MODES {
+                for details in [
+                    json!({"cached_tokens": 11}),
+                    json!({"audio_tokens": 1}),
+                    json!({"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": 0, "ttl_12h_tokens": 5}}),
+                ] {
+                    let mut frame = completion(10, 1);
+                    frame["response"]["usage"]["input_tokens_details"] = details;
+                    frame["response"]["usage"]["cost"] = json!(2.5);
+                    let fixture =
+                        UsageHttpFixture::with_rates(mode, mode.events(&[frame]), 2.0, None);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("expected reported bill for {mode:?}");
+                        };
+                        assert!(matches!(
+                            message.usage.billing.as_ref(),
+                            Some(BillingUsage::ReportedTotal { total }) if *total == 2.5
+                        ));
+                        assert_eq!(message.usage.cost.total, 2.5);
+                        assert_eq!(fixture.budget.spent(), 2.5);
+                        assert!(matches!(
+                            fixture.budget.admit(),
+                            Err(Error::CostCap { .. })
+                        ));
+                    });
+                    fixture.assert_request();
+                }
             }
         }
 
