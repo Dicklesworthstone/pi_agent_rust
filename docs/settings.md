@@ -1035,11 +1035,13 @@ Native backends:
 
 The browser executable and user agent are set with the `PI_BROWSER_EXECUTABLE` and `PI_BROWSER_USER_AGENT` environment variables, not settings. Pi always asks the operating system for a free debugging port, so it has no port setting; to use a fixed port, start the browser yourself and attach with `PI_BROWSER_CDP_URL`. See [browser automation](tools/browser-cdp.md).
 
-### Web Remote & Collab
+### Local browser companion
 
-Not available yet: this build has no web remote server, `pi web` exits with an
-error, and there are no `web.*` settings (Pi reports them as unrecognised). See
-[the web remote design notes](tools/web_remote.md).
+`pi web` starts the normal FrankenTUI session with supervised browser access on
+loopback. Use `--port`, `--view-only`, and `--max-viewers` on that subcommand.
+The local terminal must accept each browser prompt and retains tool approval
+and login input. There are no persistent `web.*` settings (Pi reports them as
+unrecognised). See [the browser companion guide](tools/web_remote.md).
 
 ## Full reference
 

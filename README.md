@@ -961,6 +961,14 @@ clear this hold, and other sessions can continue normally.
 
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
+**Browser companion** (`pi web`) keeps the normal FrankenTUI session running and
+offers a private, one-time pairing link for a browser on the same computer.
+The browser shows screened completed messages and can propose a prompt for
+explicit F8 acceptance on the local terminal. Drafts, tool approvals, login,
+and cancellation stay in the terminal. Use `/web` for pairing or inbox review
+and `/web revoke` to close browser access. See the
+[browser companion guide](docs/tools/web_remote.md) for options and limits.
+
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
 
 **Print mode and tool approval.** The approval mode defaults to `always-ask` on

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Pi · Local companion</title>
+  <link rel="stylesheet" href="/client.css">
+  <script src="/client.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark" aria-hidden="true">π</span><span>Pi <span class="subtle">/ companion</span></span></div>
+    <div class="connection"><span id="signal" class="signal"></span><span id="connection">Pairing</span><button id="disconnect" class="quiet" hidden>Disconnect</button></div>
+  </header>
+  <main>
+    <section class="heading">
+      <div><p class="eyebrow">YOUR LOCAL SESSION</p><h1 id="session-name">A window into your work.</h1><p id="model" class="subtle">Connect with a fresh link from the Pi terminal.</p></div>
+      <span id="status" class="status">Starting</span>
+    </section>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <section class="workspace">
+      <div class="conversation">
+        <div class="section-label"><h2>Conversation</h2><span>Completed messages</span></div>
+        <div id="messages" class="messages" aria-live="polite"><div class="empty"><span class="empty-mark" aria-hidden="true">π</span><h3>Keep the terminal in charge.</h3><p>This companion shows privacy-screened conversation text and live session status. Drafts, tool details, and approvals stay local.</p></div></div>
+        <p id="omitted" class="footnote" hidden>Showing a bounded recent conversation. Some content is omitted or shortened after privacy screening.</p>
+      </div>
+      <aside class="sidebar">
+        <section class="proposal-card">
+          <p class="eyebrow">NEXT INSTRUCTION</p><h2>Propose a prompt</h2>
+          <p class="subtle">The local terminal must accept it before Pi starts any work.</p>
+          <form id="proposal-form">
+            <label for="prompt">Your proposal</label>
+            <textarea id="prompt" rows="7" placeholder="What should Pi work on next?" maxlength="8192" disabled></textarea>
+            <div class="composer-footer"><span id="prompt-count">0 / 8 KiB</span><button id="submit" type="submit" disabled>Send for acceptance <span aria-hidden="true">↗</span></button></div>
+          </form>
+          <p id="proposal-status" class="proposal-status" role="status">Waiting for the session.</p>
+        </section>
+        <section class="boundary-card"><h3>Local by design</h3><ul><li>Connected to this Pi process on loopback.</li><li>Permission and login prompts stay in the terminal.</li><li>Conversation data stays in this page’s memory.</li></ul><p>For another link, use <code>/web</code> locally. Revoke browser access with <code>/web revoke</code>.</p></section>
+      </aside>
+    </section>
+  </main>
+</body>
+</html>

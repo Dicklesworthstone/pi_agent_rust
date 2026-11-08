@@ -822,6 +822,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
             description: "Show help for interactive commands",
         },
         BuiltinSlashCommand {
+            name: "web",
+            description: "Open browser companion pairing or revoke browser access",
+        },
+        BuiltinSlashCommand {
             name: "login",
             description: "OAuth login (provider-specific)",
         },

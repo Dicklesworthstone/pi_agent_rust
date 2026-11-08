@@ -91,6 +91,15 @@ impl AuxiliaryPrivacySnapshot {
 }
 
 impl AuxiliaryPrivacy {
+    /// Supply the detector policy for in-process terminal frame protection
+    /// without exposing the mutable policy fields to sibling modules.
+    pub(crate) fn remote_frame_policy(&self) -> (Vec<regex::Regex>, bool) {
+        (
+            self.extra_patterns.clone(),
+            self.mode == crate::secrets::SecretsMode::Block,
+        )
+    }
+
     /// Provider-free checkpoints may redact locally even when outbound
     /// requests are blocked. Preserve the same configured detector patterns.
     pub(crate) fn local_redaction(&self) -> Self {

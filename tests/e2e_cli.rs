@@ -3813,8 +3813,8 @@ fn e2e_cli_doctor_invalid_only_value_is_usage_error() {
 /// gh #182: `pi web` printed "server listening", a client URL and a pairing
 /// token, then exited with nothing serving the port.
 #[test]
-fn e2e_cli_web_fails_instead_of_reporting_a_server() {
-    let harness = CliTestHarness::new("e2e_cli_web_fails_instead_of_reporting_a_server");
+fn e2e_cli_web_requires_local_terminal_before_reporting_a_server() {
+    let harness = CliTestHarness::new("e2e_cli_web_requires_local_terminal_before_reporting_a_server");
     let result = harness.run(&["web", "--port", "18080"]);
 
     assert_ne!(result.exit_code, 0, "stdout: {}", result.stdout);
@@ -3828,7 +3828,11 @@ fn e2e_cli_web_fails_instead_of_reporting_a_server() {
     assert_contains(
         &harness.harness,
         &result.stderr,
-        "`pi web` is not available",
+        if cfg!(feature = "ftui") {
+            "`pi web` requires a local terminal"
+        } else {
+            "`pi web` requires a build with FrankenTUI support"
+        },
     );
 }
 

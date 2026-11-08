@@ -1,6 +1,45 @@
 # Web-Remote Access Threat Model & Security Posture
 
-> **Status:** Active Security Gate  
+## Current implementation: supervised loopback companion
+
+The implemented `pi web` path is documented in the
+[browser companion guide](../tools/web_remote.md). It serves bounded completed
+conversation snapshots over authenticated loopback HTTP. Prompt proposals
+require explicit local F8 acceptance and a final session/credential check at
+driver admission. It does not expose raw terminal frames, WebSockets, Tailscale
+binding, or unattended remote control.
+
+Current controls include 256-bit single-use pairing links, hashed credentials,
+exact Host and Origin checks, a restrictive CSP, privacy discovery before
+omission or clipping, non-restorable redaction, bounded memory and connection
+lifetimes, and revocation of pending proposals. The in-memory audit ring holds
+metadata only. Browser extensions or a compromised browser can still read data
+already delivered to that browser; in-memory storage and CSP do not prevent
+that access.
+
+The real listener and native admission regressions are in
+`src/web_remote/companion/tests.rs`, `src/web_remote/companion/projection.rs`,
+and `src/interactive_ftui.rs`. Their authoritative execution path is DSR.
+
+## Embedded terminal transport
+
+`WebRemoteServer` and `WebRemoteBridge` provide a separate authenticated
+WebSocket transport for embedding hosts. It supports terminal keyframes and
+patches, local approval of control leases, and bounded sequenced input with
+provenance for host revalidation. Its socket regressions live in
+`src/web_remote/server.rs`; manager and privacy coverage also appears in
+`tests/web_remote.rs` and `tests/web_security.rs`. The CLI does not start this
+transport, and its credentials and control leases do not authorize companion
+proposals. These implementations do not establish WASM or complete terminal
+integration acceptance by themselves.
+
+## Historical design: WASM remote terminal
+
+The sections below retain the earlier design and its proposed acceptance
+criteria. They do not describe the current companion or establish a passed
+security gate for it.
+
+> **Status:** Historical design, not the current runtime contract
 > **Bead ID:** `bd-cv653.10.3`  
 > **Schema:** `pi.web.threat_model.v1`  
 > **Feature:** `pi web` (WASM Browser Client over WebSocket Frame Diffs)

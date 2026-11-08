@@ -756,6 +756,11 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
+    /// Validated `pi web` launch state. The CLI normalizes the subcommand
+    /// before ordinary session discovery, trust, and FTUI startup.
+    #[arg(skip)]
+    pub web_companion: Option<crate::web_remote::WebRemoteSettings>,
+
     // === Positional Arguments ===
     /// Messages and @file references
     #[arg(trailing_var_arg = true)]
@@ -3315,15 +3320,15 @@ pub enum Commands {
         refresh: bool,
     },
 
-    /// Web remote access (not available yet: this build has no web remote server)
+    /// Start the local TUI with a supervised loopback browser companion
     Web {
         /// Port to bind web server (default: 8080)
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Network interface binding mode: loopback (default), tailscale, lan
-        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan"])]
+        /// Bind only to loopback; a local terminal remains required
+        #[arg(long, default_value = "loopback", value_parser = ["loopback"])]
         bind: String,
-        /// Connect in view-only mode (disallows input from web clients)
+        /// Offer viewing only; otherwise browser prompts require local approval
         #[arg(long)]
         view_only: bool,
         /// Maximum concurrent connected web viewers (default: 4)

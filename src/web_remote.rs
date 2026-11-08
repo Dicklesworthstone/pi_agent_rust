@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Web-remote access: ftui-web WASM browser client over WebSocket frame diffs (OMP-ADOPT / bd-cv653.10.1 / bd-cv653.10.2).
+//! Browser access to a supervised local Pi session.
 //!
-//! Provides relay-free browser access to the live Pi agent session over local network or Tailscale,
-//! with strict input arbitration, server-rendered frame diffs, QR console pairing, and privacy/audit controls.
+//! [`CompanionServer`] serves the `pi web` loopback companion with bounded
+//! semantic snapshots and locally accepted prompt proposals. [`WebRemoteServer`]
+//! and [`WebRemoteBridge`] expose a separate mirrored-terminal transport for
+//! embedded hosts; its control leases do not authorize companion proposals.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -12,9 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod bridge;
+mod companion;
 pub mod server;
 
 pub use bridge::{WebRemoteBridge, WebRemoteEvent, WebRemoteInput};
+pub use companion::{CompanionHandle, CompanionServer, PromptProposal};
 pub use server::WebRemoteServer;
 
 pub const MAX_WEB_VIEWERS: usize = 64;
