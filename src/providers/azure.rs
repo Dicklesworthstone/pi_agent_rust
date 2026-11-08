@@ -9,7 +9,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ThinkingLevel, Usage,
+    UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -98,6 +99,9 @@ pub struct AzureOpenAIProvider {
     /// Optional override for the full endpoint URL (primarily for deterministic tests).
     endpoint_url_override: Option<String>,
     compat: Option<CompatConfig>,
+    /// Deployment names are arbitrary; use the registry's model capability,
+    /// never the deployment name, to select reasoning request fields.
+    reasoning: bool,
 }
 
 impl AzureOpenAIProvider {
@@ -115,7 +119,19 @@ impl AzureOpenAIProvider {
             api_version: azure_api_version(),
             endpoint_url_override: None,
             compat: None,
+            reasoning: false,
         }
+    }
+
+    /// Set whether the deployment serves a reasoning model.
+    ///
+    /// Reasoning models use `max_completion_tokens` by default. Sending an
+    /// effort also requires `compat.supportsReasoningEffort`, since some
+    /// reasoning deployments (such as o1-mini) do not support that parameter.
+    #[must_use]
+    pub const fn with_reasoning(mut self, reasoning: bool) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// Set the provider name for event reporting.
@@ -168,27 +184,72 @@ impl AzureOpenAIProvider {
     }
 
     /// Build the request body for Azure OpenAI (same format as OpenAI).
-    #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> AzureRequest {
         let messages = self.build_messages(context);
+        let compat = self.compat.as_ref();
+        let tools_supported = compat.and_then(|c| c.supports_tools).unwrap_or(true);
 
-        let tools: Option<Vec<AzureTool>> = if context.tools.is_empty() {
+        let tools: Option<Vec<AzureTool>> = if context.tools.is_empty() || !tools_supported {
             None
         } else {
             Some(context.tools.iter().map(convert_tool_to_azure).collect())
         };
 
+        // Azure reasoning deployments reject max_tokens. An explicit field
+        // override remains authoritative, including an explicit max_tokens.
+        let use_completion_tokens = compat
+            .and_then(|c| c.max_tokens_field.as_deref())
+            .map_or(self.reasoning, |field| field == "max_completion_tokens");
+        let token_limit = options.max_tokens.or(Some(DEFAULT_MAX_TOKENS));
+        let (max_tokens, max_completion_tokens) = if use_completion_tokens {
+            (None, token_limit)
+        } else {
+            (token_limit, None)
+        };
+
         AzureRequest {
             messages,
-            max_tokens: options.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+            max_tokens,
+            max_completion_tokens,
             temperature: options.temperature,
             tools,
             stream: true,
             stream_options: Some(AzureStreamOptions {
-                include_usage: true,
+                include_usage: compat
+                    .and_then(|c| c.supports_usage_in_streaming)
+                    .unwrap_or(true),
             }),
+            reasoning_effort: self.reasoning_effort(options.thinking_level.unwrap_or_default()),
             prompt_cache_key: options.prompt_cache_key.clone(),
         }
+    }
+
+    /// Match the plain OpenAI effort dialect: explicit capability opt-in,
+    /// per-tier string/null overrides, and no unmapped `off` field.
+    fn reasoning_effort(&self, level: ThinkingLevel) -> Option<String> {
+        let compat = self.compat.as_ref()?;
+        if !self.reasoning || compat.supports_reasoning_effort != Some(true) {
+            return None;
+        }
+        if compat
+            .thinking_format
+            .as_deref()
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+            .is_some_and(|format| !format.eq_ignore_ascii_case("openai"))
+        {
+            return None;
+        }
+
+        let name = level.to_string();
+        if let Some(mapped) = compat
+            .thinking_level_map
+            .as_ref()
+            .and_then(|map| map.get(&name))
+        {
+            return mapped.clone();
+        }
+        (level != ThinkingLevel::Off).then_some(name)
     }
 
     /// Build the messages array with system prompt prepended.
@@ -790,12 +851,16 @@ pub struct AzureRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AzureTool>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<AzureStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     /// Cache-affinity key (`prompt_cache_key`, gh #188). Omitted when unset
     /// so the wire format is unchanged. See `StreamOptions::prompt_cache_key`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1279,8 +1344,202 @@ mod tests {
         let request = provider.build_request(&context, &options);
         let request_json = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(request_json["max_tokens"], json!(DEFAULT_MAX_TOKENS));
+        assert!(request_json.get("max_completion_tokens").is_none());
+        assert!(request_json.get("reasoning_effort").is_none());
         assert_eq!(request_json["stream"], json!(true));
+        assert_eq!(request_json["stream_options"]["include_usage"], true);
         assert!(request_json.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_azure_token_limit_field_preserves_explicit_overrides() {
+        for (reasoning, field, expected_field, absent_field) in [
+            (false, None, "max_tokens", "max_completion_tokens"),
+            (true, None, "max_completion_tokens", "max_tokens"),
+            (
+                false,
+                Some("max_completion_tokens"),
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                true,
+                Some("max_tokens"),
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+        ] {
+            let provider = AzureOpenAIProvider::new("contoso", "production")
+                .with_reasoning(reasoning)
+                .with_compat(Some(CompatConfig {
+                    max_tokens_field: field.map(str::to_string),
+                    ..CompatConfig::default()
+                }));
+            for (limit, expected_limit) in [(None, 4096), (Some(1536), 1536)] {
+                let options = StreamOptions {
+                    max_tokens: limit,
+                    ..Default::default()
+                };
+                let body = serde_json::to_value(
+                    provider.build_request(&Context::default(), &options),
+                )
+                .expect("request JSON");
+                assert_eq!(body[expected_field], expected_limit, "{body}");
+                assert!(body.get(absent_field).is_none(), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_azure_reasoning_requires_model_and_effort_capabilities() {
+        for (reasoning, supports_effort, format, expected) in [
+            (true, Some(true), None, Some("high")),
+            (true, Some(true), Some(" OpenAI "), Some("high")),
+            (true, Some(true), Some(" "), Some("high")),
+            (false, Some(true), None, None),
+            (true, Some(false), None, None),
+            (true, None, None, None),
+            (true, Some(true), Some("deepseek"), None),
+            (true, Some(true), Some("openrouter"), None),
+        ] {
+            // Even a model-looking deployment name must not infer capabilities.
+            let provider = AzureOpenAIProvider::new("contoso", "o3")
+                .with_reasoning(reasoning)
+                .with_compat(Some(CompatConfig {
+                    supports_reasoning_effort: supports_effort,
+                    thinking_format: format.map(str::to_string),
+                    ..CompatConfig::default()
+                }));
+            let options = StreamOptions {
+                thinking_level: Some(ThinkingLevel::High),
+                ..Default::default()
+            };
+            let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
+                .expect("request JSON");
+            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), expected);
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert!(body.get("reasoning").is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_azure_reasoning_maps_aliases_off_and_explicit_null() {
+        let provider = AzureOpenAIProvider::new("contoso", "production")
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                supports_reasoning_effort: Some(true),
+                thinking_level_map: Some(HashMap::from([
+                    ("xhigh".to_string(), Some("high".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
+                    ("max".to_string(), None),
+                ])),
+                ..CompatConfig::default()
+            }));
+        for (level, expected) in [
+            (ThinkingLevel::Low, Some("low")),
+            (ThinkingLevel::XHigh, Some("high")),
+            (ThinkingLevel::Off, Some("none")),
+            (ThinkingLevel::Max, None),
+        ] {
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
+                .expect("request JSON");
+            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), expected);
+        }
+
+        let provider = provider.with_compat(Some(CompatConfig {
+            supports_reasoning_effort: Some(true),
+            ..CompatConfig::default()
+        }));
+        for level in [None, Some(ThinkingLevel::Off)] {
+            let options = StreamOptions {
+                thinking_level: level,
+                ..Default::default()
+            };
+            let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
+                .expect("request JSON");
+            assert!(body.get("reasoning_effort").is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_azure_factory_preserves_model_reasoning_and_compat_precedence() {
+        let dir = tempfile::tempdir().expect("model fixture directory");
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "providers": {
+                    "azure-openai": {
+                        "api": "azure-openai",
+                        "baseUrl": "https://contoso.openai.azure.com",
+                        "compat": {
+                            "supportsReasoningEffort": true,
+                            "maxTokensField": "max_tokens",
+                            "thinkingLevelMap": {"xhigh": "medium"}
+                        },
+                        "models": [
+                            {
+                                "id": "production",
+                                "reasoning": true,
+                                "compat": {"maxTokensField": "max_completion_tokens"},
+                                "thinkingLevelMap": {"xhigh": "high"}
+                            },
+                            {"id": "plain", "reasoning": false},
+                            {
+                                "id": "effort-disabled",
+                                "reasoning": true,
+                                "compat": {"supportsReasoningEffort": false}
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .expect("write models fixture");
+        let registry =
+            crate::models::ModelRegistry::load_with_credential_resolver(Some(path), |_| None);
+        assert!(registry.error().is_none(), "{:?}", registry.error());
+
+        for (model, expected_effort, expected_field) in [
+            ("production", Some("high"), "max_completion_tokens"),
+            ("plain", None, "max_tokens"),
+            ("effort-disabled", None, "max_tokens"),
+        ] {
+            let entry = registry.find("azure-openai", model).expect("fixture model");
+            let provider = crate::providers::create_provider(&entry, None).expect("Azure factory");
+            let (tx, rx) = mpsc::channel();
+            let options = StreamOptions {
+                api_key: Some("azure-test-key".to_string()),
+                max_tokens: Some(2048),
+                thinking_level: Some(ThinkingLevel::XHigh),
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    move |event| {
+                        tx.send(event).expect("capture factory request");
+                        // Hold before dispatch, so this exercises the real
+                        // factory without opening an Azure network connection.
+                        Box::pin(std::future::pending())
+                    },
+                )),
+                ..Default::default()
+            };
+            let context = Context::default();
+            assert!(
+                futures::FutureExt::now_or_never(provider.stream(&context, &options)).is_none()
+            );
+            let captured = rx.try_recv().expect("factory reached request hook");
+            assert_eq!(captured.api, "azure-openai");
+            assert_eq!(captured.payload[expected_field], 2048);
+            assert_eq!(
+                captured.payload.get("reasoning_effort").and_then(Value::as_str),
+                expected_effort,
+                "{model}: {}",
+                captured.payload
+            );
+        }
     }
 
     #[test]
@@ -1420,6 +1679,69 @@ mod tests {
     struct CapturedRequest {
         headers: HashMap<String, String>,
         body: String,
+    }
+
+    #[test]
+    fn test_stream_sends_azure_reasoning_and_capability_overrides() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AzureOpenAIProvider::new("contoso", "production")
+            .with_endpoint_url(base_url)
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                supports_reasoning_effort: Some(true),
+                supports_tools: Some(false),
+                supports_usage_in_streaming: Some(false),
+                system_role_name: Some("developer".to_string()),
+                thinking_level_map: Some(HashMap::from([(
+                    "xhigh".to_string(),
+                    Some("high".to_string()),
+                )])),
+                ..CompatConfig::default()
+            }));
+        let context = Context::owned(
+            Some("Be concise.".to_string()),
+            vec![Message::User(UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            vec![ToolDef {
+                name: "lookup".to_string(),
+                description: "Look up a fact".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+        );
+        let options = StreamOptions {
+            api_key: Some("azure-test-key".to_string()),
+            max_tokens: Some(8192),
+            thinking_level: Some(ThinkingLevel::XHigh),
+            ..Default::default()
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut done = false;
+            while let Some(event) = stream.next().await {
+                done |= matches!(event.expect("stream event"), StreamEvent::Done { .. });
+            }
+            assert!(done, "Azure response should complete");
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        let body: Value = serde_json::from_str(&captured.body).expect("body JSON");
+        assert_eq!(body["max_completion_tokens"], 8192);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["messages"][0]["role"], "developer");
+        assert_eq!(body["messages"][1]["content"], "ping");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], false);
+        assert!(body.get("tools").is_none());
+        assert_eq!(
+            captured.headers.get("api-key").map(String::as_str),
+            Some("azure-test-key")
+        );
     }
 
     #[test]
