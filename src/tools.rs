@@ -8607,7 +8607,7 @@ pub struct BashRunResult {
 
 /// Capture limitations are separate from the command's exit status and from
 /// truncating the displayed tail. A capped artifact can accompany complete EOF.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BashCapture {
     pub output_complete: bool,
@@ -8836,6 +8836,7 @@ async fn execute_bash_spawn(
             timeout_secs,
             on_update,
             shell_state,
+            None,
         )
         .await
     }
@@ -9112,11 +9113,41 @@ pub(crate) async fn run_bash_command(
         timeout_secs,
         on_update,
         None,
+        None,
     )
     .await
 }
 
-#[allow(clippy::too_many_lines)]
+/// Per-call cancellation for transports such as RPC. Checking a local probe
+/// avoids cancelling the server's shared context just to stop one command.
+pub(crate) struct BashRunControl<'a> {
+    pub abort_requested: &'a mut (dyn FnMut() -> bool + Send),
+    pub drain_timeout: Duration,
+}
+
+/// Run an explicitly controlled command without the foreground tool's default
+/// execution timeout or persistent shell transaction.
+pub(crate) async fn run_bash_command_with_control(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    control: BashRunControl<'_>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_state(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        Some(0),
+        None,
+        None,
+        Some(control),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_bash_command_with_state(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -9125,12 +9156,38 @@ async fn run_bash_command_with_state(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
+    mut control: Option<BashRunControl<'_>>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
         Some(0) => None,
         Some(value) => Some(value),
     };
+    let cx = AgentCx::for_current_or_request();
+    let controlled = control.is_some();
+    let drain_timeout = control
+        .as_ref()
+        .map_or(Duration::from_secs(5), |control| control.drain_timeout);
+    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
+    let mut bash_output = BashOutputState::new(max_chunks_bytes);
+    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
+
+    // A request cancelled while queued must not launch a command with side
+    // effects. Keep this before shell resolution and process creation.
+    if control
+        .as_mut()
+        .is_some_and(|control| (control.abort_requested)())
+        || cx.checkpoint().is_err()
+    {
+        return Ok(assemble_bash_run_result(
+            bash_output,
+            Some(-1),
+            false,
+            true,
+            Some(BashCancellationReason::AmbientCancellation),
+            timeout_secs,
+        ));
+    }
     let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),
@@ -9220,11 +9277,6 @@ async fn run_bash_command_with_state(
     pumps.spawn(stdout, "stdout", tx.clone())?;
     pumps.spawn(stderr, "stderr", tx)?;
 
-    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
-    let mut bash_output = BashOutputState::new(max_chunks_bytes);
-    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
-
-    let cx = AgentCx::for_current_or_request();
     let mut timed_out = false;
     let mut cancelled = false;
     let mut cancellation_reason: Option<BashCancellationReason> = None;
@@ -9248,6 +9300,18 @@ async fn run_bash_command_with_state(
 
         if updated {
             emit_bash_update(&bash_output, on_update)?;
+        }
+
+        // Output publication is bounded, so a continuously busy command
+        // cannot starve an explicit abort. Preserve abort-before-exit ordering.
+        if control
+            .as_mut()
+            .is_some_and(|control| (control.abort_requested)())
+        {
+            cancelled = true;
+            cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+            exit_code = Some(guard.kill().map_or(-1, exit_status_code));
+            break;
         }
 
         match guard.try_wait_child() {
@@ -9296,15 +9360,14 @@ async fn run_bash_command_with_state(
     // Drain any remaining channel frames while waiting for the pump threads
     // to observe EOF and exit. Because the channel is bounded, they may still
     // be waiting for queue space until we consume buffered output after the
-    // child closes its pipe ends. The 5-second cap is a safety net for pathological
-    // cases (e.g. the child spawned a grandchild that inherited the pipe fd
-    // and is still running).
+    // child closes its pipe ends. The bounded grace interval covers descendants
+    // that retain a pipe after the root exits; RPC supplies its two-second cap.
     {
         let drain_start = cx
             .cx()
             .timer_driver()
             .map_or_else(wall_now, |timer| timer.now());
-        let drain_deadline = drain_start + Duration::from_secs(5);
+        let drain_deadline = drain_start + drain_timeout;
         let allow_drain_cancellation = !cancelled && !timed_out && exit_code.is_none();
         loop {
             // A descendant may still be filling the pipe. Return to the
@@ -9320,7 +9383,26 @@ async fn run_bash_command_with_state(
                 emit_bash_update(&bash_output, on_update)?;
             }
 
-            if pumps.is_finished() {
+            let readers_finished = pumps.is_finished();
+            // The RPC request still owns its output drain after root exit.
+            // Honour a fresh abort or an already-consumed abort here, while
+            // retaining a known exit status and every accepted channel frame.
+            if controlled
+                && (cancelled
+                    || control
+                        .as_mut()
+                        .is_some_and(|control| (control.abort_requested)())
+                    || cx.checkpoint().is_err())
+            {
+                cancelled = true;
+                cancellation_reason.get_or_insert(BashCancellationReason::AmbientCancellation);
+                if !readers_finished {
+                    bash_output.output_complete = false;
+                }
+                break;
+            }
+
+            if readers_finished {
                 break;
             }
 

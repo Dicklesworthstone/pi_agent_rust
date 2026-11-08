@@ -127,6 +127,84 @@ Session and RPC message events retain the native content blocks. Native Chat
 audio also enforces per-request transport bounds and requires detailed streamed
 billing; see [model configuration](models.md#native-audio-with-openai-chat-completions).
 
+### Bash commands
+
+Send `bash` with a string `command`; only one Bash request can run at a time.
+Send `abort_bash` to request cancellation while its response is pending:
+
+```json
+{"id":"shell-1","type":"bash","command":"make test"}
+{"id":"stop-1","type":"abort_bash"}
+```
+
+`abort_bash` acknowledges the request, including when no command is active.
+The terminal execution result arrives separately under the original `bash`
+request ID. A `user_bash` extension hook runs first and may supply that result;
+the native execution and cancellation guarantees below apply to the fallback
+runner, not to work performed by an extension hook.
+
+Native RPC Bash uses the configured `shell_path` and `shell_command_prefix`
+in Pi's runtime working directory, with the shared proxy and non-interactive
+environment settings. Each request starts a fresh shell with piped output and
+closed stdin; shell state does not persist between requests. It uses neither
+PTY selection nor automatic background promotion. There is no implicit
+120-second execution timeout for RPC Bash.
+
+The runner checks cancellation between bounded output batches, so continuous
+stdout or stderr cannot prevent an abort. Cancellation terminates the owned
+process tree and retires its output readers. After the root shell exits, the
+runner waits up to two seconds for output readers to reach EOF, then stops
+them and preserves already-accepted output. `abort_bash` can also interrupt
+that final drain. A descendant retaining an output descriptor cannot leave
+the native reader running after the request completes.
+
+`exitCode` describes the shell outcome; a nonzero exit still returns an RPC
+response with `success: true`. `truncated` describes the displayed output
+tail, which retains at most 2,000 lines or 1 MB. Capture limitations are
+reported independently in the optional `capture` object:
+
+| Field | Meaning |
+| --- | --- |
+| `outputComplete` | Whether all output readers finished before capture stopped. |
+| `artifactTruncated` | Whether the retained output artifact reached its size cap. |
+| `artifactError` | Artifact retention error, or `null`. |
+| `artifactPath` | Retained partial artifact path, or `null`. |
+
+For native execution, `fullOutputPath` is non-null only when a complete output
+artifact accompanies a truncated display. An incomplete, capped, or failed
+artifact is never advertised there. Normal complete capture omits `capture`.
+For example, these response fields show that a zero exit and an untruncated
+display can still accompany missing output:
+
+```json
+{
+  "id": "shell-1",
+  "type": "response",
+  "command": "bash",
+  "success": true,
+  "data": {
+    "exitCode": 0,
+    "cancelled": false,
+    "truncated": false,
+    "fullOutputPath": null,
+    "capture": {
+      "outputComplete": false,
+      "artifactTruncated": false,
+      "artifactError": null,
+      "artifactPath": null
+    }
+  }
+}
+```
+
+The complete response also includes `output` and history persistence fields.
+The server attempts to append the execution and its capture metadata to the
+originating session's Bash history. `persisted`, `persistenceStatus`, and an
+optional `persistenceWarning` report whether that history was saved; disabled
+saving or an append/save failure does not change the command's exit status.
+The Rust SDK exposes capture metadata as `RpcBashResult.capture`; responses
+without the optional field deserialize with `capture: None`.
+
 ### Compact output and attachment retrieval
 
 RPC output defaults to `full`, preserving the existing inline payload format.

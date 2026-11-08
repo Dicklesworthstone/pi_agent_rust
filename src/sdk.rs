@@ -1061,6 +1061,9 @@ pub struct RpcBashResult {
     pub cancelled: bool,
     pub truncated: bool,
     pub full_output_path: Option<String>,
+    /// Output capture and retained-artifact status, when supplied by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<crate::tools::BashCapture>,
 }
 
 /// Compaction result returned by RPC `compact` or in-place `handoff`.
@@ -4713,6 +4716,90 @@ mod tests {
     use std::env;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn rpc_bash_result_omits_absent_capture() {
+        let payload = serde_json::json!({
+            "output": "done\n",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+            "fullOutputPath": null,
+        });
+        let result: RpcBashResult =
+            serde_json::from_value(payload.clone()).expect("bash response without capture");
+
+        assert!(result.capture.is_none());
+        assert_eq!(
+            serde_json::to_value(result).expect("bash response"),
+            payload
+        );
+    }
+
+    #[test]
+    fn rpc_bash_result_reads_complete_capture_metadata() {
+        let result: RpcBashResult = serde_json::from_value(serde_json::json!({
+            "output": "done\n",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+            "fullOutputPath": null,
+            "capture": {"outputComplete": true},
+        }))
+        .expect("bash response with complete capture");
+
+        assert_eq!(
+            result.capture,
+            Some(crate::tools::BashCapture {
+                output_complete: true,
+                artifact_truncated: false,
+                artifact_error: None,
+                artifact_path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn rpc_bash_result_preserves_incomplete_capture_metadata() {
+        for (output_complete, artifact_truncated, artifact_error, artifact_path) in [
+            (false, false, None, Some("/tmp/pi-bash-partial.log")),
+            (true, true, None, Some("/tmp/pi-bash-capped.log")),
+            (true, false, Some("artifact write failed"), None),
+        ] {
+            let payload = serde_json::json!({
+                "output": "retained tail\n",
+                "exitCode": 0,
+                "cancelled": false,
+                "truncated": true,
+                "fullOutputPath": null,
+                "capture": {
+                    "outputComplete": output_complete,
+                    "artifactTruncated": artifact_truncated,
+                    "artifactError": artifact_error,
+                    "artifactPath": artifact_path,
+                },
+            });
+            let result: RpcBashResult =
+                serde_json::from_value(payload.clone()).expect("bash capture limitations");
+
+            assert_eq!(result.exit_code, 0);
+            assert!(!result.cancelled);
+            assert!(result.full_output_path.is_none());
+            assert_eq!(
+                result.capture,
+                Some(crate::tools::BashCapture {
+                    output_complete,
+                    artifact_truncated,
+                    artifact_error: artifact_error.map(str::to_string),
+                    artifact_path: artifact_path.map(str::to_string),
+                })
+            );
+            assert_eq!(
+                serde_json::to_value(result).expect("bash response"),
+                payload
+            );
+        }
+    }
 
     /// Drives `future` to completion on a `current_thread` runtime.
     ///

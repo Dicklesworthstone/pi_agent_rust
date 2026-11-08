@@ -43,12 +43,10 @@ use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
 use crate::session::{AutosaveFlushTrigger, Session, SessionEntry, SessionMessage};
-use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::{JoinHandle, RuntimeHandle};
 use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
-use memchr::memchr_iter;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -4595,6 +4593,8 @@ pub async fn run(
                 let runtime_handle = options.runtime_handle.clone();
                 let bash_cx = cx.clone();
                 let cwd = runtime_cwd.clone();
+                let shell_path = options.config.shell_path.clone();
+                let command_prefix = options.config.shell_command_prefix.clone();
                 let extensions = rpc_extension_manager.clone();
 
                 runtime_handle.spawn(async move {
@@ -4605,14 +4605,17 @@ pub async fn run(
                         None => None,
                     };
                     let result = match hooked {
-                        Some(result) => Ok(BashRpcResult {
-                            output: result.output,
-                            exit_code: result.exit_code,
-                            cancelled: result.cancelled,
-                            truncated: result.truncated,
-                            full_output_path: result.full_output_path,
-                        }),
-                        None => run_bash_rpc(&cwd, &command, abort_rx).await,
+                        Some(result) => Ok(result),
+                        None => {
+                            run_bash_rpc(
+                                &cwd,
+                                shell_path.as_deref(),
+                                command_prefix.as_deref(),
+                                &command,
+                                abort_rx,
+                            )
+                            .await
+                        }
                     };
 
                     let response = match result {
@@ -4648,6 +4651,13 @@ pub async fn run(
                                             guard.session.lock(&bash_cx).await
                                         {
                                             if inner_session.header.id == origin_session_id {
+                                                let mut extra = HashMap::new();
+                                                if let Some(capture) = &result.capture {
+                                                    extra.insert(
+                                                        "capture".to_string(),
+                                                        json!(capture),
+                                                    );
+                                                }
                                                 inner_session.append_message(
                                                     SessionMessage::BashExecution {
                                                         command: command.clone(),
@@ -4661,7 +4671,7 @@ pub async fn run(
                                                         timestamp: Some(
                                                             chrono::Utc::now().timestamp_millis(),
                                                         ),
-                                                        extra: std::collections::HashMap::default(),
+                                                        extra,
                                                     },
                                                 );
                                                 (true, None)
@@ -4853,6 +4863,9 @@ pub async fn run(
                                 "persisted": persisted,
                                 "persistenceStatus": persistence_status,
                             });
+                            if let Some(capture) = result.capture {
+                                payload["capture"] = json!(capture);
+                            }
                             if let Some(warn) = persistence_warning {
                                 payload["persistenceWarning"] = json!(warn);
                             }
@@ -4866,11 +4879,18 @@ pub async fn run(
                         Err(err) => response_error_with_hints(id_clone, "bash", &err),
                     };
 
-                    let _ = out_tx.send(response);
-                    if let Ok(mut running) = bash_state.lock(&bash_cx).await
-                        && running.as_ref().is_some_and(|r| r.id == run_id)
-                    {
-                        *running = None;
+                    // Admission and EOF draining share this lock. Retire the
+                    // slot and queue the terminal response under one guard so
+                    // neither can observe completion before the response is
+                    // available. Command cancellation cannot prevent cleanup.
+                    let completion_cx = asupersync::Cx::for_request();
+                    if let Ok(mut running) = bash_state.lock(&completion_cx).await {
+                        if running.as_ref().is_some_and(|r| r.id == run_id) {
+                            *running = None;
+                        }
+                        let _ = out_tx.send(response);
+                    } else {
+                        let _ = out_tx.send(response);
                     }
                 });
             }
@@ -15526,20 +15546,27 @@ mod retry_tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().expect("tempdir");
             let marker = tmp.path().join("leaked_child.txt");
+            let ready = tmp.path().join("root-ready");
 
             let ambient_cx = asupersync::Cx::for_testing();
             let cancel_cx = ambient_cx.clone();
             let _current = asupersync::Cx::set_current(Some(ambient_cx));
 
             let cancel_thread = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(std::time::Instant::now() < deadline, "shell did not start");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 cancel_cx.set_cancel_requested(true);
             });
 
             let (_abort_tx, abort_rx) = oneshot::channel();
             let result = run_bash_rpc(
                 tmp.path(),
-                "(sleep 3; echo leaked > leaked_child.txt) & sleep 10",
+                None,
+                None,
+                "(sleep 3; echo leaked > leaked_child.txt) & printf ready > root-ready; sleep 10",
                 abort_rx,
             )
             .await
@@ -15560,40 +15587,12 @@ mod retry_tests {
         });
     }
 
-    struct RpcFailingReader {
-        responses: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
-    }
-
-    impl RpcFailingReader {
-        fn new(responses: impl IntoIterator<Item = std::io::Result<Vec<u8>>>) -> Self {
-            Self {
-                responses: responses.into_iter().collect(),
-            }
-        }
-    }
-
-    impl std::io::Read for RpcFailingReader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            match self.responses.pop_front().unwrap_or_else(|| Ok(Vec::new())) {
-                Ok(bytes) => {
-                    assert!(
-                        bytes.len() <= buf.len(),
-                        "test reader only supports single-chunk reads"
-                    );
-                    buf[..bytes.len()].copy_from_slice(&bytes);
-                    Ok(bytes.len())
-                }
-                Err(err) => Err(err),
-            }
-        }
-    }
-
     #[test]
     fn run_bash_rpc_large_output_completes_without_deadlock() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().expect("tempdir");
             let (_abort_tx, abort_rx) = oneshot::channel();
-            let run = run_bash_rpc(tmp.path(), "yes x | head -c 1200000", abort_rx);
+            let run = run_bash_rpc(tmp.path(), None, None, "yes x | head -c 1200000", abort_rx);
 
             let result = asupersync::time::timeout(
                 asupersync::time::wall_now(),
@@ -15609,169 +15608,180 @@ mod retry_tests {
                 result.truncated,
                 "large RPC bash output should truncate instead of blocking"
             );
-        });
-    }
-
-    #[test]
-    fn run_bash_rpc_pump_stream_emits_io_error_frame_after_partial_output() {
-        let reader = RpcFailingReader::new([
-            Ok(b"partial stdout".to_vec()),
-            Err(std::io::Error::other("simulated stdout failure")),
-        ]);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<BashRpcStreamFrame>(4);
-
-        pump_bash_rpc_stream(reader, tx, "stdout");
-
-        match rx.recv().expect("partial chunk") {
-            BashRpcStreamFrame::Chunk(chunk) => assert_eq!(chunk, b"partial stdout"),
-            BashRpcStreamFrame::Error(message) => {
-                unreachable!("expected output chunk before error, got error frame: {message}")
-            }
-        }
-
-        match rx.recv().expect("io error frame") {
-            BashRpcStreamFrame::Chunk(chunk) => {
-                unreachable!("expected io error after partial chunk, got chunk: {chunk:?}")
-            }
-            BashRpcStreamFrame::Error(message) => {
-                assert!(message.contains("Failed to read bash stdout"));
-                assert!(message.contains("simulated stdout failure"));
-            }
-        }
-
-        assert!(matches!(
-            rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected)
-        ));
-    }
-
-    #[test]
-    fn run_bash_rpc_ingest_frame_returns_pipe_read_error() {
-        asupersync::test_utils::run_test(|| async {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let spill_path = tmp.path().join("partial-rpc-bash.log");
-            std::fs::write(&spill_path, b"partial output").expect("write spill file");
-
-            let mut chunks = VecDeque::new();
-            let mut chunks_bytes = 0usize;
-            let mut total_bytes = 0usize;
-            let mut total_lines = 0usize;
-            let mut last_byte_was_newline = false;
-            let mut temp_file = None;
-            let mut temp_file_path = Some(spill_path.clone());
-            let mut spill_failed = false;
-
-            ingest_bash_rpc_frame(
-                BashRpcStreamFrame::Chunk(b"partial stderr".to_vec()),
-                &mut chunks,
-                &mut chunks_bytes,
-                &mut total_bytes,
-                &mut total_lines,
-                &mut last_byte_was_newline,
-                &mut temp_file,
-                &mut temp_file_path,
-                &mut spill_failed,
-                DEFAULT_MAX_BYTES,
-            )
-            .await
-            .expect("partial output should ingest");
-
-            let err = ingest_bash_rpc_frame(
-                BashRpcStreamFrame::Error(
-                    "Failed to read bash stderr: simulated stderr failure".to_string(),
-                ),
-                &mut chunks,
-                &mut chunks_bytes,
-                &mut total_bytes,
-                &mut total_lines,
-                &mut last_byte_was_newline,
-                &mut temp_file,
-                &mut temp_file_path,
-                &mut spill_failed,
-                DEFAULT_MAX_BYTES,
-            )
-            .await
-            .expect_err("pipe read failures must surface as errors");
-
-            let message = err.to_string();
-            assert!(message.contains("Failed to read bash stderr"));
-            assert!(message.contains("simulated stderr failure"));
-            assert!(message.contains("Partial output before failure"));
-            assert!(message.contains("partial stderr"));
-            assert!(spill_failed);
-            assert!(temp_file.is_none());
-            assert!(temp_file_path.is_none());
-            assert_eq!(total_bytes, "partial stderr".len());
-            assert!(
-                !spill_path.exists(),
-                "errored RPC spill files should be discarded"
+            assert!(result.capture.is_none(), "complete output must reach EOF");
+            let artifact = result.full_output_path.expect("complete output artifact");
+            assert_eq!(
+                std::fs::metadata(artifact).expect("saved output").len(),
+                1_200_000,
             );
         });
     }
 
     #[test]
-    fn rpc_spill_file_abandon_clears_path_and_unlinks_file() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let spill_path = tmp.path().join("partial-rpc-bash.log");
-        std::fs::write(&spill_path, b"partial output").expect("write spill file");
-
-        let mut temp_file = None;
-        let mut temp_file_path = Some(spill_path.clone());
-        let mut spill_failed = false;
-
-        abandon_bash_rpc_spill_file(&mut temp_file, &mut temp_file_path, &mut spill_failed);
-
-        assert!(spill_failed);
-        assert!(temp_file.is_none());
-        assert!(temp_file_path.is_none());
-        assert!(
-            !spill_path.exists(),
-            "abandoned RPC spill files should not be left behind"
-        );
-    }
-
-    #[test]
-    fn rpc_spill_file_hard_limit_abandons_partial_spill_file() {
+    fn run_bash_rpc_pre_abort_prevents_process_spawn() {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let spill_path = tmp.path().join("hard-limit-rpc-bash.log");
-            std::fs::write(&spill_path, b"partial output").expect("write spill file");
+            let (abort_tx, abort_rx) = oneshot::channel();
+            abort_tx
+                .send(&asupersync::Cx::for_testing(), ())
+                .expect("request abort before execution");
 
-            let spill_file = asupersync::fs::OpenOptions::new()
-                .append(true)
-                .open(&spill_path)
-                .await
-                .expect("open spill file");
-
-            let mut chunks = VecDeque::new();
-            let mut chunks_bytes = 0usize;
-            let mut total_bytes = crate::tools::BASH_FILE_LIMIT_BYTES;
-            let mut total_lines = 0usize;
-            let mut last_byte_was_newline = false;
-            let mut temp_file = Some(spill_file);
-            let mut temp_file_path = Some(spill_path.clone());
-            let mut spill_failed = false;
-
-            ingest_bash_rpc_chunk(
-                vec![b'x'],
-                &mut chunks,
-                &mut chunks_bytes,
-                &mut total_bytes,
-                &mut total_lines,
-                &mut last_byte_was_newline,
-                &mut temp_file,
-                &mut temp_file_path,
-                &mut spill_failed,
-                DEFAULT_MAX_BYTES,
+            let result = run_bash_rpc(
+                tmp.path(),
+                None,
+                None,
+                "printf launched > unexpected-launch",
+                abort_rx,
             )
-            .await;
+            .await
+            .expect("pre-aborted command result");
 
-            assert!(spill_failed);
-            assert!(temp_file.is_none());
-            assert!(temp_file_path.is_none());
+            assert!(result.cancelled);
+            assert_eq!(result.timeout_ms, None, "RPC has no execution timeout");
             assert!(
-                !spill_path.exists(),
-                "hard-limit RPC spill files must be discarded"
+                !tmp.path().join("unexpected-launch").exists(),
+                "an already-aborted RPC command must never execute"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bash_rpc_explicit_abort_remains_reachable_during_output_flood() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ready = tmp.path().join("flood-ready");
+            let (abort_tx, abort_rx) = oneshot::channel();
+            let cancel_thread = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(std::time::Instant::now() < deadline, "flood did not start");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                abort_tx
+                    .send(&asupersync::Cx::for_testing(), ())
+                    .expect("abort running RPC command");
+            });
+            // The shell's independent watchdog still runs if a broken drain
+            // loop monopolizes a poll and prevents an async timeout from firing.
+            let command = "(sleep 15; kill -KILL $$) & \
+                i=0; while [ \"$i\" -lt 64 ]; do \
+                    printf '%8192s' stdout; printf '%8192s' stderr >&2; i=$((i+1)); \
+                done; printf ready > flood-ready; \
+                while :; do printf '%8192s' stdout; printf '%8192s' stderr >&2; done";
+            let start = std::time::Instant::now();
+            let result = run_bash_rpc(tmp.path(), None, None, command, abort_rx)
+                .await
+                .expect("aborted flooding RPC command");
+            cancel_thread.join().expect("abort sender");
+
+            assert!(result.cancelled, "explicit abort must reach the supervisor");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "abort must finish before the independent watchdog"
+            );
+            assert!(result.truncated, "fixture must exercise the capture path");
+            assert!(result.output.contains("stdout") || result.output.contains("stderr"));
+            assert_eq!(result.timeout_ms, None);
+
+            let (_next_abort_tx, next_abort_rx) = oneshot::channel();
+            let next = run_bash_rpc(tmp.path(), None, None, "printf next-command", next_abort_rx)
+                .await
+                .expect("RPC context remains usable after command abort");
+            assert!(!next.cancelled);
+            assert_eq!(next.output, "next-command");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_bash_rpc_abort_after_root_exit_retires_held_pipe_readers() {
+        use std::io::Write as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (abort_tx, abort_rx) = oneshot::channel();
+            // More than a pipe can buffer, so observing root.pid establishes
+            // that real output has crossed the reader/capture path already.
+            let command = "i=0; while [ \"$i\" -lt 256 ]; do \
+                printf '%8192s' stdout; i=$((i+1)); done; \
+                printf '%s' \"$$\" > root.pid; \
+                while [ ! -e release-root ]; do sleep 0.01; done";
+            let mut pending = Box::pin(run_bash_rpc(tmp.path(), None, None, command, abort_rx));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let root_pid = loop {
+                assert!(futures::poll!(&mut pending).is_pending());
+                if let Ok(contents) = std::fs::read_to_string(tmp.path().join("root.pid"))
+                    && let Ok(pid) = contents.parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(std::time::Instant::now() < deadline, "shell did not start");
+                sleep(wall_now(), Duration::from_millis(5)).await;
+            };
+
+            // Retain the actual command's pipe writers in this test instead
+            // of orphaning a descendant. They cannot reach EOF until we close
+            // them, and the live shell keeps its descriptor identity stable.
+            let root_process = PathBuf::from(format!("/proc/{root_pid}"));
+            let mut stdout = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root_process.join("fd/1"))
+                .expect("retain actual stdout writer");
+            let mut stderr = std::fs::OpenOptions::new()
+                .write(true)
+                .open(root_process.join("fd/2"))
+                .expect("retain actual stderr writer");
+            std::fs::write(tmp.path().join("release-root"), "exit").expect("release shell");
+            while root_process.exists() {
+                assert!(
+                    futures::poll!(&mut pending).is_pending(),
+                    "held writers must keep the final drain pending"
+                );
+                assert!(std::time::Instant::now() < deadline, "shell was not reaped");
+                sleep(wall_now(), Duration::from_millis(5)).await;
+            }
+
+            // Only the runner can reap its shell. Its disappearance therefore
+            // proves this abort arrives during the post-exit drain, where the
+            // normal two-second deadline has not elapsed yet.
+            abort_tx
+                .send(&asupersync::Cx::for_testing(), ())
+                .expect("abort post-exit drain");
+            let result = asupersync::time::timeout(wall_now(), Duration::from_secs(1), pending)
+                .await
+                .expect("abort must interrupt the two-second final drain")
+                .expect("cancelled drain result");
+            assert!(result.cancelled);
+            assert_eq!(result.exit_code, 0, "preserve the completed root's status");
+            assert!(result.output.contains("stdout"), "retain accepted output");
+            assert!(result.truncated);
+            assert!(result.full_output_path.is_none());
+            let capture = result.capture.expect("incomplete capture status");
+            assert!(!capture.output_complete);
+            assert!(!capture.artifact_truncated);
+            assert!(capture.artifact_error.is_none());
+            assert!(
+                capture.artifact_path.is_some(),
+                "retain the accepted artifact"
+            );
+
+            // The first writes are the ownership witness. Retrying until EPIPE
+            // would let the old detached blocking readers consume one more
+            // chunk after publication and conceal their lifetime leak.
+            assert_eq!(
+                stdout
+                    .write_all(b"probe\n")
+                    .expect_err("stdout reader retired")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe,
+            );
+            assert_eq!(
+                stderr
+                    .write_all(b"probe\n")
+                    .expect_err("stderr reader retired")
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe,
             );
         });
     }
@@ -16485,510 +16495,25 @@ async fn export_html_snapshot(
     Ok(path.display().to_string())
 }
 
-#[derive(Debug, Clone)]
-struct BashRpcResult {
-    output: String,
-    exit_code: i32,
-    cancelled: bool,
-    truncated: bool,
-    full_output_path: Option<String>,
-}
-
-enum BashRpcStreamFrame {
-    Chunk(Vec<u8>),
-    Error(String),
-}
-
-fn pump_bash_rpc_stream(
-    mut reader: impl std::io::Read,
-    tx: std::sync::mpsc::SyncSender<BashRpcStreamFrame>,
-    stream_name: &'static str,
-) {
-    let mut buf = [0u8; 8192];
-    loop {
-        let read = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                let _ = tx.send(BashRpcStreamFrame::Error(format!(
-                    "Failed to read bash {stream_name}: {err}"
-                )));
-                break;
-            }
-        };
-        if tx
-            .send(BashRpcStreamFrame::Chunk(buf[..read].to_vec()))
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-fn abandon_bash_rpc_spill_file(
-    temp_file: &mut Option<asupersync::fs::File>,
-    temp_file_path: &mut Option<PathBuf>,
-    spill_failed: &mut bool,
-) {
-    *spill_failed = true;
-    *temp_file = None;
-    if let Some(path) = temp_file_path.take()
-        && let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::debug!(
-            "Failed to remove incomplete RPC bash spill file {}: {}",
-            path.display(),
-            e
-        );
-    }
-}
-
-const fn line_count_from_newline_count(
-    total_bytes: usize,
-    newline_count: usize,
-    last_byte_was_newline: bool,
-) -> usize {
-    if total_bytes == 0 {
-        0
-    } else if last_byte_was_newline {
-        newline_count
-    } else {
-        newline_count.saturating_add(1)
-    }
-}
-
-async fn ingest_bash_rpc_chunk(
-    bytes: Vec<u8>,
-    chunks: &mut VecDeque<Vec<u8>>,
-    chunks_bytes: &mut usize,
-    total_bytes: &mut usize,
-    total_lines: &mut usize,
-    last_byte_was_newline: &mut bool,
-    temp_file: &mut Option<asupersync::fs::File>,
-    temp_file_path: &mut Option<PathBuf>,
-    spill_failed: &mut bool,
-    max_chunks_bytes: usize,
-) {
-    if bytes.is_empty() {
-        return;
-    }
-
-    *last_byte_was_newline = bytes.last().is_some_and(|byte| *byte == b'\n');
-    *total_bytes = total_bytes.saturating_add(bytes.len());
-    *total_lines = total_lines.saturating_add(memchr_iter(b'\n', &bytes).count());
-
-    // Spill to temp file if we exceed the limit
-    if *total_bytes > DEFAULT_MAX_BYTES && temp_file.is_none() && !*spill_failed {
-        let id_full = uuid::Uuid::new_v4().simple().to_string();
-        let id = &id_full[..16];
-        let path = std::env::temp_dir().join(format!("pi-rpc-bash-{id}.log"));
-
-        // Secure synchronous creation
-        let path_clone = path.clone();
-        let expected_inode: Option<u64> =
-            asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<Option<u64>> {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-
-                match options.open(&path_clone) {
-                    Ok(file) => {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt;
-                            Ok(file.metadata().ok().map(|m| m.ino()))
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            drop(file);
-                            Ok(None)
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to create bash temp file: {e}");
-                        Ok(None)
-                    }
-                }
-            })
-            .await
-            .unwrap_or(None);
-
-        if expected_inode.is_some() || !cfg!(unix) {
-            // Re-open async for writing
-            match asupersync::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .await
-            {
-                Ok(mut file) => {
-                    // Validate identity to prevent TOCTOU/symlink attacks
-                    #[cfg_attr(not(unix), allow(unused_mut))]
-                    let mut identity_match = true;
-                    #[cfg(unix)]
-                    if let Some(expected) = expected_inode {
-                        use std::os::unix::fs::MetadataExt;
-                        // asupersync 0.3.6's fs::Metadata no longer exposes the
-                        // inode; re-stat the path with std symlink_metadata
-                        // (does not follow symlinks) for the TOCTOU guard.
-                        match std::fs::symlink_metadata(&path) {
-                            Ok(meta) => {
-                                if meta.ino() != expected {
-                                    tracing::warn!(
-                                        "Temp file identity mismatch (possible TOCTOU attack)"
-                                    );
-                                    identity_match = false;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to stat temp file: {e}");
-                                identity_match = false;
-                            }
-                        }
-                    }
-
-                    if identity_match {
-                        // Flush existing chunks to the new file
-                        let mut failed_flush = false;
-                        for existing in chunks.iter() {
-                            use asupersync::io::AsyncWriteExt;
-                            if let Err(e) = file.write_all(existing).await {
-                                tracing::warn!("Failed to flush bash chunk to temp file: {e}");
-                                failed_flush = true;
-                                break;
-                            }
-                        }
-                        *temp_file_path = Some(path);
-                        if failed_flush {
-                            abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
-                        } else {
-                            *temp_file = Some(file);
-                        }
-                    } else {
-                        *temp_file_path = Some(path);
-                        abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to reopen bash temp file async: {e}");
-                    *temp_file_path = Some(path);
-                    abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
-                }
-            }
-        } else {
-            *spill_failed = true;
-        }
-    }
-
-    // Write new chunk to file if we have one
-    let mut abandon_spill_file = false;
-    let mut close_spill_file = false;
-    if let Some(file) = temp_file.as_mut() {
-        if *total_bytes <= crate::tools::BASH_FILE_LIMIT_BYTES {
-            use asupersync::io::AsyncWriteExt;
-            if let Err(e) = file.write_all(&bytes).await {
-                tracing::warn!("Failed to write bash chunk to temp file: {e}");
-                abandon_spill_file = true;
-            }
-        } else {
-            // Hard limit reached. Stop writing and close the file to release the FD.
-            if !*spill_failed {
-                tracing::warn!("Bash output exceeded hard limit; stopping file log");
-                close_spill_file = true;
-                *spill_failed = true;
-            }
-        }
-    }
-    if abandon_spill_file || close_spill_file {
-        abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
-    }
-
-    // Update memory buffer
-    *chunks_bytes = chunks_bytes.saturating_add(bytes.len());
-    chunks.push_back(bytes);
-    while *chunks_bytes > max_chunks_bytes && chunks.len() > 1 {
-        if let Some(front) = chunks.pop_front() {
-            *chunks_bytes = chunks_bytes.saturating_sub(front.len());
-        }
-    }
-}
-
-async fn ingest_bash_rpc_frame(
-    frame: BashRpcStreamFrame,
-    chunks: &mut VecDeque<Vec<u8>>,
-    chunks_bytes: &mut usize,
-    total_bytes: &mut usize,
-    total_lines: &mut usize,
-    last_byte_was_newline: &mut bool,
-    temp_file: &mut Option<asupersync::fs::File>,
-    temp_file_path: &mut Option<PathBuf>,
-    spill_failed: &mut bool,
-    max_chunks_bytes: usize,
-) -> Result<()> {
-    match frame {
-        BashRpcStreamFrame::Chunk(bytes) => {
-            ingest_bash_rpc_chunk(
-                bytes,
-                chunks,
-                chunks_bytes,
-                total_bytes,
-                total_lines,
-                last_byte_was_newline,
-                temp_file,
-                temp_file_path,
-                spill_failed,
-                max_chunks_bytes,
-            )
-            .await;
-            Ok(())
-        }
-        BashRpcStreamFrame::Error(message) => {
-            let error_message =
-                bash_rpc_capture_error_message(&message, chunks, *total_bytes, *chunks_bytes);
-            abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
-            Err(Error::tool("bash", error_message))
-        }
-    }
-}
-
-fn bash_rpc_capture_error_message(
-    message: &str,
-    chunks: &VecDeque<Vec<u8>>,
-    total_bytes: usize,
-    chunks_bytes: usize,
-) -> String {
-    let mut raw = Vec::with_capacity(chunks_bytes);
-    for chunk in chunks {
-        raw.extend_from_slice(chunk);
-    }
-    if raw.is_empty() {
-        return message.to_string();
-    }
-
-    let full_text = String::from_utf8_lossy(&raw).into_owned();
-    let truncation = truncate_tail(full_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    let mut error_message = message.to_string();
-    let partial_output = if truncation.content.is_empty() {
-        "(no output)".to_string()
-    } else {
-        truncation.content
-    };
-    error_message.push_str("\n\nPartial output before failure:\n");
-    error_message.push_str(&partial_output);
-    if truncation.truncated || total_bytes > chunks_bytes {
-        error_message.push_str("\n\n[Partial output truncated before failure]");
-    }
-    error_message
-}
-
 async fn run_bash_rpc(
     cwd: &std::path::Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
     command: &str,
     mut abort_rx: oneshot::Receiver<()>,
-) -> Result<BashRpcResult> {
-    let shell = crate::tools::default_bash_shell()?;
-
-    let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
-
-    let mut child = std::process::Command::new(&shell);
-    child
-        .arg("-c")
-        .arg(&command)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    crate::tools::isolate_command_process_group(&mut child);
-    let child = crate::tools::spawn_command_with_job_discipline(&mut child)
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
-    let mut guard =
-        crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);
-
-    let Some(stdout) = guard.take_stdout() else {
-        return Err(Error::tool("bash", "Missing stdout".to_string()));
-    };
-    let Some(stderr) = guard.take_stderr() else {
-        return Err(Error::tool("bash", "Missing stderr".to_string()));
-    };
-
-    // We use a bounded channel to provide backpressure. If the child process
-    // produces output faster than the async loop can drain it (and spill to disk),
-    // the pump threads will block on send(), which stops them from reading from the OS pipe.
-    // The OS pipe buffer will fill up, causing the child's `write()` calls to block.
-    // This correctly pauses the child until we catch up, preventing unbounded memory growth (OOM).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<BashRpcStreamFrame>(1024);
-    let tx_stdout = tx.clone();
-    let _stdout_handle =
-        std::thread::spawn(move || pump_bash_rpc_stream(stdout, tx_stdout, "stdout"));
-    let _stderr_handle = std::thread::spawn(move || pump_bash_rpc_stream(stderr, tx, "stderr"));
-
-    let tick = Duration::from_millis(10);
-    let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
-
-    // Bounded buffer state (same logic as BashTool)
-    let mut chunks: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut chunks_bytes = 0usize;
-    let mut total_bytes = 0usize;
-    let mut total_lines = 0usize;
-    let mut last_byte_was_newline = false;
-    let mut temp_file: Option<asupersync::fs::File> = None;
-    let mut temp_file_path: Option<PathBuf> = None;
-    let max_chunks_bytes = DEFAULT_MAX_BYTES * 2;
-
-    let mut cancelled = false;
-    let mut spill_failed = false;
-
-    let exit_code = loop {
-        while let Ok(frame) = rx.try_recv() {
-            if let Err(err) = ingest_bash_rpc_frame(
-                frame,
-                &mut chunks,
-                &mut chunks_bytes,
-                &mut total_bytes,
-                &mut total_lines,
-                &mut last_byte_was_newline,
-                &mut temp_file,
-                &mut temp_file_path,
-                &mut spill_failed,
-                max_chunks_bytes,
-            )
-            .await
-            {
-                let _ = guard.kill();
-                return Err(err);
-            }
-        }
-
-        if !cancelled && abort_rx.try_recv().is_ok() {
-            cancelled = true;
-            let status_code = guard
-                .kill()
-                .map_or(-1, |status| status.code().unwrap_or(-1));
-            break status_code;
-        }
-
-        match guard.try_wait_child() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
-            Ok(None) => {}
-            Err(err) => {
-                return Err(Error::tool(
-                    "bash",
-                    format!("Failed to wait for process: {err}"),
-                ));
-            }
-        }
-
-        if cx.checkpoint().is_err() {
-            cancelled = true;
-            let _ = guard.kill();
-            let status_code = -1;
-            break status_code;
-        }
-
-        let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
-        sleep(now, tick).await;
-    };
-
-    // Drain remaining output
-    let now_drain = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
-    let drain_deadline = now_drain + std::time::Duration::from_secs(2);
-    let mut drain_timed_out = false;
-    loop {
-        match rx.try_recv() {
-            Ok(frame) => {
-                if let Err(err) = ingest_bash_rpc_frame(
-                    frame,
-                    &mut chunks,
-                    &mut chunks_bytes,
-                    &mut total_bytes,
-                    &mut total_lines,
-                    &mut last_byte_was_newline,
-                    &mut temp_file,
-                    &mut temp_file_path,
-                    &mut spill_failed,
-                    max_chunks_bytes,
-                )
-                .await
-                {
-                    let _ = guard.kill();
-                    return Err(err);
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
-                if now >= drain_deadline {
-                    drain_timed_out = true;
-                    break;
-                }
-                if cx.checkpoint().is_err() {
-                    cancelled = true;
-                    break;
-                }
-                sleep(now, tick).await;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-        }
-    }
-
-    // Drop the receiver to close the channel.
-    // This ensures that any `tx.send()` calls in the pump threads return an error (Disconnected)
-    // instead of blocking if the channel is full.
-    // We intentionally do NOT join() the pump threads because if a background child process
-    // inherits stdout/stderr, the pipe remains open and `read()` blocks indefinitely,
-    // which would cause `join()` to hang the entire agent.
-    drop(rx);
-
-    // Explicitly reap the child to prevent zombie retention on macOS and other
-    // platforms where the polling path can observe process exit before the
-    // shell is fully reaped from its isolated process group.
-    let _ = guard.wait();
-
-    // Explicitly drop the temp file handle to ensure any buffered data is flushed to disk
-    // before we potentially return the path to the caller.
-    drop(temp_file);
-
-    // Construct final output from memory buffer
-    let mut combined = Vec::with_capacity(chunks_bytes);
-    for chunk in chunks {
-        combined.extend_from_slice(&chunk);
-    }
-    let tail_output = String::from_utf8_lossy(&combined).to_string();
-
-    let mut truncation = truncate_tail(tail_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    if total_bytes > chunks_bytes {
-        truncation.truncated = true;
-        truncation.truncated_by = Some(crate::tools::TruncatedBy::Bytes);
-        truncation.total_bytes = total_bytes;
-        truncation.total_lines =
-            line_count_from_newline_count(total_bytes, total_lines, last_byte_was_newline);
-    } else if drain_timed_out {
-        truncation.truncated = true;
-        truncation.truncated_by = Some(crate::tools::TruncatedBy::Bytes);
-    }
-    let will_truncate = truncation.truncated;
-
-    let mut output_text = if truncation.content.is_empty() {
-        "(no output)".to_string()
-    } else {
-        truncation.content
-    };
-
-    if drain_timed_out {
-        output_text.push_str("\n... [Output truncated: drain timeout]");
-    }
-
-    Ok(BashRpcResult {
-        output: output_text,
-        exit_code,
-        cancelled,
-        truncated: will_truncate,
-        full_output_path: temp_file_path.map(|p| p.display().to_string()),
-    })
+) -> Result<crate::tools::BashRunResult> {
+    let mut abort_requested = || abort_rx.try_recv().is_ok();
+    crate::tools::run_bash_command_with_control(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        crate::tools::BashRunControl {
+            abort_requested: &mut abort_requested,
+            drain_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
 }
 
 // Bound one RPC media batch independently of the configurable per-file cap.
@@ -20245,10 +19770,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rpc_bash_and_new_sessions_use_the_selected_runtime_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = tempfile::tempdir().expect("workspace");
         let workspace = temp.path().canonicalize().expect("canonical workspace");
         std::fs::write(workspace.join("cwd-probe.txt"), "bound RPC workspace")
             .expect("write workspace probe");
+        let shell = workspace.join("rpc-shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nprintf configured > shell-used.txt\nexec /bin/sh \"$@\"\n",
+        )
+        .expect("write configured shell");
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700))
+            .expect("executable configured shell");
         let process_cwd = std::env::current_dir().expect("process cwd");
         assert_ne!(workspace, process_cwd);
         let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
@@ -20264,6 +19799,9 @@ mod tests {
             let session_store = Arc::clone(&agent_session.session);
             let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
             options.working_directory = Some(workspace.clone());
+            options.config.shell_path = Some(shell.display().to_string());
+            options.config.shell_command_prefix =
+                Some("export RPC_PREFIX='configured prefix'".to_string());
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
             let out_rx = Arc::new(Mutex::new(out_rx));
@@ -20271,19 +19809,41 @@ mod tests {
                 Box::pin(run(agent_session, options, in_rx, out_tx)).await
             });
 
-            let response = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"bash","type":"bash","command":"cat cwd-probe.txt && printf completed > cwd-result.txt"}"#,
-                "bash in selected workspace",
-            )
-            .await;
+            let request = json!({
+                "id": "bash", "type": "bash",
+                "command": "cat cwd-probe.txt && printf '\\n%s|%s|%s' \"$RPC_PREFIX\" \"$PAGER\" \"$GIT_TERMINAL_PROMPT\" && printf completed > cwd-result.txt",
+            })
+            .to_string();
+            let response =
+                send_recv(&in_tx, &out_rx, &request, "bash in selected workspace").await;
             assert_ok(&response, "bash");
             assert_eq!(response["data"]["exitCode"], 0);
-            assert_eq!(response["data"]["output"], "bound RPC workspace");
+            assert_eq!(
+                response["data"]["output"],
+                "bound RPC workspace\nconfigured prefix|cat|0"
+            );
+            assert!(response["data"].get("capture").is_none());
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("shell-used.txt"))
+                    .expect("shell invocation"),
+                "configured"
+            );
             assert_eq!(
                 std::fs::read_to_string(workspace.join("cwd-result.txt")).expect("bash output"),
                 "completed"
+            );
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"nonzero","type":"bash","command":"printf command-result; exit 7"}"#,
+                "nonzero command still returns an RPC result",
+            )
+            .await;
+            assert_ok(&response, "bash");
+            assert_eq!(response["data"]["exitCode"], 7);
+            assert_eq!(
+                response["data"]["output"],
+                "command-result\n\nCommand exited with code 7"
             );
             let response = send_recv(
                 &in_tx,
@@ -20299,6 +19859,145 @@ mod tests {
                 assert_eq!(stored.header.cwd, workspace.display().to_string());
             }
             assert_eq!(std::env::current_dir().expect("unchanged cwd"), process_cwd);
+            drop(in_tx);
+            assert!(server.await.is_ok());
+        }));
+    }
+
+    #[test]
+    fn rpc_bash_hook_capture_reaches_wire_and_durable_history() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let workspace = temp.path().canonicalize().expect("canonical workspace");
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let artifact = workspace.join("partial-output.log");
+            std::fs::write(&artifact, "hook retained output").expect("retained artifact");
+            let capture = json!({
+                "outputComplete": false,
+                "artifactTruncated": false,
+                "artifactError": null,
+                "artifactPath": artifact,
+            });
+            let extension_path = workspace.join("bash-capture.native.json");
+            let descriptor = json!({
+                "id": "rpc-bash-capture", "name": "rpc-bash-capture",
+                "version": "1.0.0", "apiVersion": crate::extensions::PROTOCOL_VERSION,
+                "eventHooks": ["user_bash"],
+                "eventResponses": {"user_bash": {"result": {
+                    "output": "hook retained output",
+                    "exitCode": 23,
+                    "cancelled": false,
+                    "truncated": true,
+                    "fullOutputPath": artifact,
+                    "capture": capture,
+                }}},
+            });
+            std::fs::write(
+                &extension_path,
+                serde_json::to_vec(&descriptor).expect("encode extension"),
+            )
+            .expect("write extension");
+            let manager = ExtensionManager::new();
+            manager.set_native_runtime(
+                crate::extensions::NativeRustExtensionRuntimeHandle::start()
+                    .await
+                    .expect("native extension runtime"),
+            );
+            manager
+                .load_native_extensions(vec![
+                    crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(&extension_path)
+                        .expect("native extension spec"),
+                ])
+                .await
+                .expect("load user_bash hook");
+
+            let mut stored = Session::create_with_dir(Some(workspace.join("sessions")));
+            stored.header.cwd = workspace.display().to_string();
+            stored.save().await.expect("initial saved session");
+            let session_path = stored.path.clone().expect("saved session path");
+            let agent = Agent::new(
+                Arc::new(NoopProvider),
+                ToolRegistry::new(&[], &workspace, None),
+                AgentConfig::default(),
+            );
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(stored)),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            agent_session.extensions = Some(crate::extensions::ExtensionRegion::new(manager));
+            let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
+            options.working_directory = Some(workspace.clone());
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = handle.spawn(async move {
+                Box::pin(run(agent_session, options, in_rx, out_tx)).await
+            });
+
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"capture","type":"bash","command":"printf replayed > unexpected-local-command"}"#,
+                "hook capture response",
+            )
+            .await;
+            assert_ok(&response, "bash");
+            let data = &response["data"];
+            assert_eq!(data["exitCode"], 23);
+            assert_eq!(data["persisted"], true);
+            assert_eq!(data["capture"], capture);
+            assert!(data["fullOutputPath"].is_null());
+            assert!(
+                data["output"]
+                    .as_str()
+                    .expect("hook output")
+                    .contains("output may be missing")
+            );
+            assert!(
+                !workspace.join("unexpected-local-command").exists(),
+                "hook capture limitations must never replay the command locally"
+            );
+            let typed: crate::sdk::RpcBashResult =
+                serde_json::from_value(data.clone()).expect("SDK consumes actual RPC response");
+            assert_eq!(
+                typed.capture,
+                Some(serde_json::from_value(capture.clone()).expect("typed capture"))
+            );
+
+            let reopened = Session::open(session_path.to_str().expect("UTF-8 session path"))
+                .await
+                .expect("reopen persisted bash execution");
+            let saved = reopened
+                .entries
+                .iter()
+                .find_map(|entry| {
+                    let SessionEntry::Message(entry) = entry else {
+                        return None;
+                    };
+                    let SessionMessage::BashExecution {
+                        output,
+                        exit_code,
+                        full_output_path,
+                        extra,
+                        ..
+                    } = &entry.message
+                    else {
+                        return None;
+                    };
+                    Some((output, *exit_code, full_output_path, extra))
+                })
+                .expect("durable bash execution");
+            assert_eq!(saved.0, &typed.output);
+            assert_eq!(saved.1, 23);
+            assert!(saved.2.is_none());
+            assert_eq!(saved.3.get("capture"), Some(&capture));
             drop(in_tx);
             assert!(server.await.is_ok());
         }));
@@ -20691,14 +20390,6 @@ export default function init(pi) {
     });
 }
 "#;
-
-    #[test]
-    fn line_count_from_newline_count_matches_trailing_newline_semantics() {
-        assert_eq!(line_count_from_newline_count(0, 0, false), 0);
-        assert_eq!(line_count_from_newline_count(2, 1, true), 1);
-        assert_eq!(line_count_from_newline_count(1, 0, false), 1);
-        assert_eq!(line_count_from_newline_count(3, 1, false), 2);
-    }
 
     // -----------------------------------------------------------------------
     // parse_queue_mode
