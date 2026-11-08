@@ -44,7 +44,7 @@ use pi::extensions::{
     resolve_extension_load_spec,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
-use pi::failover::RecoveryEventStream;
+use pi::failover::{LogicalTurnEventState, RecoveryEventStream};
 use pi::file_identity::FileIdentity;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
 use pi::models::{
@@ -11107,16 +11107,29 @@ where
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
     let prewalk_turn = session.begin_prewalk_turn();
-    let recovery_events = RecoveryEventStream::new(move |event| {
-        if is_json {
-            emit_json_event(&event);
+    // Provider attempts may end before retry, failover or persistence does.
+    // Keep their messages, but expose one completed request to JSON clients.
+    // Native extension lifecycle events are dispatched by Agent itself.
+    let turn_events = Arc::new(StdMutex::new(LogicalTurnEventState::default()));
+    let make_turn_event_handler = || {
+        let state = Arc::clone(&turn_events);
+        let output = make_event_handler();
+        move |event: AgentEvent| {
+            let event = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(event);
+            if let Some(event) = event {
+                output(event);
+            }
         }
-    });
+    };
+    let recovery_events = RecoveryEventStream::new(make_turn_event_handler());
     let mut result = run_print_prompt_attempts(
         session,
         config,
         abort_signal,
-        make_event_handler,
+        &make_turn_event_handler,
         retry_enabled,
         max_retries,
         is_json,
@@ -11126,6 +11139,7 @@ where
         failover_state,
         &prewalk_turn,
         &recovery_events,
+        &turn_events,
     )
     .await;
     let exhaustion = match &result {
@@ -11164,7 +11178,14 @@ where
             })
         },
     );
-    recovery_events.finish(!interrupted, final_error);
+    recovery_events.finish(!interrupted, final_error.clone());
+    let terminal = turn_events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(final_error);
+    if let Some(terminal) = terminal {
+        make_event_handler()(terminal);
+    }
     result
 }
 
@@ -11183,6 +11204,7 @@ async fn run_print_prompt_attempts<H, EH>(
     failover_state: &mut PrintFailoverState,
     prewalk_turn: &pi::prewalk::PrewalkTurn,
     recovery_events: &RecoveryEventStream,
+    turn_events: &StdMutex<LogicalTurnEventState>,
 ) -> Result<AssistantMessage>
 where
     H: Fn() -> EH + Sync,
@@ -11416,6 +11438,10 @@ where
                     emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(restore_err);
                 }
+                turn_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .restored_tail();
                 if let Some((provider, key)) = quota_credential.as_ref()
                     && let Err(error) = session
                         .rotate_rate_limited_credential_after_retry(
@@ -11485,6 +11511,10 @@ where
                         }
                     };
                     if swapped.is_some() {
+                        turn_events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .restored_tail();
                         failed_over = true;
                         failovers_this_turn += 1;
                         retry_count = 0;
@@ -11573,6 +11603,10 @@ where
                         emit_print_failover_end(recovery_events, failed_over, session, false);
                         return Err(terminal_err);
                     }
+                    turn_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .restored_tail();
                     if let Some((provider, key)) = quota_credential.as_ref()
                         && let Err(error) = session
                             .rotate_rate_limited_credential_after_retry(
@@ -11625,6 +11659,10 @@ where
                         }
                     };
                     if swapped.is_some() {
+                        turn_events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .restored_tail();
                         failed_over = true;
                         failovers_this_turn += 1;
                         retry_count = 0;
@@ -15897,6 +15935,14 @@ mod tests {
     }
 
     fn print_recovery_session(provider: &Arc<PrintRecoveryProvider>) -> AgentSession {
+        print_recovery_session_with_store(provider, Session::in_memory(), false)
+    }
+
+    fn print_recovery_session_with_store(
+        provider: &Arc<PrintRecoveryProvider>,
+        mut stored: Session,
+        save_enabled: bool,
+    ) -> AgentSession {
         let mut agent = Agent::new(
             Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
             ToolRegistry::new(&[], Path::new("."), None),
@@ -15906,13 +15952,12 @@ mod tests {
             },
         );
         agent.set_model_accepts_images(true);
-        let mut stored = Session::in_memory();
         stored.header.provider = Some("print-recovery".to_string());
         stored.header.model_id = Some("test-model".to_string());
         AgentSession::new(
             agent,
             Arc::new(Mutex::new(stored)),
-            false,
+            save_enabled,
             ResolvedCompactionSettings {
                 enabled: false,
                 ..ResolvedCompactionSettings::default()
@@ -15949,6 +15994,141 @@ mod tests {
             &mut PrintFailoverState::default(),
         )
         .await
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_logical_turn_ends_after_retry_success_abort_or_restore_failure() {
+        run_cli_workdir_test(async {
+            for transport_error in [false, true] {
+                for outcome in ["success", "abort", "restore_failure"] {
+                    let provider = Arc::new(PrintRecoveryProvider {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                        prompts: StdMutex::new(Vec::new()),
+                        input_tokens: 0,
+                        transport_error,
+                    });
+                    let temp = tempfile::tempdir().expect("print lifecycle root");
+                    let poison = temp.path().join("retry-save-directory");
+                    fs::create_dir(&poison).expect("directory cannot be a session file");
+                    let mut stored = Session::create_with_dir(Some(temp.path().to_path_buf()));
+                    stored.path = Some(temp.path().join("session.jsonl"));
+                    stored.save().await.expect("initial session save");
+                    let mut session = print_recovery_session_with_store(&provider, stored, true);
+                    let store = Arc::clone(&session.session);
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let (abort, signal) = AbortHandle::new();
+                    let make_handler = || {
+                        let events = Arc::clone(&events);
+                        let store = Arc::clone(&store);
+                        let abort = abort.clone();
+                        let poison = poison.clone();
+                        move |event: AgentEvent| {
+                            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                                if outcome == "abort" {
+                                    abort.abort();
+                                } else if outcome == "restore_failure" {
+                                    store.try_lock().expect("retry boundary is unlocked").path =
+                                        Some(poison.clone());
+                                }
+                            }
+                            events.lock().expect("record print event").push(event);
+                        }
+                    };
+                    let config = Config {
+                        retry: Some(pi::config::RetrySettings {
+                            enabled: Some(true),
+                            max_retries: Some(1),
+                            base_delay_ms: Some(1),
+                            max_delay_ms: Some(1),
+                            ..pi::config::RetrySettings::default()
+                        }),
+                        ..Config::default()
+                    };
+                    let result = run_print_prompt_with_retry(
+                        &mut session,
+                        &config,
+                        &signal,
+                        &make_handler,
+                        true,
+                        1,
+                        true,
+                        &Arc::new(StdMutex::new(PrintTextStreamState::default())),
+                        PromptInput::Text {
+                            text: "original prompt".to_string(),
+                            keyword_scan_source: None,
+                        },
+                        None,
+                        &mut PrintFailoverState::default(),
+                    )
+                    .await;
+                    let expected_error = result.as_ref().err().map(ToString::to_string);
+                    assert_eq!(result.is_ok(), outcome == "success");
+                    assert_eq!(
+                        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                        if outcome == "success" { 2 } else { 1 },
+                        "cancelled or unpersisted recovery must not call the provider"
+                    );
+                    let events = events.lock().expect("captured print events");
+                    let lifecycle: Vec<&str> = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            AgentEvent::AgentStart { .. } => Some("agent_start"),
+                            AgentEvent::AutoRetryStart { .. } => Some("auto_retry_start"),
+                            AgentEvent::AutoRetryEnd { .. } => Some("auto_retry_end"),
+                            AgentEvent::AgentEnd { .. } => Some("agent_end"),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        lifecycle,
+                        [
+                            "agent_start",
+                            "auto_retry_start",
+                            "auto_retry_end",
+                            "agent_end",
+                        ],
+                        "{outcome}, transport_error={transport_error}"
+                    );
+                    let Some(AgentEvent::AgentEnd { messages, error, .. }) = events.last() else {
+                        panic!("the logical end must be the final callback");
+                    };
+                    assert_eq!(
+                        error, &expected_error,
+                        "terminal error must describe the outcome"
+                    );
+                    assert_eq!(
+                        messages
+                            .iter()
+                            .filter(|message| matches!(message, pi::model::Message::User(_)))
+                            .count(),
+                        1,
+                        "the terminal retains the original input without replaying it"
+                    );
+                    let errors = messages
+                        .iter()
+                        .filter(|message| matches!(message, pi::model::Message::Assistant(message)
+                            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)))
+                        .count();
+                    assert_eq!(
+                        errors,
+                        usize::from(outcome != "success"),
+                        "failed tails disappear only after a successful durable rewind"
+                    );
+                    if outcome == "abort" {
+                        assert!(matches!(
+                            result.unwrap_err().downcast_ref::<pi::error::Error>(),
+                            Some(pi::error::Error::Aborted)
+                        ));
+                    } else if outcome == "restore_failure" {
+                        assert!(
+                            expected_error.unwrap().contains("retry restoration"),
+                            "the final frame must report the save failure, not stale provider error"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[test]
@@ -16261,6 +16441,7 @@ mod tests {
     /// after a typed session-persistence failure, even when the wrapped prose
     /// looks like a transient connection reset.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn run_print_prompt_with_retry_rejects_session_persistence_after_tool() {
         use std::sync::atomic::Ordering;
 
@@ -16319,11 +16500,16 @@ mod tests {
             };
             let (_abort_handle, abort_signal) = AbortHandle::new();
             let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let make_handler = || {
+                let events = Arc::clone(&events);
+                move |event| events.lock().expect("record persistence event").push(event)
+            };
             let error = run_print_prompt_with_retry(
                 &mut agent_session,
                 &config,
                 &abort_signal,
-                &|| |_| {},
+                &make_handler,
                 true,
                 3,
                 true,
@@ -16359,6 +16545,28 @@ mod tests {
             assert!(
                 write_path.is_file(),
                 "the write tool must have executed before persistence failed"
+            );
+            let events = events.lock().expect("persistence events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                    .count(),
+                1,
+                "native termination is held until the persistence result"
+            );
+            let Some(AgentEvent::AgentEnd { messages, error, .. }) = events.last() else {
+                panic!("the terminal frame follows the failed save");
+            };
+            assert_eq!(error.as_deref(), Some(message.as_str()));
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, pi::model::Message::ToolResult(result)
+                        if result.tool_call_id == "step1"))
+                    .count(),
+                1,
+                "the terminal must retain completed tool effects despite the failed save"
             );
         });
     }

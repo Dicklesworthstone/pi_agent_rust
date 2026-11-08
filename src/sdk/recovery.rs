@@ -115,60 +115,17 @@ struct LogicalTurn {
 
 #[derive(Default)]
 struct LogicalTurnState {
-    session_id: Option<Arc<str>>,
-    messages: Vec<Message>,
+    events: crate::failover::LogicalTurnEventState,
     recovery: crate::failover::RecoveryEventLifecycle,
-    finished: bool,
 }
 
 impl LogicalTurnState {
-    fn forget_incomplete_tail(&mut self) {
-        while self.messages.last().is_some_and(|message| {
-            matches!(
-                message,
-                Message::Assistant(assistant)
-                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
-            )
-        }) {
-            let _ = self.messages.pop();
-        }
-    }
-
     /// At most two pending lifecycles close before an incoming event. A fixed
     /// array avoids allocating a Vec for every streamed text delta.
     fn observe(&mut self, event: AgentEvent) -> [Option<AgentEvent>; 3] {
-        if self.finished {
-            return [None, None, None];
-        }
-        if let AgentEvent::AgentEnd { messages, .. } = event {
-            self.messages.extend(messages);
-            return [None, None, None];
-        }
-        let forward = match &event {
-            AgentEvent::AgentStart { session_id } => {
-                if self.session_id.is_some() {
-                    false
-                } else {
-                    self.session_id = Some(Arc::clone(session_id));
-                    true
-                }
-            }
-            AgentEvent::AutoCompactionEnd {
-                aborted: false,
-                will_retry: true,
-                error_message: None,
-                ..
-            } => {
-                self.forget_incomplete_tail();
-                true
-            }
-            _ => true,
-        };
-        if forward {
+        self.events.observe(event).map_or([None, None, None], |event| {
             self.recovery.observe(event)
-        } else {
-            [None, None, None]
-        }
+        })
     }
 }
 
@@ -205,7 +162,8 @@ impl LogicalTurn {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .forget_incomplete_tail();
+            .events
+            .restored_tail();
     }
 
     fn finish(&self, outcome: &Result<AssistantMessage>) {
@@ -230,20 +188,12 @@ impl LogicalTurn {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.finished {
+            if state.events.is_finished() {
                 return;
             }
-            state.finished = true;
             let success = error.is_none();
             let [retry_end, fallback_end] = state.recovery.finish(success, error.clone());
-            let terminal = state
-                .session_id
-                .take()
-                .map(|session_id| AgentEvent::AgentEnd {
-                    session_id,
-                    messages: std::mem::take(&mut state.messages),
-                    error,
-                });
+            let terminal = state.events.finish(error);
             drop(state);
             [retry_end, fallback_end, terminal]
         };

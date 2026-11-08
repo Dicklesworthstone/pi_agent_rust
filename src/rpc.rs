@@ -974,7 +974,7 @@ fn rpc_agent_event_handler(
     out_tx: std::sync::mpsc::SyncSender<String>,
     runtime_handle: RuntimeHandle,
     extensions: Option<ExtensionManager>,
-    deferred_agent_end: Option<Arc<std::sync::Mutex<Option<AgentEvent>>>>,
+    turn_events: Option<Arc<std::sync::Mutex<crate::failover::LogicalTurnEventState>>>,
     defer_time_cap: bool,
     output: RpcOutput,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
@@ -1007,7 +1007,7 @@ fn rpc_agent_event_handler(
             return;
         }
         if matches!(event, AgentEvent::AgentEnd { .. })
-            && let Some(deferred) = &deferred_agent_end
+            && let Some(turn) = &turn_events
         {
             output_pressure
                 .lock()
@@ -1017,11 +1017,26 @@ fn rpc_agent_event_handler(
             if let Some(coalescer) = &coalescer {
                 coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
             }
-            *deferred
+            let _ = turn
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(event);
             return;
         }
+        let event = if let Some(turn) = &turn_events {
+            let Some(event) = turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(event)
+            else {
+                // Native extension lifecycle hooks run at the Agent boundary;
+                // only the client's repeated attempt starts are suppressed.
+                return;
+            };
+            event
+        } else {
+            event
+        };
         let serialized = output.event_line(&event);
         output_pressure
             .lock()
@@ -7149,7 +7164,9 @@ async fn run_prompt_with_retry_owned(
     let mut turn_system_prompt = None;
     let mut follow_up_first = false;
     let mut expected_follow_up_fetch: Option<(Arc<AtomicU64>, u64)> = None;
-    let deferred_agent_end = Arc::new(std::sync::Mutex::new(None::<AgentEvent>));
+    let turn_events = Arc::new(std::sync::Mutex::new(
+        crate::failover::LogicalTurnEventState::default(),
+    ));
     let mut success = false;
     let mut stopped_at_time_cap = false;
     let mut final_error: Option<String> = None;
@@ -7182,9 +7199,6 @@ async fn run_prompt_with_retry_owned(
         }
 
         let runtime_for_events = options.runtime_handle.clone();
-        *deferred_agent_end
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
         let (result, prewalk_pending) = if let Some(error) = pending_recovery_error.take() {
             // Credential exhaustion follows a durable rewind but admits no
@@ -7215,7 +7229,7 @@ async fn run_prompt_with_retry_owned(
                 out_tx.clone(),
                 runtime_for_events,
                 extensions,
-                Some(Arc::clone(&deferred_agent_end)),
+                Some(Arc::clone(&turn_events)),
                 true,
                 output.clone(),
             );
@@ -7554,6 +7568,10 @@ async fn run_prompt_with_retry_owned(
             };
             match failover_result {
                 Ok(true) => {
+                    turn_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .restored_tail();
                     retry_count = 0;
                     failovers_this_turn += 1;
                     final_error = None;
@@ -7628,6 +7646,10 @@ async fn run_prompt_with_retry_owned(
             final_error_hints = Some(error_hints_value(&restore_err));
             break;
         }
+        turn_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restored_tail();
         let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
             Ok(guard) => guard,
             Err(lock_err) => {
@@ -7729,10 +7751,10 @@ async fn run_prompt_with_retry_owned(
         // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
         // drain only guarantees flush-before-shutdown for events queued while
         // a flag is still set (gh #137).
-        let mut terminal_messages = deferred_agent_end
+        let mut terminal_messages = turn_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .finish(final_error.clone())
             .and_then(|event| match event {
                 AgentEvent::AgentEnd { messages, .. } => Some(messages),
                 _ => None,
@@ -7758,10 +7780,10 @@ async fn run_prompt_with_retry_owned(
     }
 
     recovery_events.finish(true, None);
-    let terminal_messages = deferred_agent_end
+    let terminal_messages = turn_events
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+        .finish(None)
         .and_then(|event| match event {
             AgentEvent::AgentEnd { messages, .. } => Some(messages),
             _ => None,
@@ -8211,7 +8233,9 @@ async fn run_extension_command_owned(
         return;
     }
 
-    let deferred_agent_end = Arc::new(std::sync::Mutex::new(None::<AgentEvent>));
+    let turn_events = Arc::new(std::sync::Mutex::new(
+        crate::failover::LogicalTurnEventState::default(),
+    ));
 
     let result = {
         let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
@@ -8243,7 +8267,7 @@ async fn run_extension_command_owned(
                 out_tx.clone(),
                 runtime_handle,
                 extensions,
-                Some(Arc::clone(&deferred_agent_end)),
+                Some(Arc::clone(&turn_events)),
                 false,
                 output.clone(),
             );
@@ -8265,10 +8289,10 @@ async fn run_extension_command_owned(
 
     // Emit exactly one terminal event after AgentSession has completed its
     // persistence work, but before clearing streaming so EOF drains it.
-    let terminal_messages = deferred_agent_end
+    let terminal_messages = turn_events
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+        .finish(result.as_ref().err().map(ToString::to_string))
         .and_then(|event| match event {
             AgentEvent::AgentEnd { messages, .. } => Some(messages),
             _ => None,
@@ -10121,11 +10145,12 @@ mod retry_tests {
             let mut saw_retry_start = false;
             let mut saw_retry_end_success = false;
             let mut retry_end_value = None;
+            let events: Vec<Value> = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                .collect();
 
-            for line in out_rx.try_iter() {
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
+            for value in &events {
                 let Some(kind) = value.get("type").and_then(Value::as_str) else {
                     continue;
                 };
@@ -10153,6 +10178,32 @@ mod retry_tests {
                 retry_end_value.get("finalError").is_none(),
                 "successful auto_retry_end must omit absent finalError: {retry_end_value}"
             );
+            let lifecycle: Vec<&str> = events
+                .iter()
+                .filter_map(|event| event["type"].as_str())
+                .filter(|kind| {
+                    matches!(
+                        *kind,
+                        "agent_start" | "auto_retry_start" | "auto_retry_end" | "agent_end"
+                    )
+                })
+                .collect();
+            assert_eq!(
+                lifecycle,
+                ["agent_start", "auto_retry_start", "auto_retry_end", "agent_end"],
+                "provider retries must remain inside one logical RPC turn"
+            );
+            let terminal = events.last().expect("logical turn terminal");
+            assert_eq!(terminal["type"], "agent_end");
+            assert!(terminal["error"].is_null());
+            let terminal_messages: Vec<Message> =
+                serde_json::from_value(terminal["messages"].clone()).expect("terminal messages");
+            let [Message::User(user), Message::Assistant(assistant)] = &terminal_messages[..]
+            else {
+                panic!("terminal must retain the original input and successful reply only");
+            };
+            assert_eq!(serde_json::to_value(&user.content).unwrap(), expected);
+            assert_eq!(assistant.stop_reason, StopReason::Stop);
             assert_eq!(
                 provider_probe.calls.load(Ordering::SeqCst),
                 2,
@@ -10502,6 +10553,26 @@ mod retry_tests {
             let agent_end = position("agent_end")
                 .unwrap_or_else(|| panic!("agent_end must be emitted; saw {kinds:?}"));
             assert!(start < end && end < agent_end, "lifecycle order: {kinds:?}");
+            assert_eq!(
+                kinds.iter().filter(|kind| **kind == "agent_start").count(),
+                1,
+                "a fallback must not start a second logical turn: {kinds:?}"
+            );
+            assert_eq!(
+                kinds.iter().filter(|kind| **kind == "agent_end").count(),
+                1,
+                "exactly one terminal outcome: {kinds:?}"
+            );
+            assert_eq!(
+                events[agent_end]["messages"]
+                    .as_array()
+                    .expect("terminal messages")
+                    .iter()
+                    .filter(|message| message["role"] == "user")
+                    .count(),
+                1,
+                "the initial input survives the provider transition"
+            );
             assert_eq!(
                 kinds.iter().filter(|k| **k == "failover_end").count(),
                 1,
@@ -13126,6 +13197,16 @@ mod retry_tests {
             );
             assert!(of_type("failover_start").is_empty(), "{kinds:?}");
             assert_eq!(of_type("agent_end").len(), 1, "{kinds:?}");
+            assert_eq!(of_type("agent_start").len(), 1, "{kinds:?}");
+            let terminal = events.last().expect("terminal after failed restoration");
+            assert_eq!(terminal["type"], "agent_end");
+            assert_eq!(terminal["error"], final_error);
+            let terminal_messages: Vec<Message> =
+                serde_json::from_value(terminal["messages"].clone()).expect("terminal messages");
+            assert!(matches!(
+                terminal_messages.last(),
+                Some(Message::Assistant(message)) if message.stop_reason == StopReason::Error
+            ));
 
             let cx = AgentCx::for_request();
             let guard = session.lock(&cx).await.expect("agent session lock");

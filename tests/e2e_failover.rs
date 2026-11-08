@@ -673,6 +673,43 @@ fn event_kinds(events: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
+fn print_turn_lifecycle(events: &[serde_json::Value]) -> Vec<&str> {
+    let kinds = event_kinds(events);
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "agent_start").count(),
+        1,
+        "provider attempts share one logical start: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "agent_end").count(),
+        1,
+        "a request has exactly one terminal frame: {kinds:?}"
+    );
+    let terminal = kinds
+        .iter()
+        .position(|kind| kind == "agent_end")
+        .expect("exactly one end was counted");
+    assert!(
+        kinds[terminal + 1..].iter().all(|kind| kind == "error"),
+        "only a process-exit diagnostic may follow the terminal frame: {kinds:?}"
+    );
+    events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|kind| {
+            matches!(
+                *kind,
+                "agent_start"
+                    | "auto_retry_start"
+                    | "auto_retry_end"
+                    | "failover_start"
+                    | "failover_end"
+                    | "agent_end"
+            )
+        })
+        .collect()
+}
+
 /// Two retries on each failed provider and two committed fallback hops expose
 /// counters that accidentally replace event-lifecycle state. Exercise both
 /// successful and terminal-error outcomes through the real print/RPC drivers.
@@ -845,6 +882,10 @@ fn e2e_recovery_pairs_every_attempt_across_multiple_provider_hops() {
             assert_eq!(terminal["error"].is_null(), final_success, "{stdout}");
             if mode == "rpc" {
                 assert_eq!(events.last().expect("last event")["type"], "agent_end");
+            } else {
+                let lifecycle = print_turn_lifecycle(&events);
+                assert_eq!(lifecycle.first(), Some(&"agent_start"));
+                assert_eq!(lifecycle.last(), Some(&"agent_end"));
             }
             let log_path = harness.temp_path("multi-hop-recovery.jsonl");
             harness
@@ -855,10 +896,119 @@ fn e2e_recovery_pairs_every_attempt_across_multiple_provider_hops() {
     }
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_print_retry_terminal_retains_completed_tool_output() {
+    use serde_json::json;
+
+    let harness = TestHarness::new("e2e_print_retry_terminal_retains_completed_tool_output");
+    let server = harness.start_mock_http_server();
+    let env = PiEnv::new(&harness);
+    env.write_models(&server.base_url());
+    let output_path = env.root.join("completed-write.txt");
+    let tool_delta = json!({
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0, "id": "preserved-write", "type": "function",
+            "function": {"name": "write", "arguments": json!({
+                "path": output_path, "content": "kept"
+            }).to_string()}
+        }]}}]
+    });
+    let tool_response = format!(
+        "data: {tool_delta}\n\n{}\n\ndata: [DONE]\n\n",
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+    );
+    server.add_route_queue(
+        "POST",
+        "/primary/v1/chat/completions",
+        vec![
+            sse_response(tool_response),
+            error_response(
+                503,
+                r#"{"error":{"type":"overloaded_error","message":"retry after the write"}}"#,
+            ),
+            sse_response(text_sse_body("completed after retry")),
+        ],
+    );
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    command.current_dir(&env.root).args([
+        "--print",
+        "--mode",
+        "json",
+        "--no-session",
+        "--no-extensions",
+        "--tools",
+        "write",
+        "--provider",
+        "e2eprimary",
+        "--model",
+        "primary-model",
+        "write the file, then finish",
+    ]);
+    let (stdout, stderr) = run_and_collect(command.spawn().expect("spawn print retry"), 90);
+    let events = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        print_turn_lifecycle(&events),
+        [
+            "agent_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "agent_end",
+        ],
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(output_path).expect("read completed tool output"),
+        "kept"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .count(),
+        1,
+        "retry must resume after the completed tool: {stdout}"
+    );
+    assert_eq!(server.requests().len(), 3, "tool, transient failure, retry");
+    let terminal = events.last().expect("final event");
+    assert_eq!(terminal["type"], "agent_end");
+    assert!(terminal["error"].is_null(), "{stdout}\n{stderr}");
+    let messages = terminal["messages"].as_array().expect("terminal transcript");
+    assert_eq!(
+        messages
+            .iter()
+            .filter_map(|message| message["role"].as_str())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "toolResult", "assistant"],
+        "retain completed work from the failed attempt, omit only its reverted tail: {terminal}"
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["stopReason"] != "error"),
+        "the persisted retry removed the failed assistant: {terminal}"
+    );
+    assert_eq!(messages[2]["toolCallId"], "preserved-write");
+    harness
+        .log()
+        .info_ctx("verify", "retry terminal retained completed work", |ctx| {
+            ctx.push(("stdout".to_string(), stdout));
+            ctx.push(("stderr".to_string(), stderr));
+        });
+    let path = harness.temp_path("print-retry-terminal.jsonl");
+    harness
+        .write_jsonl_logs(&path)
+        .expect("write lifecycle evidence");
+    harness.record_artifact("print-retry-terminal.jsonl", &path);
+}
+
 /// bd-2vmu6.1: in JSON mode a turn that walks the fallback chain closes its
 /// `failover_start` with exactly one `failover_end { restoredPrimary: false }`
-/// naming the fallback, emitted with the other lifecycle closers after the
-/// fallback attempt's `agent_end`, on the success path.
+/// naming the fallback before the logical request's terminal `agent_end`.
 #[test]
 fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
     let harness = TestHarness::new("e2e_failover_json_mode_closes_lifecycle_after_backup_success");
@@ -883,6 +1033,18 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
         "spawning pi --print --mode json on 429 primary",
     );
     let kinds = event_kinds(&events);
+    assert_eq!(
+        print_turn_lifecycle(&events),
+        [
+            "agent_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "failover_start",
+            "failover_end",
+            "agent_end",
+        ],
+        "the recovered request ends only after the fallback: {stdout}\n{stderr}"
+    );
     let start = kinds
         .iter()
         .position(|k| k == "failover_start")
@@ -898,14 +1060,9 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_success() {
         .rposition(|k| k == "agent_end")
         // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
         .unwrap_or_else(|| panic!("agent_end missing: {kinds:?}\n{stdout}\n{stderr}"));
-    // Print JSON mode streams the agent loop's own `agent_end` as each attempt
-    // finishes and emits the retry loop's lifecycle closers (`auto_retry_end`,
-    // `failover_end`) after the last one, so the close lands after the final
-    // `agent_end`, never before the `failover_start` it closes. (The RPC loop
-    // defers its terminal `agent_end` and closes the lifecycle before it.)
     assert!(
-        start < end && agent_end < end,
-        "failover lifecycle must close after the fallback attempt's agent_end: {kinds:?}"
+        start < end && end < agent_end,
+        "failover lifecycle must close before the request's agent_end: {kinds:?}"
     );
     assert_eq!(
         kinds.iter().filter(|k| *k == "failover_end").count(),
@@ -1009,6 +1166,20 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_failure() {
         "spawning pi --print --mode json on 429 primary and 503 backup",
     );
     let kinds = event_kinds(&events);
+    assert_eq!(
+        print_turn_lifecycle(&events),
+        [
+            "agent_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "failover_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "failover_end",
+            "agent_end",
+        ],
+        "terminal failure follows all exhausted attempts: {stdout}\n{stderr}"
+    );
     let start = kinds
         .iter()
         .position(|k| k == "failover_start")
@@ -1024,14 +1195,9 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_failure() {
         .rposition(|k| k == "agent_end")
         // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
         .unwrap_or_else(|| panic!("agent_end missing: {kinds:?}\n{stdout}\n{stderr}"));
-    // Print JSON mode streams the agent loop's own `agent_end` as each attempt
-    // finishes and emits the retry loop's lifecycle closers (`auto_retry_end`,
-    // `failover_end`) after the last one, so the close lands after the final
-    // `agent_end`, never before the `failover_start` it closes. (The RPC loop
-    // defers its terminal `agent_end` and closes the lifecycle before it.)
     assert!(
-        start < end && agent_end < end,
-        "failover lifecycle must close after the fallback attempt's agent_end: {kinds:?}"
+        start < end && end < agent_end,
+        "failover lifecycle must close before the request's agent_end: {kinds:?}"
     );
     assert_eq!(
         kinds.iter().filter(|k| *k == "failover_end").count(),
@@ -1104,6 +1270,20 @@ fn e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle() {
         "spawning pi --print --mode json on a 429 primary and a fallback that needs one retry",
     );
     let kinds = event_kinds(&events);
+    assert_eq!(
+        print_turn_lifecycle(&events),
+        [
+            "agent_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "failover_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "failover_end",
+            "agent_end",
+        ],
+        "fallback retry cannot expose an intermediate terminal: {stdout}\n{stderr}"
+    );
 
     // Two lifecycles, each opened and closed exactly once. An implementation
     // whose only lifecycle state is `retry_count`, reset to 0 on the swap,
@@ -1254,10 +1434,8 @@ fn e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle() {
 /// Running the real binary against the mock server is what makes the fallback
 /// able to fail once and then succeed.
 ///
-/// The two surfaces close their lifecycles in a different ORDER, and that
-/// difference is asserted rather than papered over: print streams the agent
-/// loop's own `agent_end` per attempt and emits the closers after the last one,
-/// while RPC defers its terminal `agent_end` and closes the lifecycle first.
+/// Both surfaces keep recovery inside one logical request, closing retry and
+/// failover before their single terminal `agent_end`.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_failover_rpc_mode_gives_the_fallback_its_own_retry_lifecycle() {

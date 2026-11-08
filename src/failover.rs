@@ -17,6 +17,106 @@ use std::time::{Duration, Instant};
 
 pub(crate) mod provider_code;
 
+/// Collect provider attempts into one externally visible logical turn.
+///
+/// An attempt's `AgentEnd` is emitted before its session save, and recovery
+/// may continue through more attempts. Hosts must finish this state only
+/// after observing the final durable outcome and closing recovery events.
+/// Message and tool events continue streaming while their terminal payload
+/// is retained across successful retries and provider transitions.
+#[derive(Default)]
+pub struct LogicalTurnEventState {
+    session_id: Option<Arc<str>>,
+    messages: Vec<crate::model::Message>,
+    finished: bool,
+}
+
+impl LogicalTurnEventState {
+    /// Forward the first start and ordinary events, retaining attempt ends.
+    /// A finished or abandoned turn rejects every late callback.
+    pub fn observe(&mut self, event: crate::agent::AgentEvent) -> Option<crate::agent::AgentEvent> {
+        use crate::agent::AgentEvent;
+
+        if self.finished {
+            return None;
+        }
+        match event {
+            AgentEvent::AgentEnd { messages, .. } => {
+                self.messages.extend(messages);
+                None
+            }
+            AgentEvent::AgentStart { session_id } => {
+                if self.session_id.is_some() {
+                    None
+                } else {
+                    self.session_id = Some(Arc::clone(&session_id));
+                    Some(AgentEvent::AgentStart { session_id })
+                }
+            }
+            event @ AgentEvent::AutoCompactionEnd {
+                aborted: false,
+                will_retry: true,
+                error_message: None,
+                ..
+            } => {
+                self.restored_tail();
+                Some(event)
+            }
+            event => Some(event),
+        }
+    }
+
+    /// Reflect a successfully persisted rewind. Calling this when a retry is
+    /// merely announced would hide failed output after a rejected restoration.
+    pub fn restored_tail(&mut self) {
+        use crate::model::{Message, StopReason};
+
+        while self.messages.last().is_some_and(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
+            )
+        }) {
+            let _ = self.messages.pop();
+        }
+    }
+
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Emit at most one end, using the logical request's final error rather
+    /// than an earlier provider attempt's result. No start means no synthetic
+    /// lifecycle; a host can still report its pre-admission refusal separately.
+    pub fn finish(&mut self, error: Option<String>) -> Option<crate::agent::AgentEvent> {
+        if self.finished {
+            return None;
+        }
+        self.finished = true;
+        self.session_id
+            .take()
+            .map(|session_id| crate::agent::AgentEvent::AgentEnd {
+                session_id,
+                messages: std::mem::take(&mut self.messages),
+                error,
+            })
+    }
+
+    /// Seal an unobserved outcome without fabricating a durability receipt.
+    /// Returns whether the caller abandoned an unfinished turn.
+    pub fn abandon(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.finished = true;
+        self.session_id = None;
+        self.messages.clear();
+        true
+    }
+}
+
 /// Pair recovery events independently of the counters used to admit attempts.
 /// A new retry or fallback closes the preceding unsuccessful attempt before
 /// announcing its successor. Resetting a provider's retry budget cannot lose
@@ -1862,6 +1962,122 @@ pub fn decide(
         return TurnDecision::FailOver;
     }
     TurnDecision::Finish { success: false }
+}
+
+#[cfg(test)]
+mod logical_turn_event_tests {
+    use super::LogicalTurnEventState;
+    use crate::agent::AgentEvent;
+    use crate::model::{
+        AssistantMessage, ContentBlock, Message, StopReason, TextContent, ToolResultMessage,
+        UserContent, UserMessage,
+    };
+    use std::sync::Arc;
+
+    fn start() -> AgentEvent {
+        AgentEvent::AgentStart {
+            session_id: Arc::from("logical-turn"),
+        }
+    }
+
+    fn assistant(reason: StopReason) -> Message {
+        Message::assistant(AssistantMessage {
+            stop_reason: reason,
+            ..AssistantMessage::default()
+        })
+    }
+
+    fn end(messages: Vec<Message>) -> AgentEvent {
+        AgentEvent::AgentEnd {
+            session_id: Arc::from("logical-turn"),
+            messages,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn recovered_turn_retains_input_and_completed_tools_without_failed_tails() {
+        let user = Message::User(UserMessage {
+            content: UserContent::Text("edit once".to_string()),
+            timestamp: 0,
+        });
+        let call = assistant(StopReason::ToolUse);
+        let result = Message::tool_result(ToolResultMessage {
+            tool_call_id: "write-once".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("file written"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        let completed = vec![user, call, result];
+        let mut attempt = completed.clone();
+        attempt.push(assistant(StopReason::Error));
+        let mut state = LogicalTurnEventState::default();
+        assert!(matches!(
+            state.observe(start()),
+            Some(AgentEvent::AgentStart { .. })
+        ));
+        assert!(state.observe(end(attempt)).is_none());
+        assert!(
+            !state.is_finished(),
+            "an attempt end does not acknowledge its save"
+        );
+        state.restored_tail();
+        assert!(state.observe(start()).is_none());
+        let reply = assistant(StopReason::Stop);
+        assert!(state.observe(end(vec![reply.clone()])).is_none());
+        let Some(AgentEvent::AgentEnd { messages, error, .. }) = state.finish(None) else {
+            panic!("one final logical end");
+        };
+        let mut expected = completed;
+        expected.push(reply.clone());
+        assert_eq!(
+            serde_json::to_value(messages).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(error.is_none());
+        assert!(state.finish(Some("late error".to_string())).is_none());
+        assert!(
+            state
+                .observe(AgentEvent::MessageEnd { message: reply })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejected_rewind_keeps_failed_output_and_reports_the_later_failure() {
+        for final_error in ["Retry aborted", "session save failed", "fallback setup failed"] {
+            let mut state = LogicalTurnEventState::default();
+            let _ = state.observe(start());
+            let failed = assistant(StopReason::Error);
+            let _ = state.observe(end(vec![failed.clone()]));
+            // No successful restoration occurred, so the failed tail is still
+            // part of the current conversation and must not disappear.
+            let Some(AgentEvent::AgentEnd { messages, error, .. }) =
+                state.finish(Some(final_error.to_string()))
+            else {
+                panic!("one terminal result even without another provider attempt");
+            };
+            assert_eq!(error.as_deref(), Some(final_error));
+            assert_eq!(
+                serde_json::to_value(messages).unwrap(),
+                serde_json::to_value(vec![failed]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_turn_cannot_publish_a_late_durability_acknowledgement() {
+        let mut state = LogicalTurnEventState::default();
+        let _ = state.observe(start());
+        let _ = state.observe(end(vec![assistant(StopReason::Stop)]));
+        assert!(state.abandon());
+        assert!(!state.abandon());
+        assert!(state.is_finished());
+        assert!(state.observe(start()).is_none());
+        assert!(state.finish(None).is_none());
+    }
 }
 
 #[cfg(test)]

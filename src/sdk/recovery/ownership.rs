@@ -35,17 +35,13 @@ impl Drop for TurnGuard {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.finished {
-                false
-            } else {
+            let interrupted = state.events.abandon();
+            if interrupted {
                 // Seal retained callbacks. Do not emit AgentEnd: neither an
                 // attempt's raw terminal nor dropping its owner proves a save.
-                state.finished = true;
-                state.session_id = None;
-                state.messages.clear();
                 state.recovery = crate::failover::RecoveryEventLifecycle::default();
-                true
             }
+            interrupted
         };
         if interrupted && self.admission.reason().is_none() {
             // Never clear admission, run callbacks, spawn cleanup, or attempt
