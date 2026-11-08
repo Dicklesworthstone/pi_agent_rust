@@ -4607,13 +4607,14 @@ pub async fn run(
                     } else {
                         let hooked = match &extensions {
                             Some(manager) => manager.dispatch_user_bash(&command, false, &cwd).await,
-                            None => None,
+                            None => Ok(None),
                         };
                         match hooked {
                             // Once a hook has run, keep its actual result.
                             // Cancellation must not replace or replay effects.
-                            Some(result) => Ok(result),
-                            None => {
+                            Ok(Some(result)) => Ok(result),
+                            Err(error) => Err(error),
+                            Ok(None) => {
                                 run_bash_rpc(
                                     &cwd,
                                     shell_path.as_deref(),
@@ -20154,6 +20155,159 @@ mod tests {
                     executions,
                     [Some(queued_abort)],
                     "record one terminal execution"
+                );
+            }
+        }));
+    }
+
+    #[test]
+    fn rpc_bash_hook_failure_never_replays_effects_or_runs_later_hooks() {
+        let reactor = asupersync::runtime::reactor::create_reactor().expect("reactor");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for (case, outcome, expected_error) in [
+                (
+                    "throw",
+                    "throw new Error('hook failed after its side effect');",
+                    Some("hook failed after its side effect"),
+                ),
+                (
+                    "malformed",
+                    "return { result: 'claimed execution without a result object' };",
+                    Some("result"),
+                ),
+                (
+                    "undefined-claim",
+                    "return { result: undefined };",
+                    Some("result"),
+                ),
+                (
+                    "operations",
+                    "return { operations: {} };",
+                    Some("operations"),
+                ),
+                (
+                    "function-operations",
+                    "return { operations: async () => {} };",
+                    Some("operations"),
+                ),
+                ("unhandled", "return undefined;", None),
+            ] {
+                let temp = tempfile::tempdir().expect("workspace");
+                let workspace = temp.path().canonicalize().expect("canonical workspace");
+                let extension_path = workspace.join("bash-owner.mjs");
+                let source = format!(
+                    r#"export default function init(pi) {{
+                        pi.on("user_bash", async () => {{
+                            await pi.session("appendEntry", {{
+                                customType: "bash-first-hook-entered",
+                                data: {{ executed: true }}
+                            }});
+                            {outcome}
+                        }});
+                        pi.on("user_bash", async () => {{
+                            await pi.session("appendEntry", {{
+                                customType: "bash-later-hook-entered",
+                                data: {{ executed: true }}
+                            }});
+                        }});
+                    }}"#,
+                );
+                std::fs::write(&extension_path, source).expect("write command ownership hooks");
+                let mut stored = Session::in_memory();
+                stored.header.cwd = workspace.display().to_string();
+                let mut agent_session = build_test_agent_session(stored);
+                agent_session
+                    .enable_extensions(&[], &workspace, None, &[extension_path])
+                    .await
+                    .expect("enable observable hooks");
+                let session_store = Arc::clone(&agent_session.session);
+                let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
+                options.working_directory = Some(workspace.clone());
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(
+                        &cx,
+                        json!({
+                            "id": case, "type": "bash",
+                            "command": "printf native > native-command-started",
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .expect("queue command");
+                drop(in_tx);
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    Box::pin(run(agent_session, options, in_rx, out_tx)),
+                )
+                .await
+                .expect("hook failure must release the Bash slot and finish EOF drain")
+                .expect("RPC server result");
+
+                let responses = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .filter(|event| event["type"] == "response")
+                    .collect::<Vec<_>>();
+                assert_eq!(responses.len(), 1, "one terminal response: {case}");
+                let response = &responses[0];
+                assert_eq!(response["id"], case);
+                assert_eq!(response["command"], "bash");
+                if let Some(message) = expected_error {
+                    assert_eq!(response["success"], false, "{case}: {response}");
+                    assert!(
+                        response["error"]
+                            .as_str()
+                            .is_some_and(|error| error.contains(message)),
+                        "surface the hook failure: {case}: {response}"
+                    );
+                } else {
+                    assert_ok(response, "bash");
+                    assert_eq!(response["data"]["exitCode"], 0);
+                }
+                assert_eq!(
+                    workspace.join("native-command-started").exists(),
+                    expected_error.is_none(),
+                    "only unhandled hooks authorize native execution: {case}"
+                );
+
+                let stored = session_store.lock(&cx).await.expect("completed session");
+                let hook_entries = stored
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        SessionEntry::Custom(custom) if custom.custom_type.starts_with("bash-") => {
+                            Some(custom.custom_type.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let expected_hooks = if expected_error.is_some() {
+                    vec!["bash-first-hook-entered"]
+                } else {
+                    vec!["bash-first-hook-entered", "bash-later-hook-entered"]
+                };
+                assert_eq!(hook_entries, expected_hooks, "hook execution: {case}");
+                let executions = stored
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry, SessionEntry::Message(message)
+                            if matches!(&message.message, SessionMessage::BashExecution { .. }))
+                    })
+                    .count();
+                assert_eq!(
+                    executions,
+                    usize::from(expected_error.is_none()),
+                    "failed ownership must not fabricate a completed shell result: {case}"
                 );
             }
         }));

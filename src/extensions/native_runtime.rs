@@ -189,6 +189,18 @@ impl NativeRustRuntimeState {
                 continue;
             };
 
+            if event_name == "user_bash" {
+                // Only an explicit response takes ownership of shell execution.
+                // A later descriptor must not erase a completed result or a
+                // malformed execution claim and permit local shell fallback.
+                if let Some(explicit) = extension.event_responses.get(event_name)
+                    && !explicit.is_null()
+                {
+                    return explicit.clone();
+                }
+                continue;
+            }
+
             if let Some(explicit) = extension.event_responses.get(event_name) {
                 response = explicit.clone();
                 continue;
@@ -1069,6 +1081,74 @@ impl ExtensionRuntimeEngineSelection {
     pub fn from_env() -> Self {
         let value = std::env::var(Self::ENV_VAR).unwrap_or_default();
         Self::from_env_value(&value)
+    }
+}
+
+#[cfg(test)]
+mod event_ownership_tests {
+    use super::{NativeRustLoadedExtension, NativeRustRuntimeState};
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+
+    fn extension(id: &str, response: Option<Value>) -> NativeRustLoadedExtension {
+        let event_responses = response.map_or_else(HashMap::new, |response| {
+            HashMap::from([
+                ("user_bash".into(), response.clone()),
+                ("turn_start".into(), response),
+            ])
+        });
+        NativeRustLoadedExtension {
+            snapshot: serde_json::from_value(json!({
+                "id": id,
+                "event_hooks": ["user_bash", "turn_start"],
+            }))
+            .expect("extension snapshot"),
+            event_responses,
+            tool_outputs: HashMap::new(),
+            command_outputs: HashMap::new(),
+            shortcut_outputs: HashMap::new(),
+            provider_streams: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn user_bash_preserves_first_response_after_unhandled_subscribers() {
+        for first_response in [
+            json!({"result": {"output": "already executed", "exitCode": 0}}),
+            json!({"result": null}),
+            json!({"operations": {}}),
+            json!({"allow": true}),
+        ] {
+            let mut state = NativeRustRuntimeState::default();
+            state.load_extensions(vec![
+                extension("no-response", None),
+                extension("null-response", Some(Value::Null)),
+                extension("owner", Some(first_response.clone())),
+                extension("later-observer", Some(json!({"allow": false}))),
+            ]);
+            assert_eq!(
+                state.dispatch_event("user_bash", &Value::Null, &Value::Null),
+                first_response
+            );
+            assert_eq!(
+                state.dispatch_event("turn_start", &Value::Null, &Value::Null),
+                json!({"allow": false}),
+                "unrelated lifecycle events keep last-response aggregation"
+            );
+        }
+    }
+
+    #[test]
+    fn user_bash_without_an_explicit_response_remains_unhandled() {
+        let mut state = NativeRustRuntimeState::default();
+        state.load_extensions(vec![
+            extension("no-response", None),
+            extension("null-response", Some(Value::Null)),
+        ]);
+        assert_eq!(
+            state.dispatch_event("user_bash", &Value::Null, &Value::Null),
+            Value::Null
+        );
     }
 }
 

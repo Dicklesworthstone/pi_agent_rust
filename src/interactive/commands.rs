@@ -1945,12 +1945,12 @@ impl PiApp {
                         .dispatch_user_bash(&command, exclude_from_context, &cwd)
                         .await
                 }
-                None => None,
+                None => Ok(None),
             };
 
             let result = match override_result {
-                Some(result) => Ok(result),
-                None => {
+                Ok(Some(result)) => Ok(result),
+                Ok(None) => {
                     crate::tools::run_bash_command(
                         &cwd,
                         shell_path.as_deref(),
@@ -1961,6 +1961,7 @@ impl PiApp {
                     )
                     .await
                 }
+                Err(err) => Err(err),
             };
             match result {
                 Ok(result) => {

@@ -4797,7 +4797,15 @@ impl ExtensionManager {
         };
 
         #[cfg(feature = "wasm-host")]
-        let response = if has_hook_wasm {
+        let response = if has_hook_wasm
+            && (event != ExtensionEventName::UserBash
+                || response.as_ref().is_none_or(Value::is_null))
+        {
+            let timeout_ms = if event == ExtensionEventName::UserBash {
+                user_bash_remaining_timeout(timeout_ms, started_at)?
+            } else {
+                timeout_ms
+            };
             let mut wasm_payload = event_payload;
             if let Value::Object(map) = &mut wasm_payload {
                 map.insert("ctx".into(), (*ctx_payload).clone());
@@ -4833,6 +4841,37 @@ impl ExtensionManager {
         event_payload: &Value,
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
+        if event_name == "user_bash" {
+            // A shell override owns execution once it responds. Starting later
+            // handlers concurrently could perform the same command twice, even
+            // if only one of their results is eventually kept.
+            let started_at = Instant::now();
+            for extension in extensions
+                .iter()
+                .filter(|ext| ext.event_hooks().iter().any(|hook| hook == event_name))
+            {
+                let remaining_timeout_ms = user_bash_remaining_timeout(timeout_ms, started_at)?;
+                match extension
+                    .handle_event_value(event_payload, remaining_timeout_ms)
+                    .await
+                {
+                    Ok(Some(value)) => return Ok(Some(value)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            event = "ext.wasm.dispatch.failed",
+                            extension_name = %extension.registration().name,
+                            event_name = %event_name,
+                            error = %err,
+                            "WASM extension event dispatch failed"
+                        );
+                        return Err(err);
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
         // Fan out across subscribed extensions concurrently. A single
         // slow or deadlocked extension bounds to its own per-instance
         // timeout and cannot block its peers — each `WasmExtensionHandle`
@@ -4939,13 +4978,15 @@ impl ExtensionManager {
 
     /// Dispatch `user_bash` for a `!command` the user typed. A hook that ran
     /// the command itself answers `{ result: BashResult }`, which replaces the
-    /// shell run; any other answer lets the command run.
+    /// shell run. Only an unhandled response permits the local shell to run:
+    /// dispatch failures and malformed execution claims may follow effects
+    /// that have already occurred and must never replay the command.
     pub async fn dispatch_user_bash(
         &self,
         command: &str,
         exclude_from_context: bool,
         cwd: &Path,
-    ) -> Option<crate::tools::BashRunResult> {
+    ) -> Result<Option<crate::tools::BashRunResult>> {
         let response = match self
             .dispatch_event_with_response(
                 ExtensionEventName::UserBash,
@@ -4958,25 +4999,33 @@ impl ExtensionManager {
             )
             .await
         {
-            Ok(response) => response?,
+            Ok(Some(response)) => response,
+            Ok(None) => return Ok(None),
             Err(err) => {
                 tracing::warn!(
                     event = "ext.user_bash.failed",
                     error = %err,
                     "Failed to dispatch user_bash"
                 );
-                return None;
+                return Err(err);
             }
         };
+        if let Some(result) = response.get("result") {
+            return user_bash_result(result).map(Some).ok_or_else(|| {
+                Error::extension(
+                    "A user_bash hook returned a non-object result; refusing to execute the command locally",
+                )
+            });
+        }
         if response.get("operations").is_some() {
             // pi-mono's `{ operations }` (run through the extension's own
-            // exec) cannot cross the bridge: its members are functions.
-            tracing::warn!(
-                event = "ext.user_bash.operations_unsupported",
-                "A user_bash hook returned shell operations; running the command locally"
-            );
+            // exec) cannot cross the bridge: its members are functions. Do
+            // not silently run a command intended for a different executor.
+            return Err(Error::extension(
+                "A user_bash hook returned unsupported shell operations; return a completed result instead. The command was not executed locally",
+            ));
         }
-        user_bash_result(response.get("result")?)
+        Ok(None)
     }
 
     pub async fn discover_resources(&self, cwd: &Path, reason: &str) -> ExtensionResourcePaths {
@@ -5456,6 +5505,19 @@ impl ExtensionManager {
     }
 }
 
+#[cfg(feature = "wasm-host")]
+fn user_bash_remaining_timeout(timeout_ms: u64, started_at: Instant) -> Result<u64> {
+    let remaining = Duration::from_millis(timeout_ms)
+        .checked_sub(started_at.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Error::extension("user_bash hook dispatch timed out"))?;
+    // The WASM handle treats zero as unlimited, so a sub-millisecond remainder
+    // must stay bounded instead of accidentally disabling the deadline.
+    Ok(u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1))
+}
+
 /// A `user_bash` hook's `result` (OMP's `BashResult`, camelCase or
 /// snake_case keys).
 fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
@@ -5557,6 +5619,17 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
 mod user_bash_result_tests {
     use super::user_bash_result;
     use serde_json::json;
+
+    #[cfg(feature = "wasm-host")]
+    #[test]
+    fn exhausted_user_bash_budget_never_becomes_an_unlimited_wasm_timeout() {
+        let now = std::time::Instant::now();
+        assert!(super::user_bash_remaining_timeout(0, now).is_err());
+        let expired = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("earlier instant");
+        assert!(super::user_bash_remaining_timeout(1, expired).is_err());
+    }
 
     #[test]
     fn incomplete_capture_never_advertises_a_full_output_path() {

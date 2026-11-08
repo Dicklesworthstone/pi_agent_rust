@@ -144,6 +144,12 @@ extension hook can run. Otherwise, that hook runs first and may supply the
 result. An abort does not interrupt an already-running hook; the native
 execution and cancellation guarantees below apply to the fallback runner.
 
+A hook failure, timeout, malformed execution result, or unsupported
+`operations` response returns an RPC error. It does not authorize a local
+retry of the command: the hook may already have performed side effects.
+Failed dispatch also stops later hooks from executing. Native execution
+starts only after an unhandled hook dispatch.
+
 Native RPC Bash uses the configured `shell_path` and `shell_command_prefix`
 in Pi's runtime working directory, with the shared proxy and non-interactive
 environment settings. Each request starts a fresh shell with piped output and

@@ -24624,7 +24624,7 @@ const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
 	            value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
 	        } catch (e) {
 	            try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
-	            if (eventName === 'tool_call' || eventName.startsWith('session_before_')) {
+	            if (eventName === 'tool_call' || eventName === 'user_bash' || eventName.startsWith('session_before_')) {
 	                throw e;
 	            }
 	            continue;
@@ -24633,6 +24633,21 @@ const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
 
         // First-result semantics (legacy parity)
         if (eventName === 'user_bash') {
+            if (value !== null && (typeof value === 'object' || typeof value === 'function')) {
+                if ('result' in value) {
+                    const result = value.result;
+                    if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+                        throw new Error('A user_bash hook returned a non-object result; refusing to execute the command locally');
+                    }
+                    // Preserve the execution claim across bridge serialization,
+                    // which drops undefined/function properties. Read a getter
+                    // only once and keep a completed result ahead of operations.
+                    return { result };
+                }
+                if ('operations' in value) {
+                    throw new Error('A user_bash hook returned unsupported shell operations; return a completed result instead. The command was not executed locally');
+                }
+            }
             return value;
         }
 
@@ -34966,6 +34981,52 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(
                 get_global_json(&runtime, "seen").await,
                 serde_json::json!([{ "hello": "world" }])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_user_bash_error_stops_later_handlers_after_effects() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    globalThis.seen = [];
+                    globalThis.failure = null;
+                    __pi_begin_extension(__pi_test_secret, "ext.shell", { name: "ext.shell" });
+                    pi.on("user_bash", () => {
+                        globalThis.seen.push("executed");
+                        throw new Error("shell failed after execution");
+                    });
+                    pi.on("user_bash", () => {
+                        globalThis.seen.push("replayed");
+                        return { result: { output: "duplicate" } };
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    (async () => {
+                        try {
+                            await __pi_dispatch_extension_event(__pi_test_secret, "user_bash", { command: "side-effect" }, {});
+                        } catch (error) {
+                            globalThis.failure = String(error);
+                        }
+                    })();
+                    "#,
+                ))
+                .await
+                .expect("eval");
+            assert_eq!(
+                get_global_json(&runtime, "seen").await,
+                serde_json::json!(["executed"])
+            );
+            assert!(
+                get_global_json(&runtime, "failure")
+                    .await
+                    .as_str()
+                    .is_some_and(|error| error.contains("shell failed after execution"))
             );
         });
     }

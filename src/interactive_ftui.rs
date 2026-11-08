@@ -11867,11 +11867,11 @@ async fn run_bash_ui_command(
     });
     let hooked = match extensions {
         Some(manager) => manager.dispatch_user_bash(command, exclude, cwd).await,
-        None => None,
+        None => Ok(None),
     };
     let result = match hooked {
-        Some(result) => Ok(result),
-        None => {
+        Ok(Some(result)) => Ok(result),
+        Ok(None) => {
             crate::tools::run_bash_command(
                 cwd,
                 shell.path.as_deref(),
@@ -11882,6 +11882,7 @@ async fn run_bash_ui_command(
             )
             .await
         }
+        Err(err) => Err(err),
     };
     let output = match result {
         Ok(result) => {

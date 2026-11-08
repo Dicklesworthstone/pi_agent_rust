@@ -643,7 +643,24 @@ export default function init(pi) {
     pi.on("user_bash", (event) => {
         if (event.command === "observe") return { allow: true };
         if (event.command === "ops") return { operations: { exec: async () => ({ exitCode: 0 }) } };
+        if (event.command === "ops-function") return { operations: async () => ({ exitCode: 0 }) };
+        if (event.command === "ops-undefined") return { operations: undefined };
+        if (event.command === "result-null") return { result: null };
+        if (event.command === "result-array") return { result: [] };
+        if (event.command === "result-string") return { result: "done" };
+        if (event.command === "result-undefined") return { result: undefined };
+        if (event.command === "result-function") return { result: () => ({ output: "done" }) };
+        if (event.command === "result-symbol") return { result: Symbol("done") };
         if (event.command === "local") return undefined;
+        if (event.command === "completed-with-ops") {
+            return { result: { output: "completed" }, operations: async () => {} };
+        }
+        if (event.command === "result-getter") {
+            let reads = 0;
+            return Object.defineProperty({}, "result", {
+                get: () => ++reads === 1 ? { output: "completed" } : undefined,
+            });
+        }
         return {
             result: {
                 output: `${event.cwd}|${event.excludeFromContext}|${event.command}`,
@@ -655,9 +672,9 @@ export default function init(pi) {
 }
 "#;
 
-/// Only `{ result }` replaces the shell run. An observing answer
-/// (`{ allow: true }`) or pi-mono's `{ operations }` used to be read as an
-/// empty successful result, so the command silently never ran.
+/// Only a completed `{ result }` replaces the shell run. Observers pass through,
+/// while malformed execution claims and unsupported shell operations fail
+/// without permitting a local replay.
 #[test]
 fn dispatch_user_bash_takes_only_a_result_answer() {
     let harness = common::TestHarness::new("dispatch_user_bash_takes_only_a_result_answer");
@@ -669,26 +686,132 @@ fn dispatch_user_bash_takes_only_a_result_answer() {
         let cwd = cwd.clone();
         async move {
             let mut passed_through = Vec::new();
-            for command in ["observe", "ops", "local"] {
+            for command in ["observe", "local"] {
                 if manager
                     .dispatch_user_bash(command, false, &cwd)
                     .await
+                    .expect("unhandled hook succeeds")
                     .is_none()
                 {
                     passed_through.push(command);
                 }
             }
-            let hooked = manager.dispatch_user_bash("make", true, &cwd).await;
+            for command in [
+                "ops",
+                "ops-function",
+                "ops-undefined",
+                "result-null",
+                "result-array",
+                "result-string",
+                "result-undefined",
+                "result-function",
+                "result-symbol",
+            ] {
+                assert!(
+                    manager
+                        .dispatch_user_bash(command, false, &cwd)
+                        .await
+                        .is_err(),
+                    "{command} must not permit local fallback"
+                );
+            }
+            for command in ["completed-with-ops", "result-getter"] {
+                let result = manager
+                    .dispatch_user_bash(command, false, &cwd)
+                    .await
+                    .expect("completed hook succeeds")
+                    .expect("completed result is preserved");
+                assert_eq!(result.output, "completed");
+            }
+            let hooked = manager
+                .dispatch_user_bash("make", true, &cwd)
+                .await
+                .expect("dispatch completed result");
             (passed_through, hooked)
         }
     });
 
-    assert_eq!(passed_through, ["observe", "ops", "local"]);
+    assert_eq!(passed_through, ["observe", "local"]);
     let hooked = hooked.expect("a result answer replaces the run");
     assert_eq!(hooked.output, format!("{}|true|make", cwd.display()));
     assert_eq!(hooked.exit_code, 3);
     assert!(hooked.truncated); // ubs:ignore[rust.panic.assert-macros] -- test assertion
     assert!(!hooked.cancelled); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+}
+
+#[test]
+fn dispatch_user_bash_stops_later_extensions_after_a_response_or_error() {
+    let harness = common::TestHarness::new(
+        "dispatch_user_bash_stops_later_extensions_after_a_response_or_error",
+    );
+    let manager = load_js_extensions(
+        &harness,
+        &[
+            (
+                "first",
+                r#"
+export default function init(pi) {
+    pi.on("user_bash", (event) => {
+        if (event.command === "local") return undefined;
+        if (event.command === "observe") return { allow: true };
+        if (event.command === "throw") throw new Error("execution failed after effects");
+        if (event.command === "malformed") return { result: undefined };
+        return { result: { output: "first" } };
+    });
+}
+"#,
+            ),
+            (
+                "later",
+                r#"
+export default function init(pi) {
+    const events = [];
+    pi.on("user_bash", (event) => {
+        events.push(event.command);
+        return { result: { output: "later" } };
+    });
+    pi.registerCommand("get-events", {
+        handler: async () => JSON.stringify(events),
+    });
+}
+"#,
+            ),
+        ],
+    );
+    let cwd = harness.temp_dir().to_path_buf();
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            let completed = manager
+                .dispatch_user_bash("handled", false, &cwd)
+                .await
+                .expect("first hook succeeds")
+                .expect("first result");
+            assert_eq!(completed.output, "first");
+            assert!(
+                manager
+                    .dispatch_user_bash("observe", false, &cwd)
+                    .await
+                    .expect("observer succeeds")
+                    .is_none()
+            );
+            for command in ["throw", "malformed"] {
+                assert!(
+                    manager
+                        .dispatch_user_bash(command, false, &cwd)
+                        .await
+                        .is_err()
+                );
+            }
+            let completed = manager
+                .dispatch_user_bash("local", false, &cwd)
+                .await
+                .expect("unhandled first hook passes through")
+                .expect("later result");
+            assert_eq!(completed.output, "later");
+        }
+    });
+    assert_eq!(recorded_events(&manager), ["local"]);
 }
 
 fn assert_signal_probe(response: &Value) {
