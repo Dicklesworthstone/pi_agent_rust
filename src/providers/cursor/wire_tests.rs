@@ -1,13 +1,20 @@
 //! Regression coverage for atomic, bounded Cursor protobuf decoding.
 
+use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 
-use futures::stream;
+use futures::{FutureExt, Stream, StreamExt, stream};
+
+use crate::cost::CostBudget;
+use crate::provider::{Context, ModelCost, Provider, StreamOptions};
 
 use super::{
-    AssistantMessage, CONNECT_COMPRESSED_FLAG, CONNECT_END_STREAM_FLAG, MAX_PROTOBUF_EVENTS,
-    MAX_PROTOBUF_FIELDS, Result, ServerEvent, StreamEvent, StreamState, connect,
+    AssistantMessage, CONNECT_COMPRESSED_FLAG, CONNECT_END_STREAM_FLAG, CursorProvider, Error,
+    MAX_PROTOBUF_EVENTS, MAX_PROTOBUF_FIELDS, Result, ServerEvent, StreamEvent, StreamState, connect,
     decode_server_message, encode_frame, pb,
 };
 
@@ -342,4 +349,367 @@ fn corrupt_protobuf_inside_valid_gzip_is_rejected_atomically() {
         encode_frame(CONNECT_COMPRESSED_FLAG, &compressed),
         connect::Encoding::Gzip,
     );
+}
+
+struct UsageWireProbe {
+    chunks: Mutex<VecDeque<std::io::Result<Vec<u8>>>>,
+    pending: bool,
+    dropped: AtomicBool,
+}
+
+struct UsageWireBody(Arc<UsageWireProbe>);
+
+impl Stream for UsageWireBody {
+    type Item = std::io::Result<Vec<u8>>;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.0.chunks.lock().unwrap().pop_front() {
+            Poll::Ready(Some(chunk))
+        } else if self.0.pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    }
+}
+
+impl Drop for UsageWireBody {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+struct UsageWireProvider(Mutex<Option<UsageWireBody>>);
+
+fn usage_prices() -> ModelCost {
+    ModelCost {
+        input: 1_000_000.0,
+        output: 2_000_000.0,
+        ..ModelCost::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for UsageWireProvider {
+    fn name(&self) -> &str {
+        "cursor"
+    }
+
+    fn api(&self) -> &str {
+        "cursor-agent"
+    }
+
+    fn model_id(&self) -> &str {
+        "cursor-usage-fixture"
+    }
+
+    fn model_cost(&self) -> Option<ModelCost> {
+        Some(usage_prices())
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        let source = self.0.lock().unwrap().take().expect("one wire request");
+        let state = StreamState::new(Box::pin(source), AssistantMessage::default())
+            .with_usage_observer(options.usage_observer.clone());
+        Ok(Box::pin(stream::unfold(state, |mut state| async move {
+            state.next_event().await.map(|event| (event, state))
+        })))
+    }
+}
+
+fn guarded_usage_wire(
+    chunks: Vec<std::io::Result<Vec<u8>>>,
+    pending: bool,
+    cap: f64,
+) -> (Arc<dyn Provider>, CostBudget, Arc<UsageWireProbe>) {
+    let probe = Arc::new(UsageWireProbe {
+        chunks: Mutex::new(chunks.into()),
+        pending,
+        dropped: AtomicBool::new(false),
+    });
+    let provider = Arc::new(UsageWireProvider(Mutex::new(Some(UsageWireBody(
+        Arc::clone(&probe),
+    )))));
+    let budget = CostBudget::new(None, Some(cap), 0.0).unwrap();
+    (
+        crate::provider::guard_with_cost_budget(provider, budget.clone()),
+        budget,
+        probe,
+    )
+}
+
+fn usage_frames() -> Vec<u8> {
+    [
+        encode_frame(0, &interaction(8, &integer_field(1, 2))),
+        encode_frame(0, &checkpoint(10)),
+        encode_frame(0, &interaction(8, &integer_field(1, 3))),
+        encode_frame(0, &checkpoint(12)),
+        encode_frame(0, &checkpoint(12)),
+        encode_frame(0, &interaction(8, &integer_field(1, u64::MAX))),
+    ]
+    .concat()
+}
+
+#[test]
+fn usage_frames_reserve_spend_before_pending_and_settle_on_drop() {
+    futures::executor::block_on(async {
+        for (wire, expected) in [
+            (usage_frames(), 17.0),
+            (encode_frame(0, &interaction(8, &integer_field(1, 5))), 10.0),
+        ] {
+            let (provider, budget, probe) =
+                guarded_usage_wire(vec![Ok(wire)], true, expected - 1.0);
+            let context = Context::default();
+            let options = StreamOptions::default();
+            let mut output = provider.stream(&context, &options).await.unwrap();
+            assert!(output.next().now_or_never().is_none());
+            assert_eq!(budget.snapshot().pending, expected);
+            assert_eq!(budget.spent(), 0.0);
+            assert!(!probe.dropped.load(Ordering::SeqCst));
+            assert!(matches!(
+                provider.stream(&context, &options).await,
+                Err(Error::CostCap { .. })
+            ));
+            drop(output);
+            assert!(probe.dropped.load(Ordering::SeqCst));
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert_eq!(budget.spent(), expected);
+        }
+    });
+}
+
+#[test]
+fn accepted_usage_survives_transport_and_protocol_failures_once() {
+    futures::executor::block_on(async {
+        for outcome in ["done", "refused", "eof", "io", "truncated", "protobuf", "terminal"] {
+            let mut chunks = vec![Ok(usage_frames())];
+            match outcome {
+                "done" => chunks.push(Ok(encode_frame(CONNECT_END_STREAM_FLAG, b"{}"))),
+                "refused" => chunks.push(Ok(encode_frame(
+                    CONNECT_END_STREAM_FLAG,
+                    br#"{"error":{"code":"unavailable","message":"capacity"}}"#,
+                ))),
+                "io" => chunks.push(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "fixture transport failure",
+                ))),
+                "truncated" => chunks.push(Ok(vec![0, 0])),
+                "protobuf" => {
+                    let mut invalid = checkpoint(1_000);
+                    invalid.extend_from_slice(&interaction(8, &integer_field(1, 100)));
+                    invalid.push(0x80);
+                    chunks.push(Ok(encode_frame(0, &invalid)));
+                }
+                "terminal" => chunks.push(Ok(encode_frame(CONNECT_END_STREAM_FLAG, b"[]"))),
+                _ => {}
+            }
+            let (provider, budget, probe) = guarded_usage_wire(chunks, false, 16.0);
+            let context = Context::default();
+            let options = StreamOptions::default();
+            let mut output = provider.stream(&context, &options).await.unwrap();
+            let mut terminal = None;
+            while let Some(event) = output.next().await {
+                match event {
+                    Ok(StreamEvent::Start { .. }) => {}
+                    Ok(StreamEvent::Done { message, .. }) => {
+                        assert_eq!(outcome, "done");
+                        assert!(terminal.replace("done").is_none());
+                        assert_eq!(message.usage.cost.total, 17.0);
+                        assert_eq!(message.usage.input, 7);
+                        assert_eq!(message.usage.output, 5);
+                        assert_eq!(message.usage.total_tokens, 12);
+                    }
+                    Ok(StreamEvent::Error { error, .. }) => {
+                        assert_eq!(outcome, "refused");
+                        assert!(terminal.replace("refused").is_none());
+                        assert_eq!(error.usage.cost.total, 17.0);
+                    }
+                    Err(_) => {
+                        assert!(!matches!(outcome, "done" | "refused"));
+                        assert!(terminal.replace("failed").is_none());
+                    }
+                    event => panic!("unexpected usage-only event: {event:?}"),
+                }
+            }
+            assert!(terminal.is_some(), "{outcome}");
+            assert!(probe.dropped.load(Ordering::SeqCst));
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert_eq!(budget.spent(), 17.0, "{outcome}");
+            assert!(matches!(
+                provider.stream(&context, &options).await,
+                Err(Error::CostCap { .. })
+            ));
+            drop(output);
+            assert_eq!(budget.spent(), 17.0, "terminal settlement is not charged twice");
+        }
+    });
+}
+
+#[test]
+fn terminal_usage_replaces_estimate_before_buffered_terminal_is_consumed() {
+    futures::executor::block_on(async {
+        for with_text in [false, true] {
+            for refused in [false, true] {
+                let mut prefix = if with_text {
+                    encode_frame(0, &text_message(b"preview"))
+                } else {
+                    Vec::new()
+                };
+                prefix.extend_from_slice(&encode_frame(0, &interaction(8, &integer_field(1, 5))));
+                prefix.extend_from_slice(&encode_frame(0, &checkpoint(50)));
+                let (provider, budget, probe) = guarded_usage_wire(vec![Ok(prefix)], true, 20.0);
+                let context = Context::default();
+                let options = StreamOptions::default();
+                let mut output = provider.stream(&context, &options).await.unwrap();
+                if with_text {
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::TextStart { .. }))
+                    ));
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::TextDelta { .. }))
+                    ));
+                }
+                assert!(output.next().now_or_never().is_none());
+                assert_eq!(budget.snapshot().pending, 55.0);
+                assert!(matches!(
+                    provider.stream(&context, &options).await,
+                    Err(Error::CostCap { .. })
+                ));
+                let terminal: &[u8] = if refused {
+                    br#"{"error":{"code":"unavailable","message":"capacity"}}"#
+                } else {
+                    b"{}"
+                };
+                probe.chunks.lock().unwrap().push_back(Ok(
+                    [
+                        encode_frame(0, &checkpoint(12)),
+                        encode_frame(CONNECT_END_STREAM_FLAG, terminal),
+                    ]
+                    .concat(),
+                ));
+                let preview = output.next().await.unwrap().unwrap();
+                if with_text {
+                    assert!(matches!(preview, StreamEvent::TextEnd { .. }));
+                } else {
+                    assert!(matches!(preview, StreamEvent::Start { .. }));
+                }
+                assert!(probe.dropped.load(Ordering::SeqCst));
+                assert_eq!(budget.snapshot().pending, 17.0);
+                assert_eq!(budget.spent(), 0.0);
+                budget
+                    .admit()
+                    .expect("the final counters replace the larger provisional bill");
+                // Deliberately do not consume the buffered Done/Error.
+                drop(output);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert_eq!(budget.spent(), 17.0);
+            }
+        }
+    });
+}
+
+fn usage_http_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, Read, Write};
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "Cursor usage fixture was not contacted"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("Cursor fixture accept failed: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut request = std::io::BufReader::new(socket);
+        let mut line = String::new();
+        let mut content_length = None;
+        loop {
+            line.clear();
+            assert!(request.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut request_body = vec![0; content_length.expect("framed Cursor request body")];
+        request.read_exact(&mut request_body).unwrap();
+        let socket = request.get_mut();
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/connect+proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        socket.write_all(&body).unwrap();
+    });
+    (format!("http://{address}/agent.v1.AgentService/Run"), server)
+}
+
+#[test]
+fn cursor_provider_passes_observed_usage_through_http_transport_failure() {
+    let (url, server) = usage_http_server(usage_frames());
+    let priced = Arc::new(crate::providers::PricedProvider {
+        inner: Arc::new(CursorProvider::new("cursor-usage-fixture").with_base_url(url)),
+        cost: usage_prices(),
+    });
+    let budget = CostBudget::new(None, Some(16.0), 0.0).unwrap();
+    let provider = crate::provider::guard_with_cost_budget(priced, budget.clone());
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let context = Context {
+            messages: vec![crate::model::Message::User(crate::model::UserMessage {
+                content: crate::model::UserContent::Text("usage probe".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            ..Context::default()
+        };
+        let options = StreamOptions {
+            api_key: Some("cursor-test-key".to_string()),
+            ..StreamOptions::default()
+        };
+        let mut output = provider.stream(&context, &options).await.unwrap();
+        let error = output.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("PI_CURSOR_STREAM_INCOMPLETE"));
+        assert_eq!(budget.spent(), 17.0);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert!(matches!(
+            provider.stream(&context, &options).await,
+            Err(Error::CostCap { .. })
+        ));
+        assert!(output.next().await.is_none());
+    });
+    server.join().expect("Cursor usage fixture completed");
 }

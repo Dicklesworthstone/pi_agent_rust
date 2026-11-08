@@ -595,6 +595,7 @@ struct StreamState {
     open_block: Option<(usize, BlockKind)>,
     output_tokens: u64,
     used_tokens: Option<u64>,
+    usage_observer: Option<crate::provider::UsageObserver>,
     error_message: Option<String>,
     started: bool,
     finalized: bool,
@@ -617,12 +618,42 @@ impl StreamState {
             open_block: None,
             output_tokens: 0,
             used_tokens: None,
+            usage_observer: None,
             error_message: None,
             started: false,
             finalized: false,
             done: false,
             transient_error_count: 0,
         }
+    }
+
+    fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
+        self.usage_observer = observer;
+        self
+    }
+
+    fn record_usage(&mut self, authoritative: bool) -> Result<()> {
+        let output = self.output_tokens;
+        let total = self.used_tokens.unwrap_or(output);
+        // Token deltas accumulate output; checkpoints replace the aggregate.
+        // The decoded protocol exposes no cache tiers or USD bill. Rebuild the
+        // snapshot so a locally priced earlier value cannot become a wire bill.
+        self.partial.usage = Usage {
+            input: total.saturating_sub(output),
+            output,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: total,
+            ..Usage::default()
+        };
+        if let Some(observer) = &self.usage_observer {
+            if authoritative {
+                observer.observe_authoritative(&mut self.partial.usage)?;
+            } else {
+                observer.observe(&self.partial.usage)?;
+            }
+        }
+        Ok(())
     }
 
     fn ensure_started(&mut self) {
@@ -777,7 +808,7 @@ impl StreamState {
             // Invalid or absent terminal metadata must never promote partial
             // output to a successful assistant message.
             self.error_message = connect::terminal_error(&payload)?;
-            self.finalize();
+            self.finalize()?;
             // The end-of-stream frame is the protocol terminator: stop reading so
             // we neither process data frames that arrive after `Done` nor block on
             // `source.next()` if the server holds the HTTP body open. `finalize`
@@ -789,35 +820,33 @@ impl StreamState {
         let events = decode_server_message(&payload)?;
         self.budget
             .admit(&events, self.open_block.map(|(_, kind)| kind))?;
+        let has_usage = events.iter().any(|event| {
+            matches!(event, ServerEvent::TokenDelta(_) | ServerEvent::UsedTokens(_))
+        });
         for event in events {
             self.apply(event);
+        }
+        if has_usage {
+            // An accepted frame can report usage without producing a public
+            // event. Retain it before pending reads, cancellation or a later
+            // malformed frame can drop this request's private counters.
+            self.record_usage(false)?;
         }
         Ok(())
     }
 
     /// Emit the closing events (open-block `*End`, then `Done`/`Error`).
-    fn finalize(&mut self) {
+    fn finalize(&mut self) -> Result<()> {
         if self.finalized {
-            return;
+            return Ok(());
         }
+        // The validated Connect terminator makes the latest counters final.
+        // Publish that correction before buffered Start/*End events permit
+        // the caller to drop the stream without consuming Done or Error.
+        self.record_usage(true)?;
         self.finalized = true;
         self.ensure_started();
         self.close_open_block();
-
-        let output = self.output_tokens;
-        let total = self.used_tokens.unwrap_or(output);
-        // Cursor reports only an aggregate token count and has no prompt-cache
-        // tiers, so `input` (per pi's #121 convention, cache reads excluded)
-        // is the non-output remainder.
-        let input = total.saturating_sub(output);
-        self.partial.usage = Usage {
-            input,
-            output,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: total,
-            ..Usage::default()
-        };
 
         if let Some(message) = self.error_message.take() {
             self.partial.stop_reason = StopReason::Error;
@@ -833,6 +862,7 @@ impl StreamState {
                 message: self.partial.clone(),
             });
         }
+        Ok(())
     }
 
     /// Produce the next [`StreamEvent`], reading and framing more of the HTTP
@@ -1060,7 +1090,8 @@ impl Provider for CursorProvider {
             ..AssistantMessage::default()
         };
 
-        let mut state = StreamState::new(response.bytes_stream(), partial);
+        let mut state = StreamState::new(response.bytes_stream(), partial)
+            .with_usage_observer(options.usage_observer.clone());
         state.encoding = encoding;
         let stream = stream::unfold(state, |mut state| async move {
             state.next_event().await.map(|event| (event, state))
