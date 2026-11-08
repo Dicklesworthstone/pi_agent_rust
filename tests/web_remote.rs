@@ -5,8 +5,8 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind, WebFrameType,
-    WebRemoteManager, WebRemoteSettings, render_half_block_qr,
+    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind,
+    WebFrameType, WebRemoteManager, WebRemoteSettings, render_half_block_qr,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -94,7 +94,9 @@ fn test_web_client_authentication_and_capacity() {
             .is_some_and(|e| e.contains("maximum viewer capacity"))
     );
 
-    manager.issue_token("tok-epsilon", TokenKind::Steer).unwrap();
+    manager
+        .issue_token("tok-epsilon", TokenKind::Steer)
+        .unwrap();
     assert!(
         manager
             .connect_client("viewer-1", "127.0.0.1:4006", Some("tok-epsilon"))

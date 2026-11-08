@@ -1043,6 +1043,13 @@ The local terminal must accept each browser prompt and retains tool approval
 and login input. There are no persistent `web.*` settings (Pi reports them as
 unrecognised). See [the browser companion guide](tools/web_remote.md).
 
+`pi web --terminal` selects the fullscreen terminal mirror, with locally
+approved remote control and a separate browser composer. This mode additionally
+accepts `--bind tailscale` or `--bind lan`; `--view-only` disables remote input.
+Its viewer limit is 1–64 (default 4), while the companion limit is 1–16.
+The modes own separate credentials and input permissions and cannot run on the
+same launch. Neither mode adds persistent settings or supports headless access.
+
 ## Full reference
 
 `src/config.rs` is the authoritative list of supported fields and defaulting behavior.

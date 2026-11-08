@@ -1038,6 +1038,7 @@ fn command_value(command: Option<&Commands>) -> Value {
             bind,
             view_only,
             max_viewers,
+            ..
         }) => json!({
             "name": "web",
             "port": port,

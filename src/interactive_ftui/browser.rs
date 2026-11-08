@@ -5,9 +5,9 @@
 //! SDK until a local key press and the driver's final validity check agree.
 
 use super::{
-    AgentUiState, Cmd, Event, Frame, KeyCode, Modifiers, Paragraph, PiFtuiModel, PiFtuiMsg,
-    PiMsg, Rect, Sender, StopSignal, SubId, Subscription, SubscriptionSender, Text,
-    TurnAbortSlot, TurnControlSlot, UiCommand, Widget, WrapMode, sanitize, strip_command,
+    AgentUiState, Cmd, Event, Frame, KeyCode, Modifiers, Paragraph, PiFtuiModel, PiFtuiMsg, PiMsg,
+    Rect, Sender, StopSignal, SubId, Subscription, SubscriptionSender, Text, TurnAbortSlot,
+    TurnControlSlot, UiCommand, Widget, WrapMode, sanitize, strip_command,
 };
 use crate::agent::AbortHandle;
 use crate::web_remote::{CompanionHandle, PromptProposal, TokenKind};
@@ -177,9 +177,7 @@ impl Subscription<PiFtuiMsg> for BrowserSubscription {
 
 fn plain_prompt(text: &str) -> bool {
     let trimmed = text.trim();
-    !trimmed.is_empty()
-        && text.len() <= MAX_PROMPT_BYTES
-        && !trimmed.starts_with(['/', '!'])
+    !trimmed.is_empty() && text.len() <= MAX_PROMPT_BYTES && !trimmed.starts_with(['/', '!'])
 }
 
 impl PiFtuiModel {
@@ -237,7 +235,9 @@ impl PiFtuiModel {
     }
 
     pub(super) fn browser_inbox_len(&self) -> usize {
-        self.browser.as_ref().map_or(0, |browser| browser.pending.len())
+        self.browser
+            .as_ref()
+            .map_or(0, |browser| browser.pending.len())
     }
 
     /// Intercept before ordinary slash-command history or transcript echo.
@@ -254,6 +254,9 @@ impl PiFtuiModel {
         };
         self.input.set_text("");
         self.autocomplete.close();
+        if self.submit_terminal_web_command(action.trim()) {
+            return true;
+        }
         let Some(browser) = &mut self.browser else {
             self.set_error_banner(String::from(
                 "Start with pi web to use the browser companion.",
@@ -492,11 +495,9 @@ impl PiFtuiModel {
                 text.clone(),
                 "Esc close · ↑/↓ scroll",
             ),
-            Some(Panel::Notice(text)) => (
-                "Browser companion",
-                text.clone(),
-                "Esc close · ↑/↓ scroll",
-            ),
+            Some(Panel::Notice(text)) => {
+                ("Browser companion", text.clone(), "Esc close · ↑/↓ scroll")
+            }
             Some(Panel::Proposal) => {
                 let Some(proposal) = browser.pending.front() else {
                     return false;
@@ -526,7 +527,8 @@ impl PiFtuiModel {
         let rows: Vec<_> = content
             .lines()
             .flat_map(|line| {
-                ftui::text::Line::from(line.to_string()).wrap(usize::from(width), WrapMode::WordChar)
+                ftui::text::Line::from(line.to_string())
+                    .wrap(usize::from(width), WrapMode::WordChar)
             })
             .collect();
         let visible = usize::from(height.saturating_sub(2));
@@ -569,16 +571,18 @@ pub(super) async fn run_prompt(
         }
     };
     let error = match owner {
-        Ok(owner) if owner != proposal.owner_session_id => {
-            Some(String::from("Browser prompt cancelled: the local session changed."))
-        }
+        Ok(owner) if owner != proposal.owner_session_id => Some(String::from(
+            "Browser prompt cancelled: the local session changed.",
+        )),
         Ok(_) if signal.is_aborted() => Some(String::from("Browser prompt cancelled.")),
         Ok(_) if !plain_prompt(&proposal.text) => Some(String::from(
             "Browser prompt refused: only bounded plain-text prompts are supported.",
         )),
         Ok(owner) => {
             if !companion.resolve_proposal(&proposal.id, true, "Accepted on the local terminal") {
-                Some(String::from("Browser prompt expired or browser access was revoked."))
+                Some(String::from(
+                    "Browser prompt expired or browser access was revoked.",
+                ))
             } else if agent_tx
                 .send(PiMsg::UserInputSubmitted {
                     owner_session_id: owner,
@@ -587,7 +591,9 @@ pub(super) async fn run_prompt(
                 })
                 .is_err()
             {
-                Some(String::from("Browser prompt cancelled: the local terminal closed."))
+                Some(String::from(
+                    "Browser prompt cancelled: the local terminal closed.",
+                ))
             } else {
                 let result = super::run_controlled_turn_with_pending(
                     session,
@@ -611,7 +617,9 @@ pub(super) async fn run_prompt(
             }
         }
         Err(crate::error::Error::Aborted) => Some(String::from("Browser prompt cancelled.")),
-        Err(_) => Some(String::from("Browser prompt cancelled: the local session is unavailable.")),
+        Err(_) => Some(String::from(
+            "Browser prompt cancelled: the local session is unavailable.",
+        )),
     };
     if error.is_some() {
         let _ = companion.resolve_proposal(

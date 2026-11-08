@@ -761,6 +761,10 @@ pub struct Cli {
     #[arg(skip)]
     pub web_companion: Option<crate::web_remote::WebRemoteSettings>,
 
+    /// Browser surface selected while normalizing the `web` subcommand.
+    #[arg(skip)]
+    pub web_remote_mode: crate::web_remote::WebRemoteMode,
+
     // === Positional Arguments ===
     /// Messages and @file references
     #[arg(trailing_var_arg = true)]
@@ -3320,18 +3324,21 @@ pub enum Commands {
         refresh: bool,
     },
 
-    /// Start the local TUI with a supervised loopback browser companion
+    /// Start the local TUI with a supervised browser companion or live terminal view
     Web {
+        /// Mirror the live fullscreen terminal; remote control requires local approval
+        #[arg(long)]
+        terminal: bool,
         /// Port to bind web server (default: 8080)
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Bind only to loopback; a local terminal remains required
-        #[arg(long, default_value = "loopback", value_parser = ["loopback"])]
+        /// Network binding; tailscale and lan require --terminal and a local terminal
+        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan"])]
         bind: String,
-        /// Offer viewing only; otherwise browser prompts require local approval
+        /// Offer viewing only; otherwise prompts or terminal control require local approval
         #[arg(long)]
         view_only: bool,
-        /// Maximum concurrent connected web viewers (default: 4)
+        /// Maximum connected viewers: 1-16, or 1-64 with --terminal (default: 4)
         #[arg(long, default_value_t = 4)]
         max_viewers: usize,
     },

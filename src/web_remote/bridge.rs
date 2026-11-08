@@ -117,11 +117,121 @@ struct Redactor {
     remembered_patterns: Vec<regex::Regex>,
     remembered_block: bool,
     history_unavailable: bool,
-    compiled_values: Vec<String>,
-    pattern: Option<regex::Regex>,
-    compact_pattern: Option<regex::Regex>,
+    cached_protection: Option<(ProtectionKey, Arc<RedactionProtection>)>,
     unavailable: bool,
     privacy: Option<Arc<Mutex<crate::compaction::CompactionPrivacy>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProtectionFailure {
+    Budget,
+    Unavailable,
+}
+
+#[derive(PartialEq, Eq)]
+struct ProtectionKey {
+    values: Vec<String>,
+    patterns: Vec<String>,
+    block: bool,
+    failure: Option<ProtectionFailure>,
+}
+
+impl ProtectionKey {
+    fn failed(failure: ProtectionFailure) -> Self {
+        Self {
+            values: Vec::new(),
+            patterns: Vec::new(),
+            block: false,
+            failure: Some(failure),
+        }
+    }
+}
+
+struct RedactionProtection {
+    known: Option<regex::Regex>,
+    compact_known: Option<regex::Regex>,
+    extra: Vec<regex::Regex>,
+    block: bool,
+    failure: Option<ProtectionFailure>,
+}
+
+/// Immutable credential protection for one native render. Classify complete
+/// source text before wrapping or clipping, then publish with this same scope.
+/// Cloning shares compiled detectors; neither values nor patterns are exposed.
+#[derive(Clone)]
+pub struct WebRemoteRedactionScope {
+    revision: u64,
+    protection: Arc<RedactionProtection>,
+}
+
+impl std::fmt::Debug for WebRemoteRedactionScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebRemoteRedactionScope")
+            .field("revision", &self.revision)
+            .field("unavailable", &self.protection.failure.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebRemoteRedactionScope {
+    /// Cache source classification by both its own revision and this revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether complete source text must be withheld before viewport clipping.
+    /// Oversized text or unavailable protection always fails closed.
+    #[must_use]
+    pub fn is_sensitive(&self, text: &str) -> bool {
+        if text.len() > MAX_FRAME_BYTES || self.protection.failure.is_some() {
+            return true;
+        }
+        if contains_sensitive(text, self.protection.known.as_ref(), &self.protection.extra) {
+            return true;
+        }
+        let compact = text
+            .chars()
+            .filter(|ch| !is_frame_padding(*ch))
+            .collect::<String>();
+        contains_sensitive(
+            &compact,
+            self.protection.compact_known.as_ref(),
+            &self.protection.extra,
+        )
+    }
+
+    fn redact(&self, text: &str) -> String {
+        let failure = if text.len() > MAX_FRAME_BYTES {
+            Some(ProtectionFailure::Budget)
+        } else {
+            self.protection.failure
+        };
+        match failure {
+            Some(ProtectionFailure::Budget) => {
+                "Remote frame withheld: credential protection exceeds the scan budget.".to_string()
+            }
+            Some(ProtectionFailure::Unavailable) => {
+                "Remote frame withheld: credential protection is unavailable.".to_string()
+            }
+            None => redact_text(
+                text,
+                self.protection.known.as_ref(),
+                self.protection.compact_known.as_ref(),
+                &self.protection.extra,
+                self.protection.block,
+            ),
+        }
+    }
+
+    fn same_protection(&self, other: &Self) -> bool {
+        self.revision == other.revision && Arc::ptr_eq(&self.protection, &other.protection)
+    }
+}
+
+fn contains_sensitive(text: &str, known: Option<&regex::Regex>, extra: &[regex::Regex]) -> bool {
+    known.is_some_and(|known| known.is_match(text)) || crate::secrets::contains_secret(text, extra)
 }
 
 struct BridgeState {
@@ -239,9 +349,53 @@ impl WebRemoteBridge {
         *frames = Frames::default();
     }
 
+    /// Capture immutable detectors for complete-source classification. Live
+    /// shared vault changes are observed here even when their Arc is unchanged.
+    #[must_use]
+    pub fn redaction_scope(&self) -> WebRemoteRedactionScope {
+        let mut redactor = self
+            .state
+            .redactor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (protection, changed) = redactor.protection(self.manager());
+        if changed {
+            // A previously safe cached source or frame may now contain a newly
+            // learned credential. Invalidate it under the same publication lock.
+            self.invalidate_frames();
+        }
+        WebRemoteRedactionScope {
+            revision: self.state.privacy_revision.load(Ordering::Acquire),
+            protection,
+        }
+    }
+
     /// Publish at most one current full frame and one immediate-generation diff.
     /// No renderer operation waits for a browser, socket, or outbound queue.
     pub fn publish_text(&self, width: u16, height: u16, data: String) -> bool {
+        self.publish_text_inner(None, width, height, data)
+    }
+
+    /// Publish a frame classified before clipping with this exact scope.
+    /// A changed live vault retires the stale render instead of attempting to
+    /// recognize a partial credential in already-clipped terminal cells.
+    pub fn publish_text_with_scope(
+        &self,
+        scope: &WebRemoteRedactionScope,
+        width: u16,
+        height: u16,
+        data: String,
+    ) -> bool {
+        self.publish_text_inner(Some(scope), width, height, data)
+    }
+
+    fn publish_text_inner(
+        &self,
+        expected_scope: Option<&WebRemoteRedactionScope>,
+        width: u16,
+        height: u16,
+        data: String,
+    ) -> bool {
         if self.is_closed()
             || width == 0
             || height == 0
@@ -251,15 +405,18 @@ impl WebRemoteBridge {
         {
             return false;
         }
-        let privacy_revision = self.state.privacy_revision.load(Ordering::Acquire);
-        let data = self.redact(data);
+        let scope = self.redaction_scope();
+        if expected_scope.is_some_and(|expected| !expected.same_protection(&scope)) {
+            return false;
+        }
+        let data = scope.redact(&data);
         let mut frames = self
             .state
             .frames
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.is_closed()
-            || self.state.privacy_revision.load(Ordering::Acquire) != privacy_revision
+            || self.state.privacy_revision.load(Ordering::Acquire) != scope.revision()
         {
             return false;
         }
@@ -423,35 +580,44 @@ impl WebRemoteBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while receiver.try_recv().is_ok() {}
     }
+}
 
-    fn redact(&self, data: String) -> String {
-        let mut redactor = self
-            .state
-            .redactor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if redactor.unavailable || redactor.history_unavailable {
-            return "Remote frame withheld: credential protection exceeds the scan budget."
-                .to_string();
+impl Redactor {
+    fn protection(&mut self, manager: &WebRemoteManager) -> (Arc<RedactionProtection>, bool) {
+        let (key, extra) = self.protection_key(manager);
+        if let Some((previous, protection)) = &self.cached_protection
+            && *previous == key
+        {
+            return (Arc::clone(protection), false);
         }
-        if let Some(privacy) = redactor.privacy.clone() {
+        let protection = Arc::new(self.compile_protection(&key, extra));
+        self.cached_protection = Some((key, Arc::clone(&protection)));
+        (protection, true)
+    }
+
+    fn protection_key(&mut self, manager: &WebRemoteManager) -> (ProtectionKey, Vec<regex::Regex>) {
+        if self.unavailable || self.history_unavailable {
+            return (ProtectionKey::failed(ProtectionFailure::Budget), Vec::new());
+        }
+        if let Some(privacy) = self.privacy.clone() {
             let Ok(privacy) = privacy.lock() else {
-                return "Remote frame withheld: credential protection is unavailable.".to_string();
+                return (
+                    ProtectionKey::failed(ProtectionFailure::Unavailable),
+                    Vec::new(),
+                );
             };
             let (known, patterns, should_block) = privacy.remote_frame_protection();
             // Agent session resets can refresh the same shared mutex in place.
             // Retain every observed generation, not just pointer replacements.
-            redactor.remember(known, patterns, should_block);
+            self.remember(known, patterns, should_block);
         }
-        if redactor.history_unavailable {
-            return "Remote frame withheld: credential protection exceeds the scan budget."
-                .to_string();
+        if self.history_unavailable {
+            return (ProtectionKey::failed(ProtectionFailure::Budget), Vec::new());
         }
-        let mut values = redactor.supplied.clone();
-        values.extend(redactor.remembered.iter().cloned());
-        let mut extra_patterns = redactor.remembered_patterns.clone();
-        let block = redactor.remembered_block;
-        values.extend(self.manager().tokens_for_redaction());
+        let mut values = self.supplied.clone();
+        values.extend(self.remembered.iter().cloned());
+        let mut extra_patterns = self.remembered_patterns.clone();
+        values.extend(manager.tokens_for_redaction());
         values.retain(|value| !value.is_empty());
         values.sort_unstable();
         values.dedup();
@@ -470,11 +636,51 @@ impl WebRemoteBridge {
                 })
                 .is_none_or(|bytes| bytes > MAX_SECRET_BYTES)
         {
-            return "Remote frame withheld: credential protection exceeds the scan budget."
-                .to_string();
+            return (ProtectionKey::failed(ProtectionFailure::Budget), Vec::new());
         }
-        if values != redactor.compiled_values {
-            let compact_values = values
+        let key = ProtectionKey {
+            values,
+            patterns: extra_patterns
+                .iter()
+                .map(|pattern| pattern.as_str().to_owned())
+                .collect(),
+            block: self.remembered_block,
+            failure: None,
+        };
+        (key, extra_patterns)
+    }
+
+    fn compile_protection(
+        &self,
+        key: &ProtectionKey,
+        extra: Vec<regex::Regex>,
+    ) -> RedactionProtection {
+        if let Some(failure) = key.failure {
+            return RedactionProtection {
+                known: None,
+                compact_known: None,
+                extra: Vec::new(),
+                block: key.block,
+                failure: Some(failure),
+            };
+        }
+        // Changing only a custom pattern or block policy does not require
+        // recompiling the literal detectors shared by previous snapshots.
+        let cached_literals = self
+            .cached_protection
+            .as_ref()
+            .filter(|(previous, protection)| {
+                previous.values == key.values && protection.failure.is_none()
+            });
+        let (known, compact_known, failure) = if let Some((_, protection)) = cached_literals {
+            (
+                protection.known.clone(),
+                protection.compact_known.clone(),
+                None,
+            )
+        } else {
+            let compact_values = key
+                .values
                 .iter()
                 .map(|value| {
                     value
@@ -483,27 +689,23 @@ impl WebRemoteBridge {
                         .collect::<String>()
                 })
                 .collect::<Vec<_>>();
-            let (Ok(pattern), Ok(compact_pattern)) = (
-                compile_known_pattern(&values),
+            match (
+                compile_known_pattern(&key.values),
                 compile_known_pattern(&compact_values),
-            ) else {
-                return "Remote frame withheld: credential protection is unavailable.".to_string();
-            };
-            redactor.pattern = pattern;
-            redactor.compact_pattern = compact_pattern;
-            redactor.compiled_values = values;
+            ) {
+                (Ok(known), Ok(compact_known)) => (known, compact_known, None),
+                _ => (None, None, Some(ProtectionFailure::Unavailable)),
+            }
+        };
+        RedactionProtection {
+            known,
+            compact_known,
+            extra,
+            block: key.block,
+            failure,
         }
-        redact_text(
-            &data,
-            redactor.pattern.as_ref(),
-            redactor.compact_pattern.as_ref(),
-            &extra_patterns,
-            block,
-        )
     }
-}
 
-impl Redactor {
     fn remember(&mut self, values: Vec<String>, patterns: Vec<regex::Regex>, block: bool) {
         if self.history_unavailable {
             return;
@@ -781,6 +983,117 @@ mod tests {
         assert!(!retired.data.contains(old));
         assert!(!retired.data.contains(learned));
         assert!(!retired.data.contains("CUSTOM_12345"));
+    }
+
+    #[test]
+    fn source_scope_classifies_a_secret_before_viewport_clipping() {
+        let bridge = WebRemoteBridge::new(WebRemoteSettings::default());
+        let secret = "opaque-source-credential-987654";
+        bridge.set_secrets(vec![secret.to_owned(), "private passphrase".to_owned()]);
+        let scope = bridge.redaction_scope();
+        let source = format!("Tool output before wrapping: {secret}\nordinary trailing text");
+        let viewport_fragment = "credential-987654";
+
+        assert!(scope.is_sensitive(&source));
+        assert!(
+            !scope.is_sensitive(viewport_fragment),
+            "the clipped fragment alone cannot identify its credential"
+        );
+        assert!(scope.is_sensitive("private\n │passphrase"));
+        assert!(scope.is_sensitive("api_key=sk-abcdefghijklmnop12345678"));
+        assert!(!scope.is_sensitive("ordinary tool output"));
+        assert!(scope.is_sensitive(&"x".repeat(MAX_FRAME_BYTES + 1)));
+        assert!(!format!("{scope:?}").contains(secret));
+        assert!(!format!("{scope:?}").contains("passphrase"));
+
+        let repeated = bridge.redaction_scope();
+        assert_eq!(scope.revision(), repeated.revision());
+        assert!(scope.same_protection(&repeated));
+        // The renderer withholds the complete classified source, rather than
+        // attempting to redact an unrecognizable tail after layout clipped it.
+        let rendered = if scope.is_sensitive(&source) {
+            "[local interaction]"
+        } else {
+            viewport_fragment
+        };
+        assert!(bridge.publish_text_with_scope(&scope, 80, 1, rendered.to_owned()));
+        assert_eq!(bridge.frame_after(0).unwrap().data, "[local interaction]");
+    }
+
+    #[test]
+    fn live_vault_discovery_advances_scope_revision_and_rejects_a_stale_render() {
+        let bridge = WebRemoteBridge::new(WebRemoteSettings::default());
+        let privacy = Arc::new(Mutex::new(crate::compaction::CompactionPrivacy::default()));
+        bridge.set_privacy_state(Arc::clone(&privacy));
+        let before = bridge.redaction_scope();
+        let secret = "opaque-learned-scope-credential";
+        assert!(!before.is_sensitive(secret));
+        assert!(bridge.publish_text_with_scope(&before, 80, 1, "earlier frame".to_owned()));
+
+        let mut vault = crate::secrets::SecretVault::default();
+        crate::secrets::obfuscate(secret, &mut vault, &[regex::Regex::new(secret).unwrap()]);
+        *privacy.lock().unwrap() = crate::compaction::CompactionPrivacy::with_vault(None, &vault);
+        // No setter or explicit invalidation runs: publishing itself must
+        // observe the shared vault change before comparing the render scope.
+        assert!(!bridge.publish_text_with_scope(&before, 80, 1, "scope-credential".to_owned()));
+        assert!(bridge.frame_after(0).is_none());
+        let after = bridge.redaction_scope();
+        assert!(after.revision() > before.revision());
+        assert!(after.is_sensitive(secret));
+        assert!(
+            !before.is_sensitive(secret),
+            "a captured scope stays immutable"
+        );
+        assert_eq!(after.revision(), bridge.redaction_scope().revision());
+        assert!(bridge.publish_text_with_scope(&after, 80, 1, secret.to_owned()));
+        assert!(!bridge.frame_after(0).unwrap().data.contains(secret));
+
+        let other = WebRemoteBridge::new(WebRemoteSettings::default());
+        assert!(!other.publish_text_with_scope(&after, 80, 1, "foreign scope".to_owned()));
+    }
+
+    #[test]
+    fn scope_revisions_cover_custom_patterns_blocking_and_failed_protection() {
+        let bridge = WebRemoteBridge::new(WebRemoteSettings::default());
+        let privacy = Arc::new(Mutex::new(crate::compaction::CompactionPrivacy::default()));
+        bridge.set_privacy_state(Arc::clone(&privacy));
+        let initial = bridge.redaction_scope();
+        assert!(!initial.is_sensitive("INTERNAL_123"));
+
+        let mut settings = crate::secrets::SecretsSettings {
+            extra_patterns: Some(vec!["INTERNAL_[0-9]+".to_owned()]),
+            ..Default::default()
+        };
+        *privacy.lock().unwrap() =
+            crate::compaction::CompactionPrivacy::from_settings(Some(&settings));
+        let patterned = bridge.redaction_scope();
+        assert!(patterned.revision() > initial.revision());
+        assert!(patterned.is_sensitive("INTERNAL_123"));
+        assert_eq!(patterned.redact("INTERNAL_123"), "************");
+
+        settings.mode = Some("block".to_owned());
+        *privacy.lock().unwrap() =
+            crate::compaction::CompactionPrivacy::from_settings(Some(&settings));
+        let blocked = bridge.redaction_scope();
+        assert!(blocked.revision() > patterned.revision());
+        assert!(
+            blocked
+                .redact("INTERNAL_123")
+                .starts_with("Remote frame withheld by")
+        );
+        assert_eq!(patterned.redact("INTERNAL_123"), "************");
+
+        bridge.remember_secrets(vec!["x".repeat(MAX_SECRET_BYTES + 1)]);
+        let failed = bridge.redaction_scope();
+        assert!(failed.revision() > blocked.revision());
+        assert!(failed.is_sensitive("ordinary text"));
+        assert!(failed.is_sensitive(""));
+        assert!(
+            failed
+                .redact("ordinary text")
+                .starts_with("Remote frame withheld:")
+        );
+        assert_eq!(failed.revision(), bridge.redaction_scope().revision());
     }
 
     #[test]

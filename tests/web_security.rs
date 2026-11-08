@@ -5,8 +5,8 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind, WebRemoteBridge,
-    WebRemoteManager, WebRemoteSettings,
+    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind,
+    WebRemoteBridge, WebRemoteManager, WebRemoteSettings,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -115,11 +115,9 @@ fn test_remote_mutating_action_requires_local_approval() {
 
     // Audit logs record takeover grant with provenance
     let logs = manager.audit_log();
-    assert!(logs.iter().any(
-        |e| e.event_type == "takeover_granted"
-            && e.client_id.as_deref() == Some("remote-user")
-            && e.details.get("actor").map(String::as_str) == Some("local_operator")
-    ));
+    assert!(logs.iter().any(|e| e.event_type == "takeover_granted"
+        && e.client_id.as_deref() == Some("remote-user")
+        && e.details.get("actor").map(String::as_str) == Some("local_operator")));
     assert!(!serde_json::to_string(&logs).unwrap().contains(&token));
     assert!(!format!("{manager:?}").contains(&token));
 

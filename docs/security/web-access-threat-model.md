@@ -21,17 +21,36 @@ The real listener and native admission regressions are in
 `src/web_remote/companion/tests.rs`, `src/web_remote/companion/projection.rs`,
 and `src/interactive_ftui.rs`. Their authoritative execution path is DSR.
 
-## Embedded terminal transport
+## Explicit terminal mirror
 
-`WebRemoteServer` and `WebRemoteBridge` provide a separate authenticated
-WebSocket transport for embedding hosts. It supports terminal keyframes and
+`pi web --terminal` uses `WebRemoteServer` and `WebRemoteBridge` as a separate
+authenticated WebSocket surface, also available to embedding hosts. It supports terminal keyframes and
 patches, local approval of control leases, and bounded sequenced input with
-provenance for host revalidation. Its socket regressions live in
+provenance revalidated at admission, native consumption, and agent submission.
+Host input revokes control. The approval panel must visibly contain the complete
+client identity and decision hint; small terminals cannot silently approve a
+clipped request. A separate remote composer preserves the local draft.
+
+The mirror requires fullscreen FTUI and a local terminal. Loopback is default;
+Tailscale and LAN binding require explicit flags. Pairing tokens remain in
+memory, expire after ten minutes, and are consumed once. Exact Host/Origin
+checks, a strict CSP, request/write deadlines, bounded input queues, and bounded
+frame history constrain the transport. The server is owned by the native
+session and joins its connections at shutdown.
+
+Complete source blocks are screened before wrapping or clipping with immutable,
+revisioned privacy scopes. A vault change retires a stale scoped publication.
+Local drafts, authentication/questions, in-flight response text, and truncated
+live tool cards are withheld from the browser projection. Completed safe
+transcript and status updates remain visible. Credentials learned in previous
+session states remain protected within the bounded listener history.
+
+Its socket regressions live in
 `src/web_remote/server.rs`; manager and privacy coverage also appears in
-`tests/web_remote.rs` and `tests/web_security.rs`. The CLI does not start this
-transport, and its credentials and control leases do not authorize companion
-proposals. These implementations do not establish WASM or complete terminal
-integration acceptance by themselves.
+`tests/web_remote.rs`, `tests/web_security.rs`, and `src/interactive_ftui.rs`.
+Only the selected browser mode starts. Mirror credentials and leases cannot
+authorize companion proposals. Neither implementation establishes WASM,
+headless, QR, or a passed runtime security gate; DSR execution remains required.
 
 ## Historical design: WASM remote terminal
 

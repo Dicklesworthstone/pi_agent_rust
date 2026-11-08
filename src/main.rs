@@ -2898,6 +2898,7 @@ async fn run(
             ftui_sessions,
             pi::interactive_ftui::FtuiSettings {
                 web_remote: cli.web_companion.take(),
+                web_remote_mode: cli.web_remote_mode,
                 markdown_spacing: config.markdown_spacing(),
                 // Resolved exactly as the classic stack resolves it; the
                 // `--no-mouse-capture` flag has already been folded into
@@ -3684,11 +3685,12 @@ async fn run(
     result
 }
 
-/// A browser companion is the normal local FTUI host with another output
-/// surface. Remove its subcommand before any session/trust/bootstrap decision;
+/// Both browser modes use the normal local FTUI host with another output
+/// surface. Remove the subcommand before any session/trust/bootstrap decision;
 /// constructing a separate abbreviated session would bypass those policies.
 fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) -> Result<()> {
     let Some(cli::Commands::Web {
+        terminal,
         port,
         bind,
         view_only,
@@ -3707,28 +3709,50 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
         || cli.mode.is_some()
         || cli.export.is_some()
         || cli.list_models.is_some()
+        || cli.fetch_models.is_some()
         || cli.list_providers
         || cli.explain_extension_policy
         || cli.explain_repair_policy
     {
-        bail!("`pi web` runs the local FrankenTUI session; output/query modes and --classic cannot be combined with it");
+        bail!(
+            "`pi web` runs the local FrankenTUI session; output/query modes and --classic cannot be combined with it"
+        );
+    }
+    if *terminal && cli.inline {
+        bail!("`pi web --terminal` requires fullscreen rendering; remove --inline");
     }
     if !has_local_terminal {
-        bail!("`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported");
+        bail!(
+            "`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported"
+        );
     }
-    if bind != "loopback" {
-        bail!("`pi web` currently supports only --bind loopback");
-    }
-    if !(1..=16).contains(max_viewers) {
-        bail!("`pi web --max-viewers` must be between 1 and 16");
+    let (mode, bind_mode, viewer_limit) = if *terminal {
+        (
+            pi::web_remote::WebRemoteMode::Terminal,
+            bind.parse().map_err(anyhow::Error::msg)?,
+            pi::web_remote::MAX_WEB_VIEWERS,
+        )
+    } else {
+        if bind != "loopback" {
+            bail!("`pi web` supports only --bind loopback; other bindings require --terminal");
+        }
+        (
+            pi::web_remote::WebRemoteMode::Companion,
+            pi::web_remote::BindMode::Loopback,
+            16,
+        )
+    };
+    if !(1..=viewer_limit).contains(max_viewers) {
+        bail!("`pi web --max-viewers` must be between 1 and {viewer_limit}");
     }
     cli.web_companion = Some(pi::web_remote::WebRemoteSettings {
         port: *port,
-        bind_mode: pi::web_remote::BindMode::Loopback,
+        bind_mode,
         view_only: *view_only,
         max_viewers: *max_viewers,
         ..Default::default()
     });
+    cli.web_remote_mode = mode;
     cli.command = None;
     #[cfg(feature = "ftui")]
     {
@@ -11905,10 +11929,27 @@ mod tests {
     #[cfg(feature = "ftui")]
     fn web_launch_keeps_normal_session_trust_approval_and_budget_options() {
         let mut cli = cli::Cli::parse_from([
-            "pi", "--provider", "anthropic", "--model", "claude-test",
-            "--session", "saved-session.jsonl", "--session-workdir", "/tmp/pi-web-workspace",
-            "--trust", "--approval-mode", "write", "--max-cost", "1.5",
-            "--tools", "read,grep", "web", "--port", "0", "--max-viewers", "2",
+            "pi",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-test",
+            "--session",
+            "saved-session.jsonl",
+            "--session-workdir",
+            "/tmp/pi-web-workspace",
+            "--trust",
+            "--approval-mode",
+            "write",
+            "--max-cost",
+            "1.5",
+            "--tools",
+            "read,grep",
+            "web",
+            "--port",
+            "0",
+            "--max-viewers",
+            "2",
             "--view-only",
         ]);
         assert!(!cli_uses_runtime_session(&cli));
@@ -11916,10 +11957,17 @@ mod tests {
         assert!(cli_uses_runtime_session(&cli));
         assert!(cli.command.is_none());
         assert!(cli.ftui);
+        assert_eq!(
+            cli.web_remote_mode,
+            pi::web_remote::WebRemoteMode::Companion
+        );
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
         assert_eq!(cli.model.as_deref(), Some("claude-test"));
         assert_eq!(cli.session.as_deref(), Some("saved-session.jsonl"));
-        assert_eq!(cli.session_workdir.as_deref(), Some(Path::new("/tmp/pi-web-workspace")));
+        assert_eq!(
+            cli.session_workdir.as_deref(),
+            Some(Path::new("/tmp/pi-web-workspace"))
+        );
         assert!(cli.trust);
         assert_eq!(cli.approval_mode.as_deref(), Some("write"));
         assert_eq!(cli.max_cost, Some(1.5));
@@ -11956,17 +12004,110 @@ mod tests {
             let mut cli = cli::Cli::parse_from(["pi", "web", "--max-viewers", limit]);
             assert!(prepare_web_companion_launch(&mut cli, true).is_err());
         }
-        assert!(cli::Cli::try_parse_from(["pi", "web", "--bind", "lan"]).is_err());
-        assert!(cli::Cli::try_parse_from(["pi", "web", "--bind", "tailscale"]).is_err());
+        for bind in ["lan", "tailscale"] {
+            let mut cli = cli::Cli::parse_from(["pi", "web", "--bind", bind]);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("other bindings require --terminal")
+            );
+            assert!(cli.web_companion.is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ftui")]
+    fn web_terminal_launch_preserves_session_options_and_selects_requested_binding() {
+        for (bind, expected) in [
+            ("loopback", pi::web_remote::BindMode::Loopback),
+            ("tailscale", pi::web_remote::BindMode::Tailscale),
+            ("lan", pi::web_remote::BindMode::Lan),
+        ] {
+            let mut cli = cli::Cli::parse_from([
+                "pi",
+                "--session",
+                "saved-session.jsonl",
+                "--session-workdir",
+                "/tmp/pi-web-terminal",
+                "--trust",
+                "--approval-mode",
+                "write",
+                "--max-cost",
+                "1.5",
+                "--tools",
+                "read,grep",
+                "web",
+                "--terminal",
+                "--bind",
+                bind,
+                "--port",
+                "0",
+                "--max-viewers",
+                "64",
+                "--view-only",
+            ]);
+            prepare_web_companion_launch(&mut cli, true).unwrap();
+            assert_eq!(cli.web_remote_mode, pi::web_remote::WebRemoteMode::Terminal);
+            assert!(cli.command.is_none());
+            assert!(cli.ftui);
+            assert!(cli_uses_runtime_session(&cli));
+            assert!(cli.trust);
+            assert_eq!(cli.session.as_deref(), Some("saved-session.jsonl"));
+            assert_eq!(
+                cli.session_workdir.as_deref(),
+                Some(Path::new("/tmp/pi-web-terminal"))
+            );
+            assert_eq!(cli.approval_mode.as_deref(), Some("write"));
+            assert_eq!(cli.max_cost, Some(1.5));
+            assert_eq!(cli.tools.as_deref(), Some("read,grep"));
+            let settings = cli.web_companion.as_ref().unwrap();
+            assert_eq!(settings.bind_mode, expected);
+            assert_eq!(settings.port, 0);
+            assert_eq!(settings.max_viewers, 64);
+            assert!(settings.view_only);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ftui")]
+    fn web_terminal_launch_requires_local_terminal_fullscreen_and_bounded_viewers() {
+        let mut cli = cli::Cli::parse_from(["pi", "web", "--terminal"]);
+        let error = prepare_web_companion_launch(&mut cli, false).unwrap_err();
+        assert!(error.to_string().contains("requires a local terminal"));
+        assert!(cli.web_companion.is_none());
+        assert!(cli.command.is_some());
+        let mut cli = cli::Cli::parse_from(["pi", "--inline", "web", "--terminal"]);
+        let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+        assert!(error.to_string().contains("requires fullscreen rendering"));
+        assert!(cli.web_companion.is_none());
+        for limit in ["0", "65"] {
+            let mut cli = cli::Cli::parse_from(["pi", "web", "--terminal", "--max-viewers", limit]);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(error.to_string().contains("between 1 and 64"));
+            assert!(cli.web_companion.is_none());
+        }
+        let mut cli = cli::Cli::parse_from(["pi", "--inline", "web"]);
+        prepare_web_companion_launch(&mut cli, true).unwrap();
+        assert_eq!(
+            cli.web_remote_mode,
+            pi::web_remote::WebRemoteMode::Companion
+        );
     }
 
     #[test]
     #[cfg(not(feature = "ftui"))]
     fn web_launch_requires_the_ftui_feature() {
-        let mut cli = cli::Cli::parse_from(["pi", "web"]);
-        let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
-        assert!(error.to_string().contains("requires a build with FrankenTUI support"));
-        assert!(cli.web_companion.is_none());
+        for args in [vec!["pi", "web"], vec!["pi", "web", "--terminal"]] {
+            let mut cli = cli::Cli::parse_from(args);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires a build with FrankenTUI support")
+            );
+            assert!(cli.web_companion.is_none());
+        }
     }
 
     #[test]
@@ -16209,7 +16350,10 @@ mod tests {
                         ],
                         "{outcome}, transport_error={transport_error}"
                     );
-                    let Some(AgentEvent::AgentEnd { messages, error, .. }) = events.last() else {
+                    let Some(AgentEvent::AgentEnd {
+                        messages, error, ..
+                    }) = events.last()
+                    else {
                         panic!("the logical end must be the final callback");
                     };
                     assert_eq!(
@@ -16674,15 +16818,20 @@ mod tests {
                 1,
                 "native termination is held until the persistence result"
             );
-            let Some(AgentEvent::AgentEnd { messages, error, .. }) = events.last() else {
+            let Some(AgentEvent::AgentEnd {
+                messages, error, ..
+            }) = events.last()
+            else {
                 panic!("the terminal frame follows the failed save");
             };
             assert_eq!(error.as_deref(), Some(message.as_str()));
             assert_eq!(
                 messages
                     .iter()
-                    .filter(|message| matches!(message, pi::model::Message::ToolResult(result)
-                        if result.tool_call_id == "step1"))
+                    .filter(
+                        |message| matches!(message, pi::model::Message::ToolResult(result)
+                        if result.tool_call_id == "step1")
+                    )
                     .count(),
                 1,
                 "the terminal must retain completed tool effects despite the failed save"

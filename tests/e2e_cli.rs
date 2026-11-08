@@ -3811,29 +3811,43 @@ fn e2e_cli_doctor_invalid_only_value_is_usage_error() {
 }
 
 /// gh #182: `pi web` printed "server listening", a client URL and a pairing
-/// token, then exited with nothing serving the port.
+/// token, then exited with nothing serving the port. The live server requires
+/// a local terminal, so the headless harness must fail before advertising it.
 #[test]
 fn e2e_cli_web_requires_local_terminal_before_reporting_a_server() {
-    let harness = CliTestHarness::new("e2e_cli_web_requires_local_terminal_before_reporting_a_server");
-    let result = harness.run(&["web", "--port", "18080"]);
+    let harness =
+        CliTestHarness::new("e2e_cli_web_requires_local_terminal_before_reporting_a_server");
+    for args in [
+        vec!["web", "--port", "18080"],
+        vec!["web", "--terminal", "--port", "18080"],
+    ] {
+        let result = harness.run(&args);
 
-    assert_ne!(result.exit_code, 0, "stdout: {}", result.stdout);
-    for claim in ["listening", "Pairing token", "Web client interface"] {
-        assert!(
-            !result.stdout.contains(claim),
-            "pi web must not claim a server: {}",
-            result.stdout
+        assert_ne!(result.exit_code, 0, "stdout: {}", result.stdout);
+        for claim in ["listening", "Pairing token", "Web client interface"] {
+            assert!(
+                !result.stdout.contains(claim),
+                "pi web must not claim a server: {}",
+                result.stdout
+            );
+        }
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            if cfg!(feature = "ftui") {
+                "`pi web` requires a local terminal"
+            } else {
+                "`pi web` requires a build with FrankenTUI support"
+            },
         );
-    }
-    assert_contains(
-        &harness.harness,
-        &result.stderr,
         if cfg!(feature = "ftui") {
-            "`pi web` requires a local terminal"
-        } else {
-            "`pi web` requires a build with FrankenTUI support"
-        },
-    );
+            assert_contains(
+                &harness.harness,
+                &result.stderr,
+                "headless browser control is not supported",
+            );
+        }
+    }
 }
 
 #[test]

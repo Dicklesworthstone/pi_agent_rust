@@ -6834,6 +6834,13 @@ impl Agent {
         compaction::CompactionPrivacy::with_vault(self.config.secrets.as_ref(), &self.secrets_vault)
     }
 
+    /// Observe the same privacy state that is refreshed before live agent
+    /// events are published, without borrowing the agent while it is running.
+    #[cfg(feature = "ftui")]
+    pub(crate) fn web_remote_privacy_state(&self) -> Arc<StdMutex<compaction::CompactionPrivacy>> {
+        Arc::clone(&self.compaction_privacy_state)
+    }
+
     fn refresh_compaction_privacy(&self) {
         if let Ok(mut privacy) = self.compaction_privacy_state.lock() {
             *privacy = self.compaction_privacy();

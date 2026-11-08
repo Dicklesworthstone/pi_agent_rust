@@ -843,6 +843,14 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**Browser access to interactive mode.** `pi web` provides a supervised loopback
+companion with local approval for each proposed prompt. `pi web --terminal`
+provides a terminal mirror with a locally approved, revocable control lease and
+a separate browser composer. Both require the native FTUI and a local terminal;
+the mirror uses fullscreen rendering and adds explicit Tailscale/LAN options.
+See [web access](docs/tools/web_remote.md) for the two modes' controls, privacy,
+and limits (`src/web_remote/`, `src/interactive_ftui.rs`).
+
 **Interactive queued input.** In the default terminal interface, messages
 accepted as a turn finishes continue in their original order, with each
 message's prepared file contents preserved. They keep separate message
@@ -968,6 +976,14 @@ explicit F8 acceptance on the local terminal. Drafts, tool approvals, login,
 and cancellation stay in the terminal. Use `/web` for pairing or inbox review
 and `/web revoke` to close browser access. See the
 [browser companion guide](docs/tools/web_remote.md) for options and limits.
+
+**Browser terminal mirror** (`pi web --terminal`) projects the native terminal
+through bounded WebSocket keyframes and patches. The local F8 panel issues
+one-use links and grants or revokes remote control. Host input reclaims control;
+the remote composer preserves local drafts and cannot operate local approval,
+credential, or extension dialogs. Complete sources are screened before clipping,
+and local drafts, in-flight response text, and truncated tool cards stay local.
+Headless, WASM, and QR pairing remain unimplemented.
 
 **Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
 
@@ -1358,6 +1374,12 @@ pi list                            # List user + project packages from settings
 
 # Configuration
 pi config                          # Show settings paths + precedence
+
+# Supervised browser companion (F8 reviews each prompt)
+pi web
+
+# Native terminal mirror (F8 grants/revokes browser control)
+pi web --terminal --bind tailscale --view-only --port 9000
 ```
 
 More utility subcommands:

@@ -60,6 +60,8 @@ use crate::interactive::{AutocompleteState, PiMsg, extension_commands_for_catalo
 use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::provider::ServiceTierCommand;
+use crate::web_remote::bridge::WebRemoteRedactionScope;
+use crate::web_remote::{WebRemoteBridge, WebRemoteEvent, WebRemoteInput};
 use std::collections::{HashMap, VecDeque};
 
 mod browser;
@@ -92,6 +94,8 @@ pub enum PiFtuiMsg {
     Agent(PiMsg),
     /// Progress or unclaimed native input from one session-owned goal run.
     Goal(goal_control::Event),
+    /// Untrusted browser input retains its identity and control generation.
+    Remote(WebRemoteEvent),
     /// A browser proposal or completion of its locally approved turn.
     Browser(browser::BrowserEvent),
     /// The process came back from a SIGTSTP suspension: the terminal has
@@ -158,6 +162,161 @@ impl AgentEventSubscription {
 }
 
 const AGENT_EVENT_POLL: Duration = Duration::from_millis(50);
+
+const WEB_REMOTE_SUB_ID: SubId = 0x5049_5754; // "PIWT"
+const REMOTE_DRAFT_LIMIT: usize = 16 * 1024;
+
+struct WebRemoteSubscription(WebRemoteBridge);
+
+impl Subscription<PiFtuiMsg> for WebRemoteSubscription {
+    fn id(&self) -> SubId {
+        WEB_REMOTE_SUB_ID
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn run(&self, sender: SubscriptionSender<PiFtuiMsg>, stop: StopSignal) {
+        while !stop.is_stopped() && !self.0.is_closed() {
+            if let Some(event) = self.0.recv_event_timeout(AGENT_EVENT_POLL)
+                && sender.send(PiFtuiMsg::Remote(event)).is_err()
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// The pairing URL is rendered only after the browser snapshot is captured.
+/// Browser drafts never share storage or undo history with the local editor.
+struct WebRemoteUi {
+    bridge: WebRemoteBridge,
+    pairing_url: String,
+    panel_open: bool,
+    notice: Option<String>,
+    draft: TextArea,
+    draft_owner: Option<(String, u64)>,
+    privacy_ready: Arc<std::sync::atomic::AtomicBool>,
+    displayed_request: std::cell::RefCell<Option<String>>,
+    private_lines: std::cell::RefCell<Vec<std::ops::Range<usize>>>,
+    hidden_rows: std::cell::RefCell<Vec<std::ops::Range<u16>>>,
+    sensitivity: std::cell::RefCell<Vec<Option<(u64, u64, bool)>>>,
+}
+
+impl WebRemoteUi {
+    fn new(
+        bridge: WebRemoteBridge,
+        pairing_url: String,
+        privacy_ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            bridge,
+            pairing_url,
+            panel_open: true,
+            notice: None,
+            draft: PiFtuiModel::new_input_editor()
+                .with_placeholder("Browser message · Enter sends · host input retakes control"),
+            draft_owner: None,
+            privacy_ready,
+            displayed_request: std::cell::RefCell::new(None),
+            private_lines: std::cell::RefCell::new(Vec::new()),
+            hidden_rows: std::cell::RefCell::new(Vec::new()),
+            sensitivity: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn clear_draft(&mut self) {
+        self.draft.set_text("");
+        self.draft_owner = None;
+    }
+
+    fn has_live_draft(&self) -> bool {
+        self.draft_owner
+            .as_ref()
+            .is_some_and(|(client, epoch)| self.bridge.manager().input_authorized(client, *epoch))
+    }
+
+    fn rotate_pairing(&mut self, kind: crate::web_remote::TokenKind) {
+        match self.bridge.manager().generate_token(kind) {
+            Ok(token) => {
+                let base = self.pairing_url.split('#').next().unwrap_or("");
+                self.pairing_url = format!("{base}#token={token}");
+                self.notice = Some(String::from(
+                    "New one-use pairing link (expires in 10 minutes)",
+                ));
+            }
+            Err(error) => self.notice = Some(format!("Pairing failed: {error}")),
+        }
+    }
+
+    fn entry_is_private(
+        &self,
+        index: usize,
+        entry: &TranscriptEntry,
+        scope: &WebRemoteRedactionScope,
+    ) -> bool {
+        let mut cache = self.sensitivity.borrow_mut();
+        if cache.len() <= index {
+            cache.resize(index + 1, None);
+        }
+        let revision = scope.revision();
+        if let Some((entry_revision, scope_revision, sensitive)) = cache[index]
+            && entry_revision == entry.revision
+            && scope_revision == revision
+        {
+            return entry.local_only || sensitive;
+        }
+        // Tool preview and invocation helpers mark every shortened source
+        // with an ellipsis. Its discarded suffix cannot be screened here;
+        // keep that whole card local rather than exposing a secret prefix.
+        let truncated_tool = entry.card.is_some()
+            && (entry.text.contains('…')
+                || entry
+                    .detail
+                    .as_deref()
+                    .is_some_and(|text| text.contains('…')));
+        let sensitive = truncated_tool
+            || scope.is_sensitive(&entry.text)
+            || entry
+                .detail
+                .as_deref()
+                .is_some_and(|text| scope.is_sensitive(text));
+        cache[index] = Some((entry.revision, revision, sensitive));
+        entry.local_only || sensitive
+    }
+}
+
+/// Read the one native render pass, resolving pooled graphemes before the
+/// frame is recycled. Wide-cell continuations contribute no extra character.
+fn web_frame_text(frame: &Frame, hidden_rows: &[std::ops::Range<u16>]) -> String {
+    let mut text = String::new();
+    for y in 0..frame.height() {
+        if y > 0 {
+            text.push('\n');
+        }
+        if hidden_rows.iter().any(|rows| rows.contains(&y)) {
+            text.extend(
+                "[local interaction]"
+                    .chars()
+                    .take(usize::from(frame.width())),
+            );
+            continue;
+        }
+        for x in 0..frame.width() {
+            let Some(cell) = frame.buffer.get(x, y) else {
+                text.push(' ');
+                continue;
+            };
+            if cell.content.is_continuation() {
+                continue;
+            }
+            if let Some(grapheme) = cell.content.grapheme_id().and_then(|id| frame.pool.get(id)) {
+                text.push_str(grapheme);
+            } else {
+                text.push(cell.content.as_char().unwrap_or(' '));
+            }
+        }
+    }
+    text
+}
 
 /// Spinner animation cadence while the agent works.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
@@ -1389,6 +1548,9 @@ struct TranscriptEntry {
     /// cached block is reusable iff its recorded revision still matches —
     /// uniqueness makes index shifts from entry removal self-invalidating.
     revision: u64,
+    /// Auth instructions and local response cards never become browser text,
+    /// even after the dialog closes or only part of its wrapped block is visible.
+    local_only: bool,
     /// Set for tool-execution cards; `None` renders as a plain role block.
     /// Pairing key: the opaque tool_id that ties ToolStart/ToolEnd/
     /// ToolInvocation events to this card (stable even when the head text
@@ -1764,6 +1926,12 @@ impl Eq for BashRequest {}
 pub enum UiCommand {
     /// Run an agent turn with this prompt.
     Prompt(String),
+    /// A browser prompt is checked again when the driver admits its turn.
+    RemotePrompt {
+        client_id: String,
+        epoch: u64,
+        prompt: String,
+    },
     /// A plain-text browser proposal explicitly accepted on this terminal.
     BrowserPrompt(browser::PromptRequest),
     /// Explicitly resend recovered goal input with its captured native blocks.
@@ -2299,6 +2467,8 @@ pub struct PiFtuiModel {
     /// the bridge each cycle, and the one instance the runtime actually starts
     /// takes the receiver out of this slot (see [`AgentEventSubscription`]).
     agent_rx: Arc<Mutex<Option<Receiver<PiMsg>>>>,
+    /// Optional browser mirror; local-only admin UI is never broadcast.
+    web_remote: Option<WebRemoteUi>,
     /// Whether the program owns the alternate screen (fullscreen launch).
     /// The suspend path mirrors only the features actually enabled.
     alt_screen: bool,
@@ -2365,7 +2535,7 @@ pub struct PiFtuiModel {
     render_cache: std::cell::RefCell<Vec<Option<CachedBlock>>>,
     /// Body width the blocks in `render_cache` were rendered for. A frame at
     /// a different width drops the cache before reusing anything; see
-    /// [`PiFtuiModel::conversation_text`].
+    /// [`PiFtuiModel::conversation_text_scoped`].
     render_cache_width: std::cell::Cell<u16>,
     /// `(rendered, reused)` block counts from the most recent
     /// `conversation_text()` pass — the observable that keeps the cache
@@ -2698,6 +2868,7 @@ impl PiFtuiModel {
             scroll_from_tail: 0,
             rendered_total_lines: std::cell::Cell::new(0),
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
+            web_remote: None,
 
             alt_screen: false,
             mouse: true,
@@ -2838,6 +3009,16 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
+        self
+    }
+
+    fn with_web_remote(
+        mut self,
+        bridge: WebRemoteBridge,
+        pairing_url: String,
+        privacy_ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.web_remote = Some(WebRemoteUi::new(bridge, pairing_url, privacy_ready));
         self
     }
 
@@ -3116,7 +3297,7 @@ impl PiFtuiModel {
         // Enter, and hard-line counts miss soft wraps. Ask the actual widget
         // so its layout, viewport, and cursor use the same visual rows.
         u16::try_from(
-            self.input
+            self.displayed_editor()
                 .visual_line_count_up_to(width, usize::from(MAX_INPUT_ROWS)),
         )
         .unwrap_or(MAX_INPUT_ROWS)
@@ -3326,10 +3507,17 @@ impl PiFtuiModel {
 
     fn push_entry(&mut self, role: EntryRole, text: String) {
         let revision = self.next_revision();
+        let local_only = role == EntryRole::Ask
+            || self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || self.login_pending.is_some()
+            || self.login_draft.is_some()
+            || self.mcp_auth_request.is_some();
         self.transcript.push(TranscriptEntry {
             role,
             text,
             revision,
+            local_only,
             card: None,
             pair_key: None,
             progress: None,
@@ -3550,6 +3738,7 @@ impl PiFtuiModel {
             role: EntryRole::System,
             text: display.to_string(),
             revision,
+            local_only: sanitized_name == "ask",
             card: Some(CardState::Pending),
             pair_key: Some(pair_id.to_string()),
             progress: None,
@@ -5029,6 +5218,9 @@ impl PiFtuiModel {
                 }
                 // Never echoed: the line may be an API key or an OAuth code.
                 let secret = trimmed.to_string();
+                if let Some(web) = &self.web_remote {
+                    web.bridge.remember_secrets(vec![secret.clone()]);
+                }
                 self.input.set_text("");
                 self.autocomplete.close();
                 self.error_banner = None;
@@ -7430,6 +7622,10 @@ impl PiFtuiModel {
             && !self.custom_overlay_open()
             && !self.settings_pending
             && !self.suspending
+            && self
+                .web_remote
+                .as_ref()
+                .is_none_or(|web| !web.panel_open && !web.has_live_draft())
     }
 
     /// Fail closed every modal owned by the completed/replaced turn. Replies
@@ -7520,6 +7716,13 @@ impl PiFtuiModel {
             }
         }
         for message in messages {
+            // ConversationMessage keeps tool provenance in its role and in
+            // this host-generated prefix. Preserve ask privacy when a saved
+            // session is resumed, forked or replayed after compaction.
+            let local_only = message.role == crate::interactive::MessageRole::Tool
+                && ["Tool result (ask):", "Tool error (ask):"]
+                    .iter()
+                    .any(|prefix| message.content.starts_with(*prefix));
             let role = match message.role {
                 crate::interactive::MessageRole::User => EntryRole::User,
                 crate::interactive::MessageRole::Assistant => EntryRole::Assistant,
@@ -7531,9 +7734,15 @@ impl PiFtuiModel {
                 && !thinking.is_empty()
             {
                 self.push_entry(EntryRole::Thinking, sanitize(thinking).into_owned());
+                if local_only && let Some(entry) = self.transcript.last_mut() {
+                    entry.local_only = true;
+                }
             }
             let text = sanitize(&message.content).into_owned();
             self.push_entry(role, text);
+            if local_only && let Some(entry) = self.transcript.last_mut() {
+                entry.local_only = true;
+            }
         }
         if let Some(status) = status {
             let text = sanitize(&status).into_owned();
@@ -7644,7 +7853,20 @@ impl PiFtuiModel {
     /// raw text, so `conversation_line_count()` is an approximation for
     /// scroll clamping in `update()`; the view recomputes offsets against the
     /// rendered total.
+    #[cfg(test)]
     fn conversation_text(&self, width: u16) -> Text<'static> {
+        let scope = self
+            .web_remote
+            .as_ref()
+            .map(|web| web.bridge.redaction_scope());
+        self.conversation_text_scoped(width, scope.as_ref())
+    }
+
+    fn conversation_text_scoped(
+        &self,
+        width: u16,
+        scope: Option<&WebRemoteRedactionScope>,
+    ) -> Text<'static> {
         // Assistant output always renders as markdown, matching the glamour
         // treatment in the bubbletea stack (auto-detection would leave short
         // or mostly-plain replies unstyled). Tables are fitted to the body
@@ -7676,7 +7898,18 @@ impl PiFtuiModel {
         let mut reused_blocks = 0_usize;
         let mut lines: Vec<ftui::text::Line<'static>> =
             Vec::with_capacity(self.conversation_line_count());
+        if let Some(web) = &self.web_remote {
+            web.private_lines.borrow_mut().clear();
+            web.sensitivity.borrow_mut().truncate(self.transcript.len());
+        }
         for (idx, entry) in self.transcript.iter().enumerate() {
+            let first_line = lines.len();
+            let local_only = entry.local_only
+                || self
+                    .web_remote
+                    .as_ref()
+                    .zip(scope)
+                    .is_some_and(|(web, scope)| web.entry_is_private(idx, entry, scope));
             if entry.card == Some(CardState::Pending) {
                 // Pending cards animate with the shared spinner frame, so
                 // their lines are frame-dependent: always render fresh and
@@ -7697,6 +7930,7 @@ impl PiFtuiModel {
                 );
                 wrap_body_block(&mut block_lines, wrap_width, &theme);
                 lines.extend(block_lines);
+                self.record_web_private_lines(local_only, first_line..lines.len());
                 continue;
             }
             if let Some(block) = cache[idx].as_ref()
@@ -7704,6 +7938,7 @@ impl PiFtuiModel {
             {
                 reused_blocks += 1;
                 lines.extend(block.lines.iter().cloned());
+                self.record_web_private_lines(local_only, first_line..lines.len());
                 continue;
             }
             rendered_blocks += 1;
@@ -7734,6 +7969,7 @@ impl PiFtuiModel {
             // cached line count has to be the visual one the scroll math uses.
             wrap_body_block(&mut block_lines, wrap_width, &theme);
             lines.extend(block_lines.iter().cloned());
+            self.record_web_private_lines(local_only, first_line..lines.len());
             cache[idx] = Some(CachedBlock {
                 revision: entry.revision,
                 lines: block_lines,
@@ -7745,6 +7981,7 @@ impl PiFtuiModel {
         // stay invisible until the turn's text or a tool card flushed it.
         let thinking = self.thinking.trim();
         if !thinking.is_empty() {
+            let first_line = lines.len();
             let text = if self.show_thinking {
                 thinking.to_string()
             } else {
@@ -7754,8 +7991,13 @@ impl PiFtuiModel {
             push_role_block(&mut block, EntryRole::Thinking, &text, &palette, &md);
             wrap_body_block(&mut block, wrap_width, &theme);
             lines.extend(block);
+            // A partially streamed credential cannot be identified by a
+            // complete literal matcher. Publish text after the native entry
+            // commits, when its full source can be classified before clipping.
+            self.record_web_private_lines(true, first_line..lines.len());
         }
         if !self.streaming.is_empty() {
+            let first_line = lines.len();
             // Streaming fragments may end mid-construct; the streaming
             // renderer is tolerant of unterminated markdown. The in-flight
             // tail is deliberately uncached — it changes every delta.
@@ -7767,6 +8009,7 @@ impl PiFtuiModel {
             };
             wrap_body_block(&mut tail, wrap_width, &theme);
             lines.extend(tail);
+            self.record_web_private_lines(true, first_line..lines.len());
         }
         Text::from_lines(lines)
     }
@@ -7779,6 +8022,429 @@ impl Drop for PiFtuiModel {
         // model message. The independent handoff lane belongs to this model;
         // close the driver control lane before its channels disappear too.
         self.abort_before_quit();
+    }
+}
+
+fn remote_prompt_is_plain(prompt: &str) -> bool {
+    let clean = prompt.trim();
+    !clean.is_empty()
+        && prompt.len() <= REMOTE_DRAFT_LIMIT
+        && !clean.starts_with(['/', '!'])
+        && !prompt
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+}
+
+/// Remote keys bypass the application/extension keybinding catalog entirely.
+/// Only native text-editor actions are representable on this path.
+fn remote_editor_event(key: &str, ctrl: bool, alt: bool, shift: bool) -> Option<Event> {
+    if ctrl || (alt && key != "Enter") {
+        return None;
+    }
+    let code = match key {
+        "Enter" if alt || shift => KeyCode::Enter,
+        "Backspace" => KeyCode::Backspace,
+        "Delete" => KeyCode::Delete,
+        "ArrowLeft" => KeyCode::Left,
+        "ArrowRight" => KeyCode::Right,
+        "ArrowUp" => KeyCode::Up,
+        "ArrowDown" => KeyCode::Down,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        _ => {
+            let mut chars = key.chars();
+            let ch = chars.next()?;
+            if ch.is_control() || chars.next().is_some() {
+                return None;
+            }
+            KeyCode::Char(ch)
+        }
+    };
+    Some(Event::Key(ftui::KeyEvent {
+        code,
+        modifiers: if shift {
+            Modifiers::SHIFT
+        } else {
+            Modifiers::empty()
+        },
+        kind: ftui::KeyEventKind::Press,
+    }))
+}
+
+impl PiFtuiModel {
+    fn record_web_private_lines(&self, local_only: bool, lines: std::ops::Range<usize>) {
+        if local_only && let Some(web) = &self.web_remote {
+            web.private_lines.borrow_mut().push(lines);
+        }
+    }
+
+    fn hide_web_region(&self, region: Rect) {
+        if region.height > 0
+            && let Some(web) = &self.web_remote
+        {
+            web.hidden_rows
+                .borrow_mut()
+                .push(region.y..region.y.saturating_add(region.height));
+        }
+    }
+
+    /// A browser never becomes an input source for local policy, extension,
+    /// credential, workspace or application dialogs, regardless of its lease.
+    fn web_sensitive_surface(&self) -> bool {
+        self.active_ask.is_some()
+            || self.active_ext.is_some()
+            || !self.ext_queue.is_empty()
+            || self.login_pending.is_some()
+            || self.login_draft.is_some()
+            || self.mcp_auth_request.is_some()
+            || self.picker.is_some()
+            || self.settings_pending
+            || self.custom_overlay_open()
+            || self.suspending
+            || (self.browser.is_some()
+                && (self.browser_panel_open() || self.browser_request_active()))
+    }
+
+    fn web_editor_available(&self) -> bool {
+        let Some(web) = &self.web_remote else {
+            return false;
+        };
+        self.state == AgentUiState::Ready
+            && self.busy.is_none()
+            && self.turn_control.as_ref().is_none_or(|slot| {
+                let state = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.current.is_none() && state.goal.is_none() && !state.closed
+            })
+            && !self.web_sensitive_surface()
+            && !web.panel_open
+            && web.privacy_ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn displayed_editor(&self) -> &TextArea {
+        if self.web_editor_available()
+            && let Some(web) = &self.web_remote
+            && web.has_live_draft()
+        {
+            &web.draft
+        } else {
+            &self.input
+        }
+    }
+
+    /// The existing local /web command serves the selected browser mode.
+    /// Remote prompts cannot enter this route or alter their own authority.
+    fn submit_terminal_web_command(&mut self, action: &str) -> bool {
+        let Some(web) = &mut self.web_remote else {
+            return false;
+        };
+        if web
+            .bridge
+            .manager()
+            .clients()
+            .iter()
+            .any(|client| client.is_controller)
+        {
+            web.bridge.manager().revoke_control();
+            web.clear_draft();
+        }
+        web.panel_open = true;
+        *web.displayed_request.borrow_mut() = None;
+        match action {
+            "" | "inbox" => {}
+            "pair" => web.rotate_pairing(crate::web_remote::TokenKind::Steer),
+            "revoke" => {
+                // Unlike R's control-only release, /web revoke closes all
+                // browser access, matching the supervised companion command.
+                for token in web.bridge.manager().tokens_for_redaction() {
+                    web.bridge.manager().revoke_token(&token);
+                }
+                for client in web.bridge.manager().clients() {
+                    web.bridge.manager().disconnect_client(&client.client_id);
+                }
+                web.bridge.manager().revoke_control();
+                web.clear_draft();
+                web.notice = Some(String::from(
+                    "Browser clients and links revoked. The old link is inactive; P or V creates a new one.",
+                ));
+            }
+            _ => web.notice = Some(String::from("Usage: /web [pair|inbox|revoke]")),
+        }
+        web.bridge.request_refresh();
+        true
+    }
+
+    /// Only terminal events may reach this administrator panel. It is painted
+    /// after snapshot capture, so its pairing URL cannot enter a web frame.
+    #[allow(clippy::too_many_lines)]
+    fn handle_local_web_input(&mut self, event: &Event) -> bool {
+        let Some(web) = &mut self.web_remote else {
+            return false;
+        };
+        if let Event::Key(key) = event {
+            if !key_event_is_input(key) {
+                return web.panel_open;
+            }
+            if key.code == KeyCode::F(8) && key.modifiers.is_empty() {
+                if !web.panel_open
+                    && web
+                        .bridge
+                        .manager()
+                        .clients()
+                        .iter()
+                        .any(|client| client.is_controller)
+                {
+                    web.bridge.manager().revoke_control();
+                    web.clear_draft();
+                    web.bridge.request_refresh();
+                }
+                web.panel_open = !web.panel_open;
+                return true;
+            }
+            if web.panel_open {
+                if key.modifiers.is_empty() || key.modifiers == Modifiers::SHIFT {
+                    match key.code {
+                        KeyCode::Escape => web.panel_open = false,
+                        KeyCode::Char('y' | 'Y') => {
+                            let displayed = web.displayed_request.borrow().clone();
+                            if let Some(client) = displayed {
+                                match web.bridge.manager().approve_takeover(&client) {
+                                    Ok(_) => {
+                                        web.clear_draft();
+                                        web.notice = Some(String::from("Browser control approved"));
+                                        web.panel_open = false;
+                                    }
+                                    Err(error) => web.notice = Some(sanitize(&error).into_owned()),
+                                }
+                            }
+                        }
+                        KeyCode::Char('n' | 'N') => {
+                            let displayed = web.displayed_request.borrow().clone();
+                            if let Some(client) = displayed {
+                                web.bridge.manager().deny_takeover(&client);
+                                web.notice = Some(String::from("Browser control denied"));
+                            }
+                        }
+                        KeyCode::Char('r' | 'R') => {
+                            web.bridge.manager().revoke_control();
+                            web.clear_draft();
+                            web.notice =
+                                Some(String::from("Control returned to the local terminal"));
+                        }
+                        KeyCode::Char('p' | 'P' | 'v' | 'V') => {
+                            let kind = if matches!(key.code, KeyCode::Char('v' | 'V')) {
+                                crate::web_remote::TokenKind::View
+                            } else {
+                                crate::web_remote::TokenKind::Steer
+                            };
+                            web.rotate_pairing(kind);
+                        }
+                        _ => {}
+                    }
+                }
+                web.bridge.request_refresh();
+                return true;
+            }
+        }
+        if web.panel_open && matches!(event, Event::Paste(_) | Event::Mouse(_)) {
+            return true;
+        }
+        if matches!(event, Event::Key(_) | Event::Paste(_) | Event::Mouse(_)) {
+            // Any host input wins. Epoch invalidation also fences events
+            // already queued by the socket or the agent driver.
+            if web.draft_owner.is_some()
+                || !web.bridge.manager().pending_takeovers().is_empty()
+                || web
+                    .bridge
+                    .manager()
+                    .clients()
+                    .iter()
+                    .any(|client| client.is_controller)
+            {
+                web.bridge.manager().revoke_control();
+                web.bridge.request_refresh();
+                web.clear_draft();
+                web.notice = None;
+            }
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_web_event(&mut self, event: WebRemoteEvent) -> Cmd<PiFtuiMsg> {
+        let Some(web) = &mut self.web_remote else {
+            return Cmd::none();
+        };
+        if web.draft_owner.is_some() && !web.has_live_draft() {
+            web.clear_draft();
+        }
+        let WebRemoteEvent::Input {
+            client_id,
+            epoch,
+            input,
+        } = event
+        else {
+            // Requests stay pending until a host key explicitly approves;
+            // they do not steal focus from a local approval or credential.
+            return Cmd::none();
+        };
+        if !web.bridge.manager().input_authorized(&client_id, epoch)
+            || web.panel_open
+            || !web.privacy_ready.load(std::sync::atomic::Ordering::Acquire)
+            || self.web_sensitive_surface()
+        {
+            return Cmd::none();
+        }
+        if matches!(input, WebRemoteInput::Abort) {
+            // Abort is scoped to the running turn. Do not invoke the local
+            // Ctrl-C/quit path, which permanently seals the driver lane.
+            if let Some(slot) = &self.turn_control
+                && let Some(control) = &slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .current
+            {
+                control.abort();
+            }
+            return Cmd::none();
+        }
+        if !self.web_editor_available() {
+            return Cmd::none();
+        }
+        self.autocomplete.close();
+        let web = self.web_remote.as_mut().expect("web event has a bridge");
+        if web.draft_owner.as_ref() != Some(&(client_id.clone(), epoch)) {
+            web.clear_draft();
+            web.draft_owner = Some((client_id.clone(), epoch));
+        }
+        web.notice = None;
+        match input {
+            WebRemoteInput::Paste { text } => {
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if web.draft.text().len().saturating_add(text.len()) <= REMOTE_DRAFT_LIMIT {
+                    web.draft.insert_text(&text);
+                } else {
+                    web.notice = Some(String::from("Browser draft limit is 16 KiB"));
+                }
+            }
+            WebRemoteInput::Key {
+                key,
+                ctrl,
+                alt,
+                shift,
+            } => {
+                if key == "Enter" && !ctrl && !alt && !shift {
+                    let prompt = web.draft.text();
+                    if !remote_prompt_is_plain(&prompt) {
+                        web.notice = Some(String::from(
+                            "Browser input accepts plain prompts; commands require the local terminal",
+                        ));
+                        return Cmd::none();
+                    }
+                    if self.try_send_command(UiCommand::RemotePrompt {
+                        client_id,
+                        epoch,
+                        prompt,
+                    }) {
+                        let web = self.web_remote.as_mut().expect("web prompt has a bridge");
+                        web.draft.set_text("");
+                        self.begin_busy("Sending browser prompt ...");
+                        return self.take_busy_tick();
+                    }
+                    self.web_remote
+                        .as_mut()
+                        .expect("web prompt has a bridge")
+                        .notice = Some(String::from("The agent driver is unavailable"));
+                } else if key == "Escape" && !ctrl && !alt && !shift {
+                    web.draft.set_text("");
+                } else if let Some(event) = remote_editor_event(&key, ctrl, alt, shift) {
+                    // Typing can grow a draft by at most one scalar/newline.
+                    if web.draft.text().len().saturating_add(key.len()) <= REMOTE_DRAFT_LIMIT
+                        || !matches!(&event, Event::Key(key) if matches!(key.code, KeyCode::Char(_) | KeyCode::Enter))
+                    {
+                        web.draft.handle_event(&event);
+                    }
+                }
+            }
+            WebRemoteInput::Abort => {}
+        }
+        Cmd::none()
+    }
+
+    fn publish_web_frame(&self, frame: &Frame, scope: Option<&WebRemoteRedactionScope>) {
+        let Some((web, scope)) = self.web_remote.as_ref().zip(scope) else {
+            return;
+        };
+        let data = if self.web_sensitive_surface()
+            || !web.privacy_ready.load(std::sync::atomic::Ordering::Acquire)
+        {
+            String::from(
+                "The local terminal is handling a private dialog or session change.\nBrowser input is paused.",
+            )
+        } else {
+            web_frame_text(frame, &web.hidden_rows.borrow())
+        };
+        if !web
+            .bridge
+            .publish_text_with_scope(scope, frame.width(), frame.height(), data)
+            && !web.bridge.is_closed()
+            && web.bridge.redaction_scope().revision() != scope.revision()
+        {
+            // A vault update raced this render. Repaint even if the agent has
+            // become idle, rather than waiting for another terminal event.
+            web.bridge.request_refresh();
+        }
+    }
+
+    fn render_local_web_panel(&self, frame: &mut Frame) {
+        let Some(web) = self.web_remote.as_ref().filter(|web| web.panel_open) else {
+            return;
+        };
+        let pending = web.bridge.manager().pending_takeovers();
+        let reviewable = pending.first().filter(|client| {
+            frame.width() >= 40
+                && frame.height() >= 6
+                && display_width(client) <= usize::from(frame.width())
+        });
+        *web.displayed_request.borrow_mut() = reviewable.cloned();
+        let controller = web
+            .bridge
+            .manager()
+            .clients()
+            .into_iter()
+            .find(|client| client.is_controller)
+            .map_or_else(|| String::from("local terminal"), |client| client.client_id);
+        let mut text = String::from("Browser access · local administration\n\n");
+        if let Some(client) = pending.first() {
+            if reviewable.is_some() {
+                let _ = write!(
+                    text,
+                    "Control requested:\n{client}\nY approves · N denies\n"
+                );
+            } else {
+                text.push_str("Resize the terminal to review the control request.\nApproval is disabled until the identity and decision fit.\n");
+            }
+        } else {
+            text.push_str("No pending control requests.\n");
+        }
+        let _ = write!(
+            text,
+            "\nController: {controller}\n\nPair using this one-use link:\n{}\n",
+            web.pairing_url,
+        );
+        if let Some(notice) = &web.notice {
+            let _ = write!(text, "\n{notice}\n");
+        }
+        text.push_str("\nP creates another pairing link · V creates a view-only link\nR revokes browser control · F8 or Esc closes\nHost keyboard or mouse input always retakes control.\nTool approvals and credential dialogs remain local.");
+        let area = Rect::new(0, 0, frame.width(), frame.height());
+        frame.buffer.fill(area, ftui::render::cell::Cell::default());
+        frame.cursor_position = None;
+        Paragraph::new(Text::raw(sanitize(&text).into_owned()))
+            .wrap(WrapMode::Word)
+            .render(area, frame);
     }
 }
 
@@ -7807,6 +8473,7 @@ impl Model for PiFtuiModel {
         }
         let phase = match &msg {
             PiFtuiMsg::Term(_)
+            | PiFtuiMsg::Remote(_)
             | PiFtuiMsg::Edited { .. }
             | PiFtuiMsg::TerminalFailed(_)
             | PiFtuiMsg::PastedImage { .. } => LoopPhase::Input,
@@ -7829,7 +8496,14 @@ impl Model for PiFtuiModel {
                 if request.method == "set_editor_text"
         );
         let mut cmd = match msg {
-            PiFtuiMsg::Term(event) => self.handle_term(&event),
+            PiFtuiMsg::Term(event) => {
+                if self.handle_local_web_input(&event) {
+                    Cmd::none()
+                } else {
+                    self.handle_term(&event)
+                }
+            }
+            PiFtuiMsg::Remote(event) => self.handle_web_event(event),
             PiFtuiMsg::Edited {
                 text,
                 width,
@@ -7921,7 +8595,13 @@ impl Model for PiFtuiModel {
     fn view(&self, frame: &mut Frame) {
         let probe = self.watchdog.start();
         if !self.render_browser(frame) {
-            self.render_frame(frame);
+            let scope = self
+                .web_remote
+                .as_ref()
+                .map(|web| web.bridge.redaction_scope());
+            self.render_frame(frame, scope.as_ref());
+            self.publish_web_frame(frame, scope.as_ref());
+            self.render_local_web_panel(frame);
         }
         self.rendered_frame_height.set(frame.height());
         // A frame may skip the editor or display its retained draft behind
@@ -7943,6 +8623,9 @@ impl Model for PiFtuiModel {
             subscriptions.push(Box::new(goal_control::EventSubscription(Arc::clone(
                 receiver,
             ))));
+        }
+        if let Some(web) = &self.web_remote {
+            subscriptions.push(Box::new(WebRemoteSubscription(web.bridge.clone())));
         }
         if let Some(browser) = self.browser_subscription() {
             subscriptions.push(browser);
@@ -8110,7 +8793,10 @@ impl PiFtuiModel {
     /// The real render pass. Split out of [`Model::view`] so the watchdog can
     /// time it without an extra guard type.
     #[allow(clippy::too_many_lines)]
-    fn render_frame(&self, frame: &mut Frame) {
+    fn render_frame(&self, frame: &mut Frame, scope: Option<&WebRemoteRedactionScope>) {
+        if let Some(web) = &self.web_remote {
+            web.hidden_rows.borrow_mut().clear();
+        }
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
             area,
@@ -8156,7 +8842,7 @@ impl PiFtuiModel {
             // Conversation body with tail-follow scroll. `scroll_from_tail
             // == 0` sticks to the bottom; scrolling up pins an offset
             // measured from the tail so streaming appends don't yank the view.
-            let body_text = self.conversation_text(regions.body.width);
+            let body_text = self.conversation_text_scoped(regions.body.width, scope);
             let total_lines = body_text.lines().len();
             let visible = usize::from(regions.body.height).max(1);
             // Record the authoritative total for update()'s scroll clamping
@@ -8166,6 +8852,21 @@ impl PiFtuiModel {
                 .scroll_from_tail
                 .min(total_lines.saturating_sub(visible));
             let offset = total_lines.saturating_sub(visible + from_tail);
+            if let Some(web) = &self.web_remote {
+                let mut hidden = web.hidden_rows.borrow_mut();
+                for private in web.private_lines.borrow().iter() {
+                    let start = private.start.max(offset);
+                    let end = private.end.min(offset.saturating_add(visible));
+                    if start < end {
+                        let start = u16::try_from(start - offset).unwrap_or(u16::MAX);
+                        let end = u16::try_from(end - offset).unwrap_or(u16::MAX);
+                        hidden.push(
+                            regions.body.y.saturating_add(start)
+                                ..regions.body.y.saturating_add(end),
+                        );
+                    }
+                }
+            }
             // Hand the widget just the rows that fit rather than the whole
             // transcript plus a scroll offset: `Paragraph::scroll` takes a
             // u16, and past 65535 rows it saturates and draws from the wrong
@@ -8182,6 +8883,9 @@ impl PiFtuiModel {
         // Pinned error banner (bd-cv653.9.2): sits between the conversation
         // and the status line until the next sent input dismisses it.
         if let Some(banner) = &self.error_banner {
+            if scope.is_some_and(|scope| scope.is_sensitive(banner)) {
+                self.hide_web_region(regions.banner);
+            }
             let banner_style = ftui::Style::new().bold().fg(self.palette.error);
             Paragraph::new(Text::from_lines([ftui::text::Line::styled(
                 banner_row(banner, usize::from(regions.banner.width)),
@@ -8238,6 +8942,23 @@ impl PiFtuiModel {
                     usize::from(regions.status.width).saturating_sub(used),
                 )
             });
+        if scope.is_some_and(|scope| {
+            scope.is_sensitive(&status_line)
+                || self.status_snapshot.as_ref().is_some_and(|snapshot| {
+                    [
+                        snapshot.model.as_str(),
+                        snapshot.mode.as_str(),
+                        snapshot.cwd.as_str(),
+                        snapshot.session_name.as_str(),
+                        snapshot.thinking.as_deref().unwrap_or(""),
+                        snapshot.vcs.as_deref().unwrap_or(""),
+                    ]
+                    .iter()
+                    .any(|text| scope.is_sensitive(text))
+                })
+        }) {
+            self.hide_web_region(regions.status);
+        }
         if !status_line.is_empty() || !powerline.is_empty() {
             let status_style = if self.state == AgentUiState::Working || self.busy.is_some() {
                 ftui::Style::new().fg(self.palette.warning)
@@ -8263,18 +8984,38 @@ impl PiFtuiModel {
 
         // Extension widgets, between the status line and the editor.
         if regions.widgets.height > 0 {
+            if scope.is_some_and(|scope| {
+                self.ext_widgets.values().any(|lines| {
+                    lines.iter().map(String::len).sum::<usize>()
+                        > crate::web_remote::bridge::MAX_FRAME_BYTES
+                        || scope.is_sensitive(&lines.join("\n"))
+                })
+            }) {
+                self.hide_web_region(regions.widgets);
+            }
             Paragraph::new(self.widget_text(regions.widgets.height)).render(regions.widgets, frame);
         }
 
         // Slash-command completion popup (issue #208), pinned to the editor.
         if regions.completion.height > 0 {
+            // These local suggestions have already shortened paths and
+            // descriptions; the browser uses its own plain composer.
+            self.hide_web_region(regions.completion);
             self.render_completion(regions.completion, frame);
         }
 
         // Input editor while idle or answering an ask card; processing note
         // while the agent works uninterruptibly.
         if self.input_active() {
-            self.input.render(regions.input, frame);
+            if self
+                .web_remote
+                .as_ref()
+                .is_some_and(|web| !self.web_editor_available() || !web.has_live_draft())
+                || scope.is_some_and(|scope| scope.is_sensitive(&self.displayed_editor().text()))
+            {
+                self.hide_web_region(regions.input);
+            }
+            self.displayed_editor().render(regions.input, frame);
         } else {
             Paragraph::new(Text::raw(
                 "… processing (esc to abort, ctrl+c twice to quit)",
@@ -8283,14 +9024,33 @@ impl PiFtuiModel {
         }
 
         // Footer: scroll indicator wins; otherwise last-turn usage stats.
-        let footer = if from_tail > 0 {
+        let mut footer = if from_tail > 0 {
             format!("[{from_tail} lines up] End to follow")
         } else if let Some(usage) = &self.usage_line {
             usage.clone()
         } else {
             String::from("pi")
         };
+        if let Some(web) = &self.web_remote {
+            if let Some(notice) = &web.notice {
+                footer = notice.clone();
+            } else if self.web_editor_available() && web.has_live_draft() {
+                footer = String::from("Browser composer · host input retakes control");
+            }
+            let pending = web.bridge.manager().pending_takeovers().len();
+            if pending > 0 {
+                let _ = write!(
+                    footer,
+                    " · {pending} control request(s): F8 to review locally"
+                );
+            } else {
+                footer.push_str(" · F8 browser access");
+            }
+        }
         let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
+        if scope.is_some_and(|scope| scope.is_sensitive(&footer)) {
+            self.hide_web_region(regions.footer);
+        }
         Paragraph::new(Text::from_lines([ftui::text::Line::styled(
             footer,
             footer_style,
@@ -8300,6 +9060,14 @@ impl PiFtuiModel {
 }
 
 // ── Launch path ─────────────────────────────────────────────────────────────
+
+fn update_web_privacy(bridge: &WebRemoteBridge, handle: &crate::sdk::AgentSessionHandle) {
+    let agent = &handle.session().agent;
+    bridge.set_privacy_state(agent.web_remote_privacy_state());
+    if let Some(key) = &agent.stream_options().api_key {
+        bridge.remember_secrets(vec![key.clone()]);
+    }
+}
 
 /// Cap a tool result's text content for the card detail (the card shows the
 /// first lines collapsed, all of these expanded), with an elision counter.
@@ -9337,8 +10105,34 @@ async fn run_controlled_turn(
 /// before publishing control, so live input and another maintenance barrier
 /// observe the same queue. The inherited abort remains authoritative across
 /// admission and the native turn, including a delayed UI cancellation clone.
-#[allow(clippy::option_if_let_else, clippy::too_many_lines)]
 async fn run_controlled_turn_with_pending(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    content: crate::model::UserContent,
+    initial_source: Option<String>,
+    pending: Vec<crate::session_control::PendingInput>,
+    inherited_abort: Option<crate::agent::AbortSignal>,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+) -> ControlledTurnResult {
+    run_controlled_turn_with_admission(
+        handle,
+        content,
+        initial_source,
+        pending,
+        inherited_abort,
+        agent_tx,
+        turn_control,
+        None,
+    )
+    .await
+}
+
+#[allow(
+    clippy::option_if_let_else,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn run_controlled_turn_with_admission(
     handle: &mut crate::sdk::AgentSessionHandle,
     content: crate::model::UserContent,
     initial_source: Option<String>,
@@ -9346,6 +10140,7 @@ async fn run_controlled_turn_with_pending(
     inherited_abort: Option<crate::agent::AbortSignal>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
+    remote_admission: Option<(&WebRemoteBridge, &str, u64)>,
 ) -> ControlledTurnResult {
     let origin = {
         let read = handle.with_session(|session| {
@@ -9380,6 +10175,18 @@ async fn run_controlled_turn_with_pending(
             read.await.ok()
         }
     };
+    if remote_admission.is_some_and(|(bridge, client_id, epoch)| {
+        !bridge.manager().input_authorized(client_id, epoch)
+    }) {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "Browser prompt was not sent: its control permission has ended",
+        )));
+        return ControlledTurnResult {
+            pending,
+            initial_restore: initial_source,
+            stopped: true,
+        };
+    }
     if let Some(source) = &initial_source {
         handle
             .session_mut()
@@ -9740,6 +10547,66 @@ async fn run_typed_prompt(
             let _ = agent_tx.send(PiMsg::AgentError(format!("Not sent: {err}")));
         }
     }
+}
+
+/// Browser control submits literal text. Local file references, templates
+/// and extension commands retain their host-only admission path.
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_prompt(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    bridge: &WebRemoteBridge,
+    client_id: &str,
+    epoch: u64,
+    prompt: String,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
+) {
+    if !remote_prompt_is_plain(&prompt) || !bridge.manager().input_authorized(client_id, epoch) {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "Browser prompt was not sent: its control permission has ended",
+        )));
+        return;
+    }
+    let abort = crate::agent::AbortHandle::new().0;
+    let _operation = queued_compaction::OperationAbort::publish(turn_abort, turn_control, &abort);
+    let signal = abort.signal();
+    // Session metadata can wait behind another operation. Keep local Escape
+    // and shutdown effective before the native turn has its control lane.
+    let published = {
+        let publish = publish_submitted_input(handle, agent_tx, prompt.clone(), String::new());
+        let cancelled = signal.wait();
+        futures::pin_mut!(publish, cancelled);
+        match futures::future::select(cancelled, publish).await {
+            futures::future::Either::Left(_) => {
+                let _ = agent_tx.send(PiMsg::AgentError(String::from("Browser prompt cancelled.")));
+                false
+            }
+            futures::future::Either::Right((published, _)) => published,
+        }
+    };
+    if !published {
+        return;
+    }
+    // A locally revoked lease must not survive the awaited session read.
+    if signal.is_aborted() || !bridge.manager().input_authorized(client_id, epoch) {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "Browser prompt was not sent: its control permission has ended",
+        )));
+        return;
+    }
+    let result = run_controlled_turn_with_admission(
+        handle,
+        crate::model::UserContent::Text(prompt),
+        None,
+        Vec::new(),
+        Some(signal.clone()),
+        agent_tx,
+        turn_control,
+        Some((bridge, client_id, epoch)),
+    )
+    .await;
+    finish_prompt_sequence(handle, result, agent_tx, turn_control, Some(signal)).await;
 }
 
 fn registered_prompt_command(
@@ -12518,8 +13385,10 @@ fn terminal_replacement_error(
 /// Config values this stack reads directly rather than through the SDK session
 /// options, grouped so `run` keeps a signature someone can read.
 pub struct FtuiSettings {
-    /// Supervised loopback browser access owned by this local TUI lifetime.
+    /// Browser access owned by this local TUI lifetime.
     pub web_remote: Option<crate::web_remote::WebRemoteSettings>,
+    /// Select the supervised proposal companion or the terminal mirror.
+    pub web_remote_mode: crate::web_remote::WebRemoteMode,
     /// Conversation spacing for the markdown renderer.
     pub markdown_spacing: crate::config::MarkdownSpacing,
     /// The `ghPath` setting, for `/share`. Empty or `None` means `gh` from
@@ -12658,6 +13527,7 @@ pub fn run(
     }
     let FtuiSettings {
         web_remote,
+        web_remote_mode,
         markdown_spacing,
         gh_path,
         disable_mouse_capture,
@@ -12676,6 +13546,26 @@ pub fn run(
         mut initial_content,
         initial_messages,
     } = settings;
+    let (companion_settings, terminal_settings) = match web_remote_mode {
+        crate::web_remote::WebRemoteMode::Companion => (web_remote, None),
+        crate::web_remote::WebRemoteMode::Terminal => (None, web_remote),
+    };
+    if terminal_settings.is_some() && inline {
+        return Err(std::io::Error::other(
+            "`pi web --terminal` requires fullscreen rendering; remove --inline",
+        ));
+    }
+    // The listener is live before a provider or extension driver can start.
+    // Its owner stays on this stack and shuts down on every exit path; the
+    // transport never retains a UiCommand sender that could keep the driver alive.
+    let web_server = terminal_settings
+        .map(crate::web_remote::server::WebRemoteServer::start)
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    let web_bridge = web_server.as_ref().map(|server| server.bridge());
+    let driver_web_bridge = web_bridge.clone();
+    let web_privacy_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let driver_web_privacy_ready = Arc::clone(&web_privacy_ready);
     let prewalk_requested = session_options.prewalk.is_some();
     let driver_btw_client = btw_client.clone();
     let mut cycle_models = if cycle_models.is_empty() {
@@ -12733,11 +13623,15 @@ pub fn run(
         )
     };
 
-    let view_only = web_remote.as_ref().is_some_and(|settings| settings.view_only);
-    let browser_server = web_remote
+    let view_only = companion_settings
+        .as_ref()
+        .is_some_and(|settings| settings.view_only);
+    let browser_server = companion_settings
         .map(crate::web_remote::CompanionServer::start)
         .transpose()?;
-    let driver_browser = browser_server.as_ref().map(crate::web_remote::CompanionServer::handle);
+    let driver_browser = browser_server
+        .as_ref()
+        .map(crate::web_remote::CompanionServer::handle);
     let (browser_ui, browser_tx) = if let Some(handle) = &driver_browser {
         let (ui, sender) = browser::CompanionUi::new(handle.clone(), view_only)?;
         (Some(ui), Some(sender))
@@ -12809,6 +13703,11 @@ pub fn run(
                     &driver_command_registry,
                 ))
                 .await?;
+                if let Some(bridge) = &driver_web_bridge {
+                    update_web_privacy(bridge, &handle);
+                    driver_web_privacy_ready.store(true, std::sync::atomic::Ordering::Release);
+                    bridge.request_refresh();
+                }
                 let mut settings_controller =
                     settings::SettingsController::new(settings_config, settings_path, &handle);
                 // Replacements must retain the exact live root set, including
@@ -12858,6 +13757,18 @@ pub fn run(
                 let mut browser_was_active = false;
                 loop {
                     let received = submit_rx.try_recv();
+                    if let Ok(UiCommand::RemotePrompt { client_id, epoch, prompt }) = &received
+                        && (login.is_some()
+                            || !remote_prompt_is_plain(prompt)
+                            || !driver_web_bridge.as_ref().is_some_and(|bridge| {
+                                bridge.manager().input_authorized(client_id, *epoch)
+                            }))
+                    {
+                        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+                            "Browser prompt was not sent: its control permission has ended",
+                        )));
+                        continue;
+                    }
                     let browser_active = driver_browser.is_some()
                         && (received.is_ok() || login.is_some() || {
                             let control = driver_turn_control
@@ -12871,6 +13782,25 @@ pub fn run(
                         browser.set_busy(browser_active);
                     }
                     if let Ok(command) = &received {
+                        if let Some(bridge) = &driver_web_bridge {
+                            // Rewind/new/reload may clear the current Agent's
+                            // vault in place. Capture it before any command
+                            // can change session ownership, not only afterwards.
+                            update_web_privacy(bridge, &handle);
+                        }
+                        if matches!(command,
+                            UiCommand::NewSession | UiCommand::DeleteSession
+                                | UiCommand::ResumeSession { .. } | UiCommand::Reload
+                                | UiCommand::Fork { .. } | UiCommand::ExtensionCommand { .. }
+                                | UiCommand::RegisteredExtensionCommand { .. }
+                                | UiCommand::ExtensionShortcut { .. }
+                                | UiCommand::Login { .. } | UiCommand::LoginSubmit(_)
+                                | UiCommand::McpAuth { .. }
+                        ) {
+                            // A replacement can queue its reset before returning
+                            // its new Agent. Withhold until its vault is attached.
+                            driver_web_privacy_ready.store(false, std::sync::atomic::Ordering::Release);
+                        }
                         if !matches!(command, UiCommand::Workspace {
                             command: workspace_commands::WorkspaceCommand::Goal, ..
                         }) {
@@ -12922,6 +13852,20 @@ pub fn run(
                                 &driver_turn_abort,
                             )
                             .await;
+                        }
+                        Ok(UiCommand::RemotePrompt { client_id, epoch, prompt }) => {
+                            if let Some(bridge) = &driver_web_bridge {
+                                run_remote_prompt(
+                                    &mut handle,
+                                    bridge,
+                                    &client_id,
+                                    epoch,
+                                    prompt,
+                                    &agent_tx,
+                                    &driver_turn_control,
+                                    &driver_turn_abort,
+                                ).await;
+                            }
                         }
                         Ok(UiCommand::RestoredGoalInput(request)) => {
                             Box::pin(goal_control::run_restored(
@@ -13547,12 +14491,24 @@ pub fn run(
                                     &agent_tx,
                                 ))
                                 .await;
+                                if let Some(bridge) = &driver_web_bridge {
+                                    update_web_privacy(bridge, &handle);
+                                }
                                 continue;
                             }
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
                                 .await;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                    if let Some(bridge) = &driver_web_bridge {
+                        if refresh_status {
+                            update_web_privacy(bridge, &handle);
+                        }
+                        let ready = login.is_none();
+                        if driver_web_privacy_ready.swap(ready, std::sync::atomic::Ordering::AcqRel) != ready {
+                            bridge.request_refresh();
+                        }
                     }
                     if let Some(title) = Box::pin(auto_title.tick(
                         handle.session(),
@@ -13672,6 +14628,13 @@ pub fn run(
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
         .with_ext_reply_channel(ext_reply_tx);
+    if let Some(server) = &web_server {
+        model = model.with_web_remote(
+            server.bridge(),
+            server.pairing_url().to_string(),
+            web_privacy_ready,
+        );
+    }
     // The runtime paints once before sending any Resize. Inline pointer
     // events need the physical size even when that first frame is shorter.
     if let Ok((width, height)) = crossterm::terminal::size() {
@@ -13716,6 +14679,7 @@ pub fn run(
         },
     );
     drop(log_guard);
+    drop(web_server);
     // Close the listener and revoke browser access before waiting for the
     // ordinary SDK persistence/resource shutdown to finish.
     drop(browser_server);
@@ -13785,7 +14749,7 @@ fn restart_argv(
         }
         if !saw_prompt && text == "web" {
             // A real subcommand position, not a root flag's consumed value.
-            // Root session flags must precede the companion's own arguments.
+            // Root session flags must precede either browser mode's arguments.
             web_tail.extend(args[i..].iter().cloned());
             break;
         }
@@ -13909,6 +14873,498 @@ mod tests {
     fn new_model() -> (mpsc::Sender<PiMsg>, PiFtuiModel) {
         let (tx, rx) = mpsc::channel();
         (tx, PiFtuiModel::new(rx))
+    }
+
+    fn web_test_model() -> (PiFtuiModel, WebRemoteBridge, mpsc::Receiver<UiCommand>) {
+        let bridge = WebRemoteBridge::new(crate::web_remote::WebRemoteSettings::default());
+        bridge
+            .manager()
+            .issue_token(
+                "native-web-fixture-token",
+                crate::web_remote::TokenKind::Steer,
+            )
+            .unwrap();
+        bridge
+            .manager()
+            .connect_client(
+                "browser",
+                "127.0.0.1:12345",
+                Some("native-web-fixture-token"),
+            )
+            .unwrap();
+        let (_agent_tx, model) = new_model();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let model = model.with_submit_channel(submit_tx).with_web_remote(
+            bridge.clone(),
+            String::from("http://127.0.0.1:8080/#token=private-pairing-link"),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        (model, bridge, submit_rx)
+    }
+
+    fn grant_web_control(model: &mut PiFtuiModel, bridge: &WebRemoteBridge) {
+        bridge.queue_takeover("browser").unwrap();
+        while let Some(event) = bridge.try_recv_event() {
+            let _ = model.update(PiFtuiMsg::Remote(event));
+        }
+        model.web_remote.as_mut().unwrap().panel_open = true;
+        let _ = frame_with_cursor(model, 100, 24);
+        let _ = model.update(PiFtuiMsg::Term(key(KeyCode::Char('y'), Modifiers::empty())));
+        assert!(bridge.manager().clients()[0].is_controller);
+    }
+
+    fn web_input(
+        model: &mut PiFtuiModel,
+        bridge: &WebRemoteBridge,
+        sequence: u64,
+        input: WebRemoteInput,
+    ) {
+        bridge.queue_input("browser", sequence, input).unwrap();
+        while let Some(event) = bridge.try_recv_event() {
+            let _ = model.update(PiFtuiMsg::Remote(event));
+        }
+    }
+
+    fn web_key(name: &str) -> WebRemoteInput {
+        WebRemoteInput::Key {
+            key: name.to_string(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn browser_pairing_and_takeover_require_the_visible_local_decision() {
+        let (mut model, bridge, _) = web_test_model();
+        model.push_entry(EntryRole::Assistant, String::from("Live agent output"));
+        let (local, _) = frame_with_cursor(&model, 100, 24);
+        assert!(local.contains("private-pairing-link"));
+        let remote = bridge.frame_after(0).unwrap();
+        assert!(remote.data.contains("Live agent output"));
+        assert!(!remote.data.contains("private-pairing-link"));
+        bridge.queue_takeover("browser").unwrap();
+        assert!(bridge.queue_input("browser", 1, web_key("y")).is_err());
+        assert!(!bridge.manager().clients()[0].is_controller);
+        let _ = frame_with_cursor(&model, 20, 3);
+        let _ = model.update(PiFtuiMsg::Term(key(KeyCode::Char('y'), Modifiers::empty())));
+        assert!(!bridge.manager().clients()[0].is_controller);
+        grant_web_control(&mut model, &bridge);
+
+        let epoch = bridge.manager().authorize_input("browser", 1).unwrap();
+        let _ = model.update(PiFtuiMsg::Term(key(KeyCode::F(8), Modifiers::empty())));
+        assert!(!bridge.manager().input_authorized("browser", epoch));
+        let _ = model.update(PiFtuiMsg::Term(key(KeyCode::Char('v'), Modifiers::empty())));
+        let new_url = model.web_remote.as_ref().unwrap().pairing_url.clone();
+        let token = new_url.split_once("#token=").unwrap().1;
+        let client = bridge
+            .manager()
+            .connect_client("viewer", "127.0.0.1:12346", Some(token))
+            .unwrap();
+        assert!(client.is_view_only);
+        let _ = frame_with_cursor(&model, 100, 24);
+        assert!(!bridge.frame_after(0).unwrap().data.contains(token));
+    }
+
+    #[test]
+    fn browser_composer_preserves_local_draft_and_drops_revoked_queued_input() {
+        let (mut model, bridge, commands) = web_test_model();
+        model.input.set_text("local draft");
+        model.input.move_to_document_end();
+        let _ = frame_with_cursor(&model, 80, 16);
+        assert!(!bridge.frame_after(0).unwrap().data.contains("local draft"));
+        grant_web_control(&mut model, &bridge);
+        web_input(
+            &mut model,
+            &bridge,
+            1,
+            WebRemoteInput::Paste {
+                text: String::from("remote question"),
+            },
+        );
+        assert_eq!(model.input.text(), "local draft");
+        assert_eq!(model.displayed_editor().text(), "remote question");
+        web_input(&mut model, &bridge, 2, web_key("Enter"));
+        let UiCommand::RemotePrompt {
+            client_id,
+            epoch,
+            prompt,
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("browser prompt lost its origin");
+        };
+        assert_eq!(prompt, "remote question");
+        assert!(bridge.manager().input_authorized(&client_id, epoch));
+        assert_eq!(model.input.text(), "local draft");
+        let _ = frame_with_cursor(&model, 80, 16);
+        assert!(!bridge.frame_after(0).unwrap().data.contains("local draft"));
+        model.busy = None;
+        bridge
+            .queue_input(
+                "browser",
+                3,
+                WebRemoteInput::Paste {
+                    text: String::from("stale edit"),
+                },
+            )
+            .unwrap();
+        let _ = model.update(PiFtuiMsg::Term(key(KeyCode::Char('!'), Modifiers::empty())));
+        while let Some(event) = bridge.try_recv_event() {
+            let _ = model.update(PiFtuiMsg::Remote(event));
+        }
+        assert!(!bridge.manager().input_authorized(&client_id, epoch));
+        assert_eq!(model.input.text(), "local draft!");
+        assert!(model.web_remote.as_ref().unwrap().draft.is_empty());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_browser_submits_file_references_as_literal_provider_input() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let private_file = directory.path().join("private.txt");
+            std::fs::write(&private_file, "HOST_FILE_MUST_NOT_ENTER_BROWSER_PROMPT").unwrap();
+            let text = format!("Describe @{}", private_file.display());
+            let provider = Arc::new(NativePromptProbe::default());
+            let mut handle = native_prompt_handle(Arc::clone(&provider));
+            let (mut model, bridge, commands) = web_test_model();
+            model.input.set_text("unfinished local draft");
+            grant_web_control(&mut model, &bridge);
+            web_input(
+                &mut model,
+                &bridge,
+                1,
+                WebRemoteInput::Paste { text: text.clone() },
+            );
+            web_input(&mut model, &bridge, 2, web_key("Enter"));
+            let UiCommand::RemotePrompt {
+                client_id,
+                epoch,
+                prompt,
+            } = commands.try_recv().unwrap()
+            else {
+                panic!("browser input must retain its controller provenance");
+            };
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let controls: TurnControlSlot = Arc::default();
+            let aborts: TurnAbortSlot = Arc::default();
+            run_remote_prompt(
+                &mut handle,
+                &bridge,
+                &client_id,
+                epoch,
+                prompt,
+                &agent_tx,
+                &controls,
+                &aborts,
+            )
+            .await;
+            let calls = provider.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(matches!(
+                &calls[0].content,
+                crate::model::UserContent::Text(actual) if actual == &text
+            ));
+            assert!(agent_rx.try_iter().any(|event| matches!(
+                event,
+                PiMsg::UserInputSubmitted { text: actual, history_text, .. }
+                    if actual == text && history_text.is_empty()
+            )));
+            assert_eq!(model.input.text(), "unfinished local draft");
+            assert!(aborts.lock().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn terminal_browser_rechecks_control_after_waiting_for_session_metadata() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for shutdown in [false, true] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = native_prompt_handle(Arc::clone(&provider));
+                let (mut model, bridge, _) = web_test_model();
+                grant_web_control(&mut model, &bridge);
+                let epoch = bridge.manager().authorize_input("browser", 1).unwrap();
+                let (agent_tx, _agent_rx) = mpsc::channel();
+                let controls: TurnControlSlot = Arc::default();
+                let aborts: TurnAbortSlot = Arc::default();
+                let store = handle.session_store();
+                let mut held = Some(store.try_lock().unwrap());
+                let mut operation = Box::pin(run_remote_prompt(
+                    &mut handle,
+                    &bridge,
+                    "browser",
+                    epoch,
+                    String::from("A browser turn awaiting session metadata"),
+                    &agent_tx,
+                    &controls,
+                    &aborts,
+                ));
+                assert!(futures::poll!(operation.as_mut()).is_pending());
+                if shutdown {
+                    abort_driver_work(Some(&aborts), Some(&controls));
+                } else {
+                    bridge.manager().revoke_control();
+                    drop(held.take());
+                }
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    operation,
+                )
+                .await
+                .expect("local revocation and shutdown must fence browser admission");
+                drop(held);
+                assert!(provider.calls.lock().unwrap().is_empty());
+                assert!(aborts.lock().unwrap().is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn browser_input_cannot_run_commands_or_answer_local_dialogs() {
+        let (mut model, bridge, commands) = web_test_model();
+        grant_web_control(&mut model, &bridge);
+        let mut sequence = 0;
+        for command in [
+            "/login openai",
+            "/settings",
+            "/new",
+            "!touch unauthorized",
+            "  !!echo hidden",
+        ] {
+            model.web_remote.as_mut().unwrap().draft.set_text("");
+            sequence += 1;
+            web_input(
+                &mut model,
+                &bridge,
+                sequence,
+                WebRemoteInput::Paste {
+                    text: command.to_string(),
+                },
+            );
+            sequence += 1;
+            web_input(&mut model, &bridge, sequence, web_key("Enter"));
+            assert!(commands.try_recv().is_err());
+        }
+        for key in ["g", "z", "c", "p", "t", "Enter"] {
+            sequence += 1;
+            web_input(
+                &mut model,
+                &bridge,
+                sequence,
+                WebRemoteInput::Key {
+                    key: key.to_string(),
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                },
+            );
+            assert!(commands.try_recv().is_err());
+        }
+        let (ask_tx, ask_rx) = mpsc::channel();
+        model.ask_reply_tx = Some(ask_tx);
+        model.active_ask = Some(ActiveAsk {
+            request: ask_request(
+                "local-approval",
+                vec![question("Allow file mutation?", &["Yes", "No"], false)],
+            ),
+            question_index: 0,
+            answers: Vec::new(),
+        });
+        model.input.set_text("local answer");
+        for input in [web_key("y"), web_key("Enter"), WebRemoteInput::Abort] {
+            sequence += 1;
+            web_input(&mut model, &bridge, sequence, input);
+        }
+        assert_eq!(model.input.text(), "local answer");
+        assert!(model.active_ask.is_some());
+        assert!(ask_rx.try_recv().is_err());
+        assert!(commands.try_recv().is_err());
+        model.active_ask = None;
+        model.start_login_input("openai".to_string(), false);
+        sequence += 1;
+        web_input(
+            &mut model,
+            &bridge,
+            sequence,
+            WebRemoteInput::Paste {
+                text: String::from("remote credential"),
+            },
+        );
+        sequence += 1;
+        web_input(&mut model, &bridge, sequence, web_key("Enter"));
+        assert!(model.input.is_empty());
+        assert!(model.login_pending.is_some());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn browser_frames_preserve_graphemes_and_hide_clipped_completed_auth_instructions() {
+        let mut pool = ftui::render::grapheme_pool::GraphemePool::new();
+        let mut frame = Frame::new(20, 1, &mut pool);
+        let text = "A界e\u{301}👩‍💻Z";
+        Paragraph::new(Text::raw(text)).render(Rect::new(0, 0, 20, 1), &mut frame);
+        assert_eq!(web_frame_text(&frame, &[]).trim_end(), text);
+
+        let (mut model, bridge, _) = web_test_model();
+        model.web_remote.as_mut().unwrap().panel_open = false;
+        model.start_login_input("openai".to_string(), false);
+        model.push_entry(
+            EntryRole::System,
+            String::from("Private OAuth code: UNSHARED-CODE-1234\nVisit the authorization page."),
+        );
+        model.finish_login_input(false);
+        model.push_entry(EntryRole::Assistant, String::from("Public agent response"));
+        for height in [8, 12, 20] {
+            for scroll in [0, 1, 3] {
+                model.scroll_from_tail = scroll;
+                let _ = frame_with_cursor(&model, 28, height);
+                let remote = bridge.frame_after(0).unwrap();
+                assert!(!remote.data.contains("UNSHARED"));
+                assert!(!remote.data.contains("CODE-1234"));
+                assert!(!remote.data.contains("authorization"));
+            }
+        }
+        for prefix in ["Tool result (ask):", "Tool error (ask):"] {
+            model.apply_conversation_reset(
+                vec![
+                    crate::interactive::ConversationMessage {
+                        role: crate::interactive::MessageRole::Tool,
+                        content: format!("{prefix} persisted-private-answer"),
+                        thinking: None,
+                        collapsed: false,
+                    },
+                    crate::interactive::ConversationMessage {
+                        role: crate::interactive::MessageRole::Tool,
+                        content: String::from("Tool result (read): public file output"),
+                        thinking: None,
+                        collapsed: false,
+                    },
+                ],
+                None,
+            );
+            let (local, _) = frame_with_cursor(&model, 80, 20);
+            assert!(local.contains("persisted-private-answer"));
+            let remote = bridge.frame_after(0).unwrap();
+            assert!(!remote.data.contains("persisted-private-answer"));
+            assert!(remote.data.contains("public file output"));
+        }
+        model
+            .web_remote
+            .as_ref()
+            .unwrap()
+            .privacy_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = frame_with_cursor(&model, 80, 20);
+        assert!(
+            bridge
+                .frame_after(0)
+                .unwrap()
+                .data
+                .contains("session change")
+        );
+    }
+
+    #[test]
+    fn browser_abort_cancels_the_turn_without_closing_the_native_runtime() {
+        let (mut model, bridge, _) = web_test_model();
+        grant_web_control(&mut model, &bridge);
+        let mut handle = dequeue_test_session();
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let controls = published_turn_control(control.clone());
+        model.turn_control = Some(Arc::clone(&controls));
+        model.state = AgentUiState::Working;
+        web_input(&mut model, &bridge, 1, WebRemoteInput::Abort);
+        assert!(!control.snapshot().accepting_input);
+        assert!(!controls.lock().unwrap().closed);
+        assert!(!model.pending_quit);
+        drop(turn);
+    }
+
+    #[test]
+    fn browser_checks_full_sources_before_clipping_and_withholds_incomplete_output() {
+        let (mut model, bridge, _) = web_test_model();
+        model.web_remote.as_mut().unwrap().panel_open = false;
+        let secret = "opaque-credential-ABC123-very-long-value-XYZ987";
+        model.push_entry(EntryRole::Assistant, secret.to_string());
+        let _ = frame_with_cursor(&model, 20, 6);
+        // The same unchanged transcript revision must be screened again
+        // when the session learns a new opaque credential.
+        bridge.remember_secrets(vec![secret.to_string()]);
+        let (local, _) = frame_with_cursor(&model, 20, 6);
+        assert!(local.contains("XYZ987"));
+        assert!(!bridge.frame_after(0).unwrap().data.contains("XYZ987"));
+
+        model.transcript.clear();
+        model.streaming = String::from("incomplete-assistant-credential-prefix");
+        model.thinking = String::from("incomplete-thinking-credential-prefix");
+        model.show_thinking = true;
+        let _ = frame_with_cursor(&model, 80, 16);
+        assert!(
+            !bridge
+                .frame_after(0)
+                .unwrap()
+                .data
+                .contains("credential-prefix")
+        );
+        model.streaming.clear();
+        model.thinking.clear();
+
+        let result = progress_text(&format!("{}OpaqueStoredCredential123456", "x".repeat(295)));
+        let preview = tool_output_preview(&result).unwrap();
+        assert!(!preview.contains("OpaqueStoredCredential123456"));
+        assert!(preview.contains("Opaqu…"));
+        model.push_tool_card("cutoff", "read", "read");
+        model.finish_tool_card("cutoff", "read", true, Some(preview), false);
+        model.tools_expanded = true;
+        let (local, _) = frame_with_cursor(&model, 80, 20);
+        assert!(local.contains("Opaqu"));
+        assert!(!bridge.frame_after(0).unwrap().data.contains("Opaqu"));
+    }
+
+    #[test]
+    fn browser_restart_preserves_listener_settings_and_reopens_the_session() {
+        use clap::Parser;
+
+        let args = restart_argv(
+            [
+                "--session",
+                "previous.jsonl",
+                "--model",
+                "provider/model",
+                "web",
+                "--terminal",
+                "--port",
+                "9090",
+                "--bind=loopback",
+                "--view-only",
+                "--max-viewers",
+                "2",
+            ]
+            .map(std::ffi::OsString::from),
+            Some(std::path::Path::new("saved.jsonl")),
+        );
+        let parsed = crate::cli::Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("pi")).chain(args.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(crate::cli::Commands::Web { port: 9090, bind, view_only: true, max_viewers: 2, terminal: true })
+                if bind == "loopback"
+        ));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--session" && pair[1] == "saved.jsonl")
+        );
+        assert!(!args.iter().any(|arg| arg == "previous.jsonl"));
     }
 
     fn published_turn_control(
@@ -18010,18 +19466,32 @@ mod tests {
     fn restart_argv_preserves_browser_mode_after_resumed_session_flags() {
         use clap::Parser as _;
         let args = [
-            "--model", "web", "--approval-mode", "write", "--session", "old.jsonl",
-            "web", "--port", "0", "--bind", "loopback", "--view-only", "--max-viewers", "2",
-        ].map(std::ffi::OsString::from);
+            "--model",
+            "web",
+            "--approval-mode",
+            "write",
+            "--session",
+            "old.jsonl",
+            "web",
+            "--port",
+            "0",
+            "--bind",
+            "loopback",
+            "--view-only",
+            "--max-viewers",
+            "2",
+        ]
+        .map(std::ffi::OsString::from);
         let restarted = restart_argv(args, Some(std::path::Path::new("saved.jsonl")));
         let cli = crate::cli::Cli::try_parse_from(
             std::iter::once(std::ffi::OsString::from("pi")).chain(restarted),
-        ).expect("restart must remain a valid browser launch");
+        )
+        .expect("restart must remain a valid browser launch");
         assert_eq!(cli.model.as_deref(), Some("web"));
         assert_eq!(cli.session.as_deref(), Some("saved.jsonl"));
         assert_eq!(cli.approval_mode.as_deref(), Some("write"));
         assert!(matches!(cli.command, Some(crate::cli::Commands::Web {
-            port: 0, bind, view_only: true, max_viewers: 2,
+            port: 0, bind, view_only: true, max_viewers: 2, terminal: false,
         }) if bind == "loopback"));
     }
 
@@ -18034,7 +19504,8 @@ mod tests {
         );
         let cli = crate::cli::Cli::try_parse_from(
             std::iter::once(std::ffi::OsString::from("pi")).chain(restarted),
-        ).expect("ordinary restart must remain an ordinary local session");
+        )
+        .expect("ordinary restart must remain an ordinary local session");
         assert!(cli.command.is_none());
         assert_eq!(cli.session.as_deref(), Some("saved.jsonl"));
         assert!(cli.args.is_empty());
@@ -28078,16 +29549,17 @@ mod tests {
 
     impl BrowserFixture {
         async fn new(handle: &crate::sdk::AgentSessionHandle) -> Self {
-            let server = crate::web_remote::CompanionServer::start(
-                crate::web_remote::WebRemoteSettings {
+            let server =
+                crate::web_remote::CompanionServer::start(crate::web_remote::WebRemoteSettings {
                     port: 0,
                     ..Default::default()
-                },
-            ).unwrap();
+                })
+                .unwrap();
             let companion = server.handle();
             companion.refresh(handle).await.unwrap();
             companion.set_busy(false);
-            let (browser_ui, _events) = browser::CompanionUi::new(companion.clone(), false).unwrap();
+            let (browser_ui, _events) =
+                browser::CompanionUi::new(companion.clone(), false).unwrap();
             let (submit_tx, commands) = mpsc::channel();
             let (agent_tx, agent_rx) = mpsc::channel();
             let (browser_tx, browser_rx) = mpsc::channel();
@@ -28099,16 +29571,27 @@ mod tests {
                 .with_submit_channel(submit_tx)
                 .with_turn_control(Arc::clone(&controls))
                 .with_turn_abort(Arc::clone(&aborts));
-            model.displayed_session_id = Some(handle
-                .with_session(|session| session.header.id.clone())
-                .await.unwrap());
+            model.displayed_session_id = Some(
+                handle
+                    .with_session(|session| session.header.id.clone())
+                    .await
+                    .unwrap(),
+            );
             let mut ui = ProgramSimulator::new(model);
             ui.init();
             // Close the initial private pairing panel before receiving input.
             ui.inject_event(key(KeyCode::Escape, Modifiers::empty()));
             Self {
-                _server: server, companion, ui, commands, browser_tx, browser_rx,
-                agent_tx, agent_rx, controls, aborts,
+                _server: server,
+                companion,
+                ui,
+                commands,
+                browser_tx,
+                browser_rx,
+                agent_tx,
+                agent_rx,
+                controls,
+                aborts,
             }
         }
 
@@ -28116,7 +29599,10 @@ mod tests {
             // Pair and submit through the actual authenticated loopback HTTP
             // endpoints; no test injects a live proposal into server state.
             let proposal = self.companion.test_delivered_proposal(text);
-            self.ui.send(PiFtuiMsg::Browser(browser::BrowserEvent::Proposal(proposal.clone())));
+            self.ui
+                .send(PiFtuiMsg::Browser(browser::BrowserEvent::Proposal(
+                    proposal.clone(),
+                )));
             proposal
         }
 
@@ -28125,7 +29611,11 @@ mod tests {
                 self.ui.inject_event(key(KeyCode::F(8), Modifiers::empty()));
             }
             self.ui.inject_event(key(KeyCode::F(8), Modifiers::empty()));
-            match self.commands.try_recv().expect("local F8 queues the approved prompt") {
+            match self
+                .commands
+                .try_recv()
+                .expect("local F8 queues the approved prompt")
+            {
                 UiCommand::BrowserPrompt(request) => request,
                 command => panic!("unexpected command: {command:?}"),
             }
@@ -28143,7 +29633,9 @@ mod tests {
 
     #[test]
     fn browser_prompt_requires_local_f8_and_preserves_the_draft_as_literal_native_input() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let provider = Arc::new(NativePromptProbe::default());
             let mut handle = native_prompt_handle(Arc::clone(&provider));
@@ -28157,7 +29649,7 @@ mod tests {
             fixture.ui.inject_event(key(KeyCode::F(8), Modifiers::empty()));
             assert!(fixture.ui.model().browser_panel_open());
             // A paste, Enter, auto-repeat and release are never approval.
-            fixture.ui.inject_event(Event::Paste(String::from("\r\n\u{1b}[19~")));
+            fixture.ui.inject_event(Event::Paste(ftui::PasteEvent::new("\r\n\u{1b}[19~", true)));
             fixture.ui.inject_event(key(KeyCode::Enter, Modifiers::empty()));
             for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
                 fixture.ui.inject_event(Event::Key(KeyEvent {
@@ -28194,11 +29686,16 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn browser_prompt_rechecks_revocation_owner_and_cancellation_at_driver_admission() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
-            for phase in ["revoked", "replaced", "escape", "shutdown", "locked", "running"] {
+            for phase in [
+                "revoked", "replaced", "escape", "shutdown", "locked", "running",
+            ] {
                 let provider = Arc::new(NativePromptProbe {
-                    pause_after_record: phase == "running", ..NativePromptProbe::default()
+                    pause_after_record: phase == "running",
+                    ..NativePromptProbe::default()
                 });
                 let mut handle = native_prompt_handle(Arc::clone(&provider));
                 let mut fixture = BrowserFixture::new(&handle).await;
@@ -28209,7 +29706,9 @@ mod tests {
                     "revoked" => fixture.companion.revoke_all(),
                     "replaced" => handle = native_prompt_handle(Arc::clone(&provider)),
                     "escape" => {
-                        fixture.ui.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                        fixture
+                            .ui
+                            .inject_event(key(KeyCode::Escape, Modifiers::empty()));
                     }
                     "shutdown" => fixture.ui.model_mut().abort_before_quit(),
                     _ => {}
@@ -28217,8 +29716,13 @@ mod tests {
                 let store = handle.session_store();
                 let held = (phase == "locked").then(|| store.try_lock().unwrap());
                 let mut operation = Box::pin(browser::run_prompt(
-                    &mut handle, request, &fixture.companion, &fixture.agent_tx,
-                    &fixture.browser_tx, &fixture.controls, &fixture.aborts,
+                    &mut handle,
+                    request,
+                    &fixture.companion,
+                    &fixture.agent_tx,
+                    &fixture.browser_tx,
+                    &fixture.controls,
+                    &fixture.aborts,
                 ));
                 if matches!(phase, "locked" | "running") {
                     assert!(futures::poll!(operation.as_mut()).is_pending());
@@ -28227,56 +29731,101 @@ mod tests {
                             fixture.ui.send(PiFtuiMsg::Agent(event));
                         }
                         assert_eq!(fixture.ui.model().state, AgentUiState::Working);
-                        fixture.ui.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-                        assert!(fixture.ui.model().input.is_empty(), "Enter steers the native turn");
+                        fixture
+                            .ui
+                            .inject_event(key(KeyCode::Enter, Modifiers::empty()));
+                        assert!(
+                            fixture.ui.model().input.is_empty(),
+                            "Enter steers the native turn"
+                        );
                         let control = fixture.controls.lock().unwrap().current.clone().unwrap();
                         assert_eq!(control.snapshot().pending_steering, 1);
-                        assert!(fixture.commands.try_recv().is_err(), "steering stays on its live lane");
+                        assert!(
+                            fixture.commands.try_recv().is_err(),
+                            "steering stays on its live lane"
+                        );
                     }
-                    fixture.ui.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+                    fixture
+                        .ui
+                        .inject_event(key(KeyCode::Escape, Modifiers::empty()));
                 }
                 asupersync::time::timeout(
-                    asupersync::time::wall_now(), Duration::from_secs(5), operation,
-                ).await.expect("cancellation must drain the same owned operation");
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    operation,
+                )
+                .await
+                .expect("cancellation must drain the same owned operation");
                 drop(held);
-                assert_eq!(provider.calls.lock().unwrap().len(), usize::from(phase == "running"), "{phase}");
+                assert_eq!(
+                    provider.calls.lock().unwrap().len(),
+                    usize::from(phase == "running"),
+                    "{phase}"
+                );
                 assert!(fixture.aborts.lock().unwrap().is_none());
                 fixture.drain();
                 assert!(!fixture.ui.model().browser_request_active(), "{phase}");
                 assert!(fixture.ui.model().busy.is_none(), "{phase}");
-                assert_eq!(fixture.ui.model().input.text(), "keep this draft", "{phase}");
+                assert_eq!(
+                    fixture.ui.model().input.text(),
+                    "keep this draft",
+                    "{phase}"
+                );
             }
         });
     }
 
     #[test]
     fn browser_review_yields_to_local_modals_and_revoke_never_enters_history() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let provider = Arc::new(NativePromptProbe::default());
             let handle = native_prompt_handle(Arc::clone(&provider));
             let mut fixture = BrowserFixture::new(&handle).await;
-            fixture.ui.model_mut().input.set_text("retained local input");
+            fixture
+                .ui
+                .model_mut()
+                .input
+                .set_text("retained local input");
             let proposal = fixture.propose("Waiting for local review");
             for owner in ["settings", "login", "ask", "extension", "working"] {
                 match owner {
                     "settings" => fixture.ui.model_mut().settings_pending = true,
-                    "login" => fixture.ui.model_mut().login_pending = Some(("provider".into(), false)),
-                    "ask" => fixture.ui.model_mut().active_ask = Some(ActiveAsk {
-                        request: ask_request("local-question", vec![question("Approve?", &["yes", "no"], false)]),
-                        question_index: 0,
-                        answers: Vec::new(),
-                    }),
-                    "extension" => fixture.ui.model_mut().active_ext = Some(ext_request(
-                        "local-approval", "confirm", serde_json::json!({"title": "Allow local tool?"}),
-                    )),
+                    "login" => {
+                        fixture.ui.model_mut().login_pending = Some(("provider".into(), false))
+                    }
+                    "ask" => {
+                        fixture.ui.model_mut().active_ask = Some(ActiveAsk {
+                            request: ask_request(
+                                "local-question",
+                                vec![question("Approve?", &["yes", "no"], false)],
+                            ),
+                            question_index: 0,
+                            answers: Vec::new(),
+                        })
+                    }
+                    "extension" => {
+                        fixture.ui.model_mut().active_ext = Some(ext_request(
+                            "local-approval",
+                            "confirm",
+                            serde_json::json!({"title": "Allow local tool?"}),
+                        ))
+                    }
                     "working" => fixture.ui.model_mut().state = AgentUiState::Working,
                     _ => unreachable!(),
                 }
-                fixture.ui.inject_event(key(KeyCode::F(8), Modifiers::empty()));
+                fixture
+                    .ui
+                    .inject_event(key(KeyCode::F(8), Modifiers::empty()));
                 assert!(!fixture.ui.model().browser_panel_open(), "{owner}");
                 assert!(fixture.commands.try_recv().is_err(), "{owner}");
-                assert_eq!(fixture.ui.model().input.text(), "retained local input", "{owner}");
+                assert_eq!(
+                    fixture.ui.model().input.text(),
+                    "retained local input",
+                    "{owner}"
+                );
                 fixture.ui.model_mut().settings_pending = false;
                 fixture.ui.model_mut().login_pending = None;
                 fixture.ui.model_mut().active_ask = None;
@@ -28284,11 +29833,17 @@ mod tests {
                 fixture.ui.model_mut().state = AgentUiState::Ready;
             }
             fixture.ui.model_mut().input.set_text("/web revoke");
-            fixture.ui.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+            fixture
+                .ui
+                .inject_event(key(KeyCode::Enter, Modifiers::empty()));
             assert!(fixture.ui.model().input_history.is_empty());
             assert!(fixture.ui.model().transcript.is_empty());
             assert_eq!(fixture.ui.model().browser_inbox_len(), 0);
-            assert!(!fixture.companion.resolve_proposal(&proposal.id, true, "too late"));
+            assert!(
+                !fixture
+                    .companion
+                    .resolve_proposal(&proposal.id, true, "too late")
+            );
             assert!(provider.calls.lock().unwrap().is_empty());
         });
     }

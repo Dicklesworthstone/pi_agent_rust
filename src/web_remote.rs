@@ -4,8 +4,10 @@
 //!
 //! [`CompanionServer`] serves the `pi web` loopback companion with bounded
 //! semantic snapshots and locally accepted prompt proposals. [`WebRemoteServer`]
-//! and [`WebRemoteBridge`] expose a separate mirrored-terminal transport for
-//! embedded hosts; its control leases do not authorize companion proposals.
+//! and [`WebRemoteBridge`] power `pi web --terminal` and embedded terminal hosts
+//! with bounded frame diffs and locally approved control. The two modes do not
+//! share credentials or control leases. WASM, headless sessions, and scannable
+//! QR pairing remain future work.
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,17 @@ const MAX_CLIENT_ID_BYTES: usize = 128;
 const MAX_REMOTE_ADDR_BYTES: usize = 256;
 const MAX_TOKEN_BYTES: usize = 128;
 const TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+/// Select one browser surface for the native session. A launch owns only the
+/// selected server, its credential namespace, and its local admission controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebRemoteMode {
+    /// Bounded conversation snapshots and approval of each proposed prompt.
+    #[default]
+    Companion,
+    /// Native terminal projection with an explicitly approved control lease.
+    Terminal,
+}
 
 /// Network interface binding mode for web-remote server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -413,6 +426,7 @@ impl WebRemoteManager {
             .filter(|(_, client)| client.pairing_token.as_deref() == Some(token))
             .map(|(id, _)| id.clone())
             .collect();
+        let mut controller_revoked = false;
         for id in &connected {
             if let Some(client) = state.clients.remove(id) {
                 kind = Some(client.token_kind);
@@ -420,6 +434,7 @@ impl WebRemoteManager {
             state.pending_takeovers.retain(|pending| pending != id);
             if state.active_controller.as_ref() == Some(id) {
                 state.active_controller = None;
+                controller_revoked = true;
             }
             self.record_audit(
                 &mut state,
@@ -430,7 +445,9 @@ impl WebRemoteManager {
         let Some(kind) = kind else {
             return false;
         };
-        let _ = state.advance_control_epoch();
+        if controller_revoked {
+            let _ = state.advance_control_epoch();
+        }
         self.record_audit(
             &mut state,
             WebAuditEvent::new("token_revoked", None)
@@ -579,8 +596,8 @@ impl WebRemoteManager {
             .retain(|pending| pending != client_id);
         if state.active_controller.as_deref() == Some(client_id) {
             state.active_controller = None;
+            let _ = state.advance_control_epoch();
         }
-        let _ = state.advance_control_epoch();
         self.record_audit(
             &mut state,
             WebAuditEvent::new("client_disconnected", Some(client_id.to_string())),
@@ -876,7 +893,8 @@ fn valid_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Render a text/URL string into half-block terminal QR presentation (`▀`, `▄`, `█`, ` `).
+/// Legacy decorative pairing marker. This fixed pattern does not encode a QR
+/// payload and is not used by the live server's copyable-link pairing interface.
 pub fn render_half_block_qr(data: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1311,6 +1329,27 @@ mod tests {
         assert!(second > first);
         assert!(!manager.input_authorized("controller", first));
         assert!(manager.input_authorized("controller", second));
+    }
+
+    #[test]
+    fn unrelated_viewer_departures_preserve_the_controllers_draft_authority() {
+        let (manager, controller_token) = approved_controller();
+        let epoch = manager.authorize_input("controller", 1).unwrap();
+        for id in ["disconnecting-viewer", "revoked-viewer"] {
+            let token = manager.generate_token(TokenKind::View).unwrap();
+            manager
+                .connect_client(id, "127.0.0.1:4011", Some(&token))
+                .unwrap();
+            if id == "disconnecting-viewer" {
+                manager.disconnect_client(id);
+            } else {
+                assert!(manager.revoke_token(&token));
+            }
+            assert!(manager.input_authorized("controller", epoch));
+        }
+        assert_eq!(manager.authorize_input("controller", 2).unwrap(), epoch);
+        assert!(manager.revoke_token(&controller_token));
+        assert!(!manager.input_authorized("controller", epoch));
     }
 
     #[test]
