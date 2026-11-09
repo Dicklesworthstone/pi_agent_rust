@@ -989,6 +989,7 @@ impl Attempt {
 
 struct ChildProcessGuard {
     child: Option<std::process::Child>,
+    root_reaped: bool,
     descendants_stopped: bool,
     process_lease: Option<ProcessLease>,
     hub_channel: Option<crate::agent_hub::ipc::ChildChannel>,
@@ -1005,6 +1006,7 @@ impl ChildProcessGuard {
     const fn new(child: std::process::Child) -> Self {
         Self {
             child: Some(child),
+            root_reaped: false,
             descendants_stopped: false,
             process_lease: None,
             hub_channel: None,
@@ -1034,6 +1036,7 @@ impl ChildProcessGuard {
             child.try_wait()
         };
         if matches!(&status, Ok(Some(_))) {
+            self.root_reaped = true;
             // No listener or credential survives OS reaping, including while
             // output acceptance or ordered writeback remains pending.
             self.hub_channel = None;
@@ -1047,6 +1050,15 @@ impl ChildProcessGuard {
         self.descendants_stopped = true;
         let pid = self.id();
         if pid == 0 {
+            return;
+        }
+        if !self.root_reaped {
+            // Native Bash jobs form their own process groups. Snapshot those
+            // descendants while this unreaped root still reserves its PID,
+            // before killing the root can orphan them. After successful reaping
+            // only the original group's cleanup remains valid; a tree walk by
+            // numeric PID could otherwise target a newly reused process ID.
+            crate::tools::kill_process_group_tree(Some(pid));
             return;
         }
         #[cfg(unix)]

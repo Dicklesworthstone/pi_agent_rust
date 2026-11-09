@@ -60,7 +60,7 @@ const STRUCTURED_BLOCK_LIMIT_BYTES: usize = 16 * 1024;
 const STRUCTURED_BLOCK_OPEN: &str = "<subagent-structured-result>";
 const STRUCTURED_BLOCK_CLOSE: &str = "</subagent-structured-result>";
 const STRUCTURED_TRUNCATION_MARKER: &str = "…[truncated]";
-const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit,hub";
+const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit,jobs,hub";
 const TAN_RESULT_SCHEMA: &str = "pi.background-tan.result.v1";
 const TAN_AGENT_NAME: &str = "tan";
 const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
@@ -1309,7 +1309,16 @@ fn child_args(
     selection: Option<&model_selection::Selection>,
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
-    let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
+    // A one-shot child owns every job started during its assignment. Bash can
+    // promote a long verification command automatically, so a provisional
+    // answer must not end the process before that job's completion is consumed.
+    // The runner still supplies and enforces the original remaining deadline.
+    let mut args = vec![
+        "--mode".into(),
+        "json".into(),
+        "--print".into(),
+        "--wait-async".into(),
+    ];
     args.extend(child_options(
         agent,
         role_model_spec,
@@ -2173,6 +2182,13 @@ mod tests {
         );
         assert!(args.windows(2).any(|pair| pair == ["--thinking", "high"]));
         assert!(args.windows(2).any(|pair| pair == ["--tools", "read,grep"]));
+        assert!(args.iter().any(|arg| arg == "--wait-async"));
+        assert!(
+            worker_args(&agent, None, None, None)
+                .iter()
+                .all(|arg| arg != "--wait-async"),
+            "retained RPC workers own their separate turn lifecycle"
+        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--skill", "/tmp/skill.md"])

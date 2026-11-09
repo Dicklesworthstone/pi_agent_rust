@@ -6539,6 +6539,247 @@ fn e2e_cli_print_background_results_wake_only_when_enabled() {
     }
 }
 
+/// Exercise the actual parent -> built-in task -> native Bash path. The job
+/// cannot finish before the child's provisional agent_end is persisted, so
+/// accepting the final answer requires the one-shot child's idle wake loop.
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+fn e2e_cli_native_tasks_collect_background_work_within_their_original_deadline() {
+    struct ReleaseJob(PathBuf);
+    impl Drop for ReleaseJob {
+        fn drop(&mut self) {
+            // Even a regressed implementation must not leave the fixture's
+            // separately grouped command executing after an assertion fails.
+            let _ = fs::write(&self.0, "release fixture");
+        }
+    }
+
+    for completes in [true, false] {
+        let name = if completes {
+            "native_task_background_completion"
+        } else {
+            "native_task_background_deadline"
+        };
+        let mut harness = CliTestHarness::new(name);
+        let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+        fs::create_dir_all(&agent_dir).expect("create isolated child configuration");
+        fs::write(
+            agent_dir.join("models.json"),
+            serde_json::to_vec(&json!({"providers": {"delegation-fixture": {
+                "api":"anthropic-messages", "baseUrl":"https://api.anthropic.com/v1/messages",
+                "apiKey":"test-vcr-key", "authHeader":true,
+                "models":[
+                    {"id":"parent", "reasoning":false, "contextWindow":32_000, "maxTokens":512},
+                    {"id":"child", "reasoning":false, "contextWindow":32_000, "maxTokens":512}
+                ]
+            }}}))
+            .expect("offline parent and child models"),
+        )
+        .expect("write model catalog");
+        fs::write(
+            harness.global_settings_path(),
+            serde_json::to_vec(&json!({
+                "approval":{"mode":"yolo"}, "retry":{"enabled":false},
+                "compaction":{"enabled":false}, "async":{"printWake":false},
+                "modelRoles":{"task":"delegation-fixture/child"},
+                "shellPath":"/bin/sh",
+                "bash":{"pty":"off", "persistent":false,
+                    "autoBackground":{"enabled":true, "thresholdMs":0}},
+                "tools":{"loadMode":{"subagent":"essential", "jobs":"essential"}}
+            }))
+            .expect("native delegation settings"),
+        )
+        .expect("write settings");
+        harness.env.insert(
+            "PI_SUBAGENT_PI_BINARY".to_string(),
+            harness.binary_path.display().to_string(),
+        );
+        let release = harness.harness.temp_path("release-delegated-job");
+        let _release_on_failure = ReleaseJob(release.clone());
+        let idle = harness.harness.temp_path("child-was-idle");
+        let job_pid = harness.harness.temp_path("delegated-job.pid");
+        setup_vcr_anthropic_sequence(
+            &mut harness,
+            name,
+            &[
+                (
+                    json!({"model":"parent", "stream":true}),
+                    build_anthropic_tool_use_chunks(
+                        "subagent",
+                        &json!({"agent":"task", "task":"Run the verification and collect its result.",
+                            "timeoutSeconds":if completes { 20 } else { 5 }}),
+                    ),
+                ),
+                (
+                    json!({"model":"child", "stream":true}),
+                    build_anthropic_tool_use_chunks(
+                        "bash",
+                        &json!({
+                            "command":"printf '%s' $$ > delegated-job.pid; while [ ! -e release-delegated-job ]; do sleep 0.02; done; printf 'DELEGATED_JOB_FINISHED\\n'",
+                            "timeout":0
+                        }),
+                    ),
+                ),
+                (
+                    json!({"model":"child", "stream":true}),
+                    build_anthropic_response_chunks("CHILD_PROVISIONAL_RESULT"),
+                ),
+                (
+                    json!({"model":"child", "stream":true}),
+                    build_anthropic_response_chunks("CHILD_COLLECTED_VERIFICATION"),
+                ),
+                (
+                    json!({"model":"parent", "stream":true}),
+                    build_anthropic_response_chunks("PARENT_FINISHED"),
+                ),
+            ],
+        );
+        let hub_root = agent_dir.join("agent-hub");
+        let observed_idle = idle.clone();
+        let observed_job_pid = job_pid.clone();
+        let result = harness.run_with_stdout_observer(
+            &[
+                "-p",
+                "--mode",
+                "json",
+                "--provider",
+                "delegation-fixture",
+                "--model",
+                "parent",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--tools",
+                "subagent",
+                "--max-time",
+                "30",
+                "Delegate verification to the built-in task agent.",
+            ],
+            None,
+            move |line| {
+                let Ok(event) = serde_json::from_slice::<Value>(line) else {
+                    return;
+                };
+                if event["type"] != "tool_execution_update"
+                    || event["toolName"] != "subagent"
+                    || observed_idle.exists()
+                {
+                    return;
+                }
+                let result = &event["partialResult"]["details"]["result"];
+                let Some(id) = result["hubId"].as_str() else {
+                    return;
+                };
+                let Ok(namespaces) = fs::read_dir(&hub_root) else {
+                    return;
+                };
+                for namespace in namespaces.flatten() {
+                    let path = namespace.path().join(format!("{id}.transcript.jsonl"));
+                    let Ok(transcript) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    if !transcript.lines().any(|line| {
+                        serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                            event["type"] == "agent_end"
+                                && event["messages"]
+                                    .as_array()
+                                    .and_then(|messages| messages.last())
+                                    .is_some_and(|message| {
+                                        message["content"][0]["text"] == "CHILD_PROVISIONAL_RESULT"
+                                    })
+                        })
+                    }) {
+                        continue;
+                    }
+                    let pid = fs::read_to_string(&observed_job_pid).expect("job really started");
+                    let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                        .expect("background command remains alive while child is idle");
+                    let fields: Vec<_> = stat
+                        .rsplit_once(')')
+                        .expect("process stat")
+                        .1
+                        .split_whitespace()
+                        .collect();
+                    assert_eq!(
+                        fields[2],
+                        pid.trim(),
+                        "native job owns a separate process group"
+                    );
+                    assert_ne!(result["pid"].as_u64().unwrap().to_string(), pid.trim());
+                    fs::write(&observed_idle, path.to_string_lossy().as_bytes())
+                        .expect("record child idle boundary");
+                    if completes {
+                        fs::write(&release, "continue after child agent_end").expect("release job");
+                    }
+                    break;
+                }
+            },
+        );
+        assert_exit_code(&harness.harness, &result, 0);
+        assert!(
+            idle.exists(),
+            "the delegated job must outlive the child's first turn: {}",
+            result.stdout
+        );
+        let events = parse_json_mode_stdout_lines(&result.stdout);
+        let ended = events
+            .iter()
+            .find(|event| event["type"] == "tool_execution_end" && event["toolName"] == "subagent")
+            .expect("settled native delegation");
+        let child = &ended["result"]["details"]["results"][0];
+        assert!(
+            child["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "jobs")
+        );
+        if completes {
+            assert_eq!(ended["isError"], false, "{child}");
+            assert_eq!(child["output"], "CHILD_COLLECTED_VERIFICATION");
+            assert_eq!(child["status"], "completed");
+            let transcript = fs::read_to_string(fs::read_to_string(&idle).unwrap()).unwrap();
+            assert!(
+                transcript.lines().any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|event| {
+                        event["type"] == "message_end"
+                            && event["message"]["role"] == "user"
+                            && event["message"]["content"].as_str().is_some_and(|text| {
+                                text.starts_with("[background job ")
+                                    && text.contains("DELEGATED_JOB_FINISHED")
+                            })
+                    })
+                }),
+                "the completion must reach the child conversation"
+            );
+        } else {
+            assert_eq!(ended["isError"], true, "{child}");
+            assert_eq!(child["status"], "failed");
+            assert!(
+                result.duration < Duration::from_secs(20),
+                "the original child deadline must bound idle drain"
+            );
+            assert_ne!(child["output"], "CHILD_COLLECTED_VERIFICATION");
+        }
+        let pid = fs::read_to_string(&job_pid).expect("job PID");
+        let running = match fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+            Ok(stat) => !matches!(
+                stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                Some("Z" | "X")
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("inspect owned job: {error}"),
+        };
+        assert!(
+            !running,
+            "delegation left separately grouped job {} executing",
+            pid.trim()
+        );
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn e2e_cli_wait_async_waits_for_jobs_started_by_a_wake_turn() {
