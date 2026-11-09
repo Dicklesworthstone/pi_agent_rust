@@ -959,6 +959,7 @@ struct SemanticContextPromptStats {
 pub struct QueuedAgentMessage {
     message: Message,
     keyword_scan_source: Option<String>,
+    display_text: Option<String>,
     persistence_identity: Arc<OnceLock<QueuedPersistenceIdentity>>,
 }
 
@@ -979,6 +980,7 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source,
+            display_text: None,
             persistence_identity: Arc::new(OnceLock::new()),
         }
     }
@@ -1008,6 +1010,7 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source,
+            display_text: None,
             persistence_identity: Arc::new(OnceLock::new()),
         }
     }
@@ -1019,8 +1022,18 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source: None,
+            display_text: None,
             persistence_identity: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Preserve an editor draft independently of the instruction scan source.
+    /// Attachment paths belong in restored input, but must not activate magic
+    /// keywords when they were removed from the authored instruction text.
+    #[must_use]
+    pub fn with_display_text(mut self, text: impl Into<String>) -> Self {
+        self.display_text = Some(text.into());
+        self
     }
 
     #[must_use]
@@ -1066,21 +1079,24 @@ impl QueuedAgentMessage {
         self.keyword_scan_source.as_deref()
     }
 
-    /// Text suitable for queue previews/editor restoration. Prefer the raw
-    /// authored source, falling back to provider-visible text for explicitly
-    /// suppressed generated entries.
+    /// Text suitable for queue previews/editor restoration. Prefer an explicit
+    /// editor draft, then the authored scan source, then provider-visible text
+    /// for explicitly suppressed generated entries.
     #[must_use]
     pub fn text_for_display(&self) -> Option<&str> {
-        self.keyword_scan_source().or_else(|| match &self.message {
-            Message::User(user) => match &user.content {
-                UserContent::Text(text) => Some(text.as_str()),
-                UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                }),
-            },
-            _ => None,
-        })
+        self.display_text
+            .as_deref()
+            .or(self.keyword_scan_source())
+            .or_else(|| match &self.message {
+                Message::User(user) => match &user.content {
+                    UserContent::Text(text) => Some(text.as_str()),
+                    UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    }),
+                },
+                _ => None,
+            })
     }
 
     #[must_use]

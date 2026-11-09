@@ -3412,18 +3412,27 @@ After approving access in the browser, press Enter in Pi to complete login."
             return;
         }
 
-        let expanded = self.resources.expand_input(trimmed);
-
-        // Track input history
-        self.history.push(trimmed.to_string());
-
-        if let Ok(mut queue) = self.message_queue.lock() {
-            let queued = QueuedAgentMessage::authored(build_user_message(expanded), trimmed);
+        let queued = match self.prepare_queued_input(trimmed) {
+            Ok(queued) => queued,
+            Err(message) => {
+                self.status_message = Some(message);
+                return;
+            }
+        };
+        {
+            let Ok(mut queue) = self.message_queue.lock() else {
+                self.status_message = Some("Could not queue input; the draft was retained".into());
+                return;
+            };
             match kind {
                 QueuedMessageKind::Steering => queue.push_steering(queued),
                 QueuedMessageKind::FollowUp => queue.push_follow_up(queued),
             }
         }
+
+        // Record and clear the authored draft only after queue admission. The
+        // queued payload owns its file bytes, so later edits cannot change it.
+        self.history.push(trimmed.to_string());
 
         // Clear input and reset to single-line mode
         self.input.reset();
@@ -3435,6 +3444,79 @@ After approving access in the browser, press Enter in Pi to complete login."
             QueuedMessageKind::FollowUp => "follow-up",
         };
         self.status_message = Some(format!("Queued {label} message"));
+    }
+
+    fn prepare_queued_input(
+        &mut self,
+        authored: &str,
+    ) -> std::result::Result<QueuedAgentMessage, String> {
+        // Scan only the instruction the user wrote, excluding attachment
+        // paths. Template bodies and file contents are generated context.
+        let (scan_source, mut file_refs) = self.extract_file_references(authored);
+        let expanded = if let Some((SlashCommand::Template, args)) = SlashCommand::parse(authored) {
+            let args = args.trim();
+            let (name, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let name = name.trim_start_matches('/');
+            if name.is_empty() {
+                return Err("Usage: /template <name> [args]".to_string());
+            }
+            if self
+                .resources
+                .prompts()
+                .iter()
+                .all(|template| template.name != name)
+            {
+                return Err(format!("Template not found: {name}"));
+            }
+            crate::resources::expand_prompt_template(
+                &format!("/{name} {rest}"),
+                self.resources.prompts(),
+            )
+        } else {
+            self.resources.expand_input(authored)
+        };
+        if expanded.trim().is_empty() {
+            return Err("Template expansion produced empty output".to_string());
+        }
+        let (without_refs, expanded_refs) = self.extract_file_references(&expanded);
+        // A positional template can omit an argument containing an explicit
+        // attachment. Preserve those authored references, and read references
+        // emitted by the template once even when it repeats the argument.
+        let mut seen = std::collections::HashSet::new();
+        file_refs.retain(|path| seen.insert(path.clone()));
+        file_refs.extend(
+            expanded_refs
+                .into_iter()
+                .filter(|path| seen.insert(path.clone())),
+        );
+        let message = if file_refs.is_empty() {
+            build_user_message(expanded)
+        } else {
+            let processed = process_file_arguments(
+                &file_refs,
+                &self.cwd,
+                crate::tools::FileArgumentOptions::from_config(&self.config),
+                self.workspace(),
+            )
+            .map_err(|err| err.to_string())?;
+            let mut text = processed.text;
+            text.push_str(without_refs.trim());
+            let mut content = Vec::with_capacity(processed.attachments.len() + 1);
+            if !text.trim().is_empty() {
+                content.push(ContentBlock::Text(TextContent::new(text)));
+            }
+            content.extend(processed.attachments);
+            ModelMessage::User(UserMessage {
+                content: UserContent::Blocks(content),
+                timestamp: Utc::now().timestamp_millis(),
+            })
+        };
+        let queued = QueuedAgentMessage::authored(message, scan_source.trim());
+        Ok(if scan_source.trim() == authored {
+            queued
+        } else {
+            queued.with_display_text(authored)
+        })
     }
 
     pub(super) fn restore_queued_messages_to_editor(&mut self, abort: bool) -> usize {
@@ -5507,6 +5589,237 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn queued_classic_attachments_snapshot_bytes_without_scanning_paths_or_generated_text() {
+        for kind in [QueuedMessageKind::Steering, QueuedMessageKind::FollowUp] {
+            for prefix in ["inspect", "/queued", "/template queued"] {
+                let directory = tempfile::tempdir().unwrap();
+                let text_path = directory.path().join("ultrathink.txt");
+                let media_path = directory.path().join("audio.wav");
+                std::fs::write(&text_path, "generated workflowz attachment").unwrap();
+                std::fs::write(&media_path, [0, 0xff, 1, 2]).unwrap();
+                let (mut app, _) = build_test_app_with_provider(Arc::new(DummyProvider));
+                app.cwd = directory.path().to_path_buf();
+                app.set_workspace(crate::workspace::WorkspaceHandle::single(directory.path()));
+                app.config.media = Some(crate::media_tools::MediaSettings {
+                    max_bytes: Some(4),
+                    ..Default::default()
+                });
+                app.resources
+                    .push_prompt_for_tests(crate::resources::PromptTemplate {
+                        name: "queued".into(),
+                        description: String::new(),
+                        content: "generated ultrathink template: $ARGUMENTS".into(),
+                        side: false,
+                        source: "test".into(),
+                        file_path: directory.path().join("queued.md"),
+                    });
+                let authored = format!("{prefix} @ultrathink.txt @audio.wav");
+                app.input.set_value(&authored);
+                app.queue_input(kind);
+                assert!(app.input.value().is_empty());
+                assert_eq!(app.history.entries().last().unwrap().value, authored);
+
+                // A tool may edit the files before the next provider request.
+                // The accepted input must retain the bytes the user submitted.
+                std::fs::write(&text_path, "later text").unwrap();
+                std::fs::write(&media_path, [3, 4, 5, 6]).unwrap();
+                let mut queued = {
+                    let mut queue = app.message_queue.lock().unwrap();
+                    match kind {
+                        QueuedMessageKind::Steering => queue.pop_steering(),
+                        QueuedMessageKind::FollowUp => queue.pop_follow_up(),
+                    }
+                };
+                assert_eq!(queued.len(), 1);
+                let delivery = queued.pop().unwrap();
+                assert_eq!(delivery.keyword_scan_source(), Some(prefix));
+                assert_eq!(delivery.text_for_display(), Some(authored.as_str()));
+                let ModelMessage::User(UserMessage {
+                    content: UserContent::Blocks(content),
+                    ..
+                }) = delivery.message()
+                else {
+                    panic!("queued file input must carry native content blocks");
+                };
+                let text = content_blocks_to_text(content);
+                assert!(text.contains("generated workflowz attachment"));
+                assert!(!text.contains("later text"));
+                assert!(content.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::Media(media)
+                        if media.data == "AP8BAg==" && media.name.as_deref() == Some("audio.wav")
+                )));
+                if prefix.starts_with('/') {
+                    assert!(text.contains("generated ultrathink template:"));
+                }
+
+                // Editor restoration uses the authored draft, independently
+                // of both the expanded payload and the keyword scan source.
+                {
+                    let mut queue = app.message_queue.lock().unwrap();
+                    match kind {
+                        QueuedMessageKind::Steering => queue.push_steering(delivery),
+                        QueuedMessageKind::FollowUp => queue.push_follow_up(delivery),
+                    }
+                }
+                app.input.set_value("unsent draft");
+                assert_eq!(app.restore_queued_messages_to_editor(false), 1);
+                assert_eq!(app.input.value(), format!("{authored}\n\nunsent draft"));
+                assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn queued_classic_attachments_observe_live_workspace_grants_and_media_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let media_path = extra.path().join("audio.wav");
+        std::fs::write(&media_path, [0, 0xff, 1, 2]).unwrap();
+        let (mut app, _) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.cwd = directory.path().to_path_buf();
+        let mut workspace = crate::workspace::WorkspaceHandle::single(directory.path());
+        app.set_workspace(workspace.clone());
+        let authored = format!("inspect @{}", media_path.display());
+        let history_before = app.history.entries().len();
+
+        // A refused read must not consume the draft or acknowledge history.
+        app.input.set_value(&authored);
+        app.queue_input(QueuedMessageKind::Steering);
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        assert_eq!(app.input.value(), authored);
+        assert_eq!(app.history.entries().len(), history_before);
+        assert!(app.status_message.as_deref().is_some_and(|message| {
+            message.contains("outside") || message.contains("workspace")
+        }));
+
+        workspace.add_root(extra.path());
+        for cap in [3, 4] {
+            app.config.media = Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(cap),
+                ..Default::default()
+            });
+            app.input.set_value(&authored);
+            app.queue_input(QueuedMessageKind::Steering);
+            let queued = app.message_queue.lock().unwrap().pop_steering();
+            assert_eq!(queued.len(), 1);
+            let ModelMessage::User(UserMessage {
+                content: UserContent::Blocks(content),
+                ..
+            }) = queued[0].message()
+            else {
+                panic!("expected prepared file input");
+            };
+            assert_eq!(
+                content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Media(_))),
+                cap == 4
+            );
+            assert_eq!(
+                content_blocks_to_text(content).contains("Max allowed is 3 bytes"),
+                cap == 3
+            );
+        }
+
+        assert!(workspace.remove_root(extra.path()));
+        app.input.set_value(&authored);
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        assert_eq!(app.input.value(), authored);
+    }
+
+    #[test]
+    fn queued_classic_positional_templates_cannot_drop_or_duplicate_authored_attachments() {
+        for template in ["Inspect $1", "Inspect $1 @audio.wav @audio.wav"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("audio.wav"), [0, 0xff, 1, 2]).unwrap();
+            let (mut app, _) = build_test_app_with_provider(Arc::new(DummyProvider));
+            app.cwd = directory.path().to_path_buf();
+            app.set_workspace(crate::workspace::WorkspaceHandle::single(directory.path()));
+            app.resources
+                .push_prompt_for_tests(crate::resources::PromptTemplate {
+                    name: "queued".into(),
+                    description: String::new(),
+                    content: template.into(),
+                    side: false,
+                    source: "test".into(),
+                    file_path: directory.path().join("queued.md"),
+                });
+            let authored = "/queued goal @audio.wav";
+            app.input.set_value(authored);
+            app.queue_input(QueuedMessageKind::FollowUp);
+            let queued = app.message_queue.lock().unwrap().pop_follow_up();
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].keyword_scan_source(), Some("/queued goal"));
+            assert_eq!(queued[0].text_for_display(), Some(authored));
+            let ModelMessage::User(UserMessage {
+                content: UserContent::Blocks(content),
+                ..
+            }) = queued[0].message()
+            else {
+                panic!("the explicitly submitted attachment must survive expansion");
+            };
+            assert_eq!(
+                content
+                    .iter()
+                    .filter(|block| matches!(block, ContentBlock::Media(_)))
+                    .count(),
+                1,
+                "one file snapshot for repeated references"
+            );
+            assert!(content_blocks_to_text(content).contains("Inspect goal"));
+        }
+    }
+
+    #[test]
+    fn queued_classic_template_attachments_reach_the_native_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_path = directory.path().join("audio.wav");
+        std::fs::write(&media_path, [0, 0xff, 1, 2]).unwrap();
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) =
+            build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }));
+        app.cwd = directory.path().to_path_buf();
+        app.set_workspace(crate::workspace::WorkspaceHandle::single(directory.path()));
+        app.session.try_lock().unwrap().session_dir = Some(directory.path().join("sessions"));
+        app.resources
+            .push_prompt_for_tests(crate::resources::PromptTemplate {
+                name: "queued".into(),
+                description: String::new(),
+                content: "Inspect the original recording @audio.wav: $ARGUMENTS".into(),
+                side: false,
+                source: "test".into(),
+                file_path: directory.path().join("queued.md"),
+            });
+        app.input.set_value("/queued after this turn");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        std::fs::write(&media_path, [3, 4, 5, 6]).unwrap();
+        let _ = app.submit_message("First request");
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(matches!(
+            events.last(),
+            Some(PiMsg::AgentDone {
+                stop_reason: StopReason::Stop,
+                ..
+            })
+        ));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*state.received_media.lock().unwrap(), ["AP8BAg=="]);
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        let agent = app.agent.try_lock().unwrap();
+        assert!(agent.messages().iter().any(|message| matches!(
+            message,
+            ModelMessage::User(UserMessage { content: UserContent::Blocks(content), .. })
+                if content.iter().any(|block| matches!(block, ContentBlock::Media(media)
+                    if media.data == "AP8BAg=="))
+                    && content_blocks_to_text(content).contains("Inspect the original recording")
+        )));
+    }
+
+    #[test]
     fn side_templates_never_enter_classic_steering_or_session_history() {
         for (busy, follow_up, input) in [
             (false, false, "/sitrep"),
@@ -5952,6 +6265,7 @@ mod stream_delta_batcher_tests {
         calls: AtomicUsize,
         saw_custom_message: AtomicBool,
         saw_user_message: AtomicBool,
+        received_media: std::sync::Mutex<Vec<String>>,
     }
 
     struct ContinueProbeProvider {
@@ -6064,6 +6378,20 @@ mod stream_delta_batcher_tests {
                     .any(|message| matches!(message, ModelMessage::User(_))),
                 Ordering::SeqCst,
             );
+            let mut received_media = self.state.received_media.lock().unwrap();
+            for message in context.messages.iter() {
+                if let ModelMessage::User(UserMessage {
+                    content: UserContent::Blocks(content),
+                    ..
+                }) = message
+                {
+                    received_media.extend(content.iter().filter_map(|block| match block {
+                        ContentBlock::Media(media) => Some(media.data.clone()),
+                        _ => None,
+                    }));
+                }
+            }
+            drop(received_media);
 
             let partial = self.assistant_message("");
             let message = self.assistant_message("continued");
