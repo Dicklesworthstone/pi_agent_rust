@@ -13,6 +13,7 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use uuid::Uuid;
 
 #[cfg(test)]
 mod shutdown_tests;
@@ -688,9 +689,14 @@ impl ExtensionRuntimeHandle {
     pub(super) async fn load_js_extensions_snapshots(
         &self,
         specs: Vec<JsExtensionLoadSpec>,
+        provider_generation: Uuid,
     ) -> Result<Vec<JsExtensionSnapshot>> {
         match self {
-            Self::Js(runtime) => runtime.load_extensions_snapshots(specs).await,
+            Self::Js(runtime) => {
+                runtime
+                    .load_extensions_snapshots(specs, provider_generation)
+                    .await
+            }
             Self::NativeRust(_) => Err(Error::extension(
                 "Native-rust runtime does not support JS extension load specs".to_string(),
             )),

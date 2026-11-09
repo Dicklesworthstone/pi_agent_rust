@@ -2190,6 +2190,9 @@ pub enum PiMsg {
     /// built-in list; the charmed stack builds its catalog inline and
     /// ignores this.
     AutocompleteCatalog(crate::autocomplete::AutocompleteCatalog),
+    /// Live model identities and display names after extension registration or
+    /// session replacement. No credentials or provider options enter the UI.
+    ModelCatalog(Vec<(String, String)>),
     /// Atomically replace reloaded prompt/skill bodies and their completion
     /// catalog. Side-command routing must use the same loader as the driver.
     ResourcesReloadedWithCatalog {

@@ -2703,6 +2703,63 @@ fn refresh_extension_commands(
     let _ = agent_tx.send(PiMsg::AutocompleteCatalog(catalog.clone()));
 }
 
+/// Model pickers share the live selection catalog. Rebuild display rows only
+/// when its Arc changes, and retain the workspace's provider visibility policy.
+fn refresh_live_models(
+    handle: &crate::sdk::AgentSessionHandle,
+    admitted: &mut Vec<String>,
+    previous: &mut Option<Arc<crate::models::ModelRegistry>>,
+    config: &crate::config::Config,
+    cwd: &std::path::Path,
+    agent_tx: &Sender<PiMsg>,
+) {
+    if handle.extension_manager().is_none() && previous.is_none() {
+        return;
+    }
+    let registry = match handle.session().model_registry_snapshot() {
+        Ok(Some(registry)) => registry,
+        Ok(None) => return,
+        Err(error) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("Model catalog: {error}")));
+            return;
+        }
+    };
+    if previous
+        .as_ref()
+        .is_some_and(|old| Arc::ptr_eq(old, &registry))
+    {
+        return;
+    }
+    let entries: Vec<_> = admitted
+        .iter()
+        .filter_map(|id| {
+            let (provider, model) = crate::provider_metadata::split_provider_model_spec(id)?;
+            registry.find(provider, model)
+        })
+        .collect();
+    let choices = crate::app::model_choices_for_workspace(
+        registry
+            .refresh_model_choices(&entries, true)
+            .into_iter()
+            .cloned()
+            .collect(),
+        config,
+        cwd,
+    );
+    let rows: Vec<_> = choices
+        .into_iter()
+        .map(|entry| {
+            (
+                format!("{}/{}", entry.model.provider, entry.model.id),
+                entry.model.name,
+            )
+        })
+        .collect();
+    *admitted = rows.iter().map(|(id, _)| id.clone()).collect();
+    *previous = Some(registry);
+    let _ = agent_tx.send(PiMsg::ModelCatalog(rows));
+}
+
 /// Preserve the runtime's registered spelling while accepting the same
 /// case-insensitive tokens as built-ins. An exact registration wins when
 /// an extension deliberately registers names that differ only in case.
@@ -4179,6 +4236,7 @@ impl PiFtuiModel {
                 msg,
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
+                    | PiMsg::ModelCatalog(_)
                     | PiMsg::ResourcesReloadedWithCatalog { .. }
                     | PiMsg::LoginPending { .. }
                     | PiMsg::SystemNote(_)
@@ -4558,6 +4616,18 @@ impl PiFtuiModel {
                     .clone_from(&catalog.extension_commands);
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
+            }
+            PiMsg::ModelCatalog(models) => {
+                self.available_models = models.iter().map(|(id, _)| id.clone()).collect();
+                self.model_names = models.into_iter().collect();
+                if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| matches!(picker.kind, PickerKind::Model))
+                {
+                    self.picker = None;
+                    self.route_model_command("");
+                }
             }
             PiMsg::ResourcesReloadedWithCatalog { resources, catalog } => {
                 self.steer_resources = Some(*resources);
@@ -11335,11 +11405,15 @@ async fn run_login_command(
     use crate::interactive::login_flow::{LoginStart, start_login};
 
     let auth_path = crate::config::Config::auth_path();
-    let models = handle
-        .session()
-        .model_registry()
-        .map(|registry| registry.models().to_vec())
-        .unwrap_or_default();
+    let models = match handle.session().model_registry_snapshot() {
+        Ok(registry) => registry
+            .map(|registry| registry.models().to_vec())
+            .unwrap_or_default(),
+        Err(error) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("Model catalog: {error}")));
+            return;
+        }
+    };
     match start_login(args, &auth_path, &models, handle.extension_manager()).await {
         Ok(LoginStart::Listing(listing)) => {
             let _ = agent_tx.send(PiMsg::System(listing));
@@ -12307,6 +12381,7 @@ fn run_scoped_models_command(
     args: &str,
     available: &[String],
     cycle: &mut Vec<String>,
+    scoped: &mut bool,
     cwd: &std::path::Path,
 ) -> PiMsg {
     const USAGE: &str = "Usage: /scoped-models [patterns|clear] (e.g. gpt-5*,claude-sonnet*)";
@@ -12342,6 +12417,7 @@ fn run_scoped_models_command(
         }
     };
     *cycle = next;
+    *scoped = !patterns.is_empty();
     let mut message = if patterns.is_empty() {
         format!(
             "Scoped models cleared: ctrl+p cycles all {} models.",
@@ -12371,6 +12447,26 @@ async fn run_cycle_model_command(
     forward: bool,
     agent_tx: &Sender<PiMsg>,
 ) -> bool {
+    let current_models;
+    let models = match handle.session().model_registry_snapshot() {
+        Ok(Some(registry)) => {
+            current_models = models
+                .iter()
+                .filter_map(|id| {
+                    let (provider, model) =
+                        crate::provider_metadata::split_provider_model_spec(id)?;
+                    let entry = registry.find(provider, model)?;
+                    Some(format!("{}/{}", entry.model.provider, entry.model.id))
+                })
+                .collect::<Vec<_>>();
+            current_models.as_slice()
+        }
+        Ok(None) => models,
+        Err(error) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("Model catalog: {error}")));
+            return false;
+        }
+    };
     let (provider, model_id) = handle.model();
     let current = format!("{provider}/{model_id}");
     let Some(next) = next_cycle_model(models, &current, forward) else {
@@ -13606,12 +13702,13 @@ pub fn run(
     let driver_web_privacy_ready = Arc::clone(&web_privacy_ready);
     let prewalk_requested = session_options.prewalk.is_some();
     let driver_btw_client = btw_client.clone();
+    let mut cycle_is_scoped = !cycle_models.is_empty();
     let mut cycle_models = if cycle_models.is_empty() {
         available_models.clone()
     } else {
         cycle_models
     };
-    let driver_available_models = available_models.clone();
+    let mut driver_available_models = available_models.clone();
     // `/restart`: the UI raises the flag and quits; the driver, once it has
     // saved and shut the session down, records the session file to reopen.
     let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -13768,6 +13865,15 @@ pub fn run(
                 // event, so completion and routing use the live session.
                 let mut info_catalog = driver_catalog;
                 refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
+                let mut live_model_registry = None;
+                refresh_live_models(
+                    &handle,
+                    &mut driver_available_models,
+                    &mut live_model_registry,
+                    settings_controller.config(),
+                    &bash_cwd,
+                    &agent_tx,
+                );
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
                 if prewalk_requested {
                     let note = handle.prewalk_target().map_or_else(
@@ -14419,11 +14525,17 @@ pub fn run(
                                 &args,
                                 &driver_available_models,
                                 &mut cycle_models,
+                                &mut cycle_is_scoped,
                                 &bash_cwd,
                             ));
                         }
                         Ok(UiCommand::CycleModel { forward }) => {
-                            if run_cycle_model_command(&mut handle, &cycle_models, forward, &agent_tx)
+                            let models = if cycle_is_scoped {
+                                &cycle_models
+                            } else {
+                                &driver_available_models
+                            };
+                            if run_cycle_model_command(&mut handle, models, forward, &agent_tx)
                                 .await
                             {
                                 plans.forget_model_restore();
@@ -14569,6 +14681,14 @@ pub fn run(
                         // source. Refresh here as well as after /reload's
                         // resource read, including new/removed registrations.
                         refresh_extension_commands(&handle, &mut info_catalog, &agent_tx);
+                        refresh_live_models(
+                            &handle,
+                            &mut driver_available_models,
+                            &mut live_model_registry,
+                            settings_controller.config(),
+                            &bash_cwd,
+                            &agent_tx,
+                        );
                         Box::pin(send_status_snapshot(&handle, &bash_cwd, &agent_tx)).await;
                     }
                     if (refresh_status || browser_became_idle)
@@ -30028,6 +30148,130 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn model_picker_tracks_late_provider_replacement_and_unload() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let extension = directory.path().join("late-models.mjs");
+            std::fs::write(
+                &extension,
+                r#"
+                export default function(pi) {
+                    pi.registerCommand('publish-models', { handler: raw => {
+                        const config = JSON.parse(raw);
+                        pi.registerProvider('late-ftui', config);
+                        pi.registerProvider('hidden-ftui', config);
+                    }});
+                }
+            "#,
+            )
+            .unwrap();
+            let mut handle = native_prompt_handle(Arc::new(NativePromptProbe::default()));
+            handle.session_mut().set_model_registry(
+                crate::models::ModelRegistry::from_entries_for_tests(Vec::new()),
+            );
+            handle
+                .session_mut()
+                .enable_extensions(&[], directory.path(), None, &[extension])
+                .await
+                .unwrap();
+            let config = crate::config::Config {
+                disabled_providers: Some(vec!["hidden-ftui".to_string()]),
+                ..Default::default()
+            };
+            let (sender, receiver) = mpsc::channel();
+            let (_ui_sender, ui_receiver) = mpsc::channel();
+            let (submit, commands) = mpsc::channel();
+            let mut ui = PiFtuiModel::new(ui_receiver).with_submit_channel(submit);
+            let mut admitted = Vec::new();
+            let mut previous = None;
+            for (id, name) in [
+                ("chat", "First registration"),
+                ("replacement", "New registration"),
+            ] {
+                let spec = serde_json::json!({
+                    "api": "openai-completions", "baseUrl": "https://late.invalid/v1",
+                    "apiKey": "fixture-key", "models": [{"id": id, "name": name}]
+                });
+                handle
+                    .session_mut()
+                    .execute_extension_command("publish-models", &spec.to_string(), 5_000, |_| {})
+                    .await
+                    .unwrap();
+                refresh_live_models(
+                    &handle,
+                    &mut admitted,
+                    &mut previous,
+                    &config,
+                    directory.path(),
+                    &sender,
+                );
+                let update = receiver
+                    .try_recv()
+                    .expect("registration publishes model choices");
+                assert!(matches!(&update, PiMsg::ModelCatalog(_)));
+                let _ = ui.handle_agent(update);
+                assert_eq!(ui.available_models, vec![format!("late-ftui/{id}")]);
+                assert_eq!(ui.model_names[&format!("late-ftui/{id}")], name);
+                ui.route_model_command("");
+                assert!(ui.picker.as_ref().unwrap().items[0].contains(name));
+                ui.route_model_command(&format!("late-ftui/{id}"));
+                assert_eq!(
+                    commands.try_recv().unwrap(),
+                    UiCommand::SetModel {
+                        provider: "late-ftui".to_string(),
+                        model: id.to_string(),
+                    }
+                );
+                refresh_live_models(
+                    &handle,
+                    &mut admitted,
+                    &mut previous,
+                    &config,
+                    directory.path(),
+                    &sender,
+                );
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "unchanged catalog is not rebuilt"
+                );
+            }
+            handle
+                .extension_manager()
+                .unwrap()
+                .load_js_extensions(Vec::new())
+                .await
+                .unwrap();
+            refresh_live_models(
+                &handle,
+                &mut admitted,
+                &mut previous,
+                &config,
+                directory.path(),
+                &sender,
+            );
+            let _ = ui.handle_agent(receiver.try_recv().expect("unload publishes removal"));
+            assert!(ui.available_models.is_empty());
+            assert!(
+                ui.picker.is_none(),
+                "an open picker cannot retain retired models"
+            );
+            ui.route_model_command("late-ftui/replacement");
+            let UiCommand::SetModel { provider, model } = commands.try_recv().unwrap() else {
+                panic!("explicit model names are validated by the driver");
+            };
+            assert!(
+                !run_set_model_command(&mut handle, &provider, &model, &sender).await,
+                "a retired model cannot be installed from stale or explicit input"
+            );
+            let _ = handle.shutdown_owned_resources().await;
+        });
+    }
+
+    #[test]
     fn extension_commands_receive_current_session_and_model_context() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -32544,19 +32788,25 @@ mod tests {
             String::from("anthropic/claude-x"),
         ];
         let mut cycle = available.clone();
-        let reply = run_scoped_models_command("gpt-*", &available, &mut cycle, dir.path());
+        let mut scoped = false;
+        let reply =
+            run_scoped_models_command("gpt-*", &available, &mut cycle, &mut scoped, dir.path());
         assert!(matches!(reply, PiMsg::System(ref text) if text.contains("1 model(s)")));
         assert_eq!(cycle, vec![String::from("openai/gpt-5")]);
+        assert!(scoped);
         let saved = std::fs::read_to_string(dir.path().join(".pi").join("settings.json"))
             .expect("project settings written");
         assert!(saved.contains("gpt-*"), "{saved}");
 
-        let unchanged = run_scoped_models_command("zzz-*", &available, &mut cycle, dir.path());
+        let unchanged =
+            run_scoped_models_command("zzz-*", &available, &mut cycle, &mut scoped, dir.path());
         assert!(matches!(unchanged, PiMsg::System(ref text) if text.contains("unchanged")));
         assert_eq!(cycle, vec![String::from("openai/gpt-5")]);
+        assert!(scoped);
 
-        run_scoped_models_command("clear", &available, &mut cycle, dir.path());
+        run_scoped_models_command("clear", &available, &mut cycle, &mut scoped, dir.path());
         assert_eq!(cycle, available);
+        assert!(!scoped);
     }
 
     /// `/open` finds the newest link, in text or tool output, without the

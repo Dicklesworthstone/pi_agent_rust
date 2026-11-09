@@ -1201,7 +1201,7 @@ async fn run(
                                     ));
                                     continue;
                                 }
-                                let result = session_setup_response(&session_id, &state)
+                                let result = session_setup_response(&session_id, &state)?
                                     .ok_or_else(|| Error::session("New session is unavailable"))?;
                                 let mcp_state = state.mcp.clone();
                                 let state_arc = Arc::new(Mutex::new(state));
@@ -2601,7 +2601,7 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
         .ok_or_else(|| Error::session("Cannot arm prewalk while the session is busy"))?;
     let registry = handle
         .session()
-        .model_registry()
+        .model_registry_snapshot()?
         .ok_or_else(|| Error::config("Prewalk requires a model registry"))?;
     let target = crate::app::resolve_prewalk_target(
         cli.prewalk_into
@@ -2609,7 +2609,7 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
             .unwrap_or_else(|| config.prewalk_into()),
         &cli,
         &config,
-        registry,
+        &registry,
         &state.cwd,
     )
     .map_err(|error| Error::config(error.to_string()))?;
@@ -2733,41 +2733,84 @@ fn config_options_with_models(models: &AcpModelState, thinking: &str) -> Value {
 
 /// New, loaded and resumed sessions expose identical discovery contracts.
 /// Do not advertise `modes`: this server has no `session/set_mode` handler.
-fn session_setup_response(session_id: &str, state: &AcpSessionState) -> Option<Value> {
-    let handle = state.agent_session.as_ref()?;
+fn session_setup_response(session_id: &str, state: &AcpSessionState) -> Result<Option<Value>> {
+    let Some(handle) = state.agent_session.as_ref() else {
+        return Ok(None);
+    };
     let (provider, model) = handle.model();
-    let models = session_model_state((&provider, &model), &state.available_models);
+    let available = live_acp_models(handle, &state.available_models, &state.config, &state.cwd)?;
+    let models = session_model_state((&provider, &model), &available);
     let config_options = config_options_with_models(
         &models,
         &handle.thinking_level().unwrap_or_default().to_string(),
     );
-    Some(json!({
+    Ok(Some(json!({
         "sessionId": session_id,
         "models": models,
         "configOptions": config_options,
-    }))
+    })))
 }
 
 /// [`session_config_options`] for a live session, or `None` while a prompt
 /// holds the agent session.
-fn config_options_for(state: &AcpSessionState) -> Option<Value> {
-    let agent_session = state.agent_session.as_ref()?;
-    Some(config_options_for_handle(
+fn config_options_for(state: &AcpSessionState) -> Result<Option<Value>> {
+    let Some(agent_session) = state.agent_session.as_ref() else {
+        return Ok(None);
+    };
+    config_options_for_handle(
         agent_session,
         &state.available_models,
-    ))
+        &state.config,
+        &state.cwd,
+    )
+    .map(Some)
+}
+
+fn live_acp_models(
+    handle: &AgentSessionHandle,
+    admitted: &[ModelEntry],
+    config: &Config,
+    cwd: &std::path::Path,
+) -> Result<Vec<ModelEntry>> {
+    if handle.extension_manager().is_none() {
+        return Ok(admitted.to_vec());
+    }
+    let Some(registry) = handle.session().model_registry_snapshot()? else {
+        return Ok(admitted.to_vec());
+    };
+    Ok(project_acp_model_choices(&registry, admitted, config, cwd))
+}
+
+fn project_acp_model_choices(
+    registry: &ModelRegistry,
+    admitted: &[ModelEntry],
+    config: &Config,
+    cwd: &std::path::Path,
+) -> Vec<ModelEntry> {
+    crate::app::model_choices_for_workspace(
+        registry
+            .refresh_model_choices(admitted, true)
+            .into_iter()
+            .cloned()
+            .collect(),
+        config,
+        cwd,
+    )
 }
 
 fn config_options_for_handle(
     handle: &AgentSessionHandle,
     available_models: &[ModelEntry],
-) -> Value {
+    config: &Config,
+    cwd: &std::path::Path,
+) -> Result<Value> {
     let (provider, model) = handle.model();
-    session_config_options(
+    let available = live_acp_models(handle, available_models, config, cwd)?;
+    Ok(session_config_options(
         (&provider, &model),
         &handle.thinking_level().unwrap_or_default().to_string(),
-        available_models,
-    )
+        &available,
+    ))
 }
 
 fn config_options_update(session_id: &str, configuration: &Value) -> String {
@@ -2798,6 +2841,7 @@ async fn publish_config_options(
             .await
             .map_err(|_| "session state lock unavailable".to_string())?;
         config_options_for(&guard)
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "Session configuration is unavailable during a prompt".to_string())?
     };
     out.send(config_options_update(session_id, &configuration))
@@ -2813,6 +2857,10 @@ struct AcpRecoveryUpdates {
     session_id: String,
     session: Arc<Mutex<Session>>,
     available_models: Vec<ModelEntry>,
+    model_catalog: crate::agent::ExtensionModelCatalog,
+    live_extensions: bool,
+    config: Arc<Config>,
+    cwd: PathBuf,
     last_configuration: StdMutex<Value>,
 }
 
@@ -2820,15 +2868,25 @@ impl AcpRecoveryUpdates {
     fn new(
         handle: &AgentSessionHandle,
         available_models: Vec<ModelEntry>,
+        config: Arc<Config>,
+        cwd: PathBuf,
         out: &AcpOutput,
         session_id: &str,
     ) -> Arc<Self> {
-        let configuration = config_options_for_handle(handle, &available_models);
+        let configuration = config_options_for_handle(handle, &available_models, &config, &cwd)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "ACP model catalog unavailable before prompt");
+                Value::Null
+            });
         Arc::new(Self {
             out: out.clone(),
             session_id: session_id.to_string(),
             session: handle.session_store(),
             available_models,
+            model_catalog: handle.session().extension_model_catalog(),
+            live_extensions: handle.extension_manager().is_some(),
+            config,
+            cwd,
             last_configuration: StdMutex::new(configuration),
         })
     }
@@ -2893,6 +2951,23 @@ impl AcpRecoveryUpdates {
     }
 
     fn committed_model(&self, provider: &str, model: &str) {
+        let available = if self.live_extensions {
+            match self.model_catalog.registry_snapshot() {
+                Ok(Some(registry)) => project_acp_model_choices(
+                    &registry,
+                    &self.available_models,
+                    &self.config,
+                    &self.cwd,
+                ),
+                Ok(None) => self.available_models.clone(),
+                Err(error) => {
+                    self.notice(&format!("Model catalog unavailable: {error}"));
+                    return;
+                }
+            }
+        } else {
+            self.available_models.clone()
+        };
         let configuration = {
             // Recovery publishes the event after its durable transition has
             // released Session. If another reader currently owns the store,
@@ -2912,7 +2987,7 @@ impl AcpRecoveryUpdates {
             let thinking = session
                 .effective_thinking_level_for_current_path()
                 .unwrap_or_else(|| "off".to_string());
-            session_config_options((provider, model), &thinking, &self.available_models)
+            session_config_options((provider, model), &thinking, &available)
         };
         self.configuration(&configuration);
     }
@@ -2934,7 +3009,10 @@ impl AcpRecoveryUpdates {
     }
 
     fn finish(&self, handle: &AgentSessionHandle) {
-        self.configuration(&config_options_for_handle(handle, &self.available_models));
+        match config_options_for_handle(handle, &self.available_models, &self.config, &self.cwd) {
+            Ok(configuration) => self.configuration(&configuration),
+            Err(error) => self.notice(&format!("Model catalog unavailable: {error}")),
+        }
     }
 }
 
@@ -3001,10 +3079,15 @@ fn resolve_set_model_target(
         return Ok((provider.to_string(), model.to_string()));
     }
 
-    if let Some((provider, model_id)) = model.split_once('/')
-        && let Some(entry) = registry.find(provider, model_id)
-    {
-        return Ok((entry.model.provider, entry.model.id));
+    if let Some((provider, model_id)) = model.split_once('/') {
+        if let Some(entry) = registry.find(provider, model_id) {
+            return Ok((entry.model.provider, entry.model.id));
+        }
+        if registry.extension_provider_was_registered(provider) {
+            return Err(format!(
+                "Unknown extension model: {model} (not in the live model registry)"
+            ));
+        }
     }
 
     // No provider given — resolve it from the registry by model id.
@@ -3071,9 +3154,10 @@ async fn apply_set_model_request(
     };
     let registry = agent_session
         .session()
-        .model_registry()
+        .model_registry_snapshot()
+        .map_err(|error| error.to_string())?
         .ok_or_else(|| "session model registry unavailable".to_string())?;
-    let (provider, model) = resolve_set_model_target(params, registry)?;
+    let (provider, model) = resolve_set_model_target(params, &registry)?;
     agent_session
         .set_model(&provider, &model)
         .await
@@ -3146,11 +3230,19 @@ async fn run_prompt(
         Ok(mut guard) => guard
             .agent_session
             .take()
-            .map(|agent| (agent, guard.mcp.clone(), guard.available_models.clone()))
+            .map(|agent| {
+                (
+                    agent,
+                    guard.mcp.clone(),
+                    guard.available_models.clone(),
+                    Arc::clone(&guard.config),
+                    guard.cwd.clone(),
+                )
+            })
             .ok_or_else(|| Error::session("Agent session is unavailable while a prompt is active")),
         Err(error) => Err(Error::from(error)),
     };
-    let (mut agent_session, mcp_state, available_models) = match taken {
+    let (mut agent_session, mcp_state, available_models, config, cwd) = match taken {
         Ok(taken) => taken,
         Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
@@ -3168,8 +3260,14 @@ async fn run_prompt(
                 Some(input.fetcher(&out_tx, steering::Queue::FollowUp)),
             );
     }
-    let recovery_updates =
-        AcpRecoveryUpdates::new(&agent_session, available_models, &out_tx, &session_id);
+    let recovery_updates = AcpRecoveryUpdates::new(
+        &agent_session,
+        available_models,
+        config,
+        cwd,
+        &out_tx,
+        &session_id,
+    );
     let recovery_callback = Arc::clone(&recovery_updates);
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
 
@@ -6357,6 +6455,25 @@ mod tests {
             resolve_set_model_target(&params, &registry).expect("resolves bare value");
         assert_eq!(model, "gpt-5.5");
         assert_eq!(provider, "openai", "provider resolved from registry");
+    }
+
+    #[test]
+    fn retired_extension_selector_cannot_be_reinterpreted_as_another_models_id() {
+        let host = crate::models::ad_hoc_model_entry("openai", "retired-provider/chat")
+            .expect("native namespace fixture");
+        let mut extension = host.clone();
+        extension.model.provider = "retired-provider".to_string();
+        extension.model.id = "chat".to_string();
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![host]);
+        registry.merge_extension_entries(vec![extension]).unwrap();
+        let selector = json!({"value": "retired-provider/chat"});
+        assert_eq!(
+            resolve_set_model_target(&selector, &registry).unwrap(),
+            ("retired-provider".to_string(), "chat".to_string()),
+        );
+        registry.merge_extension_registry(&[], Vec::new()).unwrap();
+        assert!(registry.find_by_id("retired-provider/chat").is_some());
+        assert!(resolve_set_model_target(&selector, &registry).is_err());
     }
 
     #[test]

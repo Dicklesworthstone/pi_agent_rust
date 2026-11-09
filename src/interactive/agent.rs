@@ -1035,6 +1035,7 @@ impl PiApp {
             PiMsg::UiShutdown
             | PiMsg::TerminalTitle(_)
             | PiMsg::AutocompleteCatalog(_)
+            | PiMsg::ModelCatalog(_)
             | PiMsg::ResourcesReloadedWithCatalog { .. }
             | PiMsg::LoginPending { .. }
             | PiMsg::StatusSnapshot(_)

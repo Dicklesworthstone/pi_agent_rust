@@ -260,7 +260,9 @@ pub(super) async fn load(
         .agent_session
         .as_ref()
         .ok_or_else(HistoryError::busy)?;
-    let response = session_setup_response(id, &guard).ok_or_else(HistoryError::busy)?;
+    let response = session_setup_response(id, &guard)
+        .map_err(|error| HistoryError::internal(error.to_string()))?
+        .ok_or_else(HistoryError::busy)?;
     if replay {
         let session = OwnedMutexGuard::lock(agent.session_store(), cx)
             .await
@@ -505,7 +507,9 @@ pub(super) async fn fork(
             .refresh_extension_completion_host_state();
     }
     drop(candidate);
-    let response = session_setup_response(&fork_id, &state).ok_or_else(HistoryError::busy)?;
+    let response = session_setup_response(&fork_id, &state)
+        .map_err(|error| HistoryError::internal(error.to_string()))?
+        .ok_or_else(HistoryError::busy)?;
     let mcp_notification = state
         .mcp
         .as_ref()

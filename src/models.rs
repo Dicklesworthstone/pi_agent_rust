@@ -1208,6 +1208,18 @@ pub struct CompatConfig {
 pub struct ModelRegistry {
     models: Vec<ModelEntry>,
     error: Option<String>,
+    /// Rows contributed by the last complete extension snapshot. Host rows
+    /// retain their route, headers and credentials when that snapshot changes.
+    extension_rows: HashSet<(String, String)>,
+    /// Only provider spelling and OAuth binding are overlaid on host rows.
+    /// Retain their originals so unloading an extension restores the host.
+    extension_host_bindings: HashMap<(String, String), (String, Option<OAuthConfig>)>,
+    /// Retired extension namespaces must not turn into built-in aliases when
+    /// an old selector still holds their declared provider/model identity.
+    extension_provider_names: HashSet<String>,
+    /// Keep active zero-model registrations distinct from retired namespaces
+    /// when a frontend supplies additional manually configured model rows.
+    active_extension_provider_names: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1791,6 +1803,7 @@ impl ModelRegistry {
         Self {
             models: entries,
             error: None,
+            ..Self::default()
         }
     }
 
@@ -1947,11 +1960,22 @@ impl ModelRegistry {
         Self {
             models,
             error: (!errors.is_empty()).then(|| errors.join("\n\n")),
+            ..Self::default()
         }
     }
 
     pub fn models(&self) -> &[ModelEntry] {
         &self.models
+    }
+
+    pub(crate) fn extension_manages_model(&self, provider: &str, model: &str) -> bool {
+        let key = extension_model_key(provider, model);
+        self.extension_rows.contains(&key) || self.extension_host_bindings.contains_key(&key)
+    }
+
+    pub(crate) fn extension_provider_was_registered(&self, provider: &str) -> bool {
+        self.extension_provider_names
+            .contains(&extension_provider_key(provider))
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -1969,8 +1993,88 @@ impl ModelRegistry {
         self.available_models().into_iter().cloned().collect()
     }
 
+    /// Refresh admitted choices without replacing their order or declared
+    /// provider identity. Explicit scopes set `include_new` to false; ordinary
+    /// selectors can append newly available registrations. Retired rows never
+    /// survive through stale metadata captured by a frontend at startup.
+    pub fn refresh_model_choices<'a, 'b>(
+        &'a self,
+        admitted: impl IntoIterator<Item = &'b ModelEntry>,
+        include_new: bool,
+    ) -> Vec<&'a ModelEntry> {
+        // Most frontend admissions already use exact declared identities.
+        // Index those once so refreshing a full catalog remains linear in its
+        // size, with the general alias resolver needed only for absent names.
+        let mut exact = HashMap::with_capacity(self.models.len());
+        let mut providers = HashSet::new();
+        for entry in &self.models {
+            let key = extension_model_key(&entry.model.provider, &entry.model.id);
+            providers.insert(key.0.clone());
+            exact.entry(key).or_insert(entry);
+        }
+        let mut seen = HashSet::new();
+        let mut choices = Vec::new();
+        for admitted in admitted {
+            let key = extension_model_key(&admitted.model.provider, &admitted.model.id);
+            let entry = exact.get(&key).copied().or_else(|| {
+                if providers.contains(&key.0) || self.extension_provider_names.contains(&key.0) {
+                    None
+                } else {
+                    self.find_entry(&admitted.model.provider, &admitted.model.id)
+                }
+            });
+            if let Some(entry) = entry
+                && seen.insert(extension_model_key(&entry.model.provider, &entry.model.id))
+            {
+                choices.push(entry);
+            }
+        }
+        if include_new {
+            for entry in &self.models {
+                if model_entry_is_ready(entry)
+                    && seen.insert(extension_model_key(&entry.model.provider, &entry.model.id))
+                {
+                    choices.push(entry);
+                }
+            }
+        }
+        choices
+    }
+
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
-        find_model_entry(&self.models, provider, id).cloned()
+        self.find_entry(provider, id).cloned()
+    }
+
+    pub(crate) fn find_entry(&self, provider: &str, id: &str) -> Option<&ModelEntry> {
+        if self
+            .extension_provider_names
+            .contains(&extension_provider_key(provider))
+            && !self.models.iter().any(|entry| {
+                entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
+            })
+        {
+            return None;
+        }
+        find_model_entry(&self.models, provider, id)
+    }
+
+    /// Resolve registered destinations or native ad-hoc IDs without reviving
+    /// a provider namespace previously owned by a removed extension.
+    pub fn resolve(&self, provider: &str, id: &str) -> Option<ModelEntry> {
+        if let Some(entry) = self.find(provider, id) {
+            return Some(entry);
+        }
+        if self
+            .extension_provider_names
+            .contains(&extension_provider_key(provider))
+        {
+            return None;
+        }
+        resolve_model_entry(&self.models, provider, id)
     }
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
@@ -2031,7 +2135,19 @@ impl ModelRegistry {
             )
         };
         let mut present: HashSet<_> = self.models.iter().map(key).collect();
+        let live_providers: HashSet<_> = self
+            .models
+            .iter()
+            .map(|entry| extension_provider_key(&entry.model.provider))
+            .collect();
         for entry in entries {
+            let provider = extension_provider_key(&entry.model.provider);
+            if self.extension_provider_names.contains(&provider)
+                && !self.active_extension_provider_names.contains(&provider)
+                && !live_providers.contains(&provider)
+            {
+                continue;
+            }
             if present.insert(key(&entry)) {
                 self.models.push(entry);
             }
@@ -2085,9 +2201,10 @@ impl ModelRegistry {
         self.merge_extension_registry(&bindings, entries)
     }
 
-    /// Atomically merge a complete extension-provider snapshot and its model
-    /// rows into the registry. Provider bindings are independent of model rows,
-    /// so zero-model providers still bind manual models and OAuth discovery.
+    /// Atomically replace a complete extension-provider snapshot and its model
+    /// rows. Provider bindings are independent of model rows, so zero-model
+    /// providers still bind manual models and OAuth discovery. Previously
+    /// contributed rows are retired; host rows keep their original metadata.
     ///
     /// # Errors
     /// Returns a configuration error for normalized provider collisions,
@@ -2170,10 +2287,42 @@ impl ModelRegistry {
             entry.oauth_config.clone_from(oauth_config);
         }
 
+        // Validation above is side-effect free. Retire only rows admitted by
+        // the previous snapshot, then restore the narrow binding overlay on
+        // host-owned rows before applying the replacement. Repeated snapshots
+        // must not promote extension rows into permanent host configuration.
+        self.extension_provider_names
+            .extend(extension_providers.keys().cloned());
+        self.active_extension_provider_names = extension_providers.keys().cloned().collect();
+        self.models.retain(|entry| {
+            !self
+                .extension_rows
+                .contains(&extension_model_key(&entry.model.provider, &entry.model.id))
+        });
+        self.extension_rows.clear();
         for existing in &mut self.models {
+            let key = extension_model_key(&existing.model.provider, &existing.model.id);
+            if let Some((provider, oauth)) = self.extension_host_bindings.remove(&key) {
+                existing.model.provider = provider;
+                existing.oauth_config = oauth;
+            }
+        }
+        self.extension_host_bindings.clear();
+
+        let mut present = HashSet::with_capacity(self.models.len() + entries.len());
+        for existing in &mut self.models {
+            let key = extension_model_key(&existing.model.provider, &existing.model.id);
+            present.insert(key.clone());
             let provider_key = extension_provider_key(&existing.model.provider);
             if let Some((extension_provider, oauth_config)) = extension_providers.get(&provider_key)
             {
+                self.extension_host_bindings.insert(
+                    key,
+                    (
+                        existing.model.provider.clone(),
+                        existing.oauth_config.clone(),
+                    ),
+                );
                 existing.model.provider.clone_from(extension_provider);
                 existing.oauth_config.clone_from(oauth_config);
             }
@@ -2181,10 +2330,8 @@ impl ModelRegistry {
 
         for entry in entries {
             let entry_key = extension_model_key(&entry.model.provider, &entry.model.id);
-            let exists = self.models.iter().any(|existing| {
-                extension_model_key(&existing.model.provider, &existing.model.id) == entry_key
-            });
-            if !exists {
+            if present.insert(entry_key.clone()) {
+                self.extension_rows.insert(entry_key);
                 self.models.push(entry);
             }
         }
@@ -7560,6 +7707,100 @@ mod tests {
     }
 
     #[test]
+    fn retired_extension_alias_does_not_resolve_to_native_provider() {
+        let mut native = ad_hoc_model_entry("openrouter", "shared").expect("native entry");
+        native.api_key = Some("native-key".to_string());
+        let mut extension = native.clone();
+        extension.model.provider = "open-router".to_string();
+        extension.model.base_url = "https://extension.example.test/v1".to_string();
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![native]);
+        registry
+            .merge_extension_entries(vec![extension.clone()])
+            .expect("declare independent alias provider");
+        assert_eq!(
+            registry
+                .find("open-router", "shared")
+                .unwrap()
+                .model
+                .base_url,
+            extension.model.base_url
+        );
+        registry
+            .merge_extension_registry(&[], Vec::new())
+            .expect("retire extension snapshot");
+        assert!(registry.find("open-router", "shared").is_none());
+        assert!(registry.resolve("open-router", "shared").is_none());
+        assert!(
+            registry
+                .refresh_model_choices([&extension], false)
+                .is_empty()
+        );
+        assert!(registry.find("openrouter", "shared").is_some());
+        assert!(
+            registry
+                .resolve("openai", "unlisted-native-model")
+                .is_some()
+        );
+        registry.merge_missing_entries(vec![extension.clone()]);
+        assert!(registry.find("open-router", "shared").is_none());
+
+        // A new manual row is admissible under a currently active provider,
+        // including one that deliberately starts with an empty model list.
+        registry
+            .merge_extension_registry(
+                &[ExtensionProviderBinding {
+                    provider: "open-router".to_string(),
+                    oauth_config: None,
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+        registry.merge_missing_entries(vec![extension]);
+        assert!(registry.find("open-router", "shared").is_some());
+    }
+
+    #[test]
+    fn live_model_choices_keep_admission_order_and_refresh_without_alias_collapse() {
+        let mut native = ad_hoc_model_entry("openrouter", "shared").expect("native entry");
+        native.api_key = None;
+        native.model.name = "Current native".to_string();
+        let mut declared = native.clone();
+        declared.model.provider = "open-router".to_string();
+        declared.model.name = "Current declared".to_string();
+        declared.api_key = Some("declared-key".to_string());
+        let mut added = declared.clone();
+        added.model.provider = "new-provider".to_string();
+        added.model.id = "new-model".to_string();
+        let mut unavailable = added.clone();
+        unavailable.model.id = "unavailable".to_string();
+        unavailable.api_key = None;
+        let registry = ModelRegistry::from_entries_for_tests(vec![
+            native.clone(),
+            declared.clone(),
+            added,
+            unavailable,
+        ]);
+        let mut stale_native = native;
+        stale_native.model.name = "Old name".to_string();
+        stale_native.api_key = Some("expired-admission-key".to_string());
+        let mut missing = stale_native.clone();
+        missing.model.id = "removed".to_string();
+        let admitted = [&declared, &stale_native, &missing, &declared];
+        let scoped = registry.refresh_model_choices(admitted, false);
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped[0].model.provider, "open-router");
+        assert_eq!(scoped[1].model.provider, "openrouter");
+        assert_eq!(scoped[1].model.name, "Current native");
+        assert!(
+            scoped[1].api_key.is_none(),
+            "admitted choices retain live auth errors"
+        );
+        let all = registry.refresh_model_choices(admitted, true);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].model.provider, "new-provider");
+    }
+
+    #[test]
     fn apply_custom_models_dedupes_openrouter_alias_conflicts() {
         let (_dir, auth) = test_auth_storage();
         let mut models = Vec::new();
@@ -11030,6 +11271,7 @@ mod tests {
         let registry = ModelRegistry {
             models,
             error: None,
+            ..ModelRegistry::default()
         };
 
         assert!(

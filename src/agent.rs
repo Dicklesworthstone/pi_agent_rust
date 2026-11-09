@@ -7800,7 +7800,7 @@ pub struct AgentSession {
     memory_settings: Option<crate::config::MemorySettings>,
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
-    model_registry: Option<ModelRegistry>,
+    model_registry: Option<Arc<ModelRegistry>>,
     auth_storage: Option<AuthStorage>,
     /// Distinguishes this owner from sessions reusing the same registry snapshots.
     media_auth_owner: Arc<()>,
@@ -8266,6 +8266,9 @@ struct PreparedModelSelection {
     provider_id: String,
     model_id: String,
     thinking_level: crate::model::ThinkingLevel,
+    registry: Option<Arc<ModelRegistry>>,
+    extension_revision: Option<u64>,
+    extension_model: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8381,6 +8384,35 @@ struct ExtensionAiCompletionHostState {
     compaction_privacy: Arc<StdMutex<compaction::CompactionPrivacy>>,
 }
 
+impl ExtensionAiCompletionHostState {
+    fn refresh_provider_catalog(&mut self) -> Result<()> {
+        let Some(manager) = self.compaction_models.provider_manager.upgrade() else {
+            return Ok(());
+        };
+        let Some(catalog) =
+            manager.extension_provider_catalog(self.compaction_models.provider_revision)?
+        else {
+            return Ok(());
+        };
+        let mut registry = self
+            .compaction_models
+            .registry
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
+        registry.merge_extension_registry(&catalog.bindings, catalog.entries)?;
+        let models = pi_ai_model_registry_values(&registry);
+        // Commit only after the complete projection validates. An invalid
+        // snapshot cannot partly replace routes or retire still-usable rows.
+        self.compaction_models.registry = Some(Arc::new(registry));
+        self.compaction_models.provider_revision = Some(catalog.revision);
+        self.compaction_models.js_provider_ids = catalog.stream_provider_ids;
+        self.models = models.clone();
+        manager.set_extension_models(models);
+        Ok(())
+    }
+}
+
 /// Live model selection state shared by extension session adapters. Reading this
 /// handle never acquires the outer AgentSession lock held during a turn.
 #[derive(Clone)]
@@ -8391,17 +8423,28 @@ pub(crate) struct ExtensionModelCatalog {
 pub(crate) struct ExtensionModelCatalogSnapshot {
     registry: Option<Arc<ModelRegistry>>,
     active_provider: Arc<dyn Provider>,
+    extension_revision: Option<u64>,
+    active_extension_model: bool,
+    active_provider_revision: Option<u64>,
 }
 
 impl ExtensionModelCatalog {
+    pub(crate) fn registry_snapshot(&self) -> Result<Option<Arc<ModelRegistry>>> {
+        Ok(self.snapshot()?.registry)
+    }
+
     pub(crate) fn snapshot(&self) -> Result<ExtensionModelCatalogSnapshot> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
+        state.refresh_provider_catalog()?;
         Ok(ExtensionModelCatalogSnapshot {
             registry: state.compaction_models.registry.clone(),
             active_provider: Arc::clone(&state.provider),
+            extension_revision: state.compaction_models.provider_revision,
+            active_extension_model: state.compaction_models.active_extension_model,
+            active_provider_revision: state.compaction_models.active_provider_revision,
         })
     }
 }
@@ -8428,7 +8471,12 @@ impl ExtensionModelCatalogSnapshot {
         if let Some(entry) = self.find(provider, model_id) {
             return Ok((entry.model.provider, entry.model.id));
         }
-        if self.active_provider.name().eq_ignore_ascii_case(provider)
+        if !self.active_extension_model
+            && self
+                .registry
+                .as_ref()
+                .is_none_or(|registry| !registry.extension_provider_was_registered(provider))
+            && self.active_provider.name().eq_ignore_ascii_case(provider)
             && self
                 .active_provider
                 .model_id()
@@ -8517,6 +8565,10 @@ impl Provider for AutomaticCompactionProvider {
 #[derive(Clone, Default)]
 struct ExtensionCompactionModelState {
     registry: Option<Arc<ModelRegistry>>,
+    provider_manager: crate::extensions::ExtensionManagerHandle,
+    provider_revision: Option<u64>,
+    active_extension_model: bool,
+    active_provider_revision: Option<u64>,
     auth: Option<Arc<AuthStorage>>,
     js_provider_ids: Vec<String>,
     api_key_override: Option<String>,
@@ -8647,6 +8699,23 @@ impl ExtensionCompactionModelState {
 
         let same_provider = resolved_provider == current_provider.name();
         let same_model = same_provider && resolved_model == current_provider.model_id();
+        if same_model
+            && entry.is_none()
+            && (self.active_extension_model
+                || self.registry.as_ref().is_some_and(|registry| {
+                    registry.extension_provider_was_registered(provider_id)
+                }))
+        {
+            return Err(Error::validation(format!(
+                "{operation}: model {provider_id}/{model_id} is no longer registered"
+            )));
+        }
+        let registration_changed = same_model
+            && (self.active_extension_model
+                || self.registry.as_ref().is_some_and(|registry| {
+                    registry.extension_manages_model(resolved_provider, resolved_model)
+                }))
+            && self.provider_revision != self.active_provider_revision;
         stream_options.thinking_level = stream_options.thinking_level.map(|level| {
             entry
                 .as_ref()
@@ -8655,7 +8724,7 @@ impl ExtensionCompactionModelState {
         // The normal provider hook can itself be the extension awaiting this
         // request. The summary engine also clears it for ordinary callers.
         stream_options.before_provider_request = None;
-        if same_model {
+        if same_model && !registration_changed {
             self.refresh_current_key(current_provider.as_ref(), &mut stream_options)?;
             return Ok((current_provider, stream_options));
         }
@@ -8675,14 +8744,14 @@ impl ExtensionCompactionModelState {
             None
         } else if let Some(auth) = &self.auth {
             crate::models::resolve_model_key(explicit, auth, &entry)?.or_else(|| {
-                same_provider
+                (same_provider && !registration_changed)
                     .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
                     .flatten()
             })
         } else {
             normalize_api_key_opt(explicit.map(str::to_string))
                 .or_else(|| {
-                    same_provider
+                    (same_provider && !registration_changed)
                         .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
                         .flatten()
                 })
@@ -8812,6 +8881,13 @@ impl AgentSessionHostActions {
 
 #[async_trait]
 impl ExtensionHostActions for AgentSessionHostActions {
+    fn refresh_model_catalog(&self) -> Result<()> {
+        self.ai_completion
+            .lock()
+            .map_err(|_| Error::extension("extension completion host state mutex poisoned"))?
+            .refresh_provider_catalog()
+    }
+
     async fn send_message(
         &self,
         message: ExtensionSendMessage,
@@ -8875,9 +8951,10 @@ impl ExtensionHostActions for AgentSessionHostActions {
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
         let (provider, stream_options, models) = {
-            let state = self.ai_completion.lock().map_err(|_| {
+            let mut state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
+            state.refresh_provider_catalog()?;
             (
                 Arc::clone(&state.provider),
                 state.stream_options.clone(),
@@ -8944,10 +9021,20 @@ impl ExtensionHostActions for AgentSessionHostActions {
     }
 
     async fn list_ai_models(&self) -> Result<Value> {
-        let state = self.ai_completion.lock().map_err(|_| {
+        let mut state = self.ai_completion.lock().map_err(|_| {
             Error::extension("extension completion host state mutex poisoned".to_string())
         })?;
-        if state.models.is_empty() {
+        state.refresh_provider_catalog()?;
+        if state.models.is_empty()
+            && !state.compaction_models.active_extension_model
+            && state
+                .compaction_models
+                .registry
+                .as_ref()
+                .is_none_or(|registry| {
+                    !registry.extension_provider_was_registered(state.provider.name())
+                })
+        {
             return Ok(json!([{
                 "id": state.provider.model_id(),
                 "name": state.provider.model_id(),
@@ -8977,9 +9064,10 @@ impl ExtensionHostActions for AgentSessionHostActions {
         // handlers -- so an extension calling compact() from inside
         // `session_before_compact` cannot deadlock.
         let (provider, stream_options, models, privacy) = {
-            let state = self.ai_completion.lock().map_err(|_| {
+            let mut state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
+            state.refresh_provider_catalog()?;
             (
                 Arc::clone(&state.provider),
                 state.stream_options.clone(),
@@ -13190,20 +13278,23 @@ mod extensions_integration_tests {
             true,
         )]);
 
-        // Without extensions nothing can read the compaction registry, so
-        // setting the registry and auth does not build it.
+        // Read-only model selectors can retain the shared catalog even without
+        // extensions. It shares the native Arc rather than copying all rows;
+        // expensive compaction credentials are still initialized lazily.
         session.set_model_registry(registry.clone());
         session.set_auth_storage(auth.clone());
-        assert!(
-            session
-                .extension_ai_completion
-                .lock()
-                .unwrap()
-                .compaction_models
-                .registry
-                .is_none(),
-            "the compaction registry is built only for sessions with extensions"
-        );
+        {
+            let state = session.extension_ai_completion.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                state
+                    .compaction_models
+                    .registry
+                    .as_ref()
+                    .expect("shared catalog"),
+                session.model_registry.as_ref().expect("native catalog"),
+            ));
+            assert!(state.compaction_models.auth.is_none());
+        }
 
         // With extensions it follows every registry and auth update.
         session.extensions = Some(crate::extensions::ExtensionRegion::new(
@@ -18937,7 +19028,15 @@ impl AgentSession {
                 .manager()
                 .set_extension_models(pi_ai_model_registry_values(&registry));
         }
-        self.model_registry = Some(registry);
+        let extension_model =
+            registry.extension_manages_model(provider.name(), provider.model_id());
+        self.model_registry = Some(Arc::new(registry));
+        if let Ok(mut state) = self.extension_ai_completion.lock() {
+            state.compaction_models.registry = self.model_registry.clone();
+            state.compaction_models.provider_revision = None;
+            state.compaction_models.active_extension_model |= extension_model;
+            state.compaction_models.active_provider_revision = None;
+        }
         self.refresh_extension_compaction_models();
     }
 
@@ -19106,8 +19205,17 @@ impl AgentSession {
     /// not currently available. Use it to resolve identity before filtering
     /// destinations for readiness or admission.
     #[must_use]
-    pub const fn model_registry(&self) -> Option<&ModelRegistry> {
-        self.model_registry.as_ref()
+    pub fn model_registry(&self) -> Option<&ModelRegistry> {
+        self.model_registry.as_deref()
+    }
+
+    /// The live catalog shared by native selection and extension model APIs.
+    /// Stable provider generations reuse the same Arc without rebuilding rows.
+    pub fn model_registry_snapshot(&self) -> Result<Option<Arc<ModelRegistry>>> {
+        if self.extensions.is_none() {
+            return Ok(self.model_registry.clone());
+        }
+        Ok(self.extension_model_catalog().snapshot()?.registry)
     }
 
     pub(crate) fn extension_model_catalog(&self) -> ExtensionModelCatalog {
@@ -19174,7 +19282,21 @@ impl AgentSession {
             tracing::error!("extension completion host state mutex poisoned; keeping stale state");
             return;
         };
-        state.provider = self.agent.provider();
+        let provider = self.agent.provider();
+        if !Arc::ptr_eq(&state.provider, &provider) {
+            // Some frontends construct and install providers themselves.
+            // Never mark that instance as matching a newer catalog generation
+            // merely because its provider/model IDs happen to be unchanged.
+            state.compaction_models.active_extension_model = state
+                .compaction_models
+                .registry
+                .as_ref()
+                .is_some_and(|registry| {
+                    registry.extension_provider_was_registered(provider.name())
+                });
+            state.compaction_models.active_provider_revision = None;
+        }
+        state.provider = provider;
         state.stream_options = self.agent.stream_options().clone();
         state
             .compaction_models
@@ -19191,42 +19313,33 @@ impl AgentSession {
     }
 
     fn refresh_extension_compaction_models(&self) {
-        // Only extensions read this state (`ctx.compact` with a `model`), and
-        // building it deep-copies the whole model registry and auth store.
-        // Startup sets both, so a session without extensions paid for two
-        // copies it could never use, several milliseconds of every start.
-        // Installing extensions calls this again, so they still get it.
-        if self.extensions.is_none() {
+        // Credential updates must retain the newest shared catalog, including
+        // registrations observed by a read-only selector before native model
+        // installation. Only set_model_registry replaces the host baseline.
+        let Some(region) = &self.extensions else {
             return;
-        }
-        let models = ExtensionCompactionModelState {
-            registry: self.model_registry.clone().map(Arc::new),
-            auth: self.auth_storage.clone().map(Arc::new),
-            api_key_override: self.api_key_override.clone(),
-            api_key_override_provider: self.api_key_override_provider.clone(),
-            recovery_cli_api_key: self.recovery_cli_api_key.clone(),
-            js_provider_ids: self.extensions.as_ref().map_or_else(Vec::new, |region| {
-                region
-                    .manager()
-                    .extension_providers()
-                    .iter()
-                    .filter(|spec| {
-                        spec.get("hasStreamSimple")
-                            .and_then(Value::as_bool)
-                            .or_else(|| spec.get("streamSimple").and_then(Value::as_bool))
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|spec| spec.get("id").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            }),
         };
+        let manager = region.manager().handle();
+        let auth = self.auth_storage.clone().map(Arc::new);
         let Ok(mut state) = self.extension_ai_completion.lock() else {
             tracing::error!(
                 "extension completion host state mutex poisoned; keeping stale compaction registry"
             );
             return;
         };
-        state.compaction_models = models;
+        let models = &mut state.compaction_models;
+        if !models.provider_manager.same_manager(&manager) {
+            models.provider_manager = manager;
+            models.provider_revision = None;
+        }
+        models.auth = auth;
+        models.api_key_override.clone_from(&self.api_key_override);
+        models
+            .api_key_override_provider
+            .clone_from(&self.api_key_override_provider);
+        models
+            .recovery_cli_api_key
+            .clone_from(&self.recovery_cli_api_key);
     }
 
     fn set_extension_ai_models(&self, models: Vec<Value>) {
@@ -19318,13 +19431,29 @@ impl AgentSession {
         let active_provider = self.agent.provider();
         let requested_matches_active =
             active_provider.name().eq(provider_id) && active_provider.model_id().eq(model_id);
-        let entry = self
-            .model_registry
+        let (registry, extension_revision, active_extension_model, active_provider_revision) =
+            if self.extensions.is_some() {
+                let catalog = self.extension_model_catalog().snapshot()?;
+                (
+                    catalog.registry,
+                    catalog.extension_revision,
+                    catalog.active_extension_model,
+                    catalog.active_provider_revision,
+                )
+            } else {
+                (self.model_registry.clone(), None, false, None)
+            };
+        let entry = registry
             .as_ref()
             .and_then(|registry| registry.find(provider_id, model_id));
 
         let Some(entry) = entry else {
-            if !requested_matches_active {
+            if !requested_matches_active
+                || active_extension_model
+                || registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.extension_provider_was_registered(provider_id))
+            {
                 return Err(Error::validation(format!(
                     "Unable to switch provider/model to {provider_id}/{model_id}"
                 )));
@@ -19348,6 +19477,9 @@ impl AgentSession {
                 provider_id: active_provider.name().to_string(),
                 model_id: active_provider.model_id().to_string(),
                 thinking_level: requested_thinking,
+                registry,
+                extension_revision,
+                extension_model: false,
             });
         };
 
@@ -19355,9 +19487,14 @@ impl AgentSession {
         let canonical_model_id = entry.model.id.clone();
         let already_active = active_provider.name().eq(&canonical_provider_id)
             && active_provider.model_id().eq(&canonical_model_id);
+        let extension_model = registry.as_ref().is_some_and(|registry| {
+            registry.extension_manages_model(&canonical_provider_id, &canonical_model_id)
+        });
+        let registration_changed = (extension_model || active_extension_model)
+            && extension_revision != active_provider_revision;
         let requires_credential = model_requires_configured_credential(&entry);
         let resolved_key = self.resolve_stream_api_key_for_model(&entry)?.or_else(|| {
-            (already_active && requires_credential)
+            (already_active && !registration_changed && requires_credential)
                 .then(|| self.agent.stream_options().api_key.clone())
                 .flatten()
         });
@@ -19366,7 +19503,7 @@ impl AgentSession {
                 "Missing credentials for {provider_id}/{model_id}"
             )));
         }
-        let provider = if already_active {
+        let provider = if already_active && !registration_changed {
             None
         } else {
             Some(
@@ -19391,6 +19528,9 @@ impl AgentSession {
             provider_id: canonical_provider_id,
             model_id: canonical_model_id,
             thinking_level,
+            registry,
+            extension_revision,
+            extension_model,
         })
     }
 
@@ -19398,6 +19538,7 @@ impl AgentSession {
         let active_provider = self.agent.provider();
         if active_provider.name() != prepared.provider_id
             || active_provider.model_id() != prepared.model_id
+            || prepared.provider.is_some()
         {
             self.invalidate_background_compaction();
         }
@@ -19408,6 +19549,9 @@ impl AgentSession {
             provider_id,
             model_id,
             thinking_level,
+            registry,
+            extension_revision,
+            extension_model,
         } = prepared;
         if let Some(provider) = provider {
             tracing::info!("Updating agent provider to {provider_id}/{model_id}");
@@ -19446,7 +19590,12 @@ impl AgentSession {
                 .manager()
                 .set_current_model(Some(provider_id), Some(model_id));
         }
+        self.model_registry = registry;
         self.refresh_extension_completion_host_state();
+        if let Ok(mut state) = self.extension_ai_completion.lock() {
+            state.compaction_models.active_extension_model = extension_model;
+            state.compaction_models.active_provider_revision = extension_revision;
+        }
     }
 
     pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
@@ -19594,10 +19743,8 @@ impl AgentSession {
             .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
         if automatic {
             let runtime = self.agent.provider();
-            let catalog = self
-                .model_registry
-                .as_ref()
-                .map_or(&[][..], ModelRegistry::models);
+            let registry = self.model_registry_snapshot()?;
+            let catalog = registry.as_deref().map_or(&[][..], ModelRegistry::models);
             let model_matches = previous_model.as_ref().is_none_or(|(provider, model)| {
                 crate::models::model_identities_match(
                     catalog,
@@ -19689,8 +19836,7 @@ impl AgentSession {
             return Ok(Some(current.clone()));
         }
         let entry = self
-            .model_registry
-            .as_ref()
+            .model_registry_snapshot()?
             .and_then(|registry| registry.find(&target.provider, &target.model))
             .ok_or_else(|| Error::validation("PREWALK_TARGET: select a registered model"))?;
         let thinking = target.thinking.unwrap_or_else(|| {
@@ -19754,8 +19900,7 @@ impl AgentSession {
         let _session_action = session_actions.acquire_origin(&origin).await?;
 
         let registry = self
-            .model_registry
-            .as_ref()
+            .model_registry_snapshot()?
             .ok_or_else(|| Error::validation("PREWALK_SOURCE: select a registered model"))?;
         let source_entry = registry
             .find(&source.provider, &source.model)
@@ -19902,8 +20047,9 @@ impl AgentSession {
     /// cannot be resolved degrades the same way everywhere.
     pub fn current_model_entry(&self) -> Option<ModelEntry> {
         let provider = self.agent.provider();
-        self.model_registry
-            .as_ref()
+        self.model_registry_snapshot()
+            .ok()
+            .flatten()
             .and_then(|registry| registry.find(provider.name(), provider.model_id()))
     }
 
@@ -19913,8 +20059,9 @@ impl AgentSession {
         model_id: &str,
         level: crate::model::ThinkingLevel,
     ) -> crate::model::ThinkingLevel {
-        self.model_registry
-            .as_ref()
+        self.model_registry_snapshot()
+            .ok()
+            .flatten()
             .and_then(|registry| registry.find(provider_id, model_id))
             .map_or(level, |entry| entry.clamp_thinking_level(level))
     }
@@ -20320,9 +20467,9 @@ impl AgentSession {
     ) -> Result<Option<RestoredPrimary>> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let (active_provider, active_model) = request.active;
-        let catalog = self
-            .model_registry
-            .as_ref()
+        let registry = self.model_registry_snapshot()?;
+        let catalog = registry
+            .as_deref()
             .map_or(request.available_models, ModelRegistry::models);
 
         // The runtime must still be on the fallback the caller recorded.
@@ -20466,13 +20613,14 @@ impl AgentSession {
         request: &PrimaryRestoreRequest<'_>,
     ) -> Result<Option<(crate::models::ModelEntry, Option<String>)>> {
         let primary = request.primary;
-        let catalog = self
-            .model_registry
-            .as_ref()
+        let registry = self.model_registry_snapshot()?;
+        let catalog = registry
+            .as_deref()
             .map_or(request.available_models, ModelRegistry::models);
-        let Some(entry) =
-            crate::models::resolve_model_entry(catalog, &primary.provider, &primary.model_id)
-        else {
+        let Some(entry) = registry.as_ref().map_or_else(
+            || crate::models::resolve_model_entry(catalog, &primary.provider, &primary.model_id),
+            |registry| registry.resolve(&primary.provider, &primary.model_id),
+        ) else {
             if request.strict_invariants {
                 return Err(Error::validation(format!(
                     "Unable to restore primary provider/model {}/{}",
@@ -20673,9 +20821,9 @@ impl AgentSession {
             &from_model,
         );
         loop {
-            let catalog = self
-                .model_registry
-                .as_ref()
+            let registry = self.model_registry_snapshot()?;
+            let catalog = registry
+                .as_deref()
                 .map_or(attempt.available_models, ModelRegistry::models);
             let Some((entry_index, spec)) = walk.next_spec(catalog) else {
                 break;
@@ -20685,6 +20833,15 @@ impl AgentSession {
             else {
                 continue;
             };
+            if let Some(registry) = &registry
+                && let Some((requested_provider, _)) =
+                    crate::provider_metadata::split_provider_model_spec(spec)
+                && registry
+                    .resolve(requested_provider, &entry.model.id)
+                    .is_none()
+            {
+                continue;
+            }
             if !self.fallback_provider_allowed(&entry.model.provider) {
                 continue;
             }
@@ -22755,7 +22912,8 @@ impl AgentSession {
             // Startup hooks can select models before `self.extensions` is
             // installed. Seed the same catalog that subsequent registry refreshes
             // keep current for runtime model selection and compaction.
-            state.compaction_models.registry = self.model_registry.clone().map(Arc::new);
+            state.compaction_models.registry = self.model_registry.clone();
+            state.compaction_models.provider_revision = None;
         }
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
@@ -22864,7 +23022,7 @@ impl AgentSession {
         // that just loaded. Validate a private registration snapshot for those
         // hooks; the caller still owns final credential refresh and selection.
         let bindings = crate::models::extension_provider_bindings(&manager.extension_providers())?;
-        let mut hook_registry = self.model_registry.clone().unwrap_or_default();
+        let mut hook_registry = self.model_registry.as_deref().cloned().unwrap_or_default();
         hook_registry.merge_extension_registry(&bindings, manager.extension_model_entries())?;
         manager.set_extension_models(pi_ai_model_registry_values(&hook_registry));
         {
@@ -22873,6 +23031,8 @@ impl AgentSession {
                 .lock()
                 .map_err(|_| Error::extension("Failed to publish the startup model catalog"))?;
             state.compaction_models.registry = Some(Arc::new(hook_registry));
+            state.compaction_models.provider_manager = manager.handle();
+            state.compaction_models.provider_revision = None;
         }
 
         // Fire the `startup` lifecycle hook once extensions are loaded.

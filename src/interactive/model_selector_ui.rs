@@ -59,6 +59,10 @@ impl PiApp {
             self.status_message = Some("Cannot switch models while processing".to_string());
             return;
         }
+        if let Err(error) = self.refresh_runtime_model_choices() {
+            self.status_message = Some(error);
+            return;
+        }
 
         if self.available_models.is_empty() {
             self.status_message = Some("No models available".to_string());
@@ -73,6 +77,10 @@ impl PiApp {
     pub(super) fn open_model_selector_configured_only(&mut self) {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot switch models while processing".to_string());
+            return;
+        }
+        if let Err(error) = self.refresh_runtime_model_choices() {
+            self.status_message = Some(error);
             return;
         }
 
@@ -131,6 +139,10 @@ impl PiApp {
 
     /// Apply a model selection from the model selector overlay.
     fn apply_model_selection(&mut self, selected: &crate::model_selector::ModelKey) {
+        if let Err(error) = self.refresh_runtime_model_choices() {
+            self.status_message = Some(error);
+            return;
+        }
         // Find the matching ModelEntry from available_models
         let entry = self
             .available_models

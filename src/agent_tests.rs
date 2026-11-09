@@ -5543,6 +5543,444 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn late_provider_registration_replaces_routes_and_retires_only_owned_models() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut manual = extension_switch_entry("Dynamic-Provider", "manual");
+            manual.oauth_config = Some(crate::models::OAuthConfig {
+                auth_url: "https://manual.example.test/authorize".to_string(),
+                token_url: "https://manual.example.test/token".to_string(),
+                client_id: "manual-client".to_string(),
+                scopes: vec!["manual-scope".to_string()],
+                redirect_uri: None,
+            });
+            let mut session = build_extension_switch_session(
+                vec![
+                    extension_switch_entry("host-native", "base"),
+                    manual.clone(),
+                ],
+                ("host-native", "base"),
+                dir.path(),
+                r#"export default function init(pi) {
+                    pi.registerCommand("publish-provider", {
+                        handler: async (raw) => {
+                            const request = JSON.parse(raw);
+                            pi.registerProvider("dynamic-provider", request);
+                            const models = await pi.events("getModels", {});
+                            await pi.session("setModel", {
+                                provider: "dynamic-provider", modelId: "chat"
+                            });
+                            return models.filter(model => model.provider === "dynamic-provider");
+                        }
+                    });
+                }"#,
+            )
+            .await;
+            let shared_catalog = session.extension_model_catalog();
+            let first_spec = json!({
+                "api": "openai-completions",
+                "baseUrl": "https://first.example.test/v1",
+                "apiKey": "first-dynamic-key",
+                "headers": { "x-dynamic": "first" },
+                "oauth": {
+                    "authUrl": "https://extension.example.test/authorize",
+                    "tokenUrl": "https://extension.example.test/token",
+                    "clientId": "extension-client"
+                },
+                "models": [
+                    { "id": "chat", "maxTokens": 4096, "contextWindow": 64000 },
+                    { "id": "obsolete" },
+                    { "id": "manual", "maxTokens": 1 }
+                ]
+            });
+            let listed = session
+                .execute_extension_command(
+                    "publish-provider",
+                    &first_spec.to_string(),
+                    5_000,
+                    |_| {},
+                )
+                .await
+                .expect("register, list and select in one JavaScript handler");
+            assert!(
+                listed
+                    .as_array()
+                    .expect("listed models")
+                    .iter()
+                    .any(|model| { model["id"] == "chat" && model["maxTokens"] == 4096 })
+            );
+            session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .expect("install late registration");
+            let first_provider = session.agent.provider();
+            let first_catalog = shared_catalog.registry_snapshot().unwrap().unwrap();
+            assert!(Arc::ptr_eq(
+                &first_catalog,
+                &shared_catalog.registry_snapshot().unwrap().unwrap()
+            ));
+            assert_eq!(
+                session.agent.stream_options().api_key.as_deref(),
+                Some("first-dynamic-key")
+            );
+            let retained = first_catalog.find("dynamic-provider", "manual").unwrap();
+            assert_eq!(retained.model.base_url, manual.model.base_url);
+            assert_eq!(retained.api_key, manual.api_key);
+            assert_eq!(retained.headers, manual.headers);
+            assert_eq!(retained.model.max_tokens, manual.model.max_tokens);
+
+            // Re-registering identical metadata neither rebuilds the catalog
+            // nor replaces a working provider instance.
+            session
+                .execute_extension_command(
+                    "publish-provider",
+                    &first_spec.to_string(),
+                    5_000,
+                    |_| {},
+                )
+                .await
+                .expect("identical registration");
+            session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&first_provider, &session.agent.provider()));
+            assert!(Arc::ptr_eq(
+                &first_catalog,
+                &shared_catalog.registry_snapshot().unwrap().unwrap()
+            ));
+
+            let mut replacement = first_spec;
+            replacement["baseUrl"] = json!("https://replacement.example.test/v1");
+            replacement["apiKey"] = json!("replacement-dynamic-key");
+            replacement["headers"] = json!({"x-dynamic": "replacement"});
+            replacement["models"] = json!([
+                { "id": "chat", "name": "Replacement", "maxTokens": 2048 },
+                { "id": "newly-added" }
+            ]);
+            session
+                .execute_extension_command(
+                    "publish-provider",
+                    &replacement.to_string(),
+                    5_000,
+                    |_| {},
+                )
+                .await
+                .expect("replace same-owner registration");
+            session
+                .sync_runtime_selection_from_session_header()
+                .await
+                .unwrap();
+            assert!(!Arc::ptr_eq(&first_provider, &session.agent.provider()));
+            assert_eq!(
+                session.agent.stream_options().api_key.as_deref(),
+                Some("replacement-dynamic-key")
+            );
+            assert_eq!(
+                session.agent.stream_options().headers["x-dynamic"],
+                "replacement"
+            );
+            assert_eq!(session.agent.stream_options().max_tokens, Some(2048));
+            let replaced = session.model_registry_snapshot().unwrap().unwrap();
+            let old_choice = first_catalog.find("dynamic-provider", "chat").unwrap();
+            assert_eq!(
+                replaced
+                    .find("dynamic-provider", "chat")
+                    .unwrap()
+                    .model
+                    .base_url,
+                "https://replacement.example.test/v1"
+            );
+            assert!(replaced.find("dynamic-provider", "obsolete").is_none());
+            assert!(replaced.find("dynamic-provider", "newly-added").is_some());
+
+            let manager = session.extensions.as_ref().unwrap().manager().clone();
+            manager
+                .load_js_extensions(Vec::new())
+                .await
+                .expect("unload owner");
+            let retired = shared_catalog.registry_snapshot().unwrap().unwrap();
+            assert!(retired.find("dynamic-provider", "chat").is_none());
+            assert!(
+                retired
+                    .refresh_model_choices([&old_choice], false)
+                    .is_empty()
+            );
+            let restored = retired.find("Dynamic-Provider", "manual").unwrap();
+            assert_eq!(restored.model.provider, manual.model.provider);
+            assert_eq!(restored.oauth_config, manual.oauth_config);
+            assert_eq!(restored.model.base_url, manual.model.base_url);
+            assert_eq!(restored.headers, manual.headers);
+            assert!(
+                session
+                    .set_provider_model("dynamic-provider", "chat")
+                    .await
+                    .is_err()
+            );
+            let bridge = manager.session_handle().unwrap();
+            let origin = session.session_action_admission.capture_origin();
+            assert!(
+                bridge
+                    .set_model("dynamic-provider".into(), "chat".into(), Some(origin))
+                    .await
+                    .is_err()
+            );
+            session
+                .set_provider_model("host-native", "base")
+                .await
+                .expect("native route survives");
+
+            let next_owner = dir.path().join("replacement-owner.mjs");
+            std::fs::write(
+                &next_owner,
+                r#"export default function init(pi) {
+                    pi.registerProvider("dynamic-provider", {
+                        api: "openai-completions", apiKey: "new-owner-key",
+                        baseUrl: "https://new-owner.example.test/v1",
+                        models: [{ id: "chat" }]
+                    });
+                }"#,
+            )
+            .unwrap();
+            manager
+                .load_js_extensions(vec![
+                    crate::extensions::JsExtensionLoadSpec::from_entry_path(&next_owner).unwrap(),
+                ])
+                .await
+                .expect("a new owner can register the retired provider name");
+            session
+                .set_provider_model("dynamic-provider", "chat")
+                .await
+                .expect("select the new owner's route");
+            assert_eq!(
+                session.agent.stream_options().api_key.as_deref(),
+                Some("new-owner-key")
+            );
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn read_only_provider_retirement_survives_auth_refresh_and_stale_installation() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut session = build_extension_switch_session(
+                vec![extension_switch_entry("openrouter", "shared")],
+                ("openrouter", "shared"),
+                dir.path(),
+                r#"export default function init(pi) {
+                    pi.registerCommand("register-only", {
+                        handler: () => pi.registerProvider("open-router", {
+                            api: "openai-completions", apiKey: "late-key",
+                            baseUrl: "https://late-alias.example.test/v1",
+                            models: [{ id: "shared", name: "Late alias" }]
+                        })
+                    });
+                    pi.registerCommand("lookup-late", {
+                        handler: (_args, ctx) => ctx.modelRegistry.find("open-router", "shared")
+                    });
+                }"#,
+            )
+            .await;
+            let shared = session.extension_model_catalog();
+            session
+                .execute_extension_command("register-only", "", 5_000, |_| {})
+                .await
+                .expect("register without a model hostcall");
+            let lookup = session
+                .execute_extension_command("lookup-late", "", 5_000, |_| {})
+                .await
+                .expect("next synchronous context sees the registration");
+            assert_eq!(lookup["name"], "Late alias");
+            let declared = shared
+                .registry_snapshot()
+                .unwrap()
+                .unwrap()
+                .find("open-router", "shared")
+                .unwrap();
+            assert_eq!(session.agent.provider().name(), "openrouter");
+            let manager = session.extensions.as_ref().unwrap().manager().clone();
+            manager.load_js_extensions(Vec::new()).await.unwrap();
+            let retired = shared.registry_snapshot().unwrap().unwrap();
+            assert!(retired.find("open-router", "shared").is_none());
+            session.set_auth_storage(AuthStorage::empty_at(dir.path().join("auth.json")));
+            let refreshed = shared.registry_snapshot().unwrap().unwrap();
+            assert!(Arc::ptr_eq(&retired, &refreshed));
+            assert!(refreshed.resolve("open-router", "shared").is_none());
+            assert!(refreshed.find("openrouter", "shared").is_some());
+
+            // A frontend may have constructed this instance before removal
+            // and only finish its durable selection afterward.
+            let stale = crate::providers::create_provider(&declared, None).unwrap();
+            session.agent.set_provider(stale);
+            session.refresh_extension_completion_host_state();
+            assert!(
+                shared
+                    .snapshot()
+                    .unwrap()
+                    .resolve_selection("open-router", "shared")
+                    .is_err()
+            );
+            assert!(
+                session
+                    .set_provider_model("open-router", "shared")
+                    .await
+                    .is_err()
+            );
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dynamically_registered_stream_provider_runs_and_invalid_replacement_is_retired() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut session = build_extension_switch_session(
+                vec![extension_switch_entry("host-native", "base")],
+                ("host-native", "base"),
+                dir.path(),
+                r#"export default function init(pi) {
+                    pi.registerCommand("late-stream", {
+                        handler: async (mode) => {
+                            pi.registerProvider("dynamic-stream", {
+                                api: "extension-stream-test", apiKey: "fixture-key",
+                                models: mode === "invalid" ? [{ id: "chat" }, { id: "CHAT" }]
+                                    : [{ id: "chat", contextWindow: 64000, maxTokens: 4096 }],
+                                streamSimple: async function* (model) {
+                                    const message = {
+                                        role: "assistant", content: [{ type: "text", text: "late provider reply" }],
+                                        api: model.api, provider: model.provider, model: model.id,
+                                        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+                                            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+                                        stopReason: "stop", timestamp: 0
+                                    };
+                                    yield { type: "done", reason: "stop", message };
+                                }
+                            });
+                            if (mode !== "invalid") await pi.setModel("dynamic-stream", "chat");
+                        }
+                    });
+                }"#,
+            )
+            .await;
+            session
+                .execute_extension_command("late-stream", "valid", 5_000, |_| {})
+                .await
+                .expect("late custom transport registration");
+            let reply = session
+                .run_text("hello".to_string(), |_| {})
+                .await
+                .expect("use the registered stream through normal AgentSession admission");
+            assert_eq!(assistant_text_content(&reply.content), "late provider reply");
+            assert_eq!(reply.provider, "dynamic-stream");
+            session.set_model_registry(ModelRegistry::default());
+            let actions = AgentSessionHostActions {
+                session: Arc::clone(&session.session),
+                injected: Arc::clone(session.extension_injected_queue.as_ref().unwrap()),
+                is_streaming: Arc::clone(&session.extensions_is_streaming),
+                is_turn_active: Arc::clone(&session.extensions_turn_active),
+                pending_idle_actions: Arc::clone(&session.extensions_pending_idle_actions),
+                ai_completion: Arc::clone(&session.extension_ai_completion),
+                provider_admission: session.provider_admission.clone(),
+                session_action_admission: session.session_action_admission.clone(),
+            };
+            let error = session
+                .execute_extension_command("late-stream", "invalid", 5_000, |_| {})
+                .await
+                .expect_err("duplicate model identities quarantine their owner");
+            assert!(error.to_string().contains("canonical registry identity"));
+            let registry = session.model_registry_snapshot().unwrap().unwrap();
+            assert!(registry.find("dynamic-stream", "chat").is_none());
+            assert!(registry.models().is_empty());
+            assert_eq!(actions.list_ai_models().await.unwrap(), json!([]));
+            assert!(
+                session
+                    .set_provider_model("dynamic-stream", "chat")
+                    .await
+                    .is_err()
+            );
+            let manager = session.extensions.as_ref().unwrap().manager();
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn cancelled_provider_registration_retires_its_published_catalog() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut session = build_extension_switch_session(
+                vec![extension_switch_entry("host-native", "base")],
+                ("host-native", "base"),
+                dir.path(),
+                r#"export default function init(pi) {
+                    pi.registerCommand("publish-and-wait", {
+                        handler: async () => {
+                            pi.registerProvider("cancelled-provider", {
+                                api: "openai-completions", apiKey: "fixture-key",
+                                baseUrl: "https://cancelled.example.test/v1",
+                                models: [{ id: "chat" }]
+                            });
+                            await pi.events("getModels", {});
+                            await new Promise(() => {});
+                        }
+                    });
+                }"#,
+            )
+            .await;
+            let catalog = session.extension_model_catalog();
+            let manager = session.extensions.as_ref().unwrap().manager().clone();
+            let (abort, signal) = AbortHandle::new();
+            let observe_then_abort = async {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut observed = false;
+                while Instant::now() < deadline {
+                    if catalog
+                        .registry_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .find("cancelled-provider", "chat")
+                        .is_some()
+                    {
+                        observed = true;
+                        break;
+                    }
+                    asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(1))
+                        .await;
+                }
+                abort.abort();
+                observed
+            };
+            let command = session.execute_extension_command_with_abort(
+                "publish-and-wait",
+                "",
+                10_000,
+                Some(signal),
+                |_| {},
+            );
+            let (result, observed) = futures::join!(command, observe_then_abort);
+            assert!(observed, "abort follows actual catalog publication");
+            assert!(result.is_err());
+            manager.runtime().unwrap().pump_once().await.unwrap();
+            let retired = catalog.registry_snapshot().unwrap().unwrap();
+            assert!(retired.find("cancelled-provider", "chat").is_none());
+            assert!(retired.find("host-native", "base").is_some());
+            assert!(
+                session
+                    .set_provider_model("cancelled-provider", "chat")
+                    .await
+                    .is_err()
+            );
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // one fixture run in both catalog orders
     fn failover_keeps_full_catalog_identity_and_exact_admission() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");

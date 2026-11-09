@@ -1177,6 +1177,12 @@ pub trait ExtensionHostActions: Send + Sync {
         ))
     }
 
+    /// Refresh the credential-free model projection before constructing a
+    /// handler context. Hosts with a static catalog have nothing to update.
+    fn refresh_model_catalog(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Run summary compaction using the session provider or a registered
     /// public model identity. The host owns endpoint and credential resolution;
     /// extensions can supply summary guidance and a requested thinking level.
@@ -11474,6 +11480,7 @@ mod tool_progress_tests {
 enum JsRuntimeCommand {
     LoadExtensions {
         specs: Vec<JsExtensionLoadSpec>,
+        provider_generation: Uuid,
         origin: Option<SessionActionOrigin>,
         deadline: Instant,
         reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
@@ -11591,6 +11598,9 @@ struct JsRuntimeShard {
     extension_id: String,
     runtime: Rc<PiJsRuntime>,
     snapshot: JsExtensionSnapshot,
+    published_provider_specs: Vec<Value>,
+    provider_actor: Weak<JsActorLifecycle>,
+    provider_generation: Option<Uuid>,
     /// An idle turn polls at most one FIFO dispatch. Retaining its future here
     /// preserves its admission lease, provenance and eventual completion while
     /// the actor receives commands or advances another extension's timers.
@@ -11653,6 +11663,9 @@ struct JsRuntimeShardSet {
     provider_stream_routes: HashMap<String, JsProviderStreamRoute>,
     next_provider_stream_id: u64,
     pump_cursor: usize,
+    /// Weak owner installed only after a cold candidate is accepted. Candidate
+    /// initialization must not publish registrations into the live manager.
+    provider_manager: Option<ExtensionManagerHandle>,
 }
 
 #[derive(Default)]
@@ -11899,7 +11912,28 @@ impl JsRuntimeShardSet {
         if let Some(fault) = shard.pump_fault.as_deref() {
             return Err(Error::extension(fault.to_string()));
         }
+        if !self.provider_generation_ready(shard_index) {
+            return Err(Error::extension(
+                "JS extension load is awaiting catalog activation",
+            ));
+        }
         Ok(())
+    }
+
+    fn provider_generation_ready(&self, shard_index: usize) -> bool {
+        let Some(manager) = &self.provider_manager else {
+            return true;
+        };
+        manager.upgrade().is_some_and(|manager| {
+            let shard = &self.shards[shard_index];
+            if shard.provider_generation.is_none() {
+                // A quarantined iterator may run cleanup after publication
+                // authority was revoked; that is not an unaccepted load.
+                return true;
+            }
+            manager
+                .runtime_provider_generation_ready(&shard.provider_actor, shard.provider_generation)
+        })
     }
 
     fn rebuild_indexes(&mut self) -> Result<()> {
@@ -12316,6 +12350,7 @@ impl JsExtensionRuntimeHandle {
                         JsRuntimeCommand::Shutdown => break,
                         JsRuntimeCommand::LoadExtensions {
                             specs,
+                            provider_generation,
                             origin,
                             deadline,
                             reply,
@@ -12393,9 +12428,30 @@ impl JsExtensionRuntimeHandle {
                                         )
                                         .await;
                                     }
+                                    if reply.is_closed() || actor_lifecycle.is_stopped() {
+                                        continue;
+                                    }
+                                    if let Err(err) =
+                                        js_runtime_remaining_timeout_ms(deadline, "load")
+                                    {
+                                        let _ = reply.send(&cx, Err(err));
+                                        continue;
+                                    }
                                     candidate.next_provider_stream_id = next_provider_stream_id;
                                     let snapshots = candidate.snapshots();
                                     let shard_count = candidate.shards.len();
+                                    if let Some(manager) = host.manager()
+                                        && manager.begin_runtime_provider_generation(
+                                            &Arc::downgrade(&actor_lifecycle),
+                                            provider_generation,
+                                        )
+                                    {
+                                        candidate.provider_manager = Some(manager.handle());
+                                    }
+                                    for shard in &mut candidate.shards {
+                                        shard.provider_actor = Arc::downgrade(&actor_lifecycle);
+                                        shard.provider_generation = Some(provider_generation);
+                                    }
                                     shard_set = candidate;
                                     tracing::info!(
                                         event = "extension_runtime.shards.reload",
@@ -13085,6 +13141,7 @@ impl JsExtensionRuntimeHandle {
                 // Release retained dispatch futures and their admission/UI
                 // leases before acknowledging shutdown to application code.
                 // Each shard cancels its pending call before dropping its realm.
+                retire_runtime_provider_catalog(&shard_set);
                 drop(shard_set);
                 // Signal that the runtime thread has exited its event loop.
                 let _ = exit_tx.send(&cx, ());
@@ -13200,6 +13257,7 @@ impl JsExtensionRuntimeHandle {
     async fn load_extensions_snapshots(
         &self,
         specs: Vec<JsExtensionLoadSpec>,
+        provider_generation: Uuid,
     ) -> Result<Vec<JsExtensionSnapshot>> {
         let timeout_ms = EXTENSION_LOAD_BUDGET_MS;
         let deadline = js_runtime_request_deadline(timeout_ms);
@@ -13207,6 +13265,7 @@ impl JsExtensionRuntimeHandle {
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::LoadExtensions {
             specs,
+            provider_generation,
             origin: self.capture_session_action_origin(),
             deadline,
             reply: reply_tx,
@@ -15231,6 +15290,9 @@ async fn build_js_runtime_shards(
         candidate.shards.push(JsRuntimeShard {
             extension_id,
             runtime: Rc::new(runtime),
+            published_provider_specs: snapshot.providers.clone(),
+            provider_actor: Weak::new(),
+            provider_generation: None,
             snapshot,
             pending_idle_dispatch: None,
             pending_tool_dispatches: VecDeque::new(),
@@ -15341,6 +15403,7 @@ async fn scrub_and_drop_runtime_shards(
     // the only supported next step: drop every attempted realm and every
     // route/fault rather than retaining a Rust snapshot that cannot be proven
     // equivalent to a fresh realm.
+    retire_runtime_provider_catalog(shards);
     let next_provider_stream_id = shards.next_provider_stream_id;
     *shards = JsRuntimeShardSet {
         next_provider_stream_id,
@@ -15509,7 +15572,13 @@ async fn refresh_runtime_shard_snapshot(
         }
     };
     if new_snapshot == shards.shards[shard_index].snapshot {
-        return Ok(());
+        return publish_runtime_shard_providers(shards, shard_index).map_err(|error| {
+            quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("provider registry publication failed: {error}"),
+            )
+        });
     }
     let old_snapshot = std::mem::replace(&mut shards.shards[shard_index].snapshot, new_snapshot);
     if let Err(err) = shards.rebuild_indexes() {
@@ -15535,7 +15604,64 @@ async fn refresh_runtime_shard_snapshot(
         );
         return Err(quarantine_runtime_shard(shards, shard_index, &reason));
     }
+    if let Err(error) = publish_runtime_shard_providers(shards, shard_index) {
+        shards.shards[shard_index].snapshot = old_snapshot;
+        let _ = shards.rebuild_indexes();
+        return Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            &format!("provider registry publication failed: {error}"),
+        ));
+    }
     Ok(())
+}
+
+fn publish_runtime_shard_providers(
+    shards: &mut JsRuntimeShardSet,
+    shard_index: usize,
+) -> Result<()> {
+    let shard = &mut shards.shards[shard_index];
+    if shard.published_provider_specs == shard.snapshot.providers {
+        return Ok(());
+    }
+    if let Some(manager) = shards
+        .provider_manager
+        .as_ref()
+        .and_then(ExtensionManagerHandle::upgrade)
+        && manager.replace_runtime_provider_specs(
+            &shard.extension_id,
+            &shard.provider_actor,
+            shard.provider_generation,
+            &shard.published_provider_specs,
+            &shard.snapshot.providers,
+        )?
+    {
+        shard
+            .published_provider_specs
+            .clone_from(&shard.snapshot.providers);
+    }
+    Ok(())
+}
+
+fn retire_runtime_provider_catalog(shards: &JsRuntimeShardSet) {
+    let Some(manager) = shards
+        .provider_manager
+        .as_ref()
+        .and_then(ExtensionManagerHandle::upgrade)
+    else {
+        return;
+    };
+    for shard in &shards.shards {
+        if let Err(error) = manager.replace_runtime_provider_specs(
+            &shard.extension_id,
+            &shard.provider_actor,
+            shard.provider_generation,
+            &shard.published_provider_specs,
+            &[],
+        ) {
+            tracing::warn!(%error, "Failed to retire stopped provider registrations");
+        }
+    }
 }
 
 fn quarantine_runtime_shard(
@@ -15543,6 +15669,13 @@ fn quarantine_runtime_shard(
     shard_index: usize,
     reason: &str,
 ) -> Error {
+    if let Some(fault) = shards
+        .shards
+        .get(shard_index)
+        .and_then(|shard| shard.pump_fault.as_ref())
+    {
+        return Error::extension(fault.clone());
+    }
     let extension_id = shards.shards.get(shard_index).map_or_else(
         || "<missing>".to_string(),
         |shard| shard.extension_id.clone(),
@@ -15552,6 +15685,23 @@ fn quarantine_runtime_shard(
         shard.cancel_idle_dispatch();
         shard.runtime.cancel_native_resources_for_quarantine();
         shard.pump_fault = Some(fault.clone());
+        if let Some(manager) = shards
+            .provider_manager
+            .as_ref()
+            .and_then(ExtensionManagerHandle::upgrade)
+            && let Err(error) = manager.replace_runtime_provider_specs(
+                &extension_id,
+                &shard.provider_actor,
+                shard.provider_generation,
+                &shard.published_provider_specs,
+                &[],
+            )
+        {
+            tracing::warn!(%error, "Failed to retire quarantined provider registrations");
+        }
+        // Iterator cleanup may temporarily clear pump_fault to run return().
+        // It must never regain authority to publish registrations.
+        shard.provider_generation = None;
     }
     tracing::error!(
         event = "extension_runtime.shards.quarantined",
@@ -17598,6 +17748,61 @@ fn retain_hostcall_dispatch(
     }
 }
 
+/// Model selection inside a handler must see providers registered earlier in
+/// that same handler. This path runs only for installed shards, never cold
+/// candidate initialization, and still validates the complete owned catalog.
+#[allow(clippy::future_not_send)]
+async fn publish_providers_before_model_hostcall(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+    request: &HostcallRequest,
+) -> Result<()> {
+    if !shard.runtime.is_hostcall_active(&request.call_id) {
+        return Ok(());
+    }
+    let uses_model_catalog = match &request.kind {
+        HostcallKind::Events { op } => matches!(
+            parse_events_hostcall_op(op),
+            Some(
+                EventsHostcallOp::GetModels
+                    | EventsHostcallOp::SetModel
+                    | EventsHostcallOp::CompleteAi
+                    | EventsHostcallOp::Compact
+            )
+        ),
+        HostcallKind::Session { op } => {
+            matches!(
+                parse_session_hostcall_op(op),
+                Some(SessionHostcallOp::SetModel)
+            )
+        }
+        _ => false,
+    };
+    if !uses_model_catalog {
+        return Ok(());
+    }
+    let snapshot = require_single_shard_snapshot(
+        snapshot_extensions(&shard.runtime).await?,
+        &shard.extension_id,
+    )?;
+    if !shard.runtime.is_hostcall_active(&request.call_id) {
+        return Ok(());
+    }
+    if shard.published_provider_specs != snapshot.providers
+        && let Some(manager) = host.manager()
+        && manager.replace_runtime_provider_specs(
+            &shard.extension_id,
+            &shard.provider_actor,
+            shard.provider_generation,
+            &shard.published_provider_specs,
+            &snapshot.providers,
+        )?
+    {
+        shard.published_provider_specs = snapshot.providers;
+    }
+    Ok(())
+}
+
 struct IdleRuntimeProgress {
     has_pending: bool,
     ran_javascript: bool,
@@ -17635,6 +17840,7 @@ async fn pump_active_runtime_shard(
         let Some(request) = shard.runtime.pop_hostcall_request() else {
             break;
         };
+        publish_providers_before_model_hostcall(shard, host, &request).await?;
         let pending = retain_hostcall_dispatch(shard, host, request);
         shard.pending_tool_dispatches.push_back(pending);
     }
@@ -17673,6 +17879,7 @@ async fn pump_idle_runtime_shard(
     if shard.pending_idle_dispatch.is_none()
         && let Some(request) = shard.runtime.pop_hostcall_request()
     {
+        publish_providers_before_model_hostcall(shard, host, &request).await?;
         shard.pending_idle_dispatch = Some(retain_hostcall_dispatch(shard, host, request));
     }
     poll_idle_hostcall(shard).await;
@@ -17687,8 +17894,11 @@ fn idle_runtime_poll_delay(shards: &JsRuntimeShardSet) -> Option<Duration> {
     shards
         .shards
         .iter()
-        .filter(|shard| shard.pump_fault.is_none())
-        .filter_map(|shard| {
+        .enumerate()
+        .filter(|(index, shard)| {
+            shard.pump_fault.is_none() && shards.provider_generation_ready(*index)
+        })
+        .filter_map(|(_, shard)| {
             let delay = shard.runtime.idle_poll_delay_ms();
             if shard.pending_idle_dispatch.is_some() || !shard.pending_tool_dispatches.is_empty() {
                 Some(delay.unwrap_or(10).min(10))
@@ -17713,6 +17923,9 @@ async fn pump_idle_runtime_shards(shards: &mut JsRuntimeShardSet, host: &JsRunti
     let start = shards.pump_cursor % shard_count;
     for offset in 0..shard_count {
         let shard_index = (start + offset) % shard_count;
+        if !shards.provider_generation_ready(shard_index) {
+            continue;
+        }
         let shard = &mut shards.shards[shard_index];
         if shard.pump_fault.is_some()
             || (shard.pending_idle_dispatch.is_none()
@@ -17751,11 +17964,10 @@ async fn pump_runtime_shard_for_command(
     host: &JsRuntimeHost,
     root_deadline: Option<Instant>,
 ) -> Result<bool> {
-    if !shard.pending_tool_dispatches.is_empty() {
-        pump_active_runtime_shard(shard, host)
-            .await
-            .map(|progress| progress.has_pending)
-    } else if shard.pending_idle_dispatch.is_some() {
+    if let Some(deadline) = root_deadline {
+        js_runtime_remaining_timeout_ms(deadline, "runtime pump")?;
+    }
+    if shard.pending_tool_dispatches.is_empty() && shard.pending_idle_dispatch.is_some() {
         // A command may depend on idle initialization already in progress.
         // Poll that same future without overtaking it with newer hostcalls or
         // attaching the new command's deadline to the earlier operation.
@@ -17763,13 +17975,12 @@ async fn pump_runtime_shard_for_command(
             .await
             .map(|progress| progress.has_pending)
     } else {
-        pump_js_runtime_once_for_owner(
-            &shard.runtime,
-            host,
-            Some(&shard.extension_id),
-            root_deadline,
-        )
-        .await
+        // Installed stream callbacks need the same owned publication and
+        // bounded dispatch path as commands. Cold initialization still uses
+        // the standalone runtime pump before a shard can publish providers.
+        pump_active_runtime_shard(shard, host)
+            .await
+            .map(|progress| progress.has_pending)
     }
 }
 
@@ -17862,6 +18073,9 @@ mod idle_runtime_tests {
                 runtime: Rc::new(runtime),
                 snapshot: serde_json::from_value(json!({ "id": "tool-pump-fixture" }))
                     .expect("fixture snapshot"),
+                published_provider_specs: Vec::new(),
+                provider_actor: Weak::new(),
+                provider_generation: None,
                 pending_idle_dispatch: None,
                 pending_tool_dispatches: VecDeque::new(),
                 pump_fault: None,
@@ -18156,6 +18370,9 @@ mod idle_runtime_tests {
                 runtime: Rc::new(runtime),
                 snapshot: serde_json::from_value(json!({ "id": "idle-fifo-fixture" }))
                     .expect("fixture snapshot"),
+                published_provider_specs: Vec::new(),
+                provider_actor: Weak::new(),
+                provider_generation: None,
                 pending_idle_dispatch: Some(pending),
                 pending_tool_dispatches: VecDeque::new(),
                 pump_fault: None,
@@ -18404,18 +18621,11 @@ async fn pump_js_runtime_shards_once_for_target(
                 shards.pump_cursor = (shard_index + 1) % shard_count;
                 Ok(pending)
             }
-            Err(err) => {
-                let extension_id = shards.shards[shard_index].extension_id.clone();
-                let fault = format!(
-                    "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
-                );
-                shards.shards[shard_index].cancel_idle_dispatch();
-                shards.shards[shard_index]
-                    .runtime
-                    .cancel_native_resources_for_quarantine();
-                shards.shards[shard_index].pump_fault = Some(fault.clone());
-                Err(Error::extension(fault))
-            }
+            Err(err) => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("runtime pump failed: {err}"),
+            )),
         };
     }
 
@@ -18424,7 +18634,9 @@ async fn pump_js_runtime_shards_once_for_target(
     let mut first_fault = None;
     for offset in 0..shard_count {
         let shard_index = (start + offset) % shard_count;
-        if shards.shards[shard_index].pump_fault.is_some() {
+        if shards.shards[shard_index].pump_fault.is_some()
+            || !shards.provider_generation_ready(shard_index)
+        {
             continue;
         }
         let pump_result = {
@@ -18441,17 +18653,11 @@ async fn pump_js_runtime_shards_once_for_target(
             Ok(pending) => has_pending |= pending,
             Err(err) => {
                 let extension_id = shards.shards[shard_index].extension_id.clone();
-                let fault = format!(
-                    "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
+                let fault = quarantine_runtime_shard(
+                    shards,
+                    shard_index,
+                    &format!("runtime pump failed: {err}"),
                 );
-                shards.shards[shard_index].cancel_idle_dispatch();
-                shards.shards[shard_index]
-                    .runtime
-                    .cancel_native_resources_for_quarantine();
-                shards.shards[shard_index].pump_fault = Some(fault.clone());
-                if first_fault.is_none() {
-                    first_fault = Some(fault.clone());
-                }
                 tracing::error!(
                     event = "extension_runtime.shards.pump_quarantined",
                     extension_id,
@@ -18459,11 +18665,14 @@ async fn pump_js_runtime_shards_once_for_target(
                     error = %fault,
                     "Quarantined a failed shard and continued pumping healthy peers"
                 );
+                if first_fault.is_none() {
+                    first_fault = Some(fault);
+                }
             }
         }
     }
     shards.pump_cursor = (start + 1) % shard_count;
-    first_fault.map_or_else(|| Ok(has_pending), |fault| Err(Error::extension(fault)))
+    first_fault.map_or_else(|| Ok(has_pending), Err)
 }
 
 #[derive(Debug, Deserialize)]
@@ -23686,6 +23895,15 @@ async fn await_js_task_in_shards_and_refresh(
     }
 }
 
+/// One accepted generation of provider metadata, projected from one manager
+/// snapshot so model rows and transport ownership cannot come from two loads.
+pub(crate) struct ExtensionProviderCatalog {
+    pub revision: u64,
+    pub bindings: Vec<crate::models::ExtensionProviderBinding>,
+    pub entries: Vec<crate::models::ModelEntry>,
+    pub stream_provider_ids: Vec<String>,
+}
+
 /// Immutable snapshot of frequently-read extension registry metadata.
 ///
 /// Published via RCU-style swap: writers hold the mutex, build a new snapshot,
@@ -23693,6 +23911,8 @@ async fn await_js_task_in_shards_and_refresh(
 /// any lock, paying only an atomic increment for the refcount.
 #[derive(Clone, Default)]
 pub(crate) struct RegistrySnapshot {
+    /// Total writer order assigned while holding the manager mutex.
+    publication_revision: u64,
     /// Number of registered/loaded extensions.
     pub extension_count: usize,
     /// Pre-computed set of event names with at least one registered hook.
@@ -23705,6 +23925,8 @@ pub(crate) struct RegistrySnapshot {
     pub active_tools: Option<Vec<String>>,
     /// Registered provider specs.
     pub providers: Vec<Value>,
+    /// Changes only when provider ownership or registration metadata changes.
+    pub provider_revision: u64,
     /// Registered MCP server specs.
     pub mcp_servers: Vec<Value>,
     /// Registered flags.
@@ -23780,32 +24002,30 @@ pub struct ExtensionManager {
 #[derive(Clone, Default)]
 pub(crate) struct ExtensionManagerHandle {
     inner: Weak<Mutex<ExtensionManagerInner>>,
-    snapshot: Option<Arc<RwLock<Arc<RegistrySnapshot>>>>,
-    snapshot_version: Option<Arc<AtomicU64>>,
+    snapshot: Weak<RwLock<Arc<RegistrySnapshot>>>,
+    snapshot_version: Weak<AtomicU64>,
 }
 
 impl ExtensionManagerHandle {
     fn new(manager: &ExtensionManager) -> Self {
         Self {
             inner: Arc::downgrade(&manager.inner),
-            snapshot: Some(Arc::clone(&manager.snapshot)),
-            snapshot_version: Some(Arc::clone(&manager.snapshot_version)),
+            snapshot: Arc::downgrade(&manager.snapshot),
+            snapshot_version: Arc::downgrade(&manager.snapshot_version),
         }
     }
 
-    fn upgrade(&self) -> Option<ExtensionManager> {
-        self.inner.upgrade().map(|inner| ExtensionManager {
-            inner,
+    pub(crate) fn upgrade(&self) -> Option<ExtensionManager> {
+        Some(ExtensionManager {
+            inner: self.inner.upgrade()?,
             runtime_owner_lifetime: None,
-            snapshot: self
-                .snapshot
-                .clone()
-                .unwrap_or_else(|| Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default())))),
-            snapshot_version: self
-                .snapshot_version
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+            snapshot: self.snapshot.upgrade()?,
+            snapshot_version: self.snapshot_version.upgrade()?,
         })
+    }
+
+    pub(crate) fn same_manager(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.inner, &other.inner)
     }
 }
 
@@ -23824,6 +24044,7 @@ struct CachedEventContext {
 
 #[derive(Default)]
 struct ExtensionManagerInner {
+    snapshot_publication_revision: u64,
     extensions: Vec<RegisterPayload>,
     /// Runtime principal for each `extensions` entry at the same index.
     /// Display names are intentionally kept separate from security identity.
@@ -23848,6 +24069,9 @@ struct ExtensionManagerInner {
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
     providers: Vec<Value>,
+    provider_revision: u64,
+    js_provider_generation: Option<Uuid>,
+    js_provider_catalog_ready: bool,
     mcp_servers: Vec<Value>,
     flags: Vec<Value>,
     cwd: Option<String>,

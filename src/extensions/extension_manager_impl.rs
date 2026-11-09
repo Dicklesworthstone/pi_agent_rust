@@ -134,7 +134,8 @@ impl ExtensionManager {
     /// Build a `RegistrySnapshot` from the current inner state.
     ///
     /// Caller must already hold the mutex on `inner`.
-    fn build_snapshot_from_inner(inner: &ExtensionManagerInner) -> RegistrySnapshot {
+    fn build_snapshot_from_inner(inner: &mut ExtensionManagerInner) -> RegistrySnapshot {
+        inner.snapshot_publication_revision = inner.snapshot_publication_revision.wrapping_add(1);
         // Pre-compute derived views so readers never touch the mutex.
         let all_flags = Self::precompute_all_flags(inner);
         let all_commands = Self::precompute_all_commands(inner);
@@ -144,12 +145,14 @@ impl ExtensionManager {
         let command_names = Self::precompute_command_names(inner);
 
         RegistrySnapshot {
+            publication_revision: inner.snapshot_publication_revision,
             extension_count: inner.extensions.len(),
             hook_bitmap: inner.hook_bitmap.clone(),
             has_any_hooks: !inner.hook_bitmap.is_empty(),
             session: inner.session.clone(),
             active_tools: inner.active_tools.clone(),
             providers: inner.providers.clone(),
+            provider_revision: inner.provider_revision,
             mcp_servers: inner.mcp_servers.clone(),
             flags: inner.flags.clone(),
             cwd: inner.cwd.clone(),
@@ -317,13 +320,20 @@ impl ExtensionManager {
     /// Previous readers keep their `Arc` alive until they drop it.
     fn publish_snapshot(&self, snap: RegistrySnapshot) {
         let version = snap.version;
-        {
-            let mut guard = match self.snapshot.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard = Arc::new(snap);
+        let mut guard = match self.snapshot.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let advancement = snap
+            .publication_revision
+            .wrapping_sub(guard.publication_revision);
+        if advancement == 0 || advancement > u64::MAX / 2 {
+            // Snapshot construction is serialized, publication is not. A
+            // paused older writer must never restore removed provider rows
+            // or roll the frontend cache version backwards.
+            return;
         }
+        *guard = Arc::new(snap);
         self.snapshot_version.store(version, StdOrdering::Release);
     }
 
@@ -350,7 +360,7 @@ impl ExtensionManager {
     /// Call this after any mutation to fields captured in `RegistrySnapshot`.
     /// Caller must already hold the mutex.
     #[allow(dead_code)]
-    fn refresh_snapshot_locked(&self, inner: &ExtensionManagerInner) {
+    fn refresh_snapshot_locked(&self, inner: &mut ExtensionManagerInner) {
         let snap = Self::build_snapshot_from_inner(inner);
         self.publish_snapshot(snap);
     }
@@ -359,9 +369,9 @@ impl ExtensionManager {
     /// publishing to avoid prolonging lock hold time.
     fn refresh_snapshot_with_guard_release(
         &self,
-        guard: std::sync::MutexGuard<'_, ExtensionManagerInner>,
+        mut guard: std::sync::MutexGuard<'_, ExtensionManagerInner>,
     ) {
-        let snap = Self::build_snapshot_from_inner(&guard);
+        let snap = Self::build_snapshot_from_inner(&mut guard);
         drop(guard);
         self.publish_snapshot(snap);
     }
@@ -2925,8 +2935,7 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
-    #[cfg(feature = "wasm-host")]
-    pub(super) fn handle(&self) -> ExtensionManagerHandle {
+    pub(crate) fn handle(&self) -> ExtensionManagerHandle {
         ExtensionManagerHandle::new(self)
     }
 
@@ -3203,7 +3212,10 @@ impl ExtensionManager {
             None
         };
 
-        let snapshots = runtime.load_js_extensions_snapshots(specs).await?;
+        let provider_generation = Uuid::new_v4();
+        let snapshots = runtime
+            .load_js_extensions_snapshots(specs, provider_generation)
+            .await?;
 
         let mut payloads = Vec::new();
         let mut extension_ids = Vec::new();
@@ -3296,12 +3308,24 @@ impl ExtensionManager {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.js_provider_generation != Some(provider_generation)
+                || !matches!((&guard.runtime, &runtime),
+                    (Some(ExtensionRuntimeHandle::Js(current)), ExtensionRuntimeHandle::Js(loaded))
+                        if Weak::ptr_eq(&current.actor_lifecycle, &loaded.actor_lifecycle)
+                            && loaded.actor_lifecycle.upgrade().is_some_and(|actor| !actor.is_stopped()))
+            {
+                return Err(Error::extension(
+                    "JS extension load was superseded before catalog installation",
+                ));
+            }
             guard.extensions = payloads;
             guard.extension_ids = extension_ids;
             guard.extension_roots = extension_roots;
             guard.extension_versions = extension_versions;
             guard.active_tools = active_tools;
             guard.providers = all_providers;
+            guard.provider_revision = guard.provider_revision.wrapping_add(1);
+            guard.js_provider_catalog_ready = true;
             guard.mcp_servers = all_mcp_servers;
             guard.flags = all_flags;
             // Rebuild hook_bitmap from the freshly-loaded extensions so that
@@ -3325,6 +3349,9 @@ impl ExtensionManager {
                 .retain(|ext_id, _| active_extension_ids.contains(ext_id));
             self.refresh_snapshot_with_guard_release(guard);
         }
+        // Release the accepted generation's queued background work and
+        // reconcile its provider snapshot before the load is reported ready.
+        runtime.pump_once().await?;
         Ok(())
     }
 
@@ -3431,6 +3458,9 @@ impl ExtensionManager {
             guard.extension_versions = extension_versions;
             guard.active_tools = active_tools;
             guard.providers = all_providers;
+            guard.provider_revision = guard.provider_revision.wrapping_add(1);
+            guard.js_provider_generation = None;
+            guard.js_provider_catalog_ready = false;
             guard.mcp_servers = all_mcp_servers;
             guard.flags = all_flags;
             guard.hook_bitmap.clear();
@@ -3786,7 +3816,7 @@ impl ExtensionManager {
                 .is_none_or(|existing| js_command_route_name(&existing) != normalized_name)
         });
         target.slash_commands.push(entry);
-        let snapshot = Self::build_snapshot_from_inner(&guard);
+        let snapshot = Self::build_snapshot_from_inner(&mut guard);
         drop(guard);
         self.publish_snapshot(snapshot);
         Ok(())
@@ -3799,6 +3829,7 @@ impl ExtensionManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.providers.push(payload);
+        guard.provider_revision = guard.provider_revision.wrapping_add(1);
         self.refresh_snapshot_with_guard_release(guard);
     }
 
@@ -3843,15 +3874,144 @@ impl ExtensionManager {
                 "registerProvider: provider spec must be an object",
             ));
         }
-        guard.providers.retain(|provider| {
+        let mut providers = guard.providers.clone();
+        providers.retain(|provider| {
             provider.get("id").and_then(Value::as_str) != Some(provider_id.as_str())
                 || provider.get("extension_id").and_then(Value::as_str) != Some(extension_id)
         });
-        guard.providers.push(payload);
-        let snapshot = Self::build_snapshot_from_inner(&guard);
+        providers.push(payload);
+        if providers == guard.providers {
+            return Ok(());
+        }
+        let bindings = crate::models::extension_provider_bindings(&providers)?;
+        let entries = Self::model_entries_from_provider_specs(&providers);
+        crate::models::ModelRegistry::default().merge_extension_registry(&bindings, entries)?;
+        guard.providers = providers;
+        guard.provider_revision = guard.provider_revision.wrapping_add(1);
+        let snapshot = Self::build_snapshot_from_inner(&mut guard);
         drop(guard);
         self.publish_snapshot(snapshot);
         Ok(())
+    }
+
+    /// Publish only a loaded runtime principal's accepted provider delta.
+    /// Hostcall-only providers and registrations belonging to other owners
+    /// remain intact. Cold candidates cannot claim a principal before load.
+    pub(super) fn replace_runtime_provider_specs(
+        &self,
+        extension_id: &str,
+        actor: &Weak<JsActorLifecycle>,
+        provider_generation: Option<Uuid>,
+        previous: &[Value],
+        replacements: &[Value],
+    ) -> Result<bool> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(&guard.runtime, Some(ExtensionRuntimeHandle::Js(runtime))
+            if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
+            || provider_generation.is_none()
+            || guard.js_provider_generation != provider_generation
+            || !guard.js_provider_catalog_ready
+            || Self::extension_index_for_owner(&guard, extension_id).is_err()
+            || (!replacements.is_empty() && actor.upgrade().is_none_or(|actor| actor.is_stopped()))
+        {
+            return Ok(false);
+        }
+        let replaced_ids = previous
+            .iter()
+            .chain(replacements)
+            .filter_map(|spec| spec.get("id").and_then(Value::as_str))
+            .collect::<HashSet<_>>();
+        let mut providers = guard
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider.get("extension_id").and_then(Value::as_str) != Some(extension_id)
+                    || provider
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| !replaced_ids.contains(id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for replacement in replacements {
+            let mut replacement = replacement.clone();
+            let object = replacement.as_object_mut().ok_or_else(|| {
+                Error::extension("registerProvider: provider spec must be an object")
+            })?;
+            object.insert(
+                "extension_id".to_string(),
+                Value::String(extension_id.to_string()),
+            );
+            providers.push(replacement);
+        }
+        if providers == guard.providers {
+            return Ok(true);
+        }
+        // Validate the complete replacement before making any rows visible.
+        // This also rejects normalized cross-owner collisions and duplicate
+        // model IDs that the raw JavaScript route index does not normalize.
+        let bindings = crate::models::extension_provider_bindings(&providers)?;
+        let entries = Self::model_entries_from_provider_specs(&providers);
+        crate::models::ModelRegistry::default().merge_extension_registry(&bindings, entries)?;
+        guard.providers = providers;
+        guard.provider_revision = guard.provider_revision.wrapping_add(1);
+        let snapshot = Self::build_snapshot_from_inner(&mut guard);
+        drop(guard);
+        self.publish_snapshot(snapshot);
+        Ok(true)
+    }
+
+    /// Fence a cold replacement before its realms can run background work.
+    /// The caller installs the load snapshot before enabling this generation;
+    /// an older load completion cannot overwrite a newer candidate's catalog.
+    pub(super) fn begin_runtime_provider_generation(
+        &self,
+        actor: &Weak<JsActorLifecycle>,
+        provider_generation: Uuid,
+    ) -> bool {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(&guard.runtime, Some(ExtensionRuntimeHandle::Js(runtime))
+            if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
+        {
+            return false;
+        }
+        guard.js_provider_generation = Some(provider_generation);
+        guard.js_provider_catalog_ready = false;
+        let owners = guard.extension_ids.iter().cloned().collect::<HashSet<_>>();
+        let previous_len = guard.providers.len();
+        guard.providers.retain(|provider| {
+            provider
+                .get("extension_id")
+                .and_then(Value::as_str)
+                .is_none_or(|owner| !owners.contains(owner))
+        });
+        if guard.providers.len() != previous_len {
+            guard.provider_revision = guard.provider_revision.wrapping_add(1);
+            self.refresh_snapshot_with_guard_release(guard);
+        }
+        true
+    }
+
+    pub(super) fn runtime_provider_generation_ready(
+        &self,
+        actor: &Weak<JsActorLifecycle>,
+        provider_generation: Option<Uuid>,
+    ) -> bool {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        provider_generation.is_some()
+            && guard.js_provider_generation == provider_generation
+            && guard.js_provider_catalog_ready
+            && matches!(&guard.runtime, Some(ExtensionRuntimeHandle::Js(runtime))
+                if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
     }
 
     /// Dynamically register an MCP server at runtime (from a hostcall).
@@ -3947,7 +4107,7 @@ impl ExtensionManager {
                 || flag.get("extension_id").and_then(Value::as_str) != Some(extension_id)
         });
         guard.flags.push(spec);
-        let snapshot = Self::build_snapshot_from_inner(&guard);
+        let snapshot = Self::build_snapshot_from_inner(&mut guard);
         drop(guard);
         self.publish_snapshot(snapshot);
         Ok(())
@@ -3997,6 +4157,9 @@ impl ExtensionManager {
         // Handlers can run after ordinary session appends without a registry
         // change. Build their context afresh instead of reusing the lifecycle
         // cache, whose generation tracks registry mutations.
+        if let Some(actions) = self.host_actions() {
+            actions.refresh_model_catalog()?;
+        }
         let snapshot = self.read_snapshot();
         let context = Self::build_ctx_payload(&snapshot);
         let context = if let Some(abort) = &abort {
@@ -4094,14 +4257,49 @@ impl ExtensionManager {
     /// merging into the `ModelRegistry`.
     #[allow(clippy::too_many_lines)]
     pub fn extension_model_entries(&self) -> Vec<crate::models::ModelEntry> {
+        Self::model_entries_from_provider_specs(&self.read_snapshot().providers)
+    }
+
+    /// Read one provider generation for both registry projection and transport
+    /// selection. Unchanged catalogs do no schema parsing or credential lookup.
+    pub(crate) fn extension_provider_catalog(
+        &self,
+        known_revision: Option<u64>,
+    ) -> Result<Option<ExtensionProviderCatalog>> {
+        let snap = self.read_snapshot();
+        if known_revision == Some(snap.provider_revision) {
+            return Ok(None);
+        }
+        let bindings = crate::models::extension_provider_bindings(&snap.providers)?;
+        let entries = Self::model_entries_from_provider_specs(&snap.providers);
+        let stream_provider_ids = snap
+            .providers
+            .iter()
+            .filter(|spec| {
+                spec.get("hasStreamSimple")
+                    .and_then(Value::as_bool)
+                    .or_else(|| spec.get("streamSimple").and_then(Value::as_bool))
+                    .unwrap_or(false)
+            })
+            .filter_map(|spec| spec.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        Ok(Some(ExtensionProviderCatalog {
+            revision: snap.provider_revision,
+            bindings,
+            entries,
+            stream_provider_ids,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn model_entries_from_provider_specs(specs: &[Value]) -> Vec<crate::models::ModelEntry> {
         use crate::models::{CompatConfig, merge_compat};
         use crate::provider::{InputType, Model, ModelCost};
         use std::collections::HashMap;
 
-        let snap = self.read_snapshot();
         let mut entries = Vec::new();
 
-        for provider_spec in &snap.providers {
+        for provider_spec in specs {
             let provider_id = provider_spec
                 .get("id")
                 .and_then(Value::as_str)
@@ -4647,7 +4845,10 @@ impl ExtensionManager {
     /// stored for future dispatches within the same generation.
     ///
     /// Returns `Arc<Value>` so callers can share the payload cheaply.
-    async fn get_or_build_ctx_payload(&self) -> Arc<Value> {
+    async fn get_or_build_ctx_payload(&self) -> Result<Arc<Value>> {
+        if let Some(actions) = self.host_actions() {
+            actions.refresh_model_catalog()?;
+        }
         // Seqlock fast-path: read version without any lock.
         let version = self.snapshot_version();
 
@@ -4664,7 +4865,7 @@ impl ExtensionManager {
         if let Some(ref c) = cached
             && c.generation == version
         {
-            return Arc::clone(&c.payload);
+            return Ok(Arc::clone(&c.payload));
         }
 
         // Cache miss: read state from the RCU snapshot (no mutex needed).
@@ -4691,7 +4892,7 @@ impl ExtensionManager {
             }
         }
 
-        payload
+        Ok(payload)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4756,7 +4957,7 @@ impl ExtensionManager {
         );
 
         // --- Use cached context when generation hasn't changed ---
-        let mut ctx_payload = self.get_or_build_ctx_payload().await;
+        let mut ctx_payload = self.get_or_build_ctx_payload().await?;
         if let Some(usage) = context_usage {
             // This request's estimate must never enter the generation-cached
             // base context: messages can advance without registry mutations,
@@ -5181,7 +5382,7 @@ impl ExtensionManager {
             return Ok(());
         }
 
-        let ctx_payload = self.get_or_build_ctx_payload().await;
+        let ctx_payload = self.get_or_build_ctx_payload().await?;
 
         if let Some(runtime) = runtime {
             // Same record `dispatch_event_value` emits, for the same reason:
@@ -5266,7 +5467,7 @@ impl ExtensionManager {
 
         // Reuse cached event context payload instead of rebuilding session state
         // on every tool_call dispatch.
-        let ctx_payload = self.get_or_build_ctx_payload().await;
+        let ctx_payload = self.get_or_build_ctx_payload().await?;
         let event_payload = json!({
             "type": "tool_call",
             "toolName": tool_call.name.clone(),
@@ -5376,7 +5577,7 @@ impl ExtensionManager {
         }
 
         // Use cached context payload.
-        let ctx_payload = self.get_or_build_ctx_payload().await;
+        let ctx_payload = self.get_or_build_ctx_payload().await?;
 
         let event_payload = json!({
             "type": "tool_result",
@@ -5613,6 +5814,41 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         truncation: None,
         capture,
     })
+}
+
+#[cfg(test)]
+mod provider_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_snapshot_cannot_overwrite_a_newer_provider_catalog() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(json!({ "id": "first", "models": [{ "id": "chat" }] }));
+        let delayed = {
+            let mut inner = manager.inner.lock().unwrap();
+            ExtensionManager::build_snapshot_from_inner(&mut inner)
+        };
+        manager.register_provider(json!({ "id": "second", "models": [{ "id": "chat" }] }));
+        manager.set_current_model(Some("second".into()), Some("chat".into()));
+        let accepted = manager.read_snapshot();
+        manager.publish_snapshot(delayed);
+        let current = manager.read_snapshot();
+        assert!(Arc::ptr_eq(&accepted, &current));
+        assert_eq!(current.providers.len(), 2);
+        assert_eq!(current.current_provider.as_deref(), Some("second"));
+        assert_eq!(manager.snapshot_version(), current.version);
+    }
+
+    #[test]
+    fn catalog_source_handle_does_not_retain_the_session_snapshot() {
+        let manager = ExtensionManager::new();
+        let snapshot = Arc::downgrade(&manager.snapshot);
+        let handle = manager.handle();
+        assert!(handle.upgrade().is_some());
+        drop(manager);
+        assert!(snapshot.upgrade().is_none());
+        assert!(handle.upgrade().is_none());
+    }
 }
 
 #[cfg(test)]

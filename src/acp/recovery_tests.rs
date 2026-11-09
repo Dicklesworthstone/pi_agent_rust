@@ -2055,7 +2055,13 @@ fn launch_selection_reaches_the_configured_agent_and_session_metadata() {
             assert_eq!(stream.headers.get("x-acp-model").map(String::as_str), Some(expected_model));
             assert_eq!(stream.thinking_level.unwrap().to_string(), expected_effort);
             assert_eq!(stream.max_tokens, Some(if expected_model == PRIMARY_MODEL { 2_048 } else { 512 }));
-            let config = config_options_for_handle(handle, &options.available_models);
+            let config = config_options_for_handle(
+                handle,
+                &options.available_models,
+                &options.config,
+                root.path(),
+            )
+            .unwrap();
             assert_eq!(config[0]["currentValue"], format!("{expected_provider}/{expected_model}"));
             assert_eq!(config[1]["currentValue"], expected_effort);
             assert!(!config.to_string().contains("launch-fixture-key"));
@@ -2244,7 +2250,7 @@ fn selected_ad_hoc_model_remains_registered_for_runtime_switching() {
         .unwrap();
         {
             let guard = state.try_lock().unwrap();
-            let config = config_options_for(&guard).unwrap();
+            let config = config_options_for(&guard).unwrap().unwrap();
             assert!(
                 config[0]["options"]
                     .as_array()

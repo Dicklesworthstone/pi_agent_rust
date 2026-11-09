@@ -360,6 +360,10 @@ impl PiApp {
             self.status_message = Some("Cannot switch models while processing".to_string());
             return;
         }
+        if let Err(error) = self.refresh_runtime_model_choices() {
+            self.status_message = Some(error);
+            return;
+        }
 
         let scope_configured = self
             .config
@@ -373,6 +377,29 @@ impl PiApp {
         } else {
             self.available_models.clone()
         };
+        if use_scope && !candidates.is_empty() && self.extensions.is_some() {
+            let registry = self.agent.try_lock().ok().and_then(|agent| {
+                agent
+                    .handle
+                    .session()
+                    .model_registry_snapshot()
+                    .ok()
+                    .flatten()
+            });
+            let Some(registry) = registry else {
+                self.status_message = Some("Model catalog unavailable; try again".to_string());
+                return;
+            };
+            candidates = registry
+                .refresh_model_choices(&candidates, false)
+                .into_iter()
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                self.status_message = Some("No scoped models remain registered".to_string());
+                return;
+            }
+        }
         if use_scope && candidates.is_empty() {
             candidates.clone_from(&self.available_models);
             fell_back_to_available = true;

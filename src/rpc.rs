@@ -2827,20 +2827,32 @@ pub async fn run(
     let cx = AgentCx::for_current_or_request();
     // The available list can omit unready declared providers. Retain the full
     // catalog and admit option-only entries without replacing registry routes.
-    // This snapshot also lets get_state avoid the outer lock held by a stream.
-    let model_registry = session.model_registry().cloned().map(|mut registry| {
-        registry.merge_missing_entries(options.available_models.clone());
-        registry
-    });
-    if let Some(registry) = &model_registry {
-        session.set_model_registry(registry.clone());
+    let mut model_registry = session.model_registry().cloned();
+    if model_registry.is_none()
+        && let Some(region) = &session.extensions
+    {
+        // A host without a registry may supply its initial extension rows in
+        // options. Mark those rows as extension-owned before admitting the
+        // remaining host-only entries, so an unload can still retire them.
+        let registry = model_registry.get_or_insert_with(crate::models::ModelRegistry::default);
+        if let Some(catalog) = region.manager().extension_provider_catalog(None)? {
+            registry.merge_extension_registry(&catalog.bindings, catalog.entries)?;
+        }
     }
+    if let Some(mut registry) = model_registry {
+        registry.merge_missing_entries(options.available_models.clone());
+        session.set_model_registry(registry);
+    }
+    // Refresh extension registrations without acquiring the outer session lock
+    // held by a streaming turn. Unchanged generations reuse their catalog Arc.
+    let model_catalog = session.extension_model_catalog();
     let requested_cwd = options
         .working_directory
         .clone()
         .map_or_else(std::env::current_dir, Ok)?;
     let runtime_cwd = crate::workspace::validate_new_root(&requested_cwd)?;
     options.auth.set_command_working_directory(&runtime_cwd)?;
+    options.working_directory = Some(runtime_cwd.clone());
     session.set_auth_storage(options.auth.clone());
     session.set_recovery_cli_api_key(options.cli_api_key.clone());
     let session_handle = Arc::clone(&session.session);
@@ -4021,6 +4033,13 @@ pub async fn run(
             }
 
             "get_state" => {
+                let catalog = match model_catalog.registry_snapshot() {
+                    Ok(registry) => RpcModelCatalog::new(registry, &options),
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "get_state", &error));
+                        continue;
+                    }
+                };
                 let snapshot = {
                     let state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
@@ -4035,10 +4054,7 @@ pub async fn run(
                         })?;
                     session_state(
                         &inner_session,
-                        model_registry.as_ref().map_or(
-                            options.available_models.as_slice(),
-                            crate::models::ModelRegistry::models,
-                        ),
+                        catalog.header_model(&inner_session),
                         &snapshot,
                         &options.config,
                         is_streaming.load(Ordering::SeqCst),
@@ -4095,9 +4111,20 @@ pub async fn run(
             }
 
             "get_available_models" => {
-                let models = options
-                    .available_models
-                    .iter()
+                let catalog = match model_catalog.registry_snapshot() {
+                    Ok(registry) => RpcModelCatalog::new(registry, &options),
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id,
+                            "get_available_models",
+                            &error,
+                        ));
+                        continue;
+                    }
+                };
+                let models = catalog
+                    .available()
+                    .into_iter()
                     .map(rpc_model_from_entry)
                     .collect::<Vec<_>>();
                 let _ = out_tx.send(response_ok(
@@ -4129,11 +4156,8 @@ pub async fn run(
                     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let entry = model_entry_for_provider_and_id(
-                        provider,
-                        model_id,
-                        rpc_model_catalog(&guard, &options),
-                    )
+                    let entry = rpc_model_catalog(&guard, &options)?
+                    .find(provider, model_id)
                     .cloned()
                     .ok_or_else(|| {
                         Error::validation(format!(
@@ -4276,18 +4300,25 @@ pub async fn run(
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let catalog = match rpc_model_catalog(&guard, &options) {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "set_thinking_level",
+                                &error,
+                            ));
+                            continue;
+                        }
+                    };
                     let runtime_provider = guard.agent.provider().name().to_string();
                     let runtime_model_id = guard.agent.provider().model_id().to_string();
                     let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
-                    current_or_runtime_model_entry(
-                        &inner_session,
-                        &runtime_provider,
-                        &runtime_model_id,
-                        rpc_model_catalog(&guard, &options),
-                    )
-                    .map_or(level, |entry| entry.clamp_thinking_level(level))
+                    catalog
+                        .current_or_runtime(&inner_session, &runtime_provider, &runtime_model_id)
+                        .map_or(level, |entry| entry.clamp_thinking_level(level))
                 };
 
                 // Apply the thinking level without holding the lock across await
@@ -4316,19 +4347,30 @@ pub async fn run(
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let catalog = match rpc_model_catalog(&guard, &options) {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            let _ = out_tx.send(response_error_with_hints(
+                                id,
+                                "cycle_thinking_level",
+                                &error,
+                            ));
+                            continue;
+                        }
+                    };
                     let runtime_provider = guard.agent.provider().name().to_string();
                     let runtime_model_id = guard.agent.provider().model_id().to_string();
                     let entry = {
                         let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
-                        current_or_runtime_model_entry(
-                            &inner_session,
-                            &runtime_provider,
-                            &runtime_model_id,
-                            rpc_model_catalog(&guard, &options),
-                        )
-                        .cloned()
+                        catalog
+                            .current_or_runtime(
+                                &inner_session,
+                                &runtime_provider,
+                                &runtime_model_id,
+                            )
+                            .cloned()
                     };
                     let Some(entry) = entry else {
                         let _ =
@@ -5755,8 +5797,7 @@ pub async fn run(
                                         provider.model_id().to_string(),
                                     )
                                 });
-                            let entry = crate::models::resolve_model_entry(
-                                rpc_model_catalog(&guard, &options),
+                            let entry = rpc_model_catalog(&guard, &options)?.resolve(
                                 &requested_model.0,
                                 &requested_model.1,
                             )
@@ -6052,8 +6093,7 @@ pub async fn run(
                                     provider.model_id().to_string(),
                                 )
                             });
-                        let entry = crate::models::resolve_model_entry(
-                            rpc_model_catalog(&guard, &options),
+                        let entry = rpc_model_catalog(&guard, &options)?.resolve(
                             &requested_model.0,
                             &requested_model.1,
                         )
@@ -7420,18 +7460,22 @@ async fn run_prompt_with_retry_owned(
                     let context_window = if let Ok(guard) =
                         OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
                     {
+                        let catalog = match rpc_model_catalog(&guard, &options) {
+                            Ok(catalog) => catalog,
+                            Err(error) => {
+                                final_error = Some(error.to_string());
+                                final_error_hints = None;
+                                break;
+                            }
+                        };
                         let runtime_provider = guard.agent.provider().name().to_string();
                         let runtime_model_id = guard.agent.provider().model_id().to_string();
                         let session_store = Arc::clone(&guard.session);
                         let inner_session = OwnedMutexGuard::lock(session_store, &cx).await.ok();
                         inner_session.and_then(|inner| {
-                            current_or_runtime_model_entry(
-                                &inner,
-                                &runtime_provider,
-                                &runtime_model_id,
-                                rpc_model_catalog(&guard, &options),
-                            )
-                            .map(|e| e.model.context_window)
+                            catalog
+                                .current_or_runtime(&inner, &runtime_provider, &runtime_model_id)
+                                .map(|e| e.model.context_window)
                         })
                     } else {
                         None
@@ -7857,6 +7901,7 @@ async fn reconcile_rpc_failover_state(
     options: &RpcOptions,
     cx: &AgentCx,
 ) -> Result<bool> {
+    let catalog = rpc_model_catalog(guard, options)?;
     let inner = guard
         .session
         .lock(cx.cx())
@@ -7868,7 +7913,7 @@ async fn reconcile_rpc_failover_state(
             .effective_model_for_current_path()
             .is_none_or(|(provider, model)| {
                 crate::models::model_identities_match(
-                    rpc_model_catalog(guard, options),
+                    catalog.models(),
                     runtime.name(),
                     runtime.model_id(),
                     &provider,
@@ -7933,11 +7978,12 @@ async fn maybe_restore_primary(
     // that record across turns and would otherwise re-enter a provider against
     // a session nobody can describe.
     let active = (active_provider, active_model);
+    let catalog = rpc_model_catalog(&guard, options)?;
     let request = crate::agent::PrimaryRestoreRequest {
         primary: &primary,
         active: &active,
         cooldown_elapsed,
-        available_models: &options.available_models,
+        available_models: catalog.models(),
         auth: &options.auth,
         cli_api_key: options.cli_api_key.as_deref(),
         strict_invariants: true,
@@ -8027,6 +8073,7 @@ async fn try_failover_to_next_chain_entry(
     let provider = guard.agent.provider();
     let (current_provider, current_model) =
         (provider.name().to_string(), provider.model_id().to_string());
+    let catalog = rpc_model_catalog(&guard, options)?;
     let primary_model = match (
         state.active_failover_model.as_ref(),
         state.failover_primary.as_ref(),
@@ -8042,7 +8089,7 @@ async fn try_failover_to_next_chain_entry(
         },
         (Some((active_provider, active_model)), Some(primary))
             if crate::models::model_identities_match(
-                rpc_model_catalog(&guard, options),
+                catalog.models(),
                 &current_provider,
                 &current_model,
                 active_provider,
@@ -8075,7 +8122,7 @@ async fn try_failover_to_next_chain_entry(
         chains,
         &primary_model.provider,
         &primary_model.model_id,
-        rpc_model_catalog(&guard, options),
+        catalog.models(),
     ) else {
         return Ok(false);
     };
@@ -8095,7 +8142,7 @@ async fn try_failover_to_next_chain_entry(
     let attempt = crate::agent::FailoverSwapAttempt {
         chain: &chain,
         start_position: state.failover_chain_position.unwrap_or(0),
-        available_models: &options.available_models,
+        available_models: catalog.models(),
         auth: &options.auth,
         cli_api_key: options.cli_api_key.as_deref(),
         class,
@@ -15917,17 +15964,21 @@ async fn maybe_auto_compact(
         if guard.ensure_provider_reentry_allowed().is_err() {
             return;
         }
+        let catalog = match rpc_model_catalog(&guard, &options) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                emit_auto_compaction_error(&out_tx, error.to_string());
+                return;
+            }
+        };
         let reader = guard.agent.provider();
         let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
             return;
         };
         inner_session.ensure_entry_ids();
-        let Some(entry) = current_or_runtime_model_entry(
-            &inner_session,
-            reader.name(),
-            reader.model_id(),
-            rpc_model_catalog(&guard, &options),
-        ) else {
+        let Some(entry) =
+            catalog.current_or_runtime(&inner_session, reader.name(), reader.model_id())
+        else {
             return;
         };
         let mut settings = options
@@ -16233,20 +16284,12 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
 
 fn session_state(
     session: &crate::session::Session,
-    models: &[ModelEntry],
+    model_entry: Option<&ModelEntry>,
     snapshot: &RpcStateSnapshot,
     config: &Config,
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
-    let model_entry = session
-        .header
-        .provider
-        .as_deref()
-        .zip(session.header.model_id.as_deref())
-        .and_then(|(provider, model_id)| {
-            model_entry_for_provider_and_id(provider, model_id, models)
-        });
     let model = model_entry.map(rpc_model_from_entry);
     let accepts_images = !config.image_block_images()
         && model_entry.is_some_and(|entry| {
@@ -16988,11 +17031,130 @@ fn normalize_resumed_session_model(
     )
 }
 
-fn rpc_model_catalog<'a>(guard: &'a AgentSession, options: &'a RpcOptions) -> &'a [ModelEntry] {
-    guard.model_registry().map_or(
-        options.available_models.as_slice(),
-        crate::models::ModelRegistry::models,
-    )
+/// One request owns its live catalog generation while borrowing model rows.
+/// Legacy hosts without a registry retain their explicitly supplied list.
+struct RpcModelCatalog<'a> {
+    registry: Option<Arc<crate::models::ModelRegistry>>,
+    options: &'a RpcOptions,
+}
+
+impl<'a> RpcModelCatalog<'a> {
+    fn new(registry: Option<Arc<crate::models::ModelRegistry>>, options: &'a RpcOptions) -> Self {
+        Self { registry, options }
+    }
+
+    fn models(&self) -> &[ModelEntry] {
+        self.registry
+            .as_ref()
+            .map_or(self.options.available_models.as_slice(), |registry| {
+                registry.models()
+            })
+    }
+
+    fn find(&self, provider: &str, model_id: &str) -> Option<&ModelEntry> {
+        self.registry.as_ref().map_or_else(
+            || model_entry_for_provider_and_id(provider, model_id, self.models()),
+            |registry| registry.find_entry(provider, model_id),
+        )
+    }
+
+    fn resolve(&self, provider: &str, model_id: &str) -> Option<ModelEntry> {
+        self.registry.as_ref().map_or_else(
+            || crate::models::resolve_model_entry(self.models(), provider, model_id),
+            |registry| registry.resolve(provider, model_id),
+        )
+    }
+
+    fn header_model(&self, session: &crate::session::Session) -> Option<&ModelEntry> {
+        let (provider, model_id) = session
+            .header
+            .provider
+            .as_deref()
+            .zip(session.header.model_id.as_deref())?;
+        self.find(provider, model_id)
+    }
+
+    fn current_or_runtime(
+        &self,
+        session: &crate::session::Session,
+        runtime_provider: &str,
+        runtime_model_id: &str,
+    ) -> Option<&ModelEntry> {
+        if self.registry.is_none() {
+            return current_or_runtime_model_entry(
+                session,
+                runtime_provider,
+                runtime_model_id,
+                self.models(),
+            );
+        }
+        session
+            .effective_model_for_current_path()
+            .and_then(|(provider, model_id)| self.find(&provider, &model_id))
+            .or_else(|| self.find(runtime_provider, runtime_model_id))
+    }
+
+    /// Keep the host's offered identities and ordering, refresh their metadata,
+    /// then append newly ready registrations. Removed rows never fall back to
+    /// stale startup copies; selected rows still undergo credential admission.
+    fn available(&self) -> Vec<&ModelEntry> {
+        self.visible(self.registry.as_ref().map_or_else(
+            || self.options.available_models.iter().collect(),
+            |registry| registry.refresh_model_choices(&self.options.available_models, true),
+        ))
+    }
+
+    fn scoped(&self) -> Vec<&ModelEntry> {
+        self.visible(self.registry.as_ref().map_or_else(
+            || {
+                self.options
+                    .scoped_models
+                    .iter()
+                    .map(|scoped| &scoped.model)
+                    .collect()
+            },
+            |registry| {
+                registry.refresh_model_choices(
+                    self.options
+                        .scoped_models
+                        .iter()
+                        .map(|scoped| &scoped.model),
+                    false,
+                )
+            },
+        ))
+    }
+
+    fn visible<'b>(&self, mut models: Vec<&'b ModelEntry>) -> Vec<&'b ModelEntry> {
+        let config = &self.options.config;
+        let scope_override = config
+            .model_scope_overrides
+            .as_deref()
+            .and_then(|overrides| {
+                crate::failover::best_scope_override(
+                    overrides,
+                    self.options
+                        .working_directory
+                        .as_deref()
+                        .unwrap_or_else(|| std::path::Path::new(".")),
+                )
+            });
+        let disabled = config.disabled_providers.as_deref().unwrap_or_default();
+        models.retain(|entry| {
+            !crate::failover::provider_is_disabled(disabled, scope_override, &entry.model.provider)
+        });
+        models
+    }
+}
+
+fn rpc_model_catalog<'a>(
+    guard: &AgentSession,
+    options: &'a RpcOptions,
+) -> Result<RpcModelCatalog<'a>> {
+    Ok(RpcModelCatalog::new(
+        guard.model_registry_snapshot()?,
+        options,
+    ))
 }
 
 fn current_model_entry<'a>(
@@ -17195,20 +17357,15 @@ async fn cycle_model_for_rpc(
     state: &mut RpcSharedState,
     options: &RpcOptions,
 ) -> Result<Option<(ModelEntry, crate::model::ThinkingLevel, bool)>> {
-    let (candidates, is_scoped) = if options.scoped_models.is_empty() {
-        (options.available_models.clone(), false)
+    let catalog = rpc_model_catalog(guard, options)?;
+    let is_scoped = !options.scoped_models.is_empty();
+    let candidates = if is_scoped {
+        catalog.scoped()
     } else {
-        (
-            options
-                .scoped_models
-                .iter()
-                .map(|sm| sm.model.clone())
-                .collect::<Vec<_>>(),
-            true,
-        )
+        catalog.available()
     };
 
-    if candidates.len() <= 1 {
+    if candidates.is_empty() {
         return Ok(None);
     }
 
@@ -17221,26 +17378,22 @@ async fn cycle_model_for_rpc(
             .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        current_or_runtime_model_entry(
-            &inner_session,
-            &runtime_provider,
-            &runtime_model_id,
-            rpc_model_catalog(guard, options),
-        )
-        .map_or_else(
-            || {
-                (
-                    inner_session.header.provider.clone(),
-                    inner_session.header.model_id.clone(),
-                )
-            },
-            |entry| {
-                (
-                    Some(entry.model.provider.clone()),
-                    Some(entry.model.id.clone()),
-                )
-            },
-        )
+        catalog
+            .current_or_runtime(&inner_session, &runtime_provider, &runtime_model_id)
+            .map_or_else(
+                || {
+                    (
+                        inner_session.header.provider.clone(),
+                        inner_session.header.model_id.clone(),
+                    )
+                },
+                |entry| {
+                    (
+                        Some(entry.model.provider.clone()),
+                        Some(entry.model.id.clone()),
+                    )
+                },
+            )
     };
 
     let current_index = candidates.iter().position(|entry| {
@@ -17253,16 +17406,16 @@ async fn cycle_model_for_rpc(
             .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
     });
 
+    if candidates.len() == 1 && current_index.is_some() {
+        return Ok(None);
+    }
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
 
     // Candidate lists admit identities and determine cycling order. The full
     // catalog owns their current route, credentials and provider metadata.
-    let candidate = &candidates[next_index];
-    let next_entry = crate::models::resolve_model_entry(
-        rpc_model_catalog(guard, options),
-        &candidate.model.provider,
-        &candidate.model.id,
-    )
+    let candidate = candidates[next_index];
+    let next_entry = catalog.find(&candidate.model.provider, &candidate.model.id)
+    .cloned()
     .ok_or_else(|| {
         Error::validation(format!(
             "Model not found: {}/{}. Use get_available_models to choose a registered provider/model before cycling.",
@@ -17286,8 +17439,23 @@ async fn cycle_model_for_rpc(
         Some(&options.auth),
     )?;
     let desired_thinking = if is_scoped {
-        options.scoped_models[next_index]
-            .thinking_level
+        options
+            .scoped_models
+            .iter()
+            .find(|scoped| {
+                catalog
+                    .find(&scoped.model.model.provider, &scoped.model.model.id)
+                    .is_some_and(|entry| {
+                        crate::models::model_identities_match(
+                            catalog.models(),
+                            &entry.model.provider,
+                            &entry.model.id,
+                            &next_entry.model.provider,
+                            &next_entry.model.id,
+                        )
+                    })
+            })
+            .and_then(|scoped| scoped.thinking_level)
             .unwrap_or(crate::model::ThinkingLevel::Off)
     } else {
         guard
@@ -29466,6 +29634,338 @@ export default function init(pi) {
     }
 
     #[test]
+    fn rpc_live_provider_catalog_reaches_listing_selection_and_state() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("workspace");
+            let workspace = temp.path().canonicalize().expect("canonical workspace");
+            let extension_path = workspace.join("live-provider.native.json");
+            let manager = ExtensionManager::new();
+            manager.set_native_runtime(
+                crate::extensions::NativeRustExtensionRuntimeHandle::start()
+                    .await
+                    .expect("native runtime"),
+            );
+            let mut native = dummy_entry("shared", true);
+            native.model.provider = "openrouter".to_string();
+            native.model.api = "openai-completions".to_string();
+            native.model.base_url = "https://native.example.test/v1".to_string();
+            native.api_key = Some("native-key".to_string());
+            native.auth_header = true;
+            let mut stored = Session::in_memory();
+            stored.header.provider = Some(native.model.provider.clone());
+            stored.header.model_id = Some(native.model.id.clone());
+            let mut agent_session = build_test_agent_session(stored);
+            agent_session.extensions =
+                Some(crate::extensions::ExtensionRegion::new(manager.clone()));
+            // A programmatic RPC host may provide its base models only through
+            // options. Bootstrapping the live registry must retain those rows.
+            let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
+            options.working_directory = Some(workspace.clone());
+            options.available_models = vec![native];
+            options.config.disabled_providers = Some(vec!["global-hidden".to_string()]);
+            options.config.model_scope_overrides = Some(vec![crate::config::ModelScopeOverride {
+                path: workspace.display().to_string(),
+                enabled_models: None,
+                disabled_providers: Some(vec!["workspace-hidden".to_string()]),
+            }]);
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = handle
+                .spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+
+            let initial = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"get_available_models"}"#,
+                "startup catalog",
+            )
+            .await;
+            assert_ok(&initial, "get_available_models");
+            assert_eq!(initial["data"]["models"].as_array().unwrap().len(), 1);
+
+            for (generation, second_id, reasoning, context_window) in
+                [(1, "retired", true, 65_536), (2, "newcomer", false, 98_304)]
+            {
+                let route = format!("https://extension-{generation}.example.test/v1");
+                let descriptor = json!({
+                    "id": "rpc-live-provider", "name": "rpc-live-provider",
+                    "version": "1.0.0", "apiVersion": crate::extensions::PROTOCOL_VERSION,
+                    "providers": [
+                        {
+                            "id": "open-router", "api": "openai-completions",
+                            "baseUrl": route, "apiKey": "extension-key", "authHeader": true,
+                            "models": [
+                                {"id": "shared", "name": format!("Live {generation}"),
+                                 "reasoning": reasoning, "contextWindow": context_window},
+                                {"id": second_id, "name": second_id},
+                            ],
+                        },
+                        {
+                            "id": "global-hidden", "api": "openai-completions",
+                            "baseUrl": "http://localhost/v1", "authHeader": false,
+                            "models": [{"id": "hidden", "name": "hidden"}],
+                        },
+                        {
+                            "id": "workspace-hidden", "api": "openai-completions",
+                            "baseUrl": "http://localhost/v1", "authHeader": false,
+                            "models": [{"id": "hidden", "name": "hidden"}],
+                        },
+                    ],
+                });
+                std::fs::write(&extension_path, serde_json::to_vec(&descriptor).unwrap())
+                    .expect("write provider descriptor");
+                manager
+                    .load_native_extensions(vec![
+                        crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(
+                            &extension_path,
+                        )
+                        .expect("native spec"),
+                    ])
+                    .await
+                    .expect("publish provider generation");
+
+                let available = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_available_models"}"#,
+                    "live catalog",
+                )
+                .await;
+                assert_ok(&available, "get_available_models");
+                let models = available["data"]["models"].as_array().unwrap();
+                assert_eq!(
+                    models.len(),
+                    3,
+                    "disabled providers must stay hidden: {available}"
+                );
+                assert_eq!(models[0]["provider"], "openrouter");
+                assert_eq!(models[1]["provider"], "open-router");
+                assert_eq!(models[1]["baseUrl"], route);
+                assert_eq!(models[1]["contextWindow"], context_window);
+                assert_eq!(models[2]["id"], second_id);
+
+                if generation == 1 {
+                    let cycled = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"cycle_model"}"#,
+                        "cycle into late provider",
+                    )
+                    .await;
+                    assert_ok(&cycled, "cycle_model");
+                    assert_eq!(cycled["data"]["model"]["provider"], "open-router");
+                    assert_eq!(cycled["data"]["model"]["id"], "shared");
+                    assert_eq!(cycled["data"]["isScoped"], false);
+                }
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_state"}"#,
+                    "current live metadata",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["model"]["baseUrl"], route);
+                assert_eq!(state["data"]["model"]["name"], format!("Live {generation}"));
+                assert_eq!(state["data"]["contextWindow"], context_window);
+                let thinking = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_thinking_level","level":"high"}"#,
+                    "clamp using live capabilities",
+                )
+                .await;
+                assert_ok(&thinking, "set_thinking_level");
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_state"}"#,
+                    "live thinking capability",
+                )
+                .await;
+                assert_eq!(
+                    state["data"]["thinkingLevel"],
+                    if reasoning { "high" } else { "off" }
+                );
+                let selected = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_model","provider":"open-router","modelId":"shared"}"#,
+                    "select current provider route",
+                )
+                .await;
+                assert_ok(&selected, "set_model");
+                assert_eq!(selected["data"]["baseUrl"], route);
+            }
+
+            manager
+                .load_native_extensions(Vec::new())
+                .await
+                .expect("remove extension provider");
+            let available = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"get_available_models"}"#,
+                "retired provider listing",
+            )
+            .await;
+            assert_ok(&available, "get_available_models");
+            assert_eq!(available["data"]["models"].as_array().unwrap().len(), 1);
+            let state = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"get_state"}"#,
+                "retired current provider",
+            )
+            .await;
+            assert_ok(&state, "get_state");
+            assert!(
+                state["data"]["model"].is_null(),
+                "removed aliases must not resolve to a native route"
+            );
+            let removed = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"set_model","provider":"open-router","modelId":"shared"}"#,
+                "reject retired declared provider",
+            )
+            .await;
+            assert_err(&removed, "set_model");
+            let cycled = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"type":"cycle_model"}"#,
+                "leave removed provider",
+            )
+            .await;
+            assert_ok(&cycled, "cycle_model");
+            assert_eq!(cycled["data"]["model"]["provider"], "openrouter");
+            assert_eq!(
+                cycled["data"]["model"]["baseUrl"],
+                "https://native.example.test/v1"
+            );
+
+            // An invalid newly published catalog must surface an error rather
+            // than quietly answering from the previous successful generation.
+            manager.register_provider(json!({"id": "", "api": "openai-completions"}));
+            for command in ["get_available_models", "get_state"] {
+                let rejected = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &json!({"type": command}).to_string(),
+                    "invalid live catalog",
+                )
+                .await;
+                assert_err(&rejected, command);
+            }
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_scoped_cycle_retires_removed_rows_without_changing_order_or_effort() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut native = dummy_entry("shared", true);
+            native.model.provider = "openrouter".to_string();
+            native.model.api = "openai-completions".to_string();
+            native.model.base_url = "https://native.example.test/v1".to_string();
+            native.api_key = Some("native-key".to_string());
+            let mut retired = native.clone();
+            retired.model.provider = "open-router".to_string();
+            let mut survivor = native.clone();
+            survivor.model.provider = "rpc-scoped".to_string();
+            survivor.model.id = "survivor".to_string();
+            let mut fresh = survivor.clone();
+            fresh.model.id = "unscoped-newcomer".to_string();
+            let specs = [json!({"id": "open-router"}), json!({"id": "rpc-scoped"})];
+            let mut registry =
+                crate::models::ModelRegistry::from_entries_for_tests(vec![native.clone()]);
+            registry
+                .merge_extension_registry(
+                    &crate::models::extension_provider_bindings(&specs).unwrap(),
+                    vec![retired.clone(), survivor.clone()],
+                )
+                .expect("initial provider generation");
+            let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+            options.available_models = registry.models().to_vec();
+            options.scoped_models = vec![
+                RpcScopedModel {
+                    model: retired.clone(),
+                    thinking_level: Some(ThinkingLevel::High),
+                },
+                RpcScopedModel {
+                    model: native,
+                    thinking_level: Some(ThinkingLevel::Low),
+                },
+                RpcScopedModel {
+                    model: survivor.clone(),
+                    thinking_level: Some(ThinkingLevel::Medium),
+                },
+            ];
+            let mut stored = Session::in_memory();
+            stored.header.provider = Some(retired.model.provider.clone());
+            stored.header.model_id = Some(retired.model.id.clone());
+            let mut agent_session = build_test_agent_session(stored);
+            // The host still holds its startup lists. Only the authoritative
+            // catalog changes, removing the first scoped identity and adding
+            // an unscoped model before the surviving extension row.
+            survivor.model.base_url = "https://replacement.example.test/v1".to_string();
+            registry
+                .merge_extension_registry(
+                    &crate::models::extension_provider_bindings(&specs[1..]).unwrap(),
+                    vec![fresh, survivor],
+                )
+                .expect("replacement provider generation");
+            agent_session.set_model_registry(registry);
+            let mut state = RpcSharedState::new(&options.config);
+            for (provider, model, thinking, route) in [
+                (
+                    "openrouter",
+                    "shared",
+                    ThinkingLevel::Low,
+                    "https://native.example.test/v1",
+                ),
+                (
+                    "rpc-scoped",
+                    "survivor",
+                    ThinkingLevel::Medium,
+                    "https://replacement.example.test/v1",
+                ),
+                (
+                    "openrouter",
+                    "shared",
+                    ThinkingLevel::Low,
+                    "https://native.example.test/v1",
+                ),
+            ] {
+                let (entry, actual_thinking, is_scoped) =
+                    cycle_model_for_rpc(&mut agent_session, &mut state, &options)
+                        .await
+                        .expect("cycle live scoped model")
+                        .expect("next scoped model");
+                assert!(is_scoped);
+                assert_eq!(entry.model.provider, provider);
+                assert_eq!(entry.model.id, model);
+                assert_eq!(entry.model.base_url, route);
+                assert_eq!(actual_thinking, thinking);
+            }
+        });
+    }
+
+    #[test]
     fn rpc_set_model_and_cycle_keep_declared_provider_routes() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -29708,12 +30208,19 @@ export default function init(pi) {
                     &in_tx,
                     &out_rx,
                     r#"{"type":"get_available_models"}"#,
-                    "retain admitted model listing",
+                    "list ready models without reviving credentialless routes",
                 )
                 .await;
                 assert_ok(&available, "get_available_models");
-                assert_eq!(available["data"]["models"].as_array().unwrap().len(), 1);
-                assert_eq!(available["data"]["models"][0]["provider"], "openai-codex");
+                assert_eq!(
+                    available["data"]["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|model| model["provider"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec!["openai-codex", "test-provider"],
+                );
                 drop(in_tx);
                 let result = server.await;
                 assert!(result.is_ok(), "rpc server error: {result:?}");
@@ -29996,9 +30503,10 @@ export default function init(pi) {
             auto_retry_enabled: false,
         };
 
+        let catalog = RpcModelCatalog::new(None, &options);
         let state = session_state(
             &session,
-            &options.available_models,
+            catalog.header_model(&session),
             &snapshot,
             &options.config,
             false,
@@ -30065,17 +30573,17 @@ export default function init(pi) {
         );
         assert!(expected < before);
         let config = Config::default();
-        let state = session_state(&session, &[model.clone()], &snapshot, &config, false, false);
+        let state = session_state(&session, Some(&model), &snapshot, &config, false, false);
         assert_eq!(state["contextTokens"], expected);
         assert!(state["contextTokens"].as_u64().unwrap() < 1000);
         assert_eq!(state["contextWindow"], 200_000);
         assert_eq!(
-            session_state(&session, &[], &snapshot, &config, false, false)["contextWindow"],
+            session_state(&session, None, &snapshot, &config, false, false)["contextWindow"],
             Value::Null,
         );
         model.model.context_window = 0;
         assert_eq!(
-            session_state(&session, &[model], &snapshot, &config, false, false)["contextWindow"],
+            session_state(&session, Some(&model), &snapshot, &config, false, false)["contextWindow"],
             Value::Null,
         );
     }
@@ -30119,7 +30627,7 @@ export default function init(pi) {
             session.header.model_id = Some(id.into());
             let expected = crate::token_count::active_counter().count(text, table)
                 + crate::token_count::active_counter().count(&format!("{text}\n"), table);
-            let state = session_state(&session, &[model], &snapshot, &config, false, false);
+            let state = session_state(&session, Some(&model), &snapshot, &config, false, false);
             assert_eq!(state["contextTokens"], expected, "reader {id}");
         }
     }
@@ -30154,13 +30662,12 @@ export default function init(pi) {
             auto_retry_enabled: false,
         };
         let mut config = Config::default();
-        let models = [model];
-        let vision = session_state(&session, &models, &snapshot, &config, false, false);
+        let vision = session_state(&session, Some(&model), &snapshot, &config, false, false);
         config.images = Some(crate::config::ImageSettings {
             block_images: Some(true),
             ..crate::config::ImageSettings::default()
         });
-        let text = session_state(&session, &models, &snapshot, &config, false, false);
+        let text = session_state(&session, Some(&model), &snapshot, &config, false, false);
         let vision_tokens = vision["contextTokens"].as_u64().unwrap();
         let text_tokens = text["contextTokens"].as_u64().unwrap();
         assert!(

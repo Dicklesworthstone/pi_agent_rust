@@ -1623,34 +1623,52 @@ impl PiApp {
 
         let session_model = session_guard.effective_model_for_current_path();
         let session_thinking = session_guard.effective_thinking_level_for_current_path();
-        let catalog = agent_guard.handle.session().model_registry().map_or(
-            self.available_models.as_slice(),
-            crate::models::ModelRegistry::models,
-        );
+        let registry = agent_guard
+            .handle
+            .session()
+            .model_registry_snapshot()
+            .map_err(|error| error.to_string())?;
+        let find_entry = |provider: &str, model_id: &str| {
+            registry.as_ref().map_or_else(
+                || find_model_entry(&self.available_models, provider, model_id).cloned(),
+                |registry| registry.find(provider, model_id),
+            )
+        };
 
-        let (target_entry, sync_model) = match session_model.as_ref() {
-            Some((provider, model_id)) => {
-                if self
-                    .model_entry
-                    .model
-                    .provider
-                    .trim()
-                    .eq_ignore_ascii_case(provider.trim())
-                    && self.model_entry.model.id.eq_ignore_ascii_case(model_id)
-                {
-                    (self.model_entry.clone(), true)
-                } else {
-                    (
-                        find_model_entry(catalog, provider, model_id)
-                            .cloned()
-                            .ok_or_else(|| {
-                                format!("Unable to switch provider/model to {provider}/{model_id}")
-                            })?,
-                        true,
-                    )
-                }
+        let (provider_id, model_id) = session_model.as_ref().map_or(
+            (
+                self.model_entry.model.provider.as_str(),
+                self.model_entry.model.id.as_str(),
+            ),
+            |(provider, model)| (provider.as_str(), model.as_str()),
+        );
+        let target_entry = match find_entry(provider_id, model_id) {
+            Some(entry) => entry,
+            None if self
+                .model_entry
+                .model
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(provider_id.trim())
+                && self.model_entry.model.id.eq_ignore_ascii_case(model_id) =>
+            {
+                // Native embedders may own a current model outside the
+                // registry. The live snapshot distinguishes that case from
+                // an extension model whose registration has been retired.
+                agent_guard
+                    .handle
+                    .session()
+                    .extension_model_catalog()
+                    .snapshot()
+                    .and_then(|catalog| catalog.resolve_selection(provider_id, model_id))
+                    .map_err(|error| error.to_string())?;
+                self.model_entry.clone()
             }
-            None => (self.model_entry.clone(), false),
+            None => {
+                return Err(format!(
+                    "Unable to switch provider/model to {provider_id}/{model_id}"
+                ));
+            }
         };
 
         let current_thinking = agent_guard
@@ -1664,8 +1682,9 @@ impl PiApp {
         );
 
         let provider = agent_guard.provider();
-        let runtime_matches_target =
-            find_model_entry(catalog, provider.name(), provider.model_id()).map_or_else(
+        let runtime_matches_target = find_entry(provider.name(), provider.model_id())
+            .as_ref()
+            .map_or_else(
                 || {
                     provider
                         .name()
@@ -1697,14 +1716,17 @@ impl PiApp {
                 .session_mut()
                 .invalidate_background_compaction();
             agent_guard.set_provider(provider_impl);
-            let stream_options = agent_guard.stream_options_mut();
-            stream_options.api_key.clone_from(&resolved_key_opt);
-            stream_options.headers.clone_from(&target_entry.headers);
-            // Pick up the new model's configured output cap so an interactive
-            // model switch honors its registry `maxTokens` instead of carrying
-            // over the previous model's limit.
-            stream_options.max_tokens = Some(target_entry.model.max_tokens);
+            agent_guard
+                .stream_options_mut()
+                .api_key
+                .clone_from(&resolved_key_opt);
         }
+        // A registration can replace metadata without changing the identity.
+        // Native admission owns transport revision checks and rebinding; this
+        // synchronous UI refresh must not reinstall the old declared limits.
+        let stream_options = agent_guard.stream_options_mut();
+        stream_options.headers.clone_from(&target_entry.headers);
+        stream_options.max_tokens = Some(target_entry.model.max_tokens);
         agent_guard.set_keyword_model(&target_entry);
         agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
         agent_guard.set_model_accepts_images(
@@ -1743,17 +1765,13 @@ impl PiApp {
         };
         drop(session_guard);
 
-        let model_changed = if sync_model && !model_entry_matches(&self.model_entry, &target_entry)
-        {
-            self.model_entry = target_entry.clone();
-            if let Ok(mut guard) = self.model_entry_shared.lock() {
-                *guard = target_entry.clone();
-            }
-            self.model = format!("{}/{}", target_entry.model.provider, target_entry.model.id);
-            true
-        } else {
-            false
-        };
+        let model_changed =
+            session_model.is_some() && !model_entry_matches(&self.model_entry, &target_entry);
+        self.model_entry = target_entry.clone();
+        if let Ok(mut guard) = self.model_entry_shared.lock() {
+            *guard = target_entry.clone();
+        }
+        self.model = format!("{}/{}", target_entry.model.provider, target_entry.model.id);
 
         if persist_needed {
             self.spawn_save_session();
@@ -2797,6 +2815,10 @@ impl PiApp {
             self.status_message = Some("Cannot login while processing".to_string());
             return None;
         }
+        if let Err(error) = self.refresh_runtime_model_choices() {
+            self.status_message = Some(error);
+            return None;
+        }
 
         let args = args.trim();
         if args.is_empty() {
@@ -3153,10 +3175,19 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             .agent
             .try_lock()
             .map_err(|_| "Agent busy; try again".to_string())?;
-        let catalog = agent.handle.session().model_registry().map_or(
-            self.available_models.as_slice(),
-            crate::models::ModelRegistry::models,
-        );
+        let registry = agent
+            .handle
+            .session()
+            .model_registry_snapshot()
+            .map_err(|error| error.to_string())?;
+        if let Some(registry) = registry {
+            return Ok(if allow_unlisted_native_model {
+                registry.resolve(provider, model_id)
+            } else {
+                registry.find(provider, model_id)
+            });
+        }
+        let catalog = self.available_models.as_slice();
         Ok(if allow_unlisted_native_model {
             resolve_model_entry(catalog, provider, model_id)
         } else {
@@ -3164,8 +3195,43 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         })
     }
 
+    /// Refresh selector identities and routes together. Explicit cycling scopes
+    /// retain their order and never grow when an extension registers a model.
+    pub(super) fn refresh_runtime_model_choices(&mut self) -> Result<(), String> {
+        if self.extensions.is_none() {
+            return Ok(());
+        }
+        let registry = self
+            .agent
+            .try_lock()
+            .map_err(|_| "Agent busy; try again".to_string())?
+            .handle
+            .session()
+            .model_registry_snapshot()
+            .map_err(|error| error.to_string())?;
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+        self.available_models = crate::app::model_choices_for_workspace(
+            registry
+                .refresh_model_choices(&self.available_models, true)
+                .into_iter()
+                .cloned()
+                .collect(),
+            &self.config,
+            &self.cwd,
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state == AgentState::Idle
+            && let Err(error) = self.refresh_runtime_model_choices()
+        {
+            self.status_message = Some(error);
+            return None;
+        }
         // Role targeting (bd-cv653.3.1): `/model <role>` shows the role's
         // assignment; `/model <role> <pattern>` assigns a model to the role
         // for this session. Non-role first tokens fall through to the classic
@@ -4377,6 +4443,12 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_scoped_models(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state == AgentState::Idle
+            && let Err(error) = self.refresh_runtime_model_choices()
+        {
+            self.status_message = Some(error);
+            return None;
+        }
         let value = args.trim();
         if value.is_empty() {
             self.messages.push(ConversationMessage {
@@ -6834,6 +6906,175 @@ mod tests {
             assert!(Arc::ptr_eq(&provider, &agent.provider()));
             assert_eq!(agent.model_accepts_images(), accepts_images);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classic_session_sync_refreshes_live_metadata_and_refuses_retired_current_models() {
+        let directory = TempDir::new().unwrap();
+        let extension = directory.path().join("live-model.mjs");
+        std::fs::write(
+            &extension,
+            r#"
+            export default function(pi) {
+                pi.registerCommand('publish-model', { handler: raw => {
+                    pi.registerProvider('live-classic', JSON.parse(raw));
+                }});
+            }
+            "#,
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        session.try_lock().unwrap().session_dir = Some(directory.path().join("sessions"));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), directory.path());
+        app.save_enabled = false;
+        runtime().block_on(async {
+            let manager = {
+                let mut agent = app.agent.try_lock().unwrap();
+                agent
+                    .handle
+                    .session_mut()
+                    .enable_extensions(&[], directory.path(), None, &[extension])
+                    .await
+                    .unwrap();
+                agent.handle.extension_manager().unwrap().clone()
+            };
+            app.extensions = Some(manager.clone());
+            let mut original_provider = None;
+            for revision in [1, 2] {
+                let spec = json!({
+                    "api": "openai-completions",
+                    "baseUrl": format!("https://revision-{revision}.example.test/v1"),
+                    "apiKey": "classic-metadata-fixture-key",
+                    "headers": { "x-revision": revision.to_string() },
+                    "models": [{
+                        "id": "chat", "name": format!("Revision {revision}"),
+                        "contextWindow": if revision == 1 { 8_192 } else { 2_048 },
+                        "maxTokens": if revision == 1 { 1_024 } else { 128 },
+                        "reasoning": revision == 1,
+                        "input": if revision == 1 { vec!["text", "image"] } else { vec!["text"] },
+                    }],
+                });
+                {
+                    let mut agent = app.agent.try_lock().unwrap();
+                    agent
+                        .handle
+                        .session_mut()
+                        .execute_extension_command(
+                            "publish-model",
+                            &spec.to_string(),
+                            5_000,
+                            |_| {},
+                        )
+                        .await
+                        .unwrap();
+                    if revision == 1 {
+                        agent
+                            .handle
+                            .set_model("live-classic", "chat")
+                            .await
+                            .unwrap();
+                        agent
+                            .handle
+                            .set_thinking_level(crate::model::ThinkingLevel::High)
+                            .await
+                            .unwrap();
+                        original_provider = Some(agent.provider());
+                    }
+                }
+                app.sync_runtime_selection_from_session_header().unwrap();
+                let name = format!("Revision {revision}");
+                assert_eq!(app.model_entry.model.name, name);
+                assert_eq!(app.model_entry_shared.lock().unwrap().model.name, name);
+                assert_eq!(
+                    app.model_entry.model.base_url,
+                    spec["baseUrl"].as_str().unwrap()
+                );
+                let agent = app.agent.try_lock().unwrap();
+                assert_eq!(agent.model_accepts_images(), revision == 1);
+                assert_eq!(
+                    agent.handle.compaction_settings().context_window_tokens,
+                    if revision == 1 { 8_192 } else { 2_048 }
+                );
+                assert_eq!(
+                    agent.stream_options().max_tokens,
+                    Some(if revision == 1 { 1_024 } else { 128 })
+                );
+                assert_eq!(
+                    agent.stream_options().headers.get("x-revision"),
+                    Some(&revision.to_string())
+                );
+                assert_eq!(
+                    agent.stream_options().thinking_level,
+                    Some(if revision == 1 {
+                        crate::model::ThinkingLevel::High
+                    } else {
+                        crate::model::ThinkingLevel::Off
+                    })
+                );
+                assert!(
+                    Arc::ptr_eq(original_provider.as_ref().unwrap(), &agent.provider()),
+                    "the synchronous UI does not take ownership of transport rebinding"
+                );
+            }
+            let rebound = {
+                let mut agent = app.agent.try_lock().unwrap();
+                agent
+                    .handle
+                    .session_mut()
+                    .sync_runtime_selection_from_session_header()
+                    .await
+                    .unwrap();
+                assert!(
+                    !Arc::ptr_eq(original_provider.as_ref().unwrap(), &agent.provider()),
+                    "native admission must rebind the changed provider generation"
+                );
+                agent.provider()
+            };
+            let entries = session.try_lock().unwrap().entries.len();
+            manager.load_js_extensions(Vec::new()).await.unwrap();
+            let error = app
+                .sync_runtime_selection_from_session_header()
+                .unwrap_err();
+            assert!(error.contains("unknown provider/model live-classic/chat"));
+            assert_eq!(session.try_lock().unwrap().entries.len(), entries);
+            assert_eq!(app.model_entry.model.name, "Revision 2");
+            let mut agent = app.agent.try_lock().unwrap();
+            assert!(Arc::ptr_eq(&rebound, &agent.provider()));
+            assert!(
+                agent
+                    .handle
+                    .shutdown_owned_resources()
+                    .await
+                    .completed_cleanly()
+            );
+        });
+    }
+
+    #[test]
+    fn classic_session_sync_preserves_an_unregistered_native_current_model() {
+        let directory = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), directory.path());
+        app.save_enabled = false;
+        let provider = {
+            let mut agent = app.agent.try_lock().unwrap();
+            agent.handle.session_mut().set_model_registry(
+                crate::models::ModelRegistry::from_entries_for_tests(Vec::new()),
+            );
+            agent.provider()
+        };
+        {
+            let mut session = session.try_lock().unwrap();
+            session.header.provider = Some("dummy".to_string());
+            session.header.model_id = Some("dummy-model".to_string());
+        }
+        app.sync_runtime_selection_from_session_header().unwrap();
+        assert_eq!(app.model, "dummy/dummy-model");
+        assert!(Arc::ptr_eq(
+            &provider,
+            &app.agent.try_lock().unwrap().provider()
+        ));
     }
 
     #[test]
