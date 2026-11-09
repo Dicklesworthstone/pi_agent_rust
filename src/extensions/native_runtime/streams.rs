@@ -261,6 +261,7 @@ mod tests {
                     version: "1".into(),
                     api_version: "1".into(),
                     tools: Vec::new(),
+                    tool_revisions: HashMap::new(),
                     slash_commands: Vec::new(),
                     shortcuts: Vec::new(),
                     message_renderers: Vec::new(),

@@ -10992,6 +10992,8 @@ struct JsExtensionSnapshot {
     #[serde(default)]
     tools: Vec<Value>,
     #[serde(default)]
+    tool_revisions: HashMap<String, u64>,
+    #[serde(default)]
     slash_commands: Vec<Value>,
     #[serde(default)]
     shortcuts: Vec<Value>,
@@ -11007,6 +11009,26 @@ struct JsExtensionSnapshot {
     event_hooks: Vec<String>,
     #[serde(default)]
     active_tools: Option<Vec<String>>,
+}
+
+/// A schema and its exact executable registration, captured together. Names
+/// alone are not execution authority: a reload or registerTool replacement may
+/// assign the same name to a different handler while a caller retains a schema.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExtensionToolRegistration {
+    pub definition: ExtensionToolDef,
+    pub owner: String,
+    pub generation: Uuid,
+    pub revision: u64,
+}
+
+impl ExtensionToolRegistration {
+    fn stale_error(&self) -> Error {
+        Error::extension(format!(
+            "PI_EXTENSION_TOOL_STALE: tool {} changed after its schema was selected; refresh the tool catalog before calling it",
+            self.definition.name
+        ))
+    }
 }
 
 impl JsExtensionSnapshot {
@@ -11487,7 +11509,7 @@ enum JsRuntimeCommand {
     },
     GetRegisteredTools {
         deadline: Instant,
-        reply: oneshot::Sender<Result<Vec<ExtensionToolDef>>>,
+        reply: oneshot::Sender<Result<Vec<ExtensionToolRegistration>>>,
     },
     PumpOnce {
         deadline: Instant,
@@ -11515,6 +11537,7 @@ enum JsRuntimeCommand {
     },
     ExecuteTool {
         tool_name: String,
+        registration: Option<Arc<ExtensionToolRegistration>>,
         tool_call_id: String,
         input: Value,
         ctx_payload: Arc<Value>,
@@ -11596,6 +11619,7 @@ enum JsRuntimeCommand {
 
 struct JsRuntimeShard {
     extension_id: String,
+    tool_generation: Uuid,
     runtime: Rc<PiJsRuntime>,
     snapshot: JsExtensionSnapshot,
     published_provider_specs: Vec<Value>,
@@ -11674,6 +11698,7 @@ struct JsRuntimeShardIndexes {
     tool_owner: HashMap<String, usize>,
     command_owner: HashMap<String, usize>,
     shortcut_owner: HashMap<String, usize>,
+    message_renderer_owner: HashMap<String, usize>,
     provider_owner: HashMap<String, usize>,
     mcp_server_owner: HashMap<String, usize>,
     event_owners: HashMap<String, Vec<usize>>,
@@ -12558,6 +12583,7 @@ impl JsExtensionRuntimeHandle {
                         }
                         JsRuntimeCommand::ExecuteTool {
                             tool_name,
+                            registration,
                             tool_call_id,
                             input,
                             ctx_payload,
@@ -12589,6 +12615,7 @@ impl JsExtensionRuntimeHandle {
                                         JsToolExecution {
                                             shard_index,
                                             tool_name: &tool_name,
+                                            registration: registration.as_deref(),
                                             tool_call_id: &tool_call_id,
                                             input,
                                             ctx_payload: ctx_payload.as_ref(),
@@ -12600,7 +12627,9 @@ impl JsExtensionRuntimeHandle {
                                     )
                                     .await
                                 }
-                                Err(err) => Err(err),
+                                Err(err) => Err(registration
+                                    .as_ref()
+                                    .map_or(err, |registration| registration.stale_error())),
                             };
                             let _ = reply.send(&cx, result);
                         }
@@ -13291,6 +13320,15 @@ impl JsExtensionRuntimeHandle {
     }
 
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
+        Ok(self
+            .get_tool_registrations()
+            .await?
+            .into_iter()
+            .map(|registration| registration.definition)
+            .collect())
+    }
+
+    pub(crate) async fn get_tool_registrations(&self) -> Result<Vec<ExtensionToolRegistration>> {
         let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
@@ -13475,6 +13513,29 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<Value> {
+        self.execute_tool_with_registration(
+            tool_name,
+            tool_call_id,
+            input,
+            ctx_payload,
+            timeout_ms,
+            on_update,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_tool_with_registration(
+        &self,
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        registration: Option<Arc<ExtensionToolRegistration>>,
+    ) -> Result<Value> {
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
         let invocation = Arc::new(JsToolInvocation::new(on_update.is_some()));
@@ -13482,6 +13543,7 @@ impl JsExtensionRuntimeHandle {
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteTool {
             tool_name,
+            registration,
             tool_call_id,
             input,
             ctx_payload,
@@ -15289,6 +15351,7 @@ async fn build_js_runtime_shards(
             require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
         candidate.shards.push(JsRuntimeShard {
             extension_id,
+            tool_generation: Uuid::new_v4(),
             runtime: Rc::new(runtime),
             published_provider_specs: snapshot.providers.clone(),
             provider_actor: Weak::new(),
@@ -15352,7 +15415,7 @@ fn require_single_shard_snapshot(
 async fn get_registered_tools_from_shards(
     shards: &mut JsRuntimeShardSet,
     deadline: Instant,
-) -> Result<Vec<ExtensionToolDef>> {
+) -> Result<Vec<ExtensionToolRegistration>> {
     let mut tools = Vec::new();
     for shard_index in 0..shards.shards.len() {
         if shards.shards[shard_index].pump_fault.is_some() {
@@ -15368,9 +15431,24 @@ async fn get_registered_tools_from_shards(
             // tools so the Agent can retire stale wrappers and keep peers live.
             continue;
         }
-        let mut definitions = shards.shards[shard_index].snapshot.tool_definitions()?;
+        let shard = &shards.shards[shard_index];
+        let mut definitions = shard.snapshot.tool_definitions()?;
         definitions.sort_by(|left, right| left.name.encode_utf16().cmp(right.name.encode_utf16()));
-        tools.extend(definitions);
+        for definition in definitions {
+            let revision = shard
+                .snapshot
+                .tool_revisions
+                .get(&definition.name)
+                .copied()
+                .filter(|revision| *revision > 0)
+                .ok_or_else(|| Error::extension("JS tool registration revision is missing"))?;
+            tools.push(ExtensionToolRegistration {
+                definition,
+                owner: shard.extension_id.clone(),
+                generation: shard.tool_generation,
+                revision,
+            });
+        }
     }
     Ok(tools)
 }
@@ -16634,6 +16712,7 @@ async fn dispatch_extension_event_batch_across_shards(
 struct JsToolExecution<'a> {
     shard_index: usize,
     tool_name: &'a str,
+    registration: Option<&'a ExtensionToolRegistration>,
     tool_call_id: &'a str,
     input: Value,
     ctx_payload: &'a Value,
@@ -16652,6 +16731,7 @@ async fn execute_extension_tool_sharded(
     let JsToolExecution {
         shard_index,
         tool_name,
+        registration,
         tool_call_id,
         input,
         ctx_payload,
@@ -16661,6 +16741,24 @@ async fn execute_extension_tool_sharded(
         invocation,
     } = execution;
     shards.ensure_shard_healthy(shard_index)?;
+    if let Some(registration) = registration {
+        // Refresh before validating, so even direct mutation of a parameters
+        // object cannot silently change the schema attached to this call.
+        refresh_runtime_shard_snapshot(shards, shard_index).await?;
+        let shard = &shards.shards[shard_index];
+        let current_definition = shard
+            .snapshot
+            .tool_definitions()?
+            .into_iter()
+            .find(|definition| definition.name == tool_name);
+        if registration.owner != shard.extension_id
+            || registration.generation != shard.tool_generation
+            || shard.snapshot.tool_revisions.get(tool_name) != Some(&registration.revision)
+            || current_definition.as_ref() != Some(&registration.definition)
+        {
+            return Err(registration.stale_error());
+        }
+    }
     let _ = remaining_js_task_timeout(deadline, "tool")?;
     if invocation.is_cancelled() {
         return Err(Error::extension(
@@ -16697,6 +16795,9 @@ async fn execute_extension_tool_sharded(
             let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
             let input_js = json_to_js(&ctx, &input)?;
             let ctx_js = json_to_js(&ctx, ctx_payload)?;
+            let admitted_parameters = registration
+                .map(|registration| json_to_js(&ctx, &registration.definition.parameters))
+                .transpose()?;
             let on_update = if invocation
                 .progress
                 .lock()
@@ -16719,6 +16820,8 @@ async fn execute_extension_tool_sharded(
                 ctx_js,
                 invocation_id.as_str(),
                 on_update,
+                registration.map(|registration| registration.revision),
+                admitted_parameters,
             ))?;
             let _task: String =
                 task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
@@ -18070,6 +18173,7 @@ mod idle_runtime_tests {
             host,
             shard: JsRuntimeShard {
                 extension_id: "tool-pump-fixture".to_string(),
+                tool_generation: Uuid::new_v4(),
                 runtime: Rc::new(runtime),
                 snapshot: serde_json::from_value(json!({ "id": "tool-pump-fixture" }))
                     .expect("fixture snapshot"),
@@ -18367,6 +18471,7 @@ mod idle_runtime_tests {
             };
             let mut shard = JsRuntimeShard {
                 extension_id: "idle-fifo-fixture".to_string(),
+                tool_generation: Uuid::new_v4(),
                 runtime: Rc::new(runtime),
                 snapshot: serde_json::from_value(json!({ "id": "idle-fifo-fixture" }))
                     .expect("fixture snapshot"),

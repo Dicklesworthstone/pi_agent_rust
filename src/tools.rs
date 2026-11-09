@@ -7210,7 +7210,7 @@ impl SharedToolRegistry {
         replacements: Vec<Box<dyn Tool>>,
         active: Option<&[String]>,
         initial: bool,
-    ) -> Vec<Arc<dyn Tool>> {
+    ) -> (Vec<Arc<dyn Tool>>, std::sync::Weak<ToolRegistry>) {
         let mut guard = self
             .inner
             .registry
@@ -7226,13 +7226,15 @@ impl SharedToolRegistry {
                     || before.description() != after.description()
                     || before.parameters() != after.parameters()
             });
-        *guard = Arc::new(next);
+        let next = Arc::new(next);
+        let published_snapshot = Arc::downgrade(&next);
+        *guard = next;
         if schema_changed {
             self.inner
                 .version
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        published
+        (published, published_snapshot)
     }
 
     /// Publish a modified registry: shallow-copy the current snapshot, apply
@@ -29077,19 +29079,26 @@ mod known_tool_name_tests {
                 catalog_tool("denied", "Excluded extension", ToolOrigin::Extension),
             ]
         };
-        let mut owned = shared.reconcile_extension_tools(&[], tools(), None, true);
+        let (mut owned, published_snapshot) =
+            shared.reconcile_extension_tools(&[], tools(), None, true);
         assert_eq!(
             owned.len(),
             1,
             "excluded tools cannot enter inactive ownership"
         );
         let original = shared.snapshot();
+        assert!(std::sync::Weak::ptr_eq(
+            &published_snapshot,
+            &Arc::downgrade(&original)
+        ));
         assert_eq!(
             describe_catalog_tool(&original, "late")["description"],
             "Extension catalog"
         );
         let version = shared.version();
-        owned = shared.reconcile_extension_tools(&owned, tools(), None, false);
+        owned = shared
+            .reconcile_extension_tools(&owned, tools(), None, false)
+            .0;
         assert_eq!(
             shared.version(),
             version,
@@ -29103,12 +29112,14 @@ mod known_tool_name_tests {
         assert!(shelved.get("xdev").is_none());
         assert!(shelved.discoverable_index().is_empty());
         assert_eq!(shelved.inactive_tools().len(), 1);
-        owned = shared.reconcile_extension_tools(
-            &owned,
-            tools(),
-            Some(&["late".to_string(), "denied".to_string()]),
-            false,
-        );
+        owned = shared
+            .reconcile_extension_tools(
+                &owned,
+                tools(),
+                Some(&["late".to_string(), "denied".to_string()]),
+                false,
+            )
+            .0;
         assert!(shared.snapshot().get("denied").is_none());
         assert_eq!(
             describe_catalog_tool(&shared.snapshot(), "late")["description"],
@@ -29136,7 +29147,7 @@ mod known_tool_name_tests {
                 .count(),
             1
         );
-        let released = shared.reconcile_extension_tools(&owned, Vec::new(), None, false);
+        let (released, _) = shared.reconcile_extension_tools(&owned, Vec::new(), None, false);
         assert!(released.is_empty());
         assert_eq!(
             shared.snapshot().get("late").unwrap().origin(),

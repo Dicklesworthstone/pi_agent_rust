@@ -13,6 +13,7 @@ fn loaded_extension(chunks: Arc<[Value]>) -> NativeRustLoadedExtension {
             tools: vec![
                 json!({"name":"fixture", "description":"Fixture", "parameters":{"type":"object"}}),
             ],
+            tool_revisions: HashMap::new(),
             slash_commands: vec![json!({"name":"command"})],
             shortcuts: vec![json!({"key_id":"ctrl+k"})],
             message_renderers: Vec::new(),
@@ -28,6 +29,128 @@ fn loaded_extension(chunks: Arc<[Value]>) -> NativeRustLoadedExtension {
         shortcut_outputs: HashMap::from([("ctrl+k".into(), json!({"shortcut":"ran"}))]),
         provider_streams: HashMap::from([("fixture".into(), chunks)]),
     }
+}
+
+#[test]
+fn captured_native_tool_registration_cannot_dispatch_after_reload() {
+    block_on(async {
+        let runtime = NativeRustExtensionRuntimeHandle::start().await.unwrap();
+        runtime
+            .state
+            .write()
+            .unwrap()
+            .load_extensions(vec![loaded_extension(Vec::new().into())]);
+        let registration = runtime.get_tool_registrations().await.unwrap().remove(0);
+        assert!(
+            runtime
+                .execute_registered_tool_ref("fixture", "before", json!({}), Some(&registration))
+                .await
+                .is_ok()
+        );
+
+        // Same owner, same schema, different executable bytes still constitute
+        // a replacement. A retained schema cannot authorize this new handler.
+        let mut replacement = loaded_extension(Vec::new().into());
+        replacement
+            .tool_outputs
+            .insert("fixture".into(), json!({"tool":"replacement"}));
+        runtime
+            .state
+            .write()
+            .unwrap()
+            .load_extensions(vec![replacement]);
+        let error = runtime
+            .execute_registered_tool_ref("fixture", "stale", json!({}), Some(&registration))
+            .await
+            .expect_err("a reload invalidates previously selected handlers");
+        assert!(error.to_string().contains("PI_EXTENSION_TOOL_STALE"));
+        let fresh = runtime.get_tool_registrations().await.unwrap().remove(0);
+        assert_ne!(fresh.generation, registration.generation);
+        assert_eq!(
+            runtime
+                .execute_registered_tool_ref("fixture", "fresh", json!({}), Some(&fresh))
+                .await
+                .unwrap(),
+            json!({"tool":"replacement"})
+        );
+        assert!(runtime.shutdown(Duration::ZERO).await);
+    });
+}
+
+#[test]
+fn native_tool_schema_and_executable_share_the_first_valid_owner() {
+    block_on(async {
+        let runtime = NativeRustExtensionRuntimeHandle::start().await.unwrap();
+        let mut malformed = loaded_extension(Vec::new().into());
+        malformed.snapshot.id = "malformed-owner".into();
+        malformed.snapshot.tools[0]["description"] = json!(17);
+        malformed
+            .tool_outputs
+            .insert("fixture".into(), json!({"owner":"malformed"}));
+        let mut valid = loaded_extension(Vec::new().into());
+        valid.snapshot.id = "valid-owner".into();
+        valid
+            .tool_outputs
+            .insert("fixture".into(), json!({"owner":"valid"}));
+        runtime
+            .state
+            .write()
+            .unwrap()
+            .load_extensions(vec![malformed, valid]);
+        let registrations = runtime.get_tool_registrations().await.unwrap();
+        assert_eq!(registrations.len(), 1);
+        let registration = &registrations[0];
+        assert_eq!(registration.owner, "valid-owner");
+        assert_eq!(
+            runtime
+                .execute_registered_tool_ref("fixture", "valid", json!({}), Some(registration))
+                .await
+                .unwrap(),
+            json!({"owner":"valid"})
+        );
+
+        let mut first = loaded_extension(Vec::new().into());
+        first.snapshot.id = "first-owner".into();
+        first.snapshot.tools[0]["description"] = json!("first schema");
+        first
+            .tool_outputs
+            .insert("fixture".into(), json!({"owner":"first"}));
+        let mut second = loaded_extension(Vec::new().into());
+        second.snapshot.id = "second-owner".into();
+        second.snapshot.tools[0]["description"] = json!("second schema");
+        second
+            .tool_outputs
+            .insert("fixture".into(), json!({"owner":"second"}));
+        runtime
+            .state
+            .write()
+            .unwrap()
+            .load_extensions(vec![first, second]);
+        let registrations = runtime.get_tool_registrations().await.unwrap();
+        assert_eq!(
+            registrations.len(),
+            1,
+            "duplicate names cannot advertise contradictory schemas"
+        );
+        let registration = &registrations[0];
+        assert_eq!(registration.owner, "first-owner");
+        assert_eq!(registration.definition.description, "first schema");
+        assert_eq!(
+            runtime
+                .execute_registered_tool_ref("fixture", "first", json!({}), Some(registration))
+                .await
+                .unwrap(),
+            json!({"owner":"first"})
+        );
+        let mut mismatched_schema = registration.clone();
+        mismatched_schema.definition.description = "second schema".into();
+        let error = runtime
+            .execute_registered_tool_ref("fixture", "mismatch", json!({}), Some(&mismatched_schema))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("PI_EXTENSION_TOOL_STALE"));
+        assert!(runtime.shutdown(Duration::ZERO).await);
+    });
 }
 
 fn fixture() -> (

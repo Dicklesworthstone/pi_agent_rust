@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 #[cfg(feature = "wasm-host")]
 use std::time::Duration;
 
@@ -15,9 +15,9 @@ use crate::error::{Error, Result};
 use crate::extensions::JsExtensionRuntimeHandle;
 #[cfg(feature = "wasm-host")]
 use crate::extensions::WasmExtensionHandle;
-use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
+use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle, ExtensionToolRegistration};
 use crate::extensions_js::ExtensionToolDef;
-use crate::tools::{SharedToolRegistry, Tool, ToolOutput, ToolUpdate};
+use crate::tools::{SharedToolRegistry, Tool, ToolOutput, ToolRegistry, ToolUpdate};
 #[cfg(feature = "wasm-host")]
 use asupersync::time::{timeout, wall_now};
 
@@ -30,6 +30,7 @@ const DEFAULT_EXTENSION_TOOL_TIMEOUT_MS: u64 = 60_000;
 /// stored in the shared tool registry.
 pub struct ExtensionToolWrapper {
     def: ExtensionToolDef,
+    registration: Option<Arc<ExtensionToolRegistration>>,
     runtime: ExtensionRuntimeHandle,
     ctx_payload: Arc<Value>,
     timeout_ms: u64,
@@ -43,10 +44,20 @@ impl ExtensionToolWrapper {
     {
         Self {
             def,
+            registration: None,
             runtime: runtime.into(),
             ctx_payload: Arc::new(Value::Object(serde_json::Map::new())),
             timeout_ms: DEFAULT_EXTENSION_TOOL_TIMEOUT_MS,
         }
+    }
+
+    fn from_registration(
+        registration: ExtensionToolRegistration,
+        runtime: ExtensionRuntimeHandle,
+    ) -> Self {
+        let mut wrapper = Self::new(registration.definition.clone(), runtime);
+        wrapper.registration = Some(Arc::new(registration));
+        wrapper
     }
 
     #[must_use]
@@ -118,6 +129,9 @@ pub async fn collect_extension_tool_wrappers(
 pub(crate) struct ExtensionToolCatalog {
     ctx_payload: Value,
     published: Vec<Arc<dyn Tool>>,
+    registrations: Vec<ExtensionToolRegistration>,
+    active: Option<Vec<String>>,
+    published_snapshot: Option<Weak<ToolRegistry>>,
     initialized: bool,
 }
 
@@ -126,6 +140,9 @@ impl ExtensionToolCatalog {
         Self {
             ctx_payload,
             published: Vec::new(),
+            registrations: Vec::new(),
+            active: None,
+            published_snapshot: None,
             initialized: false,
         }
     }
@@ -137,25 +154,53 @@ impl ExtensionToolCatalog {
     ) -> Result<()> {
         // Collection asks the runtime for its authoritative, owner-validated
         // snapshot. Errors leave the published registry untouched.
-        let replacements = collect_all_extension_tool_wrappers(
-            manager,
-            manager.runtime_for_tools(),
-            self.ctx_payload.clone(),
-        )
-        .await?;
+        let runtime = manager.runtime_for_tools();
+        let registrations = match &runtime {
+            Some(runtime) => runtime.get_tool_registrations().await?,
+            None => Vec::new(),
+        };
         let active = manager.active_tools();
-        self.published = tools.reconcile_extension_tools(
+        // WASM instances already bind directly to their executable owner;
+        // their catalog retains the existing refresh path. JS/native tokens
+        // let unchanged loops retain every wrapper and the shared snapshot.
+        if !cfg!(feature = "wasm-host")
+            && self.initialized
+            && self.registrations == registrations
+            && self.active == active
+            && self
+                .published_snapshot
+                .as_ref()
+                .is_some_and(|previous| Weak::ptr_eq(previous, &Arc::downgrade(&tools.snapshot())))
+        {
+            return Ok(());
+        }
+        let replacements = wrap_extension_tool_registrations(
+            manager,
+            runtime,
+            self.ctx_payload.clone(),
+            registrations.clone(),
+        );
+        let (published, published_snapshot) = tools.reconcile_extension_tools(
             &self.published,
             replacements,
             active.as_deref(),
             !self.initialized,
         );
+        self.published = published;
+        self.registrations = registrations;
+        self.active = active;
+        self.published_snapshot = Some(published_snapshot);
         self.initialized = true;
         Ok(())
     }
 
     pub(crate) fn clear(&mut self, tools: &SharedToolRegistry) {
-        self.published = tools.reconcile_extension_tools(&self.published, Vec::new(), None, false);
+        self.published = tools
+            .reconcile_extension_tools(&self.published, Vec::new(), None, false)
+            .0;
+        self.registrations.clear();
+        self.active = None;
+        self.published_snapshot = None;
         self.initialized = false;
     }
 }
@@ -165,6 +210,24 @@ async fn collect_all_extension_tool_wrappers(
     runtime: Option<ExtensionRuntimeHandle>,
     ctx_payload: Value,
 ) -> Result<Vec<Box<dyn Tool>>> {
+    let registrations = match &runtime {
+        Some(runtime) => runtime.get_tool_registrations().await?,
+        None => Vec::new(),
+    };
+    Ok(wrap_extension_tool_registrations(
+        manager,
+        runtime,
+        ctx_payload,
+        registrations,
+    ))
+}
+
+fn wrap_extension_tool_registrations(
+    manager: &ExtensionManager,
+    runtime: Option<ExtensionRuntimeHandle>,
+    ctx_payload: Value,
+    mut registrations: Vec<ExtensionToolRegistration>,
+) -> Vec<Box<dyn Tool>> {
     #[cfg(not(feature = "wasm-host"))]
     let _ = manager;
     let shared_ctx_payload = Arc::new(ctx_payload);
@@ -173,16 +236,15 @@ async fn collect_all_extension_tool_wrappers(
     let mut seen = HashSet::new();
 
     if let Some(runtime) = runtime {
-        let mut defs = runtime.get_registered_tools().await?;
-        defs.sort_by(|a, b| a.name.cmp(&b.name));
-        for def in defs {
-            if !seen.insert(def.name.clone()) {
-                tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
+        registrations.sort_by(|a, b| a.definition.name.cmp(&b.definition.name));
+        for registration in registrations {
+            if !seen.insert(registration.definition.name.clone()) {
+                tracing::warn!(tool = %registration.definition.name, "Duplicate extension tool name; ignoring");
                 continue;
             }
 
             wrappers.push(Box::new(
-                ExtensionToolWrapper::new(def, runtime.clone())
+                ExtensionToolWrapper::from_registration(registration, runtime.clone())
                     .with_ctx_payload_shared(Arc::clone(&shared_ctx_payload)),
             ));
         }
@@ -208,7 +270,7 @@ async fn collect_all_extension_tool_wrappers(
         }
     }
 
-    Ok(wrappers)
+    wrappers
 }
 
 #[async_trait]
@@ -241,13 +303,14 @@ impl Tool for ExtensionToolWrapper {
     ) -> Result<ToolOutput> {
         let result = self
             .runtime
-            .execute_tool_with_updates_ref(
+            .execute_tool_with_registration_ref(
                 &self.def.name,
                 tool_call_id,
                 input,
                 Arc::clone(&self.ctx_payload),
                 self.timeout_ms,
                 on_update,
+                self.registration.clone(),
             )
             .await
             .map_err(|err| Error::tool(self.name(), err.to_string()))?;
@@ -1387,6 +1450,8 @@ mod tests {
             let version = shared.version();
             catalog.refresh(&manager, &shared).await.unwrap();
             assert_eq!(shared.version(), version, "unchanged schemas retain the provider cache");
+            #[cfg(not(feature = "wasm-host"))]
+            assert!(Arc::ptr_eq(&original, &shared.snapshot()), "unchanged registrations retain the executable snapshot too");
 
             manager.set_active_tools(vec!["survivor".to_string()]);
             catalog.refresh(&manager, &shared).await.unwrap();
@@ -1421,6 +1486,161 @@ mod tests {
             replacement.clear(&shared);
             assert_eq!(shared.snapshot().tools().len(), 1);
             assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn selected_tool_schema_cannot_invoke_a_replaced_handler_or_mutated_schema() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (temp_dir, manager, js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function(pi) {
+                    let calls = 0;
+                    const parameters = { type: "object", properties: { value: { type: "string" } } };
+                    const install = (label) => pi.registerTool({
+                        name: "binding_probe", description: "stable description", parameters,
+                        execute: async () => {
+                            calls++;
+                            return { content: [{ type: "text", text: label }] };
+                        },
+                    });
+                    install("original");
+                    pi.registerCommand("replace", { handler: async () => { install("replacement"); } });
+                    pi.registerCommand("mutate", { handler: async () => { parameters.required = ["value"]; } });
+                    pi.registerCommand("calls", { handler: async () => ({ calls }) });
+                }
+                "#,
+            ).await;
+            let mut catalog = ExtensionToolCatalog::new(json!({ "cwd": temp_dir.path() }));
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let original = shared.snapshot();
+            let first = original.get("binding_probe").unwrap()
+                .execute("first", json!({}), None).await.unwrap();
+            assert!(matches!(&first.content[0], ContentBlock::Text(text) if text.text == "original"));
+
+            let ctx = Arc::new(json!({}));
+            js_runtime.execute_command("replace".into(), String::new(), Arc::clone(&ctx), 5_000)
+                .await.unwrap();
+            let error = original.get("binding_probe").unwrap()
+                .execute("stale-handler", json!({}), None).await.unwrap_err();
+            assert!(error.to_string().contains("PI_EXTENSION_TOOL_STALE"), "{error}");
+            assert_eq!(js_runtime.execute_command("calls".into(), String::new(), Arc::clone(&ctx), 5_000)
+                .await.unwrap(), json!({"calls":1}), "the replacement handler must not run under its predecessor's schema");
+
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let replacement = shared.snapshot();
+            let second = replacement.get("binding_probe").unwrap()
+                .execute("replacement", json!({}), None).await.unwrap();
+            assert!(matches!(&second.content[0], ContentBlock::Text(text) if text.text == "replacement"));
+            let error = original.get("binding_probe").unwrap()
+                .execute("retained-after-refresh", json!({}), None).await.unwrap_err();
+            assert!(error.to_string().contains("PI_EXTENSION_TOOL_STALE"));
+
+            // Mutating the originally supplied parameters object changes the
+            // executable schema without calling registerTool a second time.
+            js_runtime.execute_command("mutate".into(), String::new(), Arc::clone(&ctx), 5_000)
+                .await.unwrap();
+            let error = replacement.get("binding_probe").unwrap()
+                .execute("stale-schema", json!({"value":"valid for the new schema"}), None)
+                .await.unwrap_err();
+            assert!(error.to_string().contains("PI_EXTENSION_TOOL_STALE"), "{error}");
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let fresh = shared.snapshot();
+            assert_eq!(fresh.get("binding_probe").unwrap().parameters()["required"], json!(["value"]));
+            fresh.get("binding_probe").unwrap()
+                .execute("fresh-schema", json!({"value":"accepted"}), None).await.unwrap();
+            assert_eq!(js_runtime.execute_command("calls".into(), String::new(), ctx, 5_000)
+                .await.unwrap(), json!({"calls":3}));
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn selected_tool_validates_its_published_schema_without_guest_accessors() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function(pi) {
+                    const parameters = { type: "object", properties: {} };
+                    Object.defineProperty(parameters, "required", {
+                        get() { return ["never advertised"]; },
+                    });
+                    pi.registerTool({
+                        name: "binding_probe", description: "projected schema", parameters,
+                        execute: async () => ({ content: [{ type: "text", text: "admitted" }] }),
+                    });
+                }
+                "#,
+            )
+            .await;
+            let mut catalog = ExtensionToolCatalog::new(json!({ "cwd": temp_dir.path() }));
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let selected = shared.snapshot();
+            let tool = selected.get("binding_probe").unwrap();
+            assert!(tool.parameters().get("required").is_none());
+            let output = tool
+                .execute("projected-input", json!({}), None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&output.content[0], ContentBlock::Text(text) if text.text == "admitted")
+            );
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn selected_tool_owner_cannot_survive_same_owner_or_cross_owner_cold_reload() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let source = r#"
+                export default function(pi) {
+                    pi.registerTool({ name: "binding_probe", description: "same schema",
+                        parameters: { type: "object" },
+                        execute: async () => ({ content: [{ type: "text", text: "fresh" }] }),
+                    });
+                }
+            "#;
+            let (temp_dir, manager, _js_runtime, shared) =
+                start_extension_on_shared_registry(source).await;
+            let mut catalog = ExtensionToolCatalog::new(json!({ "cwd": temp_dir.path() }));
+            catalog.refresh(&manager, &shared).await.unwrap();
+            for filename in ["ext.mjs", "new-owner.mjs"] {
+                let selected = shared.snapshot();
+                let path = temp_dir.path().join(filename);
+                std::fs::write(&path, source).unwrap();
+                manager
+                    .load_js_extensions(vec![JsExtensionLoadSpec::from_entry_path(&path).unwrap()])
+                    .await
+                    .unwrap();
+                let error = selected
+                    .get("binding_probe")
+                    .unwrap()
+                    .execute("retained-owner", json!({}), None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("PI_EXTENSION_TOOL_STALE"),
+                    "{filename}: {error}"
+                );
+                catalog.refresh(&manager, &shared).await.unwrap();
+                let fresh = shared
+                    .snapshot()
+                    .get("binding_probe")
+                    .unwrap()
+                    .execute("fresh-owner", json!({}), None)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&fresh.content[0], ContentBlock::Text(text) if text.text == "fresh")
+                );
+            }
+            manager.load_js_extensions(Vec::new()).await.unwrap();
+            catalog.refresh(&manager, &shared).await.unwrap();
+            assert!(shared.snapshot().get("binding_probe").is_none());
             assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
         });
     }

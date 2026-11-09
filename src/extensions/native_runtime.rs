@@ -1,9 +1,9 @@
 //! Active deterministic native descriptor extension runtime.
 
 use super::{
-    Error, ExtensionInteraction, ExtensionRepairEvent, ExtensionToolDef, JsExtensionLoadSpec,
-    JsExtensionRuntimeHandle, JsExtensionSnapshot, NativeRustExtensionLoadSpec, Result,
-    extract_slash_command_name, parse_extension_tool_defs,
+    Error, ExtensionInteraction, ExtensionRepairEvent, ExtensionToolDef, ExtensionToolRegistration,
+    JsExtensionLoadSpec, JsExtensionRuntimeHandle, JsExtensionSnapshot,
+    NativeRustExtensionLoadSpec, Result, extract_slash_command_name, parse_extension_tool_defs,
 };
 use crate::tools::ToolUpdate;
 use serde::Deserialize;
@@ -73,7 +73,10 @@ struct NativeRustLoadedExtension {
 #[derive(Debug, Default)]
 struct NativeRustRuntimeState {
     extensions: Vec<NativeRustLoadedExtension>,
-    tool_extension_index: HashMap<String, usize>,
+    tool_generation: Uuid,
+    /// Name -> (executable owner, validated schema). Both are published by the
+    /// same rebuild, so dispatch never reparses a different owner's raw row.
+    tool_extension_index: HashMap<String, (usize, usize)>,
     command_extension_index: HashMap<String, usize>,
     shortcut_extension_index: HashMap<String, usize>,
     provider_stream_extension_index: HashMap<String, usize>,
@@ -94,6 +97,7 @@ impl NativeRustRuntimeState {
             .map(|extension| extension.snapshot.clone())
             .collect::<Vec<_>>();
         self.extensions = loaded;
+        self.tool_generation = Uuid::new_v4();
         self.reset_transient_state();
         self.rebuild_indexes();
         snapshots
@@ -108,14 +112,15 @@ impl NativeRustRuntimeState {
         self.registered_tools.clear();
 
         for (extension_index, extension) in self.extensions.iter().enumerate() {
-            self.registered_tools
-                .extend(parse_extension_tool_defs(&extension.snapshot.tools));
-
-            for tool in &extension.snapshot.tools {
-                if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                    self.tool_extension_index
-                        .entry(name.to_string())
-                        .or_insert(extension_index);
+            // Advertise and route the same validated row. A malformed earlier
+            // descriptor must not claim a later owner's usable schema, and
+            // duplicate valid names retain their first executable owner.
+            for definition in parse_extension_tool_defs(&extension.snapshot.tools) {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.tool_extension_index.entry(definition.name.clone())
+                {
+                    entry.insert((extension_index, self.registered_tools.len()));
+                    self.registered_tools.push(definition);
                 }
             }
 
@@ -151,8 +156,13 @@ impl NativeRustRuntimeState {
     }
 
     fn find_tool_extension(&self, tool_name: &str) -> Option<&NativeRustLoadedExtension> {
-        let extension_index = *self.tool_extension_index.get(tool_name)?;
+        let (extension_index, _) = *self.tool_extension_index.get(tool_name)?;
         self.extensions.get(extension_index)
+    }
+
+    fn find_tool_definition(&self, tool_name: &str) -> Option<&ExtensionToolDef> {
+        let (_, definition_index) = *self.tool_extension_index.get(tool_name)?;
+        self.registered_tools.get(definition_index)
     }
 
     fn find_command_extension(&self, command_name: &str) -> Option<&NativeRustLoadedExtension> {
@@ -313,6 +323,25 @@ impl NativeRustExtensionRuntimeHandle {
         Ok(state.registered_tools.clone())
     }
 
+    pub(crate) async fn get_tool_registrations(&self) -> Result<Vec<ExtensionToolRegistration>> {
+        let state = self.read_running()?;
+        state
+            .registered_tools
+            .iter()
+            .map(|definition| {
+                let extension = state.find_tool_extension(&definition.name).ok_or_else(|| {
+                    Error::extension("native-rust tool registration has no executable owner")
+                })?;
+                Ok(ExtensionToolRegistration {
+                    definition: definition.clone(),
+                    owner: extension.snapshot.id.clone(),
+                    generation: state.tool_generation,
+                    revision: 0,
+                })
+            })
+            .collect()
+    }
+
     pub async fn pump_once(&self) -> Result<bool> {
         self.ensure_running()?;
         Ok(false)
@@ -370,6 +399,18 @@ impl NativeRustExtensionRuntimeHandle {
         input: Value,
         _timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_registered_tool_ref(tool_name, tool_call_id, input, None)
+            .await
+    }
+
+    #[allow(clippy::option_if_let_else)]
+    async fn execute_registered_tool_ref(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: Value,
+        registration: Option<&ExtensionToolRegistration>,
+    ) -> Result<Value> {
         enum Lookup {
             Output(Value),
             RegisteredWithoutOutput,
@@ -378,6 +419,16 @@ impl NativeRustExtensionRuntimeHandle {
 
         let lookup = {
             let state = self.read_running()?;
+            if let Some(registration) = registration {
+                let extension = state.find_tool_extension(tool_name);
+                if registration.generation != state.tool_generation
+                    || registration.revision != 0
+                    || extension.is_none_or(|extension| extension.snapshot.id != registration.owner)
+                    || state.find_tool_definition(tool_name) != Some(&registration.definition)
+                {
+                    return Err(registration.stale_error());
+                }
+            }
             if let Some(extension) = state.find_tool_extension(tool_name) {
                 extension
                     .tool_outputs
@@ -629,6 +680,7 @@ fn load_native_extension_from_spec(
             version,
             api_version,
             tools: descriptor.tools,
+            tool_revisions: HashMap::new(),
             slash_commands: descriptor.slash_commands,
             shortcuts: descriptor.shortcuts,
             message_renderers: descriptor.message_renderers,
@@ -719,6 +771,13 @@ impl ExtensionRuntimeHandle {
         match self {
             Self::Js(runtime) => runtime.get_registered_tools().await,
             Self::NativeRust(runtime) => runtime.get_registered_tools().await,
+        }
+    }
+
+    pub(crate) async fn get_tool_registrations(&self) -> Result<Vec<ExtensionToolRegistration>> {
+        match self {
+            Self::Js(runtime) => runtime.get_tool_registrations().await,
+            Self::NativeRust(runtime) => runtime.get_tool_registrations().await,
         }
     }
 
@@ -813,23 +872,52 @@ impl ExtensionRuntimeHandle {
         timeout_ms: u64,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<Value> {
+        self.execute_tool_with_registration_ref(
+            tool_name,
+            tool_call_id,
+            input,
+            ctx_payload,
+            timeout_ms,
+            on_update,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_tool_with_registration_ref(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        input: Value,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        registration: Option<Arc<ExtensionToolRegistration>>,
+    ) -> Result<Value> {
         match self {
             Self::Js(runtime) => {
                 runtime
-                    .execute_tool_with_updates(
+                    .execute_tool_with_registration(
                         tool_name.to_string(),
                         tool_call_id.to_string(),
                         input,
                         ctx_payload,
                         timeout_ms,
                         on_update,
+                        registration,
                     )
                     .await
             }
             Self::NativeRust(runtime) => {
                 let _ = (ctx_payload, on_update);
                 runtime
-                    .execute_tool_ref(tool_name, tool_call_id, input, timeout_ms)
+                    .execute_registered_tool_ref(
+                        tool_name,
+                        tool_call_id,
+                        input,
+                        registration.as_deref(),
+                    )
                     .await
             }
         }

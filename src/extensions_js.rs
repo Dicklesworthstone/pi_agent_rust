@@ -22431,6 +22431,7 @@ const __pi_extensions = new Map();
 
 // Fast indexes
 const __pi_tool_index = new Map();      // tool_name -> { extensionId, spec, execute }
+let __pi_next_tool_revision = 0;
 const __pi_command_index = new Map();   // command_name -> { extensionId, name, description, handler }
 const __pi_hook_index = new Map();      // event_name -> [{ extensionId, handler }, ...]
 const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler }, ...] (pi.events.on)
@@ -22856,7 +22857,13 @@ function __pi_register_tool(spec) {
         }
     }
 
-    const record = { extensionId: ext.id, spec: toolSpec, execute: spec.execute };
+    if (__pi_next_tool_revision >= Number.MAX_SAFE_INTEGER) {
+        throw new Error('registerTool: registration revision exhausted');
+    }
+    const record = {
+        extensionId: ext.id, spec: toolSpec, execute: spec.execute,
+        revision: ++__pi_next_tool_revision,
+    };
     ext.tools.set(name, record);
     __pi_tool_index.set(name, record);
 }
@@ -23714,8 +23721,10 @@ function __pi_snapshot_extensions() {
     const out = [];
     for (const [id, ext] of __pi_extensions.entries()) {
         const tools = [];
+        const tool_revisions = Object.create(null);
         for (const tool of ext.tools.values()) {
             tools.push(tool.spec);
+            tool_revisions[tool.spec.name] = tool.revision;
         }
 
         const commands = [];
@@ -23771,6 +23780,7 @@ function __pi_snapshot_extensions() {
             version: ext.version,
             api_version: ext.apiVersion,
             tools: tools,
+            tool_revisions: tool_revisions,
             slash_commands: commands,
             providers: providers,
             mcp_servers: mcp_servers,
@@ -24792,15 +24802,25 @@ function __pi_validate_tool_input(schema, input) {
 }
 
 async function __pi_execute_tool(
-    tool_name, tool_call_id, input, ctx_payload, invocation_token, native_update
+    tool_name, tool_call_id, input, ctx_payload, invocation_token, native_update,
+    expected_revision, admitted_parameters
 ) {
     const name = String(tool_name || '').trim();
     const record = __pi_tool_index.get(name);
     if (!record) {
         throw new Error(`Unknown tool: ${name}`);
     }
+    if (expected_revision != null && record.revision !== expected_revision) {
+        throw new Error(`PI_EXTENSION_TOOL_STALE: tool ${name} registration changed`);
+    }
 
-    __pi_validate_tool_input(record.spec && record.spec.parameters, input);
+    // Bound callers authorize the host-projected schema. Reading the live
+    // guest object again could run getters or use an edit made after its
+    // snapshot was checked; neither may change the admitted input contract.
+    __pi_validate_tool_input(
+        expected_revision != null ? admitted_parameters : record.spec && record.spec.parameters,
+        input
+    );
 
     return __pi_with_extension_async(record.extensionId, async () => {
         const invocation = __pi_tool_invocation_runtime.start(
