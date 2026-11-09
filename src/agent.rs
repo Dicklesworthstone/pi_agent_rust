@@ -16762,11 +16762,20 @@ mod abort_tests {
         Text,
         Content,
         Custom,
+        SdkText,
+        SdkImages,
+        SdkContent,
+    }
+
+    enum StartupAbortPhase {
+        BeforeAgentStart,
+        Input,
     }
 
     #[allow(clippy::too_many_lines)]
     fn cancelled_startup_never_reaches_provider(
         prompt: StartupAbortPrompt,
+        phase: StartupAbortPhase,
         pre_warmed: bool,
         return_after_abort: bool,
     ) {
@@ -16776,16 +16785,25 @@ mod abort_tests {
         runtime.block_on(async move {
             let temp = tempfile::TempDir::new().expect("fixture directory");
             let entry = temp.path().join("startup.js");
-            std::fs::write(
-                &entry,
-                r"export default function(pi) {
+            let extension = match phase {
+                StartupAbortPhase::BeforeAgentStart => {
+                    r"export default function(pi) {
                     pi.on('before_agent_start', async () => {
                         await pi.tool('read', {});
                         return { systemPrompt: 'late readiness prompt' };
                     });
-                }",
-            )
-            .expect("extension fixture");
+                }"
+                }
+                StartupAbortPhase::Input => {
+                    r"export default function(pi) {
+                    pi.on('input', async () => {
+                        await pi.tool('read', {});
+                        return { action: 'transform', text: 'late transformed input' };
+                    });
+                }"
+                }
+            };
+            std::fs::write(&entry, extension).expect("extension fixture");
             let (abort_handle, abort_signal) = AbortHandle::new();
             let entered = Arc::new(AtomicUsize::new(0));
             let dropped = Arc::new(AtomicBool::new(false));
@@ -16872,24 +16890,31 @@ mod abort_tests {
                 .expect("session lock")
                 .entries
                 .len();
+            let mut sdk = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                agent_session,
+                crate::sdk::EventListeners::default(),
+            );
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let observed = Arc::clone(&events);
+            let on_event = move |event| observed.lock().unwrap().push(event);
             let run = async {
                 match prompt {
                     StartupAbortPrompt::Text => {
-                        agent_session
-                            .run_text_with_abort("hello".to_string(), Some(abort_signal), |_| {})
+                        sdk.session_mut()
+                            .run_text_with_abort("hello".to_string(), Some(abort_signal), on_event)
                             .await
                     }
                     StartupAbortPrompt::Content => {
-                        agent_session
+                        sdk.session_mut()
                             .run_with_content_with_abort(
                                 vec![ContentBlock::Text(TextContent::new("hello"))],
                                 Some(abort_signal),
-                                |_| {},
+                                on_event,
                             )
                             .await
                     }
                     StartupAbortPrompt::Custom => {
-                        agent_session
+                        sdk.session_mut()
                             .run_custom_message_with_abort(
                                 Message::Custom(CustomMessage {
                                     custom_type: "startup-note".to_string(),
@@ -16899,9 +16924,38 @@ mod abort_tests {
                                     timestamp: 0,
                                 }),
                                 Some(abort_signal),
-                                |_| {},
+                                on_event,
                             )
                             .await
+                    }
+                    StartupAbortPrompt::SdkText => {
+                        sdk.prompt_with_abort("hello", abort_signal, on_event).await
+                    }
+                    StartupAbortPrompt::SdkImages => {
+                        sdk.prompt_with_images_with_abort(
+                            "hello",
+                            vec![ImageContent {
+                                data: "AQID".to_string(),
+                                mime_type: "image/png".to_string(),
+                            }],
+                            abort_signal,
+                            on_event,
+                        )
+                        .await
+                    }
+                    StartupAbortPrompt::SdkContent => {
+                        sdk.prompt_with_content_with_abort(
+                            vec![
+                                ContentBlock::Image(ImageContent {
+                                    data: "AQID".to_string(),
+                                    mime_type: "image/png".to_string(),
+                                }),
+                                ContentBlock::Text(TextContent::new("hello")),
+                            ],
+                            abort_signal,
+                            on_event,
+                        )
+                        .await
                     }
                 }
             };
@@ -16911,7 +16965,7 @@ mod abort_tests {
                 run,
             )
             .await
-            .expect("caller cancellation must not wait for the 75-second startup budget");
+            .expect("caller cancellation must release extension startup");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert!(matches!(result, Err(Error::Aborted)));
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -16919,7 +16973,7 @@ mod abort_tests {
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
-            assert!(agent_session.agent.messages().is_empty());
+            assert!(sdk.session().agent.messages().is_empty());
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert_eq!(
                 session
@@ -16931,9 +16985,12 @@ mod abort_tests {
                 previous_entries
             );
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
-            assert_eq!(agent_session.agent.system_prompt(), Some("base-system"));
+            assert_eq!(sdk.session().agent.system_prompt(), Some("base-system"));
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
-            assert!(!agent_session.extensions_turn_active.load(Ordering::SeqCst));
+            assert!(!sdk.session().extensions_turn_active.load(Ordering::SeqCst));
+            sdk.session()
+                .ensure_provider_reentry_allowed()
+                .expect("cancelled input admission must not quarantine session persistence");
             let handle = manager.js_runtime().expect("native JS runtime");
             asupersync::time::timeout(
                 asupersync::time::wall_now(),
@@ -16948,6 +17005,10 @@ mod abort_tests {
                 dropped.load(Ordering::SeqCst),
                 "cancelled initialization must release its hostcall"
             );
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "cancelled startup must not start or finish a provider lifecycle"
+            );
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert!(manager.shutdown(Duration::from_secs(5)).await);
         });
@@ -16955,22 +17016,69 @@ mod abort_tests {
 
     #[test]
     fn text_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
-        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Text, false, false);
+        cancelled_startup_never_reaches_provider(
+            StartupAbortPrompt::Text,
+            StartupAbortPhase::BeforeAgentStart,
+            false,
+            false,
+        );
     }
 
     #[test]
     fn content_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
-        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Content, false, false);
+        cancelled_startup_never_reaches_provider(
+            StartupAbortPrompt::Content,
+            StartupAbortPhase::BeforeAgentStart,
+            false,
+            false,
+        );
     }
 
     #[test]
     fn custom_message_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
-        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Custom, false, false);
+        cancelled_startup_never_reaches_provider(
+            StartupAbortPrompt::Custom,
+            StartupAbortPhase::BeforeAgentStart,
+            false,
+            false,
+        );
     }
 
     #[test]
     fn prewarmed_startup_cancellation_wins_when_hostcall_returns_after_abort() {
-        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Text, true, true);
+        cancelled_startup_never_reaches_provider(
+            StartupAbortPrompt::Text,
+            StartupAbortPhase::BeforeAgentStart,
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn sdk_input_cancellation_drops_pending_hostcalls_before_accepting_prompts() {
+        for prompt in [
+            StartupAbortPrompt::SdkText,
+            StartupAbortPrompt::SdkImages,
+            StartupAbortPrompt::SdkContent,
+        ] {
+            cancelled_startup_never_reaches_provider(
+                prompt,
+                StartupAbortPhase::Input,
+                false,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_input_cancellation_rejects_late_prompt_transformations() {
+        for prompt in [
+            StartupAbortPrompt::SdkText,
+            StartupAbortPrompt::SdkImages,
+            StartupAbortPrompt::SdkContent,
+        ] {
+            cancelled_startup_never_reaches_provider(prompt, StartupAbortPhase::Input, true, true);
+        }
     }
 
     #[test]
@@ -23129,7 +23237,9 @@ impl AgentSession {
             // Consume the one-shot provenance before extension dispatch so a
             // blocked/failed input cannot leak it into the next user turn.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
-            let outcome = self.dispatch_input_event(input, Vec::new()).await?;
+            let outcome = self
+                .dispatch_input_event(input, Vec::new(), abort.as_ref())
+                .await?;
             let (text, images) = match outcome {
                 InputEventOutcome::Continue { text, images } => (text, images),
                 InputEventOutcome::Block { reason } => {
@@ -23240,7 +23350,7 @@ impl AgentSession {
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
             let (original_text, images) = Self::split_content_blocks_for_input(&content);
             let outcome = self
-                .dispatch_input_event(original_text.clone(), images)
+                .dispatch_input_event(original_text.clone(), images, abort.as_ref())
                 .await?;
             let (text, images) = match outcome {
                 InputEventOutcome::Continue { text, images } => (text, images),
@@ -23322,10 +23432,14 @@ impl AgentSession {
         &self,
         text: String,
         images: Vec<ImageContent>,
+        abort: Option<&AbortSignal>,
     ) -> Result<InputEventOutcome> {
         let Some(region) = &self.extensions else {
             return Ok(InputEventOutcome::Continue { text, images });
         };
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
         let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
         let attachments_value = images_value.clone();
@@ -23338,16 +23452,48 @@ impl AgentSession {
             "source": self.input_source.as_str(),
         });
 
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::Input,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await?;
+        let response = Self::dispatch_pre_turn_event_with_abort(
+            region.manager(),
+            ExtensionEventName::Input,
+            payload,
+            EXTENSION_EVENT_TIMEOUT_MS,
+            abort,
+        )
+        .await?;
 
         Ok(apply_input_event_response(response, text, images))
+    }
+
+    /// Input and readiness hooks own the same cancellable startup boundary.
+    /// Dropping their dispatch future signals the native actor out of band,
+    /// cancelling pending hostcalls and quarantining late extension work. A
+    /// response racing cancellation must never become accepted user input.
+    async fn dispatch_pre_turn_event_with_abort(
+        manager: &ExtensionManager,
+        event: ExtensionEventName,
+        payload: Value,
+        timeout_ms: u64,
+        abort: Option<&AbortSignal>,
+    ) -> Result<Option<Value>> {
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
+        let response = manager.dispatch_event_with_response(event, Some(payload), timeout_ms);
+        let Some(abort) = abort else {
+            return response.await;
+        };
+        let cancelled = abort.wait();
+        futures::pin_mut!(response, cancelled);
+        match futures::future::select(cancelled, response).await {
+            futures::future::Either::Left(_) => Err(Error::Aborted),
+            futures::future::Either::Right((result, _)) => {
+                if abort.is_aborted() {
+                    Err(Error::Aborted)
+                } else {
+                    result
+                }
+            }
+        }
     }
 
     async fn dispatch_before_agent_start(
@@ -23383,36 +23529,21 @@ impl AgentSession {
             "systemPrompt": system_prompt,
         });
 
-        let response = region.manager().dispatch_event_with_response(
+        let response = Self::dispatch_pre_turn_event_with_abort(
+            region.manager(),
             ExtensionEventName::BeforeAgentStart,
-            Some(payload),
+            payload,
             self.extension_startup_timeout_ms,
-        );
-        let response = if let Some(abort) = abort {
-            let cancelled = abort.wait();
-            futures::pin_mut!(response, cancelled);
-            match futures::future::select(cancelled, response).await {
-                // Dropping the event future signals the native actor out of
-                // band, so pending or CPU-bound initialization is quarantined.
-                futures::future::Either::Left(_) => return Err(Error::Aborted),
-                futures::future::Either::Right((result, _)) => {
-                    // Cancellation wins when readiness and abort become ready
-                    // together. No provider request may use the late response.
-                    if abort.is_aborted() {
-                        return Err(Error::Aborted);
-                    }
-                    result
-                }
-            }
-        } else {
-            response.await
-        };
+            abort,
+        )
+        .await;
 
         match response {
             Ok(value) => Ok(apply_before_agent_start_response(
                 value,
                 Utc::now().timestamp_millis(),
             )),
+            Err(Error::Aborted) => Err(Error::Aborted),
             Err(err) => {
                 tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
                 Ok(BeforeAgentStartOutcome {
