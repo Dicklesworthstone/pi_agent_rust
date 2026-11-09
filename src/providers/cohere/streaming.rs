@@ -21,6 +21,7 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_BLOCKS: usize = 1024;
 const MAX_ID_BYTES: usize = 1024;
+const MAX_READY_STEPS_PER_YIELD: usize = 64;
 
 fn protocol(message: &str) -> Error {
     Error::api(format!("Cohere stream protocol error: {message}"))
@@ -82,6 +83,7 @@ where
     seen_tool_ids: BTreeSet<String>,
     plan: Option<ContentSlot>,
     received_bytes: usize,
+    ready_steps: usize,
     usage_observer: Option<crate::provider::UsageObserver>,
 }
 
@@ -117,6 +119,7 @@ where
             seen_tool_ids: BTreeSet::new(),
             plan: None,
             received_bytes: 0,
+            ready_steps: 0,
             usage_observer: None,
         }
     }
@@ -577,6 +580,13 @@ where
 
     async fn next_event(&mut self) -> Option<Result<StreamEvent>> {
         loop {
+            // Keep the budget across public events as well as silent frames:
+            // a consumer may drain many immediately ready events in one poll.
+            if self.ready_steps == MAX_READY_STEPS_PER_YIELD {
+                yield_stream_turn().await;
+                self.ready_steps = 0;
+            }
+            self.ready_steps += 1;
             if let Some(event) = self.pending_events.pop_front() {
                 return Some(Ok(event));
             }
@@ -607,6 +617,22 @@ where
             }
         }
     }
+}
+
+/// Return control to the existing consumer without a timer or detached task.
+/// In particular, a continuously ready transport must not starve cancellation.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 fn token_count(value: Option<&Value>) -> Result<u64> {
@@ -682,8 +708,16 @@ where
     let mut state = StreamState::new(SseStream::new(source), model, api, provider);
     state.usage_observer = usage_observer;
     Box::pin(
-        stream::unfold(state, |mut state| async move {
-            state.next_event().await.map(|event| (event, state))
+        stream::unfold(Some(state), |active| async move {
+            let mut state = active?;
+            let event = state.next_event().await?;
+            let terminal = matches!(
+                &event,
+                Err(_) | Ok(StreamEvent::Done { .. } | StreamEvent::Error { .. })
+            );
+            // Drop the HTTP source, captured owner and buffered tail before
+            // returning a terminal item. A caller need never poll for EOF.
+            Some((event, (!terminal).then_some(state)))
         })
         .fuse(),
     )
@@ -1130,5 +1164,295 @@ mod tests {
             ));
             assert!(events.next().await.is_none());
         });
+    }
+
+    mod transport_lifecycle {
+        use super::*;
+        use futures::FutureExt as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        type Output = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+
+        #[derive(Default)]
+        struct Observation {
+            dropped: AtomicBool,
+            polls: AtomicUsize,
+        }
+
+        enum Tail {
+            Pending,
+            Eof,
+            Repeat(Vec<u8>),
+        }
+
+        struct ObservedSource {
+            chunks: VecDeque<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+            observation: Arc<Observation>,
+        }
+
+        impl Stream for ObservedSource {
+            type Item = std::io::Result<Vec<u8>>;
+
+            fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                let this = self.get_mut();
+                let polls = this.observation.polls.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(chunk) = this.chunks.pop_front() {
+                    return Poll::Ready(Some(chunk));
+                }
+                match &this.tail {
+                    Tail::Pending => Poll::Pending,
+                    Tail::Eof => Poll::Ready(None),
+                    Tail::Repeat(bytes) => {
+                        assert!(
+                            polls <= MAX_READY_STEPS_PER_YIELD * 4,
+                            "the ready source starved its consumer's cancellation"
+                        );
+                        Poll::Ready(Some(Ok(bytes.clone())))
+                    }
+                }
+            }
+        }
+
+        impl Drop for ObservedSource {
+            fn drop(&mut self) {
+                self.observation.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn observed(
+            chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
+            tail: Tail,
+        ) -> (Output, Arc<Observation>) {
+            let observation = Arc::new(Observation::default());
+            let source = ObservedSource {
+                chunks: chunks.into_iter().collect(),
+                tail,
+                observation: Arc::clone(&observation),
+            };
+            (
+                response_stream(
+                    source,
+                    "model".into(),
+                    "cohere-chat".into(),
+                    "cohere".into(),
+                    None,
+                ),
+                observation,
+            )
+        }
+
+        fn wire(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
+            events
+                .into_iter()
+                .flat_map(|event| format!("data: {event}\n\n").into_bytes())
+                .collect()
+        }
+
+        fn assert_retired(output: &mut Output, observation: &Observation) {
+            // Check before requesting EOF: hosts commonly stop polling at the
+            // terminal item while retaining the stream in a session handle.
+            assert!(observation.dropped.load(Ordering::SeqCst));
+            let polls = observation.polls.load(Ordering::SeqCst);
+            for _ in 0..3 {
+                assert!(
+                    output
+                        .next()
+                        .now_or_never()
+                        .expect("fused EOF must be ready")
+                        .is_none()
+                );
+            }
+            assert_eq!(observation.polls.load(Ordering::SeqCst), polls);
+        }
+
+        #[test]
+        fn native_terminal_releases_source_after_queued_plan_end_and_preserves_usage() {
+            for (finish, expected) in [
+                ("COMPLETE", StopReason::Stop),
+                ("MAX_TOKENS", StopReason::Length),
+                ("ERROR", StopReason::Error),
+            ] {
+                let mut bytes = wire([
+                    json!({"type":"message-start"}),
+                    json!({"type":"tool-plan-delta","delta":{"message":{"tool_plan":"plan"}}}),
+                    end(finish),
+                ]);
+                bytes.extend_from_slice(b"data: {private invalid trailing payload}\n\n");
+                let (mut output, observation) = observed([Ok(bytes)], Tail::Pending);
+                let mut order = Vec::new();
+                for _ in 0..8 {
+                    let event = output.next().now_or_never().unwrap().unwrap().unwrap();
+                    match event {
+                        StreamEvent::Start { .. } => order.push("start"),
+                        StreamEvent::TextStart { .. } => order.push("text_start"),
+                        StreamEvent::TextDelta { delta, .. } => {
+                            assert_eq!(delta, "plan");
+                            order.push("text_delta");
+                        }
+                        StreamEvent::TextEnd { content, .. } => {
+                            assert_eq!(content, "plan");
+                            order.push("text_end");
+                        }
+                        StreamEvent::Done { reason, message } => {
+                            assert_eq!(reason, expected);
+                            assert_eq!(message.usage.total_tokens, 5);
+                            order.push("done");
+                            break;
+                        }
+                        event => panic!("unexpected event: {event:?}"),
+                    }
+                }
+                assert_eq!(
+                    order,
+                    ["start", "text_start", "text_delta", "text_end", "done"]
+                );
+                assert_retired(&mut output, &observation);
+            }
+        }
+
+        #[test]
+        fn protocol_transport_and_eof_errors_release_source_before_the_error() {
+            for input in [
+                Ok(b"data: {private malformed JSON}\n\n".to_vec()),
+                Ok(b"data: [DONE]\n\n".to_vec()),
+                Ok(b"data: {\"type\":\"error\",\"message\":\"private\"}\n\n".to_vec()),
+                Ok(b"data: \xff\n\n".to_vec()),
+                Err(std::io::Error::other("private transport details")),
+            ] {
+                let (mut output, observation) = observed(
+                    [
+                        input,
+                        Ok(wire([json!({"type":"message-start"}), end("COMPLETE")])),
+                    ],
+                    Tail::Pending,
+                );
+                let error = output.next().now_or_never().unwrap().unwrap().unwrap_err();
+                assert!(!error.to_string().contains("private"));
+                assert_retired(&mut output, &observation);
+            }
+            for partial in [false, true] {
+                let chunks = partial.then(|| Ok(wire([json!({"type":"message-start"})])));
+                let (mut output, observation) = observed(chunks, Tail::Eof);
+                if partial {
+                    assert!(matches!(
+                        output.next().now_or_never(),
+                        Some(Some(Ok(StreamEvent::Start { .. })))
+                    ));
+                }
+                let error = output.next().now_or_never().unwrap().unwrap().unwrap_err();
+                assert!(error.to_string().contains("unexpected EOF"));
+                assert_retired(&mut output, &observation);
+            }
+        }
+
+        #[derive(Default)]
+        struct WakeFlag(AtomicBool);
+
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn ready_heartbeat_and_metadata_bursts_yield_wake_and_resume_in_order() {
+            for coalesced in [false, true] {
+                for silent in [
+                    b"event: ping\ndata:\n\n".to_vec(),
+                    wire([json!({"type":"citation-start"})]),
+                ] {
+                    let mut chunks = vec![wire([json!({"type":"message-start"})])];
+                    chunks.extend(std::iter::repeat_n(silent, MAX_READY_STEPS_PER_YIELD * 2));
+                    chunks.push(wire([end("COMPLETE")]));
+                    if coalesced {
+                        chunks = vec![chunks.concat()];
+                    }
+                    let (mut output, observation) =
+                        observed(chunks.into_iter().map(Ok), Tail::Pending);
+                    assert!(matches!(
+                        output.next().now_or_never(),
+                        Some(Some(Ok(StreamEvent::Start { .. })))
+                    ));
+                    let flag = Arc::new(WakeFlag::default());
+                    let waker = Waker::from(Arc::clone(&flag));
+                    let mut task = Context::from_waker(&waker);
+                    assert!(output.as_mut().poll_next(&mut task).is_pending());
+                    assert!(flag.0.load(Ordering::SeqCst));
+                    assert!(observation.polls.load(Ordering::SeqCst) <= MAX_READY_STEPS_PER_YIELD);
+                    assert!(!observation.dropped.load(Ordering::SeqCst));
+                    let event = futures::executor::block_on(output.next()).unwrap().unwrap();
+                    let StreamEvent::Done { message, .. } = event else {
+                        panic!("metadata changed the public event order");
+                    };
+                    assert_eq!(message.usage.total_tokens, 5);
+                    assert_retired(&mut output, &observation);
+                }
+            }
+        }
+
+        #[test]
+        fn cancellation_wins_while_draining_ready_metadata_or_public_deltas() {
+            for public_deltas in [false, true] {
+                let prefix = public_deltas.then(|| {
+                    Ok(wire([
+                        json!({"type":"message-start"}),
+                        json!({"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}}),
+                    ]))
+                });
+                let repeat = if public_deltas {
+                    wire([
+                        json!({"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"x"}}}}),
+                    ])
+                } else {
+                    wire([json!({"type":"citation-start"})])
+                };
+                let (mut output, observation) = observed(prefix, Tail::Repeat(repeat));
+                let mut deltas = 0;
+                futures::executor::block_on(async {
+                    let (abort, signal) = crate::agent::AbortHandle::new();
+                    let drain = Box::pin(async {
+                        loop {
+                            let event = output.next().await.unwrap().unwrap();
+                            assert!(!matches!(
+                                event,
+                                StreamEvent::Done { .. } | StreamEvent::Error { .. }
+                            ));
+                            if matches!(event, StreamEvent::TextDelta { .. }) {
+                                deltas += 1;
+                            }
+                        }
+                    });
+                    let cancel = Box::pin(async move {
+                        abort.abort();
+                        signal.wait().await;
+                    });
+                    match futures::future::select(drain, cancel).await {
+                        futures::future::Either::Right(((), pending)) => drop(pending),
+                        futures::future::Either::Left(_) => panic!("cancellation was starved"),
+                    }
+                });
+                assert_eq!(deltas > 0, public_deltas);
+                assert!(deltas < MAX_READY_STEPS_PER_YIELD);
+                assert!(observation.polls.load(Ordering::SeqCst) <= MAX_READY_STEPS_PER_YIELD);
+                drop(output);
+                assert!(observation.dropped.load(Ordering::SeqCst));
+            }
+        }
+
+        #[test]
+        fn dropping_unpolled_and_pending_consumers_releases_the_transport() {
+            for poll_first in [false, true] {
+                let (mut output, observation) = observed([], Tail::Pending);
+                if poll_first {
+                    assert!(output.next().now_or_never().is_none());
+                }
+                assert!(!observation.dropped.load(Ordering::SeqCst));
+                drop(output);
+                assert!(observation.dropped.load(Ordering::SeqCst));
+            }
+        }
     }
 }

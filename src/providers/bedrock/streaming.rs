@@ -23,6 +23,7 @@ pub(super) const CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
 const MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BLOCKS: usize = super::MAX_BEDROCK_CONTENT_BLOCKS;
+const MAX_READY_STEPS_PER_YIELD: usize = 64;
 type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
 
 fn invalid(message: &str) -> Error {
@@ -701,36 +702,48 @@ pub(super) fn from_bytes(
     usage_observer: Option<crate::provider::UsageObserver>,
 ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
     struct State {
-        source: Option<ByteStream>,
+        source: ByteStream,
         decoder: Decoder,
         message: MessageState,
         secrets: Vec<String>,
-        finished: bool,
+        ready_steps: usize,
     }
     let state = State {
-        source: Some(source),
+        source,
         decoder: Decoder::default(),
         message: MessageState::new(model, provider, usage_observer),
         secrets,
-        finished: false,
+        ready_steps: 0,
     };
-    Box::pin(stream::unfold(state, |mut state| async move {
-        if state.finished {
-            return None;
-        }
-        loop {
-            if let Some(event) = state.message.pending.pop_front() {
-                return Some((Ok(event), state));
-            }
-            let outcome = match state.decoder.next() {
-                Ok(Some(frame)) => dispatch(&frame, &mut state.message, &state.secrets),
-                Err(error) => Err(error),
-                Ok(None) => {
-                    let chunk = match state.source.as_mut() {
-                        Some(source) => source.next().await,
-                        None => None,
-                    };
-                    match chunk {
+    Box::pin(
+        stream::unfold(Some(state), |active| async move {
+            let mut state = active?;
+            loop {
+                // Count body reads, decoded frames and public event delivery.
+                // Keep the counter across next() calls so both invisible reasoning
+                // frames and a consumer draining ready text yield to cancellation.
+                if state.ready_steps == MAX_READY_STEPS_PER_YIELD {
+                    state.ready_steps = 0;
+                    let mut yielded = false;
+                    std::future::poll_fn(|task| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            task.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                state.ready_steps += 1;
+                if let Some(event) = state.message.pending.pop_front() {
+                    return Some((Ok(event), Some(state)));
+                }
+                let outcome = match state.decoder.next() {
+                    Ok(Some(frame)) => dispatch(&frame, &mut state.message, &state.secrets),
+                    Err(error) => Err(error),
+                    Ok(None) => match state.source.next().await {
                         Some(Ok(bytes)) => state.decoder.push(&bytes),
                         Some(Err(error)) => {
                             let details =
@@ -741,25 +754,21 @@ pub(super) fn from_bytes(
                             ))
                         }
                         None => {
-                            state.finished = true;
-                            state.source = None;
                             let outcome =
                                 state.decoder.finish().and_then(|()| state.message.finish());
-                            return Some((outcome, state));
+                            return Some((outcome, None));
                         }
-                    }
+                    },
+                };
+                if let Err(error) = outcome {
+                    // Retire the socket, buffers and usage observer before the
+                    // terminal result. Callers need not poll again to release them.
+                    return Some((Err(error), None));
                 }
-            };
-            if let Err(error) = outcome {
-                // Drop the socket before yielding the terminal error. A caller
-                // is not obliged to poll again or immediately drop our stream.
-                state.source = None;
-                state.finished = true;
-                state.message.pending.clear();
-                return Some((Err(error), state));
             }
-        }
-    }))
+        })
+        .fuse(),
+    )
 }
 
 #[cfg(test)]
@@ -770,7 +779,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::task::{Context, Poll};
 
@@ -1201,6 +1210,7 @@ mod tests {
         assert!(output.next().now_or_never().unwrap().unwrap().is_err());
         assert!(dropped.load(Ordering::SeqCst));
         assert!(output.next().now_or_never().unwrap().is_none());
+        assert!(output.next().now_or_never().unwrap().is_none());
     }
 
     #[test]
@@ -1219,6 +1229,157 @@ mod tests {
         assert!(output.next().now_or_never().is_none());
         drop(output);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct ReadyProbe {
+        first: Option<Vec<u8>>,
+        repeated: Vec<u8>,
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for ReadyProbe {
+        type Item = std::io::Result<Vec<u8>>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            // A regression fails within this poll instead of hanging forever.
+            assert!(
+                self.polls.fetch_add(1, Ordering::SeqCst) < MAX_READY_STEPS_PER_YIELD * 4,
+                "ready transport monopolized the executor"
+            );
+            let bytes = self.first.take().unwrap_or_else(|| self.repeated.clone());
+            Poll::Ready(Some(Ok(bytes)))
+        }
+    }
+
+    impl Drop for ReadyProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl futures::task::ArcWake for WakeCount {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn redacted_delta() -> Vec<u8> {
+        event(
+            "contentBlockDelta",
+            &json!({"contentBlockIndex": 0, "delta": {
+                "reasoningContent": {"redactedContent": "YQ=="}
+            }}),
+        )
+    }
+
+    #[test]
+    fn ready_silent_frames_and_empty_chunks_yield_and_remain_cancellable() {
+        for repeated in [redacted_delta(), Vec::new()] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut output = from_bytes(
+                Box::pin(ReadyProbe {
+                    first: Some(start()),
+                    repeated,
+                    polls: Arc::clone(&polls),
+                    dropped: Arc::clone(&dropped),
+                }),
+                "m".into(),
+                "p".into(),
+                Vec::new(),
+                None,
+            );
+            assert!(matches!(
+                output.next().now_or_never(),
+                Some(Some(Ok(StreamEvent::Start { .. })))
+            ));
+            let wakes = Arc::new(WakeCount::default());
+            let waker = futures::task::waker(Arc::clone(&wakes));
+            {
+                let mut next = std::pin::pin!(output.next());
+                assert!(
+                    next.as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+            assert!((2..=MAX_READY_STEPS_PER_YIELD).contains(&polls.load(Ordering::SeqCst)));
+            assert!(!dropped.load(Ordering::SeqCst));
+            drop(output);
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn draining_ready_text_events_also_yields_between_polls() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let output = from_bytes(
+            Box::pin(ReadyProbe {
+                first: Some(start()),
+                repeated: text(),
+                polls: Arc::clone(&polls),
+                dropped: Arc::clone(&dropped),
+            }),
+            "m".into(),
+            "p".into(),
+            Vec::new(),
+            None,
+        );
+        let wakes = Arc::new(WakeCount::default());
+        let waker = futures::task::waker(Arc::clone(&wakes));
+        let mut drain = Box::pin(output.collect::<Vec<_>>());
+        for expected_wakes in 1..=3 {
+            assert!(
+                drain
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(wakes.0.load(Ordering::SeqCst), expected_wakes);
+            assert!(polls.load(Ordering::SeqCst) <= MAX_READY_STEPS_PER_YIELD * expected_wakes);
+        }
+        drop(drain);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cooperative_yields_preserve_fragmented_and_coalesced_reasoning_and_usage() {
+        let count = MAX_READY_STEPS_PER_YIELD * 2;
+        let mut wire = start();
+        for _ in 0..count {
+            wire.extend(redacted_delta());
+        }
+        wire.extend(block_stop(0));
+        wire.extend(stop());
+        wire.extend(usage_metadata());
+        for chunks in [
+            vec![wire.clone()],
+            wire.chunks(1).map(<[u8]>::to_vec).collect(),
+        ] {
+            let result = collect(chunks);
+            assert_eq!(result.len(), 2, "{result:?}");
+            assert!(matches!(&result[0], Ok(StreamEvent::Start { .. })));
+            let Ok(StreamEvent::Done { reason, message }) = &result[1] else {
+                panic!("expected a complete response: {result:?}");
+            };
+            assert_eq!(*reason, StopReason::Stop);
+            assert_eq!(message.usage.total_tokens, 35);
+            let [ContentBlock::RedactedThinking(block)] = message.content.as_slice() else {
+                panic!("expected one redacted reasoning block");
+            };
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&block.data)
+                    .unwrap(),
+                vec![b'a'; count]
+            );
+        }
     }
 
     fn tool_start(index: u64, id: &str, name: &str) -> Vec<u8> {
