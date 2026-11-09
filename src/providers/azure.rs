@@ -31,6 +31,7 @@ mod usage;
 /// Default Azure OpenAI API version.  Override via `PI_AZURE_API_VERSION`.
 pub(crate) const DEFAULT_API_VERSION: &str = "2024-12-01-preview";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 
 pub(crate) fn azure_api_version() -> String {
     std::env::var("PI_AZURE_API_VERSION")
@@ -439,6 +440,9 @@ where
     finalized: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    /// Retained across yielded items so draining visible deltas cannot bypass
+    /// the same cooperative budget that bounds silent metadata frames.
+    ready_work_since_yield: usize,
     usage_observer: Option<crate::provider::UsageObserver>,
     model_cost: Option<crate::provider::ModelCost>,
 }
@@ -475,6 +479,7 @@ where
             done: false,
             finalized: false,
             transient_error_count: 0,
+            ready_work_since_yield: 0,
             usage_observer: None,
             model_cost: None,
         }
@@ -491,16 +496,32 @@ where
     }
 
     fn into_stream(self) -> impl Stream<Item = Result<StreamEvent>> {
-        stream::unfold(self, |mut state| async move {
+        stream::unfold(Some(self), |active| async move {
+            let mut state = active?;
             loop {
+                // The SSE parser budgets each event separately. Bound both
+                // parsing silent frames and delivering queued deltas across
+                // calls, so a ready stream cannot starve cancellation.
+                if state.ready_work_since_yield == MAX_READY_EVENTS_PER_YIELD {
+                    yield_stream_turn().await;
+                    state.ready_work_since_yield = 0;
+                }
                 if let Some(event) = state.pending_events.pop_front() {
-                    return Some((Ok(event), state));
+                    state.ready_work_since_yield += 1;
+                    let terminal =
+                        matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                    // Retire the transport before exposing its terminal item:
+                    // an SDK caller may retain the stream without repolling it.
+                    let active = (!terminal).then_some(state);
+                    return Some((Ok(event), active));
                 }
                 // A terminal frame can enqueue block-end events before Done.
                 // Drain that queue even after the transport is finished.
                 if state.done {
                     return None;
                 }
+
+                state.ready_work_since_yield += 1;
 
                 match state.event_source.next().await {
                     Some(Ok(msg)) => {
@@ -512,8 +533,7 @@ where
                         }
 
                         if let Err(e) = state.process_event(&msg.data) {
-                            state.done = true;
-                            return Some((Err(e), state));
+                            return Some((Err(e), None));
                         }
                     }
                     Some(Err(e)) => {
@@ -540,25 +560,24 @@ where
                                  consecutive attempts, treating as fatal"
                             );
                         }
-                        state.done = true;
                         let err = Error::sse(&e);
-                        return Some((Err(err), state));
+                        return Some((Err(err), None));
                     }
                     // A clean transport EOF is not a successful Azure
                     // OpenAI completion unless [DONE] was observed. The
                     // agent loop retains partial content on this error.
                     None => {
-                        state.done = true;
                         return Some((
                             Err(Error::api(
                                 "Azure OpenAI stream ended before [DONE] sentinel (unexpected EOF)",
                             )),
-                            state,
+                            None,
                         ));
                     }
                 }
             }
         })
+        .fuse()
     }
 
     fn record_error(&mut self, message: String) {
@@ -880,6 +899,21 @@ where
 
         Ok(())
     }
+}
+
+/// Yield once without a timer or detached task, retaining the consumer's waker.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -1413,10 +1447,9 @@ mod tests {
                     max_tokens: limit,
                     ..Default::default()
                 };
-                let body = serde_json::to_value(
-                    provider.build_request(&Context::default(), &options),
-                )
-                .expect("request JSON");
+                let body =
+                    serde_json::to_value(provider.build_request(&Context::default(), &options))
+                        .expect("request JSON");
                 assert_eq!(body[expected_field], expected_limit, "{body}");
                 assert!(body.get(absent_field).is_none(), "{body}");
             }
@@ -1449,7 +1482,10 @@ mod tests {
             };
             let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
                 .expect("request JSON");
-            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), expected);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected
+            );
             assert!(body.get("thinking").is_none(), "{body}");
             assert!(body.get("reasoning").is_none(), "{body}");
         }
@@ -1480,7 +1516,10 @@ mod tests {
             };
             let body = serde_json::to_value(provider.build_request(&Context::default(), &options))
                 .expect("request JSON");
-            assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), expected);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected
+            );
         }
 
         let provider = provider.with_compat(Some(CompatConfig {
@@ -1567,7 +1606,10 @@ mod tests {
             assert_eq!(captured.api, "azure-openai");
             assert_eq!(captured.payload[expected_field], 2048);
             assert_eq!(
-                captured.payload.get("reasoning_effort").and_then(Value::as_str),
+                captured
+                    .payload
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str),
                 expected_effort,
                 "{model}: {}",
                 captured.payload

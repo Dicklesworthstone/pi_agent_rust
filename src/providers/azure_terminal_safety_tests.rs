@@ -1,4 +1,7 @@
-use super::{AssistantMessage, ContentBlock, SseStream, StopReason, StreamEvent, StreamState};
+use super::{
+    AssistantMessage, ContentBlock, MAX_READY_EVENTS_PER_YIELD, SseStream, StopReason, StreamEvent,
+    StreamState,
+};
 use crate::provider::{Context, ModelCost, Provider, StreamOptions};
 use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{Value, json};
@@ -6,7 +9,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context as TaskContext, Poll};
+use std::task::{Context as TaskContext, Poll, Wake, Waker};
 
 type TestState = StreamState<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>;
 
@@ -443,6 +446,294 @@ impl Drop for UsageSource {
     }
 }
 
+type WireOutput = Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>;
+
+fn wire_output(
+    chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
+    pending_at_end: bool,
+) -> (WireOutput, Arc<AtomicBool>) {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let source = UsageSource {
+        chunks: chunks.into_iter().collect(),
+        pending_at_end,
+        dropped: Arc::clone(&dropped),
+    };
+    let output = StreamState::new(
+        SseStream::new(source),
+        "deployment".to_string(),
+        "azure-openai".to_string(),
+        "azure-openai".to_string(),
+    )
+    .into_stream();
+    (Box::pin(output), dropped)
+}
+
+fn wire_bytes(events: impl IntoIterator<Item = Value>) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut bytes = String::new();
+    for event in events {
+        write!(bytes, "data: {event}\n\n").unwrap();
+    }
+    bytes.into_bytes()
+}
+
+fn assert_retired(output: &mut WireOutput, dropped: &AtomicBool) {
+    // The terminal item, not a subsequent EOF poll or the caller's Drop,
+    // releases transport ownership even when the wire would stay pending.
+    assert!(dropped.load(Ordering::SeqCst), "terminal retained source");
+    for _ in 0..3 {
+        assert!(output.next().now_or_never().unwrap().is_none());
+    }
+}
+
+#[test]
+fn wire_terminal_retires_source_after_trailing_usage_and_block_ends() {
+    for reason in ["stop", "error"] {
+        let mut bytes = wire_bytes([
+            json!({"choices":[{"delta":{"content":"answer"},"finish_reason":reason}]}),
+            json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}),
+        ]);
+        bytes.extend_from_slice(b"data: [DONE]\n\ndata: {invalid unread tail}\n\n");
+        let (mut output, dropped) = wire_output([Ok(bytes)], true);
+        let mut text_ends = 0;
+        let mut terminal = false;
+        for _ in 0..8 {
+            match output.next().now_or_never().unwrap().unwrap().unwrap() {
+                StreamEvent::TextEnd { content, .. } => {
+                    assert_eq!(content, "answer");
+                    text_ends += 1;
+                    assert!(!dropped.load(Ordering::SeqCst));
+                }
+                StreamEvent::Done {
+                    reason: stop,
+                    message,
+                } => {
+                    assert_eq!(
+                        stop,
+                        if reason == "stop" {
+                            StopReason::Stop
+                        } else {
+                            StopReason::Error
+                        }
+                    );
+                    assert_eq!(message.usage.input, 12);
+                    assert_eq!(message.usage.output, 3);
+                    assert_eq!(message.usage.total_tokens, 15);
+                    terminal = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(terminal);
+        assert_eq!(text_ends, 1);
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
+fn wire_fatal_parse_and_transport_errors_retire_before_delivery() {
+    for input in [
+        Ok(b"data: {invalid json}\n\n".to_vec()),
+        Ok(b"data: {\"choices\":\"invalid shape\"}\n\n".to_vec()),
+        Ok(b"data: \xff\n\n".to_vec()),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        )),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid",
+        )),
+    ] {
+        let (mut output, dropped) = wire_output([input, Ok(b"data: [DONE]\n\n".to_vec())], true);
+        assert!(output.next().now_or_never().unwrap().unwrap().is_err());
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
+fn wire_unexpected_eof_preserves_partial_text_and_fuses_after_one_error() {
+    let (mut output, dropped) = wire_output(
+        [Ok(wire_bytes([
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+        ]))],
+        false,
+    );
+    let mut text = String::new();
+    let mut failed = false;
+    for _ in 0..8 {
+        match output.next().now_or_never().unwrap().unwrap() {
+            Ok(StreamEvent::TextDelta { delta, .. }) => text.push_str(&delta),
+            Ok(StreamEvent::Done { .. } | StreamEvent::Error { .. }) => {
+                panic!("EOF must not invent a completed response");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                assert!(error.to_string().contains("before [DONE] sentinel"));
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert_eq!(text, "partial");
+    assert_retired(&mut output, &dropped);
+}
+
+struct WakeFlag(AtomicBool);
+
+impl Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn silent_burst(kind: &str) -> Vec<u8> {
+    let mut bytes = wire_bytes([json!({"choices":[{"delta":{"role":"assistant"}}]})]);
+    let usage = json!({"choices":[],"usage":{
+        "prompt_tokens":12,"completion_tokens":3,"total_tokens":15
+    }});
+    for _ in 0..MAX_READY_EVENTS_PER_YIELD * 2 {
+        match kind {
+            "heartbeat" => bytes.extend_from_slice(b"event: ping\ndata: {}\n\n"),
+            "role" => bytes.extend(wire_bytes([
+                json!({"choices":[{"delta":{"role":"assistant"}}]}),
+            ])),
+            "usage" => bytes.extend(wire_bytes([usage.clone()])),
+            _ => panic!("unknown silent frame"),
+        }
+    }
+    bytes.extend(wire_bytes([usage]));
+    bytes.extend_from_slice(b"data: [DONE]\n\n");
+    bytes
+}
+
+#[test]
+fn ready_metadata_bursts_yield_and_wake_without_losing_usage() {
+    for kind in ["heartbeat", "role", "usage"] {
+        let (mut output, dropped) = wire_output([Ok(silent_burst(kind))], true);
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut task = TaskContext::from_waker(&waker);
+        assert!(matches!(
+            output.as_mut().poll_next(&mut task),
+            Poll::Ready(Some(Ok(StreamEvent::Start { .. })))
+        ));
+        assert!(output.as_mut().poll_next(&mut task).is_pending(), "{kind}");
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "{kind} must arrange a repoll"
+        );
+        assert!(!dropped.load(Ordering::SeqCst));
+        let mut terminal = false;
+        for _ in 0..6 {
+            if let Poll::Ready(Some(Ok(StreamEvent::Done { message, .. }))) =
+                output.as_mut().poll_next(&mut task)
+            {
+                assert_eq!(message.usage.total_tokens, 15);
+                terminal = true;
+                break;
+            }
+        }
+        assert!(terminal, "{kind} must resume after yielding");
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
+fn draining_ready_text_and_queued_tool_events_still_yields() {
+    for tools in [false, true] {
+        let count = MAX_READY_EVENTS_PER_YIELD * 2;
+        let mut bytes = if tools {
+            let calls = (0..count)
+                .map(|index| {
+                    json!({
+                        "index":index,"id":format!("call-{index}"),
+                        "function":{"name":"read","arguments":"{}"}
+                    })
+                })
+                .collect::<Vec<_>>();
+            wire_bytes([json!({"choices":[{
+                "delta":{"tool_calls":calls},"finish_reason":"tool_calls"
+            }]})])
+        } else {
+            wire_bytes((0..count).map(|_| json!({"choices":[{"delta":{"content":"x"}}]})))
+        };
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let (mut output, dropped) = wire_output([Ok(bytes)], true);
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut task = TaskContext::from_waker(&waker);
+        let mut drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+        assert!(drain.as_mut().poll(&mut task).is_pending());
+        assert!(flag.0.load(Ordering::SeqCst));
+        let mut events = None;
+        for _ in 0..16 {
+            if let Poll::Ready(completed) = drain.as_mut().poll(&mut task) {
+                events = Some(completed);
+                break;
+            }
+        }
+        drop(drain);
+        let events = events.expect("bounded visible drain must complete");
+        let events = events
+            .into_iter()
+            .collect::<crate::error::Result<Vec<_>>>()
+            .unwrap();
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+        if tools {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                    .count(),
+                count
+            );
+        } else {
+            let text = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(text, "x".repeat(count));
+        }
+        assert_retired(&mut output, &dropped);
+    }
+}
+
+#[test]
+fn cancellation_can_win_while_a_ready_metadata_stream_is_drained() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let (mut output, dropped) = wire_output([Ok(silent_burst("usage"))], true);
+    runtime.block_on(async {
+        assert!(matches!(
+            output.next().await,
+            Some(Ok(StreamEvent::Start { .. }))
+        ));
+        let (abort, signal) = crate::agent::AbortHandle::new();
+        let next = Box::pin(output.next());
+        let cancel = Box::pin(async move {
+            abort.abort();
+            signal.wait().await;
+        });
+        match futures::future::select(next, cancel).await {
+            futures::future::Either::Right(((), pending)) => drop(pending),
+            futures::future::Either::Left(_) => panic!("metadata stream starved cancellation"),
+        }
+    });
+    drop(output);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
 struct UsageWireProvider {
     response: Mutex<Option<Vec<std::io::Result<Vec<u8>>>>>,
     pending_at_end: bool,
@@ -646,12 +937,8 @@ fn cache_writes_are_exclusive_and_acknowledged_before_cancellation() {
                 if complete {
                     chunks.push(Ok(b"data: [DONE]\n\n".to_vec()));
                 }
-                let (provider, budget, dropped) = guarded_usage_wire_with_rates(
-                    chunks,
-                    !complete,
-                    Some(usage_rates()),
-                    149.0,
-                );
+                let (provider, budget, dropped) =
+                    guarded_usage_wire_with_rates(chunks, !complete, Some(usage_rates()), 149.0);
                 let mut events = provider
                     .stream(&Context::default(), &StreamOptions::default())
                     .await
@@ -915,12 +1202,8 @@ fn explicit_zero_bill_refunds_pending_spend_but_unknown_price_counts_do_not() {
                     if complete {
                         chunks.push(Ok(b"data: [DONE]\n\n".to_vec()));
                     }
-                    let (provider, budget, dropped) = guarded_usage_wire_with_rates(
-                        chunks,
-                        !complete,
-                        rates.clone(),
-                        15.0,
-                    );
+                    let (provider, budget, dropped) =
+                        guarded_usage_wire_with_rates(chunks, !complete, rates.clone(), 15.0);
                     let mut events = provider
                         .stream(&Context::default(), &StreamOptions::default())
                         .await
@@ -1009,7 +1292,10 @@ fn factory_passes_configured_write_rates_to_native_usage_normalization() {
     }
     let trace = std::fs::read_to_string(&log_path).expect("read child diagnostics");
     let status = result.unwrap_or_else(|reason| panic!("{reason}\n{trace}"));
-    assert!(status.success(), "Azure factory regression failed:\n{trace}");
+    assert!(
+        status.success(),
+        "Azure factory regression failed:\n{trace}"
+    );
     assert!(
         trace.contains(COMPLETE),
         "child did not execute the test:\n{trace}"
@@ -1057,8 +1343,11 @@ fn write_factory_usage_fixture(root: &std::path::Path) {
         "baseUrl": "https://contoso.openai.azure.com",
         "models": models,
     }}});
-    std::fs::write(root.join("models.json"), serde_json::to_vec(&config).unwrap())
-        .expect("write models fixture");
+    std::fs::write(
+        root.join("models.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .expect("write models fixture");
     let cassette = json!({
         "version": "1.0",
         "test_name": "azure_factory_write_usage",
