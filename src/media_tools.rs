@@ -176,6 +176,7 @@ pub const READ_MEDIA_EXTENSIONS: &[&str] =
 pub struct ReadMediaTool {
     cwd: PathBuf,
     max_bytes: u64,
+    workspace: crate::workspace::WorkspaceHandle,
 }
 
 impl ReadMediaTool {
@@ -183,7 +184,15 @@ impl ReadMediaTool {
         Self {
             cwd: cwd.to_path_buf(),
             max_bytes: DEFAULT_MEDIA_MAX_BYTES,
+            workspace: crate::workspace::WorkspaceHandle::default(),
         }
+    }
+
+    /// Share the session's live read roots, including additions and revocations.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     #[must_use]
@@ -197,10 +206,6 @@ impl ReadMediaTool {
     #[must_use]
     pub const fn max_bytes(&self) -> u64 {
         self.max_bytes
-    }
-
-    fn resolve_path(&self, rel_or_abs: &str) -> PathBuf {
-        self.cwd.join(rel_or_abs)
     }
 }
 
@@ -248,14 +253,22 @@ impl Tool for ReadMediaTool {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::tool("read_media", "missing required path parameter"))?;
-        let target_path = self.resolve_path(path_str);
+        let target_path = transport::resolve_input(
+            &self.cwd,
+            Path::new(path_str),
+            &self.workspace,
+            "read_media",
+        )?;
         if !target_path.is_file() {
             return Err(Error::tool(
                 "read_media",
                 format!("media file not found: {}", target_path.display()),
             ));
         }
-        let ext = target_path
+        // Keep the caller's label (including an admitted symlink's extension)
+        // while all filesystem access uses the authorized resolved path.
+        let source_path = self.cwd.join(path_str);
+        let ext = source_path
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("")
@@ -289,10 +302,16 @@ impl Tool for ReadMediaTool {
         }
         // Enforce the cap while reading, not merely after allocating the whole
         // file. The advisory metadata check above cannot prevent concurrent growth.
-        let bytes = transport::read_capped(&target_path, "read_media", self.max_bytes)?;
+        let bytes = transport::read_capped(
+            &target_path,
+            &self.cwd,
+            &self.workspace,
+            "read_media",
+            self.max_bytes,
+        )?;
         let size = bytes.len() as u64;
         let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-        let name = target_path
+        let name = source_path
             .file_name()
             .and_then(|name| name.to_str())
             .and_then(crate::model::sanitize_media_name);

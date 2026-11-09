@@ -22,6 +22,7 @@ const COMMON_RATIOS: &[&str] = &["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:
 
 pub struct GenerateImageTool {
     cwd: PathBuf,
+    workspace: crate::workspace::WorkspaceHandle,
     default_provider: Option<String>,
     default_model: Option<String>,
     mock_mode: Option<bool>,
@@ -41,12 +42,20 @@ impl GenerateImageTool {
     pub fn with_defaults(cwd: &Path, provider: Option<String>, model: Option<String>) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: crate::workspace::WorkspaceHandle::default(),
             default_provider: provider,
             default_model: model,
             mock_mode: None,
             api_key: None,
             transport: transport::Transport::default(),
         }
+    }
+
+    /// Share the session's live roots for source images and masks.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     #[must_use]
@@ -177,6 +186,15 @@ impl Tool for GenerateImageTool {
             self.transport.check_admission(NAME)?;
         }
         let artifact = artifact::preflight(&self.cwd, requested, "images/generated", NAME)?;
+        let reference_count = inputs::attach(
+            &self.cwd,
+            &self.workspace,
+            provider,
+            model,
+            &args,
+            &mut endpoint,
+            &mut payload,
+        )?;
         let api = if is_mock {
             None
         } else {
@@ -186,14 +204,6 @@ impl Tool for GenerateImageTool {
                     .await?,
             )
         };
-        let reference_count = inputs::attach(
-            &self.cwd,
-            provider,
-            model,
-            &args,
-            &mut endpoint,
-            &mut payload,
-        )?;
         let (bytes, mime) = match api.as_ref() {
             None => (super::MIN_VALID_PNG.to_vec(), "image/png"),
             Some(api) => {

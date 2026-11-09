@@ -2269,7 +2269,7 @@ fn read_scoped_file_capped_sync(
     Ok(contents)
 }
 
-fn read_file_capped_within_roots_sync(
+pub(crate) fn read_file_capped_within_roots_sync(
     path: &Path,
     allowed_roots: &[PathBuf],
     max_bytes: u64,
@@ -6262,7 +6262,8 @@ impl ToolRegistry {
                             cwd,
                             vision_provider,
                             vision_model,
-                        ),
+                        )
+                        .with_workspace(workspace.clone()),
                     ));
                 }
                 "read_media" => {
@@ -6270,7 +6271,9 @@ impl ToolRegistry {
                         .and_then(|c| c.media.as_ref())
                         .and_then(|m| m.max_bytes);
                     tools.push(Box::new(
-                        crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(max_bytes),
+                        crate::media_tools::ReadMediaTool::new(cwd)
+                            .with_max_bytes(max_bytes)
+                            .with_workspace(workspace.clone()),
                     ));
                 }
                 "generate_image" => {
@@ -6278,7 +6281,8 @@ impl ToolRegistry {
                     let provider = media.and_then(|m| m.image_gen_provider.clone());
                     let model = media.and_then(|m| m.image_gen_model.clone());
                     tools.push(Box::new(
-                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model),
+                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model)
+                            .with_workspace(workspace.clone()),
                     ));
                 }
                 "tts" => {
@@ -6401,7 +6405,8 @@ impl ToolRegistry {
                         cwd,
                         media_cfg.vision_provider.clone(),
                         media_cfg.vision_model.clone(),
-                    ),
+                    )
+                    .with_workspace(workspace.clone()),
                 ));
             }
             if automatic_allowed("read_media")
@@ -6409,7 +6414,9 @@ impl ToolRegistry {
                 && !tools.iter().any(|t| t.name() == "read_media")
             {
                 tools.push(Box::new(
-                    crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(media_cfg.max_bytes),
+                    crate::media_tools::ReadMediaTool::new(cwd)
+                        .with_max_bytes(media_cfg.max_bytes)
+                        .with_workspace(workspace.clone()),
                 ));
             }
             if automatic_allowed("generate_image")
@@ -6424,7 +6431,8 @@ impl ToolRegistry {
                         cwd,
                         media_cfg.image_gen_provider.clone(),
                         media_cfg.image_gen_model.clone(),
-                    ),
+                    )
+                    .with_workspace(workspace.clone()),
                 ));
             }
             if automatic_allowed("tts")

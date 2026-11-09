@@ -18,6 +18,7 @@ const MAX_ANALYSIS_BYTES: usize = 64 * 1024;
 
 pub struct InspectImageTool {
     cwd: PathBuf,
+    workspace: crate::workspace::WorkspaceHandle,
     default_provider: Option<String>,
     default_model: Option<String>,
     mock_mode: Option<bool>,
@@ -33,12 +34,20 @@ impl InspectImageTool {
     pub fn with_defaults(cwd: &Path, provider: Option<String>, model: Option<String>) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: crate::workspace::WorkspaceHandle::default(),
             default_provider: provider,
             default_model: model,
             mock_mode: None,
             api_key: None,
             transport: Transport::default(),
         }
+    }
+
+    /// Share the session's live read roots, including additions and revocations.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     #[must_use]
@@ -113,7 +122,7 @@ impl Tool for InspectImageTool {
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
         let path_str = transport::required(&args, NAME, "path")?;
-        let path = self.cwd.join(path_str);
+        let path = transport::resolve_input(&self.cwd, Path::new(path_str), &self.workspace, NAME)?;
         if !path.is_file() {
             return Err(Error::tool(
                 NAME,
@@ -128,7 +137,7 @@ impl Tool for InspectImageTool {
                 format!("image file exceeds 20 MiB limit: {} bytes", metadata.len()),
             ));
         }
-        let ext = path
+        let ext = Path::new(path_str)
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("")
@@ -212,7 +221,13 @@ impl Tool for InspectImageTool {
                 "convert SVG/BMP to PNG, JPEG, WebP or GIF before vision inspection",
             ));
         }
-        let bytes = transport::read_capped(&path, NAME, MAX_IMAGE_FILE_SIZE_BYTES)?;
+        let bytes = transport::read_capped(
+            &path,
+            &self.cwd,
+            &self.workspace,
+            NAME,
+            MAX_IMAGE_FILE_SIZE_BYTES,
+        )?;
         if transport::image_mime(&bytes) != Some(mime) {
             return Err(Error::tool(
                 NAME,

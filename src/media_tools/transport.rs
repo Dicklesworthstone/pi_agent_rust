@@ -6,8 +6,7 @@ use crate::error::{Error, Result};
 use crate::http::client::Client;
 use futures::future::{Either, select};
 use serde_json::Value;
-use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -480,8 +479,32 @@ pub(super) fn timeout(args: &Value, tool: &str, default_ms: u64) -> Result<Durat
     Ok(Duration::from_millis(ms))
 }
 
-pub(super) fn read_capped(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>> {
-    let initial = std::fs::metadata(path)
+/// Resolve before probing metadata or credentials. Media has the same read
+/// authority as the native read tool, including the agent resource directory.
+pub(super) fn resolve_input(
+    cwd: &Path,
+    path: &Path,
+    workspace: &crate::workspace::WorkspaceHandle,
+    tool: &str,
+) -> Result<PathBuf> {
+    crate::tools::enforce_read_scope_with_roots(
+        &cwd.join(path),
+        cwd,
+        &crate::config::Config::global_dir(),
+        workspace,
+    )
+    .map_err(|error| Error::tool(tool, error.to_string()))
+}
+
+pub(super) fn read_capped(
+    path: &Path,
+    cwd: &Path,
+    workspace: &crate::workspace::WorkspaceHandle,
+    tool: &str,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    let path = resolve_input(cwd, path, workspace, tool)?;
+    let initial = std::fs::metadata(&path)
         .map_err(|error| Error::tool(tool, format!("cannot stat media file: {error}")))?;
     if !initial.is_file() || initial.len() > limit {
         return Err(Error::tool(
@@ -489,34 +512,12 @@ pub(super) fn read_capped(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>
             format!("media input must be a regular file of at most {limit} bytes"),
         ));
     }
-    // A regular file can be replaced between metadata and open. NONBLOCK keeps
-    // a concurrent FIFO swap from hanging before the descriptor can be checked.
-    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
-    let file = {
-        use rustix::fs::{Mode, OFlags};
-        let fd = rustix::fs::open(
-            path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
-        std::fs::File::from(fd)
-    };
-    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
-    let file = std::fs::File::open(path)
-        .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| Error::tool(tool, format!("cannot stat media file: {error}")))?;
-    if !metadata.is_file() || metadata.len() > limit {
-        return Err(Error::tool(
-            tool,
-            format!("media input must be a regular file of at most {limit} bytes"),
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
+    // Re-snapshot live roots at the actual open. The native reader validates
+    // the opened descriptor, rejects symlink/reparse swaps and FIFOs, and caps
+    // the bytes even if an admitted file grows after the advisory stat above.
+    let mut roots = workspace.snapshot_or(cwd).all();
+    roots.push(crate::config::Config::global_dir());
+    let bytes = crate::tools::read_file_capped_within_roots_sync(&path, &roots, limit)
         .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
     if bytes.is_empty() || bytes.len() as u64 > limit {
         return Err(Error::tool(
@@ -956,12 +957,53 @@ pub(super) mod tests {
     #[test]
     fn bounded_file_reader_rejects_empty_and_oversized_inputs() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_capped(dir.path(), "inspect_image", 4).is_err());
+        let workspace = crate::workspace::WorkspaceHandle::single(dir.path());
+        let read =
+            |path: &Path, limit| read_capped(path, dir.path(), &workspace, "inspect_image", limit);
+        assert!(read(dir.path(), 4).is_err());
         let path = dir.path().join("image.png");
         std::fs::write(&path, []).unwrap();
-        assert!(read_capped(&path, "inspect_image", 4).is_err());
+        assert!(read(&path, 4).is_err());
         std::fs::write(&path, b"12345").unwrap();
-        assert!(read_capped(&path, "inspect_image", 4).is_err());
-        assert_eq!(read_capped(&path, "inspect_image", 5).unwrap(), b"12345");
+        assert!(read(&path, 4).is_err());
+        assert_eq!(read(&path, 5).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn media_reads_follow_live_workspace_additions_and_revocations() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        let extra = parent.path().join("extra");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        let outside = extra.join("source.png");
+        std::fs::write(&outside, b"pixels").unwrap();
+        let mut workspace = crate::workspace::WorkspaceHandle::single(&root);
+        let bound = workspace.clone();
+        for path in [outside.as_path(), Path::new("../extra/source.png")] {
+            let error = read_capped(path, &root, &bound, "generate_image", 6).unwrap_err();
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        }
+        workspace.add_root(&extra);
+        assert_eq!(
+            read_capped(&outside, &root, &bound, "generate_image", 6).unwrap(),
+            b"pixels"
+        );
+        assert!(workspace.remove_root(&extra));
+        assert!(read_capped(&outside, &root, &bound, "generate_image", 6).is_err());
+
+        #[cfg(unix)]
+        {
+            let linked = root.join("linked.png");
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+            assert!(read_capped(&linked, &root, &bound, "generate_image", 6).is_err());
+            std::fs::write(root.join("local.png"), b"local").unwrap();
+            let local_link = root.join("local-link.png");
+            std::os::unix::fs::symlink(root.join("local.png"), &local_link).unwrap();
+            assert_eq!(
+                read_capped(&local_link, &root, &bound, "generate_image", 6).unwrap(),
+                b"local"
+            );
+        }
     }
 }

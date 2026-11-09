@@ -16,6 +16,7 @@ const MAX_OPENAI_DATA_URL_BYTES: usize = 20 * 1024 * 1024;
 #[allow(clippy::too_many_lines)]
 pub(super) fn attach(
     cwd: &Path,
+    workspace: &crate::workspace::WorkspaceHandle,
     provider: &str,
     model: &str,
     args: &Value,
@@ -74,7 +75,7 @@ pub(super) fn attach(
     let mut budget = MAX_INPUT_BYTES;
     let mut references = Vec::with_capacity(paths.len());
     for path in &paths {
-        let (mime, encoded) = load(cwd, path, &mut budget)?;
+        let (mime, encoded) = load(cwd, workspace, path, &mut budget)?;
         references.push(match provider {
             "gemini" => json!({"inlineData": {"mimeType": mime, "data": encoded}}),
             "openai" => json!({"image_url": data_url(mime, &encoded, true)?}),
@@ -109,7 +110,7 @@ pub(super) fn attach(
                 payload["input_fidelity"] = json!(fidelity);
             }
             if let Some(mask) = mask {
-                let (mime, encoded) = load(cwd, mask, &mut budget)?;
+                let (mime, encoded) = load(cwd, workspace, mask, &mut budget)?;
                 if mime != "image/png" {
                     return Err(Error::tool(NAME, "mask_path must contain a PNG alpha mask"));
                 }
@@ -134,14 +135,19 @@ pub(super) fn attach(
     Ok(paths.len())
 }
 
-fn load(cwd: &Path, path: &str, remaining: &mut u64) -> Result<(&'static str, String)> {
+fn load(
+    cwd: &Path,
+    workspace: &crate::workspace::WorkspaceHandle,
+    path: &str,
+    remaining: &mut u64,
+) -> Result<(&'static str, String)> {
     if path.trim().is_empty() || path.len() > 4096 {
         return Err(Error::tool(
             NAME,
             "image paths must be nonempty and at most 4096 bytes",
         ));
     }
-    let bytes = transport::read_capped(&cwd.join(path), NAME, *remaining)?;
+    let bytes = transport::read_capped(Path::new(path), cwd, workspace, NAME, *remaining)?;
     *remaining = remaining.saturating_sub(bytes.len() as u64);
     let mime = transport::image_mime(&bytes).ok_or_else(|| {
         Error::tool(
@@ -262,6 +268,7 @@ mod tests {
             assert!(
                 attach(
                     Path::new("missing-directory"),
+                    &crate::workspace::WorkspaceHandle::default(),
                     "openai",
                     "gpt-image-1.5",
                     &args,
@@ -274,6 +281,7 @@ mod tests {
         assert!(
             attach(
                 Path::new("missing-directory"),
+                &crate::workspace::WorkspaceHandle::default(),
                 "xai",
                 "grok-imagine-image-2.0",
                 &json!({"image_path":"first.png","mask_path":"mask.png"}),
@@ -285,6 +293,7 @@ mod tests {
         assert!(
             attach(
                 Path::new("missing-directory"),
+                &crate::workspace::WorkspaceHandle::default(),
                 "openai",
                 "dall-e-3",
                 &json!({"image_path":"first.png"}),
@@ -293,5 +302,61 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn references_and_masks_follow_live_workspace_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let source = extra.path().join("source.png");
+        std::fs::write(&source, super::super::super::MIN_VALID_PNG).unwrap();
+        std::fs::write(
+            root.path().join("local.png"),
+            super::super::super::MIN_VALID_PNG,
+        )
+        .unwrap();
+        let mut workspace = crate::workspace::WorkspaceHandle::single(root.path());
+        let bound = workspace.clone();
+        let requests = [
+            json!({"image_path":source}),
+            json!({"image_paths":["local.png",source]}),
+            json!({"image_path":"local.png","mask_path":source}),
+        ];
+        for admitted in [false, true, false] {
+            if admitted {
+                workspace.add_root(extra.path());
+            } else {
+                workspace.remove_root(extra.path());
+            }
+            for args in &requests {
+                let mut endpoint = "images/generations".to_string();
+                let mut body = json!({});
+                let result = attach(
+                    root.path(),
+                    &bound,
+                    "openai",
+                    "gpt-image-1.5",
+                    args,
+                    &mut endpoint,
+                    &mut body,
+                );
+                if admitted {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(endpoint, "images/edits");
+                    let expected = format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(super::super::super::MIN_VALID_PNG)
+                    );
+                    assert_eq!(body["images"][0]["image_url"], expected);
+                    if args.get("mask_path").is_some() {
+                        assert_eq!(body["mask"]["image_url"], expected);
+                    }
+                } else {
+                    let error = result.expect_err("unattached source or mask must be refused");
+                    assert!(error.to_string().contains("Cannot read outside"), "{error}");
+                }
+            }
+        }
     }
 }

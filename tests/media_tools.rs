@@ -779,3 +779,156 @@ fn test_read_media_registry_applies_config_cap_and_is_gated_off_by_default() {
 
     finish_case(&harness, "read_media_registry_cap");
 }
+
+#[test]
+fn media_inputs_cannot_escape_through_absolute_parent_or_symlink_paths() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    let outside = parent.path().join("private");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("clip.mp4"), b"private video").unwrap();
+    fs::write(outside.join("image.png"), b"private image").unwrap();
+    let video_paths = vec![
+        outside.join("clip.mp4"),
+        std::path::PathBuf::from("../private/clip.mp4"),
+    ];
+    let image_paths = vec![
+        outside.join("image.png"),
+        std::path::PathBuf::from("../private/image.png"),
+    ];
+    #[cfg(unix)]
+    let (video_paths, image_paths) = {
+        let mut video_paths = video_paths;
+        let mut image_paths = image_paths;
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        video_paths.push(root.join("linked/clip.mp4"));
+        image_paths.push(root.join("linked/image.png"));
+        (video_paths, image_paths)
+    };
+    // These tools are exercised without an API credential or provider fixture:
+    // scope refusal must precede credential resolution and any provider call.
+    asupersync::test_utils::run_test(|| async {
+        let media = ReadMediaTool::new(&root);
+        for path in video_paths {
+            let error = media
+                .execute("media", json!({"path":path}), None)
+                .await
+                .expect_err("read_media must honor native read scope");
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        }
+        let vision = InspectImageTool::new(&root).with_mock(false);
+        let generation = GenerateImageTool::new(&root).with_mock(false);
+        for path in image_paths {
+            let error = vision
+                .execute("vision", json!({"path":path}), None)
+                .await
+                .expect_err("inspection must refuse before provider authentication");
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+            for field in ["image_path", "image_paths"] {
+                let mut args = json!({"prompt":"edit","provider":"openai"});
+                args[field] = if field == "image_paths" {
+                    json!([path])
+                } else {
+                    json!(path)
+                };
+                let error = generation
+                    .execute("edit", args, None)
+                    .await
+                    .expect_err("reference paths must refuse before authentication");
+                assert!(error.to_string().contains("Cannot read outside"), "{error}");
+            }
+        }
+    });
+    // Output preflight must not create a destination for a refused source.
+    assert!(!root.join("images").exists());
+    assert_eq!(
+        fs::read(outside.join("image.png")).unwrap(),
+        b"private image"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn admitted_media_symlinks_keep_the_callers_extension_and_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let opaque = dir.path().join("content-hash");
+    fs::write(&opaque, b"stored bytes").unwrap();
+    std::os::unix::fs::symlink(&opaque, dir.path().join("clip.wav")).unwrap();
+    std::os::unix::fs::symlink(&opaque, dir.path().join("picture.png")).unwrap();
+    asupersync::test_utils::run_test(|| async {
+        let media = ReadMediaTool::new(dir.path())
+            .execute("media", json!({"path":"clip.wav"}), None)
+            .await
+            .unwrap();
+        let ContentBlock::Media(block) = &media.content[1] else {
+            panic!("expected the admitted media bytes");
+        };
+        assert_eq!(block.mime_type, "audio/wav");
+        assert_eq!(block.name.as_deref(), Some("clip.wav"));
+        let vision = InspectImageTool::new(dir.path())
+            .with_mock(true)
+            .execute("vision", json!({"path":"picture.png"}), None)
+            .await
+            .unwrap();
+        assert_eq!(vision.details.unwrap()["mime_type"], "image/png");
+    });
+}
+
+#[test]
+fn media_registry_shares_live_additional_roots_for_explicit_and_configured_tools() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("workspace");
+    let extra = parent.path().join("extra");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&extra).unwrap();
+    let clip = extra.join("clip.mp4");
+    fs::write(&clip, b"video bytes").unwrap();
+    let mut workspace = pi::workspace::WorkspaceHandle::single(&root);
+    let config = Config {
+        media: Some(MediaSettings {
+            enable_media: Some(true),
+            enable_read_media: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for explicit in [true, false] {
+        let enabled: &[&str] = if explicit {
+            &["read_media", "inspect_image", "generate_image"]
+        } else {
+            &[]
+        };
+        let registry = ToolRegistry::with_mutation_recorder(
+            enabled,
+            &root,
+            Some(&config),
+            None,
+            Some(&workspace),
+        );
+        let media = registry.get("read_media").unwrap();
+        asupersync::test_utils::run_test(|| async {
+            let error = media
+                .execute("before", json!({"path":clip}), None)
+                .await
+                .expect_err("unattached root must be refused");
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        });
+        workspace.add_root(&extra);
+        asupersync::test_utils::run_test(|| async {
+            let result = media
+                .execute("added", json!({"path":clip}), None)
+                .await
+                .expect("live added root must be visible to the existing tool");
+            assert!(matches!(&result.content[1], ContentBlock::Media(_)));
+        });
+        assert!(workspace.remove_root(&extra));
+        asupersync::test_utils::run_test(|| async {
+            let error = media
+                .execute("removed", json!({"path":clip}), None)
+                .await
+                .expect_err("existing tool must observe root revocation");
+            assert!(error.to_string().contains("Cannot read outside"), "{error}");
+        });
+    }
+}
