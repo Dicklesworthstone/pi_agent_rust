@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance};
+use super::config::{ConfiguredServer, McpDiscovery, McpOAuthConfig, Provenance, ResolvedCommand};
 use super::tasks::TaskSupport;
 #[cfg(test)]
 use super::transport::MCP_PROTOCOL_VERSION;
@@ -1209,7 +1209,7 @@ impl McpManager {
         cwd: &Path,
         workspace: &Path,
         trust_path: &Path,
-    ) -> Result<TrustWriteGuard> {
+    ) -> Result<(TrustWriteGuard, Option<ResolvedCommand>)> {
         if !config.enabled {
             return Err(tool_err(
                 "MCP_SERVER_DISABLED",
@@ -1226,8 +1226,9 @@ impl McpManager {
         // derive the identity and compare. PATH swaps, symlink retargets, or
         // in-place content replacement all fail closed here instead of
         // executing substituted code.
-        if matches!(decision, TrustDecision::Acknowledged) && config.command.is_some() {
-            let current = config.execution_identity(cwd).map_err(|err| {
+        let acknowledged = matches!(decision, TrustDecision::Acknowledged);
+        let execution = if acknowledged && config.command.is_some() {
+            let current = config.resolve_execution(cwd).map_err(|err| {
                 tool_err(
                     "MCP_TRUST_IDENTITY_UNRESOLVED",
                     format!(
@@ -1250,15 +1251,15 @@ impl McpManager {
                 ));
             };
             match stored {
-                Some(bound) if bound == current => {}
+                Some(bound) if bound == current.identity => {}
                 Some(bound) => {
                     return Err(tool_err(
                         "MCP_TRUST_IDENTITY_MISMATCH",
                         format!(
                             "server {:?} now resolves to a different executable \
                              than the operator approved; refusing to spawn.\n  \
-                             approved: {bound}\n  current:  {current}",
-                            config.name
+                             approved: {bound}\n  current:  {}",
+                            config.name, current.identity
                         ),
                     ));
                 }
@@ -1274,10 +1275,13 @@ impl McpManager {
                     ));
                 }
             }
-        }
+            Some(current)
+        } else {
+            None
+        };
 
         match decision {
-            TrustDecision::Acknowledged => Ok(guard),
+            TrustDecision::Acknowledged => Ok((guard, execution)),
             TrustDecision::Pending => Err(tool_err(
                 "MCP_TRUST_PENDING",
                 format!(
@@ -1581,7 +1585,7 @@ impl McpManager {
             // execution effect ($CMD resolution and stdio process creation).
             // A concurrent deny/reset either linearizes before this guard and
             // blocks execution, or waits and linearizes after it.
-            let _trust_execution_guard =
+            let (_trust_execution_guard, execution) =
                 Self::lock_trust_for_execution(&config, &cwd, &workspace, &trust_path)?;
             ensure_active()?;
 
@@ -1642,7 +1646,7 @@ impl McpManager {
                 }
                 return Ok(transport);
             }
-            let command = config.command.clone().ok_or_else(|| {
+            let command = execution.ok_or_else(|| {
                 tool_err(
                     "MCP_CONFIG_INVALID",
                     format!("server {:?} has no command or url", config.name),
@@ -1656,8 +1660,37 @@ impl McpManager {
                 &workspace,
             )?;
             ensure_active()?;
-            let transport =
-                super::transport::StdioTransport::spawn(&command, &config.args, &env, &cwd)?;
+            // A credential helper can change a symlink, executable or PATH
+            // entry while the trust-store lock is held. Revalidate the same
+            // selection before starting the server, then pass its absolute
+            // invocation alias so the child environment cannot select again.
+            let current = config.resolve_execution(&cwd).map_err(|err| {
+                tool_err(
+                    "MCP_TRUST_IDENTITY_UNRESOLVED",
+                    format!(
+                        "server {:?} executable cannot be revalidated before spawn: {err}",
+                        config.name,
+                    ),
+                )
+            })?;
+            if current.as_ref() != Some(&command) {
+                return Err(tool_err(
+                    "MCP_TRUST_IDENTITY_MISMATCH",
+                    format!(
+                        "server {:?} executable or invocation path changed during credential resolution; refusing to spawn",
+                        config.name,
+                    ),
+                ));
+            }
+            ensure_active()?;
+            // Native path execution still has its ordinary filesystem
+            // check-to-exec race; interpreters and dependencies are not bound.
+            let transport = super::transport::StdioTransport::spawn(
+                &command.invocation_path,
+                &config.args,
+                &env,
+                &cwd,
+            )?;
             transport.configure_workspace_root(&workspace)?;
             transport.configure_context_updates(context_updates)?;
             if let Err(error) = ensure_active() {

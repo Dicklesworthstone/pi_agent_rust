@@ -88,6 +88,212 @@ fn imported_manager(temp: &tempfile::TempDir, config: &Value) -> McpManager {
 }
 
 #[cfg(unix)]
+const EXECUTION_PEER: &str = r#"#!/bin/sh
+printf '%s\n' "$0" > invoked
+printf '%s\n' "$PATH" > child-path
+printf '%s\n' "$TOKEN" > child-token
+while IFS= read -r line; do
+    case "$line" in
+        *'"id":'*) id=${line#*'"id":'}; id=${id%%,*}; id=${id%%\}*} ;;
+        *) continue ;;
+    esac
+    case "$line" in
+        *'"method":"initialize"'*) result='{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"execution-probe","version":"1"}}' ;;
+        *'"method":"tools/list"'*) result='{"tools":[{"name":"probe","inputSchema":{"type":"object"}}]}' ;;
+        *'"method":"tools/call"'*) result='{"content":[{"type":"text","text":"approved"}]}' ;;
+        *) continue ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#;
+
+#[cfg(unix)]
+fn write_execution_peer(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::write(path, EXECUTION_PEER).expect("stdio execution peer");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("executable peer");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_stdio_preserves_the_approved_invocation_alias_and_child_environment() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_cwd = temp.path().join("project/server runtime");
+    let shadow = server_cwd.join("shadow");
+    std::fs::create_dir_all(&shadow).expect("server cwd and child PATH");
+    write_execution_peer(&server_cwd.join("implementation"));
+    write_execution_peer(&shadow.join("serve"));
+    std::os::unix::fs::symlink("implementation", server_cwd.join("serve"))
+        .expect("server invocation alias");
+    let manager = imported_manager(
+        &temp,
+        &json!({"mcpServers":{"fixture":{
+            "command":"./serve", "cwd":"server runtime",
+            "env":{"PATH":shadow,"TOKEN":"$CMD:printf admitted-token"}
+        }}}),
+    );
+    let entry = manager.entry("fixture").expect("server");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    let output = runtime
+        .block_on(async {
+            let result = async {
+                manager.trust("fixture").await?;
+                manager.call_tool("fixture", "probe", json!({})).await
+            }
+            .await;
+            manager.shutdown_all().await;
+            result
+        })
+        .expect("native server remains usable");
+    assert_eq!(output["content"][0]["text"], "approved");
+    assert_eq!(
+        std::fs::read_to_string(server_cwd.join("invoked"))
+            .expect("invocation marker")
+            .trim_end(),
+        entry
+            .effective_cwd(&manager.inner.cwd)
+            .join("serve")
+            .to_str()
+            .expect("UTF-8 alias"),
+        "canonicalizing the executable for launch would break alias-sensitive programs",
+    );
+    assert_eq!(
+        std::fs::read_to_string(server_cwd.join("child-path"))
+            .expect("child PATH")
+            .trim_end(),
+        shadow.to_str().expect("UTF-8 child PATH"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(server_cwd.join("child-token"))
+            .expect("child token")
+            .trim_end(),
+        "admitted-token",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_stdio_bare_command_keeps_its_target_when_child_path_contains_a_shadow() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let server_cwd = temp.path().join("project/server runtime");
+    let shadow = server_cwd.join("shadow");
+    std::fs::create_dir_all(&shadow).expect("server cwd and child PATH");
+    let peer = server_cwd
+        .canonicalize()
+        .expect("canonical server cwd")
+        .join("peer script.sh");
+    write_execution_peer(&peer);
+    write_execution_peer(&shadow.join("sh"));
+    let manager = imported_manager(
+        &temp,
+        &json!({"mcpServers":{"fixture":{
+            "command":"sh", "args":[peer], "cwd":"server runtime",
+            "env":{"PATH":shadow}
+        }}}),
+    );
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    let output = runtime
+        .block_on(async {
+            let result = async {
+                manager.trust("fixture").await?;
+                manager.call_tool("fixture", "probe", json!({})).await
+            }
+            .await;
+            manager.shutdown_all().await;
+            result
+        })
+        .expect("the trusted shell interprets the selected peer");
+    assert_eq!(output["content"][0]["text"], "approved");
+    // The real shell sets the script's $0 to the peer argument. A fresh
+    // command lookup in the child PATH would run shadow/sh as the script.
+    assert_eq!(
+        std::fs::read_to_string(server_cwd.join("invoked"))
+            .expect("invocation marker")
+            .trim_end(),
+        peer.to_str().expect("UTF-8 peer path"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(server_cwd.join("child-path"))
+            .expect("child PATH")
+            .trim_end(),
+        shadow.to_str().expect("UTF-8 child PATH"),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_changes_before_or_during_credentials_never_start_the_stdio_server() {
+    for before_helper in [true, false] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let server_cwd = temp.path().join("project/server");
+        std::fs::create_dir_all(&server_cwd).expect("server cwd");
+        let executable = server_cwd.join("serve");
+        let replacement = server_cwd.join("replacement");
+        write_execution_peer(&executable);
+        std::fs::write(
+            &replacement,
+            format!("{EXECUTION_PEER}\n# changed executable\n"),
+        )
+        .expect("replacement peer");
+        let manager = imported_manager(
+            &temp,
+            &json!({"mcpServers":{"fixture":{
+                "command":"./serve", "cwd":"server",
+                "env":{"TOKEN":"$CMD:cat replacement > serve; printf ready > helper-ran; printf token"}
+            }}}),
+        );
+        let entry = manager.entry("fixture").expect("server");
+        let identity = entry
+            .config
+            .execution_identity(&entry.effective_cwd(&manager.inner.cwd))
+            .expect("executable identity")
+            .expect("stdio identity");
+        TrustStore::load(&manager.inner.trust_path)
+            .expect("trust store")
+            .acknowledge_execution(
+                "fixture",
+                &manager.trust_fingerprint_for(&entry),
+                "operator",
+                identity,
+            )
+            .expect("acknowledge original executable");
+        if before_helper {
+            std::fs::write(
+                &executable,
+                std::fs::read(&replacement).expect("replacement bytes"),
+            )
+            .expect("change after acknowledgment");
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let outcome = runtime.block_on(async {
+            let result = manager.ensure_ready(&entry).await;
+            manager.shutdown_all().await;
+            result
+        });
+        let error = outcome.expect_err("changed executable must not be launched");
+        assert!(
+            error.to_string().contains("MCP_TRUST_IDENTITY_MISMATCH"),
+            "{error}"
+        );
+        assert_eq!(server_cwd.join("helper-ran").exists(), !before_helper);
+        assert!(
+            !server_cwd.join("invoked").exists(),
+            "no server side effect"
+        );
+        assert!(McpManager::lock(&entry.transport).is_none());
+        assert!(manager.mounted_tool_metas().is_empty());
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn imported_cwd_and_timeout_reach_trust_setup_tools_and_context() {
     use std::os::unix::fs::PermissionsExt as _;

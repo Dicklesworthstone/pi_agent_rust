@@ -479,6 +479,15 @@ pub struct StoredExecutionIdentity {
     pub content_sha256: String,
 }
 
+/// The selected invocation alias and the file it identified during admission.
+/// Keep the alias: virtual environments, multicall binaries and script resource
+/// lookup can depend on the invoked path even when the target bytes are equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResolvedCommand {
+    pub invocation_path: String,
+    pub identity: StoredExecutionIdentity,
+}
+
 impl std::fmt::Display for StoredExecutionIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -519,14 +528,41 @@ fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
+/// Match the native Windows executable suffix rules without using a shell or
+/// PATHEXT. Batch files require their explicit extension; argv stays separate.
+fn command_candidate(path: PathBuf, searching_path: bool) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let exe = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+        if !exe && (!searching_path || !filename.contains('.')) {
+            let mut suffixed = path.clone();
+            suffixed.as_mut_os_string().push(".exe");
+            if searching_path || is_executable_file(&suffixed) {
+                return suffixed;
+            }
+        }
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = searching_path;
+        path
+    }
+}
+
 /// Pure resolver for one raw command against explicit PATH contents.
 ///
-/// Semantics mirror ambient spawn behavior: bare names are searched in every
-/// non-empty `path_env` directory in order (the current directory is NOT
-/// implicitly searched), relative paths containing a separator anchor to
-/// `cwd`, absolute paths pass through. The result collapses symlinks so a
-/// retargeted link changes identity, and hashes the executable's content so
-/// an in-place replacement is detected even when size/mtime lie.
+/// Bare names search nonempty PATH entries in order; relative entries and
+/// qualified relative commands anchor to cwd. Empty entries never implicitly
+/// select a workspace executable. The stored identity collapses symlinks and
+/// hashes contents; execution separately retains the selected absolute alias.
 // Debug-quoting paths in these errors is deliberate (quotes delimit untrusted input).
 #[allow(clippy::unnecessary_debug_formatting)]
 pub fn resolve_command_identity(
@@ -534,22 +570,39 @@ pub fn resolve_command_identity(
     cwd: &Path,
     path_env: Option<&std::ffi::OsStr>,
 ) -> Result<StoredExecutionIdentity, String> {
+    resolve_command(raw_command, cwd, path_env).map(|command| command.identity)
+}
+
+#[allow(clippy::unnecessary_debug_formatting)]
+fn resolve_command(
+    raw_command: &str,
+    cwd: &Path,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<ResolvedCommand, String> {
     let trimmed = raw_command.trim();
     if trimmed.is_empty() {
         return Err("command is empty".to_string());
     }
     let raw_path = Path::new(trimmed);
+    let cwd = canonical_cwd(cwd);
     let candidate = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
+        command_candidate(raw_path.to_path_buf(), false)
     } else if trimmed.contains('/') || trimmed.contains('\\') {
-        cwd.join(raw_path)
+        command_candidate(cwd.join(raw_path), false)
     } else {
         let dirs = path_env.map_or_else(Vec::new, |os_str| {
             std::env::split_paths(os_str).collect::<Vec<_>>()
         });
         dirs.iter()
             .filter(|dir| !dir.as_os_str().is_empty())
-            .map(|dir| dir.join(raw_path))
+            .map(|dir| {
+                let directory = if dir.is_absolute() {
+                    dir.clone()
+                } else {
+                    cwd.join(dir)
+                };
+                command_candidate(directory.join(raw_path), true)
+            })
             .find(|candidate| is_executable_file(candidate))
             .ok_or_else(|| format!("executable {trimmed:?} was not found on the current PATH"))?
     };
@@ -558,6 +611,22 @@ pub fn resolve_command_identity(
         .components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect();
+    if !candidate.is_absolute() {
+        return Err("command could not be pinned to an absolute invocation path".to_string());
+    }
+    // Windows treats an absolute non-.exe name differently from a bare name.
+    // Do not approve a .cmd alias and then let Command select its .cmd.exe
+    // sibling when that alias becomes absolute for launch.
+    if command_candidate(candidate.clone(), false) != candidate {
+        return Err(
+            "command has an ambiguous executable suffix; configure the full intended executable path"
+                .to_string(),
+        );
+    }
+    let invocation_path = candidate
+        .to_str()
+        .ok_or_else(|| "command invocation path is not valid UTF-8".to_string())?
+        .to_string();
     let resolved = candidate
         .canonicalize()
         .map_err(|err| format!("cannot resolve command target {candidate:?}: {err}"))?;
@@ -579,9 +648,15 @@ pub fn resolve_command_identity(
         }
     }
 
-    Ok(StoredExecutionIdentity {
-        resolved_path: resolved.display().to_string(),
-        content_sha256: sha256_file(&resolved)?,
+    Ok(ResolvedCommand {
+        invocation_path,
+        identity: StoredExecutionIdentity {
+            resolved_path: resolved
+                .to_str()
+                .ok_or_else(|| "resolved command path is not valid UTF-8".to_string())?
+                .to_string(),
+            content_sha256: sha256_file(&resolved)?,
+        },
     })
 }
 
@@ -600,11 +675,18 @@ impl ConfiguredServer {
         &self,
         effective_cwd: &Path,
     ) -> Result<Option<StoredExecutionIdentity>, String> {
+        self.resolve_execution(effective_cwd)
+            .map(|command| command.map(|command| command.identity))
+    }
+
+    pub(super) fn resolve_execution(
+        &self,
+        effective_cwd: &Path,
+    ) -> Result<Option<ResolvedCommand>, String> {
         let Some(command) = self.command.as_deref() else {
             return Ok(None);
         };
-        resolve_command_identity(command, effective_cwd, std::env::var_os("PATH").as_deref())
-            .map(Some)
+        resolve_command(command, effective_cwd, std::env::var_os("PATH").as_deref()).map(Some)
     }
 }
 
@@ -2430,6 +2512,88 @@ mod tests {
             error.contains("cannot resolve") || error.contains("not a regular"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_resolution_keeps_the_alias_and_anchors_relative_path_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("server");
+        std::fs::create_dir_all(cwd.join("bin")).expect("server bin");
+        let target = cwd.join("implementation");
+        write_executable(&target, "#!/bin/sh\nexit 0\n");
+        let alias = cwd.join("bin/serve");
+        std::os::unix::fs::symlink("../implementation", &alias).expect("invocation alias");
+        write_executable(&cwd.join("serve"), "#!/bin/sh\nexit 97\n");
+        let path_env = std::env::join_paths([Path::new(""), Path::new("bin")]).expect("PATH");
+
+        let selected = resolve_command("serve", &cwd, Some(&path_env))
+            .expect("relative PATH must use the server cwd, not the Pi process cwd");
+        let expected_alias = cwd.canonicalize().expect("canonical cwd").join("bin/serve");
+        assert_eq!(
+            Path::new(&selected.invocation_path),
+            expected_alias.as_path()
+        );
+        assert_eq!(selected.identity.resolved_path, canonical_string(&target));
+        assert_ne!(selected.invocation_path, selected.identity.resolved_path);
+        assert_eq!(
+            resolve_command("./bin/serve", &cwd, None).expect("qualified alias"),
+            selected,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_resolution_supports_exe_suffix_without_inventing_batch_lookup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        std::fs::write(bin.join("server.exe"), b"executable identity fixture").expect("exe");
+        std::fs::write(bin.join("runner.cmd"), b"@echo fixture\r\n").expect("batch");
+        let path_env = std::env::join_paths([&bin]).expect("PATH");
+        let selected = resolve_command("server", temp.path(), Some(&path_env))
+            .expect("omitted .exe is supported");
+        assert!(selected.invocation_path.ends_with("server.exe"));
+        assert_eq!(
+            resolve_command("server.exe", temp.path(), Some(&path_env)).expect("explicit .exe"),
+            selected,
+        );
+        assert_eq!(
+            resolve_command(
+                bin.join("server").to_str().expect("UTF-8 fixture"),
+                temp.path(),
+                None,
+            )
+            .expect("qualified omitted .exe"),
+            selected,
+        );
+        let batch = resolve_command("runner.cmd", temp.path(), Some(&path_env))
+            .expect("explicit batch extension");
+        assert!(batch.invocation_path.ends_with("runner.cmd"));
+        assert!(resolve_command("runner", temp.path(), Some(&path_env)).is_err());
+
+        // A bare batch selection must not turn into another executable when
+        // its invocation becomes absolute for native Command construction.
+        std::fs::write(bin.join("runner.cmd.exe"), b"different executable").expect("sibling");
+        let error = resolve_command("runner.cmd", temp.path(), Some(&path_env))
+            .expect_err("ambiguous native suffix lookup must fail before trust");
+        assert!(error.contains("ambiguous executable suffix"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_identity_never_substitutes_a_lossy_target_path() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b't', 0xff]));
+        write_executable(&target, "#!/bin/sh\nexit 0\n");
+        std::os::unix::fs::symlink(&target, temp.path().join("serve")).expect("alias");
+        let error = resolve_command("./serve", temp.path(), None)
+            .expect_err("the stored UTF-8 identity must name the exact target");
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     /// In-place content replacement (same filename, similar size) MUST
