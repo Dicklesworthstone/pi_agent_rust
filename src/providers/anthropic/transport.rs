@@ -445,10 +445,9 @@ pub(super) fn response_stream(
     )
 }
 
-/// Metadata and heartbeat frames do not yield a public event. Even if the
-/// transport is continuously ready, periodically return control to the executor
-/// so abort/select futures and other sessions can be polled. No timer or task
-/// is detached from the consumer's stream lifetime.
+/// Periodically return control while draining ready frames, including public
+/// events that a consumer can await repeatedly within one executor poll. No
+/// timer or task is detached from the consumer's stream lifetime.
 async fn yield_stream_turn() {
     let mut yielded = false;
     std::future::poll_fn(|task| {
@@ -476,11 +475,12 @@ where
     let state = StreamState::new(SseStream::new(source), model, api, provider)
         .with_usage_observer(usage_observer);
     let output = stream::unfold(
-        Some((state, StreamLifecycle::default())),
+        Some((state, StreamLifecycle::default(), 0)),
         |active| async move {
-            let (mut state, mut lifecycle) = active?;
-            let mut ready_events = 0;
+            let (mut state, mut lifecycle, mut ready_events) = active?;
             loop {
+                // Retain the budget across public events, not just silent
+                // metadata. This also bounds frames already queued by SSE.
                 if ready_events == MAX_READY_EVENTS_PER_YIELD {
                     yield_stream_turn().await;
                     ready_events = 0;
@@ -508,7 +508,8 @@ where
                                 // event BEFORE returning it. Retaining the outer
                                 // stream must not retain a socket, owner waiter,
                                 // buffered tail or partial tool accumulators.
-                                let active = (!state.done).then_some((state, lifecycle));
+                                let active =
+                                    (!state.done).then_some((state, lifecycle, ready_events));
                                 return Some((Ok(event), active));
                             }
                             Ok(None) => {
@@ -1790,6 +1791,15 @@ mod tests {
         chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
         pending_at_end: bool,
     ) -> (EventStream, Arc<AtomicBool>) {
+        observed_wire_for_api(chunks, pending_at_end, "anthropic-messages", "anthropic")
+    }
+
+    fn observed_wire_for_api(
+        chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
+        pending_at_end: bool,
+        api: &str,
+        provider: &str,
+    ) -> (EventStream, Arc<AtomicBool>) {
         let dropped = Arc::new(AtomicBool::new(false));
         let source = ObservedSource {
             chunks: chunks.into_iter().collect(),
@@ -1800,8 +1810,8 @@ mod tests {
             wire_stream(
                 source,
                 "claude-test".into(),
-                "anthropic-messages".into(),
-                "anthropic".into(),
+                api.into(),
+                provider.into(),
                 None,
             ),
             dropped,
@@ -2259,5 +2269,229 @@ mod tests {
         });
         drop(output);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn public_burst(kind: &str, reason: &str) -> Vec<Value> {
+        let mut frames = vec![start()];
+        match kind {
+            "text" => {
+                frames.push(json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text"}}));
+                for index in 0..MAX_READY_EVENTS_PER_YIELD * 2 {
+                    frames.push(json!({"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": format!("{index}界\n")}}));
+                }
+                frames.push(stop(0));
+            }
+            "tools" => {
+                for index in 0..MAX_READY_EVENTS_PER_YIELD {
+                    frames.push(tool_start(index, &format!("call-{index}"), &json!({})));
+                    frames.push(tool_delta(
+                        index,
+                        &json!({"path": format!("file-{index}.txt")}).to_string(),
+                    ));
+                    frames.push(stop(index));
+                }
+            }
+            _ => panic!("unexpected public fixture kind"),
+        }
+        frames.extend([final_delta(reason), json!({"type": "message_stop"})]);
+        frames
+    }
+
+    fn burst_chunks(frames: Vec<Value>, coalesced: bool) -> Vec<std::io::Result<Vec<u8>>> {
+        if coalesced {
+            vec![Ok(wire_bytes(frames))]
+        } else {
+            frames
+                .into_iter()
+                .map(|frame| Ok(wire_bytes([frame])))
+                .collect()
+        }
+    }
+
+    fn drain_with_poll_budget(output: &mut EventStream) -> (Vec<Result<StreamEvent>>, usize) {
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut task = TaskContext::from_waker(&waker);
+        let mut events = Vec::new();
+        let mut ready_events = 0;
+        let mut yields = 0;
+        // A broken budget fails after a bounded number of public events. A
+        // missing wake or failure to resume also cannot hang this regression.
+        for _ in 0..MAX_READY_EVENTS_PER_YIELD * 8 {
+            match output.as_mut().poll_next(&mut task) {
+                Poll::Ready(Some(event)) => {
+                    ready_events += 1;
+                    assert!(
+                        ready_events <= MAX_READY_EVENTS_PER_YIELD,
+                        "draining public events never returned control"
+                    );
+                    let terminal = matches!(
+                        &event,
+                        Err(_) | Ok(StreamEvent::Done { .. } | StreamEvent::Error { .. })
+                    );
+                    events.push(event);
+                    if terminal {
+                        return (events, yields);
+                    }
+                }
+                Poll::Pending => {
+                    assert!(flag.0.swap(false, Ordering::SeqCst), "yield lost its wake");
+                    ready_events = 0;
+                    yields += 1;
+                }
+                Poll::Ready(None) => panic!("stream ended without a terminal event"),
+            }
+        }
+        panic!("finite public burst did not resume to completion");
+    }
+
+    #[test]
+    fn public_text_bursts_yield_across_next_calls_and_preserve_order() {
+        let expected: String = (0..MAX_READY_EVENTS_PER_YIELD * 2)
+            .map(|index| format!("{index}界\n"))
+            .collect();
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            for coalesced in [false, true] {
+                let chunks = burst_chunks(public_burst("text", "end_turn"), coalesced);
+                let (mut output, dropped) = observed_wire_for_api(chunks, true, api, provider);
+                let (events, yields) = drain_with_poll_budget(&mut output);
+                assert!(yields > 0);
+                assert!(events.iter().all(Result::is_ok));
+                let deltas: String = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Ok(StreamEvent::TextDelta { delta, .. }) => Some(delta.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(deltas, expected);
+                assert!(matches!(
+                    &events[events.len() - 2],
+                    Ok(StreamEvent::TextEnd { content, .. }) if content == &expected
+                ));
+                let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                    panic!("text burst lost its successful terminal");
+                };
+                assert_eq!(*reason, StopReason::Stop);
+                assert_eq!(message.api, api);
+                assert_eq!(message.provider, provider);
+                assert_eq!(message.usage.total_tokens, 67);
+                let ContentBlock::Text(text) = &message.content[0] else {
+                    panic!("text burst lost its content");
+                };
+                assert_eq!(text.text, expected);
+                assert_retired(&mut output, &dropped);
+            }
+        }
+    }
+
+    #[test]
+    fn queued_tool_bursts_yield_without_changing_terminal_authorization() {
+        for (api, provider) in [
+            ("anthropic-messages", "anthropic"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            for reason in ["tool_use", "refusal"] {
+                // Every tool frame is already buffered inside SseStream after
+                // its first read; draining that queue must still cooperate.
+                let chunks = burst_chunks(public_burst("tools", reason), true);
+                let (mut output, dropped) = observed_wire_for_api(chunks, true, api, provider);
+                let (events, yields) = drain_with_poll_budget(&mut output);
+                assert!(yields > 0);
+                assert_eq!(events.len(), 2 + MAX_READY_EVENTS_PER_YIELD * 3);
+                for (index, group) in events[1..events.len() - 1].chunks_exact(3).enumerate() {
+                    assert!(matches!(
+                        &group[0], Ok(StreamEvent::ToolCallStart { content_index, id, .. })
+                            if *content_index == index && id == &format!("call-{index}")
+                    ));
+                    assert!(matches!(
+                        &group[1], Ok(StreamEvent::ToolCallDelta { content_index, .. })
+                            if *content_index == index
+                    ));
+                    let Ok(StreamEvent::ToolCallEnd {
+                        content_index,
+                        tool_call,
+                    }) = &group[2]
+                    else {
+                        panic!("tool burst lost a complete tool call");
+                    };
+                    assert_eq!(*content_index, index);
+                    assert_eq!(tool_call.id, format!("call-{index}"));
+                    assert_eq!(
+                        tool_call.arguments,
+                        json!({"path": format!("file-{index}.txt")})
+                    );
+                }
+                let message = if reason == "refusal" {
+                    let error = terminal_failure(&events);
+                    assert!(error.error_message.as_deref().unwrap().contains("withheld"));
+                    error
+                } else {
+                    let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                        panic!("tool_use burst lost its authorization");
+                    };
+                    assert_eq!(*reason, StopReason::ToolUse);
+                    message
+                };
+                assert_eq!(message.api, api);
+                assert_eq!(message.provider, provider);
+                assert_eq!(message.usage.total_tokens, 67);
+                assert_eq!(message.content.len(), MAX_READY_EVENTS_PER_YIELD);
+                assert_retired(&mut output, &dropped);
+            }
+        }
+    }
+
+    #[test]
+    fn abort_can_win_while_ready_text_or_queued_tools_are_drained() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (api, provider) in [
+                ("anthropic-messages", "anthropic"),
+                ("google-vertex", "google-vertex"),
+            ] {
+                for (kind, reason) in [("text", "end_turn"), ("tools", "tool_use")] {
+                    for coalesced in [false, true] {
+                        let chunks = burst_chunks(public_burst(kind, reason), coalesced);
+                        let (mut output, dropped) =
+                            observed_wire_for_api(chunks, true, api, provider);
+                        let mut delivered = 0;
+                        let drain = Box::pin(async {
+                            while let Some(event) = output.next().await {
+                                delivered += 1;
+                                if matches!(
+                                    event.unwrap(),
+                                    StreamEvent::Done { .. } | StreamEvent::Error { .. }
+                                ) {
+                                    break;
+                                }
+                            }
+                        });
+                        let (abort, signal) = crate::agent::AbortHandle::new();
+                        let cancel = Box::pin(async move {
+                            abort.abort();
+                            signal.wait().await;
+                        });
+                        // Drain first. The finite fixture detects starvation
+                        // without relying on timing or an unbounded source.
+                        match futures::future::select(drain, cancel).await {
+                            futures::future::Either::Right(((), pending)) => drop(pending),
+                            futures::future::Either::Left(_) => {
+                                panic!("{kind} starved cancellation")
+                            }
+                        }
+                        assert!(delivered > 0 && delivered <= MAX_READY_EVENTS_PER_YIELD);
+                        assert!(!dropped.load(Ordering::SeqCst));
+                        drop(output);
+                        assert!(dropped.load(Ordering::SeqCst));
+                    }
+                }
+            }
+        });
     }
 }

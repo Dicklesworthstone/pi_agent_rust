@@ -572,6 +572,8 @@ where
     /// A later STOP cannot authorize calls from a response that hit its
     /// output limit. Text-only truncation still retains its Length outcome.
     saw_truncation: bool,
+    /// Shared by wire reads and queued event delivery across next() calls.
+    ready_work_since_yield: usize,
     content_state: reasoning::ContentState,
     usage_state: reasoning::UsageState,
     usage_observer: Option<crate::provider::UsageObserver>,
@@ -605,6 +607,7 @@ where
             finished: false,
             saw_terminal: false,
             saw_truncation: false,
+            ready_work_since_yield: 0,
             content_state: reasoning::ContentState::default(),
             usage_state: reasoning::UsageState::default(),
             usage_observer: None,
@@ -628,9 +631,15 @@ where
     ) -> impl Stream<Item = Result<StreamEvent>> {
         stream::unfold(Some(self), move |active| async move {
             let mut state = active?;
-            let mut ready_events = 0;
             loop {
+                // A consumer collecting ready text or tool deltas must yield
+                // too, including events queued by one multi-part response.
+                if state.ready_work_since_yield == MAX_READY_EVENTS_PER_YIELD {
+                    yield_stream_turn().await;
+                    state.ready_work_since_yield = 0;
+                }
                 if let Some(event) = state.pending_events.pop_front() {
+                    state.ready_work_since_yield += 1;
                     let active =
                         (!matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. }))
                             .then_some(state);
@@ -639,11 +648,7 @@ where
                 if state.finished {
                     return None;
                 }
-                if ready_events == MAX_READY_EVENTS_PER_YIELD {
-                    yield_stream_turn().await;
-                    ready_events = 0;
-                }
-                ready_events += 1;
+                state.ready_work_since_yield += 1;
                 match state.event_source.next().await {
                     Some(Ok(msg)) => {
                         if msg.event == "ping" {
@@ -1948,6 +1953,148 @@ mod tests {
                     }
                     assert_usage(&terminal.expect("yielded stream did not finish"));
                     assert_retired(&mut output, &dropped);
+                }
+            }
+        }
+
+        fn visible_burst(mode: Mode, tools: bool, count: usize) -> Vec<u8> {
+            let mut bytes = if tools {
+                let parts = (0..count)
+                    .map(|index| {
+                        json!({
+                            "functionCall": {"name": "echo", "args": {"ordinal": index}},
+                            "thoughtSignature": "c2ln"
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                wire(mode, json!({"candidates": [{"content": {"parts": parts}}]}))
+            } else {
+                wire(
+                    mode,
+                    json!({"candidates": [{"content": {"parts": [{"text": "λ"}]}}]}),
+                )
+                .repeat(count)
+            };
+            bytes.extend(wire(
+                mode,
+                json!({"candidates": [{"finishReason": "STOP"}]}),
+            ));
+            if !tools {
+                bytes.extend(wire(
+                    mode,
+                    json!({"candidates": [{"content": {"parts": [{
+                        "text": "", "thoughtSignature": "bGF0ZQ=="
+                    }]}}]}),
+                ));
+            }
+            bytes.extend(wire(mode, usage()));
+            bytes
+        }
+
+        #[test]
+        fn draining_visible_text_and_queued_tools_yields_and_preserves_late_metadata() {
+            for mode in MODES {
+                for tools in [false, true] {
+                    let count = MAX_READY_EVENTS_PER_YIELD * 2;
+                    let (mut output, dropped) =
+                        observed(mode, [Ok(visible_burst(mode, tools, count))], Tail::Eof);
+                    let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+                    let waker = Waker::from(Arc::clone(&flag));
+                    let mut task = TaskContext::from_waker(&waker);
+                    let mut drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+                    assert!(
+                        std::future::Future::poll(drain.as_mut(), &mut task).is_pending(),
+                        "visible drain must yield for {}",
+                        mode.api
+                    );
+                    assert!(
+                        flag.0.load(Ordering::SeqCst),
+                        "visible drain must self-wake"
+                    );
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    let events = futures::executor::block_on(drain)
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()
+                        .unwrap();
+                    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                        panic!("visible drain lost terminal outcome for {}", mode.api);
+                    };
+                    assert_eq!(message.api, mode.api);
+                    assert_eq!(message.provider, mode.provider);
+                    assert_usage(message);
+                    if tools {
+                        assert_eq!(*reason, StopReason::ToolUse);
+                        assert_eq!(message.content.len(), count);
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                                .count(),
+                            count
+                        );
+                        for (index, block) in message.content.iter().enumerate() {
+                            let ContentBlock::ToolCall(call) = block else {
+                                panic!("tool burst changed content kind");
+                            };
+                            assert_eq!(call.name, "echo");
+                            assert_eq!(call.arguments, json!({"ordinal": index}));
+                            assert_eq!(call.thought_signature.as_deref(), Some("c2ln"));
+                        }
+                    } else {
+                        assert_eq!(*reason, StopReason::Stop);
+                        let text = events
+                            .iter()
+                            .filter_map(|event| match event {
+                                StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        assert_eq!(text, "λ".repeat(count));
+                        let [ContentBlock::Text(answer), ContentBlock::Text(signed)] =
+                            message.content.as_slice()
+                        else {
+                            panic!("text burst lost its late signed part");
+                        };
+                        assert_eq!(answer.text, text);
+                        assert_eq!(signed.text, "");
+                        assert_eq!(signed.text_signature.as_deref(), Some("bGF0ZQ=="));
+                    }
+                    assert_retired(&mut output, &dropped);
+                }
+            }
+        }
+
+        #[test]
+        fn cancellation_wins_while_a_consumer_drains_ready_visible_events() {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            for mode in MODES {
+                for tools in [false, true] {
+                    let (mut output, dropped) = observed(
+                        mode,
+                        [Ok(visible_burst(
+                            mode,
+                            tools,
+                            MAX_READY_EVENTS_PER_YIELD * 2,
+                        ))],
+                        Tail::Eof,
+                    );
+                    runtime.block_on(async {
+                        let (abort, signal) = crate::agent::AbortHandle::new();
+                        let drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+                        let cancel = Box::pin(async move {
+                            abort.abort();
+                            signal.wait().await;
+                        });
+                        match futures::future::select(drain, cancel).await {
+                            futures::future::Either::Right(((), pending)) => drop(pending),
+                            futures::future::Either::Left(_) => {
+                                panic!("visible drain starved cancellation for {}", mode.api);
+                            }
+                        }
+                    });
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    drop(output);
+                    assert!(dropped.load(Ordering::SeqCst));
                 }
             }
         }
