@@ -1044,6 +1044,113 @@ fn ready_heartbeat_role_and_usage_bursts_yield_and_wake_without_losing_usage() {
     }
 }
 
+fn visible_burst(tools: bool, count: usize) -> Vec<u8> {
+    let mut bytes = if tools {
+        let calls = (0..count)
+            .map(|index| {
+                json!({
+                    "index":index,"id":format!("call-{index}"),
+                    "function":{"name":"read","arguments":"{}"}
+                })
+            })
+            .collect::<Vec<_>>();
+        wire_bytes([json!({"choices":[{
+            "delta":{"tool_calls":calls},"finish_reason":"tool_calls"
+        }]})])
+    } else {
+        let mut bytes =
+            wire_bytes((0..count).map(|_| json!({"choices":[{"delta":{"content":"λ"}}]})));
+        bytes.extend(wire_bytes([
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ]));
+        bytes
+    };
+    bytes.extend(wire_bytes([usage_chunk()]));
+    bytes.extend_from_slice(b"data: [DONE]\n\n");
+    bytes
+}
+
+#[test]
+fn draining_visible_text_and_queued_tool_events_yields_without_losing_final_usage() {
+    for tools in [false, true] {
+        let count = MAX_READY_EVENTS_PER_YIELD * 2;
+        let (mut output, observation) = observed_wire([Ok(visible_burst(tools, count))], true);
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut task = TaskContext::from_waker(&waker);
+        let mut drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+        assert!(std::future::Future::poll(drain.as_mut(), &mut task).is_pending());
+        assert!(
+            flag.0.load(Ordering::SeqCst),
+            "visible drain must self-wake"
+        );
+        assert!(!observation.dropped.load(Ordering::SeqCst));
+        let events = futures::executor::block_on(drain)
+            .into_iter()
+            .collect::<crate::error::Result<Vec<_>>>()
+            .unwrap();
+        let Some(StreamEvent::Done { reason, message }) = events.last() else {
+            panic!("visible drain lost terminal event");
+        };
+        assert_eq!(message.usage.input, 7);
+        assert_eq!(message.usage.cache_read, 5);
+        assert_eq!(message.usage.total_tokens, 15);
+        if tools {
+            assert_eq!(*reason, StopReason::ToolUse);
+            assert_eq!(message.content.len(), count);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                    .count(),
+                count
+            );
+        } else {
+            assert_eq!(*reason, StopReason::Stop);
+            let text = events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(text, "λ".repeat(count));
+            assert!(matches!(
+                message.content.as_slice(),
+                [ContentBlock::Text(block)] if block.text == text
+            ));
+        }
+        assert_retired(&mut output, &observation);
+    }
+}
+
+#[test]
+fn cancellation_wins_while_a_consumer_drains_ready_visible_events() {
+    for tools in [false, true] {
+        let (mut output, observation) = observed_wire(
+            [Ok(visible_burst(tools, MAX_READY_EVENTS_PER_YIELD * 2))],
+            true,
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (abort, signal) = crate::agent::AbortHandle::new();
+            let drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+            let cancel = Box::pin(async move {
+                abort.abort();
+                signal.wait().await;
+            });
+            match futures::future::select(drain, cancel).await {
+                futures::future::Either::Right(((), pending)) => drop(pending),
+                futures::future::Either::Left(_) => panic!("visible drain starved cancellation"),
+            }
+        });
+        drop(output);
+        assert!(observation.dropped.load(Ordering::SeqCst));
+    }
+}
+
 #[test]
 fn abort_can_win_when_a_ready_openai_metadata_burst_would_otherwise_starve_it() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()

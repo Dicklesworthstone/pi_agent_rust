@@ -1110,9 +1110,15 @@ where
     state.usage_observer = usage_observer;
     let output = stream::unfold(Some(state), |active| async move {
         let mut state = active?;
-        let mut ready_events = 0;
         loop {
+            // Retain this budget across public events: a consumer collecting
+            // ready text or tool deltas must yield just like silent metadata.
+            if state.ready_work_since_yield == MAX_READY_EVENTS_PER_YIELD {
+                yield_stream_turn().await;
+                state.ready_work_since_yield = 0;
+            }
             if let Some(event) = state.pending_events.pop_front() {
+                state.ready_work_since_yield += 1;
                 let terminal =
                     matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
                 // Drop the socket, captured owner and buffered tail before
@@ -1126,11 +1132,7 @@ where
             if state.done {
                 return None;
             }
-            if ready_events == MAX_READY_EVENTS_PER_YIELD {
-                yield_stream_turn().await;
-                ready_events = 0;
-            }
-            ready_events += 1;
+            state.ready_work_since_yield += 1;
 
             match state.event_source.next().await {
                 Some(Ok(msg)) => {
@@ -1206,6 +1208,8 @@ where
     finalized: bool,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    /// Shared by wire reads and queued event delivery across next() calls.
+    ready_work_since_yield: usize,
     audio_input_in_request: bool,
     usage_received: bool,
     complete_billing_received: bool,
@@ -1425,6 +1429,7 @@ where
             done: false,
             finalized: false,
             transient_error_count: 0,
+            ready_work_since_yield: 0,
             audio_input_in_request: false,
             usage_received: false,
             complete_billing_received: false,
