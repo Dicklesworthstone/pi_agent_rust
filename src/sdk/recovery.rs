@@ -13,7 +13,6 @@ use super::{
 };
 use crate::failover::{RetryPolicy, TurnDecision, TurnOutcome, TurnProgress};
 use serde_json::{Map, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,78 +31,6 @@ fn fence_session_persistence<T>(
         admission.block(error.to_string());
     }
     result
-}
-
-/// Complete only the typed stream hook. The generic SDK event stream and
-/// extension observation remain unchanged. `make_combined_callback` already
-/// forwards explicit terminal MessageUpdates (notably cancellation), so only
-/// synthesize a terminal when an assistant MessageEnd had no such update.
-#[derive(Default)]
-struct StreamTerminalForwarder {
-    terminal_seen: AtomicBool,
-}
-
-impl StreamTerminalForwarder {
-    fn missing_terminal(&self, event: &AgentEvent) -> Option<super::StreamEvent> {
-        use crate::model::AssistantMessageEvent;
-
-        match event {
-            AgentEvent::MessageStart {
-                message: Message::Assistant(_),
-            } => {
-                self.terminal_seen.store(false, Ordering::SeqCst);
-                None
-            }
-            AgentEvent::MessageUpdate {
-                assistant_message_event:
-                    AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. },
-                ..
-            } => {
-                self.terminal_seen.store(true, Ordering::SeqCst);
-                None
-            }
-            AgentEvent::MessageEnd {
-                message: Message::Assistant(message),
-            } => {
-                if self.terminal_seen.swap(true, Ordering::SeqCst) {
-                    return None;
-                }
-                let reason = message.stop_reason;
-                if matches!(reason, StopReason::Error | StopReason::Aborted) {
-                    Some(super::StreamEvent::Error {
-                        reason,
-                        error: (**message).clone(),
-                    })
-                } else {
-                    Some(super::StreamEvent::Done {
-                        reason,
-                        message: (**message).clone(),
-                    })
-                }
-            }
-            _ => None,
-        }
-    }
-}
-
-/// Response completion is not a durability acknowledgement: the SDK's logical
-/// AgentEnd still waits for persistence and may report a save failure after a
-/// typed Done. Keep typed hooks ahead of generic subscribers, as in the normal
-/// fan-out, and never hold a mutex while calling embedder code.
-fn complete_stream_callback(
-    output: EventCallback,
-    on_stream_event: Option<super::OnStreamEvent>,
-) -> EventCallback {
-    let Some(on_stream_event) = on_stream_event else {
-        return output;
-    };
-    let terminals = StreamTerminalForwarder::default();
-    Arc::new(move |event| {
-        if let Some(terminal) = terminals.missing_terminal(&event) {
-            on_stream_event(&terminal);
-        }
-        output(event);
-    })
 }
 
 /// One logical SDK call owns its terminal event, not any provider attempt.
@@ -380,7 +307,6 @@ impl AgentSessionHandle {
                 .and_then(|options| options.cli_api_key.clone()),
         );
         let shared: EventCallback = Arc::new(self.make_combined_callback(on_event));
-        let shared = complete_stream_callback(shared, self.listeners.on_stream_event.clone());
         self.maybe_restore_primary(&shared).await?;
         ensure_not_aborted(&abort_signal)?;
         let turn = LogicalTurn::new(shared);
@@ -1323,6 +1249,7 @@ mod persistence_fence_tests {
 mod stream_terminal_tests {
     use super::*;
     use crate::model::{AssistantMessageEvent, StreamEvent, Usage, UserMessage};
+    use crate::sdk::StreamTerminalForwarder;
 
     fn assistant(reason: StopReason) -> Arc<AssistantMessage> {
         Arc::new(AssistantMessage {
@@ -1465,40 +1392,59 @@ mod stream_terminal_tests {
 
     #[test]
     fn typed_terminal_precedes_generic_delivery_without_changing_the_event() {
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let generic_events = Arc::new(Mutex::new(Vec::new()));
-        let generic_order = Arc::clone(&order);
-        let captured = Arc::clone(&generic_events);
-        let output: EventCallback = Arc::new(move |event| {
-            generic_order.lock().unwrap().push("generic");
-            captured
-                .lock()
-                .unwrap()
-                .push(serde_json::to_value(event).unwrap());
-        });
-        let typed_order = Arc::clone(&order);
-        let hook: super::super::OnStreamEvent = Arc::new(move |event| {
-            assert!(matches!(event, StreamEvent::Done { .. }));
-            typed_order.lock().unwrap().push("typed");
-        });
-        let callback = complete_stream_callback(output, Some(hook));
-        let message = assistant(StopReason::Stop);
-        let started = start(&message);
-        let ended = end(&message);
-        let expected = vec![
-            serde_json::to_value(&started).unwrap(),
-            serde_json::to_value(&ended).unwrap(),
-        ];
-        callback(started);
-        callback(ended);
-        assert_eq!(*order.lock().unwrap(), ["generic", "typed", "generic"]);
-        assert_eq!(*generic_events.lock().unwrap(), expected);
-    }
-
-    #[test]
-    fn absent_stream_listener_reuses_the_existing_callback() {
-        let output: EventCallback = Arc::new(|_| {});
-        let wrapped = complete_stream_callback(Arc::clone(&output), None);
-        assert!(Arc::ptr_eq(&wrapped, &output));
+        for listen in [false, true] {
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let generic_events = Arc::new(Mutex::new(Vec::new()));
+            let mut listeners = crate::sdk::EventListeners::default();
+            if listen {
+                let typed_order = Arc::clone(&order);
+                listeners.on_stream_event = Some(Arc::new(move |event| {
+                    assert!(matches!(event, StreamEvent::Done { .. }));
+                    typed_order.lock().unwrap().push("typed");
+                }));
+            }
+            let entry = crate::models::ad_hoc_model_entry("openai", "gpt-4o-mini").unwrap();
+            let agent = crate::agent::Agent::new(
+                crate::providers::create_provider(&entry, None).unwrap(),
+                crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None),
+                crate::agent::AgentConfig::default(),
+            );
+            let session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(
+                    crate::session::Session::in_memory(),
+                )),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let handle = AgentSessionHandle::from_session_with_listeners(session, listeners);
+            let generic_order = Arc::clone(&order);
+            let captured = Arc::clone(&generic_events);
+            let callback = handle.make_combined_callback(move |event| {
+                generic_order.lock().unwrap().push("generic");
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            });
+            let message = assistant(StopReason::Stop);
+            let started = start(&message);
+            let ended = end(&message);
+            let expected = vec![
+                serde_json::to_value(&started).unwrap(),
+                serde_json::to_value(&ended).unwrap(),
+            ];
+            callback(started);
+            callback(ended);
+            assert_eq!(
+                *order.lock().unwrap(),
+                if listen {
+                    vec!["generic", "typed", "generic"]
+                } else {
+                    vec!["generic", "generic"]
+                }
+            );
+            assert_eq!(*generic_events.lock().unwrap(), expected);
+        }
     }
 }

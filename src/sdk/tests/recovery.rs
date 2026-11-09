@@ -2251,6 +2251,223 @@ fn completion_response() -> (u16, &'static str, String) {
     )
 }
 
+async fn extension_stream_handle(directory: &Path, url: &str) -> AgentSessionHandle {
+    let extension = directory.join("sdk-stream-terminals.mjs");
+    std::fs::write(
+        &extension,
+        r#"export default function init(pi) {
+  const user = () => pi.events("sendUserMessage", { text: "Run the requested work" });
+  pi.registerCommand("sdk-stream-turns", {
+    description: "Generate user and custom turns",
+    handler: async (args) => {
+      await user();
+      if (args === "both") {
+        await pi.events("sendMessage", {
+          message: { customType: "sdk-note", content: "Review the result", display: true },
+          options: { deliverAs: "steer", triggerTurn: true }
+        });
+      }
+      return "queued";
+    }
+  });
+  pi.registerShortcut("ctrl+alt+k", { handler: async () => { await user(); } });
+}
+"#,
+    )
+    .unwrap();
+    let mut entry = crate::models::ad_hoc_model_entry("openai", "fallback-b").unwrap();
+    entry.model.api = "openai-completions".to_string();
+    entry.model.base_url = url.to_string();
+    let agent = Agent::new(
+        crate::providers::create_provider(&entry, None).unwrap(),
+        ToolRegistry::new(&["write"], directory, None),
+        AgentConfig {
+            stream_options: StreamOptions {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        },
+    );
+    let mut stored = Session::in_memory();
+    stored.header.cwd = directory.display().to_string();
+    let mut session = AgentSession::new(
+        agent,
+        Arc::new(AsyncMutex::new(stored)),
+        false,
+        ResolvedCompactionSettings {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    session
+        .enable_extensions(&["write"], directory, None, &[extension])
+        .await
+        .unwrap();
+    AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn extension_generated_turns_deliver_typed_terminals_before_their_generic_message_end() {
+    run_async(async {
+        let directory = tempdir().unwrap();
+        let mut server = RecoveryHttpFixture::new(vec![
+            write_tool_response(),
+            completion_response(),
+            completion_response(),
+            (
+                200,
+                "text/event-stream",
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial before transport failure\"},\"finish_reason\":null}]}\n\n",
+                    "data: {broken json\n\n",
+                )
+                .to_string(),
+            ),
+        ]);
+        let mut handle = extension_stream_handle(directory.path(), &server.url).await;
+        let terminals = Arc::new(Mutex::new(Vec::<(&str, StopReason, Value)>::new()));
+        let captured = Arc::clone(&terminals);
+        handle.listeners_mut().on_stream_event = Some(Arc::new(move |event| {
+            let (reason, message) = match event {
+                StreamEvent::Done { reason, message } => (*reason, message),
+                StreamEvent::Error { reason, error } => (*reason, error),
+                _ => return,
+            };
+            captured.lock().unwrap().push((
+                "typed",
+                reason,
+                serde_json::to_value(message).unwrap(),
+            ));
+        }));
+        let captured = Arc::clone(&terminals);
+        let subscribers = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let subscribed = Arc::clone(&subscribers);
+        handle.subscribe(move |event| {
+            if let AgentEvent::MessageEnd {
+                message: Message::Assistant(message),
+            } = &event
+            {
+                captured.lock().unwrap().push((
+                    "generic",
+                    message.stop_reason,
+                    serde_json::to_value(message.as_ref()).unwrap(),
+                ));
+            }
+            subscribed
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(event).unwrap());
+        });
+        let tool_starts = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&tool_starts);
+        handle.listeners_mut().on_tool_start = Some(Arc::new(move |name, _| {
+            assert_eq!(name, "write");
+            captured.fetch_add(1, Ordering::SeqCst);
+        }));
+        let (events, callback) = event_log();
+        let on_command = Arc::clone(&callback);
+        let value = handle
+            .execute_extension_command_with_abort(
+                "sdk-stream-turns",
+                "both",
+                5_000,
+                None,
+                move |event| on_command(event),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, "queued");
+        handle
+            .execute_extension_shortcut_with_abort("ctrl+alt+k", 5_000, None, move |event| {
+                callback(event);
+            })
+            .await
+            .unwrap();
+        server.finish();
+
+        {
+            let terminals = terminals.lock().unwrap();
+            let reasons = [
+                StopReason::ToolUse,
+                StopReason::Stop,
+                StopReason::Stop,
+                StopReason::Error,
+            ];
+            assert_eq!(terminals.len(), reasons.len() * 2);
+            for (pair, reason) in terminals.chunks_exact(2).zip(reasons) {
+                assert_eq!((pair[0].0, pair[1].0), ("typed", "generic"));
+                assert_eq!(pair[0].1, reason);
+                assert_eq!(pair[0].1, pair[1].1);
+                assert_eq!(pair[0].2, pair[1].2, "the final payload must be identical");
+            }
+        }
+        assert_eq!(*subscribers.lock().unwrap(), *events.lock().unwrap());
+        assert_eq!(tool_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("result.txt")).unwrap(),
+            "saved exactly once"
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
+        assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+    });
+}
+
+#[test]
+fn cancelling_an_extension_turn_emits_one_abort_and_the_next_turn_completes_once() {
+    run_async(async {
+        let directory = tempdir().unwrap();
+        let mut server =
+            RecoveryHttpFixture::new(vec![completion_response(), completion_response()]);
+        let mut handle = extension_stream_handle(directory.path(), &server.url).await;
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&reasons);
+        handle.listeners_mut().on_stream_event = Some(Arc::new(move |event| match event {
+            StreamEvent::Done { reason, .. } | StreamEvent::Error { reason, .. } => {
+                captured.lock().unwrap().push(*reason);
+            }
+            _ => {}
+        }));
+        let (abort, signal) = AbortHandle::new();
+        let result = handle
+            .execute_extension_shortcut_with_abort(
+                "ctrl+alt+k",
+                5_000,
+                Some(signal),
+                move |event| {
+                    if matches!(
+                        event,
+                        AgentEvent::MessageUpdate {
+                            assistant_message_event:
+                                crate::model::AssistantMessageEvent::TextDelta { .. },
+                            ..
+                        }
+                    ) {
+                        abort.abort();
+                    }
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Aborted)));
+        assert_eq!(*reasons.lock().unwrap(), [StopReason::Aborted]);
+
+        let completed = handle
+            .prompt("continue after cancellation", |_| {})
+            .await
+            .unwrap();
+        assert_eq!(completed.stop_reason, StopReason::Stop);
+        server.finish();
+        assert_eq!(
+            *reasons.lock().unwrap(),
+            [StopReason::Aborted, StopReason::Stop],
+            "ordinary recovery must not install a second terminal forwarder"
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+    });
+}
+
 fn http_chain_handle(url: &str, cap: u32) -> (AgentSessionHandle, Arc<AtomicUsize>) {
     let (handle, calls) = flaky_handle_as(usize::MAX, "anthropic", "claude-x");
     let entries = ["fallback-a", "fallback-b"]
