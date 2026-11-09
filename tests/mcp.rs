@@ -2036,6 +2036,36 @@ mod fixture_lanes {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn mcp_windows_native_pipes_preserve_large_frames_and_stderr() {
+        let case = "mcp_windows_native_pipes_preserve_large_frames_and_stderr";
+        let harness = TestHarness::new(case);
+        let payload = "native-pipe-界\n".repeat(20_000);
+        for _ in 0..3 {
+            let transport = fixture_transport(&harness, &[]);
+            let result = block_on_local(transport.request(
+                "tools/call",
+                json!({"name":"echo", "arguments":{"text":payload}}),
+                std::time::Duration::from_secs(10),
+            ))
+            .expect("large request and response cross the native pipes");
+            let text = result["content"][0]["text"].as_str().expect("echo text");
+            let (echo, receipt) = text.rsplit_once(" [pid=").expect("fixture receipt");
+            assert_eq!(echo, format!("echo: {payload}"));
+            assert!(receipt.ends_with(" req=1]"), "{receipt}");
+            let tail = wait_for_transport_diagnostics(
+                &transport,
+                "7f3a9c-v2",
+                std::time::Duration::from_secs(2),
+            );
+            assert!(tail.contains("7f3a9c-v2"), "{tail}");
+            block_on_local(transport.close());
+            assert!(!transport.is_alive());
+        }
+        finish_case(&harness, case);
+    }
+
+    #[test]
     fn acknowledged_extension_server_is_mounted_by_startup_connect_seam() {
         let case = "acknowledged_extension_server_is_mounted_by_startup_connect_seam";
         let harness = TestHarness::new(case);

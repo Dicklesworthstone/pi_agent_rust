@@ -1,14 +1,18 @@
-//! Cancellation-aware Unix MCP pipes.
+//! Cancellation-aware native MCP pipes.
 //!
 //! Process-tree cleanup does not guarantee pipe EOF: a descendant can leave
-//! the process group and retain a descriptor. Keep all three parent endpoints
+//! the process group or retain a duplicated handle. Keep all parent endpoints
 //! nonblocking, but present ordinary blocking-style Read/Write to the existing
 //! frame decoder and single writer. WouldBlock must not escape into the frame
 //! decoder: it owns a partially assembled newline-delimited JSON message.
 
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -17,12 +21,14 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The parent endpoints only. The child's opposite pipe ends retain their
 /// ordinary blocking behavior. Prepare every endpoint before starting workers.
+#[cfg(unix)]
 pub struct StdioPipes {
     pub(crate) stdin: CancellablePipe<ChildStdin>,
     pub(crate) stdout: CancellablePipe<ChildStdout>,
     pub(crate) stderr: CancellablePipe<ChildStderr>,
 }
 
+#[cfg(unix)]
 pub fn prepare(
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -36,11 +42,82 @@ pub fn prepare(
     })
 }
 
+/// Windows anonymous child pipes cannot be made nonblocking after spawn.
+/// Prepare synchronous child handles backed by the existing shared overlapped
+/// reactor before starting the child, then retire the command's handle copies.
+#[cfg(windows)]
+pub(crate) struct WindowsStdioPipes {
+    pub(crate) stdin: CancellablePipe<WindowsInput>,
+    pub(crate) stdout: CancellablePipe<WindowsOutput>,
+    pub(crate) stderr: CancellablePipe<WindowsOutput>,
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_command(
+    command: &mut Command,
+    alive: &Arc<AtomicBool>,
+) -> io::Result<WindowsStdioPipes> {
+    use crate::jobs::windows_job_pipe;
+
+    let (stdin, child_stdin) = windows_job_pipe::stdin_pair()?;
+    let (stdout, child_stdout) = windows_job_pipe::pair()?;
+    let (stderr, child_stderr) = windows_job_pipe::pair()?;
+    // Configure only after every pair exists. A preparation failure drops all
+    // admitted endpoints without spawning a child or a per-connection worker.
+    command
+        .stdin(Stdio::from(child_stdin))
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr));
+    Ok(WindowsStdioPipes {
+        stdin: CancellablePipe {
+            inner: WindowsInput(stdin),
+            alive: Arc::clone(alive),
+        },
+        stdout: CancellablePipe {
+            inner: WindowsOutput(stdout),
+            alive: Arc::clone(alive),
+        },
+        stderr: CancellablePipe {
+            inner: WindowsOutput(stderr),
+            alive: Arc::clone(alive),
+        },
+    })
+}
+
+#[cfg(windows)]
+pub(crate) struct WindowsInput(crate::jobs::windows_job_pipe::Writer);
+
+#[cfg(windows)]
+impl Write for WindowsInput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.try_write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // As with Mio's NamedPipe::flush, accepted writes remain owned by the
+        // reactor until completion. This is not a server acknowledgment; the
+        // JSON-RPC response supplies that. Drop cancels pending input instead
+        // of waiting for an unresponsive or retained client handle to read it.
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct WindowsOutput(crate::jobs::windows_job_pipe::Reader);
+
+#[cfg(windows)]
+impl Read for WindowsOutput {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.try_read(buffer)
+    }
+}
+
 pub struct CancellablePipe<T> {
     inner: T,
     alive: Arc<AtomicBool>,
 }
 
+#[cfg(unix)]
 impl<T: AsFd> CancellablePipe<T> {
     fn new(inner: T, alive: Arc<AtomicBool>) -> io::Result<Self> {
         let flags = rustix::fs::fcntl_getfl(&inner)?;
@@ -103,6 +180,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io::BufReader;
+    #[cfg(unix)]
     use std::os::fd::BorrowedFd;
     use std::sync::mpsc::{SyncSender, sync_channel};
 
@@ -153,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn nonblocking_setup_preserves_flags_and_the_opposite_endpoint() {
         let (reader, writer) = io::pipe().expect("native pipe");
         let reader_flags = rustix::fs::fcntl_getfl(&reader).expect("reader flags");
@@ -396,6 +475,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl<T: AsFd> AsFd for ObserveBlocked<T> {
         fn as_fd(&self) -> BorrowedFd<'_> {
             self.inner.as_fd()
@@ -421,6 +501,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn idle_native_reader_stops_with_writer_retained_and_retires_its_fd() {
         for _ in 0..8 {
             let (reader, mut writer) = io::pipe().expect("native pipe");
@@ -475,6 +556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn saturated_native_writer_stops_with_reader_retained() {
         let (reader, writer) = io::pipe().expect("native pipe");
         let alive = live();
@@ -511,6 +593,138 @@ mod tests {
         assert_eq!(
             stopped_with_reader_held.expect("stopped with reader retained"),
             io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_idle_reader_stops_with_duplicated_writers_retained() {
+        for _ in 0..8 {
+            let (reader, writer) = crate::jobs::windows_job_pipe::pair().expect("Windows output");
+            let retained = writer.try_clone().expect("duplicated peer writer");
+            let alive = live();
+            let (blocked_tx, blocked_rx) = sync_channel(1);
+            let (done_tx, done_rx) = sync_channel(1);
+            let mut reader = CancellablePipe {
+                inner: ObserveBlocked {
+                    inner: WindowsOutput(reader),
+                    blocked: Some(blocked_tx),
+                },
+                alive: Arc::clone(&alive),
+            };
+            let worker = std::thread::spawn(move || {
+                let result = reader.read(&mut [0]).map_err(|error| error.kind());
+                drop(reader);
+                let _ = done_tx.send(result);
+            });
+            let blocked = blocked_rx.recv_timeout(Duration::from_secs(2));
+            alive.store(false, Ordering::SeqCst);
+            let stopped = done_rx.recv_timeout(Duration::from_secs(2));
+            // Release both peers before joining, even if cancellation regresses.
+            // A passing observation must precede that release, not depend on it.
+            drop(writer);
+            drop(retained);
+            worker.join().expect("Windows output worker");
+            blocked.expect("idle overlapped read observed");
+            assert_eq!(
+                stopped.expect("reader retires while both peers remain open"),
+                Err(io::ErrorKind::ConnectionAborted)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_backpressured_writer_stops_with_duplicated_readers_retained() {
+        let (mut writer, reader) =
+            crate::jobs::windows_job_pipe::stdin_pair().expect("Windows input");
+        let retained = reader.try_clone().expect("duplicated peer reader");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut accepted = 0;
+        loop {
+            // A single asynchronous write can briefly report WouldBlock even
+            // when the pipe has room. Fill beyond Mio's 64 KiB pipe buffer so
+            // the cancellation probe observes an actual unread full pipe.
+            match writer.try_write(&[b'x'; 8192]) {
+                Ok(count) => {
+                    assert!(count > 0 && count <= 8192);
+                    accepted += count;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && accepted > 64 * 1024 => {
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("prepare saturated MCP stdin: {error}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stdin never saturated"
+            );
+        }
+        let alive = live();
+        let (blocked_tx, blocked_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        let mut writer = CancellablePipe {
+            inner: ObserveBlocked {
+                inner: WindowsInput(writer),
+                blocked: Some(blocked_tx),
+            },
+            alive: Arc::clone(&alive),
+        };
+        let worker = std::thread::spawn(move || {
+            // More than the pipe's capacity, with no reader consuming bytes.
+            // write_all must not mistake WouldBlock for delivery or retry an
+            // already accepted prefix when cancellation interrupts the frame.
+            let result = writer
+                .write_all(&vec![b'x'; 256 * 1024])
+                .map_err(|error| error.kind());
+            drop(writer);
+            let _ = done_tx.send(result);
+        });
+        let blocked = blocked_rx.recv_timeout(Duration::from_secs(2));
+        alive.store(false, Ordering::SeqCst);
+        let stopped = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(reader);
+        drop(retained);
+        worker.join().expect("Windows input worker");
+        blocked.expect("overlapped input backpressure observed");
+        assert_eq!(
+            stopped.expect("writer retires while both peers remain open"),
+            Err(io::ErrorKind::ConnectionAborted)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_command_copies_are_the_only_client_handles_before_spawn() {
+        let mut command = Command::new("pi-mcp-never-spawned-fixture");
+        let alive = live();
+        let mut pipes = prepare_command(&mut command, &alive).expect("prepare native stdio");
+        assert!(matches!(
+            pipes.stdout.inner.read(&mut [0]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            pipes.stderr.inner.read(&mut [0]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        drop(command);
+        let (done_tx, done_rx) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let stdout = pipes.stdout.read(&mut [0]).map_err(|error| error.kind());
+            let stderr = pipes.stderr.read(&mut [0]).map_err(|error| error.kind());
+            drop(pipes);
+            let _ = done_tx.send((stdout, stderr));
+        });
+        let eof = done_rx.recv_timeout(Duration::from_secs(2));
+        alive.store(false, Ordering::SeqCst);
+        worker.join().expect("unspawned pipe cleanup worker");
+        assert_eq!(
+            eof.expect("dropping an unspawned command closes both output peers"),
+            (Ok(0), Ok(0))
         );
     }
 }

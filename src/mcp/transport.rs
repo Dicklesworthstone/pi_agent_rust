@@ -30,7 +30,7 @@ use crate::tools::{ProcessCleanupMode, ProcessGuard};
 #[cfg(test)]
 mod progress_tests;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod cancellable_stdio;
 
 #[path = "sse_transport.rs"]
@@ -1122,14 +1122,30 @@ impl McpStdioClient {
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
         crate::tools::isolate_command_process_group(&mut command_builder);
-        let mut child = crate::tools::spawn_command_with_job_discipline(&mut command_builder)
-            .map_err(|error| {
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        #[cfg(windows)]
+        let pipes =
+            cancellable_stdio::prepare_command(&mut command_builder, &alive).map_err(|error| {
+                tool_err(
+                    "MCP_TRANSPORT_IO",
+                    format!("failed to prepare cancellable MCP stdio pipes: {error}"),
+                )
+            })?;
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command_builder).map_err(
+            |error| {
                 tool_err(
                     "MCP_SERVER_MISSING",
                     format!("failed to spawn MCP server {command:?}: {error}"),
                 )
-            })?;
+            },
+        )?;
+        // Caller-supplied Stdio handles remain in Command after spawn. Keeping
+        // them here would suppress EOF even after the server closes its ends.
+        drop(command_builder);
+        #[cfg(not(windows))]
+        let mut child = child;
         let pid = child.id();
+        #[cfg(not(windows))]
         let Some(stdin) = child.stdin.take() else {
             let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
             let _ = guard.kill();
@@ -1138,6 +1154,7 @@ impl McpStdioClient {
                 "spawned MCP server has no stdin",
             ));
         };
+        #[cfg(not(windows))]
         let Some(stdout) = child.stdout.take() else {
             let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
             let _ = guard.kill();
@@ -1146,6 +1163,7 @@ impl McpStdioClient {
                 "spawned MCP server has no stdout",
             ));
         };
+        #[cfg(not(windows))]
         let Some(stderr) = child.stderr.take() else {
             let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);
             let _ = guard.kill();
@@ -1154,12 +1172,13 @@ impl McpStdioClient {
                 "spawned MCP server has no stderr",
             ));
         };
+        #[cfg(windows)]
+        let (stdin, stdout, stderr) = (pipes.stdin, pipes.stdout, pipes.stderr);
 
         let pending = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let progress = std::sync::Arc::new(ProgressRegistry::default());
         let roots = std::sync::Arc::new(ClientRoots::default());
         let tools_list_changed = std::sync::Arc::new(AtomicBool::new(false));
-        let alive = std::sync::Arc::new(AtomicBool::new(true));
         let closing = std::sync::Arc::new(AtomicBool::new(false));
         let tree_cleanup_state = std::sync::Arc::new(Mutex::new(TreeCleanupState::Pending));
         let stderr_tail = std::sync::Arc::new(Mutex::new(PublicTailBuffer::new()));
