@@ -2959,6 +2959,7 @@ async fn run(
                 .and_then(|resolution| {
                     pi::btw::BtwClient::for_model_entry(
                         &resolution.model_entry,
+                        &selection.model_entry,
                         cli.api_key.as_deref(),
                         &auth,
                         config.secrets.as_ref(),
@@ -3153,6 +3154,7 @@ async fn run(
             .and_then(|resolution| {
                 pi::btw::BtwClient::for_model_entry(
                     &resolution.model_entry,
+                    &selection.model_entry,
                     cli.api_key.as_deref(),
                     &auth,
                     config.secrets.as_ref(),
@@ -3161,6 +3163,7 @@ async fn run(
     // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
+    let btw_primary_entry = selection.model_entry.clone();
     let btw_secrets_settings = config.secrets.clone();
     let btw_cwd = cwd.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
@@ -3170,6 +3173,7 @@ async fn run(
         auth.set_command_working_directory(&btw_cwd).ok()?;
         pi::btw::BtwClient::for_model_entry(
             entry,
+            &btw_primary_entry,
             btw_api_key.as_deref(),
             &auth,
             btw_secrets_settings.as_ref(),

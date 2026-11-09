@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::model::{Message, UserContent, UserMessage};
-use crate::provider::Provider;
+use crate::model::{Message, ThinkingLevel, UserContent, UserMessage};
+use crate::provider::{Provider, StreamOptions};
 use crate::text_completion::{
     AuxiliaryPrivacy, MAX_INPUT_BYTES, MAX_TEXT_BYTES, OMITTED_INPUT, RequestStop, collect_text,
     redact_inputs, with_timeout,
@@ -39,13 +39,16 @@ pub type BtwClientFactory = std::sync::Arc<
 /// One-shot client bound to the resolved `smol` role provider.
 pub struct BtwClient {
     provider: Arc<dyn Provider>,
-    api_key: Option<String>,
+    options: StreamOptions,
     credential_binding: Option<ModelCredentialBinding>,
     privacy: Arc<AuxiliaryPrivacy>,
 }
 
-/// Retain credential provenance separately from the last resolved key. A
-/// startup-created client can outlive a foreground request's pool cooldown.
+/// Retain credential provenance separately from the last resolved key. The
+/// supplied auth snapshot remains authoritative, including unsaved SDK
+/// credentials; each request rechecks its live environment and pool cooldown.
+/// Native role rebinding can supply a refreshed store without silently
+/// replacing an embedder's credential scope with a disk read.
 struct ModelCredentialBinding {
     entry: crate::models::ModelEntry,
     auth: crate::auth::AuthStorage,
@@ -66,7 +69,11 @@ impl BtwClient {
     pub fn new(provider: Arc<dyn Provider>, api_key: Option<String>) -> Self {
         Self {
             provider,
-            api_key,
+            options: StreamOptions {
+                api_key,
+                max_tokens: Some(ANSWER_MAX_TOKENS),
+                ..Default::default()
+            },
             credential_binding: None,
             privacy: Arc::new(AuxiliaryPrivacy::default()),
         }
@@ -81,17 +88,27 @@ impl BtwClient {
         self
     }
 
-    /// Resolve provider + credentials for `entry` and build a client using
-    /// the startup precedence (`--api-key` > stored auth > inline key).
+    /// Resolve the side model's provider, options and credentials. The
+    /// foreground `--api-key` belongs to its original provider and endpoint;
+    /// another destination resolves its own stored or configured credential.
     /// Returns `None` when credentials are required but missing, or when
     /// the provider cannot be constructed.
     pub fn for_model_entry(
         entry: &crate::models::ModelEntry,
+        primary_entry: &crate::models::ModelEntry,
         cli_api_key: Option<&str>,
         auth: &crate::auth::AuthStorage,
         secrets: Option<&crate::secrets::SecretsSettings>,
     ) -> Option<std::sync::Arc<Self>> {
-        let key = crate::models::resolve_model_key(cli_api_key, auth, entry).ok()?;
+        // Match the native title client's destination identity. Provider
+        // aliases share credentials only when the configured endpoint also
+        // matches; rebinding the smol role cannot retarget a foreground key.
+        let same_destination = crate::provider_metadata::provider_ids_match(
+            &entry.model.provider,
+            &primary_entry.model.provider,
+        ) && entry.model.base_url == primary_entry.model.base_url;
+        let override_key = cli_api_key.filter(|_| same_destination);
+        let key = crate::models::resolve_model_key(override_key, auth, entry).ok()?;
         let credentialed =
             !crate::models::model_requires_configured_credential(entry) || key.is_some();
         if !credentialed {
@@ -101,10 +118,14 @@ impl BtwClient {
             .ok()
             .map(|provider| {
                 let mut client = Self::new(provider, key).with_secrets_settings(secrets);
+                client.options.headers.clone_from(&entry.headers);
+                client.options.max_tokens = Some(entry.model.max_tokens.min(ANSWER_MAX_TOKENS));
+                client.options.thinking_level =
+                    Some(entry.clamp_thinking_level(ThinkingLevel::Minimal));
                 client.credential_binding = Some(ModelCredentialBinding {
                     entry: entry.clone(),
                     auth: auth.clone(),
-                    override_key: cli_api_key.map(str::to_string),
+                    override_key: override_key.map(str::to_string),
                 });
                 std::sync::Arc::new(client)
             })
@@ -250,19 +271,14 @@ impl BtwClient {
             tools: Vec::new().into(),
         };
         with_timeout(ANSWER_TIMEOUT, async {
-            let api_key = match &self.credential_binding {
-                Some(binding) => crate::models::resolve_model_key(
+            let mut options = self.options.clone();
+            if let Some(binding) = &self.credential_binding {
+                options.api_key = crate::models::resolve_model_key(
                     binding.override_key.as_deref(),
                     &binding.auth,
                     &binding.entry,
-                )?,
-                None => self.api_key.clone(),
-            };
-            let options = crate::provider::StreamOptions {
-                max_tokens: Some(ANSWER_MAX_TOKENS),
-                api_key,
-                ..Default::default()
-            };
+                )?;
+            }
             let stream = provider.stream(&context, &options).await?;
             collect_text(stream, MAX_TEXT_BYTES).await
         })
@@ -754,8 +770,8 @@ mod tests {
             std::env::temp_dir().join(format!("pi-btw-test-auth-{}.json", std::process::id())),
         )
         .expect("empty auth storage loads");
-        let client =
-            BtwClient::for_model_entry(&entry, None, &auth, None).expect("local provider builds");
+        let client = BtwClient::for_model_entry(&entry, &entry, None, &auth, None)
+            .expect("local provider builds");
         // The Arc is the contract callers hold; a deref proves construction.
         let _arc: std::sync::Arc<BtwClient> = client;
     }
@@ -778,7 +794,218 @@ mod tests {
             std::process::id()
         )))
         .expect("empty auth storage loads");
-        assert!(BtwClient::for_model_entry(&entry, None, &auth, None).is_none());
+        assert!(BtwClient::for_model_entry(&entry, &entry, None, &auth, None).is_none());
+    }
+
+    fn role_entry(provider: &str, base_url: &str, key: Option<&str>) -> crate::models::ModelEntry {
+        crate::models::ModelEntry {
+            model: crate::provider::Model {
+                id: "side-fixture".to_string(),
+                name: "Side fixture".to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                reasoning: false,
+                input: vec![crate::provider::InputType::Text],
+                cost: crate::provider::ModelCost::default(),
+                context_window: 8_192,
+                max_tokens: 2_048,
+                headers: std::collections::HashMap::new(),
+            },
+            api_key: key.map(str::to_string),
+            headers: std::collections::HashMap::from([(
+                "x-side-route".to_string(),
+                "smol".to_string(),
+            )]),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    type CapturedSideRequest = (std::collections::HashMap<String, String>, serde_json::Value);
+
+    /// Exercise the real model factory, request serialization and SSE reader;
+    /// every socket and accept is bounded even if admission unexpectedly fails.
+    fn side_peer() -> (String, std::thread::JoinHandle<CapturedSideRequest>) {
+        use std::io::{BufRead, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("side peer");
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut socket = loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "side request deadline"
+                );
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("side peer accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /v1/chat/completions HTTP/1.1\r\n");
+            let mut bytes = line.len();
+            let mut headers = std::collections::HashMap::new();
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                bytes += line.len();
+                assert!(bytes <= 64 * 1024, "side request headers are bounded");
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').expect("header");
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+            }
+            let length: usize = headers["content-length"].parse().unwrap();
+            assert!(length <= 64 * 1024, "side request body is bounded");
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let start = serde_json::json!({
+                "id": "side-response", "object": "chat.completion.chunk",
+                "created": 0, "model": "side-fixture",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Side answer"}, "finish_reason": null}],
+            });
+            let end = serde_json::json!({
+                "id": "side-response", "object": "chat.completion.chunk",
+                "created": 0, "model": "side-fixture",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
+            });
+            let response = format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            socket.flush().unwrap();
+            (headers, body)
+        });
+        (base_url, worker)
+    }
+
+    #[test]
+    fn side_model_wire_preserves_destination_credentials_headers_and_supported_options() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("side wire runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut auth = crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                "btw-secondary",
+                crate::auth::AuthCredential::ApiKey {
+                    key: "side-stored-key".to_string(),
+                },
+            );
+            for case in [
+                "same",
+                "other-provider",
+                "other-endpoint",
+                "canonical-alias",
+            ] {
+                let (base_url, peer) = side_peer();
+                let mut primary = role_entry("btw-primary", &base_url, None);
+                let mut role = role_entry("btw-primary", &base_url, Some("side-inline-key"));
+                let expected_key = match case {
+                    "other-provider" => {
+                        role.model.provider = "btw-secondary".to_string();
+                        "side-stored-key"
+                    }
+                    "other-endpoint" => {
+                        primary.model.base_url.push_str("/foreground");
+                        "side-inline-key"
+                    }
+                    "canonical-alias" => {
+                        primary.model.provider = "openrouter".to_string();
+                        role.model.provider = "open-router".to_string();
+                        "foreground-key"
+                    }
+                    _ => "foreground-key",
+                };
+                if case == "other-endpoint" {
+                    role.model.reasoning = true;
+                    role.model.max_tokens = 128;
+                    role.compat = Some(crate::models::CompatConfig {
+                        supports_reasoning_effort: Some(true),
+                        reasoning_required: Some(true),
+                        thinking_level_map: Some(std::collections::HashMap::from([
+                            ("off".to_string(), None),
+                            ("minimal".to_string(), None),
+                            ("low".to_string(), Some("low".to_string())),
+                        ])),
+                        ..Default::default()
+                    });
+                }
+                let client = BtwClient::for_model_entry(
+                    &role,
+                    &primary,
+                    Some(" foreground-key "),
+                    &auth,
+                    None,
+                )
+                .expect("authorized side destination");
+                assert_eq!(
+                    client.ask("current work", "why?").await.unwrap(),
+                    "Side answer"
+                );
+                let (headers, body) = peer.join().expect("completed side request");
+                assert_eq!(headers["authorization"], format!("Bearer {expected_key}"));
+                assert_eq!(headers["x-side-route"], "smol");
+                assert_eq!(body["model"], "side-fixture");
+                assert_eq!(
+                    body["max_tokens"],
+                    role.model.max_tokens.min(ANSWER_MAX_TOKENS)
+                );
+                if case == "other-endpoint" {
+                    assert_eq!(body["reasoning_effort"], "low");
+                } else {
+                    assert!(body.get("reasoning_effort").is_none());
+                }
+                let serialized = body.to_string();
+                for key in ["foreground-key", "side-stored-key", "side-inline-key"] {
+                    assert!(
+                        !serialized.contains(key),
+                        "credentials stay out of model context"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn unrelated_side_roles_require_their_own_credentials_but_local_roles_still_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let auth = crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+        let primary = role_entry("btw-primary", "https://primary.invalid/v1", None);
+        for (provider, url) in [
+            ("btw-secondary", "https://primary.invalid/v1"),
+            ("btw-primary", "https://secondary.invalid/v1"),
+        ] {
+            let role = role_entry(provider, url, None);
+            assert!(
+                BtwClient::for_model_entry(&role, &primary, Some("foreground-key"), &auth, None)
+                    .is_none()
+            );
+            let mut local = role;
+            local.auth_header = false;
+            let client =
+                BtwClient::for_model_entry(&local, &primary, Some("foreground-key"), &auth, None)
+                    .expect("credential-free side role");
+            assert!(client.options.api_key.is_none());
+        }
     }
 
     #[test]
@@ -820,7 +1047,7 @@ mod tests {
                 .expect("known OpenAI model");
             entry.api_key = Some("catalog-bypass".to_string());
             let provider = Arc::new(RecordingProvider::default());
-            let mut client = BtwClient::for_model_entry(&entry, None, &auth, None)
+            let mut client = BtwClient::for_model_entry(&entry, &entry, None, &auth, None)
                 .expect("pool is initially available");
             Arc::get_mut(&mut client).unwrap().provider = provider.clone();
             let request = client.prepare_with_messages(&[], "why?").unwrap();
@@ -837,8 +1064,9 @@ mod tests {
 
             let direct = BtwClient::new(provider.clone(), Some("test-key".to_string()));
             assert_eq!(direct.ask("", "why?").await.unwrap(), "safe answer");
-            let mut pinned = BtwClient::for_model_entry(&entry, Some("test-key"), &auth, None)
-                .expect("explicit override remains available");
+            let mut pinned =
+                BtwClient::for_model_entry(&entry, &entry, Some("test-key"), &auth, None)
+                    .expect("explicit override remains available");
             Arc::get_mut(&mut pinned).unwrap().provider = provider.clone();
             assert_eq!(pinned.ask("", "why?").await.unwrap(), "safe answer");
             assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
