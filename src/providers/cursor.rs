@@ -62,6 +62,8 @@ const CURSOR_CLIENT_VERSION: &str = "cli-2026.01.09-231024f";
 
 /// The `api` identifier reported for streamed events / session logs.
 const CURSOR_API_NAME: &str = "cursor-agent";
+/// Error bodies are diagnostic control data, not generated model output.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 // ============================================================================
 // Minimal protobuf wire codec (proto3 subset)
@@ -596,6 +598,9 @@ struct StreamState {
     output_tokens: u64,
     used_tokens: Option<u64>,
     usage_observer: Option<crate::provider::UsageObserver>,
+    /// Used only to redact this request's diagnostics; never serialized and
+    /// released with the wire source at the terminal boundary.
+    diagnostic_token: Option<String>,
     error_message: Option<String>,
     started: bool,
     finalized: bool,
@@ -619,6 +624,7 @@ impl StreamState {
             output_tokens: 0,
             used_tokens: None,
             usage_observer: None,
+            diagnostic_token: None,
             error_message: None,
             started: false,
             finalized: false,
@@ -630,6 +636,22 @@ impl StreamState {
     fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
         self.usage_observer = observer;
         self
+    }
+
+    fn with_diagnostic_token(mut self, token: String) -> Self {
+        self.diagnostic_token = Some(token);
+        self
+    }
+
+    /// A completed response remains exhausted when an SDK consumer polls it
+    /// again. `unfold` itself must not be repolled after returning `None`.
+    fn into_stream(self) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+        Box::pin(
+            stream::unfold(self, |mut state| async move {
+                state.next_event().await.map(|event| (event, state))
+            })
+            .fuse(),
+        )
     }
 
     fn record_usage(&mut self, authoritative: bool) -> Result<()> {
@@ -672,6 +694,7 @@ impl StreamState {
         self.done = true;
         self.source = Box::pin(stream::empty());
         self.frames = FrameBuffer::default();
+        self.diagnostic_token = None;
     }
 
     /// Close the currently-open content block, emitting its `*End` event.
@@ -807,7 +830,8 @@ impl StreamState {
         if frame.end_stream {
             // Invalid or absent terminal metadata must never promote partial
             // output to a successful assistant message.
-            self.error_message = connect::terminal_error(&payload)?;
+            self.error_message =
+                connect::terminal_error(&payload, self.diagnostic_token.as_deref())?;
             self.finalize()?;
             // The end-of-stream frame is the protocol terminator: stop reading so
             // we neither process data frames that arrive after `Done` nor block on
@@ -821,7 +845,10 @@ impl StreamState {
         self.budget
             .admit(&events, self.open_block.map(|(_, kind)| kind))?;
         let has_usage = events.iter().any(|event| {
-            matches!(event, ServerEvent::TokenDelta(_) | ServerEvent::UsedTokens(_))
+            matches!(
+                event,
+                ServerEvent::TokenDelta(_) | ServerEvent::UsedTokens(_)
+            )
         });
         for event in events {
             self.apply(event);
@@ -1070,10 +1097,12 @@ impl Provider for CursorProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
+            let body = match response.text_limited(MAX_ERROR_BODY_BYTES).await {
+                Ok(body) => connect::diagnostic_detail(&body, Some(&token)),
+                Err(_) => format!(
+                    "response body could not be read within the {MAX_ERROR_BODY_BYTES}-byte diagnostic limit"
+                ),
+            };
             return Err(Error::provider(
                 &self.provider,
                 format!("Cursor API error (HTTP {status}): {body}"),
@@ -1091,12 +1120,10 @@ impl Provider for CursorProvider {
         };
 
         let mut state = StreamState::new(response.bytes_stream(), partial)
-            .with_usage_observer(options.usage_observer.clone());
+            .with_usage_observer(options.usage_observer.clone())
+            .with_diagnostic_token(token);
         state.encoding = encoding;
-        let stream = stream::unfold(state, |mut state| async move {
-            state.next_event().await.map(|event| (event, state))
-        });
-        Ok(Box::pin(stream))
+        Ok(state.into_stream())
     }
 }
 

@@ -14,8 +14,8 @@ use crate::provider::{Context, ModelCost, Provider, StreamOptions};
 
 use super::{
     AssistantMessage, CONNECT_COMPRESSED_FLAG, CONNECT_END_STREAM_FLAG, CursorProvider, Error,
-    MAX_PROTOBUF_EVENTS, MAX_PROTOBUF_FIELDS, Result, ServerEvent, StreamEvent, StreamState, connect,
-    decode_server_message, encode_frame, pb,
+    MAX_PROTOBUF_EVENTS, MAX_PROTOBUF_FIELDS, Result, ServerEvent, StreamEvent, StreamState,
+    connect, decode_server_message, encode_frame, pb,
 };
 
 fn length_field(field: u32, payload: &[u8]) -> Vec<u8> {
@@ -415,9 +415,7 @@ impl Provider for UsageWireProvider {
         let source = self.0.lock().unwrap().take().expect("one wire request");
         let state = StreamState::new(Box::pin(source), AssistantMessage::default())
             .with_usage_observer(options.usage_observer.clone());
-        Ok(Box::pin(stream::unfold(state, |mut state| async move {
-            state.next_event().await.map(|event| (event, state))
-        })))
+        Ok(state.into_stream())
     }
 }
 
@@ -485,7 +483,15 @@ fn usage_frames_reserve_spend_before_pending_and_settle_on_drop() {
 #[test]
 fn accepted_usage_survives_transport_and_protocol_failures_once() {
     futures::executor::block_on(async {
-        for outcome in ["done", "refused", "eof", "io", "truncated", "protobuf", "terminal"] {
+        for outcome in [
+            "done",
+            "refused",
+            "eof",
+            "io",
+            "truncated",
+            "protobuf",
+            "terminal",
+        ] {
             let mut chunks = vec![Ok(usage_frames())];
             match outcome {
                 "done" => chunks.push(Ok(encode_frame(CONNECT_END_STREAM_FLAG, b"{}"))),
@@ -544,7 +550,11 @@ fn accepted_usage_survives_transport_and_protocol_failures_once() {
                 Err(Error::CostCap { .. })
             ));
             drop(output);
-            assert_eq!(budget.spent(), 17.0, "terminal settlement is not charged twice");
+            assert_eq!(
+                budget.spent(),
+                17.0,
+                "terminal settlement is not charged twice"
+            );
         }
     });
 }
@@ -590,13 +600,11 @@ fn terminal_usage_replaces_estimate_before_buffered_terminal_is_consumed() {
                 } else {
                     b"{}"
                 };
-                probe.chunks.lock().unwrap().push_back(Ok(
-                    [
-                        encode_frame(0, &checkpoint(12)),
-                        encode_frame(CONNECT_END_STREAM_FLAG, terminal),
-                    ]
-                    .concat(),
-                ));
+                probe.chunks.lock().unwrap().push_back(Ok([
+                    encode_frame(0, &checkpoint(12)),
+                    encode_frame(CONNECT_END_STREAM_FLAG, terminal),
+                ]
+                .concat()));
                 let preview = output.next().await.unwrap().unwrap();
                 if with_text {
                     assert!(matches!(preview, StreamEvent::TextEnd { .. }));
@@ -618,7 +626,11 @@ fn terminal_usage_replaces_estimate_before_buffered_terminal_is_consumed() {
     });
 }
 
-fn usage_http_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+fn cursor_http_server(
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> (String, std::thread::JoinHandle<()>) {
     use std::io::{BufRead, Read, Write};
     use std::time::{Duration, Instant};
 
@@ -666,18 +678,21 @@ fn usage_http_server(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
         let socket = request.get_mut();
         write!(
             socket,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/connect+proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .unwrap();
         socket.write_all(&body).unwrap();
     });
-    (format!("http://{address}/agent.v1.AgentService/Run"), server)
+    (
+        format!("http://{address}/agent.v1.AgentService/Run"),
+        server,
+    )
 }
 
 #[test]
 fn cursor_provider_passes_observed_usage_through_http_transport_failure() {
-    let (url, server) = usage_http_server(usage_frames());
+    let (url, server) = cursor_http_server(200, "application/connect+proto", usage_frames());
     let priced = Arc::new(crate::providers::PricedProvider {
         inner: Arc::new(CursorProvider::new("cursor-usage-fixture").with_base_url(url)),
         cost: usage_prices(),
@@ -712,4 +727,141 @@ fn cursor_provider_passes_observed_usage_through_http_transport_failure() {
         assert!(output.next().await.is_none());
     });
     server.join().expect("Cursor usage fixture completed");
+}
+
+fn diagnostic_context() -> Context<'static> {
+    Context {
+        messages: vec![crate::model::Message::User(crate::model::UserMessage {
+            content: crate::model::UserContent::Text("diagnostic probe".to_string()),
+            timestamp: 0,
+        })]
+        .into(),
+        ..Context::default()
+    }
+}
+
+#[test]
+fn cursor_http_errors_are_bounded_redacted_and_keep_the_actual_status() {
+    let credential = "cursor+credential/%42";
+    let encoded = "cursor%2Bcredential%2F%2542";
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let context = diagnostic_context();
+    let options = StreamOptions {
+        api_key: Some(credential.to_string()),
+        ..StreamOptions::default()
+    };
+    for (status, body, oversized) in [
+        (401, format!("denied: {credential}; {encoded}; \u{1b}]52;c;control\u{7}\u{202e}").into_bytes(), false),
+        (503, br#"{"message":"capacity","access_token":"server-only-access","refresh_token":"server-only-refresh"}"#.to_vec(), false),
+        (429, vec![b'x'; super::MAX_ERROR_BODY_BYTES + 1], true),
+    ] {
+        let (url, server) = cursor_http_server(status, "application/json", body);
+        let provider = CursorProvider::new("cursor-diagnostic-fixture").with_base_url(url);
+        runtime.block_on(async {
+            let error = match provider.stream(&context, &options).await {
+                Err(error) => error,
+                Ok(_) => panic!("an HTTP error must not admit a response stream"),
+            };
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&format!("Cursor API error (HTTP {status}):")));
+            for secret in [credential, encoded, "server-only-access", "server-only-refresh"] {
+                assert!(!diagnostic.contains(secret), "credential escaped in {diagnostic}");
+            }
+            assert!(!diagnostic.chars().any(char::is_control));
+            assert!(!diagnostic.contains('\u{202e}'));
+            assert!(diagnostic.len() < connect::MAX_DIAGNOSTIC_BYTES + 128);
+            if oversized {
+                assert!(diagnostic.contains("65536-byte diagnostic limit"));
+            } else {
+                assert!(diagnostic.contains("[REDACTED]"));
+            }
+            assert_eq!(
+                crate::failover::call_error_is_retryable(&error),
+                status != 401,
+                "diagnostic screening must retain HTTP recovery semantics",
+            );
+        });
+        server.join().expect("Cursor diagnostic fixture completed");
+    }
+}
+
+#[test]
+fn cursor_terminal_errors_screen_the_request_credential_and_preserve_preview() {
+    let credential = "cursor+credential/%42";
+    let terminal = serde_json::to_vec(&serde_json::json!({
+        "error": {
+            "code": "resource_exhausted",
+            "message": format!("capacity: {credential}; cursor%2Bcredential%2F%2542; \u{1b}]52;c;control\u{7}"),
+        }
+    }))
+    .unwrap();
+    let mut wire = encode_frame(0, &text_message(b"accepted preview"));
+    wire.extend_from_slice(&encode_frame(CONNECT_END_STREAM_FLAG, &terminal));
+    let (url, server) = cursor_http_server(200, "application/connect+proto", wire);
+    let provider = CursorProvider::new("cursor-diagnostic-fixture").with_base_url(url);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let options = StreamOptions {
+            api_key: Some(credential.to_string()),
+            ..StreamOptions::default()
+        };
+        let mut output = provider.stream(&diagnostic_context(), &options).await.unwrap();
+        let mut failures = 0;
+        let mut preview = String::new();
+        while let Some(event) = output.next().await {
+            match event.unwrap() {
+                StreamEvent::TextDelta { delta, .. } => preview.push_str(&delta),
+                StreamEvent::Error { error, reason } => {
+                    failures += 1;
+                    assert_eq!(reason, crate::model::StopReason::Error);
+                    let diagnostic = error.error_message.as_deref().unwrap();
+                    assert!(diagnostic.starts_with("PI_CONNECT_ERROR[resource_exhausted]:"));
+                    assert_eq!(diagnostic.matches("[REDACTED]").count(), 2);
+                    assert!(!diagnostic.contains(credential));
+                    assert!(!diagnostic.chars().any(char::is_control));
+                    assert_eq!(
+                        crate::failover::classify_failover(diagnostic),
+                        Some(crate::failover::FailoverClass::Quota),
+                    );
+                    assert!(matches!(&error.content[0], crate::model::ContentBlock::Text(text) if text.text == "accepted preview"));
+                }
+                StreamEvent::Done { .. } => panic!("a rejected Connect call cannot succeed"),
+                _ => {}
+            }
+        }
+        assert_eq!(preview, "accepted preview");
+        assert_eq!(failures, 1);
+        assert!(output.next().await.is_none());
+        assert!(output.next().await.is_none());
+    });
+    server.join().expect("Cursor terminal fixture completed");
+}
+
+#[test]
+fn cursor_response_stream_is_fused_after_success_and_protocol_failure() {
+    futures::executor::block_on(async {
+        for terminal in [b"{}".as_slice(), b"invalid-json".as_slice()] {
+            let wire = encode_frame(CONNECT_END_STREAM_FLAG, terminal);
+            let state = StreamState::new(
+                Box::pin(stream::iter([Ok(wire)])),
+                AssistantMessage::default(),
+            )
+            .with_diagnostic_token("private-token".into());
+            let mut output = state.into_stream();
+            let mut terminal_count = 0;
+            while let Some(event) = output.next().await {
+                if matches!(event, Err(_) | Ok(StreamEvent::Done { .. })) {
+                    terminal_count += 1;
+                }
+            }
+            assert_eq!(terminal_count, 1);
+            for _ in 0..3 {
+                assert!(output.next().await.is_none());
+            }
+        }
+    });
 }

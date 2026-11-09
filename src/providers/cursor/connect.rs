@@ -16,6 +16,42 @@ use crate::failover::provider_code::ConnectCode;
 use super::MAX_CONNECT_FRAME_LEN;
 
 pub(super) const ACCEPT_ENCODING: &str = "gzip, identity";
+pub(super) const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+
+/// Server diagnostics can echo credentials even when the request failed.
+/// Redact before clipping so a credential that crosses the output boundary
+/// cannot leak a prefix. Keep the validated protocol code outside this text.
+pub(super) fn diagnostic_detail(message: &str, token: Option<&str>) -> String {
+    let secrets = token.into_iter().collect::<Vec<_>>();
+    let redacted =
+        crate::auth::redact_known_secrets_bounded(message, &secrets, MAX_DIAGNOSTIC_BYTES);
+    let mut escaped = String::with_capacity(redacted.len());
+    for character in redacted.chars() {
+        let rendered = if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            ) {
+            character.escape_unicode().to_string()
+        } else {
+            character.to_string()
+        };
+        if rendered.len() > MAX_DIAGNOSTIC_BYTES.saturating_sub(escaped.len()) {
+            const TRUNCATION: &str = "...[truncated]";
+            while escaped.len() > MAX_DIAGNOSTIC_BYTES - TRUNCATION.len() {
+                escaped.pop();
+            }
+            escaped.push_str(TRUNCATION);
+            break;
+        }
+        escaped.push_str(&rendered);
+    }
+    escaped
+}
 
 pub(super) fn protocol(message: &str) -> Error {
     Error::api(format!("PI_CURSOR_PROTOCOL: {message}"))
@@ -106,7 +142,7 @@ fn single_header<'a>(headers: &'a [(String, String)], name: &str) -> Result<Opti
 
 /// Success omits `error` entirely. In particular, `error: null` is invalid,
 /// not a successful RPC. Unknown top-level fields remain forward-compatible.
-pub(super) fn terminal_error(payload: &[u8]) -> Result<Option<String>> {
+pub(super) fn terminal_error(payload: &[u8], token: Option<&str>) -> Result<Option<String>> {
     let value: Value =
         serde_json::from_slice(payload).map_err(|_| protocol("malformed Connect terminal JSON"))?;
     let object = value
@@ -144,7 +180,7 @@ pub(super) fn terminal_error(payload: &[u8]) -> Result<Option<String>> {
     // The agent flattens stream errors into message text. Carry the validated
     // code across that boundary rather than asking recovery to infer it from
     // optional, untrusted prose. No synthetic HTTP status is introduced.
-    Ok(Some(code.diagnostic(message)))
+    Ok(Some(code.diagnostic(&diagnostic_detail(message, token))))
 }
 
 #[cfg(test)]
@@ -358,22 +394,79 @@ mod tests {
     #[test]
     fn code_only_error_is_not_lost_and_metadata_is_supported() {
         assert_eq!(
-            terminal_error(br#"{"error":{"code":"resource_exhausted"}}"#).unwrap(),
+            terminal_error(br#"{"error":{"code":"resource_exhausted"}}"#, None).unwrap(),
             Some(
                 "PI_CONNECT_ERROR[resource_exhausted]: Cursor stream returned resource_exhausted"
                     .to_string()
             )
         );
         assert_eq!(
-            terminal_error(br#"{"metadata":{"cost":["1","2"]},"future":true}"#).unwrap(),
+            terminal_error(br#"{"metadata":{"cost":["1","2"]},"future":true}"#, None).unwrap(),
             None
         );
     }
 
     #[test]
     fn malformed_terminal_diagnostics_do_not_echo_the_body() {
-        let error = terminal_error(b"credential-marker-not-json").unwrap_err();
+        let error = terminal_error(b"credential-marker-not-json", None).unwrap_err();
         assert!(!error.to_string().contains("credential-marker"));
+    }
+
+    #[test]
+    fn terminal_diagnostics_redact_before_clipping_without_changing_the_code() {
+        let credential = "cursor+credential/%42";
+        let encoded = "cursor%2Bcredential%2F%2542";
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "error": {
+                "code": "unavailable",
+                "message": format!("capacity: {credential}; encoded={encoded}; control=\u{1b}]52;c;secret\u{7}\u{202e}"),
+            }
+        }))
+        .unwrap();
+        let diagnostic = terminal_error(&payload, Some(credential)).unwrap().unwrap();
+        assert!(diagnostic.starts_with("PI_CONNECT_ERROR[unavailable]: capacity:"));
+        assert!(!diagnostic.contains(credential));
+        assert!(!diagnostic.contains(encoded));
+        assert_eq!(diagnostic.matches("[REDACTED]").count(), 2);
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(!diagnostic.contains('\u{202e}'));
+        assert_eq!(
+            crate::failover::classify_failover(&diagnostic),
+            Some(crate::failover::FailoverClass::Overload),
+        );
+
+        let payload = br#"{"error":{"code":"unavailable","message":"unavailable"}}"#;
+        assert_eq!(
+            terminal_error(payload, Some("unavailable"))
+                .unwrap()
+                .unwrap(),
+            "PI_CONNECT_ERROR[unavailable]: [REDACTED]",
+            "redaction must never alter the independently validated wire code",
+        );
+        let boundary = format!("{}{credential}", "x".repeat(MAX_DIAGNOSTIC_BYTES - 5));
+        let diagnostic = diagnostic_detail(&boundary, Some(credential));
+        assert!(diagnostic.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(diagnostic.ends_with("...[truncated]"));
+        assert!(
+            !diagnostic.contains("curso"),
+            "no clipped credential prefix"
+        );
+    }
+
+    #[test]
+    fn diagnostic_details_screen_structured_secrets_and_bound_escaped_unicode() {
+        let structured = diagnostic_detail(
+            r#"{"message":"capacity","access_token":"unknown-access","refresh_token":"unknown-refresh"}"#,
+            None,
+        );
+        assert!(structured.contains("capacity"));
+        assert!(!structured.contains("unknown-access"));
+        assert!(!structured.contains("unknown-refresh"));
+        let diagnostic = diagnostic_detail(&"é\u{1b}\u{202e}".repeat(MAX_DIAGNOSTIC_BYTES), None);
+        assert!(diagnostic.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(diagnostic.ends_with("...[truncated]"));
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(!diagnostic.contains('\u{202e}'));
     }
 
     #[test]
