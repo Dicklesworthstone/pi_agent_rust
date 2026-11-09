@@ -651,10 +651,11 @@ impl Origin {
         &self,
         account: &str,
         own: Writer,
+        observed: &Writers,
         imported: &Writers,
         covered: &Coverage,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<Writers> {
         remaining(deadline)?;
         let lock_name = format!("{}.lock", self.journal_name);
         let lock = self.open_member(OsStr::new(&lock_name), true)?;
@@ -670,7 +671,42 @@ impl Origin {
         }
         // Dropping this handle releases the dedicated journal lock. Transcript
         // locks are never acquired here, including during canceled cleanup.
-        let mut journal = self.read()?;
+        let required =
+            observed.contains_key(account) || observed.values().any(|writer| !writer.closed);
+        let mut journal = self.read_with_presence(required)?;
+        for (id, previous) in observed {
+            let Some(persisted) = journal.writers.get(id) else {
+                // A cached foreign terminal counter is immutable, so its
+                // source may retire. Our own registered writer and every
+                // unresolved peer must remain present until final settlement.
+                if id != account && previous.closed {
+                    continue;
+                }
+                return Err(Error::session(
+                    "acknowledged model cost writer is unavailable",
+                ));
+            };
+            if persisted.own_total < previous.own_total
+                || persisted.baseline_own > previous.baseline_own
+                || (previous.closed
+                    && (!persisted.closed || persisted.own_total > previous.own_total))
+                || (previous.billing_unavailable && !persisted.billing_unavailable)
+            {
+                return Err(Error::session(
+                    "acknowledged model cost writer moved backwards",
+                ));
+            }
+        }
+        for (id, previous) in observed.iter().filter(|(_, writer)| writer.closed) {
+            // Reading already retains these immutable terminal facts. Keep
+            // their original local floor if an imported counter reintroduces
+            // an omitted row; a saved checkpoint's rebased floor is not a new
+            // observation of this journal's history.
+            journal
+                .writers
+                .entry(id.clone())
+                .or_insert_with(|| previous.clone());
+        }
         let additional = usize::from(!journal.writers.contains_key(account))
             + imported
                 .keys()
@@ -725,7 +761,8 @@ impl Origin {
             merge_writer(writer, &observed)?;
         }
         journal.version = 2;
-        self.write(&journal, deadline)
+        self.write(&journal, deadline)?;
+        Ok(journal.writers)
     }
 }
 
@@ -744,6 +781,7 @@ impl Retirement {
         origin: Arc<Origin>,
         baseline: f64,
         covered: Coverage,
+        previous: Option<&ReadOrigin>,
         owner: &asupersync::Cx,
     ) -> Result<Self> {
         let capabilities = owner.capabilities();
@@ -754,7 +792,13 @@ impl Retirement {
         }
         validate_coverage(&covered)?;
         origin.validate_source()?;
-        let reader = ReadOrigin::watch_source(Arc::clone(&origin), BTreeSet::new());
+        let mut reader = ReadOrigin::watch_source(Arc::clone(&origin), BTreeSet::new());
+        if let Some(previous) = previous {
+            // Keep only facts observed at this exact source. Imported totals
+            // can have another origin or a rebased floor and grant no evidence
+            // that this journal already existed before its first local writer.
+            reader.merge(previous.clone())?;
+        }
         Ok(Self {
             origin,
             baseline,
@@ -801,10 +845,22 @@ impl Retirement {
             billing_unavailable,
             closed,
         };
-        self.origin
-            .update(account, writer.clone(), imported, &self.covered, deadline)?;
-        self.reader
-            .remember(&Writers::from([(account.to_owned(), writer)]))?;
+        // Only an unobserved first registration may create a missing journal.
+        // Recreating an observed writer from its last known total can erase
+        // newer bills. Check every observation from this source while holding
+        // the journal lock, before publishing a new bill.
+        let observed = self.reader.observations();
+        let written = self.origin.update(
+            account,
+            writer,
+            &observed,
+            imported,
+            &self.covered,
+            deadline,
+        )?;
+        // A successful write also acknowledges peers first encountered under
+        // its lock, even when no admission refresh preceded this settlement.
+        self.reader.remember(&written)?;
         Ok(())
     }
 }
