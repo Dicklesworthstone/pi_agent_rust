@@ -1521,6 +1521,7 @@ fn advisor_options(
     config: &Config,
     model_registry: &ModelRegistry,
     auth: &AuthStorage,
+    primary_entry: &pi::models::ModelEntry,
 ) -> Option<pi::advisor::AdvisorOptions> {
     if !config.advisor_enabled() {
         return None;
@@ -1528,27 +1529,24 @@ fn advisor_options(
     let entry =
         pi::app::resolve_role_model(pi::models::ModelRole::Advisor, cli, config, model_registry)?
             .model_entry;
-    let key = pi::models::resolve_model_key(cli.api_key.as_deref(), auth, &entry).ok()?;
-    if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
-        tracing::info!(
-            event = "pi.advisor.no_credentials",
-            "advisor role configured but credentials missing; advisor disabled"
-        );
-        return None;
-    }
-    match pi::providers::create_provider_with_auth(&entry, None, Some(auth)) {
-        Ok(provider) => Some(pi::advisor::AdvisorOptions {
-            provider,
-            label: format!("{}/{}", entry.model.provider, entry.model.id),
-            timeout: Duration::from_secs(config.advisor_timeout_secs()),
-            continue_severity: config.advisor_continue_severity(),
-            api_key: key,
-            credential_binding: Some(pi::advisor::AdvisorCredentialBinding::new(
-                &entry,
-                auth,
-                cli.api_key.as_deref(),
-            )),
-        }),
+    match pi::advisor::AdvisorOptions::for_model_entry(
+        &entry,
+        primary_entry,
+        cli.api_key.as_deref(),
+        auth,
+    ) {
+        Ok(Some(mut options)) => {
+            options.timeout = Duration::from_secs(config.advisor_timeout_secs());
+            options.continue_severity = config.advisor_continue_severity();
+            Some(options)
+        }
+        Ok(None) => {
+            tracing::info!(
+                event = "pi.advisor.no_credentials",
+                "advisor role configured but credentials missing; advisor disabled"
+            );
+            None
+        }
         Err(err) => {
             tracing::warn!(
                 event = "pi.advisor.provider_failed",
@@ -2826,7 +2824,13 @@ async fn run(
             approval_state: Some(approval_state.clone()),
             // The advisor was built only on the classic stack; the role
             // the user configured never reviewed a turn on this one.
-            advisor: advisor_options(&cli, &config, &model_registry, &auth),
+            advisor: advisor_options(
+                &cli,
+                &config,
+                &model_registry,
+                &auth,
+                &selection.model_entry,
+            ),
             // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
             // hard error on this stack while the same request in print
             // mode or over RPC retried and completed, and this is the
@@ -3110,13 +3114,19 @@ async fn run(
             eprintln!("Warning: --plan-mode requires the submit_plan tool to be enabled");
         }
     }
-    agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
-        .as_ref()
-        .map(|options| {
-            options
-                .runtime()
-                .with_secrets_settings(config.secrets.as_ref())
-        });
+    agent_session.advisor = advisor_options(
+        &cli,
+        &config,
+        &model_registry,
+        &auth,
+        &selection.model_entry,
+    )
+    .as_ref()
+    .map(|options| {
+        options
+            .runtime()
+            .with_secrets_settings(config.secrets.as_ref())
+    });
     // Host authorization must not depend on granting the model the ask tool.
     // The registry picker is always handed to interactive/RPC hosts; only this
     // conditional extend adds ask to the provider-visible schema.

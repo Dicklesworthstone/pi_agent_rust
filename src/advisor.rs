@@ -481,8 +481,9 @@ pub fn format_injection(verdict: &AdvisorVerdict) -> String {
 pub static ADVISOR_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Credential provenance for a configured model. A retained advisor resolves
-/// the pool again for each review instead of pinning its startup snapshot.
+/// Model configuration and credential provenance for a configured advisor.
+/// A retained advisor resolves the pool again for each review instead of
+/// pinning its startup credential snapshot.
 #[derive(Clone)]
 pub struct AdvisorCredentialBinding {
     entry: crate::models::ModelEntry,
@@ -503,6 +504,23 @@ impl AdvisorCredentialBinding {
             override_key: override_key.map(str::to_string),
         }
     }
+
+    fn stream_options(&self) -> crate::error::Result<crate::provider::StreamOptions> {
+        Ok(crate::provider::StreamOptions {
+            api_key: crate::models::resolve_model_key(
+                self.override_key.as_deref(),
+                &self.auth,
+                &self.entry,
+            )?,
+            headers: self.entry.headers.clone(),
+            max_tokens: Some(self.entry.model.max_tokens.min(REVIEW_MAX_TOKENS)),
+            thinking_level: Some(
+                self.entry
+                    .clamp_thinking_level(crate::model::ThinkingLevel::Minimal),
+            ),
+            ..Default::default()
+        })
+    }
 }
 
 /// What a session needs to build its own [`AdvisorRuntime`]: hosts that
@@ -519,6 +537,39 @@ pub struct AdvisorOptions {
 }
 
 impl AdvisorOptions {
+    /// Admit a configured advisor with its own model controls and credentials.
+    /// The foreground CLI key is reusable only for the same provider and
+    /// configured endpoint. A different destination must resolve its own key.
+    /// Missing credentials disable this optional reviewer; credential-pool or
+    /// provider-construction failures remain available to the host for logging.
+    ///
+    /// # Errors
+    /// Returns an error when credential admission or provider construction fails.
+    pub fn for_model_entry(
+        entry: &crate::models::ModelEntry,
+        primary_entry: &crate::models::ModelEntry,
+        cli_api_key: Option<&str>,
+        auth: &crate::auth::AuthStorage,
+    ) -> crate::error::Result<Option<Self>> {
+        let same_destination = crate::provider_metadata::provider_ids_match(
+            &entry.model.provider,
+            &primary_entry.model.provider,
+        ) && entry.model.base_url == primary_entry.model.base_url;
+        let override_key = cli_api_key.filter(|_| same_destination);
+        let api_key = crate::models::resolve_model_key(override_key, auth, entry)?;
+        if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            provider: crate::providers::create_provider_with_auth(entry, None, Some(auth))?,
+            label: format!("{}/{}", entry.model.provider, entry.model.id),
+            timeout: Duration::from_secs(15),
+            continue_severity: ContinueSeverity::default(),
+            api_key,
+            credential_binding: Some(AdvisorCredentialBinding::new(entry, auth, override_key)),
+        }))
+    }
+
     #[must_use]
     pub fn runtime(&self) -> AdvisorRuntime {
         AdvisorRuntime::new(Arc::clone(&self.provider), self.label.clone())
@@ -559,6 +610,7 @@ pub enum AdvisorOutcome {
 }
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const REVIEW_MAX_TOKENS: u32 = 512;
 
 impl AdvisorRuntime {
     #[must_use]
@@ -762,18 +814,13 @@ impl AdvisorRuntime {
             .into(),
             tools: Vec::new().into(),
         };
-        let api_key = match &self.credential_binding {
-            Some(binding) => crate::models::resolve_model_key(
-                binding.override_key.as_deref(),
-                &binding.auth,
-                &binding.entry,
-            )?,
-            None => self.api_key.clone(),
-        };
-        let options = crate::provider::StreamOptions {
-            max_tokens: Some(512),
-            api_key,
-            ..Default::default()
+        let options = match &self.credential_binding {
+            Some(binding) => binding.stream_options()?,
+            None => crate::provider::StreamOptions {
+                max_tokens: Some(REVIEW_MAX_TOKENS),
+                api_key: self.api_key.clone(),
+                ..Default::default()
+            },
         };
         let stream = self.provider.stream(&context, &options).await?;
         collect_text(stream, MAX_TEXT_BYTES).await
@@ -1018,6 +1065,241 @@ mod tests {
                 ..Default::default()
             },
         }]
+    }
+
+    fn advisor_entry(
+        provider: &str,
+        base_url: &str,
+        key: Option<&str>,
+    ) -> crate::models::ModelEntry {
+        crate::models::ModelEntry {
+            model: crate::provider::Model {
+                id: "advisor-fixture".to_string(),
+                name: "Advisor fixture".to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                reasoning: false,
+                input: vec![crate::provider::InputType::Text],
+                cost: crate::provider::ModelCost::default(),
+                context_window: 8_192,
+                max_tokens: 2_048,
+                headers: std::collections::HashMap::new(),
+            },
+            api_key: key.map(str::to_string),
+            headers: std::collections::HashMap::from([(
+                "x-review-route".to_string(),
+                "advisor".to_string(),
+            )]),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    type CapturedReview = (std::collections::HashMap<String, String>, serde_json::Value);
+
+    fn advisor_peer() -> (String, std::thread::JoinHandle<CapturedReview>) {
+        use std::io::{BufRead, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut socket = loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "advisor request deadline"
+                );
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("advisor peer accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "POST /v1/chat/completions HTTP/1.1\r\n");
+            let mut header_bytes = line.len();
+            let mut headers = std::collections::HashMap::new();
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                header_bytes += line.len();
+                assert!(header_bytes <= 64 * 1024, "bounded advisor headers");
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').expect("header");
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+            }
+            let length: usize = headers["content-length"].parse().unwrap();
+            assert!(length <= 64 * 1024, "bounded advisor body");
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+            let body = serde_json::from_slice(&body).unwrap();
+            let delta = serde_json::json!({
+                "id": "review-response", "object": "chat.completion.chunk",
+                "created": 0, "model": "advisor-fixture",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "CONCERN\nCheck the migration rollback before proceeding."}, "finish_reason": null}],
+            });
+            let terminal = serde_json::json!({
+                "id": "review-response", "object": "chat.completion.chunk",
+                "created": 0, "model": "advisor-fixture",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 9, "total_tokens": 19},
+            });
+            let response = format!("data: {delta}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            socket.flush().unwrap();
+            (headers, body)
+        });
+        (base_url, worker)
+    }
+
+    #[test]
+    fn configured_advisor_wire_preserves_destination_auth_and_model_controls() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("advisor wire runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut auth = crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+            auth.set(
+                "review-secondary",
+                crate::auth::AuthCredential::ApiKey {
+                    key: "review-stored-key".to_string(),
+                },
+            );
+            for case in [
+                "same",
+                "other-provider",
+                "other-endpoint",
+                "canonical-alias",
+            ] {
+                let (base_url, peer) = advisor_peer();
+                let mut primary = advisor_entry("review-primary", &base_url, None);
+                let mut advisor =
+                    advisor_entry("review-primary", &base_url, Some("review-inline-key"));
+                let expected_key = match case {
+                    "other-provider" => {
+                        advisor.model.provider = "review-secondary".to_string();
+                        "review-stored-key"
+                    }
+                    "other-endpoint" => {
+                        primary.model.base_url.push_str("/foreground");
+                        "review-inline-key"
+                    }
+                    "canonical-alias" => {
+                        primary.model.provider = "openrouter".to_string();
+                        advisor.model.provider = "open-router".to_string();
+                        "foreground-key"
+                    }
+                    _ => "foreground-key",
+                };
+                if case == "other-endpoint" {
+                    advisor.model.reasoning = true;
+                    advisor.model.max_tokens = 128;
+                    advisor.compat = Some(crate::models::CompatConfig {
+                        supports_reasoning_effort: Some(true),
+                        reasoning_required: Some(true),
+                        thinking_level_map: Some(std::collections::HashMap::from([
+                            ("off".to_string(), None),
+                            ("minimal".to_string(), None),
+                            ("low".to_string(), Some("low".to_string())),
+                        ])),
+                        ..Default::default()
+                    });
+                }
+                let options = AdvisorOptions::for_model_entry(
+                    &advisor,
+                    &primary,
+                    Some(" foreground-key "),
+                    &auth,
+                )
+                .unwrap()
+                .expect("authorized advisor");
+                if case == "other-provider" {
+                    // Native reconfiguration may supply a new store, but a
+                    // retained SDK scope must not silently reload disk auth.
+                    let mut disk_auth =
+                        crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+                    disk_auth.set(
+                        "review-secondary",
+                        crate::auth::AuthCredential::ApiKey {
+                            key: "unrelated-disk-key".to_string(),
+                        },
+                    );
+                    disk_auth.save().unwrap();
+                }
+                let mut reviewer = options.runtime();
+                let outcome = reviewer.review_turn(&review_digest(), 0).await;
+                let (headers, body) = peer.join().expect("advisor request completed");
+                assert!(matches!(outcome, AdvisorOutcome::Inject(_)));
+                assert_eq!(headers["authorization"], format!("Bearer {expected_key}"));
+                assert_eq!(headers["x-review-route"], "advisor");
+                assert_eq!(body["model"], "advisor-fixture");
+                assert_eq!(
+                    body["max_tokens"],
+                    advisor.model.max_tokens.min(REVIEW_MAX_TOKENS)
+                );
+                if case == "other-endpoint" {
+                    assert_eq!(body["reasoning_effort"], "low");
+                } else {
+                    assert!(body.get("reasoning_effort").is_none());
+                }
+                let serialized = body.to_string();
+                for key in [
+                    "foreground-key",
+                    "review-stored-key",
+                    "review-inline-key",
+                    "unrelated-disk-key",
+                ] {
+                    assert!(
+                        !serialized.contains(key),
+                        "credentials stay out of review context"
+                    );
+                }
+                assert!(!reviewer.is_disabled());
+            }
+        });
+    }
+
+    #[test]
+    fn unrelated_advisors_need_their_own_key_and_local_advisors_never_receive_the_foreground_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let auth = crate::auth::AuthStorage::empty_at(directory.path().join("auth.json"));
+        let primary = advisor_entry("review-primary", "https://primary.invalid/v1", None);
+        for (provider, url) in [
+            ("review-secondary", "https://primary.invalid/v1"),
+            ("review-primary", "https://secondary.invalid/v1"),
+        ] {
+            let mut advisor = advisor_entry(provider, url, None);
+            assert!(
+                AdvisorOptions::for_model_entry(&advisor, &primary, Some("foreground-key"), &auth)
+                    .unwrap()
+                    .is_none()
+            );
+            advisor.auth_header = false;
+            let options =
+                AdvisorOptions::for_model_entry(&advisor, &primary, Some("foreground-key"), &auth)
+                    .unwrap()
+                    .expect("credential-free advisor");
+            assert!(options.api_key.is_none());
+            let binding = options.credential_binding.as_ref().unwrap();
+            assert!(binding.stream_options().unwrap().api_key.is_none());
+        }
     }
 
     #[test]
