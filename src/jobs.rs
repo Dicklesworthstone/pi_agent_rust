@@ -1725,6 +1725,15 @@ pub(crate) fn spawn_foreground(
     })
 }
 
+fn check_shell_job_owner(owner: &crate::agent_cx::AgentCx) -> Result<()> {
+    crate::tools::check_bash_spawn_authority(owner)?;
+    owner.checkpoint().map_err(|_| shell_job_cancelled_error())
+}
+
+fn shell_job_cancelled_error() -> Error {
+    Error::tool("jobs", "PI_JOBS_CANCELLED: job launch cancelled")
+}
+
 // Guard scope is deliberate; tightening drops would change lock-hold semantics.
 #[allow(
     clippy::too_many_lines,
@@ -1749,6 +1758,10 @@ fn spawn_managed(
                 .to_string(),
         ));
     }
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    // This path uses raw process and artifact I/O, so it cannot rely on the
+    // ambient async runtime to enforce the invoking tool's capabilities.
+    check_shell_job_owner(&owner)?;
     // Fail promptly when teardown is already visible. The check under the
     // lifecycle lock below closes the race with a newly published fence.
     let spawn_attempt = capture_session_spawn_generation(owner_session_id)?;
@@ -1761,6 +1774,7 @@ fn spawn_managed(
     let _lifecycle = lifecycle_lock()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned".to_string()))?;
+    check_shell_job_owner(&owner)?;
     ensure_session_spawn_generation(owner_session_id, spawn_generation)?;
     if !cwd.exists() {
         return Err(Error::tool(
@@ -1872,7 +1886,9 @@ fn spawn_managed(
     invoke_before_os_spawn_hook(owner_session_id);
     ensure_session_spawn_generation(owner_session_id, spawn_generation)
         .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
-    let child = crate::tools::spawn_command_with_job_discipline(&mut cmd).map_err(|e| {
+    check_shell_job_owner(&owner)
+        .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
+    let child = owner.process().spawn_checked(&mut cmd).map_err(|e| {
         Error::tool(
             "bash",
             format!("Failed to spawn shell {shell}: {e}{cleanup_failure_context}"),
@@ -1883,6 +1899,15 @@ fn spawn_managed(
     drop(cmd);
     let pid = child.id();
     let mut child = BackgroundChild::new(child);
+    // Cancellation concurrent with OS spawn still leaves exactly one guard
+    // responsible for stopping and reaping the child before returning.
+    if let Err(error) = check_shell_job_owner(&owner) {
+        child.kill_and_wait();
+        return Err(Error::tool(
+            "jobs",
+            format!("{error}{cleanup_failure_context}"),
+        ));
+    }
     #[cfg(not(windows))]
     let stdout = child
         .child
@@ -1955,9 +1980,16 @@ fn spawn_managed(
             .get(owner_session_id)
             .copied()
             .unwrap_or_default();
-        if reg.closing_owners.contains_key(owner_session_id)
+        let admission_error = if owner.checkpoint().is_err() {
+            Some(shell_job_cancelled_error())
+        } else if reg.closing_owners.contains_key(owner_session_id)
             || current_generation != spawn_generation
         {
+            Some(session_closing_error(owner_session_id))
+        } else {
+            None
+        };
+        if let Some(error) = admission_error {
             drop(reg);
             child.kill_and_wait();
             output_sealed.store(true, Ordering::Release);
@@ -1968,10 +2000,7 @@ fn spawn_managed(
             let _ = finish_pump(&mut stderr_pump, drain_deadline);
             return Err(Error::tool(
                 "jobs",
-                format!(
-                    "{}{cleanup_failure_context}",
-                    session_closing_error(owner_session_id)
-                ),
+                format!("{error}{cleanup_failure_context}"),
             ));
         }
         let entry = JobEntry {
@@ -4248,6 +4277,221 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    fn expect_refused_shell_launch(owner_session_id: &str, result: Result<JobSnapshot>) -> Error {
+        match result {
+            Err(error) => error,
+            Ok(job) => {
+                // A mutation must fail without leaving its unexpected child
+                // or completion notice behind for another test.
+                let _ = cancel(owner_session_id, &job.id);
+                let _ = wait(owner_session_id, &job.id, Duration::from_secs(10));
+                let _ = take_completion_notices(owner_session_id);
+                panic!("refused invocation unexpectedly launched job {}", job.id);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_jobs_reject_restricted_and_cancelled_owners_before_artifact_io() {
+        use crate::agent_cx::AgentCx;
+        type WithoutSpawn = asupersync::cx::cap::CapSet<false, true, true, true, true>;
+        type WithoutIo = asupersync::cx::cap::CapSet<true, true, true, false, true>;
+
+        let _guard = process_test_guard();
+        let no_spawn = {
+            let restricted = asupersync::Cx::for_request().restrict::<WithoutSpawn>();
+            let _current = restricted.set_current_restricted();
+            AgentCx::for_current_or_request()
+        };
+        let no_io = {
+            let restricted = asupersync::Cx::for_request().restrict::<WithoutIo>();
+            let _current = restricted.set_current_restricted();
+            AgentCx::for_current_or_request()
+        };
+        let cancelled = AgentCx::for_request();
+        cancelled.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancelled before shell admission"),
+        );
+        for (actor, code) in [
+            (no_spawn, "PI_BASH_PERMISSION"),
+            (no_io, "PI_BASH_PERMISSION"),
+            (cancelled, "PI_JOBS_CANCELLED"),
+        ] {
+            let root = tempfile::tempdir().expect("isolated shell workspace");
+            let artifacts = root.path().join("artifacts");
+            let owner = format!("shell-denied-{}", uuid::Uuid::new_v4().simple());
+            let _current = actor.cx().clone().set_current_restricted();
+            let error = expect_refused_shell_launch(
+                &owner,
+                spawn_background(
+                    &owner,
+                    root.path(),
+                    Some("/bin/sh"),
+                    None,
+                    "printf forbidden > command-started",
+                    Some(5),
+                    Some(&artifacts),
+                ),
+            );
+            assert!(error.to_string().contains(code), "{error}");
+            assert!(!root.path().join("command-started").exists());
+            assert!(!artifacts.exists(), "refusal must precede artifact setup");
+            assert!(list(&owner).expect("owner listing").is_empty());
+            assert!(!has_pending_work(&owner).expect("owner admission state"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_dispatch_supports_unscoped_and_timerless_callers() {
+        use crate::agent_cx::AgentCx;
+        type WithoutTimer = asupersync::cx::cap::CapSet<true, false, true, true, true>;
+
+        let _guard = process_test_guard();
+        let _unscoped = asupersync::Cx::set_current(None);
+        let no_timer = {
+            let restricted = asupersync::Cx::for_request().restrict::<WithoutTimer>();
+            let _current = restricted.set_current_restricted();
+            AgentCx::for_current_or_request()
+        };
+        assert!(asupersync::Cx::current().is_none());
+        assert!(!no_timer.capabilities().time);
+        for actor in [None, Some(no_timer)] {
+            let root = tempfile::tempdir().expect("isolated shell workspace");
+            let owner = format!("shell-allowed-{}", uuid::Uuid::new_v4().simple());
+            let _current = actor
+                .as_ref()
+                .map(|actor| actor.cx().clone().set_current_restricted());
+            let job = spawn_background(
+                &owner,
+                root.path(),
+                Some("/bin/sh"),
+                None,
+                "printf allowed > command-started",
+                Some(5),
+                Some(root.path()),
+            )
+            .expect("synchronous dispatch needs I/O and spawn, not an async timer");
+            let settled = wait(&owner, &job.id, Duration::from_secs(10))
+                .expect("monitor settles admitted command");
+            assert_eq!(settled.status, "exited");
+            assert_eq!(settled.exit_code, Some(0));
+            assert_eq!(
+                std::fs::read(root.path().join("command-started")).expect("command marker"),
+                b"allowed"
+            );
+            assert_eq!(take_completion_notices(&owner).len(), 1);
+            assert!(!has_pending_work(&owner).expect("owner finished"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_job_cancellation_during_setup_prevents_os_spawn() {
+        use crate::agent_cx::AgentCx;
+
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().expect("isolated shell workspace");
+        let owner = format!("shell-cancel-pre-spawn-{}", uuid::Uuid::new_v4().simple());
+        let actor = AgentCx::for_request();
+        let hook_actor = actor.clone();
+        let reached_publication = Arc::new(AtomicBool::new(false));
+        let observed_publication = Arc::clone(&reached_publication);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            before_os_spawn: Some(Arc::new(move || {
+                hook_actor.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancelled while preparing shell artifacts"),
+                );
+            })),
+            before_registry_publication: Some(Arc::new(move |_| {
+                observed_publication.store(true, Ordering::Release);
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let _current = actor.cx().clone().set_current_restricted();
+        let error = expect_refused_shell_launch(
+            &owner,
+            spawn_background(
+                &owner,
+                root.path(),
+                Some("/bin/sh"),
+                None,
+                "printf forbidden > command-started",
+                Some(5),
+                Some(root.path()),
+            ),
+        );
+        assert!(error.to_string().contains("PI_JOBS_CANCELLED"), "{error}");
+        assert!(!reached_publication.load(Ordering::Acquire));
+        assert!(!root.path().join("command-started").exists());
+        assert!(list(&owner).expect("owner listing").is_empty());
+        assert!(take_completion_notices(&owner).is_empty());
+        assert!(!has_pending_work(&owner).expect("spawn capture was retired"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_job_cancellation_after_spawn_reaps_before_returning_refusal() {
+        use crate::agent_cx::AgentCx;
+
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().expect("isolated shell workspace");
+        let owner = format!("shell-cancel-post-spawn-{}", uuid::Uuid::new_v4().simple());
+        let actor = AgentCx::for_request();
+        let hook_actor = actor.clone();
+        let marker = root.path().join("command-started");
+        let hook_marker = marker.clone();
+        let spawned_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed_pid = Arc::clone(&spawned_pid);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            before_registry_publication: Some(Arc::new(move |pid| {
+                observed_pid.store(pid, Ordering::Release);
+                wait_for_path(&hook_marker, Duration::from_secs(10));
+                assert!(
+                    PathBuf::from(format!("/proc/{pid}")).is_dir(),
+                    "the process probe must observe the live fixture before cancellation"
+                );
+                hook_actor.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancelled after the OS process started"),
+                );
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let _current = actor.cx().clone().set_current_restricted();
+        let error = expect_refused_shell_launch(
+            &owner,
+            spawn_background(
+                &owner,
+                root.path(),
+                Some("/bin/sh"),
+                None,
+                "printf started > command-started; exec sleep 300",
+                Some(300),
+                Some(root.path()),
+            ),
+        );
+        assert!(error.to_string().contains("PI_JOBS_CANCELLED"), "{error}");
+        assert_eq!(
+            std::fs::read(&marker).expect("real process marker"),
+            b"started"
+        );
+        let pid = spawned_pid.load(Ordering::Acquire);
+        assert_ne!(pid, 0);
+        let probe = std::fs::metadata(format!("/proc/{pid}"))
+            .expect_err("the rejected child must be reaped, not left running or zombied");
+        assert_eq!(probe.kind(), std::io::ErrorKind::NotFound);
+        assert!(list(&owner).expect("owner listing").is_empty());
+        assert!(take_completion_notices(&owner).is_empty());
+        assert!(!has_pending_work(&owner).expect("spawn capture was retired"));
     }
 
     #[test]

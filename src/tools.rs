@@ -9133,6 +9133,30 @@ pub(crate) struct BashRunControl<'a> {
     pub drain_timeout: Duration,
 }
 
+/// Shell dispatch must use the invoking context's authority even when the
+/// runner owns raw OS handles. A background monitor does not need the caller's
+/// async timer, so waiting authority is checked separately by foreground paths.
+pub(crate) fn check_bash_spawn_authority(owner: &AgentCx) -> Result<()> {
+    let capabilities = owner.capabilities();
+    if !capabilities.io || !capabilities.spawn {
+        return Err(Error::tool(
+            "bash",
+            "PI_BASH_PERMISSION: shell execution requires I/O and spawn capabilities",
+        ));
+    }
+    Ok(())
+}
+
+fn check_bash_wait_authority(owner: &AgentCx) -> Result<()> {
+    if !owner.capabilities().time {
+        return Err(Error::tool(
+            "bash",
+            "PI_BASH_PERMISSION: waiting for shell execution requires timer capability",
+        ));
+    }
+    Ok(())
+}
+
 /// Report cancellation before any shell or extension hook has started.
 /// The caller supplies a normalized timeout: `None` means unlimited execution.
 #[must_use]
@@ -9221,6 +9245,8 @@ async fn run_bash_command_with_state(
     {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
+    check_bash_spawn_authority(&cx)?;
+    check_bash_wait_authority(&cx)?;
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
     bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
@@ -9278,8 +9304,29 @@ async fn run_bash_command_with_state(
     // can be killed reliably even if the shell exits first.
     isolate_command_process_group(&mut cmd);
 
-    let child = spawn_command_with_job_discipline(&mut cmd)
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
+    // Shell discovery and pipe preparation can take time. A queued abort or
+    // revoked owner must still prevent process creation at this boundary.
+    if control
+        .as_mut()
+        .is_some_and(|control| (control.abort_requested)())
+        || cx.checkpoint().is_err()
+    {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
+    let child = match cx.process().spawn_checked(&mut cmd) {
+        Ok(child) => child,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.checkpoint().is_err() =>
+        {
+            return Ok(bash_cancelled_before_start(timeout_secs));
+        }
+        Err(error) => {
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to spawn shell {shell}: {error}"),
+            ));
+        }
+    };
     // Command retains explicitly supplied Stdio handles after spawn. Its
     // parent copies must not keep the Windows writers alive after shell exit.
     drop(cmd);
@@ -9647,6 +9694,12 @@ pub(crate) async fn run_bash_command_pty(
         Some(0) => None,
         Some(value) => Some(value),
     };
+    let cx = AgentCx::for_current_or_request();
+    if cx.checkpoint().is_err() {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
+    check_bash_spawn_authority(&cx)?;
+    check_bash_wait_authority(&cx)?;
     let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),
@@ -9693,6 +9746,9 @@ pub(crate) async fn run_bash_command_pty(
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
     // exactly as they do for the pipe path's isolated process group.
+    if cx.checkpoint().is_err() {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
     let child = pair
         .slave
         .spawn_command(pty_cmd)
@@ -9725,7 +9781,6 @@ pub(crate) async fn run_bash_command_pty(
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
     bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
 
-    let cx = AgentCx::for_current_or_request();
     let mut timed_out = false;
     let mut cancelled = false;
     let mut cancellation_reason: Option<BashCancellationReason> = None;
@@ -9938,6 +9993,7 @@ impl BashTool {
         shell_state: Option<&bash_session::ShellTransaction>,
     ) -> Result<Option<ToolOutput>> {
         let owner = AgentCx::for_current_or_request();
+        check_bash_wait_authority(&owner)?;
         owner
             .checkpoint()
             .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
@@ -10319,11 +10375,19 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let owner = AgentCx::for_current_or_request();
+        check_bash_spawn_authority(&owner)?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
         let client_terminal = if input.background == Some(true) {
             None
         } else {
             self.terminal_client.get()?
         };
+        if input.background != Some(true) && client_terminal.is_none() {
+            check_bash_wait_authority(&owner)?;
+        }
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
         // contract is identical either way.
@@ -10369,6 +10433,9 @@ impl Tool for BashTool {
             } else {
                 None
             };
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
         let mut shell_state = None;
         let mut shell_notice = None;
         if persistent {
@@ -10504,6 +10571,9 @@ impl Tool for BashTool {
         // Every execution route passes the same mediation gate above.
         if let Some(client) = client_terminal {
             let command = self.client_terminal_command(&input)?;
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("bash", "Command cancelled before client dispatch"))?;
             return client
                 .execute(command, on_update.as_deref())
                 .await
@@ -24131,6 +24201,175 @@ mod tests {
             std::task::Poll::Ready(Ok(false))
         ));
         assert!(owner.is_cancel_requested());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_bash_runners_preserve_restricted_invocation_authority() {
+        asupersync::test_utils::run_test(|| async {
+            let no_spawn = {
+                let restricted = asupersync::Cx::for_request()
+                    .restrict::<asupersync::cx::cap::CapSet<false, true, true, true, true>>();
+                let _current = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            let no_io = {
+                let restricted = asupersync::Cx::for_request()
+                    .restrict::<asupersync::cx::cap::CapSet<true, true, true, false, true>>();
+                let _current = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            let no_timer = {
+                let restricted = asupersync::Cx::for_request()
+                    .restrict::<asupersync::cx::cap::CapSet<true, false, true, true, true>>();
+                let _current = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            for owner in [no_spawn, no_io, no_timer] {
+                for use_pty in [false, true] {
+                    let root = tempfile::tempdir().expect("isolated shell workspace");
+                    let error = owner
+                        .with_current(execute_bash_spawn(
+                            root.path(),
+                            Some("/bin/sh"),
+                            None,
+                            "printf forbidden > command-started",
+                            Some(5),
+                            None,
+                            use_pty,
+                            None,
+                        ))
+                        .await
+                        .expect_err("the polling runtime cannot supply missing authority");
+                    assert!(error.to_string().contains("PI_BASH_PERMISSION"), "{error}");
+                    assert!(!root.path().join("command-started").exists());
+                }
+            }
+
+            // The denied invocations must restore their polling caller's
+            // context, and a valid ordinary shell still performs real work.
+            let root = tempfile::tempdir().expect("unrestricted shell workspace");
+            let result = execute_bash_spawn(
+                root.path(),
+                Some("/bin/sh"),
+                None,
+                "printf allowed > command-started",
+                Some(5),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("unrestricted foreground dispatch");
+            assert_eq!(result.exit_code, 0);
+            assert!(!result.cancelled);
+            assert_eq!(
+                std::fs::read(root.path().join("command-started")).expect("command marker"),
+                b"allowed"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_native_bash_refuses_before_pipe_or_pty_startup() {
+        asupersync::test_utils::run_test(|| async {
+            for use_pty in [false, true] {
+                let root = tempfile::tempdir().expect("isolated shell workspace");
+                let absent_shell = root.path().join("shell-must-not-be-resolved");
+                for shell in [
+                    "/bin/sh".to_string(),
+                    absent_shell.to_string_lossy().into_owned(),
+                ] {
+                    let owner = AgentCx::for_request();
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancelled before shell startup"),
+                    );
+                    let result = owner
+                        .with_current(execute_bash_spawn(
+                            root.path(),
+                            Some(&shell),
+                            None,
+                            "printf forbidden > command-started",
+                            Some(5),
+                            None,
+                            use_pty,
+                            None,
+                        ))
+                        .await
+                        .expect("pre-cancellation must win before shell lookup or PTY startup");
+                    assert!(result.cancelled);
+                    assert_eq!(result.exit_code, -1);
+                    assert_eq!(
+                        result.cancellation_reason,
+                        Some(BashCancellationReason::AmbientCancellation)
+                    );
+                    assert!(!root.path().join("command-started").exists());
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_tool_does_not_launch_after_its_session_resolver_cancels_the_owner() {
+        asupersync::test_utils::run_test(|| async {
+            for background in [None, Some(true)] {
+                let root = tempfile::tempdir().expect("isolated shell workspace");
+                let artifacts = root.path().join("artifacts");
+                let owner_id = format!("bash-resolver-cancel-{}", uuid::Uuid::new_v4().simple());
+                let owner = AgentCx::for_request();
+                let resolver_owner = owner.clone();
+                let resolver_id = owner_id.clone();
+                let scope = crate::jobs::JobSessionScope::fixed(owner_id.clone());
+                scope.bind(Arc::new(move || {
+                    let owner = resolver_owner.clone();
+                    let owner_id = resolver_id.clone();
+                    let mut suspended = false;
+                    Box::pin(std::future::poll_fn(move |task| {
+                        if suspended {
+                            owner.cancel_with(
+                                asupersync::types::CancelKind::User,
+                                Some("cancelled while resolving shell ownership"),
+                            );
+                            std::task::Poll::Ready(Some(owner_id.clone()))
+                        } else {
+                            suspended = true;
+                            task.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    }))
+                }));
+                let mut tool = BashTool::with_artifact_root(root.path(), &artifacts);
+                tool.shell_path = Some("/bin/sh".to_string());
+                tool.mediation = Some(crate::config::BashSettings {
+                    persistent: Some(false),
+                    ..Default::default()
+                });
+                tool.bind_job_session_scope(scope);
+                let error = owner
+                    .with_current(tool.execute(
+                        "cancelled-shell",
+                        serde_json::json!({
+                            "command": "printf forbidden > command-started",
+                            "background": background,
+                        }),
+                        None,
+                    ))
+                    .await
+                    .expect_err("cancelled session resolution must not dispatch a shell");
+                assert!(error.to_string().contains("cancelled"), "{error}");
+                assert!(!root.path().join("command-started").exists());
+                assert!(!artifacts.exists());
+                assert!(
+                    crate::jobs::list(&owner_id)
+                        .expect("owner listing")
+                        .is_empty()
+                );
+                assert!(!crate::jobs::has_pending_work(&owner_id).expect("owner idle"));
+            }
+        });
     }
 
     #[test]
