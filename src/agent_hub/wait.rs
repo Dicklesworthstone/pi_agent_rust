@@ -630,7 +630,11 @@ impl AgentHubRegistry {
             InboxWaitStatus::Messages
         } else if dropped_through_cursor != 0 || dropped_tracking_through_cursor != 0 {
             InboxWaitStatus::HistoryLost
-        } else if peer_status.is_some_and(ChildStatus::settled) {
+        } else if peer.is_some_and(|peer| !self.peer_can_reply(peer)) {
+            // Reaping revokes messaging before result validation/writeback
+            // settles the roster entry. A named wait follows that same live
+            // process boundary as an automatic wait, without hiding replies
+            // already delivered above or publishing an unfinished result.
             InboxWaitStatus::PeerStopped
         } else if !blocked_peers.is_empty()
             && (peer.is_some() || !pending_replies.iter().any(|reply| reply.can_reply))

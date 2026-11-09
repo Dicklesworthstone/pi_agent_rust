@@ -555,6 +555,15 @@ impl AgentHubRegistry {
                 entry.status.as_str()
             )));
         }
+        // Result acceptance can keep a reaped child Running while its output
+        // is validated or its isolated edits await ordered writeback. That
+        // result lease cannot receive more instructions: reject before disk
+        // I/O or delivery accounting, even though final settlement is pending.
+        if entry.status == ChildStatus::Running && self.control_pid(id).is_none() {
+            return Err(Error::validation(format!(
+                "hub: cannot steer '{id}' — its process has exited; result acceptance is still pending"
+            )));
+        }
         let seq = self
             .bus_seq
             .checked_add(1)
@@ -1952,6 +1961,49 @@ mod tests {
         let err = reg.steer(&entry.id, "parent", "hello").unwrap_err();
         assert!(err.to_string().contains("cannot steer"));
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn reaped_child_refuses_new_delivery_without_losing_queued_history() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "first task").expect("register");
+        let before_launch = reg
+            .steer(&child.id, "parent", "queued before launch")
+            .expect("starting children retain queued instructions");
+        reg.mark_running(&child.id, 4242);
+        let before_reap = reg
+            .bus_send(&child.id, "parent", "queued while alive")
+            .expect("running child accepts instructions");
+        let bytes = fs::read(&child.steer_path).expect("accepted queue");
+        reg.active_executions.insert(child.id.clone());
+        reg.mark_process_reaped(&child.id);
+        assert_eq!(reg.get(&child.id).unwrap().status, ChildStatus::Running);
+        assert!(reg.active_executions.contains(&child.id));
+
+        let steer = reg
+            .steer(&child.id, "parent", "too late")
+            .expect_err("reaped process cannot receive steering");
+        assert!(steer.to_string().contains("process has exited"));
+        assert!(reg.bus_send(&child.id, "parent", "too late too").is_err());
+        assert_eq!(reg.bus_seq, before_reap.seq);
+        assert_eq!(fs::read(&child.steer_path).unwrap(), bytes);
+        assert_eq!(reg.inbox(&child.id).len(), 2);
+        assert_eq!(reg.inbox(&child.id)[0].seq, before_launch.seq);
+        assert_eq!(reg.pending_replies["parent"][&child.id], before_reap.seq);
+        assert_eq!(reg.get(&child.id).unwrap().status, ChildStatus::Running);
+        assert!(reg.active_executions.contains(&child.id));
+
+        // A later run has a new identity; it cannot inherit this process's
+        // retired delivery authority or accepted-but-unconsumed queue.
+        let next = reg.register("worker", "next task").expect("next run");
+        assert_ne!(next.id, child.id);
+        let accepted = reg
+            .bus_send(&next.id, "parent", "new assignment")
+            .expect("independent starting child remains available");
+        assert_eq!(accepted.seq, before_reap.seq + 1);
+        assert_eq!(fs::read(&child.steer_path).unwrap(), bytes);
     }
 
     #[test]

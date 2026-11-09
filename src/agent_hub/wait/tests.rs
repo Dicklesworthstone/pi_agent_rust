@@ -742,6 +742,79 @@ fn reaped_peers_stop_automatic_reply_waits_before_result_writeback() {
 }
 
 #[test]
+fn reaped_peers_stop_named_reply_waits_without_settling_their_result() {
+    let (_dir, mut hub, first, second) = fixture();
+    let question = hub.bus_send(&first, "parent", "question").unwrap();
+    let result_hold = hub
+        .hold_child_result(&first, Duration::from_secs(60))
+        .unwrap();
+    let reply = hub.bus_send("parent", &first, "final reply").unwrap();
+    hub.active_executions.insert(first.clone());
+    hub.mark_process_reaped(&first);
+
+    let retained = hub
+        .wait_snapshot("parent", Some(&first), question.seq)
+        .unwrap();
+    assert_eq!(retained.status, InboxWaitStatus::Messages);
+    assert_eq!(retained.messages[0].seq, reply.seq);
+    assert_eq!(retained.peer_status, Some(ChildStatus::Running));
+    let drained = hub
+        .wait_snapshot("parent", Some(&first), retained.next_cursor)
+        .unwrap();
+    assert_eq!(drained.status, InboxWaitStatus::PeerStopped);
+    assert!(drained.messages.is_empty());
+    assert_eq!(drained.peer_status, Some(ChildStatus::Running));
+    assert_eq!(hub.inbox("parent").len(), 1);
+    assert!(hub.active_executions.contains(&first));
+    assert_eq!(hub.get(&first).unwrap().status, ChildStatus::Running);
+    assert!(hub.blocked_on(&first).contains("parent"));
+    assert_eq!(
+        hub.wait_snapshot("parent", Some(&second), 0)
+            .unwrap()
+            .status,
+        InboxWaitStatus::Pending,
+        "an unrelated live peer remains answerable"
+    );
+
+    // Old inbox retention loss remains visible even though this peer can no
+    // longer answer. Final result waiting retains its own acceptance lease.
+    for _ in 0..super::super::MAX_QUEUE_PER_CHILD {
+        hub.bus_send("parent", &second, "later unrelated message")
+            .unwrap();
+    }
+    assert_eq!(
+        hub.wait_snapshot("parent", Some(&first), question.seq)
+            .unwrap()
+            .status,
+        InboxWaitStatus::HistoryLost
+    );
+    drop(result_hold);
+    assert!(!hub.blocked_on(&first).contains("parent"));
+    assert!(hub.active_executions.contains(&first));
+}
+
+#[test]
+fn starting_peer_can_receive_steering_before_it_has_a_process() {
+    let (_dir, mut hub, _, _) = fixture();
+    let child = hub.register("queued", "task").unwrap();
+    assert!(hub.control_pid(&child.id).is_none());
+    hub.steer(&child.id, "parent", "before launch").unwrap();
+    assert_eq!(
+        hub.wait_snapshot("parent", Some(&child.id), 0)
+            .unwrap()
+            .status,
+        InboxWaitStatus::Pending
+    );
+    hub.settle(&child.id, ChildStatus::Failed);
+    assert_eq!(
+        hub.wait_snapshot("parent", Some(&child.id), 0)
+            .unwrap()
+            .status,
+        InboxWaitStatus::PeerStopped
+    );
+}
+
+#[test]
 fn bounded_tracking_reports_eviction_without_rejecting_accepted_messages() {
     let (_dir, mut hub, first, second) = fixture();
     let evicted = hub.bus_send(&first, "parent", "old question").unwrap();

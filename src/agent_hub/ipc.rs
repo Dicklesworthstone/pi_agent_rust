@@ -1554,6 +1554,46 @@ mod tests {
     }
 
     #[test]
+    fn child_peer_delivery_and_named_wait_stop_at_reap_before_writeback() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut hub = AgentHubRegistry::default();
+        hub.set_dir_for_tests(temp.path().to_path_buf());
+        let sender = hub.register("sender", "ask peer").unwrap();
+        let peer = hub.register("peer", "answer sender").unwrap();
+        hub.mark_running(&sender.id, 10);
+        hub.mark_running(&peer.id, 20);
+        let mut send = request(Action::Send);
+        send.name = Some(peer.id.clone());
+        send.text = Some("question".to_string());
+        let Reply::Sent { message } = dispatch(&mut hub, &sender.id, send.clone()).unwrap() else {
+            panic!("expected accepted question");
+        };
+        let before = std::fs::read(&peer.steer_path).unwrap();
+        hub.mark_process_reaped(&peer.id);
+        assert_eq!(hub.get(&peer.id).unwrap().status, ChildStatus::Running);
+
+        send.text = Some("undeliverable follow-up".to_string());
+        assert!(
+            dispatch(&mut hub, &sender.id, send)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_HUB_IPC_RECIPIENT")
+        );
+        assert_eq!(std::fs::read(&peer.steer_path).unwrap(), before);
+        assert_eq!(hub.bus_seq, message.seq);
+        let mut wait = request(Action::Wait);
+        wait.name = Some(peer.id.clone());
+        wait.cursor = Some(message.seq);
+        let Reply::Wait { result } = dispatch(&mut hub, &sender.id, wait).unwrap() else {
+            panic!("expected stopped peer reply");
+        };
+        assert_eq!(result.status, super::super::InboxWaitStatus::PeerStopped);
+        assert_eq!(result.peer_status, Some(ChildStatus::Running));
+        assert_eq!(hub.control_pid(&sender.id), Some(10));
+        assert_eq!(hub.get(&peer.id).unwrap().status, ChildStatus::Running);
+    }
+
+    #[test]
     fn automatic_wait_uses_only_the_authenticated_senders_outstanding_messages() {
         let temp = tempfile::tempdir().expect("hub directory");
         let mut hub = AgentHubRegistry::default();

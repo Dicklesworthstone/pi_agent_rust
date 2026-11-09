@@ -595,12 +595,13 @@ mod tests {
                 drop(hub);
                 reaper.join().unwrap();
 
-                let (authority_after_drop, history) = {
+                let (authority_after_drop, history, steering_after_drop) = {
                     let mut hub = registry().lock().unwrap();
                     let authority = hub.control_pid(&entry.id);
                     let history = hub.get(&entry.id).unwrap().clone();
+                    let steering = hub.steer(&entry.id, "parent", "after the actual process reap");
                     hub.settle(&entry.id, ChildStatus::Cancelled);
-                    (authority, history)
+                    (authority, history, steering)
                 };
                 assert!(drop_started, "the reaper thread must reach Drop");
                 assert!(!completed_while_locked);
@@ -610,6 +611,10 @@ mod tests {
                 );
                 assert_eq!(authority_while_locked, Some(pid));
                 assert_eq!(authority_after_drop, None);
+                assert!(
+                    steering_after_drop.is_err(),
+                    "a process-retired result lease cannot accept more instructions"
+                );
                 assert_eq!(history.pid, Some(pid), "keep diagnostic process history");
                 assert_eq!(
                     history.status,
