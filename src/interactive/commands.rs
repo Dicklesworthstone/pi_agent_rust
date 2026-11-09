@@ -4981,17 +4981,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let message_for_agent = message_without_refs.trim().to_string();
 
         if !file_refs.is_empty() {
-            let auto_resize = self
-                .config
-                .images
-                .as_ref()
-                .and_then(|images| images.auto_resize)
-                .unwrap_or(true);
-
             let processed = match process_file_arguments(
                 &file_refs,
                 &self.cwd,
-                auto_resize,
+                crate::tools::FileArgumentOptions::from_config(&self.config),
                 self.workspace(),
             ) {
                 Ok(processed) => processed,

@@ -137,7 +137,8 @@ pub struct MediaSettings {
     /// Enable local inline video/audio attachments.
     #[serde(alias = "enableReadMedia")]
     pub enable_read_media: Option<bool>,
-    /// Maximum decoded bytes in one inline `read_media` block.
+    /// Maximum decoded bytes in one audio/video attachment from `read_media`
+    /// or a CLI/interactive `@file` input.
     #[serde(alias = "maxBytes")]
     pub max_bytes: Option<u64>,
     #[serde(alias = "visionModel")]

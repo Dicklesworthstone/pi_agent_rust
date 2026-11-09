@@ -3826,17 +3826,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         };
 
         if !file_refs.is_empty() {
-            let auto_resize = self
-                .config
-                .images
-                .as_ref()
-                .and_then(|images| images.auto_resize)
-                .unwrap_or(true);
-
             let processed = match process_file_arguments(
                 &file_refs,
                 &self.cwd,
-                auto_resize,
+                crate::tools::FileArgumentOptions::from_config(&self.config),
                 self.workspace(),
             ) {
                 Ok(processed) => processed,
@@ -5406,6 +5399,78 @@ mod stream_delta_batcher_tests {
                 .any(|entry| entry.value.contains("tc-plan")),
             "template expansion should record a history entry"
         );
+    }
+
+    #[test]
+    fn classic_file_and_template_prompts_use_the_configured_media_cap() {
+        for input in ["inspect @audio.wav", "/template inspect @audio.wav"] {
+            for cap in [3, 4] {
+                let directory = tempfile::tempdir().unwrap();
+                std::fs::write(directory.path().join("audio.wav"), [0xff, 0, 1, 2]).unwrap();
+                let state = Arc::new(ContinueProbeState::default());
+                let config: Config = serde_json::from_value(json!({
+                    "media": { "maxBytes": cap },
+                    "retry": { "enabled": false },
+                }))
+                .unwrap();
+                let (mut app, mut receiver) = build_test_app_with_recovery(
+                    Arc::new(ContinueProbeProvider {
+                        state: Arc::clone(&state),
+                    }),
+                    config,
+                    None,
+                );
+                app.cwd = directory.path().to_path_buf();
+                app.set_workspace(crate::workspace::WorkspaceHandle::single(directory.path()));
+                app.session.try_lock().unwrap().session_dir =
+                    Some(directory.path().join("sessions"));
+                app.resources
+                    .push_prompt_for_tests(crate::resources::PromptTemplate {
+                        name: "inspect".to_string(),
+                        description: String::new(),
+                        content: "Inspect this recording: $ARGUMENTS".to_string(),
+                        side: false,
+                        source: "test".to_string(),
+                        file_path: directory.path().join("inspect.md"),
+                    });
+
+                let _ = app.submit_message(input);
+                let events = drive_turn(&mut app, &mut receiver);
+                assert!(matches!(
+                    events.last(),
+                    Some(PiMsg::AgentDone {
+                        stop_reason: StopReason::Stop,
+                        ..
+                    })
+                ));
+                assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+                let agent = app.agent.try_lock().unwrap();
+                let content = agent
+                    .messages()
+                    .iter()
+                    .rev()
+                    .find_map(|message| match message {
+                        ModelMessage::User(user) => Some(&user.content),
+                        _ => None,
+                    })
+                    .unwrap();
+                let (attachments, text) = match content {
+                    UserContent::Blocks(blocks) => (
+                        blocks
+                            .iter()
+                            .filter(|block| matches!(block, ContentBlock::Media(_)))
+                            .count(),
+                        content_blocks_to_text(blocks),
+                    ),
+                    UserContent::Text(text) => (0, text.clone()),
+                };
+                assert_eq!(attachments, usize::from(cap == 4), "{input}: {content:?}");
+                assert_eq!(text.contains("Max allowed is 3 bytes"), cap == 3);
+                if input.starts_with("/template") {
+                    assert!(text.contains("Inspect this recording:"));
+                }
+            }
+        }
     }
 
     #[test]

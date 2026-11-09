@@ -817,6 +817,10 @@ pub struct AgentSessionHandle {
     /// Multi-root workspace handle when the session was created with one
     /// (bd-cv653.3.12). Clones share the live root set.
     workspace: Option<crate::workspace::WorkspaceHandle>,
+    /// Attachment policy from the same admitted configuration that built the
+    /// session's tools. Frontends must replace this snapshot with the session,
+    /// rather than retaining launch-time limits after `/reload`.
+    file_argument_options: crate::tools::FileArgumentOptions,
     /// MCP manager owned by this exact SDK session, when enabled.
     mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Provider retry policy for turns driven through this handle, from
@@ -2548,6 +2552,10 @@ impl AgentSessionHandle {
             listeners,
             ask_tool: None,
             workspace: None,
+            file_argument_options: crate::tools::FileArgumentOptions {
+                auto_resize_images: true,
+                max_media_bytes: crate::media_tools::DEFAULT_MEDIA_MAX_BYTES,
+            },
             mcp_manager: None,
             // A handle built straight from a session has no options to read a
             // policy from; the caller opts in through `create_agent_session`.
@@ -2571,6 +2579,21 @@ impl AgentSessionHandle {
     #[must_use]
     pub fn workspace(&self) -> Option<crate::workspace::WorkspaceHandle> {
         self.workspace.clone()
+    }
+
+    #[must_use]
+    pub const fn file_argument_options(&self) -> crate::tools::FileArgumentOptions {
+        self.file_argument_options
+    }
+
+    /// Only the native settings owner updates an already-running session,
+    /// after its setting has been saved successfully.
+    #[cfg(feature = "ftui")]
+    pub(crate) const fn set_file_argument_options(
+        &mut self,
+        options: crate::tools::FileArgumentOptions,
+    ) {
+        self.file_argument_options = options;
     }
 
     /// MCP manager owned by this session, when MCP discovery was enabled.
@@ -4731,6 +4754,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         listeners,
         ask_tool: ask_tool_handle,
         workspace,
+        file_argument_options: crate::tools::FileArgumentOptions::from_config(&config),
         mcp_manager,
         retry: options.retry,
         failover_state,

@@ -819,7 +819,7 @@ mod file_arguments {
         let err = pi::tools::process_file_arguments(
             &file_args,
             harness.temp_dir(),
-            true,
+            pi::tools::FileArgumentOptions::default(),
             &pi::workspace::WorkspaceHandle::default(),
         )
         .expect_err("@file must enforce the selected owner permission class");

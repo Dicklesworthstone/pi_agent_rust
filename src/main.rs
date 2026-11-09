@@ -2596,11 +2596,7 @@ async fn run(
         &cwd,
         &file_args,
         &mut messages,
-        config
-            .images
-            .as_ref()
-            .and_then(|i| i.auto_resize)
-            .unwrap_or(true),
+        pi::tools::FileArgumentOptions::from_config(&config),
         &workspace,
     )?;
     messages.retain(|message| !message.trim().is_empty());
@@ -15227,7 +15223,7 @@ mod tests {
                 directory.path(),
                 &["input.txt".to_string()],
                 &mut messages,
-                false,
+                pi::tools::FileArgumentOptions::default(),
                 &workspace,
             )
             .unwrap()
@@ -15243,7 +15239,7 @@ mod tests {
             directory.path(),
             &["input.txt".to_string()],
             &mut messages,
-            false,
+            pi::tools::FileArgumentOptions::default(),
             &workspace,
         )
         .unwrap()

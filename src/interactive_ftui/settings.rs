@@ -359,7 +359,7 @@ impl SettingsController {
             auto_compaction: handle.compaction_settings().enabled,
             steering,
             follow_up,
-            auto_resize_images: self.config.image_auto_resize(),
+            auto_resize_images: handle.file_argument_options().auto_resize_images,
             enable_eval: self
                 .config
                 .tools
@@ -442,6 +442,11 @@ impl SettingsController {
                     (steering, mode)
                 };
                 handle.session_mut().set_queue_modes(steering, follow_up);
+            }
+            SettingsKey::AutoResizeImages => {
+                let mut options = handle.file_argument_options();
+                options.auto_resize_images = value == "on";
+                handle.set_file_argument_options(options);
             }
             _ => {}
         }

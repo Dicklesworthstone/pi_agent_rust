@@ -155,14 +155,14 @@ pub fn prepare_initial_message(
     cwd: &Path,
     file_args: &[String],
     messages: &mut Vec<String>,
-    auto_resize_images: bool,
+    file_options: crate::tools::FileArgumentOptions,
     workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<Option<InitialMessage>> {
     if file_args.is_empty() {
         return Ok(None);
     }
 
-    let processed = process_file_arguments(file_args, cwd, auto_resize_images, workspace)?;
+    let processed = process_file_arguments(file_args, cwd, file_options, workspace)?;
     let mut initial_message = processed.text;
     let has_message = !messages.is_empty();
     let keyword_scan_source = if has_message {

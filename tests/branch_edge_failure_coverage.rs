@@ -242,7 +242,7 @@ fn process_file_arguments_nonexistent_file() {
     let result = pi::tools::process_file_arguments(
         &["nonexistent.txt".to_string()],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     );
     assert!(result.is_err());
@@ -258,7 +258,7 @@ fn process_file_arguments_empty_file_skipped() {
     let result = pi::tools::process_file_arguments(
         &[empty_file.to_string_lossy().to_string()],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
@@ -275,7 +275,7 @@ fn process_file_arguments_rejects_outside_cwd() {
     let result = pi::tools::process_file_arguments(
         &[outside_file.to_string_lossy().to_string()],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     );
     assert!(result.is_err());
@@ -291,7 +291,7 @@ fn process_file_arguments_text_file_wrapped_in_tags() {
     let result = pi::tools::process_file_arguments(
         &[text_file.to_string_lossy().to_string()],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
@@ -308,7 +308,7 @@ fn process_file_arguments_text_file_without_trailing_newline() {
     let result = pi::tools::process_file_arguments(
         &[text_file.to_string_lossy().to_string()],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
@@ -329,7 +329,7 @@ fn process_file_arguments_multiple_files() {
             f2.to_string_lossy().to_string(),
         ],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
@@ -360,7 +360,10 @@ fn process_file_arguments_png_image_detected() {
     let result = pi::tools::process_file_arguments(
         &[img_file.to_string_lossy().to_string()],
         dir.path(),
-        false,
+        pi::tools::FileArgumentOptions {
+            auto_resize_images: false,
+            ..pi::tools::FileArgumentOptions::default()
+        },
         &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();

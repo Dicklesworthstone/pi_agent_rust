@@ -18,8 +18,13 @@ use pi::model::{ContentBlock, ThinkingLevel};
 use pi::models::{ModelEntry, ModelRegistry};
 use pi::provider::{InputType, Model, ModelCost};
 use pi::session::Session;
-use pi::tools::process_file_arguments;
+use pi::tools::{FileArgumentOptions, process_file_arguments};
 use std::collections::HashMap;
+
+const FILE_OPTIONS: FileArgumentOptions = FileArgumentOptions {
+    auto_resize_images: false,
+    max_media_bytes: pi::media_tools::DEFAULT_MEDIA_MAX_BYTES,
+};
 
 fn make_registry(harness: &TestHarness, creds: &[(&str, &str)]) -> ModelRegistry {
     let auth_path = harness.temp_path("auth.json");
@@ -560,7 +565,7 @@ fn prepare_initial_message_wraps_files_and_appends_first_message() {
         harness.temp_dir(),
         &file_args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("prepare initial")
@@ -666,7 +671,7 @@ fn prepare_initial_message_leaves_remaining_messages() {
         harness.temp_dir(),
         &file_args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("prepare initial")
@@ -693,7 +698,7 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
         harness.temp_dir(),
         &file_args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("prepare initial")
@@ -731,7 +736,7 @@ fn process_file_arguments_missing_file_reports_error() {
     let err = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect_err("missing file should error");
@@ -751,7 +756,7 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        true,
+        FileArgumentOptions::default(),
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("process file arguments");
@@ -862,7 +867,7 @@ fn prepare_initial_message_no_files_returns_none() {
         harness.temp_dir(),
         &[],
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -882,7 +887,7 @@ fn prepare_initial_message_files_only_no_messages() {
         harness.temp_dir(),
         &file_args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("prepare initial")
@@ -904,7 +909,7 @@ fn prepare_initial_message_empty_file_returns_none() {
         harness.temp_dir(),
         &file_args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -926,7 +931,7 @@ fn process_file_arguments_multiple_text_files() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -954,7 +959,7 @@ fn process_file_arguments_empty_file_skipped() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -985,7 +990,7 @@ fn process_file_arguments_binary_file_gets_a_notice() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -1020,7 +1025,7 @@ fn process_file_arguments_mixed_text_and_image() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -1061,7 +1066,7 @@ fn prepare_initial_message_preserves_mixed_media_and_image_order() {
         harness.temp_dir(),
         &args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("prepare mixed attachments")
@@ -1131,7 +1136,7 @@ fn process_file_arguments_recognizes_all_media_extensions_case_insensitively() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("attach supported media extensions");
@@ -1171,7 +1176,7 @@ fn process_file_arguments_skips_empty_media_and_reports_oversized_media() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("skip inadmissible media without losing subsequent files");
@@ -1191,7 +1196,7 @@ fn process_file_arguments_skips_empty_media_and_reports_oversized_media() {
     let empty_only = process_file_arguments(
         &[empty.to_string_lossy().into_owned()],
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("empty media follows empty-file behavior");
@@ -1209,7 +1214,7 @@ fn process_file_arguments_accepts_media_at_the_exact_inline_byte_cap() {
     let processed = process_file_arguments(
         &[path.to_string_lossy().into_owned()],
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("the inclusive media cap permits exactly that many bytes");
@@ -1233,13 +1238,126 @@ fn process_file_arguments_accepts_media_at_the_exact_inline_byte_cap() {
 }
 
 #[test]
+fn configured_media_cap_controls_initial_attachments_above_and_below_the_default() {
+    let harness = TestHarness::new("configured_media_cap_controls_initial_attachments");
+    let workspace = pi::workspace::WorkspaceHandle::single(harness.temp_dir());
+    for cap in [16, pi::media_tools::DEFAULT_MEDIA_MAX_BYTES + 9] {
+        let bytes = vec![0xff; usize::try_from(cap).expect("fixture cap")];
+        let exact = harness.create_file(format!("exact-{cap}.wav"), &bytes);
+        let over = harness.temp_path(format!("over-{cap}.mp4"));
+        std::fs::File::create(&over)
+            .unwrap()
+            .set_len(cap + 1)
+            .unwrap();
+        let args = [
+            exact.to_string_lossy().into_owned(),
+            over.to_string_lossy().into_owned(),
+        ];
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "images": {"autoResize": false}, "media": {"maxBytes": cap},
+        }))
+        .unwrap();
+        let mut messages = vec!["Compare the recordings.".to_string()];
+        let initial = prepare_initial_message(
+            harness.temp_dir(),
+            &args,
+            &mut messages,
+            FileArgumentOptions::from_config(&config),
+            &workspace,
+        )
+        .unwrap()
+        .expect("configured attachment input");
+        let [ContentBlock::Media(media)] = initial.attachments.as_slice() else {
+            panic!("only the file at the configured inclusive cap may attach");
+        };
+        assert_eq!(media.decoded_size_bytes(), cap);
+        assert_eq!(media.mime_type, "audio/wav");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&media.data)
+                .unwrap(),
+            bytes
+        );
+        assert!(
+            initial
+                .text
+                .contains(&format!("Max allowed is {cap} bytes"))
+        );
+        assert!(initial.text.ends_with("Compare the recordings."));
+        assert!(messages.is_empty());
+
+        let defaults = process_file_arguments(&args, harness.temp_dir(), FILE_OPTIONS, &workspace)
+            .expect("unchanged default cap");
+        assert_eq!(
+            defaults.attachments.len(),
+            if cap < pi::media_tools::DEFAULT_MEDIA_MAX_BYTES {
+                2
+            } else {
+                0
+            },
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn media_alias_names_preserve_format_without_granting_the_target_root() {
+    let harness = TestHarness::new("media_alias_names_preserve_format_and_canonical_scope");
+    let primary = harness.create_dir("primary");
+    let storage = harness.create_dir("storage");
+    let payload = harness.create_file("storage/content", [0xff, 0, 1, 2]);
+    let alias = primary.join("recording.WAV");
+    std::os::unix::fs::symlink(&payload, &alias).unwrap();
+    let args = ["recording.WAV".to_string()];
+    let mut workspace = pi::workspace::WorkspaceHandle::single(&primary);
+    let reader = workspace.clone();
+    let options = FileArgumentOptions {
+        max_media_bytes: 4,
+        ..FILE_OPTIONS
+    };
+    assert!(process_file_arguments(&args, &primary, options, &reader).is_err());
+    workspace.add_root(&storage);
+    let attached = process_file_arguments(&args, &primary, options, &reader).unwrap();
+    let [ContentBlock::Media(media)] = attached.attachments.as_slice() else {
+        panic!("the operator's media alias identifies an extensionless stored payload");
+    };
+    assert_eq!(media.mime_type, "audio/wav");
+    assert_eq!(media.name.as_deref(), Some("recording.WAV"));
+    assert_eq!(media.decoded_size_bytes(), 4);
+    assert!(
+        attached
+            .text
+            .contains(&alias.to_string_lossy().into_owned())
+    );
+    assert!(
+        !attached
+            .text
+            .contains(&payload.to_string_lossy().into_owned())
+    );
+    let refused = process_file_arguments(
+        &args,
+        &primary,
+        FileArgumentOptions {
+            max_media_bytes: 3,
+            ..options
+        },
+        &reader,
+    )
+    .unwrap();
+    assert!(refused.attachments.is_empty());
+    assert!(refused.text.contains("Max allowed is 3 bytes"));
+    assert!(workspace.remove_root(&storage));
+    assert!(process_file_arguments(&args, &primary, options, &reader).is_err());
+}
+
+#[test]
 fn process_file_arguments_sanitizes_media_source_names() {
     let harness = TestHarness::new("process_file_arguments_sanitizes_media_source_names");
     let path = harness.create_file("clip\u{202e}\u{2066}.MP4", [0, 0xff, 1]);
     let processed = process_file_arguments(
         &[path.to_string_lossy().into_owned()],
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("attach media with an untrusted display label");
@@ -1267,11 +1385,11 @@ fn process_file_arguments_observes_added_roots_and_shared_revocation() {
     let mut workspace = pi::workspace::WorkspaceHandle::single(&primary);
     let reader = workspace.clone();
 
-    let denied = process_file_arguments(&args, &primary, false, &reader)
+    let denied = process_file_arguments(&args, &primary, FILE_OPTIONS, &reader)
         .expect_err("ungranted roots cannot be read");
     assert!(denied.to_string().contains("outside the"));
     workspace.add_root(&additional);
-    let processed = process_file_arguments(&args, &primary, false, &reader)
+    let processed = process_file_arguments(&args, &primary, FILE_OPTIONS, &reader)
         .expect("the actual file opener must honor the newly granted root");
     assert!(processed.text.contains("allowed workspace notes"));
     assert!(matches!(
@@ -1282,14 +1400,14 @@ fn process_file_arguments_observes_added_roots_and_shared_revocation() {
     let denied = process_file_arguments(
         &[outside.to_string_lossy().into_owned()],
         &primary,
-        false,
+        FILE_OPTIONS,
         &reader,
     )
     .expect_err("adding one root must not grant unrelated siblings");
     assert!(denied.to_string().contains("outside the"));
     assert!(!denied.to_string().contains("PRIVATE-OUTSIDE-CANARY"));
     assert!(workspace.remove_root(&additional));
-    let revoked = process_file_arguments(&args, &primary, false, &reader)
+    let revoked = process_file_arguments(&args, &primary, FILE_OPTIONS, &reader)
         .expect_err("removal must immediately revoke the reader clone's access");
     assert!(revoked.to_string().contains("outside the"));
 }
@@ -1312,7 +1430,7 @@ fn process_file_arguments_rejects_symlink_and_parent_escapes_from_added_roots() 
         let denied = process_file_arguments(
             &[path.to_string_lossy().into_owned()],
             &primary,
-            false,
+            FILE_OPTIONS,
             &workspace,
         )
         .expect_err("file references must stay in the granted canonical roots");
@@ -1330,7 +1448,7 @@ fn process_file_arguments_unicode_content_preserved() {
     let processed = process_file_arguments(
         &args,
         harness.temp_dir(),
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("ok");
@@ -1423,7 +1541,7 @@ fn prepare_initial_message_multiple_files_with_message() {
         harness.temp_dir(),
         &file_args,
         &mut messages,
-        false,
+        FILE_OPTIONS,
         &pi::workspace::WorkspaceHandle::default(),
     )
     .expect("prepare initial")

@@ -4582,6 +4582,38 @@ pub struct ProcessedFiles {
     pub attachments: Vec<ContentBlock>,
 }
 
+/// Effective attachment limits shared by CLI and interactive input. Image
+/// resizing retains its separate image cap; the media limit applies to each
+/// decoded audio/video attachment, just as it does for `read_media`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileArgumentOptions {
+    pub auto_resize_images: bool,
+    pub max_media_bytes: u64,
+}
+
+impl Default for FileArgumentOptions {
+    fn default() -> Self {
+        Self {
+            auto_resize_images: true,
+            max_media_bytes: crate::media_tools::DEFAULT_MEDIA_MAX_BYTES,
+        }
+    }
+}
+
+impl FileArgumentOptions {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            auto_resize_images: config.image_auto_resize(),
+            max_media_bytes: config
+                .media
+                .as_ref()
+                .and_then(|media| media.max_bytes)
+                .unwrap_or(crate::media_tools::DEFAULT_MEDIA_MAX_BYTES),
+        }
+    }
+}
+
 fn normalize_dot_segments(path: &Path) -> PathBuf {
     use std::ffi::{OsStr, OsString};
     use std::path::Component;
@@ -5396,20 +5428,20 @@ fn append_media_argument(
 /// - Skips empty files
 /// - For images: attaches image blocks and appends `<file name="...">...</file>` references
 /// - For supported video/audio extensions: attaches the unchanged bytes as media,
-///   bounded by the default inline media byte cap
+///   bounded by the session's decoded media byte cap
 /// - For text: embeds the file contents inside `<file>` tags
 pub fn process_file_arguments(
     file_args: &[String],
     cwd: &Path,
-    auto_resize_images: bool,
+    options: FileArgumentOptions,
     workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<ProcessedFiles> {
     let mut out = ProcessedFiles::default();
 
     for file_arg in file_args {
         let resolved = resolve_read_path(file_arg, cwd);
-        let absolute_path = normalize_dot_segments(&resolved);
-        let absolute_path = enforce_read_scope(&absolute_path, cwd, workspace)?;
+        let attachment_path = normalize_dot_segments(&resolved);
+        let absolute_path = enforce_read_scope(&attachment_path, cwd, workspace)?;
 
         let meta = std::fs::metadata(&absolute_path).map_err(|e| {
             Error::tool(
@@ -5429,7 +5461,7 @@ pub fn process_file_arguments(
         if meta.is_dir() {
             append_file_notice_block(
                 &mut out.text,
-                &absolute_path,
+                &attachment_path,
                 "[Path is a directory, not a file. Use the list tool to view its contents.]",
             );
             continue;
@@ -5439,19 +5471,22 @@ pub fn process_file_arguments(
             continue;
         }
 
-        let media_mime_type = absolute_path
+        // The authored filename describes the attachment, including a symlink
+        // alias such as `recording.wav` backed by an extensionless cache file.
+        // Authorization and every filesystem operation use the canonical path.
+        let media_mime_type = attachment_path
             .extension()
             .and_then(|extension| extension.to_str())
             .and_then(crate::media_tools::media_mime_type_for_extension);
         let max_bytes = if media_mime_type.is_some() {
-            crate::media_tools::DEFAULT_MEDIA_MAX_BYTES
+            options.max_media_bytes
         } else {
             READ_TOOL_MAX_BYTES
         };
         if meta.len() > max_bytes {
             append_file_notice_block(
                 &mut out.text,
-                &absolute_path,
+                &attachment_path,
                 &format!(
                     "[File is too large ({} bytes). Max allowed is {} bytes.]",
                     meta.len(),
@@ -5476,22 +5511,27 @@ pub fn process_file_arguments(
             continue;
         }
 
-        if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
+        if maybe_append_image_argument(
+            &mut out,
+            &attachment_path,
+            &bytes,
+            options.auto_resize_images,
+        )? {
             continue;
         }
 
         if let Some(mime_type) = media_mime_type {
-            append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+            append_media_argument(&mut out, &attachment_path, &bytes, mime_type);
         } else if looks_binary(&bytes) {
             // Decoded as text it would be up to a megabyte of replacement
             // characters. OMP skips binary mentions the same way.
             append_file_notice_block(
                 &mut out.text,
-                &absolute_path,
+                &attachment_path,
                 &format!("[Binary file ({} bytes), not included.]", bytes.len()), // ubs:ignore[rust.perf.string-alloc-in-loop] -- once per binary @file argument
             );
         } else {
-            append_text_file_block(&mut out.text, &absolute_path, &bytes);
+            append_text_file_block(&mut out.text, &attachment_path, &bytes);
         }
     }
 

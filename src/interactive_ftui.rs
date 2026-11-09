@@ -2516,6 +2516,7 @@ pub struct PiFtuiModel {
     /// that expands them (the driver does this for idle prompts).
     file_ref_cwd: std::path::PathBuf,
     steer_resources: Option<crate::resources::ResourceLoader>,
+    file_arguments: Arc<Mutex<FileArgumentContext>>,
     /// Loop-lag probe with render/input/agent-event attribution. Inert unless
     /// `PI_PERF_TELEMETRY=1`.
     watchdog: LoopWatchdog,
@@ -2617,6 +2618,27 @@ pub struct ResourceSource {
     pub cli: crate::resources::ResourceCliOptions,
     /// Admission for cached project paths and the launch package manager.
     pub workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
+}
+
+/// Idle prompts and live steering share the policy of the driver's current
+/// session. Workspace clones retain additions/revocations without copying a
+/// stale list of roots into the UI; replacement installs both values together.
+#[derive(Debug, Clone, Default)]
+struct FileArgumentContext {
+    options: crate::tools::FileArgumentOptions,
+    workspace: Option<crate::workspace::WorkspaceHandle>,
+}
+
+fn sync_file_argument_context(
+    target: &Mutex<FileArgumentContext>,
+    handle: &crate::sdk::AgentSessionHandle,
+) {
+    *target
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = FileArgumentContext {
+        options: handle.file_argument_options(),
+        workspace: handle.workspace(),
+    };
 }
 
 /// After `/reload`: read skills and prompt templates again, then refresh the
@@ -2897,6 +2919,7 @@ impl PiFtuiModel {
             history_draft: String::new(),
             file_ref_cwd: std::path::PathBuf::from("."),
             steer_resources: None,
+            file_arguments: Arc::default(),
             input: Self::new_input_editor(),
             autocomplete: {
                 let mut state = AutocompleteState::new(
@@ -2994,6 +3017,12 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_autocomplete(mut self, launch: AutocompleteLaunch) -> Self {
         self.file_ref_cwd.clone_from(&launch.cwd);
+        if let Some(source) = &launch.resource_source {
+            self.file_arguments
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .options = crate::tools::FileArgumentOptions::from_config(&source.config);
+        }
         self.steer_resources = launch.resources;
         self.autocomplete.provider.set_cwd(launch.cwd);
         self.extension_commands
@@ -3001,6 +3030,11 @@ impl PiFtuiModel {
         self.autocomplete.provider.set_catalog(launch.catalog);
         self.autocomplete.max_visible = launch.max_visible.clamp(1, 20);
         self.autocomplete.close();
+        self
+    }
+
+    fn with_file_argument_context(mut self, context: Arc<Mutex<FileArgumentContext>>) -> Self {
+        self.file_arguments = context;
         self
     }
 
@@ -4865,12 +4899,17 @@ impl PiFtuiModel {
         }
         // `@file` references are read in here, as the driver does for idle
         // prompts; they used to reach the model as literal `@path` text.
+        let file_arguments = self
+            .file_arguments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let (steer_text, attachments) = match prepare_prompt(
             &clean,
             self.steer_resources.as_ref(),
             &self.file_ref_cwd,
-            None,
-            true,
+            file_arguments.workspace.as_ref(),
+            file_arguments.options,
         ) {
             Ok((_, images)) if !images.is_empty() && goal.is_none() => {
                 // The text stays in the editor for after the turn.
@@ -10439,9 +10478,9 @@ fn prepare_prompt(
     resources: Option<&crate::resources::ResourceLoader>,
     cwd: &std::path::Path,
     workspace: Option<&crate::workspace::WorkspaceHandle>,
-    auto_resize_images: bool,
+    file_options: crate::tools::FileArgumentOptions,
 ) -> std::result::Result<(String, Vec<crate::model::ContentBlock>), String> {
-    prepare_prompt_with_source(prompt, resources, cwd, workspace, auto_resize_images)
+    prepare_prompt_with_source(prompt, resources, cwd, workspace, file_options)
         .map(|(text, attachments, _)| (text, attachments))
 }
 
@@ -10450,7 +10489,7 @@ fn prepare_prompt_with_source(
     resources: Option<&crate::resources::ResourceLoader>,
     cwd: &std::path::Path,
     workspace: Option<&crate::workspace::WorkspaceHandle>,
-    auto_resize_images: bool,
+    file_options: crate::tools::FileArgumentOptions,
 ) -> std::result::Result<(String, Vec<crate::model::ContentBlock>, String), String> {
     let expand = |text: &str| resources.map_or_else(|| text.to_string(), |r| r.expand_input(text));
     let (without_refs, refs) = crate::interactive::extract_file_references(prompt, |path| {
@@ -10470,7 +10509,7 @@ fn prepare_prompt_with_source(
         single = crate::workspace::WorkspaceHandle::single(cwd);
         &single
     };
-    let processed = crate::tools::process_file_arguments(&refs, cwd, auto_resize_images, workspace)
+    let processed = crate::tools::process_file_arguments(&refs, cwd, file_options, workspace)
         .map_err(|err| err.to_string())?;
     let mut text = processed.text;
     let keyword_scan_source = without_refs.trim().to_string();
@@ -10491,7 +10530,6 @@ async fn run_typed_prompt(
     prompt: String,
     resources: Option<&crate::resources::ResourceLoader>,
     cwd: &std::path::Path,
-    auto_resize_images: bool,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
     turn_abort: &TurnAbortSlot,
@@ -10521,7 +10559,7 @@ async fn run_typed_prompt(
         resources,
         cwd,
         workspace.as_ref(),
-        auto_resize_images,
+        handle.file_argument_options(),
     ) {
         Ok((text, attachments, keyword_scan_source)) => {
             handle
@@ -13585,10 +13623,15 @@ pub fn run(
     let driver_catalog = autocomplete.catalog.clone();
     let mut driver_resources = autocomplete.resources.clone();
     let mut resource_source = autocomplete.resource_source.clone();
-    // `images.autoResize` from settings; default on, as on the classic stack.
-    let mut auto_resize_images = resource_source
-        .as_ref()
-        .is_none_or(|source| source.config.image_auto_resize());
+    let file_arguments = Arc::new(Mutex::new(FileArgumentContext {
+        options: resource_source
+            .as_ref()
+            .map_or_else(crate::tools::FileArgumentOptions::default, |source| {
+                crate::tools::FileArgumentOptions::from_config(&source.config)
+            }),
+        workspace: session_options.workspace.clone(),
+    }));
+    let driver_file_arguments = Arc::clone(&file_arguments);
     let mut settings_config = resource_source
         .as_ref()
         .map(|source| source.config.clone())
@@ -13710,6 +13753,7 @@ pub fn run(
                 }
                 let mut settings_controller =
                     settings::SettingsController::new(settings_config, settings_path, &handle);
+                sync_file_argument_context(&driver_file_arguments, &handle);
                 // Replacements must retain the exact live root set, including
                 // saved roots the SDK restored and later /remove-dir changes.
                 resume_template.workspace = handle.workspace();
@@ -13846,7 +13890,6 @@ pub fn run(
                                 prompt,
                                 driver_resources.as_ref(),
                                 &bash_cwd,
-                                auto_resize_images,
                                 &agent_tx,
                                 &driver_turn_control,
                                 &driver_turn_abort,
@@ -13905,7 +13948,7 @@ pub fn run(
                             let (snapshot, changed) =
                                 match settings_controller.apply(&mut handle, key, &value) {
                                     Ok(snapshot) => {
-                                        auto_resize_images = snapshot.auto_resize_images;
+                                        sync_file_argument_context(&driver_file_arguments, &handle);
                                         if matches!(
                                             key,
                                             SettingsKey::AutoRetry
@@ -14060,7 +14103,6 @@ pub fn run(
                                     input,
                                     driver_resources.as_ref(),
                                     &bash_cwd,
-                                    auto_resize_images,
                                     &agent_tx,
                                     &driver_turn_control,
                                     &driver_turn_abort,
@@ -14522,6 +14564,7 @@ pub fn run(
                         refresh_status = true;
                     }
                     if refresh_status {
+                        sync_file_argument_context(&driver_file_arguments, &handle);
                         // Session replacement does not require a resource
                         // source. Refresh here as well as after /reload's
                         // resource read, including new/removed registrations.
@@ -14627,6 +14670,7 @@ pub fn run(
         .with_thinking_visible(!hide_thinking_block)
         .with_double_escape_action(double_escape_action)
         .with_autocomplete(autocomplete)
+        .with_file_argument_context(file_arguments)
         .with_ext_reply_channel(ext_reply_tx);
     if let Some(server) = &web_server {
         model = model.with_web_remote(
@@ -18578,6 +18622,70 @@ mod tests {
         ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
         // The authored text, which Alt+Up puts back, is what was typed.
         assert_eq!(pending[0].text, "use @notes.txt");
+    }
+
+    #[test]
+    fn mid_turn_files_share_media_limits_and_live_additional_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("primary");
+        let additional = directory.path().join("additional");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&additional).unwrap();
+        std::fs::write(additional.join("notes.txt"), "shared work notes").unwrap();
+        std::fs::write(additional.join("audio.wav"), [0xff, 0, 1, 2]).unwrap();
+        let mut workspace = crate::workspace::WorkspaceHandle::single(&primary);
+        workspace.add_root(&additional);
+        let context = Arc::new(Mutex::new(FileArgumentContext {
+            options: crate::tools::FileArgumentOptions {
+                max_media_bytes: 3,
+                ..Default::default()
+            },
+            workspace: Some(workspace.clone()),
+        }));
+        let mut handle = native_prompt_handle(Arc::new(NativePromptProbe::default()));
+        let turn = handle.prompt_controlled("start".to_string(), |_| {});
+        let control = turn.control();
+        let (_tx, rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx)
+            .with_turn_control(published_turn_control(control.clone()))
+            .with_file_argument_context(Arc::clone(&context));
+        model.file_ref_cwd = primary;
+        model.state = AgentUiState::Working;
+        model
+            .input
+            .set_text("use @../additional/notes.txt and @../additional/audio.wav");
+        model.submit_mid_turn(false);
+        let pending = control.take_pending();
+        assert!(matches!(pending.as_slice(), [input]
+            if matches!(&input.content, crate::model::UserContent::Text(text)
+                if text.contains("shared work notes") && text.contains("Max allowed is 3 bytes"))));
+        assert!(model.input.text().is_empty());
+
+        // The same admitted media is an attachment at the inclusive cap.
+        // Live steering keeps that draft for idle rather than dropping bytes.
+        context.lock().unwrap().options.max_media_bytes = 4;
+        model.input.set_text("use @../additional/audio.wav");
+        model.submit_mid_turn(true);
+        assert_eq!(model.input.text(), "use @../additional/audio.wav");
+        assert!(control.take_pending().is_empty());
+        assert!(
+            model
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("Attachments send once"))
+        );
+
+        assert!(workspace.remove_root(&additional));
+        model.input.set_text("use @../additional/notes.txt");
+        model.submit_mid_turn(false);
+        assert_eq!(model.input.text(), "use @../additional/notes.txt");
+        assert!(control.take_pending().is_empty());
+        assert!(
+            model
+                .transcript
+                .iter()
+                .any(|entry| entry.text.contains("outside the"))
+        );
     }
 
     #[test]
@@ -31806,7 +31914,6 @@ mod tests {
                 prompt.clone(),
                 None,
                 &cwd,
-                false,
                 &agent_tx,
                 &control,
                 &Arc::default(),
@@ -31886,7 +31993,6 @@ mod tests {
                     prompt.into(),
                     Some(&resources),
                     dir.path(),
-                    false,
                     &tx,
                     &control,
                     &Arc::default(),
@@ -31949,7 +32055,10 @@ mod tests {
                 "notes.txt".into(),
             ],
             &mut messages,
-            false,
+            crate::tools::FileArgumentOptions {
+                auto_resize_images: false,
+                ..Default::default()
+            },
             &crate::workspace::WorkspaceHandle::single(dir.path()),
         )
         .unwrap();
@@ -32168,7 +32277,10 @@ mod tests {
             None,
             dir.path(),
             None,
-            false,
+            crate::tools::FileArgumentOptions {
+                auto_resize_images: false,
+                ..Default::default()
+            },
         )
         .expect("prepared");
         assert!(text.contains("remember the milk"), "{text}");
@@ -32176,9 +32288,14 @@ mod tests {
         assert!(!text.contains("@notes.txt"), "{text}");
         assert_eq!(images.len(), 1, "the image is attached");
 
-        let (plain, none) =
-            prepare_prompt("no refs, @missing.txt stays", None, dir.path(), None, false)
-                .expect("prepared");
+        let (plain, none) = prepare_prompt(
+            "no refs, @missing.txt stays",
+            None,
+            dir.path(),
+            None,
+            crate::tools::FileArgumentOptions::default(),
+        )
+        .expect("prepared");
         assert_eq!(plain, "no refs, @missing.txt stays");
         assert!(none.is_empty());
     }
@@ -32194,7 +32311,7 @@ mod tests {
             None,
             dir.path(),
             None,
-            false,
+            crate::tools::FileArgumentOptions::default(),
         )
         .expect("prepared");
         assert_eq!(text, "fill in @todo.md with a plan");
@@ -32221,12 +32338,166 @@ mod tests {
             Some(&resources),
             dir.path(),
             None,
-            false,
+            crate::tools::FileArgumentOptions::default(),
         )
         .expect("prepared");
         assert!(text.contains("stack trace here"), "{text}");
         assert!(text.contains("Triage the attached report."), "{text}");
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn typed_prompts_read_the_current_session_media_policy() {
+        use crate::model::{ContentBlock, UserContent};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("audio.wav"), [0xff, 0, 1, 2]).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for cap in [3, 4] {
+                let provider = Arc::new(NativePromptProbe::default());
+                let mut handle = native_prompt_handle(provider.clone());
+                handle.set_file_argument_options(crate::tools::FileArgumentOptions {
+                    max_media_bytes: cap,
+                    ..Default::default()
+                });
+                let (tx, _rx) = mpsc::channel();
+                run_typed_prompt(
+                    &mut handle,
+                    "inspect @audio.wav".to_string(),
+                    None,
+                    directory.path(),
+                    &tx,
+                    &Arc::default(),
+                    &Arc::default(),
+                )
+                .await;
+                let calls = provider.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                let (attachments, text) = match &calls[0].content {
+                    UserContent::Blocks(blocks) => (
+                        blocks
+                            .iter()
+                            .filter(|block| matches!(block, ContentBlock::Media(_)))
+                            .count(),
+                        blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    UserContent::Text(text) => (0, text.clone()),
+                };
+                assert_eq!(attachments, usize::from(cap == 4));
+                assert_eq!(text.contains("Max allowed is 3 bytes"), cap == 3);
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reloaded_session_and_saved_resize_keep_the_admitted_media_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("workspace");
+        let global = directory.path().join("global");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&global).unwrap();
+        let settings_path = global.join("settings.json");
+        std::fs::write(&settings_path, r#"{"media":{"maxBytes":16}}"#).unwrap();
+        std::fs::write(cwd.join("audio.wav"), [0xff; 16]).unwrap();
+        let guard = captured_ftui_workspace_trust(&cwd, &global);
+        let runtime = asupersync::runtime::RuntimeBuilder::new().build().unwrap();
+        let runtime_handle = runtime.handle();
+        let (tx, _rx) = mpsc::channel();
+        let extension_ui = Arc::new(FtuiExtensionUiHandler::new(tx.clone()));
+        let template = resume_template_from(&crate::sdk::SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("local-media-policy-fixture".to_string()),
+            working_directory: Some(cwd.clone()),
+            workspace_trusted: true,
+            workspace_trust_guard: Some(guard),
+            session_dir: Some(directory.path().join("sessions")),
+            no_context_files: true,
+            enabled_tools: Some(Vec::new()),
+            ..Default::default()
+        });
+        runtime.block_on(Box::pin(async {
+            let mut handle = crate::sdk::create_agent_session_deferred_mcp(replacement_options(
+                &template,
+                &extension_ui,
+                &runtime_handle,
+            ))
+            .await
+            .unwrap();
+            {
+                let store = handle.session_store();
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut session = store.lock(cx.cx()).await.unwrap();
+                session.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text("keep this conversation".to_string()),
+                    timestamp: Some(0),
+                });
+                session.save().await.unwrap();
+            }
+            let context = Mutex::new(FileArgumentContext::default());
+            sync_file_argument_context(&context, &handle);
+            let before = context.lock().unwrap().clone();
+            assert_eq!(before.options.max_media_bytes, 16);
+            let (_, attachments) = prepare_prompt(
+                "inspect @audio.wav",
+                None,
+                &cwd,
+                before.workspace.as_ref(),
+                before.options,
+            )
+            .unwrap();
+            assert_eq!(attachments.len(), 1);
+
+            std::fs::write(&settings_path, r#"{"media":{"maxBytes":8}}"#).unwrap();
+            reload_session_command(
+                &template,
+                &mut handle,
+                &Arc::default(),
+                &extension_ui,
+                &tx,
+                &runtime_handle,
+            )
+            .await
+            .unwrap();
+            sync_file_argument_context(&context, &handle);
+            let after = context.lock().unwrap().clone();
+            assert_eq!(after.options.max_media_bytes, 8);
+            let (text, attachments) = prepare_prompt(
+                "inspect @audio.wav",
+                None,
+                &cwd,
+                after.workspace.as_ref(),
+                after.options,
+            )
+            .unwrap();
+            assert!(attachments.is_empty());
+            assert!(text.contains("Max allowed is 8 bytes"));
+
+            // A settings panel may still hold the old launch config. Saving
+            // image resizing must change only that field on the new session.
+            let stale: crate::config::Config = serde_json::from_value(serde_json::json!({
+                "media": {"maxBytes": 16},
+            }))
+            .unwrap();
+            let mut settings = settings::SettingsController::new(stale, settings_path, &handle);
+            settings
+                .apply(&mut handle, SettingsKey::AutoResizeImages, "off")
+                .unwrap();
+            sync_file_argument_context(&context, &handle);
+            let saved = context.lock().unwrap().clone();
+            assert!(!saved.options.auto_resize_images);
+            assert_eq!(saved.options.max_media_bytes, 8);
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        }));
     }
 
     /// `/scoped-models` resolves globs and exact ids (full or bare, with a
