@@ -11036,6 +11036,7 @@ async fn try_print_failover(
     failover_ctx: Option<FailoverResolution<'_>>,
     failover_state: &mut PrintFailoverState,
     error_text: Option<&str>,
+    call_error: Option<&pi::error::Error>,
     recovery_events: &RecoveryEventStream,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
@@ -11050,7 +11051,11 @@ async fn try_print_failover(
     if !config.model_fallback_enabled() || !config.retry_fallback_on().allows(error_text) {
         return Ok(None);
     }
-    let Some(class) = pi::failover::classify_failover(error_text) else {
+    let class = call_error.map_or_else(
+        || pi::failover::classify_failover(error_text),
+        pi::failover::classify_call_failover,
+    );
+    let Some(class) = class else {
         return Ok(None);
     };
     let Some(chains) = config
@@ -11584,6 +11589,7 @@ where
                             failover_ctx,
                             failover_state,
                             msg.error_message.as_deref(),
+                            None,
                             recovery_events,
                             true,
                             (retry_count > 0).then_some(retry_count),
@@ -11729,6 +11735,7 @@ where
                             failover_ctx,
                             failover_state,
                             Some(err_str.as_str()),
+                            Some(&err),
                             recovery_events,
                             false,
                             (retry_count > 0).then_some(retry_count),
@@ -16139,6 +16146,7 @@ mod tests {
         prompts: StdMutex<Vec<Option<String>>>,
         input_tokens: u64,
         transport_error: bool,
+        transport_kind: Option<std::io::ErrorKind>,
     }
 
     #[async_trait::async_trait]
@@ -16170,6 +16178,13 @@ mod tests {
                 .expect("capture print prompt")
                 .push(context.system_prompt.as_deref().map(str::to_string));
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0
+                && let Some(kind) = self.transport_kind
+            {
+                return Err(pi::error::Error::Io(Box::new(std::io::Error::new(
+                    kind, "wire",
+                ))));
+            }
             if call == 0 && self.transport_error {
                 return Err(pi::error::Error::api("server error"));
             }
@@ -16273,6 +16288,131 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_preserves_typed_transport_evidence_through_the_swap() {
+        run_cli_workdir_test(async {
+            for (kind, expected_swaps) in [
+                (std::io::ErrorKind::ConnectionReset, 1),
+                (std::io::ErrorKind::InvalidInput, 0),
+            ] {
+                let provider = Arc::new(PrintRecoveryProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    prompts: StdMutex::new(Vec::new()),
+                    input_tokens: 0,
+                    transport_error: false,
+                    transport_kind: Some(kind),
+                });
+                let temp = tempfile::tempdir().expect("typed failover fixture");
+                let stored = Session::create_with_dir(Some(temp.path().join("sessions")));
+                let mut session = print_recovery_session_with_store(&provider, stored, true);
+                let mut fallback = pi::models::ad_hoc_model_entry("openai", "typed-fallback")
+                    .expect("fallback model");
+                // The committed fallback fails fast; this test isolates whether
+                // the typed primary failure actually reaches the chain walk.
+                fallback.model.base_url = "http://127.0.0.1:0/v1".to_string();
+                fallback.api_key = Some("fixture-key".to_string());
+                let models = vec![fallback];
+                let auth = AuthStorage::empty_at(temp.path().join("auth.json"));
+                let config = Config {
+                    retry: Some(pi::config::RetrySettings {
+                        enabled: Some(true),
+                        max_retries: Some(0),
+                        max_failovers_per_turn: Some(1),
+                        fallback_chains: Some(std::collections::HashMap::from([(
+                            "default".to_string(),
+                            vec!["openai/typed-fallback".to_string()],
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Config::default()
+                };
+                let events = Arc::new(StdMutex::new(Vec::new()));
+                let make_handler = || {
+                    let events = Arc::clone(&events);
+                    move |event: AgentEvent| events.lock().expect("record event").push(event)
+                };
+                let (_abort, signal) = AbortHandle::new();
+                let result = run_print_prompt_with_retry(
+                    &mut session,
+                    &config,
+                    &signal,
+                    &make_handler,
+                    true,
+                    0,
+                    true,
+                    &Arc::new(StdMutex::new(PrintTextStreamState::default())),
+                    PromptInput::Text {
+                        text: "one authored input".to_string(),
+                        keyword_scan_source: None,
+                    },
+                    Some(FailoverResolution {
+                        available_models: &models,
+                        auth: &auth,
+                        cli_api_key: None,
+                    }),
+                    &mut PrintFailoverState::new(&config),
+                )
+                .await;
+                if let Ok(message) = &result {
+                    assert_eq!(message.stop_reason, StopReason::Error);
+                }
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let expected_model = if expected_swaps == 1 {
+                    "typed-fallback"
+                } else {
+                    "test-model"
+                };
+                assert_eq!(session.agent.provider().model_id(), expected_model);
+                let path = session
+                    .session
+                    .try_lock()
+                    .expect("stored session")
+                    .path
+                    .clone()
+                    .expect("saved session path");
+                let reopened = Session::open(&path.display().to_string())
+                    .await
+                    .expect("reopen durable result");
+                let persisted_swaps = reopened
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            pi::session::SessionEntry::ModelChange(change)
+                                if change.role.as_deref() == Some("failover")
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    persisted_swaps, expected_swaps,
+                    "{kind:?}: the fallback decision must reach persistence"
+                );
+                let events = events.lock().expect("recorded events");
+                let lifecycle: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AgentEvent::AgentStart { .. } => Some("agent_start"),
+                        AgentEvent::FailoverStart { class, .. } => {
+                            assert_eq!(class, "transient");
+                            Some("failover_start")
+                        }
+                        AgentEvent::FailoverEnd { .. } => Some("failover_end"),
+                        AgentEvent::AgentEnd { .. } => Some("agent_end"),
+                        _ => None,
+                    })
+                    .collect();
+                let expected = if expected_swaps == 1 {
+                    vec!["agent_start", "failover_start", "failover_end", "agent_end"]
+                } else {
+                    vec!["agent_start", "agent_end"]
+                };
+                assert_eq!(lifecycle, expected, "{kind:?}");
+            }
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // one invocation must preserve both durable history and admission
     fn print_primary_restore_save_failure_stops_the_invocation_before_input() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
@@ -16284,6 +16424,7 @@ mod tests {
                 prompts: StdMutex::new(Vec::new()),
                 input_tokens: 0,
                 transport_error: false,
+                transport_kind: None,
             });
             let auth = AuthStorage::load(temp.path().join("auth.json")).expect("auth");
             let mut primary = ModelRegistry::load(&auth, None)
@@ -16393,6 +16534,7 @@ mod tests {
                         prompts: StdMutex::new(Vec::new()),
                         input_tokens: 0,
                         transport_error,
+                        transport_kind: None,
                     });
                     let temp = tempfile::tempdir().expect("print lifecycle root");
                     let poison = temp.path().join("retry-save-directory");
@@ -16528,6 +16670,7 @@ mod tests {
                 prompts: StdMutex::new(Vec::new()),
                 input_tokens: 0,
                 transport_error: true,
+                transport_kind: None,
             });
             let mut session = print_recovery_session(&provider);
             let owner = {
@@ -16588,6 +16731,7 @@ mod tests {
                             prompts: StdMutex::new(Vec::new()),
                             input_tokens: 0,
                             transport_error,
+                            transport_kind: None,
                         });
                         let mut session = print_recovery_session(&provider);
                         let root = tempfile::tempdir().expect("extension tempdir");
@@ -16701,6 +16845,7 @@ mod tests {
                     prompts: StdMutex::new(Vec::new()),
                     input_tokens: tokens,
                     transport_error: false,
+                    transport_kind: None,
                 });
                 let mut session = print_recovery_session(&provider);
                 let root = tempfile::tempdir().expect("auth tempdir");
@@ -17286,6 +17431,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 true,
                 None,
@@ -17328,6 +17474,7 @@ mod tests {
                     failover_ctx,
                     &mut failover_state,
                     Some("server error"),
+                    None,
                     &RecoveryEventStream::new(|_| {}),
                     true,
                     None,
@@ -17494,6 +17641,7 @@ mod tests {
                             }),
                             &mut state,
                             Some("503 service unavailable"),
+                            None,
                             &RecoveryEventStream::new(|_| {}),
                             false,
                             None,
@@ -17627,6 +17775,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -17673,6 +17822,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -17692,6 +17842,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -17743,6 +17894,7 @@ mod tests {
                     failover_ctx,
                     &mut holding,
                     Some("server error"),
+                    None,
                     &RecoveryEventStream::new(|_| {}),
                     false,
                     None,
@@ -17789,6 +17941,7 @@ mod tests {
                     failover_ctx,
                     &mut elapsed,
                     Some("server error"),
+                    None,
                     &RecoveryEventStream::new(|_| {}),
                     false,
                     None,
@@ -17826,6 +17979,7 @@ mod tests {
                     failover_ctx,
                     &mut ready,
                     Some("server error"),
+                    None,
                     &RecoveryEventStream::new(|_| {}),
                     false,
                     None,
@@ -17974,6 +18128,7 @@ mod tests {
                 }),
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -18001,6 +18156,7 @@ mod tests {
                 }),
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -18126,6 +18282,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -18178,6 +18335,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 false,
                 None,
@@ -18357,6 +18515,7 @@ mod tests {
                 failover_ctx,
                 &mut failover_state,
                 Some("server error"),
+                None,
                 &RecoveryEventStream::new(|_| {}),
                 true,
                 None,

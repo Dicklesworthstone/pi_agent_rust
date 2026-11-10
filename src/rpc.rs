@@ -7432,6 +7432,7 @@ async fn run_prompt_with_retry_owned(
             stream_can_retry: true,
         };
         let recovery_decision;
+        let mut call_error = None;
         let rate_limited = crate::failover::is_credential_rate_limit(match &result {
             Ok(message) => crate::failover::TurnOutcome::Completed(message),
             Err(error) => crate::failover::TurnOutcome::Failed(error),
@@ -7545,6 +7546,7 @@ async fn run_prompt_with_retry_owned(
                 );
                 final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
+                call_error = Some(err);
             }
         }
 
@@ -7600,6 +7602,7 @@ async fn run_prompt_with_retry_owned(
                     &recovery_events,
                     &options,
                     final_error.as_deref(),
+                    call_error.as_ref(),
                     require_incomplete_tail,
                     (retry_count > 0).then_some(retry_count),
                     failovers_this_turn,
@@ -8027,6 +8030,7 @@ async fn try_failover_to_next_chain_entry(
     recovery_events: &crate::failover::RecoveryEventStream,
     options: &RpcOptions,
     error_text: Option<&str>,
+    call_error: Option<&Error>,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
     swaps_so_far: u32,
@@ -8040,7 +8044,11 @@ async fn try_failover_to_next_chain_entry(
     {
         return Ok(false);
     }
-    let Some(class) = crate::failover::classify_failover(error_text) else {
+    let class = call_error.map_or_else(
+        || crate::failover::classify_failover(error_text),
+        crate::failover::classify_call_failover,
+    );
+    let Some(class) = class else {
         return Ok(false); // auth/loud errors never fail over
     };
     let Some(chains) = options
@@ -9755,6 +9763,7 @@ mod retry_tests {
         contexts: std::sync::Mutex<Vec<Vec<Message>>>,
         prompts: std::sync::Mutex<Vec<Option<String>>>,
         transport_error: bool,
+        transport_kind: Option<std::io::ErrorKind>,
     }
 
     impl FlakyProvider {
@@ -9764,6 +9773,7 @@ mod retry_tests {
                 contexts: std::sync::Mutex::new(Vec::new()),
                 prompts: std::sync::Mutex::new(Vec::new()),
                 transport_error: false,
+                transport_kind: None,
             }
         }
     }
@@ -9833,6 +9843,11 @@ mod retry_tests {
                 .expect("capture retry system prompt")
                 .push(context.system_prompt.as_deref().map(str::to_string));
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0
+                && let Some(kind) = self.transport_kind
+            {
+                return Err(Error::Io(Box::new(std::io::Error::new(kind, "wire"))));
+            }
             if call == 0 && self.transport_error {
                 return Err(Error::api("server error"));
             }
@@ -10094,6 +10109,144 @@ mod retry_tests {
                         SessionEntry::ModelChange(change) if change.role.as_deref() == Some("failover")
                     )));
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_failover_preserves_typed_transport_evidence_through_the_swap() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            for (kind, expected_swaps) in [
+                (std::io::ErrorKind::ConnectionReset, 1),
+                (std::io::ErrorKind::InvalidInput, 0),
+            ] {
+                let provider = Arc::new(FlakyProvider {
+                    transport_kind: Some(kind),
+                    ..FlakyProvider::new()
+                });
+                let agent = Agent::new(
+                    Arc::clone(&provider) as Arc<dyn Provider>,
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig::default(),
+                );
+                let temp = tempfile::tempdir().expect("typed failover fixture");
+                let store = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                    temp.path().join("sessions"),
+                ))));
+                let session = Arc::new(Mutex::new(AgentSession::new(
+                    agent,
+                    Arc::clone(&store),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                )));
+                let config = Config {
+                    retry: Some(crate::config::RetrySettings {
+                        enabled: Some(true),
+                        max_retries: Some(0),
+                        max_failovers_per_turn: Some(1),
+                        fallback_chains: Some(HashMap::from([(
+                            "default".to_string(),
+                            vec!["openai/typed-fallback".to_string()],
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Config::default()
+                };
+                let mut shared = RpcSharedState::new(&config);
+                shared.auto_compaction_enabled = false;
+                let shared = Arc::new(Mutex::new(shared));
+                let mut fallback = crate::models::ad_hoc_model_entry("openai", "typed-fallback")
+                    .expect("fallback model");
+                fallback.model.base_url = "http://127.0.0.1:0/v1".to_string();
+                fallback.api_key = Some("fixture-key".to_string());
+                let options = RpcOptions {
+                    config,
+                    working_directory: None,
+                    resources: ResourceLoader::empty(false),
+                    available_models: vec![fallback],
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth: AuthStorage::empty_at(temp.path().join("auth.json")),
+                    runtime_handle: runtime_handle.clone(),
+                    ask_tool: None,
+                };
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                run_prompt_with_retry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(std::sync::Mutex::new(())),
+                    Arc::new(Mutex::new(None)),
+                    out_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    options,
+                    "one authored input".to_string(),
+                    None,
+                    Vec::new(),
+                    AgentCx::for_request(),
+                )
+                .await;
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                let cx = AgentCx::for_request();
+                let guard = session.lock(&cx).await.expect("session");
+                let expected_model = if expected_swaps == 1 {
+                    "typed-fallback"
+                } else {
+                    "test-model"
+                };
+                assert_eq!(guard.agent.provider().model_id(), expected_model);
+                drop(guard);
+                let stored = store.lock(cx.cx()).await.expect("stored session");
+                let path = stored.path.clone().expect("saved session path");
+                drop(stored);
+                let reopened = Session::open(&path.display().to_string())
+                    .await
+                    .expect("reopen durable result");
+                let persisted_swaps = reopened
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            SessionEntry::ModelChange(change)
+                                if change.role.as_deref() == Some("failover")
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    persisted_swaps, expected_swaps,
+                    "{kind:?}: the fallback decision must reach persistence"
+                );
+                let events: Vec<Value> = out_rx
+                    .try_iter()
+                    .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                    .collect();
+                let lifecycle: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| {
+                        let kind = event["type"].as_str()?;
+                        if kind == "failover_start" {
+                            assert_eq!(event["class"], "transient");
+                        }
+                        matches!(
+                            kind,
+                            "agent_start" | "failover_start" | "failover_end" | "agent_end"
+                        )
+                        .then_some(kind)
+                    })
+                    .collect();
+                let expected = if expected_swaps == 1 {
+                    vec!["agent_start", "failover_start", "failover_end", "agent_end"]
+                } else {
+                    vec!["agent_start", "agent_end"]
+                };
+                assert_eq!(lifecycle, expected, "{kind:?}");
             }
         });
     }
@@ -10720,6 +10873,7 @@ mod retry_tests {
                             &rpc_recovery_events(out_tx),
                             &options,
                             Some("503 service unavailable"),
+                            None,
                             false,
                             None,
                             0,
@@ -10858,6 +11012,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -10910,6 +11065,7 @@ mod retry_tests {
                     &rpc_recovery_events(exhausted_tx),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -11029,6 +11185,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -11047,6 +11204,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -11166,6 +11324,7 @@ mod retry_tests {
                 &rpc_recovery_events(out_tx.clone()),
                 &options,
                 Some("server error"),
+                None,
                 true,
                 None,
                 0,
@@ -11263,6 +11422,7 @@ mod retry_tests {
                     &recovery_events,
                     &options,
                     Some("server error"),
+                    None,
                     true,
                     Some(2),
                     0,
@@ -11809,6 +11969,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx),
                     &fixture.options,
                     Some("503 service unavailable"),
+                    None,
                     false,
                     None,
                     0,
@@ -11897,6 +12058,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &fixture.options,
                     Some("503 service unavailable"),
+                    None,
                     false,
                     None,
                     0,
@@ -12157,6 +12319,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
+                    None,
                     true,
                     None,
                     0,
@@ -12224,6 +12387,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
+                    None,
                     true,
                     None,
                     1,
@@ -12549,6 +12713,7 @@ mod retry_tests {
                         &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
+                        None,
                         true,
                         None,
                         0,
@@ -12870,6 +13035,7 @@ mod retry_tests {
                         &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
+                        None,
                         true,
                         None,
                         0,

@@ -1695,6 +1695,21 @@ pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
     error.is_transient() || provider_text_is_retryable(&error_text, None, None)
 }
 
+/// Classify a failed provider call without discarding its typed transport cause.
+///
+/// A connection reset or EOF can carry an opaque diagnostic. Reclassifying only
+/// its Display text after the retry policy admitted a fallback would silently
+/// reject that fallback. Local failures and terminal provider refusals retain
+/// the same precedence as same-provider retry admission.
+#[must_use]
+pub fn classify_call_failover(error: &crate::error::Error) -> Option<FailoverClass> {
+    if !is_provider_call_error(error) {
+        return None;
+    }
+    classify_failover(&error.to_string())
+        .or_else(|| call_error_is_retryable(error).then_some(FailoverClass::Transient))
+}
+
 /// The outcome of one provider attempt, borrowed for classification.
 #[derive(Debug, Clone, Copy)]
 pub enum TurnOutcome<'a> {
@@ -4158,6 +4173,12 @@ mod tests {
             // Deliberately no transient substring: the typed kind must decide.
             let error = crate::error::Error::Io(Box::new(std::io::Error::new(kind, "wire")));
             assert!(call_error_is_retryable(&error), "{kind:?}");
+            assert_eq!(classify_failover(&error.to_string()), None, "{kind:?}");
+            assert_eq!(
+                classify_call_failover(&error),
+                Some(FailoverClass::Transient),
+                "{kind:?}"
+            );
             assert_eq!(
                 decide(
                     TurnOutcome::Failed(&error),
@@ -4191,6 +4212,32 @@ mod tests {
                 TurnDecision::Finish { success: false },
                 "{kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn typed_failover_cannot_override_local_or_provider_refusals() {
+        for error in [
+            crate::error::Error::Io(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "wire",
+            ))),
+            crate::error::Error::session("503 service unavailable"),
+            crate::error::Error::Aborted,
+        ] {
+            assert_eq!(classify_call_failover(&error), None, "{error}");
+        }
+        for text in [
+            "401 unauthorized; peer disconnected",
+            "400 bad request; overloaded",
+            "SESSION_PERSISTENCE_FAILED: connection reset",
+            "503 service unavailable: context_length_exceeded",
+        ] {
+            let error = crate::error::Error::Io(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                text,
+            )));
+            assert_eq!(classify_call_failover(&error), None, "{text}");
         }
     }
 

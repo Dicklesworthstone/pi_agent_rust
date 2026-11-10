@@ -468,15 +468,11 @@ impl AgentSessionHandle {
         let Some(error_text) = Self::turn_error_text_for(current) else {
             return Ok(false);
         };
-        let Some(class) = crate::failover::classify_failover(&error_text).or_else(|| {
-            // A typed transport drop need not spell its kind in Display.
-            // Reuse the same refusal-aware typed classifier as the decision.
-            current
-                .as_ref()
-                .err()
-                .filter(|error| crate::failover::call_error_is_retryable(error))
-                .map(|_| crate::failover::FailoverClass::Transient)
-        }) else {
+        let class = match current {
+            Ok(_) => crate::failover::classify_failover(&error_text),
+            Err(error) => crate::failover::classify_call_failover(error),
+        };
+        let Some(class) = class else {
             return Ok(false);
         };
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
