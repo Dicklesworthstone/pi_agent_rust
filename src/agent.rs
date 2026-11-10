@@ -2152,7 +2152,9 @@ pub struct Agent {
     /// A prewalk only yields to the owning session driver; it never installs
     /// a provider inside the tool loop or lets a tool choose the destination.
     prewalk: Option<crate::prewalk::PrewalkState>,
-    prewalk_budget: Option<PrewalkRunBudget>,
+    /// One logical request retains its limits through retries, failover,
+    /// compaction recovery and optional prewalk handoffs.
+    run_budget: Option<LogicalRunBudget>,
     prewalk_evidence: StdMutex<crate::prewalk::ToolEvidence>,
 
     /// Discoverable tools promoted into the live schema mid-session via
@@ -2268,10 +2270,11 @@ struct ScopedRuleState {
     activated: std::collections::HashSet<usize>,
 }
 
-/// A prewalk continuation and any recovery attempts share the original run
-/// clock and tool budget. The SDK resets this only at a public turn boundary.
+/// Recovery attempts and prewalk continuations share the original run clock
+/// and tool budget. Native drivers reset this only at a public turn boundary,
+/// regardless of whether the request has an armed prewalk.
 #[derive(Clone, Copy)]
-struct PrewalkRunBudget {
+struct LogicalRunBudget {
     started: std::time::Instant,
     max_time: Option<Duration>,
     iterations: usize,
@@ -2390,7 +2393,7 @@ impl Agent {
             ),
             stream_rule_turn: 0,
             prewalk: None,
-            prewalk_budget: None,
+            run_budget: None,
             prewalk_evidence: StdMutex::new(crate::prewalk::ToolEvidence::default()),
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2514,7 +2517,7 @@ impl Agent {
         );
         self.stream_rule_turn = 0;
         self.prewalk = None;
-        self.prewalk_budget = None;
+        self.run_budget = None;
         self.take_prewalk_evidence();
         self.keyword_ledger.clear();
         self.retry_keyword_activations.clear();
@@ -2528,7 +2531,7 @@ impl Agent {
         self.prewalk.as_ref().map(|state| &state.target)
     }
 
-    pub(crate) fn begin_prewalk_run(&mut self) {
+    pub(crate) fn begin_logical_run(&mut self) {
         self.take_prewalk_evidence();
         // An abandoned SDK future may have yielded before it installed the
         // target. A later public prompt must not silently resume that decision.
@@ -2539,7 +2542,7 @@ impl Agent {
         {
             self.prewalk = None;
         }
-        self.prewalk_budget = self.prewalk.as_ref().map(|_| PrewalkRunBudget {
+        self.run_budget = Some(LogicalRunBudget {
             started: std::time::Instant::now(),
             max_time: self.config.max_time,
             iterations: 0,
@@ -2549,9 +2552,9 @@ impl Agent {
         });
     }
 
-    pub(crate) fn finish_prewalk_run(&mut self, interrupted: bool) {
+    pub(crate) fn finish_logical_run(&mut self, interrupted: bool) {
         self.take_prewalk_evidence();
-        self.prewalk_budget = None;
+        self.run_budget = None;
         if interrupted {
             self.prewalk = None;
         }
@@ -2590,7 +2593,7 @@ impl Agent {
         input: &Value,
         output: &ToolOutput,
     ) {
-        if self.prewalk_budget.is_none()
+        if self.run_budget.is_none()
             || self.prewalk.is_none()
             || output.is_error
             || crate::agent_cx::AgentCx::for_current_or_request()
@@ -3345,7 +3348,7 @@ impl Agent {
                 .expect("cache populated above"),
         );
 
-        let system_prompt = if self.prewalk_budget.is_some() && self.prewalk.is_some() {
+        let system_prompt = if self.run_budget.is_some() && self.prewalk.is_some() {
             let mut prompt = self.config.system_prompt.clone().unwrap_or_default();
             prompt.push_str("\n\n## Prewalk\nInvestigate the request and plan the implementation before making changes. If the todo tool is available, record a concrete todo list before editing project files. Begin the first real implementation change; the session will automatically hand off after that completed tool batch. Do not stop to announce or request the handoff. For discussion or read-only requests, answer normally without making an artificial edit.");
             Some(Cow::Owned(prompt))
@@ -4199,7 +4202,7 @@ impl Agent {
             .as_deref()
             .unwrap_or("")
             .into();
-        let budget = self.prewalk_budget;
+        let budget = self.run_budget;
         let mut iterations = budget.map_or(0, |budget| budget.iterations);
         let mut pause_turn_continuations = budget.map_or(0, |budget| budget.pause_continuations);
         let mut warned_at_handoff_threshold = budget.is_some_and(|budget| budget.warned);
@@ -4227,7 +4230,6 @@ impl Agent {
         // Always poll the owning source: a private staged batch does not prove
         // that the exact RPC batch which triggered this continuation was fetched.
         let mut follow_up_staged = false;
-        let mut required_initial_follow_up_pending = initial_follow_up;
         if initial_follow_up {
             self.fetch_initial_follow_up_messages().await;
             follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
@@ -4296,8 +4298,7 @@ impl Agent {
             let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if !required_initial_follow_up_pending
-                    && let Some(cap) = max_time
+                if let Some(cap) = max_time
                     && run_started.elapsed() >= cap
                 {
                     // The owning surface already acknowledged these messages.
@@ -4352,7 +4353,6 @@ impl Agent {
                     }
                     let current_follow_up = self.message_queue.pop_follow_up();
                     follow_up_staged = false;
-                    required_initial_follow_up_pending = false;
                     if current_follow_up.is_empty() {
                         // The session changed after staging and every queued
                         // job notice belonged to the previous owner. Reach the
@@ -4586,7 +4586,7 @@ impl Agent {
                 has_more_tool_calls = execute_local_tools;
                 if pause_turn {
                     pause_turn_continuations = pause_turn_continuations.saturating_add(1);
-                    if let Some(budget) = &mut self.prewalk_budget {
+                    if let Some(budget) = &mut self.run_budget {
                         budget.pause_continuations = pause_turn_continuations;
                     }
                     if pause_turn_continuations <= MAX_PAUSE_TURN_CONTINUATIONS {
@@ -4607,7 +4607,7 @@ impl Agent {
                 let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
                 if execute_local_tools {
                     iterations += 1;
-                    if let Some(budget) = &mut self.prewalk_budget {
+                    if let Some(budget) = &mut self.run_budget {
                         budget.iterations = iterations;
                     }
                     // Soft handoff: at >=80% of the cap, push a one-shot
@@ -4624,6 +4624,9 @@ impl Agent {
                         )
                     {
                         warned_at_handoff_threshold = true;
+                        if let Some(budget) = &mut self.run_budget {
+                            budget.warned = true;
+                        }
                         let warning = Message::User(UserMessage {
                             content: UserContent::Text(iteration_handoff_steering_text(
                                 iterations,
@@ -4782,12 +4785,12 @@ impl Agent {
                 on_event(turn_end_event);
 
                 turn_index = turn_index.saturating_add(1);
-                if let Some(budget) = &mut self.prewalk_budget {
+                if let Some(budget) = &mut self.run_budget {
                     budget.turn_index = turn_index;
                     budget.warned = warned_at_handoff_threshold;
                 }
                 let prewalk_evidence = self.take_prewalk_evidence();
-                let handoff = if self.prewalk_budget.is_some()
+                let handoff = if self.run_budget.is_some()
                     && let Some(prewalk) = &mut self.prewalk
                 {
                     prewalk.observe(prewalk_evidence);
@@ -7892,11 +7895,11 @@ impl AdvisorTurn {
                 .map(|_| Arc::new(StdMutex::new(None))),
             started: session
                 .agent
-                .prewalk_budget
+                .run_budget
                 .map_or_else(Instant::now, |budget| budget.started),
             max_time: session
                 .agent
-                .prewalk_budget
+                .run_budget
                 .map_or(session.agent.config.max_time, |budget| budget.max_time),
         }
     }
@@ -8004,7 +8007,7 @@ struct SessionTurnPromptGuard<'a> {
     session: &'a mut AgentSession,
     base_system_prompt: Option<String>,
     base_max_time: Option<Duration>,
-    base_prewalk_max_time: Option<(Instant, Option<Duration>)>,
+    base_run_max_time: Option<(Instant, Option<Duration>)>,
 }
 
 impl<'a> SessionTurnPromptGuard<'a> {
@@ -8016,16 +8019,16 @@ impl<'a> SessionTurnPromptGuard<'a> {
             session,
             base_system_prompt,
             base_max_time,
-            base_prewalk_max_time: None,
+            base_run_max_time: None,
         }
     }
 
     fn limit_max_time(&mut self, started: Instant, max_time: Option<Duration>) {
         self.session.agent.config.max_time =
             max_time.map(|cap| cap.saturating_sub(started.elapsed()));
-        if let (Some(cap), Some(budget)) = (max_time, self.session.agent.prewalk_budget.as_mut()) {
-            self.base_prewalk_max_time = Some((budget.started, budget.max_time));
-            // Prewalk keeps its original clock through retries and handoffs.
+        if let (Some(cap), Some(budget)) = (max_time, self.session.agent.run_budget.as_mut()) {
+            self.base_run_max_time = Some((budget.started, budget.max_time));
+            // A logical run keeps its original clock through recovery.
             // Convert this wake's deadline to that clock before clamping it;
             // assigning the relative cap would count earlier work twice.
             let deadline = started
@@ -8043,8 +8046,8 @@ impl Drop for SessionTurnPromptGuard<'_> {
             .set_system_prompt(self.base_system_prompt.take());
         self.session.agent.config.max_time = self.base_max_time;
         if let (Some((started, max_time)), Some(budget)) = (
-            self.base_prewalk_max_time,
-            self.session.agent.prewalk_budget.as_mut(),
+            self.base_run_max_time,
+            self.session.agent.run_budget.as_mut(),
         ) && budget.started == started
         {
             // Restore the limit, retaining completed tool/turn accounting.
@@ -19636,14 +19639,15 @@ impl AgentSession {
         Ok(())
     }
 
-    /// Start the prewalk clock and capture session ownership for one logical
-    /// request. Native drivers retain this token through provider retries and
-    /// call `finish_prewalk_turn` after the final attempt. The SDK does this
-    /// automatically for its prompt/content/continuation entrypoints.
+    /// Start the logical request's shared clock and tool budget, and capture
+    /// session ownership for an optional prewalk handoff. Native drivers retain
+    /// this token through recovery attempts and call `finish_prewalk_turn`
+    /// after the final attempt. The SDK does this automatically for its
+    /// prompt/content/continuation entrypoints, even without an armed prewalk.
     #[must_use]
     pub fn begin_prewalk_turn(&mut self) -> crate::prewalk::PrewalkTurn {
         let origin = self.session_action_admission.capture_origin();
-        self.agent.begin_prewalk_run();
+        self.agent.begin_logical_run();
         crate::prewalk::PrewalkTurn { origin }
     }
 
@@ -19687,7 +19691,7 @@ impl AgentSession {
     /// Release the logical request's shared budgets. Errors and cancellation
     /// disarm an unfinished prewalk; a read-only completed request keeps it.
     pub fn finish_prewalk_turn(&mut self, interrupted: bool) {
-        self.agent.finish_prewalk_run(interrupted);
+        self.agent.finish_logical_run(interrupted);
     }
 
     /// A prewalk keeps provider and session-action authority from provenance
@@ -19976,7 +19980,7 @@ impl AgentSession {
         // No await may separate durable source installation from the arm.
         // On a failed save, the previous arm and live model remain untouched.
         self.agent.prewalk = next;
-        self.agent.prewalk_budget = None;
+        self.agent.run_budget = None;
         if let Some(policy) = &mut self.child_fallback_policy {
             policy.use_default_role();
         }
@@ -24474,19 +24478,15 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let started = Instant::now();
-        let prewalk_remaining = self.agent.prewalk_budget.and_then(|budget| {
+        let run_remaining = self.agent.run_budget.and_then(|budget| {
             budget
                 .max_time
                 .map(|cap| cap.saturating_sub(started.saturating_duration_since(budget.started)))
         });
-        let max_time = [
-            self.agent.config.max_time,
-            remaining_time,
-            prewalk_remaining,
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        let max_time = [self.agent.config.max_time, remaining_time, run_remaining]
+            .into_iter()
+            .flatten()
+            .min();
         if abort.as_ref().is_some_and(AbortSignal::is_aborted)
             || max_time.is_some_and(|remaining| remaining.is_zero())
         {

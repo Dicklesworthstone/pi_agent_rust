@@ -772,6 +772,168 @@ fn every_entrypoint_resumes_instead_of_replaying_user_input() {
     }
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn recovery_without_prewalk_keeps_the_original_time_cap_and_resets_the_next_prompt() {
+    for fail_over in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut target = RecoveryHttpFixture::new(vec![completion_response()]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cap = Duration::from_secs(2);
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 1,
+            calls: Arc::clone(&calls),
+            name: "openai".to_string(),
+            model: "budget-source".to_string(),
+            input_tokens: 0,
+        });
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], dir.path(), None),
+            AgentConfig {
+                max_time: Some(cap),
+                ..Default::default()
+            },
+        );
+        let mut stored = Session::create_with_dir(Some(dir.path().join("sessions")));
+        stored.header.cwd = dir.path().display().to_string();
+        stored.header.provider = Some("openai".to_string());
+        stored.header.model_id = Some("budget-source".to_string());
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(stored)),
+            true,
+            ResolvedCompactionSettings {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::new())
+                .with_retry(Some(crate::failover::RetryPolicy {
+                    max_retries: u32::from(!fail_over),
+                    max_failovers_per_turn: u32::from(fail_over),
+                    ..fast_retry_policy(1)
+                }));
+        if fail_over {
+            let mut fallback =
+                crate::models::ad_hoc_model_entry("openai", "budget-target").unwrap();
+            fallback.model.api = "openai-completions".to_string();
+            fallback.model.base_url.clone_from(&target.url);
+            handle = handle.with_failover(Some(FailoverOptions {
+                chains: HashMap::from([(
+                    "default".to_string(),
+                    vec!["openai/budget-target".to_string()],
+                )]),
+                available_models: vec![fallback],
+                auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+                cli_api_key: Some("fixture-key".to_string()),
+                cooldown_secs: 300,
+            }));
+        }
+        assert!(handle.prewalk_target().is_none());
+        let (events, callback) = event_log();
+        let store = handle.session_store();
+        let result = run_async(handle.prompt("one capped request", move |event| {
+            if (!fail_over && matches!(&event, AgentEvent::AutoRetryStart { .. }))
+                || (fail_over && matches!(&event, AgentEvent::FailoverStart { .. }))
+            {
+                // The first request was admitted before this callback. Force
+                // its original budget to expire between attempts, without
+                // asserting any upper wall-clock bound on the loaded host.
+                std::thread::sleep(cap + Duration::from_millis(25));
+            }
+            if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                let session = store.try_lock().expect("terminal releases session lock");
+                let saved = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+                assert!(saved.contains("[time cap reached]"));
+            }
+            callback(event);
+        }))
+        .expect("the elapsed cap is a durably saved boundary");
+        assert!(crate::agent::time_cap_marker(&result).is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no renewed primary request");
+        assert!(
+            target.requests.lock().unwrap().is_empty(),
+            "a committed fallback does not renew the original request's clock"
+        );
+        let observed = events.lock().unwrap();
+        for kind in [
+            "agent_start",
+            "agent_end",
+            if fail_over {
+                "failover_start"
+            } else {
+                "auto_retry_start"
+            },
+            if fail_over {
+                "failover_end"
+            } else {
+                "auto_retry_end"
+            },
+        ] {
+            assert_eq!(
+                observed.iter().filter(|event| event["type"] == kind).count(),
+                1
+            );
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|event| event["type"] != "tool_execution_start")
+        );
+        drop(observed);
+
+        // A new authored input is a new run, not a continuation of the expired
+        // one. The primary fixture has no failures left; a fallback remains
+        // selected during its cooldown and is now allowed its first request.
+        let fresh = run_async(handle.prompt("after capped request", |_| {})).unwrap();
+        assert_eq!(fresh.stop_reason, StopReason::Stop);
+        assert!(crate::agent::time_cap_marker(&fresh).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), if fail_over { 1 } else { 2 });
+        target.finish();
+        assert_eq!(target.requests.lock().unwrap().len(), usize::from(fail_over));
+        let path = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .path
+            .clone()
+            .unwrap();
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        let messages = reopened.to_messages_for_current_path();
+        for text in ["one capped request", "after capped request"] {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        Message::User(UserMessage { content: UserContent::Text(value), .. })
+                            if value == text
+                    ))
+                    .count(),
+                1,
+                "each authored request is persisted once"
+            );
+        }
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    Message::Assistant(assistant) if crate::agent::time_cap_marker(assistant).is_some()
+                ))
+                .count(),
+            1,
+            "one saved time-cap marker survives the next public prompt"
+        );
+        assert!(messages.iter().all(|message| !matches!(
+            message,
+            Message::Assistant(assistant) if assistant.stop_reason == StopReason::Error
+        )));
+    }
+}
+
 struct CredentialRetryProvider {
     keys: Arc<Mutex<Vec<Option<String>>>>,
     streamed_failure: bool,
@@ -3504,6 +3666,182 @@ fn prewalk_preserves_the_original_tool_budget_across_the_handoff() {
     );
     assert!(dir.path().join("result.txt").is_file());
     assert!(!dir.path().join("second.txt").exists());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn recovery_without_prewalk_preserves_completed_tool_budget_and_next_prompt_starts_fresh() {
+    for fail_over in [false, true] {
+        let dir = tempdir().unwrap();
+        let continuation = vec![
+            prewalk_tool_batch(&[(
+                "over-budget",
+                "write",
+                serde_json::json!({"path":"blocked.txt", "content":"must not run"}),
+            )]),
+            prewalk_tool_batch(&[(
+                "fresh-write",
+                "write",
+                serde_json::json!({"path":"fresh.txt", "content":"new run"}),
+            )]),
+            completion_response(),
+        ];
+        let mut primary_responses = vec![write_tool_response(), capacity_response()];
+        if !fail_over {
+            primary_responses.extend(continuation.clone());
+        }
+        let mut primary = RecoveryHttpFixture::new(primary_responses);
+        let mut fallback = RecoveryHttpFixture::new(if fail_over {
+            continuation
+        } else {
+            Vec::new()
+        });
+        let mut handle = prewalk_http_handle(dir.path(), &primary.url, &fallback.url, false, 1)
+            .with_retry(Some(crate::failover::RetryPolicy {
+                max_retries: u32::from(!fail_over),
+                max_failovers_per_turn: u32::from(fail_over),
+                ..fast_retry_policy(1)
+            }));
+        if fail_over {
+            let entries = handle.session.model_registry().unwrap().models().to_vec();
+            handle = handle.with_failover(Some(FailoverOptions {
+                chains: HashMap::from([(
+                    "default".to_string(),
+                    vec!["groq/walk-target".to_string()],
+                )]),
+                available_models: entries,
+                auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+                cli_api_key: None,
+                cooldown_secs: 300,
+            }));
+        }
+        assert!(handle.prewalk_target().is_none());
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt("write once before recovery", move |event| {
+            callback(event);
+        }))
+        .unwrap();
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(
+            result
+                .error_message
+                .unwrap()
+                .contains("Maximum tool iterations (1)")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
+            "saved exactly once"
+        );
+        assert!(!dir.path().join("blocked.txt").exists());
+        assert!(!dir.path().join("fresh.txt").exists());
+        assert_eq!(
+            primary.requests.lock().unwrap().len(),
+            if fail_over { 2 } else { 3 }
+        );
+        assert_eq!(fallback.requests.lock().unwrap().len(), usize::from(fail_over));
+        let observed = events.lock().unwrap();
+        let executed: Vec<_> = observed
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .map(|event| event["toolCallId"].as_str().unwrap())
+            .collect();
+        assert_eq!(executed, ["write-once"], "completed tools cannot replay");
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| event["type"] == "agent_end")
+                .count(),
+            1
+        );
+        drop(observed);
+        let resumed = if fail_over {
+            fallback.requests.lock().unwrap()[0].clone()
+        } else {
+            primary.requests.lock().unwrap()[2].clone()
+        };
+        assert_eq!(
+            resumed["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == "write-once"
+                })
+                .count(),
+            1,
+            "retry and failover keep the completed tool result in provider context"
+        );
+
+        let (fresh_events, callback) = event_log();
+        let fresh = run_async(handle.prompt("a separate tool budget", move |event| {
+            callback(event);
+        }))
+        .unwrap();
+        assert_eq!(fresh.stop_reason, StopReason::Stop);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("fresh.txt")).unwrap(),
+            "new run"
+        );
+        assert!(!dir.path().join("blocked.txt").exists());
+        let fresh_events = fresh_events.lock().unwrap();
+        let executed: Vec<_> = fresh_events
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .map(|event| event["toolCallId"].as_str().unwrap())
+            .collect();
+        assert_eq!(executed, ["fresh-write"]);
+        drop(fresh_events);
+        primary.finish();
+        fallback.finish();
+        assert_eq!(
+            primary.requests.lock().unwrap().len(),
+            if fail_over { 2 } else { 5 }
+        );
+        assert_eq!(
+            fallback.requests.lock().unwrap().len(),
+            if fail_over { 3 } else { 0 }
+        );
+        let path = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .path
+            .clone()
+            .unwrap();
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        let messages = reopened.to_messages_for_current_path();
+        for id in ["write-once", "fresh-write"] {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        Message::ToolResult(result) if result.tool_call_id == id && !result.is_error
+                    ))
+                    .count(),
+                1,
+                "each completed tool is persisted exactly once"
+            );
+        }
+        for text in ["write once before recovery", "a separate tool budget"] {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        Message::User(UserMessage { content: UserContent::Text(value), .. })
+                            if value == text
+                    ))
+                    .count(),
+                1,
+                "each authored request is persisted exactly once"
+            );
+        }
+        assert!(messages.iter().all(|message| !matches!(
+            message,
+            Message::ToolResult(result) if result.tool_call_id == "over-budget"
+        )));
+    }
 }
 
 #[test]

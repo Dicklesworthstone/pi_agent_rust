@@ -383,7 +383,7 @@ mod tests {
                     .await,
                 Err(Error::Aborted)
             ));
-            let expired = PrewalkRunBudget {
+            let expired = LogicalRunBudget {
                 started: Instant::now()
                     .checked_sub(Duration::from_secs(2))
                     .expect("the clock origin is over 2 s ago"),
@@ -393,7 +393,7 @@ mod tests {
                 turn_index: 4,
                 warned: false,
             };
-            session.agent.prewalk_budget = Some(expired);
+            session.agent.run_budget = Some(expired);
             assert!(
                 matches!(
                     session
@@ -432,7 +432,7 @@ mod tests {
                 ..AgentConfig::default()
             },
         );
-        agent.prewalk_budget = Some(PrewalkRunBudget {
+        agent.run_budget = Some(LogicalRunBudget {
             started,
             max_time,
             iterations: 3,
@@ -463,7 +463,7 @@ mod tests {
             );
             let mut scope = SessionTurnPromptGuard::new(&mut session, None);
             scope.limit_max_time(wake_started, Some(Duration::from_secs(10)));
-            let budget = scope.session.agent.prewalk_budget.expect("active prewalk");
+            let budget = scope.session.agent.run_budget.expect("active run");
             assert_eq!(budget.started, prewalk_started);
             assert_eq!(budget.max_time, Some(Duration::from_secs(expected_cap)));
             let advisor = AdvisorTurn::new(scope.session, Arc::new(|_| {}));
@@ -473,12 +473,12 @@ mod tests {
             scope
                 .session
                 .agent
-                .prewalk_budget
+                .run_budget
                 .as_mut()
                 .unwrap()
                 .iterations += 1;
             drop(scope);
-            let restored = session.agent.prewalk_budget.expect("surviving prewalk");
+            let restored = session.agent.run_budget.expect("surviving run");
             assert_eq!(restored.started, prewalk_started);
             assert_eq!(restored.max_time, original_cap);
             assert_eq!(
@@ -538,7 +538,7 @@ mod tests {
             .await
             .expect("wake must retain time for its second provider request");
             drop(wake);
-            let restored = session.agent.prewalk_budget.expect("surviving prewalk");
+            let restored = session.agent.run_budget.expect("surviving run");
             assert_eq!(restored.started, started);
             assert_eq!(restored.max_time, Some(Duration::from_secs(600)));
             assert_eq!(
@@ -3038,6 +3038,116 @@ mod tests {
             assert_eq!(recorded_calls[0].messages.len(), 2);
             assert_user_text(&recorded_calls[0].messages[0], "older staged follow-up");
             assert_user_text(&recorded_calls[0].messages[1], "new owning follow-up");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn required_initial_follow_up_retains_accepted_batch_after_shared_time_cap() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    max_time: Some(Duration::from_secs(60)),
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            let expected = [
+                "older staged follow-up",
+                "owning follow-up one",
+                "owning follow-up two",
+            ];
+            agent.queue_follow_up(user_message(expected[0]));
+
+            let owning_source_fetched = StdArc::new(AtomicBool::new(false));
+            let fetched_for_source = StdArc::clone(&owning_source_fetched);
+            let queued_owning = StdArc::new(StdTestMutex::new(Some(
+                expected[1..]
+                    .iter()
+                    .map(|text| queued_user_message(text))
+                    .collect::<Vec<_>>(),
+            )));
+            let queued_for_source = StdArc::clone(&queued_owning);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    fetched_for_source.store(true, Ordering::SeqCst);
+                    let queued_for_source = StdArc::clone(&queued_for_source);
+                    Box::pin(async move {
+                        queued_for_source
+                            .lock()
+                            .expect("owning follow-up queue")
+                            .take()
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
+            agent.begin_logical_run();
+            agent.run_budget.as_mut().expect("active logical run").started = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .expect("the clock origin is over 120 s ago");
+
+            let ready_checked = StdArc::new(AtomicBool::new(false));
+            let ready_for_callback = StdArc::clone(&ready_checked);
+            let fetched_for_callback = StdArc::clone(&owning_source_fetched);
+            let capped = agent
+                .run_continue_with_follow_up_on_ready_with_abort(
+                    None,
+                    move || {
+                        ready_for_callback.store(true, Ordering::SeqCst);
+                        fetched_for_callback.load(Ordering::SeqCst)
+                    },
+                    |_| {},
+                )
+                .await
+                .expect("time-capped initial follow-up");
+            assert!(assistant_text_content(&capped.content).contains("time cap reached"));
+            assert!(
+                ready_checked.load(Ordering::SeqCst),
+                "the owning-source handshake must still complete before the cap stop"
+            );
+            assert!(
+                calls.lock().expect("provider calls").is_empty(),
+                "a required initial follow-up must not restart the shared clock"
+            );
+            assert_eq!(agent.message_queue.follow_up.len(), expected.len());
+            for (entry, text) in agent.message_queue.follow_up.iter().zip(&expected) {
+                assert_user_text(&entry.delivery.message, text);
+            }
+
+            agent.finish_logical_run(false);
+            agent.begin_logical_run();
+            agent
+                .run_continue_with_follow_up_with_abort(None, |_| {})
+                .await
+                .expect("a fresh logical run resumes the retained batch");
+            agent.finish_logical_run(false);
+            assert!(agent.message_queue.follow_up.is_empty());
+            let recorded_calls = calls.lock().expect("provider calls").clone();
+            assert_eq!(recorded_calls.len(), 1);
+            let user_texts = recorded_calls[0]
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_texts,
+                expected.to_vec(),
+                "each accepted follow-up must reach the provider exactly once"
+            );
         });
     }
 
@@ -9460,7 +9570,7 @@ mod tests {
                 AgentConfig::default(),
             );
             agent.prewalk = Some(native_prewalk_state(true));
-            agent.begin_prewalk_run();
+            agent.begin_logical_run();
             let (abort, signal) = AbortHandle::new();
             let _ = agent.run_with_abort("Implement", Some(signal), move |event| {
                 if matches!(event, AgentEvent::ToolExecutionEnd { tool_name, .. } if tool_name == "write") {
@@ -9471,7 +9581,7 @@ mod tests {
             assert_eq!(std::fs::read_to_string(root.path().join("project.txt")).unwrap(), "committed");
             assert!(!root.path().join("too-late.txt").exists());
             assert!(!agent.prewalk.as_ref().expect("armed").yielded());
-            agent.finish_prewalk_run(true);
+            agent.finish_logical_run(true);
             assert!(agent.prewalk.is_none());
         });
     }
@@ -9500,7 +9610,7 @@ mod tests {
                 assert!(tools.is_discoverable("ast_edit"));
                 let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
                 agent.prewalk = Some(native_prewalk_state(true));
-                agent.begin_prewalk_run();
+                agent.begin_logical_run();
                 let mut state = native_prewalk_state(true);
                 for (replacement, expected_stage) in [
                     ("$EXPR.unwrap()", false),
@@ -9604,7 +9714,7 @@ mod tests {
                 AgentConfig::default(),
             );
             agent.prewalk = Some(native_prewalk_state(true));
-            agent.begin_prewalk_run();
+            agent.begin_logical_run();
             agent.run("Implement", |_| {}).await.unwrap();
             assert!(!agent.prewalk.as_ref().unwrap().ready());
             assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
