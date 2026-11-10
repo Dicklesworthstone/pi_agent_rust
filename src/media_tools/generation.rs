@@ -10,6 +10,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+pub(super) mod billing;
 mod inputs;
 
 const NAME: &str = "generate_image";
@@ -208,9 +209,8 @@ impl Tool for GenerateImageTool {
             None => (super::MIN_VALID_PNG.to_vec(), "image/png"),
             Some(api) => {
                 let response = api
-                    .post(&endpoint, &payload, MAX_RESPONSE_BYTES)
-                    .await?
-                    .json(NAME)?;
+                    .post_image(model, &endpoint, &payload, MAX_RESPONSE_BYTES)
+                    .await?;
                 parse_image(provider, &response)?
             }
         };
@@ -540,11 +540,349 @@ fn parse_image(provider: &str, response: &Value) -> Result<(Vec<u8>, &'static st
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // Exact quarter-dollar fixtures check once-only auxiliary billing.
 mod tests {
     use super::super::transport::tests::peer;
     use super::*;
+    use crate::cost::CostBudget;
+    use crate::tools::ToolRegistry;
+    use std::sync::Arc;
 
     const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==";
+
+    fn budgeted_session(
+        tool: GenerateImageTool,
+        budget: &CostBudget,
+    ) -> (crate::agent::AgentSession, Arc<ToolRegistry>) {
+        let agent = crate::agent::Agent::new(
+            Arc::new(crate::providers::openai::OpenAIProvider::new(
+                "primary-fixture",
+            )),
+            ToolRegistry::from_tools(vec![Box::new(tool)]),
+            crate::agent::AgentConfig {
+                cost_budget: Some(budget.clone()),
+                ..Default::default()
+            },
+        );
+        let retained = agent.shared_tools().snapshot();
+        let session = crate::agent::AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(
+                crate::session::Session::in_memory(),
+            )),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        (session, retained)
+    }
+
+    #[test]
+    fn native_images_charge_the_owning_session_and_stop_the_next_request() {
+        for (provider, model, response, expected) in [
+            (
+                "openai",
+                "gpt-image-1.5",
+                json!({"data":[{"b64_json":RED_PNG}], "usage":{
+                    "input_tokens":500_000,"output_tokens":250_000,"total_tokens":750_000,
+                    "input_tokens_details":{"text_tokens":250_000,"image_tokens":250_000}}}),
+                11.25,
+            ),
+            (
+                "gemini",
+                "gemini-3.1-flash-image",
+                json!({"candidates":[{"finishReason":"STOP","content":{"parts":[
+                    {"inlineData":{"mimeType":"image/png","data":RED_PNG}}
+                ]}}], "usageMetadata":{
+                    "promptTokenCount":500_000,"candidatesTokenCount":500_000,
+                    "thoughtsTokenCount":250_000,"totalTokenCount":1_250_000,
+                    "candidatesTokensDetails":[
+                        {"modality":"TEXT","tokenCount":250_000},
+                        {"modality":"IMAGE","tokenCount":250_000}]}}),
+                16.75,
+            ),
+            (
+                "xai",
+                "grok-imagine-image-2.0",
+                json!({"data":[{"b64_json":RED_PNG}],
+                    "usage":{"cost_in_usd_ticks":12_500_000_000_u64}}),
+                1.25,
+            ),
+        ] {
+            let (endpoint, worker) = peer(
+                200,
+                "application/json",
+                // ubs:ignore[rust.ownership.unwrap-expect] -- Serializing this JSON fixture must succeed.
+                serde_json::to_vec(&response).unwrap(),
+            );
+            // ubs:ignore[rust.ownership.unwrap-expect] -- A fixture workspace failure must fail the test.
+            let directory = tempfile::tempdir().unwrap();
+            let tool = GenerateImageTool::with_defaults(
+                directory.path(),
+                Some(provider.into()),
+                Some(model.into()),
+            )
+            .with_mock(false)
+            .with_api_key(Some("generation-cost-key".into()))
+            .with_base_url(endpoint);
+            // ubs:ignore[rust.ownership.unwrap-expect] -- These fixed valid limits must create a budget.
+            let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let (_session, registry) = budgeted_session(tool, &budget);
+            // ubs:ignore[rust.ownership.unwrap-expect] -- budgeted_session registers this exact tool.
+            let tool = registry.get(NAME).unwrap();
+            // ubs:ignore[rust.ownership.unwrap-expect] -- Runtime setup failure must fail the fixture.
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let output = runtime
+                .block_on(tool.execute(
+                    "charged",
+                    json!({"prompt":"Draw a red square","output_path":"out.png"}),
+                    None,
+                ))
+                .unwrap();
+            // ubs:ignore[rust.panic.assert-macros] -- This successful image fixture must return success.
+            assert!(!output.is_error);
+            // ubs:ignore[rust.panic.assert-macros] -- The fixture must publish the returned provider image.
+            assert!(directory.path().join("out.png").is_file());
+            assert_eq!(budget.spent(), expected, "{provider}");
+            assert_eq!(budget.snapshot().pending, 0.0);
+            // ubs:ignore[rust.panic.assert-macros] -- A consumed cap must reject this second request.
+            assert!(matches!(
+                runtime.block_on(tool.execute(
+                    "capped",
+                    json!({"prompt":"Draw another","output_path":"next.png"}),
+                    None,
+                )),
+                Err(Error::CostCap { .. })
+            ));
+            assert!(!directory.path().join("next.png").exists());
+            // Images have no primary assistant usage entry. Their auxiliary
+            // charge must survive checkpoints without being counted twice.
+            let mut saved = crate::session::Session::in_memory();
+            budget.checkpoint(&mut saved).unwrap();
+            budget.checkpoint(&mut saved).unwrap();
+            assert_eq!(crate::cost::recorded_spend(&saved).unwrap(), expected);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_image_processing_and_http_errors_do_not_refund_reported_bills() {
+        for (status, mime, data, path) in [
+            (200, "application/json", json!([]), "out.png"),
+            (
+                200,
+                "application/json",
+                json!([{"b64_json":"invalid"}]),
+                "out.png",
+            ),
+            (
+                200,
+                "application/json",
+                json!([{"b64_json":RED_PNG,"respect_moderation":false}]),
+                "out.png",
+            ),
+            (429, "application/json", json!([]), "out.png"),
+            (200, "text/plain", json!([{"b64_json":RED_PNG}]), "out.png"),
+            (
+                200,
+                "application/json",
+                json!([{"b64_json":RED_PNG}]),
+                "out.jpg",
+            ),
+        ] {
+            let response = json!({"data":data,"usage":{"cost":1.25}});
+            let (endpoint, worker) = peer(status, mime, serde_json::to_vec(&response).unwrap());
+            let directory = tempfile::tempdir().unwrap();
+            let tool = GenerateImageTool::with_provider(directory.path(), Some("openai".into()))
+                .with_model(Some("gpt-image-1.5".into()))
+                .with_mock(false)
+                .with_api_key(Some("generation-cost-key".into()))
+                .with_base_url(endpoint);
+            let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let (_session, registry) = budgeted_session(tool, &budget);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(registry.get(NAME).unwrap().execute(
+                        "failed",
+                        json!({"prompt":"Draw a red square","output_path":path}),
+                        None,
+                    ))
+                    .is_err()
+            );
+            assert!(!directory.path().join(path).exists());
+            assert_eq!(budget.spent(), 1.25, "{status} {mime} {path}");
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(budget.admit(), Err(Error::CostCap { .. })));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_image_billing_quarantines_further_generation() {
+        for (provider, usage) in [
+            ("openai", json!({"cost":-1.0})),
+            ("openai", json!({"cost":"1.25"})),
+            ("openai", json!({"cost":null})),
+            (
+                "openai",
+                json!({"input_tokens":1,"output_tokens":1,"total_tokens":2,
+                "input_tokens_details":{"text_tokens":1,"image_tokens":1}}),
+            ),
+            ("xai", json!({"cost_in_usd_ticks":-1})),
+            ("xai", json!({"cost_in_usd_ticks":1.5})),
+        ] {
+            let response = json!({"data":[{"b64_json":RED_PNG}],"usage":usage});
+            let (endpoint, worker) = peer(
+                200,
+                "application/json",
+                serde_json::to_vec(&response).unwrap(),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let tool = GenerateImageTool::with_provider(directory.path(), Some(provider.into()))
+                .with_model(Some(if provider == "xai" {
+                    "grok-imagine-image-2.0".into()
+                } else {
+                    "gpt-image-1.5".into()
+                }))
+                .with_mock(false)
+                .with_api_key(Some("generation-cost-key".into()))
+                .with_base_url(endpoint);
+            let budget = CostBudget::new(None, Some(10.0), 0.25).unwrap();
+            let (_session, registry) = budgeted_session(tool, &budget);
+            let tool = registry.get(NAME).unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(tool.execute(
+                        "invalid",
+                        json!({"prompt":"Draw a red square","output_path":"out.png"}),
+                        None,
+                    ))
+                    .is_err()
+            );
+            assert!(!directory.path().join("out.png").exists());
+            assert_eq!(budget.spent(), 0.25);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(
+                runtime.block_on(tool.execute(
+                    "quarantined",
+                    json!({"prompt":"Draw another","output_path":"next.png"}),
+                    None,
+                )),
+                Err(Error::Session(message)) if message.contains("model cost accounting unavailable")
+            ));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn image_editing_honors_an_explicit_zero_bill() {
+        let response = json!({"data":[{"b64_json":RED_PNG}],"usage":{
+            "cost":0.0,"input_tokens":500_000,"output_tokens":250_000,"total_tokens":750_000,
+            "input_tokens_details":{"text_tokens":250_000,"image_tokens":250_000}}});
+        let (endpoint, worker) = peer(
+            200,
+            "application/json",
+            serde_json::to_vec(&response).unwrap(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("source.png"),
+            super::super::MIN_VALID_PNG,
+        )
+        .unwrap();
+        let tool = GenerateImageTool::with_provider(directory.path(), Some("openai".into()))
+            .with_model(Some("gpt-image-1.5".into()))
+            .with_mock(false)
+            .with_api_key(Some("generation-cost-key".into()))
+            .with_base_url(endpoint);
+        let budget = CostBudget::new(None, Some(1.0), 0.25).unwrap();
+        let (_session, registry) = budgeted_session(tool, &budget);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(registry.get(NAME).unwrap().execute(
+                "zero-bill-edit",
+                json!({"prompt":"Make it red","image_path":"source.png","output_path":"out.png"}),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(output.details.as_ref().unwrap()["edited"], true);
+        assert_eq!(budget.spent(), 0.25);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert!(budget.admit().is_ok());
+        assert!(
+            worker
+                .join()
+                .unwrap()
+                .headers
+                .starts_with("POST /v1/images/edits ")
+        );
+    }
+
+    #[test]
+    fn a_retained_image_request_charges_its_original_saved_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        let replacement = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(budget.clone()));
+        let response = json!({"data":[{"b64_json":RED_PNG}],
+            "usage":{"cost_in_usd_ticks":12_500_000_000_u64}});
+        let (endpoint, worker) = peer(
+            200,
+            "application/json",
+            serde_json::to_vec(&response).unwrap(),
+        );
+        let mut transport = transport::Transport::default().with_base_url(endpoint);
+        transport.bind_cost_scope(scope.clone());
+        let mut saved =
+            crate::session::Session::create_with_dir(Some(directory.path().to_path_buf()));
+        budget.checkpoint(&mut saved).unwrap();
+        runtime.block_on(saved.save()).unwrap();
+        let path = saved.path.clone().unwrap();
+        let transcript = std::fs::read(&path).unwrap();
+        runtime.block_on(async {
+            let api = transport
+                .api(
+                    NAME,
+                    "xai",
+                    Some("generation-cost-key"),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            scope.set(Some(replacement.clone()));
+            budget.retire_session(&saved, api.owner.cx()).unwrap();
+            api.post_image(
+                "grok-imagine-image-2.0",
+                "images/generations",
+                &json!({"model":"grok-imagine-image-2.0","prompt":"Draw a square"}),
+                4096,
+            )
+            .await
+            .unwrap();
+        });
+        worker.join().unwrap();
+        assert_eq!(budget.spent(), 1.25);
+        assert_eq!(replacement.spent(), 0.0);
+        assert_eq!(std::fs::read(&path).unwrap(), transcript);
+        let reopened = runtime
+            .block_on(crate::session::Session::open(path.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(crate::cost::recorded_spend(&reopened).unwrap(), 1.25);
+        assert_eq!(crate::cost::recorded_spend(&reopened).unwrap(), 1.25);
+    }
 
     #[test]
     fn generation_calls_each_native_api_and_publishes_the_received_pixels() {

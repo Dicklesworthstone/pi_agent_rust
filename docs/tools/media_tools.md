@@ -111,12 +111,35 @@ be established. An explicit media API key does not bypass this check. Each
 invocation retains the account it started with; a retained tool uses the
 current account on its next invocation.
 
-The adapters do not yet add their own inspection, image, or speech charges to
-the session ledger. They enforce admission against spend already recorded by
-the rest of the session, so `--warn-cost` and `--max-cost` totals do not include
-media charges and do not cap cumulative media spending. No media USD price is
-inferred from token counts or image/audio sizes. An admitted request is never
-automatically replayed.
+Inspection and supported image-generation charges also increase the shared
+balance. Inspection uses the selected model's catalog token prices or an
+explicit provider bill. Generation and editing use their own billing units:
+
+| Provider/model | Image charge used by the budget |
+|---|---|
+| OpenAI `gpt-image-1.5` and `gpt-image-1.5-2025-12-16` | Provider token counts partitioned into text/image input and output, using the published image-model prices |
+| Gemini `gemini-3.1-flash-image` | Prompt tokens plus separate text, thinking and image output counts, using standard image-model prices |
+| xAI image models | The actual billed total in `usage.cost_in_usd_ticks` |
+| OpenAI-compatible image gateways | An explicit `usage.cost` USD total, including zero, overrides token estimates |
+
+Image-model prices are a snapshot of the [OpenAI model pricing](https://developers.openai.com/api/docs/models/gpt-image-1.5)
+and [Gemini standard pricing](https://ai.google.dev/gemini-api/docs/pricing/)
+checked on November 10, 2026. xAI's [cost-tracking field](https://docs.x.ai/developers/cost-tracking)
+reports the actual charge after discounts. Image tokens never use the ordinary
+text-model price, and output size or pixel count is not used to invent a bill.
+
+Charges are retained even when the provider refuses the image, returns invalid
+image bytes, or the output file cannot be published. A request that finishes
+after a session switch still charges its original session. Malformed explicit
+bills or inconsistent token partitions block further spending on that account.
+
+An unknown image model, missing billing evidence, or an unsupported Gemini
+cache, tool or service-tier pricing dimension remains unpriced. Native speech
+currently returns audio without usable billing evidence and does not add its
+own charge. Those requests still check the shared cap before dispatch, but
+their unknown costs are excluded from the total. Cancellation before billing
+arrives can also leave the final cost unknown. Already-admitted work can finish
+above the cap; no admitted media request is automatically replayed.
 
 ## Image inspection
 

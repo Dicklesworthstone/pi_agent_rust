@@ -5,7 +5,9 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use futures::future::{Either, select};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -157,6 +159,113 @@ pub(super) struct Response {
     parsed_json: Option<Value>,
 }
 
+#[derive(Clone, Copy)]
+enum Billing<'a> {
+    Vision(&'a str),
+    Image(&'a str),
+}
+
+/// Inspect only billing envelopes before `Value` can overwrite repeated keys.
+/// Inside an envelope, arrays and nested objects retain the same uniqueness
+/// rule. Other response content is skipped without changing its interpretation.
+struct BillingKeys {
+    envelope: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for BillingKeys {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<bool, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BillingKeys {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("native media billing metadata")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<bool, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut names = BTreeSet::new();
+        let mut duplicate = false;
+        while let Some(name) = map.next_key::<String>()? {
+            if !self.envelope || matches!(name.as_str(), "usage" | "usageMetadata") {
+                duplicate |= !names.insert(name);
+                duplicate |= map.next_value_seed(Self { envelope: false })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(duplicate)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<bool, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut duplicate = false;
+        if self.envelope {
+            // A top-level array has no native billing envelope. Its ordinary
+            // response validation remains responsible for that shape.
+            while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        } else {
+            while let Some(nested) = sequence.next_element_seed(Self { envelope: false })? {
+                duplicate |= nested;
+            }
+        }
+        Ok(duplicate)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<bool, E> {
+        Ok(false)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<bool, E> {
+        Ok(false)
+    }
+}
+
+fn reject_duplicate_billing(bytes: &[u8], attempt: &mut crate::cost::CostAttempt) -> Result<()> {
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    if let Ok(true) = (BillingKeys { envelope: true }).deserialize(&mut decoder)
+        && decoder.end().is_ok()
+    {
+        // Do not select either conflicting bill or replace previously known
+        // spend. The attempt's normal cleanup retains its valid observations.
+        let _ = attempt.observe(f64::NAN);
+        return Err(Error::session(
+            "native media response has duplicate billing fields",
+        ));
+    }
+    // Syntax errors and invalid billing types retain their existing response
+    // and provider-specific validation paths; this guard only adds uniqueness.
+    Ok(())
+}
+
 impl Response {
     pub(super) fn json(self, tool: &str) -> Result<Value> {
         if !self.content_type.is_empty()
@@ -197,41 +306,65 @@ impl Api<'_> {
         payload: &Value,
         limit: usize,
     ) -> Result<Value> {
-        self.post_inner(path, payload, limit, Some(model))
+        self.post_inner(path, payload, limit, Some(Billing::Vision(model)))
             .await?
             .json(self.tool)
     }
 
-    fn settle_vision_usage(
+    /// Retain the invocation's account through image generation and editing.
+    /// Their image-token tariffs are separate from ordinary vision/text rates.
+    pub(super) async fn post_image(
         &self,
         model: &str,
+        path: &str,
+        payload: &Value,
+        limit: usize,
+    ) -> Result<Value> {
+        self.post_inner(path, payload, limit, Some(Billing::Image(model)))
+            .await?
+            .json(self.tool)
+    }
+
+    fn vision_cost(&self, model: &str, response: &Value) -> Result<Option<f64>> {
+        let Some(mut usage) = super::vision::response_usage(self.provider, response)? else {
+            return Ok(None);
+        };
+        let rates = self
+            .model_costs
+            .get(self.provider)
+            .and_then(|models| models.get(&model.to_ascii_lowercase()))
+            .filter(|rates| rates.is_priced());
+        if let Some(rates) = rates {
+            rates.price_usage(&mut usage)?;
+        } else if matches!(
+            usage.billing,
+            Some(crate::model::BillingUsage::ReportedTotal { .. })
+        ) {
+            crate::provider::ModelCost::default().price_usage(&mut usage)?;
+        } else {
+            return Ok(None);
+        }
+        Ok(Some(usage.cost.total))
+    }
+
+    fn settle_usage(
+        &self,
+        billing: Billing<'_>,
         response: &Value,
         attempt: &mut crate::cost::CostAttempt,
     ) -> Result<()> {
-        let cost: Result<f64> = (|| {
-            let Some(mut usage) = super::vision::response_usage(self.provider, response)? else {
-                // A response without billing evidence cannot be priced from
-                // its text or pixels. Preserve the same unpriced semantics as
-                // the normal provider guard; never invent a bill.
-                return Ok(0.0);
-            };
-            let rates = self
-                .model_costs
-                .get(self.provider)
-                .and_then(|models| models.get(&model.to_ascii_lowercase()))
-                .filter(|rates| rates.is_priced());
-            if let Some(rates) = rates {
-                rates.price_usage(&mut usage)?;
-            } else if matches!(
-                usage.billing,
-                Some(crate::model::BillingUsage::ReportedTotal { .. })
-            ) {
-                crate::provider::ModelCost::default().price_usage(&mut usage)?;
+        let cost = match billing {
+            Billing::Vision(model) => self.vision_cost(model, response),
+            Billing::Image(model) => {
+                super::generation::billing::response_cost(self.provider, model, response)
             }
-            Ok(usage.cost.total)
-        })();
+        };
         match cost {
-            Ok(cost) => attempt.finish(cost),
+            Ok(Some(cost)) => attempt.finish(cost),
+            // No observed charge can be invented from content or file size,
+            // but finalizing this attempt can itself fail (for example when a
+            // remote parent disconnects). Propagate that accounting failure.
+            Ok(None) => attempt.finish(0.0),
             Err(error) => {
                 // Invalid evidence permanently fences further admissions but
                 // cannot prevent already-owned sibling attempts from settling.
@@ -248,7 +381,7 @@ impl Api<'_> {
         path: &str,
         payload: &Value,
         limit: usize,
-        vision_model: Option<&str>,
+        billing: Option<Billing<'_>>,
     ) -> Result<Response> {
         check_owner(self.tool, &self.owner)?;
         remaining_timeout(self.tool, self.started, self.timeout)?;
@@ -281,7 +414,7 @@ impl Api<'_> {
             // Sibling work may exhaust or quarantine the captured account
             // while credentials and input payloads are being prepared.
             remaining_timeout(self.tool, self.started, self.timeout)?;
-            let mut attempt = match (&self.cost_budget, vision_model) {
+            let mut attempt = match (&self.cost_budget, billing) {
                 (Some(budget), Some(_)) => Some(budget.start_attempt()?),
                 (Some(budget), None) => {
                     budget.admit()?;
@@ -309,10 +442,11 @@ impl Api<'_> {
                 }
                 let detail = match response.bytes_limited(16 * 1024).await {
                     Ok(body) => {
-                        if let (Some(model), Some(attempt)) = (vision_model, attempt.as_mut())
-                            && let Ok(json) = serde_json::from_slice::<Value>(&body)
-                        {
-                            self.settle_vision_usage(model, &json, attempt)?;
+                        if let (Some(billing), Some(attempt)) = (billing, attempt.as_mut()) {
+                            reject_duplicate_billing(&body, attempt)?;
+                            if let Ok(json) = serde_json::from_slice::<Value>(&body) {
+                                self.settle_usage(billing, &json, attempt)?;
+                            }
                         }
                         self.scrub(&String::from_utf8_lossy(&body), 2048)
                     }
@@ -346,11 +480,11 @@ impl Api<'_> {
                     ),
                 )
             })?;
-            let parsed_json = if let (Some(model), Some(attempt)) = (vision_model, attempt.as_mut())
-            {
+            let parsed_json = if let (Some(billing), Some(attempt)) = (billing, attempt.as_mut()) {
+                reject_duplicate_billing(&bytes, attempt)?;
                 let json = serde_json::from_slice::<Value>(&bytes)
                     .map_err(|_| Error::tool(self.tool, "provider returned invalid JSON"))?;
-                self.settle_vision_usage(model, &json, attempt)?;
+                self.settle_usage(billing, &json, attempt)?;
                 Some(json)
             } else {
                 None
@@ -779,6 +913,146 @@ pub(super) mod tests {
         write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
         socket.write_all(body).unwrap();
         captured
+    }
+
+    fn billed_wire_exchange(
+        provider: &'static str,
+        billing: Billing<'_>,
+        status: u16,
+        body: &str,
+    ) -> (Result<Value>, crate::cost::CostBudget) {
+        let (endpoint, worker) = peer(status, "application/json", body.as_bytes().to_vec());
+        let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.5).unwrap();
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(budget.clone()));
+        let mut transport = Transport::default().with_base_url(endpoint);
+        transport.bind_cost_scope(scope);
+        // An already-owned sibling must retain acknowledged partial spending
+        // even when the new wire response quarantines the shared account.
+        let mut sibling = budget.start_attempt().unwrap();
+        sibling.observe(0.25).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let name = match billing {
+                Billing::Image(_) => "generate_image",
+                Billing::Vision(_) => "inspect_image",
+            };
+            let api = transport
+                .api(
+                    name,
+                    provider,
+                    Some("billing-wire-key"),
+                    Duration::from_secs(2),
+                )
+                .await?;
+            match billing {
+                Billing::Image(model) => {
+                    api.post_image(model, "images/generations", &serde_json::json!({}), 4096)
+                        .await
+                }
+                Billing::Vision(model) => {
+                    api.post_vision(model, "chat/completions", &serde_json::json!({}), 4096)
+                        .await
+                }
+            }
+        });
+        worker.join().unwrap();
+        drop(sibling);
+        (result, budget)
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact quarter-dollar fixtures retain prior spending.
+    fn duplicate_billing_envelopes_quarantine_image_and_vision_accounts() {
+        for (provider, billing, status, wire) in [
+            (
+                "openai",
+                Billing::Image("gpt-image-1.5"),
+                200,
+                r#"{"usage":{"cost":1.25},"usage":{"cost":0},"data":[]}"#,
+            ),
+            (
+                "openai",
+                Billing::Vision("gpt-4.1-mini"),
+                429,
+                r#"{"error":{"message":"limited"},"usage":null,"usage":{"cost":0}}"#,
+            ),
+            (
+                "gemini",
+                Billing::Image("gemini-3.1-flash-image"),
+                200,
+                r#"{"usageMetadata":{"promptTokenCount":1,"totalTokenCount":1},
+                    "usageMetadata":{"promptTokenCount":0,"totalTokenCount":0}}"#,
+            ),
+        ] {
+            let (result, budget) = billed_wire_exchange(provider, billing, status, wire);
+            assert!(matches!(result, Err(Error::Session(message))
+                if message.contains("duplicate billing fields")));
+            assert_eq!(budget.spent(), 0.75);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(budget.admit(), Err(Error::Session(_))));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact quarter-dollar fixtures retain prior spending.
+    fn duplicate_nested_billing_fields_cannot_hide_positive_bills() {
+        for (provider, billing, status, wire) in [
+            (
+                "xai",
+                Billing::Image("grok-imagine-image-2.0"),
+                200,
+                r#"{"usage":{"cost_in_usd_ticks":12500000000,"cost_in_usd_ticks":0}}"#,
+            ),
+            (
+                "openai",
+                Billing::Vision("gpt-4.1-mini"),
+                200,
+                r#"{"usage":{"cost":1.25,"co\u0073t":0}}"#,
+            ),
+            (
+                "openai",
+                Billing::Image("gpt-image-1.5"),
+                429,
+                r#"{"usage":{"input_tokens":0,"output_tokens":0,
+                    "input_tokens_details":{"text_tokens":2,"text_tokens":0,"image_tokens":0}}}"#,
+            ),
+            (
+                "gemini",
+                Billing::Image("gemini-3.1-flash-image"),
+                200,
+                r#"{"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,
+                    "totalTokenCount":0,"candidatesTokensDetails":[
+                        {"modality":"IMAGE","tokenCount":1120,"tokenCount":0}]}}"#,
+            ),
+        ] {
+            let (result, budget) = billed_wire_exchange(provider, billing, status, wire);
+            assert!(matches!(result, Err(Error::Session(message))
+                if message.contains("duplicate billing fields")));
+            assert_eq!(budget.spent(), 0.75);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(budget.admit(), Err(Error::Session(_))));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Exact quarter-dollar fixtures verify the known bill.
+    fn duplicate_content_fields_do_not_quarantine_media_billing() {
+        for billing in [
+            Billing::Image("gpt-image-1.5"),
+            Billing::Vision("gpt-4.1-mini"),
+        ] {
+            let wire = r#"{"usage":{"cost":1.25},"data":[{"label":"old","label":"new"}],
+                "metadata":{"usage":{"cost":2,"cost":0}},"extra":1,"extra":2}"#;
+            let (result, budget) = billed_wire_exchange("openai", billing, 200, wire);
+            let response = result.expect("content duplicates must retain normal JSON behavior");
+            assert_eq!(response["data"][0]["label"], "new");
+            assert_eq!(budget.spent(), 2.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(budget.admit().is_ok());
+        }
     }
 
     #[test]
