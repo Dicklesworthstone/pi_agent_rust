@@ -6505,6 +6505,322 @@ mod tests {
         });
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum PublicRecovery {
+        Retry,
+        CommitFailover,
+        WalkFailover,
+        RestorePrimary,
+    }
+
+    async fn invoke_public_recovery(
+        session: &mut AgentSession,
+        operation: PublicRecovery,
+        models: &[ModelEntry],
+        auth: &AuthStorage,
+    ) -> Result<()> {
+        let cx = AgentCx::for_current_or_request();
+        let target = &models[1];
+        let active = (
+            session.agent.provider().name().to_string(),
+            session.agent.provider().model_id().to_string(),
+        );
+        match operation {
+            PublicRecovery::Retry => session.restore_retry_tail(&cx, true).await,
+            PublicRecovery::CommitFailover => {
+                let request = FailoverSwapRequest {
+                    entry: target,
+                    api_key: target.api_key.clone(),
+                    provider: crate::providers::create_provider(target, None)?,
+                    from_provider: &active.0,
+                    from_model: &active.1,
+                    class: crate::failover::FailoverClass::Transient,
+                    chain_position: 1,
+                    thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+                    require_incomplete_tail: true,
+                    primary: None,
+                    cooldown_secs: Some(0),
+                    lifecycle_id: Some("public-recovery-test"),
+                };
+                session.commit_failover(&cx, &request).await.map(|_| ())
+            }
+            PublicRecovery::WalkFailover => {
+                let chain = crate::failover::FailoverChain {
+                    entries: vec![format!("{}/{}", target.model.provider, target.model.id)],
+                };
+                let attempt = FailoverSwapAttempt {
+                    chain: &chain,
+                    start_position: 0,
+                    available_models: models,
+                    auth,
+                    cli_api_key: None,
+                    class: crate::failover::FailoverClass::Transient,
+                    thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+                    require_incomplete_tail: true,
+                    primary: None,
+                    cooldown_secs: Some(0),
+                    lifecycle_id: Some("public-recovery-test"),
+                };
+                let outcome = session.try_failover(&cx, &attempt).await?;
+                assert!(outcome.committed.is_some(), "fixture target must be usable");
+                Ok(())
+            }
+            PublicRecovery::RestorePrimary => {
+                let primary = crate::failover::FailoverPrimary {
+                    provider: target.model.provider.clone(),
+                    model_id: target.model.id.clone(),
+                    requested_thinking_level: crate::model::ThinkingLevel::Off,
+                };
+                let request = PrimaryRestoreRequest {
+                    primary: &primary,
+                    active: &active,
+                    cooldown_elapsed: true,
+                    available_models: models,
+                    auth,
+                    cli_api_key: None,
+                    strict_invariants: false,
+                    invalidate_background_compaction: true,
+                };
+                assert!(
+                    session.restore_primary(&cx, &request).await?.is_some(),
+                    "fixture primary must be restorable"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn public_recovery_fixture(
+        root: &Path,
+    ) -> (AgentSession, Arc<CapturingProvider>, Vec<ModelEntry>) {
+        let provider = Arc::new(CapturingProvider::new("openai-completions"));
+        let models = vec![
+            extension_switch_entry(provider.name(), provider.model_id()),
+            extension_switch_entry("recovery-target", "next-model"),
+        ];
+        let mut stored = Session::create_with_dir(Some(root.to_path_buf()));
+        stored.path = Some(root.join("session.jsonl"));
+        stored.select_model(provider.name().to_string(), provider.model_id().to_string());
+        stored.append_message(user_message("accepted input").into());
+        let mut failed = assistant_message("partial response");
+        failed.provider = provider.name().to_string();
+        failed.model = provider.model_id().to_string();
+        failed.stop_reason = StopReason::Error;
+        failed.error_message = Some("server error".to_string());
+        stored.append_message(crate::session::SessionMessage::Assistant { message: failed });
+        let mut agent = Agent::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            ToolRegistry::new(&[], root, None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        let session = AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            true,
+            ResolvedCompactionSettings::default(),
+        )
+        .with_model_registry(ModelRegistry::from_entries_for_tests(models.clone()));
+        (session, provider, models)
+    }
+
+    #[test]
+    fn public_recovery_save_failures_fence_later_provider_requests() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                PublicRecovery::Retry,
+                PublicRecovery::CommitFailover,
+                PublicRecovery::WalkFailover,
+                PublicRecovery::RestorePrimary,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let blocked = dir.path().join("blocked.jsonl");
+                std::fs::create_dir(&blocked).expect("directory cannot hold a session");
+                let store = Arc::clone(&session.session);
+                store.try_lock().expect("session").path = Some(blocked);
+                let before = SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                    .expect("source snapshot");
+                let messages = serde_json::to_value(session.agent.messages()).expect("messages");
+
+                let error = invoke_public_recovery(&mut session, operation, &models, &auth)
+                    .await
+                    .expect_err("indeterminate persistence is never a declined candidate");
+                assert!(error.is_session_persistence(), "{operation:?}: {error}");
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                        .expect("live snapshot")
+                        == before,
+                    "{operation:?}: live history must remain unchanged"
+                );
+                assert_eq!(session.agent.provider().name(), provider.name());
+                assert_eq!(
+                    serde_json::to_value(session.agent.messages()).expect("messages"),
+                    messages
+                );
+
+                // Repairing the path does not establish what an interrupted
+                // earlier save committed. Only reopening creates a new owner.
+                store.try_lock().expect("session").path = Some(dir.path().join("repaired.jsonl"));
+                let error = session
+                    .run_text("must not reach the provider".to_string(), |_| {})
+                    .await
+                    .expect_err("the existing owner remains quarantined");
+                assert!(error.is_session_persistence(), "{operation:?}: {error}");
+                assert!(provider.calls().lock().expect("calls").is_empty());
+                assert!(
+                    invoke_public_recovery(&mut session, operation, &models, &auth)
+                        .await
+                        .is_err_and(|error| error.is_session_persistence()),
+                    "another recovery operation cannot clear an existing quarantine"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn public_recovery_waits_before_locking_session_and_cancels_without_quarantine() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                PublicRecovery::Retry,
+                PublicRecovery::CommitFailover,
+                PublicRecovery::WalkFailover,
+                PublicRecovery::RestorePrimary,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let store = Arc::clone(&session.session);
+                let gate = session.provider_admission_gate();
+                let actions = session.session_action_admission_gate();
+                let cx = AgentCx::for_current_or_request();
+                let in_flight = gate
+                    .acquire(cx.cx())
+                    .await
+                    .expect("active provider request");
+                let mut recovery = Box::pin(invoke_public_recovery(
+                    &mut session,
+                    operation,
+                    &models,
+                    &auth,
+                ));
+                assert!(
+                    futures::poll!(recovery.as_mut()).is_pending(),
+                    "{operation:?}"
+                );
+                assert!(
+                    store.try_lock().is_ok(),
+                    "provider callbacks need the store"
+                );
+                let mut callback_action = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(permit)) = futures::poll!(callback_action.as_mut())
+                else {
+                    panic!("waiting {operation:?} must not block active provider callbacks");
+                };
+                drop(permit);
+                drop(callback_action);
+                drop(recovery);
+                gate.ensure_allowed().expect("cancelled before persistence");
+                drop(in_flight);
+
+                let action = actions
+                    .acquire(cx.cx())
+                    .await
+                    .expect("active Session callback");
+                let mut recovery = Box::pin(invoke_public_recovery(
+                    &mut session,
+                    operation,
+                    &models,
+                    &auth,
+                ));
+                assert!(
+                    futures::poll!(recovery.as_mut()).is_pending(),
+                    "{operation:?}"
+                );
+                assert!(store.try_lock().is_ok());
+                drop(recovery);
+                gate.ensure_allowed()
+                    .expect("waiting on a callback made no change");
+                drop(action);
+
+                invoke_public_recovery(&mut session, operation, &models, &auth)
+                    .await
+                    .expect("cancelled preparation released both permits");
+                gate.ensure_allowed()
+                    .expect("successful installation clears quarantine");
+                assert!(provider.calls().lock().expect("calls").is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn public_recovery_dropped_during_save_keeps_live_state_and_quarantines() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                PublicRecovery::Retry,
+                PublicRecovery::CommitFailover,
+                PublicRecovery::WalkFailover,
+                PublicRecovery::RestorePrimary,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let store = Arc::clone(&session.session);
+                let gate = session.provider_admission_gate();
+                let before = SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                    .expect("source snapshot");
+                // Hold the real persistence lock so the blocking writer cannot
+                // finish before we cancel, even on a fast filesystem.
+                let disk_lock =
+                    crate::session::lock_session_persistence(&dir.path().join("session.jsonl"))
+                        .expect("hold persistence lock");
+                let mut recovery = Box::pin(invoke_public_recovery(
+                    &mut session,
+                    operation,
+                    &models,
+                    &auth,
+                ));
+                assert!(
+                    futures::poll!(recovery.as_mut()).is_pending(),
+                    "{operation:?}"
+                );
+                assert!(
+                    gate.reason().is_some(),
+                    "{operation:?}: the real persistence boundary must have been entered"
+                );
+                drop(recovery);
+                assert!(
+                    gate.ensure_allowed()
+                        .is_err_and(|error| error.is_session_persistence())
+                );
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                        .expect("live snapshot")
+                        == before
+                );
+                assert_eq!(session.agent.provider().name(), provider.name());
+                assert!(
+                    session
+                        .run_text("must remain fenced".to_string(), |_| {})
+                        .await
+                        .is_err_and(|error| error.is_session_persistence())
+                );
+                assert!(provider.calls().lock().expect("calls").is_empty());
+                drop(disk_lock);
+                // Drain the one-worker pool before the temporary store goes
+                // away; cancellation may leave its earlier write in flight.
+                asupersync::runtime::spawn_blocking(|| {}).await;
+            }
+        });
+    }
+
     #[test]
     fn compaction_runtime_handle_creates_fallback_runtime() {
         let dir = tempfile::tempdir().expect("tempdir");

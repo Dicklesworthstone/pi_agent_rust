@@ -2040,9 +2040,10 @@ pub struct PrimaryRestoreRequest<'a> {
     /// runtime or the persisted Session as a corrupted model of the session:
     /// it blocks provider admission and fails the call, because re-entering a
     /// provider against a session nobody can describe is how work gets
-    /// re-billed against a record that no longer matches it. Print has no
-    /// admission gate and no long-lived state to corrupt, so it declines and
-    /// runs the next prompt on the fallback, which is a correct outcome there.
+    /// re-billed against a record that no longer matches it. Print and the
+    /// SDK decline a stale selection and retain the fallback. Every surface
+    /// treats interrupted or failed persistence as terminal uncertainty and
+    /// quarantines provider admission regardless of this flag.
     ///
     /// Preserved rather than unified, because unifying it would silently
     /// change a surface people depend on; the divergence is tracked
@@ -20294,13 +20295,11 @@ impl AgentSession {
     /// its absence means the caller's model of the turn is wrong rather than
     /// that there is nothing to do.
     ///
-    /// Print mode and the RPC server each had their own copy of this, down to
-    /// the same error prose (bd-u2qv4). `admission` is what was genuinely
-    /// RPC's: the gate is blocked for the window between persistence and live
-    /// installation, so a crash in between leaves provider re-entry quarantined
-    /// rather than silently resumed. Surfaces without such a gate pass `None`.
-    /// It is taken here rather than wrapped around the call so the lock order —
-    /// inner session first, admission permit second — stays exactly as it was.
+    /// Every caller uses the session's provider-admission authority. A dropped
+    /// persistence future or failed save quarantines later provider requests,
+    /// including print mode and embedders that drive recovery directly.
+    /// Provider admission precedes Session-action and store locks so an active
+    /// extension completion can finish its Session callbacks while we wait.
     pub async fn restore_retry_tail(
         &mut self,
         cx: &crate::agent_cx::AgentCx,
@@ -20319,6 +20318,12 @@ impl AgentSession {
         require_incomplete_tail: bool,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<()> {
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
         let session_store = Arc::clone(&self.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx)
             .await
@@ -20338,17 +20343,13 @@ impl AgentSession {
 
         let restored_messages = candidate.to_messages_for_current_path();
         let save_enabled = self.save_enabled();
-        let _provider_transition = match admission {
-            Some(gate) => Some(
-                gate.begin_transition(
-                    "retry restoration persistence was interrupted before live installation completed"
-                        .to_string(),
-                    cx,
-                )
-                .await?,
-            ),
-            None => None,
-        };
+        let _provider_transition = ProviderSwapAdmission::Held(&authority)
+            .begin_transition(
+                "retry restoration persistence was interrupted before live installation completed"
+                    .to_string(),
+                cx,
+            )
+            .await?;
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -20356,9 +20357,7 @@ impl AgentSession {
             let reason = format!(
                 "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
             );
-            if let Some(gate) = admission {
-                gate.block(reason.clone());
-            }
+            admission.block(reason.clone());
             return Err(Error::session_persistence(reason));
         }
 
@@ -20370,9 +20369,7 @@ impl AgentSession {
         self.invalidate_background_compaction();
         *inner = candidate;
         self.agent.replace_messages(restored_messages);
-        if let Some(gate) = admission {
-            gate.clear();
-        }
+        admission.clear();
         Ok(())
     }
 
@@ -20460,7 +20457,13 @@ impl AgentSession {
         request: &PrimaryRestoreRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<Option<RestoredPrimary>> {
-        self.restore_primary_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.restore_primary_with_authority(cx, request, &authority)
             .await
     }
 
@@ -20589,10 +20592,9 @@ impl AgentSession {
             if let Some(gate) = gate {
                 gate.block(reason.clone());
             }
-            if request.strict_invariants {
-                return Err(Error::session_persistence(reason));
-            }
-            return Ok(None);
+            // Leniency applies to unavailable or stale destinations. Once a
+            // save has started, uncertainty is terminal on every surface.
+            return Err(Error::session_persistence(reason));
         }
 
         // No fallible operation remains after installing the candidate.
@@ -20804,7 +20806,13 @@ impl AgentSession {
         attempt: &FailoverSwapAttempt<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<FailoverSwapOutcome> {
-        self.try_failover_swap_admitted(cx, attempt, admission.map(ProviderSwapAdmission::Gate))
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.try_failover_with_authority(cx, attempt, &authority)
             .await
     }
 
@@ -21055,9 +21063,19 @@ impl AgentSession {
         request: &FailoverSwapRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<crate::model::ThinkingLevel> {
-        self.commit_failover_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
-            .await
-            .map(|(thinking_level, _)| thinking_level)
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.commit_failover_swap_admitted(
+            cx,
+            request,
+            Some(ProviderSwapAdmission::Held(&authority)),
+        )
+        .await
+        .map(|(thinking_level, _)| thinking_level)
     }
 
     async fn commit_failover_swap_admitted(

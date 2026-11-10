@@ -7078,12 +7078,11 @@ async fn restore_rpc_retry_tail(
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
 
-    // The revert, its persistence and the live installation are the shared
-    // primitive on AgentSession (bd-u2qv4). RPC's own contribution is the
-    // admission gate it passes in: blocked across the persist-then-install
-    // window so a crash in between quarantines provider re-entry instead of
-    // silently resuming.
+    // Recovery waits for active providers before taking Session-action and
+    // store locks. Their extension callbacks may need RPC shared state, so
+    // release it before entering that wait while retaining the outer owner.
     let admission = state.provider_admission.clone();
+    drop(state);
     guard
         .restore_retry_tail_with_admission(cx, require_incomplete_tail, Some(&admission))
         .await
@@ -13035,6 +13034,65 @@ mod retry_tests {
             drop(inner);
             let guard = session.lock(&cx).await.expect("AgentSession lock");
             assert!(guard.agent.messages().is_empty());
+        });
+    }
+
+    #[test]
+    fn rpc_retry_restore_waits_without_blocking_provider_callbacks() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                Agent::new(
+                    Arc::new(AlwaysErrorProvider),
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig::default(),
+                ),
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let admission = agent_session.provider_admission_gate();
+            let actions = agent_session.session_action_admission_gate();
+            let session = Arc::new(Mutex::new(agent_session));
+            let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&Config::default())));
+            let cx = AgentCx::for_request();
+            let provider_request = admission.acquire(cx.cx()).await.expect("active provider");
+            let mut recovery =
+                Box::pin(restore_rpc_retry_tail(&session, &shared_state, &cx, false));
+            assert!(futures::poll!(recovery.as_mut()).is_pending());
+            assert!(session.try_lock().is_err(), "retain the Session owner");
+            assert!(inner_session.try_lock().is_ok(), "callbacks need the store");
+            let mut state = shared_state
+                .try_lock()
+                .expect("provider callbacks must retain access to RPC state");
+            state
+                .push_follow_up(QueuedAgentMessage::from_authored_message(
+                    build_user_message("queued by an active provider callback", &[]),
+                ))
+                .expect("waiting recovery has not entered persistence");
+            drop(state);
+            let mut callback_action = Box::pin(actions.acquire(cx.cx()));
+            let std::task::Poll::Ready(Ok(action_permit)) =
+                futures::poll!(callback_action.as_mut())
+            else {
+                panic!("waiting recovery must not hold Session-action authority");
+            };
+            drop(action_permit);
+            drop(callback_action);
+            drop(recovery);
+            admission.ensure_allowed().expect("cancelled before saving");
+            drop(provider_request);
+
+            restore_rpc_retry_tail(&session, &shared_state, &cx, false)
+                .await
+                .expect("cancelled wait released recovery authority");
+            assert_eq!(
+                shared_state.try_lock().expect("RPC state").pending_count(),
+                1
+            );
         });
     }
 

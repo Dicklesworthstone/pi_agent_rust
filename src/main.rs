@@ -10365,7 +10365,8 @@ async fn run_print_mode_inner(
         )
     };
 
-    let _ = maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
+    let _ =
+        maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await?;
 
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
@@ -10408,14 +10409,15 @@ async fn run_print_mode_inner(
         // { restoredPrimary: false }` already closed, so this can open and
         // close its own `restoredPrimary: true` without interleaving.
         //
-        // The result is deliberately unused here. Every refusal leaves the
-        // fallback installed and the next prompt simply runs on it, which is
-        // the correct outcome and not something this loop can improve on; the
-        // `FailoverEnd` event is the report when a restoration does happen.
+        // An unavailable or stale primary leaves the fallback installed. A
+        // failed durable transition stops the invocation before another user
+        // message, tool or provider request can be admitted.
+        // `FailoverEnd` reports a restoration only after it commits.
         // `print_failover_walk_skips_current_keyless_and_duplicate_entries`
         // covers the refusals, which is where the return value earns its keep.
         let _restored =
-            maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json).await;
+            maybe_restore_print_primary(session, &mut failover_state, failover_ctx, is_json)
+                .await?;
         let input = if let Some(command) = request.command {
             let args = request
                 .text
@@ -10551,7 +10553,7 @@ async fn run_print_mode_inner(
                     failover_ctx,
                     is_json,
                 )
-                .await;
+                .await?;
                 ensure_print_background_owner(session, owner_session_id).await?;
                 reset_print_text_stream_state(&text_stream_state);
                 let response = run_print_prompt_with_retry(
@@ -10922,8 +10924,8 @@ fn emit_print_failover_end(
 }
 
 /// Print mode's entry to the shared retry-tail restoration on `AgentSession`
-/// (bd-u2qv4). RPC calls the same primitive inside its provider-admission
-/// transition; print mode has no such gate and needs none.
+/// (bd-u2qv4). Every surface retains provider-admission authority across the
+/// persist-then-install boundary, including direct embedding callers.
 async fn restore_print_retry_tail(
     session: &mut AgentSession,
     require_incomplete_tail: bool,
@@ -10960,9 +10962,9 @@ fn emit_print_restore_failure(
 /// The invariants are RPC's, for RPC's reason — the recorded fallback must
 /// still be what is actually installed, in both the live agent and the Session
 /// path. If either has moved, something other than this failover changed the
-/// model and undoing it is not ours to do. Unlike RPC, a broken invariant here
-/// does not quarantine the session: print has no admission gate to block, and
-/// the honest response is to leave the fallback in place and say so.
+/// model and undoing it is not ours to do. A stale or unavailable destination
+/// declines restoration. A persistence failure stops the invocation and keeps
+/// the shared provider-admission gate quarantined.
 ///
 /// Returns `true` when the primary was restored.
 ///
@@ -10976,22 +10978,22 @@ async fn maybe_restore_print_primary(
     state: &mut PrintFailoverState,
     failover_ctx: Option<FailoverResolution<'_>>,
     is_json: bool,
-) -> bool {
+) -> Result<bool> {
     let Some(ctx) = failover_ctx else {
-        return false;
+        return Ok(false);
     };
     let Some(active) = state.active().cloned() else {
-        return false;
+        return Ok(false);
     };
     let Some(primary) = state.primary().cloned() else {
-        return false;
+        return Ok(false);
     };
 
     // The persisted transition is `AgentSession::restore_primary`, shared with
     // RPC and the SDK (bd-u2qv4, bd-gm481). What stays here is what is actually
-    // print's: no admission gate, so a record that no longer describes the live
-    // session declines and the next prompt runs on the fallback rather than
-    // failing the call, and the `FailoverEnd` is emitted as a json event.
+    // print's: stale/unavailable destinations decline, while committed primary
+    // restoration is emitted as a JSON event. Durable uncertainty is an error
+    // on every surface, even under that lenient selection policy.
     let request = pi::agent::PrimaryRestoreRequest {
         primary: &primary,
         active: &active,
@@ -11005,8 +11007,8 @@ async fn maybe_restore_print_primary(
         invalidate_background_compaction: true,
     };
     let cx = pi::agent_cx::AgentCx::for_request();
-    let Ok(Some(restored)) = session.restore_primary(&cx, &request).await else {
-        return false;
+    let Some(restored) = session.restore_primary(&cx, &request).await? else {
+        return Ok(false);
     };
     state.clear();
 
@@ -11018,7 +11020,7 @@ async fn maybe_restore_print_primary(
             restored_primary: true,
         });
     }
-    true
+    Ok(true)
 }
 
 /// Print-mode failover swap (bd-cv653.3.2): classify the terminal error; if
@@ -11101,6 +11103,11 @@ async fn try_print_failover(
     // with RPC (bd-u2qv4). What stays here is print mode's own: classification
     // above, its JSON events below, and its cross-prompt bookkeeping.
     let cx = pi::agent_cx::AgentCx::for_request();
+    // Stage one identity for both durable provenance and live bookkeeping.
+    // An exhausted or failed walk must not publish an uncommitted lifecycle.
+    let lifecycle_id = failover_state
+        .lifecycle_id()
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
     let attempt = pi::agent::FailoverSwapAttempt {
         chain: &chain,
         start_position: failover_state.chain_position(),
@@ -11115,7 +11122,7 @@ async fn try_print_failover(
         require_incomplete_tail,
         primary: Some(&primary),
         cooldown_secs: Some(config.failover_cooldown_secs()),
-        lifecycle_id: failover_state.lifecycle_id(),
+        lifecycle_id: Some(&lifecycle_id),
     };
     let outcome = session.try_failover(&cx, &attempt).await?;
     let Some(committed) = outcome.committed else {
@@ -11132,9 +11139,7 @@ async fn try_print_failover(
         // RPC and the SDK have always behaved this way; print was the outlier.
         return Ok(None);
     };
-    if failover_state.lifecycle_id().is_none() {
-        failover_state.set_lifecycle_id(Some(uuid::Uuid::new_v4().to_string()));
-    }
+    failover_state.set_lifecycle_id(Some(lifecycle_id));
     // Only a committed swap advances the cursor, so a later prompt resumes past
     // the entry it actually installed.
     failover_state.set_chain_position(outcome.next_position);
@@ -16267,6 +16272,116 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one invocation must preserve both durable history and admission
+    fn print_primary_restore_save_failure_stops_the_invocation_before_input() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("restoration fixture");
+            let provider = Arc::new(PrintRecoveryProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: StdMutex::new(Vec::new()),
+                input_tokens: 0,
+                transport_error: false,
+            });
+            let auth = AuthStorage::load(temp.path().join("auth.json")).expect("auth");
+            let mut primary = ModelRegistry::load(&auth, None)
+                .find("openai", "gpt-4o")
+                .expect("known primary");
+            primary.api_key = Some("restore-test-key".to_string());
+            let mut stored = Session::create_with_dir(Some(temp.path().to_path_buf()));
+            let original_path = temp.path().join("session.jsonl");
+            stored.path = Some(original_path.clone());
+            stored.set_model_header(
+                Some("print-recovery".to_string()),
+                Some("test-model".to_string()),
+                Some("off".to_string()),
+            );
+            stored.append_model_change_with_role_and_failover(
+                "print-recovery".to_string(),
+                "test-model".to_string(),
+                Some("failover".to_string()),
+                Some(pi::session::ModelChangeFailover {
+                    primary_provider: primary.model.provider.clone(),
+                    primary_model_id: primary.model.id.clone(),
+                    primary_thinking_level: Some("off".to_string()),
+                    fallback_provider: "print-recovery".to_string(),
+                    fallback_model_id: "test-model".to_string(),
+                    chain_position: Some(1),
+                    cooldown_deadline: Some("2020-01-01T00:00:00Z".to_string()),
+                    cooldown_secs: Some(0),
+                    lifecycle_id: Some("print-restore-save-test".to_string()),
+                }),
+            );
+            stored.save().await.expect("persist fallback provenance");
+            let mut session = print_recovery_session_with_store(&provider, stored, true);
+            let store = Arc::clone(&session.session);
+            let blocked = temp.path().join("blocked.jsonl");
+            fs::create_dir(&blocked).expect("directory blocks a session write");
+            store.try_lock().expect("session").path = Some(blocked);
+            let before = serde_json::to_value(&store.try_lock().expect("session").entries)
+                .expect("source entries");
+            let models = vec![primary];
+            let (_abort, signal) = AbortHandle::new();
+            let error = run_print_mode_inner(
+                &mut session,
+                "text",
+                None,
+                vec![
+                    "first unadmitted prompt".to_string(),
+                    "second prompt".to_string(),
+                ],
+                false,
+                &ResourceLoader::empty(true),
+                runtime_handle,
+                &Config::default(),
+                &pi::approval::ApprovalState::default(),
+                Some(FailoverResolution {
+                    available_models: &models,
+                    auth: &auth,
+                    cli_api_key: None,
+                }),
+                None,
+                None,
+                std::time::Instant::now(),
+                &signal,
+            )
+            .await
+            .expect_err("restoration uncertainty must stop the print invocation");
+            assert!(error.to_string().contains("SESSION_PERSISTENCE_FAILED"));
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(session.agent.provider().model_id(), "test-model");
+            assert_eq!(
+                serde_json::to_value(&store.try_lock().expect("session").entries)
+                    .expect("live entries"),
+                before,
+                "neither later prompt may enter the transcript"
+            );
+            let reopened = Session::open(&original_path.display().to_string())
+                .await
+                .expect("reopen last durable fallback");
+            assert!(
+                reopened
+                    .active_failover_provenance_for_current_path()
+                    .is_some()
+            );
+            store.try_lock().expect("session").path = Some(original_path);
+            assert!(
+                run_print_recovery_fixture(
+                    &mut session,
+                    PromptInput::Text {
+                        text: "a repaired path cannot clear uncertainty".to_string(),
+                        keyword_scan_source: None,
+                    },
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn print_logical_turn_ends_after_retry_success_abort_or_restore_failure() {
         run_cli_workdir_test(async {
@@ -17178,6 +17293,7 @@ mod tests {
             .await
             .expect_err("known assistant failure requires a restorable tail");
             assert!(no_tail.to_string().contains("no incomplete assistant tail"));
+            assert!(failover_state.lifecycle_id().is_none());
             assert_eq!(agent_session.agent.provider().name(), "openai");
 
             {
@@ -17568,6 +17684,7 @@ mod tests {
                 Some(("anthropic".to_string(), "fallback-model".to_string()))
             );
             assert_eq!(failover_state.chain_position(), 3);
+            let lifecycle_id = failover_state.lifecycle_id().map(str::to_string);
             let again = try_print_failover(
                 &mut session,
                 &config,
@@ -17582,6 +17699,7 @@ mod tests {
             .await
             .expect("second walk");
             assert_eq!(again, None, "the trailing duplicate is not a new swap");
+            assert_eq!(failover_state.lifecycle_id(), lifecycle_id.as_deref());
             // bd-gr6fk: an exhausted walk records nothing, so the cursor stays
             // where the last COMMITTED swap left it. This assertion previously
             // read 4 — print advanced the cursor past every rejected entry,
@@ -17607,7 +17725,9 @@ mod tests {
             // Nothing installed: there is nothing to come back from.
             let mut empty = PrintFailoverState::new(&config);
             assert!(
-                !maybe_restore_print_primary(&mut clean, &mut empty, failover_ctx, false).await,
+                !maybe_restore_print_primary(&mut clean, &mut empty, failover_ctx, false)
+                    .await
+                    .expect("no restoration needed"),
                 "a session that never failed over must not be touched"
             );
             assert_eq!(clean.agent.provider().model_id(), "primary-model");
@@ -17638,7 +17758,9 @@ mod tests {
                 "compaction must be in flight before refused restoration"
             );
             assert!(
-                !maybe_restore_print_primary(&mut swapped, &mut holding, failover_ctx, false).await,
+                !maybe_restore_print_primary(&mut swapped, &mut holding, failover_ctx, false)
+                    .await
+                    .expect("cooldown refusal"),
                 "the cooldown must hold the primary back"
             );
             assert_eq!(swapped.agent.provider().model_id(), "fallback-model");
@@ -17686,7 +17808,9 @@ mod tests {
                 std::time::Instant::now(),
             );
             assert!(
-                !maybe_restore_print_primary(&mut moved, &mut elapsed, failover_ctx, false).await,
+                !maybe_restore_print_primary(&mut moved, &mut elapsed, failover_ctx, false)
+                    .await
+                    .expect("stale fallback refusal"),
                 "a runtime that does not match the recorded fallback must not be swapped"
             );
             assert_eq!(moved.agent.provider().model_id(), "fallback-model");
@@ -17722,7 +17846,9 @@ mod tests {
             );
 
             assert!(
-                maybe_restore_print_primary(&mut restorable, &mut ready, failover_ctx, false).await,
+                maybe_restore_print_primary(&mut restorable, &mut ready, failover_ctx, false)
+                    .await
+                    .expect("durable primary restoration"),
                 "an elapsed cooldown with consistent state restores"
             );
             assert_eq!(restorable.agent.provider().model_id(), "primary-model");
@@ -17855,6 +17981,7 @@ mod tests {
             .await
             .expect("first walk");
             assert_eq!(refused, None, "an entry with no credential is not usable");
+            assert!(failover_state.lifecycle_id().is_none());
             assert_eq!(
                 failover_state.chain_position(),
                 0,
@@ -18016,6 +18143,34 @@ mod tests {
                 "a non-reasoning model clamps the requested level to Off"
             );
 
+            let lifecycle_id = failover_state
+                .lifecycle_id()
+                .expect("committed first-hop lifecycle")
+                .to_string();
+            let path = session
+                .session
+                .try_lock()
+                .expect("first-hop Session")
+                .path
+                .clone()
+                .expect("persisted first-hop path");
+            let reopened = Session::open(path.to_str().expect("UTF-8 session path"))
+                .await
+                .expect("reopen first hop");
+            assert_eq!(
+                reopened
+                    .active_failover_provenance_for_current_path()
+                    .and_then(|provenance| provenance.lifecycle_id.as_deref()),
+                Some(lifecycle_id.as_str()),
+                "the live lifecycle must be the one durably committed"
+            );
+            failover_state = PrintFailoverState::reconstruct_from_session(
+                &reopened,
+                config.failover_cooldown_secs(),
+                chrono::Utc::now(),
+            );
+            assert_eq!(failover_state.lifecycle_id(), Some(lifecycle_id.as_str()));
+
             let hop_two = try_print_failover(
                 &mut session,
                 &config,
@@ -18048,6 +18203,17 @@ mod tests {
                     .map(|p| (p.provider.as_str(), p.model_id.as_str())),
                 Some(("openai", "primary-model")),
                 "two hops in, the identity to restore is still the chain's origin"
+            );
+            assert_eq!(failover_state.lifecycle_id(), Some(lifecycle_id.as_str()));
+            let reopened = Session::open(path.to_str().expect("UTF-8 session path"))
+                .await
+                .expect("reopen second hop");
+            assert_eq!(
+                reopened
+                    .active_failover_provenance_for_current_path()
+                    .and_then(|provenance| provenance.lifecycle_id.as_deref()),
+                Some(lifecycle_id.as_str()),
+                "the resumed second hop must continue the original lifecycle"
             );
         });
     }
@@ -18211,6 +18377,7 @@ mod tests {
             // is no committed swap to come back from.
             assert!(failover_state.primary().is_none());
             assert!(failover_state.active().is_none());
+            assert!(failover_state.lifecycle_id().is_none());
             assert_eq!(agent_session.agent.provider().name(), "openai");
             assert_eq!(agent_session.agent.provider().model_id(), "primary-model");
             assert_eq!(
