@@ -612,8 +612,10 @@ pi -p --wait-async --max-cost 10 "Delegate the investigation and report the find
 The corresponding settings are `session.warnCost` and `session.maxCost`;
 CLI values override them. Values must be positive finite numbers. The limits
 cover the active session tree: foreground turns, retries, native subagents,
-advisor reviews, compaction, titles, memory extraction and side questions
-share the same account. Child requests consult the parent's live balance;
+advisor reviews, compaction, titles, memory extraction, side questions, native
+image inspection and supported image-generation billing share the same account.
+See [media spend accounting](docs/tools/media_tools.md#spend-admission) for
+supported billing units and unpriced media cases. Child requests consult the parent's live balance;
 missing or ambiguous accounting acknowledgements block further child requests.
 
 Known partial usage from an in-flight request counts toward the next admission.
@@ -676,11 +678,13 @@ to the copy. Observe final closure and save a new checkpoint before expecting a
 snapshot to be independent of its original journals. Failure to acknowledge a
 journal write blocks further requests on the affected account. If an incomplete
 save leaves primary usage and journal charges with an uncertain overlap, the
-known lower bound is retained and further requests are blocked. Startup and
-provider requests before the first successful cost checkpoint do not yet have
-an active journal. A crash before that checkpoint or before a final charge
-receives its durable acknowledgement can still lose uncheckpointed spend;
-these limits do not replace the provider's billing records.
+known lower bound is retained and further requests are blocked. Saved sessions
+with a cost account now save and acknowledge their initial checkpoint before
+extension startup hooks or the first provider request. If that save fails,
+startup and further provider requests are blocked; sessions without a cost
+account and ephemeral sessions retain their lazy persistence behavior. A crash
+before a final charge receives its durable acknowledgement can still lose
+unacknowledged spend; these limits do not replace the provider's billing records.
 
 ### Native Subagents and Orchestration
 

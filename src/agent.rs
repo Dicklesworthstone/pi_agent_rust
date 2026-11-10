@@ -7790,10 +7790,19 @@ struct CompactionInstallGuard {
     require_policy_fit: bool,
 }
 
+/// An acknowledged source stays active across turns, but neither a new account
+/// nor a replacement Session may inherit that source's initialization receipt.
+struct InitializedCostJournal {
+    account_id: String,
+    session_id: String,
+    path: Option<PathBuf>,
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
+    initialized_cost_journal: Option<InitializedCostJournal>,
     input_source: InputSource,
     /// Extension lifecycle region — ensures the JS runtime thread is shut
     /// down when the session ends.
@@ -18920,6 +18929,7 @@ impl AgentSession {
             agent,
             session,
             save_enabled,
+            initialized_cost_journal: None,
             input_source: InputSource::Interactive,
             extensions: None,
             extension_startup_timeout_ms: EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
@@ -21550,6 +21560,7 @@ impl AgentSession {
             .map(ExtensionRegion::manager)
             .ok_or_else(|| Error::extension("Extensions are disabled"))?
             .clone();
+        self.initialize_cost_journal().await?;
         let on_event: AgentEventHandler = Arc::new(on_event);
 
         self.run_pending_idle_actions_with_abort(abort.clone(), Arc::clone(&on_event))
@@ -22400,6 +22411,7 @@ impl AgentSession {
         if abort.is_some_and(AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
+        self.initialize_cost_journal().await?;
         let overflow = overflow_abort.is_some();
 
         let (entries, preparation, source_snapshot, install_guard) = {
@@ -22785,6 +22797,10 @@ impl AgentSession {
             return Ok(());
         }
 
+        // Factories and startup hooks can make model requests. Their bills
+        // need an acknowledged source before any extension code is loaded.
+        self.initialize_cost_journal().await?;
+
         // Extensions may key durable state by getSessionFile() during their
         // factory or session_start hook. Reserve the eventual transcript name
         // after the host has selected its cwd, without creating an empty file.
@@ -23128,6 +23144,59 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Activate durable final-bill accounting before startup hooks or the first
+    /// provider dispatch. Saved sessions with a cost account must acknowledge
+    /// their initial checkpoint; a failed or interrupted save fences re-entry.
+    /// Later calls for the same account and saved Session are read-only.
+    pub async fn initialize_cost_journal(&mut self) -> Result<()> {
+        if !self.save_enabled {
+            return Ok(());
+        }
+        let Some(budget) = self.agent.cost_budget().cloned() else {
+            return Ok(());
+        };
+        self.ensure_provider_reentry_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+            .await
+            .map_err(|error| Error::session(error.to_string()))?;
+        self.ensure_provider_reentry_allowed()?;
+        let account_id = budget.account_id();
+        if self
+            .initialized_cost_journal
+            .as_ref()
+            .is_some_and(|initialized| {
+                initialized.account_id == account_id
+                    && initialized.session_id == session.header.id
+                    && initialized.path == session.path
+            })
+        {
+            return Ok(());
+        }
+        let persist_result = flush_turn_autosave(
+            &mut session,
+            &self.provider_admission,
+            AutosaveFlushTrigger::Periodic,
+            Some((&budget, cx.cx())),
+        )
+        .await;
+        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
+        self.ensure_provider_reentry_allowed()?;
+        self.remember_initialized_cost_journal(&session);
+        Ok(())
+    }
+
+    fn remember_initialized_cost_journal(&mut self, session: &Session) {
+        self.initialized_cost_journal =
+            self.agent
+                .cost_budget()
+                .map(|budget| InitializedCostJournal {
+                    account_id: budget.account_id(),
+                    session_id: session.header.id.clone(),
+                    path: session.path.clone(),
+                });
+    }
+
     pub async fn save_and_index(&mut self) -> Result<()> {
         if self.save_enabled {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -23142,6 +23211,7 @@ impl AgentSession {
             )
             .await;
             finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
+            self.remember_initialized_cost_journal(&session);
         }
         Ok(())
     }
@@ -23161,7 +23231,9 @@ impl AgentSession {
             self.agent.cost_budget().map(|budget| (budget, cx.cx())),
         )
         .await;
-        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)
+        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
+        self.remember_initialized_cost_journal(&session);
+        Ok(())
     }
 
     pub async fn run_text(
@@ -23437,6 +23509,7 @@ impl AgentSession {
         handoff_input: impl FnOnce(&mut Agent) + Send,
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
+        self.initialize_cost_journal().await?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         async {
             handoff_input(&mut self.agent);
@@ -23550,6 +23623,7 @@ impl AgentSession {
                 self.agent.set_magic_keyword_scan_override(None);
                 return Err(error);
             }
+            self.initialize_cost_journal().await?;
             handoff_input(&mut self.agent);
             // See the text path above: provenance is one-shot even when an
             // input extension blocks before the Agent loop starts.
@@ -24632,6 +24706,7 @@ impl AgentSession {
         advisor_turn: Option<&AdvisorTurn>,
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
+        self.initialize_cost_journal().await?;
         self.sync_runtime_selection_from_session_header().await?;
 
         // Rehydrate the agent transcript from the (already reverted) session

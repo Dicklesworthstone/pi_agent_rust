@@ -4658,6 +4658,8 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             )));
     }
 
+    agent_session.initialize_cost_journal().await?;
+
     if has_extensions {
         let extension_paths = options
             .extension_paths
@@ -11410,6 +11412,190 @@ printf sdk-owned-command-key
                 value: Some(Value::Bool(true)),
                 cancelled: false,
             }))
+        }
+    }
+
+    struct StartupCostProbe {
+        budget: crate::cost::CostBudget,
+        observed: Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtensionUiHandler for StartupCostProbe {
+        async fn request_ui(
+            &self,
+            request: ExtensionUiRequest,
+        ) -> Result<Option<ExtensionUiResponse>> {
+            let path = request.payload["message"]
+                .as_str()
+                .ok_or_else(|| Error::session("startup did not expose a saved session"))?;
+            let saved = Session::open(path).await?;
+            let before = crate::cost::recorded_spend(&saved)?;
+            // Settle startup work through the actual shared account while no
+            // user turn, shutdown, or explicit SDK save has occurred.
+            self.budget.record(0.25)?;
+            let after = crate::cost::recorded_spend(&saved)?;
+            if (after - before - 0.25).abs() > f64::EPSILON {
+                return Err(Error::session("startup bill has no durable cost journal"));
+            }
+            self.observed.lock().unwrap().push(PathBuf::from(path));
+            Ok(Some(ExtensionUiResponse {
+                id: request.id,
+                value: Some(Value::Bool(true)),
+                cancelled: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn saved_sdk_startup_activates_cost_journal_before_extensions_or_first_prompt() {
+        for with_extension in [false, true] {
+            let tmp = tempdir().expect("tempdir");
+            let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let probe = Arc::new(StartupCostProbe {
+                budget: budget.clone(),
+                observed: Mutex::new(Vec::new()),
+            });
+            let mut options = SessionOptions {
+                no_session: false,
+                session_dir: Some(tmp.path().join("sessions")),
+                enabled_tools: Some(Vec::new()),
+                no_context_files: true,
+                cost_budget: Some(budget.clone()),
+                ..hermetic_session_options(tmp.path())
+            };
+            if with_extension {
+                let extension = tmp.path().join("startup-cost.mjs");
+                std::fs::write(
+                    &extension,
+                    r#"
+export default function init(pi) {
+    pi.on("startup", async (_event, ctx) => {
+        await ctx.ui.confirm("Inspect startup cost source", ctx.sessionManager.getSessionFile());
+    });
+}
+"#,
+                )
+                .unwrap();
+                options.extension_paths = vec![extension];
+                options.extension_ui_handler = Some(probe.clone());
+                options.persist_extension_permissions = false;
+            }
+            run_async(async {
+                let handle = create_agent_session(options).await.unwrap();
+                let store = handle.session_store();
+                let (path, session_id, provider, model) = {
+                    let stored = store.try_lock().unwrap();
+                    assert!(stored.to_messages_for_current_path().is_empty());
+                    (
+                        stored.path.clone().expect("startup checkpoint path"),
+                        stored.header.id.clone(),
+                        stored.header.provider.clone(),
+                        stored.header.model_id.clone(),
+                    )
+                };
+                assert!(path.is_file());
+                let checkpoint_bytes = std::fs::read(&path).unwrap();
+                if with_extension {
+                    assert_eq!(probe.observed.lock().unwrap().as_slice(), &[path.clone()]);
+                } else {
+                    budget.record(0.25).unwrap();
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), checkpoint_bytes);
+                let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.25).abs() < f64::EPSILON);
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+
+                // A resumed handle installs its own writer without changing
+                // the selected model or losing pre-prompt startup charges.
+                let resumed = create_agent_session(SessionOptions {
+                    no_session: false,
+                    session_path: Some(path.clone()),
+                    session_dir: Some(tmp.path().join("sessions")),
+                    max_cost: Some(5.0),
+                    no_context_files: true,
+                    ..hermetic_session_options(tmp.path())
+                })
+                .await
+                .unwrap();
+                let resumed_budget = resumed.session().agent.cost_budget().unwrap();
+                assert!(!resumed_budget.same_tree(&budget));
+                resumed_budget.record(0.5).unwrap();
+                let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON);
+                assert_eq!(saved.header.id, session_id);
+                assert_eq!(saved.header.provider, provider);
+                assert_eq!(saved.header.model_id, model);
+                assert!(resumed.shutdown_owned_resources().await.completed_cleanly());
+            });
+        }
+    }
+
+    #[test]
+    fn failed_sdk_startup_checkpoint_prevents_extension_dispatch() {
+        let tmp = tempdir().expect("tempdir");
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, "retain this file").unwrap();
+        let extension = tmp.path().join("must-not-start.mjs");
+        std::fs::write(
+            &extension,
+            r#"
+export default function init(pi) {
+    pi.on("startup", async (_event, ctx) => {
+        await ctx.ui.confirm("Unexpected startup", "The initial checkpoint should fail first");
+    });
+}
+"#,
+        )
+        .unwrap();
+        for with_extension in [false, true] {
+            let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let handler = Arc::new(SdkRecordingUiHandler {
+                prompts: Mutex::new(Vec::new()),
+            });
+            let options = SessionOptions {
+                no_session: false,
+                session_dir: Some(blocked.clone()),
+                no_context_files: true,
+                enabled_tools: Some(Vec::new()),
+                cost_budget: Some(budget.clone()),
+                extension_paths: if with_extension {
+                    vec![extension.clone()]
+                } else {
+                    Vec::new()
+                },
+                extension_ui_handler: Some(handler.clone()),
+                persist_extension_permissions: false,
+                ..hermetic_session_options(tmp.path())
+            };
+            let result = run_async(create_agent_session(options));
+            assert!(matches!(result, Err(ref error) if error.is_session_persistence()));
+            assert!(handler.prompts.lock().unwrap().is_empty());
+            assert!(matches!(budget.admit(), Err(Error::Session(_))));
+            assert_eq!(
+                std::fs::read_to_string(&blocked).unwrap(),
+                "retain this file"
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_startup_keeps_unbudgeted_and_ephemeral_sessions_unsaved() {
+        for (no_session, budgeted) in [(false, false), (true, true)] {
+            let tmp = tempdir().expect("tempdir");
+            let sessions = tmp.path().join("sessions");
+            let options = SessionOptions {
+                no_session,
+                session_dir: Some(sessions.clone()),
+                no_context_files: true,
+                max_cost: budgeted.then_some(5.0),
+                ..hermetic_session_options(tmp.path())
+            };
+            let handle = run_async(create_agent_session(options)).unwrap();
+            assert!(handle.session_store().try_lock().unwrap().path.is_none());
+            assert!(!sessions.exists());
+            assert_eq!(handle.session().agent.cost_budget().is_some(), budgeted);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
         }
     }
 

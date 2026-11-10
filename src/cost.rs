@@ -423,6 +423,15 @@ impl CostBudget {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
+    #[must_use]
+    pub(crate) fn account_id(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .account
+            .clone()
+    }
+
     /// A native child always remains charged to its original parent tree.
     pub fn for_replacement(&self, session: &Session, preserve: bool) -> Result<Self> {
         if self.remote.is_some() || preserve {
@@ -1962,6 +1971,25 @@ mod tests {
         struct BillingProvider {
             streams: AtomicUsize,
             compactions: AtomicUsize,
+            required_checkpoint: Mutex<Option<std::path::PathBuf>>,
+        }
+
+        impl BillingProvider {
+            async fn check_dispatch_source(&self) {
+                // ubs:ignore[rust.async.lock-unwrap] -- The fixture guard drops before any await.
+                let path = self.required_checkpoint.lock().unwrap().clone();
+                if let Some(path) = path {
+                    let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                    let checkpoint = latest_checkpoint(&saved).expect("pre-dispatch checkpoint");
+                    let account = checkpoint["account"].as_str().unwrap();
+                    let journal = Origin::for_session(&saved)
+                        .unwrap()
+                        .unwrap()
+                        .read()
+                        .expect("pre-dispatch journal");
+                    assert!(journal.writers.contains_key(account));
+                }
+            }
         }
 
         #[async_trait::async_trait]
@@ -1982,9 +2010,9 @@ mod tests {
                 &self,
                 _context: &Context<'_>,
                 _options: &StreamOptions,
-            ) -> Result<
-                std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>,
-            > {
+            ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+            {
+                self.check_dispatch_source().await;
                 self.streams.fetch_add(1, Ordering::SeqCst);
                 let message = AssistantMessage {
                     content: vec![ContentBlock::Text(TextContent::new("Completed."))],
@@ -2018,6 +2046,7 @@ mod tests {
                 _request_body: &serde_json::Value,
                 _options: &StreamOptions,
             ) -> Result<serde_json::Value> {
+                self.check_dispatch_source().await;
                 self.compactions.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::json!({"output": [], "usage": {"cost": 1.25}}))
             }
@@ -2051,6 +2080,281 @@ mod tests {
             )
         }
 
+        #[test]
+        fn first_native_dispatch_has_an_acknowledged_cost_source() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            runtime.block_on(async {
+                for entry in ["text", "content", "continue"] {
+                    let path = directory.path().join(format!("{entry}.jsonl"));
+                    let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                    stored.path = Some(path.clone());
+                    if entry == "continue" {
+                        stored.append_message(SessionMessage::User {
+                            content: crate::model::UserContent::Text("Continue".to_string()),
+                            timestamp: None,
+                        });
+                    }
+                    let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                    let (mut live, provider) = live_session(stored, &budget, true);
+                    *provider.required_checkpoint.lock().unwrap() = Some(path.clone()); // ubs:ignore[rust.async.lock-unwrap] -- Fixture guard drops before dispatch.
+                    assert!(!path.exists());
+                    match entry {
+                        "text" => live.run_text("Begin".to_string(), |_| {}).await,
+                        "content" => {
+                            live.run_with_content(
+                                vec![ContentBlock::Text(TextContent::new("Begin"))],
+                                |_| {},
+                            )
+                            .await
+                        }
+                        _ => live.run_continue_with_abort(None, |_| {}).await,
+                    }
+                    .unwrap();
+                    assert_eq!(provider.streams.load(Ordering::SeqCst), 1);
+                    assert_eq!(budget.spent(), 0.5);
+                    let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                    assert_eq!(recorded_spend(&saved).unwrap(), 0.5);
+                }
+            });
+        }
+
+        #[test]
+        fn failed_first_checkpoint_blocks_native_dispatch_and_remains_quarantined() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let blocked = directory.path().join("not-a-directory");
+            std::fs::write(&blocked, "retain this file").unwrap();
+            runtime.block_on(async {
+                for entry in ["text", "content", "continue", "compact"] {
+                    let mut stored = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                    stored.path = Some(blocked.join(format!("{entry}.jsonl")));
+                    let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                    let (mut live, provider) = live_session(stored, &budget, true);
+                    let error = match entry {
+                        "text" => live
+                            .run_text("Do not dispatch".to_string(), |_| {})
+                            .await
+                            .map(|_| ()),
+                        "content" => live
+                            .run_with_content(
+                                vec![ContentBlock::Text(TextContent::new("Do not dispatch"))],
+                                |_| {},
+                            )
+                            .await
+                            .map(|_| ()),
+                        "continue" => live.run_continue_with_abort(None, |_| {}).await.map(|_| ()),
+                        _ => live.compact_now(None, |_| {}).await.map(|_| ()),
+                    }
+                    .unwrap_err();
+                    assert!(error.is_session_persistence(), "{entry}: {error}");
+                    assert_eq!(provider.streams.load(Ordering::SeqCst), 0, "{entry}");
+                    assert_eq!(provider.compactions.load(Ordering::SeqCst), 0, "{entry}");
+                    assert!(budget.state.lock().unwrap().retired.is_empty());
+                    assert!(matches!(budget.admit(), Err(Error::Session(_))));
+
+                    // Correcting the destination must not silently admit work
+                    // after an unacknowledged first checkpoint.
+                    live.session.try_lock().unwrap().path =
+                        Some(directory.path().join(format!("repaired-{entry}.jsonl")));
+                    assert!(
+                        live.initialize_cost_journal()
+                            .await
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                    assert!(
+                        live.run_text("Still blocked".to_string(), |_| {})
+                            .await
+                            .unwrap_err()
+                            .is_session_persistence()
+                    );
+                    assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&blocked).unwrap(),
+                    "retain this file"
+                );
+            });
+        }
+
+        #[test]
+        fn failed_initial_checkpoint_prevents_direct_extension_loading() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let blocked = directory.path().join("not-a-directory");
+            std::fs::write(&blocked, "retain this file").unwrap();
+            let extension = directory.path().join("must-not-load.mjs");
+            std::fs::write(
+                &extension,
+                "export default function init() { throw new Error('factory must not run'); }",
+            )
+            .unwrap();
+            runtime.block_on(async {
+                let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let (mut live, _) = live_session(
+                    Session::create_with_dir(Some(blocked.clone())),
+                    &budget,
+                    true,
+                );
+                let error = live
+                    .enable_extensions(&[], directory.path(), None, &[extension])
+                    .await
+                    .unwrap_err();
+                assert!(error.is_session_persistence(), "{error}");
+                assert!(live.extensions.is_none());
+                assert!(matches!(budget.admit(), Err(Error::Session(_))));
+                assert!(budget.state.lock().unwrap().retired.is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(&blocked).unwrap(),
+                    "retain this file"
+                );
+            });
+        }
+
+        #[test]
+        fn initialization_keeps_ephemeral_unbudgeted_and_invalid_input_sessions_lazy() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            runtime.block_on(async {
+                let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let (mut ephemeral, provider) = live_session(Session::in_memory(), &budget, false);
+                ephemeral.initialize_cost_journal().await.unwrap();
+                ephemeral
+                    .run_text("Ephemeral".to_string(), |_| {})
+                    .await
+                    .unwrap();
+                assert_eq!(provider.streams.load(Ordering::SeqCst), 1);
+                assert!(budget.state.lock().unwrap().retired.is_empty());
+                assert!(ephemeral.session.try_lock().unwrap().path.is_none());
+
+                let (mut unbudgeted, _) = live_session(
+                    Session::create_with_dir(Some(directory.path().join("unbudgeted"))),
+                    &budget,
+                    true,
+                );
+                unbudgeted.agent.set_cost_budget(None);
+                unbudgeted.initialize_cost_journal().await.unwrap();
+                assert!(unbudgeted.session.try_lock().unwrap().path.is_none());
+                assert!(!directory.path().join("unbudgeted").exists());
+
+                let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let (mut invalid, provider) = live_session(
+                    Session::create_with_dir(Some(directory.path().join("invalid"))),
+                    &budget,
+                    true,
+                );
+                assert!(matches!(
+                    invalid.run_with_content(Vec::new(), |_| {}).await,
+                    Err(Error::Validation(_))
+                ));
+                assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+                assert!(invalid.session.try_lock().unwrap().path.is_none());
+                assert!(budget.state.lock().unwrap().retired.is_empty());
+                assert!(!directory.path().join("invalid").exists());
+                budget.admit().unwrap();
+            });
+        }
+
+        #[test]
+        fn initialization_reuses_only_the_same_saved_session_and_account() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            runtime.block_on(async {
+                let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+                let (mut live, _) = live_session(
+                    Session::create_with_dir(Some(directory.path().to_path_buf())),
+                    &budget,
+                    true,
+                );
+                live.initialize_cost_journal().await.unwrap();
+                let (source_path, source_id, source_leaf, flushes) = {
+                    let stored = live.session.try_lock().unwrap();
+                    (
+                        stored.path.clone().unwrap(),
+                        stored.header.id.clone(),
+                        stored.leaf_id().map(str::to_string),
+                        stored.autosave_metrics().flush_succeeded,
+                    )
+                };
+                assert!(
+                    source_leaf.is_none(),
+                    "accounting must not select a conversation leaf"
+                );
+                let source_bytes = std::fs::read(&source_path).unwrap();
+                live.session
+                    .try_lock()
+                    .unwrap()
+                    .append_session_info(Some("still pending".to_string()));
+                live.agent.set_cost_budget(Some(budget.clone()));
+                for _ in 0..3 {
+                    live.initialize_cost_journal().await.unwrap();
+                }
+                assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+                assert_eq!(
+                    live.session
+                        .try_lock()
+                        .unwrap()
+                        .autosave_metrics()
+                        .flush_succeeded,
+                    flushes
+                );
+
+                // Copying the same session ID to a different saved path must
+                // publish its canonical writer reference before new bills.
+                let copied_path = directory.path().join("copied-source.jsonl");
+                std::fs::copy(&source_path, &copied_path).unwrap();
+                live.session.try_lock().unwrap().path = Some(copied_path.clone());
+                live.initialize_cost_journal().await.unwrap();
+                budget.record(0.25).unwrap();
+                let copied = Session::open(copied_path.to_str().unwrap()).await.unwrap();
+                assert_eq!(copied.header.id, source_id);
+                assert_eq!(recorded_spend(&copied).unwrap(), 0.25);
+
+                // A shared parent account still needs a durable reference from
+                // each new saved session before that child can start requests.
+                let replacement = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                let replacement_id = replacement.header.id.clone();
+                assert_ne!(source_id, replacement_id);
+                *live.session.try_lock().unwrap() = replacement;
+                live.initialize_cost_journal().await.unwrap();
+                let replacement_path = live.session.try_lock().unwrap().path.clone().unwrap();
+                assert_ne!(replacement_path, source_path);
+                budget.record(0.5).unwrap();
+                let saved = Session::open(replacement_path.to_str().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(recorded_spend(&saved).unwrap(), 0.75);
+
+                // Resuming the same path owns a fresh writer, even though the
+                // session ID and path have not changed.
+                let resumed = CostBudget::from_session(&saved, None, Some(10.0)).unwrap();
+                assert!(!resumed.same_tree(&budget));
+                live.agent.set_cost_budget(Some(resumed.clone()));
+                live.initialize_cost_journal().await.unwrap();
+                resumed.record(0.5).unwrap();
+                let reopened = Session::open(replacement_path.to_str().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(recorded_spend(&reopened).unwrap(), 1.25);
+                assert_eq!(reopened.header.id, replacement_id);
+                assert_eq!(
+                    latest_checkpoint(&reopened).unwrap()["account"],
+                    resumed.account_id()
+                );
+            });
+        }
+
         fn crash_after_live_save(path: &Path, run_primary: bool) -> ! {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
@@ -2072,9 +2376,9 @@ mod tests {
                 let budget = CostBudget::new(None, Some(2.0), 1.0).unwrap();
                 let (mut live, provider) = live_session(stored, &budget, true);
 
-                // This production save, rather than a test-side retirement,
-                // must activate persistence for subsequent auxiliary charges.
-                live.persist_session().await.unwrap();
+                // Startup must activate persistence before the first request,
+                // without a user turn or a test-side retirement.
+                live.initialize_cost_journal().await.unwrap();
                 if run_primary {
                     live.run_text("finish the response".to_string(), |_| {})
                         .await
