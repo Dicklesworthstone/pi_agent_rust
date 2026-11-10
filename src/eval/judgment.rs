@@ -145,16 +145,29 @@ fn resolve_entry(
             let entry = registry
                 .find(&target.provider, &target.model)
                 .ok_or_else(binding_error)?;
-            let thinking = target
-                .thinking
-                .map(|level| entry.clamp_thinking_level(level));
-            (entry, thinking)
+            (entry, target.thinking)
         }
     };
     if disabled(&entry.model.provider) {
         return Err(binding_error());
     }
+    let thinking = thinking_for_entry(&entry, thinking);
     Ok((entry, thinking))
+}
+
+/// Keep an unspecified effort only when the catalog permits the off/default
+/// path. A mandatory-reasoning route needs a supported tier even for named
+/// models and role/fallback selectors without an effort suffix. Do not turn
+/// optional defaults into explicit `Off`: transports may give them different
+/// meanings (for example, Codex's default effort).
+fn thinking_for_entry(
+    entry: &ModelEntry,
+    thinking: Option<crate::model::ThinkingLevel>,
+) -> Option<crate::model::ThinkingLevel> {
+    use crate::model::ThinkingLevel;
+
+    let effective = entry.clamp_thinking_level(thinking.unwrap_or_default());
+    (thinking.is_some() || effective != ThinkingLevel::Off).then_some(effective)
 }
 
 /// Only non-secret model names may come from the cell. Model endpoints,
@@ -247,7 +260,7 @@ fn bind_entry(
         api_key,
         headers: entry.headers.clone(),
         max_tokens: Some(entry.model.max_tokens.min(4096)),
-        thinking_level,
+        thinking_level: thinking_for_entry(entry, thinking_level),
         ..StreamOptions::default()
     };
     let provider = crate::providers::create_provider_with_auth(entry, None, Some(auth))

@@ -99,7 +99,7 @@ pub(super) fn entries(
     let mut seen = vec![(
         primary.model.provider.clone(),
         primary.model.id.clone(),
-        thinking,
+        super::thinking_for_entry(primary, thinking),
     )];
     let mut candidates = Vec::new();
     while let Some(spec) = pending.pop() {
@@ -120,7 +120,7 @@ pub(super) fn entries(
         ) {
             continue;
         }
-        let thinking = thinking.map(|level| entry.clamp_thinking_level(level));
+        let thinking = super::thinking_for_entry(&entry, thinking);
         let identity = (
             // ubs:ignore -- The bounded route keeps owned model identities to detect cycles after each candidate moves.
             entry.model.provider.clone(),

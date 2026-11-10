@@ -231,6 +231,231 @@ fn catalog_entry(provider: &str, id: &str, reasoning: bool) -> ModelEntry {
     }
 }
 
+fn required_reasoning_entry(id: &str) -> ModelEntry {
+    use crate::model::ThinkingLevel;
+
+    let mut entry = catalog_entry("reasoning-fixture", id, true);
+    entry.model.api = "openai-completions".into();
+    entry.compat = Some(crate::models::CompatConfig {
+        supports_reasoning_effort: Some(true),
+        reasoning_required: Some(true),
+        thinking_level_map: Some(HashMap::from([
+            ("off".into(), None),
+            ("minimal".into(), None),
+            ("low".into(), Some("low".into())),
+            ("medium".into(), None),
+            ("high".into(), Some("high".into())),
+            ("xhigh".into(), None),
+            ("max".into(), None),
+        ])),
+        reasoning_effort_map: Some(std::collections::BTreeMap::from([(
+            "medium".into(),
+            ThinkingLevel::High,
+        )])),
+        ..Default::default()
+    });
+    entry
+}
+
+#[test]
+fn named_and_role_judges_respect_required_reasoning_without_changing_optional_defaults() {
+    use crate::model::ThinkingLevel;
+
+    let registry = ModelRegistry::from_entries_for_tests(vec![
+        required_reasoning_entry("required"),
+        catalog_entry("reasoning-fixture", "optional", true),
+        catalog_entry("reasoning-fixture", "plain", false),
+    ]);
+    let config = Config {
+        model_roles: Some(crate::config::ModelRoleSettings {
+            smol: Some("reasoning-fixture/required".into()),
+            slow: Some("reasoning-fixture/required:medium".into()),
+            default: Some("reasoning-fixture/optional".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for (selection, expected) in [
+        (
+            json!({"provider":"reasoning-fixture", "model":"required"}),
+            Some(ThinkingLevel::Low),
+        ),
+        (json!({"role":"smol"}), Some(ThinkingLevel::Low)),
+        (json!({"role":"slow"}), Some(ThinkingLevel::High)),
+        (json!({"role":"default"}), None),
+        (
+            json!({"provider":"reasoning-fixture", "model":"optional"}),
+            None,
+        ),
+        (
+            json!({"provider":"reasoning-fixture", "model":"plain"}),
+            None,
+        ),
+    ] {
+        let selection = Selection::parse(&selection).unwrap();
+        let (_, actual) = resolve_entry(
+            Path::new("/workspace/project"),
+            &selection,
+            &config,
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(actual, expected, "{selection:?}");
+    }
+}
+
+#[test]
+fn fallback_cycles_use_effective_required_effort_before_reserving_attempts() {
+    use crate::model::ThinkingLevel;
+
+    let primary = required_reasoning_entry("primary");
+    let registry = ModelRegistry::from_entries_for_tests(vec![
+        primary.clone(),
+        required_reasoning_entry("backup"),
+        catalog_entry("reasoning-fixture", "optional", true),
+    ]);
+    let config = Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                (
+                    "reasoning-fixture/primary".into(),
+                    vec![
+                        "reasoning-fixture/primary:off".into(),
+                        "reasoning-fixture/primary:low".into(),
+                        "reasoning-fixture/backup".into(),
+                        "reasoning-fixture/backup:low".into(),
+                        "reasoning-fixture/backup:medium".into(),
+                        "reasoning-fixture/backup:high".into(),
+                        "reasoning-fixture/optional".into(),
+                    ],
+                ),
+                (
+                    "reasoning-fixture/backup".into(),
+                    vec!["reasoning-fixture/primary".into()],
+                ),
+            ])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let candidates = fallback::entries(
+        Path::new("/workspace/project"),
+        &Selection::Named {
+            provider: primary.model.provider.clone(),
+            model: primary.model.id.clone(),
+        },
+        &primary,
+        None,
+        &config,
+        &registry,
+    );
+    assert_eq!(
+        candidates
+            .into_iter()
+            .map(|(entry, effort)| (entry.model.id, effort))
+            .collect::<Vec<_>>(),
+        vec![
+            ("backup".into(), Some(ThinkingLevel::Low)),
+            ("backup".into(), Some(ThinkingLevel::High)),
+            ("optional".into(), None),
+        ],
+        "equivalent default/off/alias routes must not consume extra paid attempts"
+    );
+}
+
+#[test]
+fn bound_judge_sends_required_reasoning_on_the_real_provider_request() {
+    use crate::model::ThinkingLevel;
+    use std::io::{Read, Write};
+
+    for (requested, expected) in [
+        (None, "low"),
+        (Some(ThinkingLevel::Off), "low"),
+        (Some(ThinkingLevel::Medium), "high"),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "judge request never arrived");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept judge request: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let request = loop {
+                assert!(Instant::now() < deadline, "incomplete judge request");
+                match socket.read(&mut chunk) {
+                    Ok(0) => panic!("judge request closed before its body"),
+                    Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("read judge request: {error}"),
+                }
+                assert!(bytes.len() <= 128 * 1024, "unbounded judge request");
+                let Some(end) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .expect("JSON content length");
+                if bytes.len() >= end + 4 + length {
+                    break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                        .unwrap();
+                }
+            };
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"accepted\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let auth = AuthStorage::empty_at(dir.path().join("auth.json"));
+        let mut entry = required_reasoning_entry("required");
+        entry.model.base_url = format!("http://{address}/v1");
+        let judge = bind_entry(&entry, requested, &Config::default(), &auth).unwrap();
+        let outcome = runtime().block_on(judge.complete(
+            crate::judgment::CompletionRequest::parse(json!({"prompt":"answer briefly"})).unwrap(),
+        ));
+        let body = server.join().unwrap();
+        assert_eq!(outcome.unwrap()["text"], "accepted");
+        assert_eq!(body["model"], "required");
+        assert_eq!(body["reasoning_effort"], expected);
+        assert!(body.get("tools").is_none());
+    }
+}
+
 #[test]
 fn configured_roles_resolve_registered_models_and_clamp_their_thinking() {
     let registry = ModelRegistry::from_entries_for_tests(vec![
