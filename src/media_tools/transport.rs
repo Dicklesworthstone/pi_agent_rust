@@ -64,6 +64,13 @@ impl Transport {
         if let Some(budget) = &cost_budget {
             budget.admit()?;
         }
+        let model_costs = if cost_budget.is_some() {
+            self.auth
+                .model_costs()
+                .map_err(|message| Error::tool(tool, message))?
+        } else {
+            std::sync::Arc::default()
+        };
         let (default_url, env_name) = match provider {
             "openai" => ("https://api.openai.com/v1/", "PI_MEDIA_OPENAI_BASE_URL"),
             "anthropic" => (
@@ -121,6 +128,7 @@ impl Transport {
             key,
             track_rate_limits,
             cost_budget,
+            model_costs,
             base,
             owner,
             started,
@@ -136,6 +144,7 @@ pub(super) struct Api<'a> {
     key: String,
     track_rate_limits: bool,
     cost_budget: Option<crate::cost::CostBudget>,
+    model_costs: std::sync::Arc<super::MediaModelCosts>,
     base: Url,
     pub(super) owner: AgentCx,
     started: Instant,
@@ -145,6 +154,7 @@ pub(super) struct Api<'a> {
 pub(super) struct Response {
     pub(super) bytes: Vec<u8>,
     pub(super) content_type: String,
+    parsed_json: Option<Value>,
 }
 
 impl Response {
@@ -155,8 +165,13 @@ impl Response {
         {
             return Err(Error::tool(tool, "provider returned a non-JSON response"));
         }
-        serde_json::from_slice(&self.bytes)
-            .map_err(|_| Error::tool(tool, "provider returned invalid JSON"))
+        self.parsed_json.map_or_else(
+            || {
+                serde_json::from_slice(&self.bytes)
+                    .map_err(|_| Error::tool(tool, "provider returned invalid JSON"))
+            },
+            Ok,
+        )
     }
 }
 
@@ -168,9 +183,73 @@ impl Api<'_> {
             .collect()
     }
 
+    pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
+        self.post_inner(path, payload, limit, None).await
+    }
+
+    /// Vision responses use the same token rates as ordinary model requests.
+    /// Settle billing before interpreting the answer, so refusals, malformed
+    /// content and failed artifact processing cannot erase a provider charge.
+    pub(super) async fn post_vision(
+        &self,
+        model: &str,
+        path: &str,
+        payload: &Value,
+        limit: usize,
+    ) -> Result<Value> {
+        self.post_inner(path, payload, limit, Some(model))
+            .await?
+            .json(self.tool)
+    }
+
+    fn settle_vision_usage(
+        &self,
+        model: &str,
+        response: &Value,
+        attempt: &mut crate::cost::CostAttempt,
+    ) -> Result<()> {
+        let cost: Result<f64> = (|| {
+            let Some(mut usage) = super::vision::response_usage(self.provider, response)? else {
+                // A response without billing evidence cannot be priced from
+                // its text or pixels. Preserve the same unpriced semantics as
+                // the normal provider guard; never invent a bill.
+                return Ok(0.0);
+            };
+            let rates = self
+                .model_costs
+                .get(self.provider)
+                .and_then(|models| models.get(&model.to_ascii_lowercase()))
+                .filter(|rates| rates.is_priced());
+            if let Some(rates) = rates {
+                rates.price_usage(&mut usage)?;
+            } else if matches!(
+                usage.billing,
+                Some(crate::model::BillingUsage::ReportedTotal { .. })
+            ) {
+                crate::provider::ModelCost::default().price_usage(&mut usage)?;
+            }
+            Ok(usage.cost.total)
+        })();
+        match cost {
+            Ok(cost) => attempt.finish(cost),
+            Err(error) => {
+                // Invalid evidence permanently fences further admissions but
+                // cannot prevent already-owned sibling attempts from settling.
+                let _ = attempt.observe(f64::NAN);
+                Err(error)
+            }
+        }
+    }
+
     // Keep the bounded HTTP exchange inside its shared cancellation/deadline race.
     #[allow(clippy::too_many_lines)]
-    pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
+    async fn post_inner(
+        &self,
+        path: &str,
+        payload: &Value,
+        limit: usize,
+        vision_model: Option<&str>,
+    ) -> Result<Response> {
         check_owner(self.tool, &self.owner)?;
         remaining_timeout(self.tool, self.started, self.timeout)?;
         // Paths are built by adapters, never accepted as model-facing arguments.
@@ -201,10 +280,15 @@ impl Api<'_> {
             .map_err(|_| Error::tool(self.tool, "invalid media authentication header"))?;
             // Sibling work may exhaust or quarantine the captured account
             // while credentials and input payloads are being prepared.
-            if let Some(budget) = &self.cost_budget {
-                budget.admit()?;
-            }
             remaining_timeout(self.tool, self.started, self.timeout)?;
+            let mut attempt = match (&self.cost_budget, vision_model) {
+                (Some(budget), Some(_)) => Some(budget.start_attempt()?),
+                (Some(budget), None) => {
+                    budget.admit()?;
+                    None
+                }
+                _ => None,
+            };
             let started_at = std::time::Instant::now();
             let response = request.send().await.map_err(|error| {
                 Error::tool(
@@ -223,10 +307,17 @@ impl Api<'_> {
                     // potentially billable generation or synthesis request.
                     crate::auth::report_provider_rate_limit(self.provider, &self.key);
                 }
-                let detail = response.text_limited(16 * 1024).await.map_or_else(
-                    |_| "error body unavailable or too large".to_string(),
-                    |body| self.scrub(&body, 2048),
-                );
+                let detail = match response.bytes_limited(16 * 1024).await {
+                    Ok(body) => {
+                        if let (Some(model), Some(attempt)) = (vision_model, attempt.as_mut())
+                            && let Ok(json) = serde_json::from_slice::<Value>(&body)
+                        {
+                            self.settle_vision_usage(model, &json, attempt)?;
+                        }
+                        self.scrub(&String::from_utf8_lossy(&body), 2048)
+                    }
+                    Err(_) => "error body unavailable or too large".to_string(),
+                };
                 return Err(Error::tool(
                     self.tool,
                     format!("{} HTTP {status}: {detail}", self.provider),
@@ -255,6 +346,15 @@ impl Api<'_> {
                     ),
                 )
             })?;
+            let parsed_json = if let (Some(model), Some(attempt)) = (vision_model, attempt.as_mut())
+            {
+                let json = serde_json::from_slice::<Value>(&bytes)
+                    .map_err(|_| Error::tool(self.tool, "provider returned invalid JSON"))?;
+                self.settle_vision_usage(model, &json, attempt)?;
+                Some(json)
+            } else {
+                None
+            };
             check_owner(self.tool, &self.owner)?;
             if self.started.elapsed() >= self.timeout {
                 return Err(Error::tool(
@@ -274,6 +374,7 @@ impl Api<'_> {
             Ok(Response {
                 bytes,
                 content_type,
+                parsed_json,
             })
         };
         let cancelled = async {

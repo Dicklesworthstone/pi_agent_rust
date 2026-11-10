@@ -19027,6 +19027,10 @@ impl AgentSession {
     }
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
+        self.agent
+            .shared_tools()
+            .snapshot()
+            .set_media_model_registry(&self.media_auth_owner, Some(&registry));
         let provider = self.agent.provider();
         let entry = registry.find(provider.name(), provider.model_id());
         if let Some(entry) = &entry {
@@ -19610,6 +19614,10 @@ impl AgentSession {
                 .manager()
                 .set_current_model(Some(provider_id), Some(model_id));
         }
+        self.agent
+            .shared_tools()
+            .snapshot()
+            .set_media_model_registry(&self.media_auth_owner, registry.as_deref());
         self.model_registry = registry;
         self.refresh_extension_completion_host_state();
         if let Ok(mut state) = self.extension_ai_completion.lock() {

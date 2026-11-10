@@ -7102,6 +7102,14 @@ impl ToolRegistry {
         self.media_auth_scope.set(owner, auth);
     }
 
+    pub(crate) fn set_media_model_registry(
+        &self,
+        owner: &Arc<()>,
+        registry: Option<&crate::models::ModelRegistry>,
+    ) {
+        self.media_auth_scope.set_models(owner, registry);
+    }
+
     /// Get all tools.
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools

@@ -10,6 +10,7 @@ use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -28,12 +29,17 @@ pub(crate) use transport::tests::peer as test_peer;
 #[cfg(test)]
 pub(crate) use transport::tests::peer_responses as test_peer_responses;
 
-/// Session-owned credentials shared by native media tools and registry snapshots.
+/// Session-owned credentials and prices shared by native tools and registry snapshots.
 /// Resolution stays private to the native adapters and happens only at invocation.
 #[derive(Clone, Default)]
 pub struct MediaAuthScope {
     state: Arc<RwLock<MediaAuthState>>,
 }
+
+/// Only non-secret native model prices are shared with media adapters. A
+/// request captures this immutable snapshot before credential resolution so
+/// a catalog reload cannot reprice an already-started invocation.
+type MediaModelCosts = BTreeMap<String, BTreeMap<String, crate::provider::ModelCost>>;
 
 #[derive(Default)]
 enum MediaAuthState {
@@ -42,6 +48,7 @@ enum MediaAuthState {
     Owned {
         owner: Arc<()>,
         auth: Option<Arc<crate::auth::AuthStorage>>,
+        model_costs: Arc<MediaModelCosts>,
     },
     Conflicted,
 }
@@ -53,6 +60,7 @@ impl MediaAuthState {
                 *self = Self::Owned {
                     owner: Arc::clone(incoming),
                     auth: None,
+                    model_costs: Arc::default(),
                 };
             }
             Self::Owned { owner, .. } if Arc::ptr_eq(owner, incoming) => {}
@@ -79,6 +87,48 @@ impl MediaAuthScope {
         state.claim(owner);
         if let MediaAuthState::Owned { auth: stored, .. } = &mut *state {
             *stored = Some(Arc::new(auth));
+        }
+    }
+
+    pub(crate) fn set_models(
+        &self,
+        owner: &Arc<()>,
+        registry: Option<&crate::models::ModelRegistry>,
+    ) {
+        let mut prices = MediaModelCosts::new();
+        if let Some(registry) = registry {
+            for entry in registry.models() {
+                let Ok(provider) = transport::provider("media pricing", &entry.model.provider)
+                else {
+                    continue;
+                };
+                prices.entry(provider.to_string()).or_default().insert(
+                    entry.model.id.to_ascii_lowercase(),
+                    entry.model.cost.clone(),
+                );
+            }
+        }
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.claim(owner);
+        if let MediaAuthState::Owned { model_costs, .. } = &mut *state {
+            *model_costs = Arc::new(prices);
+        }
+    }
+
+    fn model_costs(&self) -> std::result::Result<Arc<MediaModelCosts>, &'static str> {
+        match &*self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            MediaAuthState::Unclaimed => Ok(Arc::default()),
+            MediaAuthState::Owned { model_costs, .. } => Ok(Arc::clone(model_costs)),
+            MediaAuthState::Conflicted => Err(
+                "media pricing refused: this tool registry is shared by multiple AgentSessions; create a separate tool registry for each session",
+            ),
         }
     }
 
