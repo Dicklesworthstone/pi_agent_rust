@@ -2786,8 +2786,16 @@ struct OpenAIResponsesUsage {
     input_tokens_details: Option<OpenAIResponsesInputTokensDetails>,
     #[serde(default)]
     output_tokens_details: Option<OpenAIResponsesOutputTokensDetails>,
-    #[serde(default, deserialize_with = "deserialize_reported_cost")]
+    #[serde(
+        default,
+        deserialize_with = "crate::provider::deserialize_reported_cost"
+    )]
     cost: Option<serde_json::Value>,
+    #[serde(
+        default,
+        deserialize_with = "crate::provider::deserialize_reported_cost"
+    )]
+    cost_in_usd_ticks: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2815,17 +2823,6 @@ struct OpenAIResponsesOutputTokensDetails {
     audio_tokens: u64,
 }
 
-/// Missing cost is different from a supplied null or another invalid bill.
-/// Keep the outer usage object typed so duplicate known fields still fail.
-fn deserialize_reported_cost<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde_json::Value::deserialize(deserializer).map(Some)
-}
-
 impl OpenAIResponsesUsage {
     fn normalized(&self) -> Usage {
         let unavailable = |reason: &str| Usage {
@@ -2834,16 +2831,12 @@ impl OpenAIResponsesUsage {
             }),
             ..Usage::default()
         };
-        let reported_total = if let Some(cost) = &self.cost {
-            let Some(total) = cost
-                .as_f64()
-                .filter(|total| total.is_finite() && *total >= 0.0)
-            else {
-                return unavailable("OpenAI Responses reported an invalid billed total");
-            };
-            Some(total)
-        } else {
-            None
+        let reported_total = match crate::provider::reported_cost_total(
+            self.cost.as_ref(),
+            self.cost_in_usd_ticks.as_ref(),
+        ) {
+            Ok(total) => total,
+            Err(reason) => return unavailable(reason),
         };
         let mut usage = match self.token_usage() {
             Ok(usage) => usage,
@@ -7680,7 +7673,15 @@ mod tests {
         #[test]
         fn http_reported_and_zero_bills_replace_estimates_without_refunding_unknown_prices() {
             for mode in MODES {
-                for case in ["reported", "zero_bill", "zero_work", "unpriced"] {
+                for case in [
+                    "reported",
+                    "zero_bill",
+                    "ticks",
+                    "zero_ticks",
+                    "matching_bills",
+                    "zero_work",
+                    "unpriced",
+                ] {
                     let mut first = completion(7, 3);
                     first["response"]["usage"]["cost"] = json!(10.0);
                     let mut last = if case == "zero_work" {
@@ -7695,6 +7696,18 @@ mod tests {
                         }
                         "zero_bill" => {
                             last["response"]["usage"]["cost"] = json!(0.0);
+                            0.0
+                        }
+                        "ticks" | "matching_bills" => {
+                            last["response"]["usage"]["cost_in_usd_ticks"] =
+                                json!(25_000_000_000_u64);
+                            if case == "matching_bills" {
+                                last["response"]["usage"]["cost"] = json!(2.5);
+                            }
+                            2.5
+                        }
+                        "zero_ticks" => {
+                            last["response"]["usage"]["cost_in_usd_ticks"] = json!(0);
                             0.0
                         }
                         "zero_work" => 0.0,
@@ -7758,6 +7771,14 @@ mod tests {
                 json!({"input_tokens": 10, "output_tokens": 1, "cost": null}),
                 json!({"input_tokens": 10, "output_tokens": 1, "cost": -1}),
                 json!({"input_tokens": 10, "output_tokens": 1, "cost": "0"}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost_in_usd_ticks": null}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost_in_usd_ticks": -1}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost_in_usd_ticks": 0.5}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost_in_usd_ticks": "0"}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost_in_usd_ticks": {"total": 0}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": 0, "cost_in_usd_ticks": 1}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": null, "cost_in_usd_ticks": 0}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": 0, "cost_in_usd_ticks": null}),
             ];
             for mode in MODES {
                 for usage in &invalid {
@@ -7800,6 +7821,49 @@ mod tests {
                     });
                     fixture.assert_request();
                 }
+            }
+        }
+
+        #[test]
+        fn http_tick_bills_cover_server_tools_without_catalog_prices() {
+            for mode in MODES {
+                let mut frame = completion(0, 0);
+                frame["response"]["usage"]["cost_in_usd_ticks"] = json!(25_000_000_000_u64);
+                frame["response"]["usage"]["num_server_side_tools_used"] = json!(3);
+                let fixture = UsageHttpFixture::with_rates(mode, mode.events(&[frame]), 2.0, None);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 2.5);
+                    assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
+                    let events = terminal_events(&mut output).await;
+                    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                        // ubs:ignore -- A missing terminal event must fail this regression test.
+                        panic!("expected tick bill for {mode:?}");
+                    };
+                    assert_eq!(message.usage.cost.total, 2.5);
+                    assert!(message.usage.has_explicit_billing());
+                    assert_eq!(fixture.budget.spent(), 2.5);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    assert!(matches!(
+                        fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 2.5);
+                });
+                fixture.assert_request();
             }
         }
 

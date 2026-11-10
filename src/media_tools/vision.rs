@@ -309,19 +309,23 @@ pub(super) fn response_usage(
     if !usage.is_object() {
         return Err(invalid());
     }
-    // OpenAI-compatible gateways may return the authoritative billed USD
-    // amount accepted by the ordinary chat provider. Zero is a real bill too.
-    if provider == "openai"
-        && let Some(total) = usage.get("cost").filter(|value| !value.is_null())
-    {
-        let total = total
-            .as_f64()
-            .filter(|total| total.is_finite() && *total >= 0.0)
-            .ok_or_else(invalid)?;
-        return Ok(Some(Usage {
-            billing: Some(BillingUsage::ReportedTotal { total }),
-            ..Usage::default()
-        }));
+    // OpenAI-compatible gateways may return an authoritative USD or tick
+    // bill. Validate every supplied representation before choosing the total;
+    // zero is a real bill, while null or conflicting amounts are not.
+    if provider == "openai" {
+        match crate::provider::reported_cost_total(
+            usage.get("cost"),
+            usage.get("cost_in_usd_ticks"),
+        ) {
+            Ok(Some(total)) => {
+                return Ok(Some(Usage {
+                    billing: Some(BillingUsage::ReportedTotal { total }),
+                    ..Usage::default()
+                }));
+            }
+            Err(_) => return Err(invalid()),
+            Ok(None) => {}
+        }
     }
     let count = |key: &str, optional: bool| -> Result<u64> {
         match usage.pointer(key) {
@@ -672,7 +676,17 @@ mod tests {
     #[test]
     fn explicit_vision_bills_include_zero_and_unknown_catalog_models_stay_unpriced() {
         for known_model in [false, true] {
-            for reported in [Some(0.0), Some(0.75), None] {
+            for (bill, reported) in [
+                (json!({}), None),
+                (json!({"cost":0.0}), Some(0.0)),
+                (json!({"cost":0.75}), Some(0.75)),
+                (json!({"cost_in_usd_ticks":0}), Some(0.0)),
+                (json!({"cost_in_usd_ticks":7_500_000_000_u64}), Some(0.75)),
+                (
+                    json!({"cost":0.75,"cost_in_usd_ticks":7_500_000_000_u64}),
+                    Some(0.75),
+                ),
+            ] {
                 let directory = tempfile::tempdir().unwrap();
                 std::fs::write(
                     directory.path().join("input.png"),
@@ -681,8 +695,8 @@ mod tests {
                 .unwrap();
                 let mut response = json!({"choices":[{"finish_reason":"stop","message":{"content":"A diagram."}}],
                     "usage":{"prompt_tokens":1_000_000,"completion_tokens":0}});
-                if let Some(total) = reported {
-                    response["usage"]["cost"] = json!(total);
+                if let Value::Object(bill) = bill {
+                    response["usage"].as_object_mut().unwrap().extend(bill);
                 }
                 let (endpoint, worker) = peer(
                     200,
@@ -697,7 +711,7 @@ mod tests {
                 .with_mock(false)
                 .with_api_key(Some("vision-cost-key".into()))
                 .with_base_url(endpoint);
-                let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+                let budget = CostBudget::new(None, Some(0.5), 0.0).unwrap();
                 let catalog = if known_model {
                     fixture_catalog("openai", 2.0)
                 } else {
@@ -715,8 +729,20 @@ mod tests {
                     ))
                     .unwrap();
                 let expected = reported.unwrap_or(if known_model { 2.0 } else { 0.0 });
-                assert_eq!(budget.spent(), expected);
-                assert!(budget.admit().is_ok());
+                assert_eq!(budget.spent(), expected, "{bill}");
+                assert_eq!(budget.snapshot().pending, 0.0);
+                if expected >= 0.5 {
+                    assert!(matches!(
+                        runtime.block_on(registry.get(NAME).unwrap().execute(
+                            "capped",
+                            json!({"path":"input.png"}),
+                            None,
+                        )),
+                        Err(Error::CostCap { .. })
+                    ));
+                } else {
+                    budget.admit().unwrap();
+                }
                 worker.join().unwrap();
             }
         }
@@ -726,6 +752,14 @@ mod tests {
     fn malformed_vision_billing_quarantines_the_account_without_a_second_request() {
         for usage in [
             json!({"cost":-1.0}),
+            json!({"prompt_tokens":1,"completion_tokens":0,"cost":null}),
+            json!({"prompt_tokens":1,"completion_tokens":0,"cost_in_usd_ticks":null}),
+            json!({"cost_in_usd_ticks":-1}),
+            json!({"cost_in_usd_ticks":0.5}),
+            json!({"cost_in_usd_ticks":"0"}),
+            json!({"cost":0,"cost_in_usd_ticks":1}),
+            json!({"cost":null,"cost_in_usd_ticks":0}),
+            json!({"cost":0,"cost_in_usd_ticks":null}),
             json!({"total_tokens":10}),
             json!({"prompt_tokens":1,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":2}}),
             json!({"prompt_tokens":1,"completion_tokens":-1}),

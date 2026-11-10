@@ -1477,12 +1477,20 @@ where
             self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
             self.partial.usage.total_tokens = usage.total_tokens;
             self.partial.usage.billing = usage.billing(self.audio_input_in_request);
-            // Provider-reported billed total (OpenRouter). The agent fills the
-            // per-component breakdown from catalog rates when it has them and
-            // keeps this figure as the authoritative total (gh #221).
-            if let Some(cost) = usage.cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
-                self.partial.usage.cost.total = cost;
-            }
+            // A wire snapshot must not reuse an earlier local estimate or
+            // bill. Explicit USD/tick totals, including zero, are authoritative;
+            // catalog pricing can fill the component breakdown afterward.
+            self.partial.usage.cost = crate::model::Cost {
+                total: match &self.partial.usage.billing {
+                    Some(BillingUsage::ReportedTotal { total })
+                    | Some(BillingUsage::Tokens {
+                        reported_total: Some(total),
+                        ..
+                    }) => *total,
+                    _ => 0.0,
+                },
+                ..Default::default()
+            };
             if let Some(observer) = &self.usage_observer {
                 if authoritative_usage && self.partial.usage.has_explicit_billing() {
                     observer.observe_authoritative(&mut self.partial.usage)?;
@@ -2351,8 +2359,17 @@ struct OpenAIUsage {
     prompt_cache_miss_tokens: Option<u64>,
     /// OpenRouter usage accounting: the billed cost in USD for this request
     /// (present when the request asked for `usage: {include: true}`, gh #221).
-    #[serde(default)]
-    cost: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::provider::deserialize_reported_cost"
+    )]
+    cost: Option<serde_json::Value>,
+    /// xAI's exact billed total, in integer units of 10^-10 USD.
+    #[serde(
+        default,
+        deserialize_with = "crate::provider::deserialize_reported_cost"
+    )]
+    cost_in_usd_ticks: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2374,13 +2391,13 @@ impl OpenAIUsage {
         let unavailable = |reason: &str| BillingUsage::Unavailable {
             reason: reason.to_string(),
         };
-        if self
-            .cost
-            .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
-        {
-            return Some(unavailable("The provider reported an invalid billed total"));
-        }
-        let reported_total = self.cost;
+        let reported_total = match crate::provider::reported_cost_total(
+            self.cost.as_ref(),
+            self.cost_in_usd_ticks.as_ref(),
+        ) {
+            Ok(total) => total,
+            Err(reason) => return Some(unavailable(reason)),
+        };
         let input_audio = self
             .prompt_tokens_details
             .as_ref()
@@ -3050,6 +3067,10 @@ mod tests {
                 json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"cost":0}),
                 Some(0.0),
             ),
+            (
+                json!({"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"cost_in_usd_ticks":0}),
+                Some(0.0),
+            ),
         ] {
             let usage: OpenAIUsage = serde_json::from_value(usage).unwrap();
             match (usage.billing(true).unwrap(), reported) {
@@ -3173,6 +3194,195 @@ mod tests {
                 0.0,
                 "missing accounting must not fabricate a dollar charge"
             );
+        }
+    }
+
+    #[test]
+    fn xai_trailing_tick_bills_settle_once_and_enforce_the_shared_cap() {
+        use std::sync::Arc;
+
+        for (ticks, expected) in [
+            (0_u64, 0.0),
+            (2_500_000_000_u64, 0.25),
+            (12_500_000_000_u64, 1.25),
+        ] {
+            let first = json!({"choices":[{"delta":{"content":"Answer"},"finish_reason":null}],
+                "usage":{"prompt_tokens":1_000_000,"completion_tokens":0,
+                    "total_tokens":1_000_000,"cost":0.5}});
+            let stop = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+            let billed = json!({"choices":[],"usage":{"prompt_tokens":1_000_000,
+                "completion_tokens":1,"total_tokens":1_000_001,"cost_in_usd_ticks":ticks}});
+            let response =
+                format!("data: {first}\n\ndata: {stop}\n\ndata: {billed}\n\ndata: [DONE]\n\n");
+            let (url, captured) = spawn_test_server(200, "text/event-stream", &response);
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let provider = crate::provider::guard_with_cost_budget(
+                Arc::new(
+                    OpenAIProvider::new("grok-fixture")
+                        .with_provider_name("xai")
+                        .with_base_url(url)
+                        .with_model_cost(crate::provider::ModelCost {
+                            input: 2.0,
+                            ..Default::default()
+                        }),
+                ),
+                budget.clone(),
+            );
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let context = Context::default();
+                let options = StreamOptions {
+                    api_key: Some("fixture-key".to_string()),
+                    ..Default::default()
+                };
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                let mut completed = false;
+                let mut saw_partial = false;
+                while let Some(event) = stream.next().await {
+                    match event.unwrap() {
+                        StreamEvent::TextDelta { .. } => {
+                            assert_eq!(budget.snapshot().pending, 0.5);
+                            saw_partial = true;
+                        }
+                        StreamEvent::Done { message, .. } => {
+                            assert_eq!(message.usage.cost.total, expected);
+                            assert!(message.usage.has_explicit_billing());
+                            assert_eq!(message.provider, "xai");
+                            completed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(saw_partial && completed);
+                drop(stream);
+                assert_eq!(budget.spent(), expected);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                if expected >= 1.0 {
+                    assert!(matches!(
+                        provider.stream(&context, &options).await,
+                        Err(Error::CostCap { .. })
+                    ));
+                } else {
+                    budget.admit().unwrap();
+                }
+            });
+            let request = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+            let body: Value =
+                serde_json::from_str(&request.body).expect("valid fixture request JSON");
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
+    }
+
+    #[test]
+    fn xai_terminal_zero_ticks_survive_drop_before_public_done() {
+        use std::sync::Arc;
+
+        let response = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Answer\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1,\"cost\":0.5}}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2,\"cost_in_usd_ticks\":0}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, captured) = spawn_test_server(200, "text/event-stream", response);
+        let budget = crate::cost::CostBudget::new(None, Some(0.4), 0.0).unwrap();
+        let provider = crate::provider::guard_with_cost_budget(
+            Arc::new(
+                OpenAIProvider::new("grok-fixture")
+                    .with_provider_name("xai")
+                    .with_base_url(url),
+            ),
+            budget.clone(),
+        );
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let context = Context::default();
+            let options = StreamOptions {
+                api_key: Some("fixture-key".to_string()),
+                ..Default::default()
+            };
+            let mut stream = provider.stream(&context, &options).await.unwrap();
+            let mut saw_partial = false;
+            let mut saw_final_content = false;
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    StreamEvent::TextDelta { .. } => {
+                        assert_eq!(budget.snapshot().pending, 0.5);
+                        saw_partial = true;
+                    }
+                    StreamEvent::TextEnd { .. } => {
+                        saw_final_content = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_partial && saw_final_content);
+            drop(stream);
+            assert_eq!(budget.spent(), 0.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            budget.admit().unwrap();
+        });
+        captured.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_conflicting_chat_bills_quarantine_without_losing_partial_spend() {
+        use std::sync::Arc;
+
+        for fields in [
+            json!({"cost_in_usd_ticks": null}),
+            json!({"cost_in_usd_ticks": -1}),
+            json!({"cost_in_usd_ticks": 0.5}),
+            json!({"cost_in_usd_ticks": "0"}),
+            json!({"cost_in_usd_ticks": {"total":0}}),
+            json!({"cost": 0, "cost_in_usd_ticks": 1}),
+            json!({"cost": null, "cost_in_usd_ticks": 0}),
+            json!({"cost": "0", "cost_in_usd_ticks": 0}),
+            json!({"cost": 0, "cost_in_usd_ticks": null}),
+        ] {
+            let first = json!({"choices":[{"delta":{"content":"Partial"},"finish_reason":null}],
+                "usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1,"cost":0.5}});
+            let mut usage = json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":2});
+            usage
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let invalid = json!({"choices":[],"usage":usage});
+            let response = format!("data: {first}\n\ndata: {invalid}\n\ndata: [DONE]\n\n");
+            let (url, captured) = spawn_test_server(200, "text/event-stream", &response);
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let provider = crate::provider::guard_with_cost_budget(
+                Arc::new(
+                    OpenAIProvider::new("grok-fixture")
+                        .with_provider_name("xai")
+                        .with_base_url(url),
+                ),
+                budget.clone(),
+            );
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let context = Context::default();
+                let options = StreamOptions {
+                    api_key: Some("fixture-key".to_string()),
+                    ..Default::default()
+                };
+                let mut stream = provider.stream(&context, &options).await.unwrap();
+                let mut rejected = false;
+                while let Some(event) = stream.next().await {
+                    if let Err(error) = event {
+                        assert!(error.to_string().contains("cost accounting"), "{error}");
+                        rejected = true;
+                    }
+                }
+                assert!(rejected, "invalid billing was ignored: {fields}");
+                drop(stream);
+                assert_eq!(budget.spent(), 0.5);
+                assert_eq!(budget.snapshot().pending, 0.0);
+                assert!(matches!(
+                    provider.stream(&context, &options).await,
+                    Err(Error::Session(_))
+                ));
+            });
+            captured.recv_timeout(Duration::from_secs(2)).unwrap();
         }
     }
 

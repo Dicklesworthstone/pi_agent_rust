@@ -197,6 +197,57 @@ impl Provider for CostGuardedProvider {
     }
 }
 
+/// Read an authoritative bill without guessing from token or tool counts.
+/// xAI reports integer USD ticks (10^10 per dollar), including native tool
+/// charges and discounts: <https://docs.x.ai/developers/cost-tracking>.
+/// Validate every supplied field before accepting either representation; a
+/// malformed or conflicting USD amount cannot hide behind a valid tick bill.
+#[allow(clippy::cast_precision_loss)] // The ledger stores USD as f64; wire ticks remain validated integers.
+pub(crate) fn reported_cost_total(
+    usd: Option<&serde_json::Value>,
+    ticks: Option<&serde_json::Value>,
+) -> std::result::Result<Option<f64>, &'static str> {
+    let usd = usd
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|total| total.is_finite() && *total >= 0.0)
+                .ok_or("The provider reported an invalid billed total")
+        })
+        .transpose()?;
+    let ticks = ticks
+        .map(|value| {
+            value
+                .as_u64()
+                .map(|ticks| ticks as f64 / 10_000_000_000.0)
+                .ok_or("The provider reported invalid USD billing ticks")
+        })
+        .transpose()?;
+    match (usd, ticks) {
+        (Some(usd), Some(ticks)) => {
+            // Integer conversion and division can each round once. Permit
+            // only representation noise, not a billing-unit-sized mismatch.
+            let tolerance = 2.0 * f64::EPSILON * usd.abs().max(ticks.abs());
+            if (usd - ticks).abs() > tolerance {
+                return Err("The provider reported conflicting billed totals");
+            }
+            Ok(Some(ticks))
+        }
+        (usd, ticks) => Ok(ticks.or(usd)),
+    }
+}
+
+/// Preserve the distinction between an absent bill and an explicitly invalid
+/// null. Keeping these fields on typed usage structs also rejects duplicates.
+pub(crate) fn deserialize_reported_cost<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 /// Decode native Responses compaction billing without turning invalid evidence
 /// into a free request. An explicit USD bill is sufficient even if the provider
 /// does not supply a usable token breakdown; absent usage preserves observer
@@ -250,19 +301,15 @@ fn native_compaction_usage(
         }),
         ..Usage::default()
     };
-    if let Some(cost) = raw.get("cost") {
-        return Some(
-            match cost
-                .as_f64()
-                .filter(|cost| cost.is_finite() && *cost >= 0.0)
-            {
-                Some(total) => Usage {
-                    billing: Some(BillingUsage::ReportedTotal { total }),
-                    ..Usage::default()
-                },
-                None => unavailable("Native compaction reported an invalid billed total"),
-            },
-        );
+    match reported_cost_total(raw.get("cost"), raw.get("cost_in_usd_ticks")) {
+        Ok(Some(total)) => {
+            return Some(Usage {
+                billing: Some(BillingUsage::ReportedTotal { total }),
+                ..Usage::default()
+            });
+        }
+        Err(reason) => return Some(unavailable(reason)),
+        Ok(None) => {}
     }
     let Ok(usage) = serde_json::from_value::<NativeUsage>(raw.clone()) else {
         return Some(unavailable(
@@ -1743,6 +1790,9 @@ mod tests {
             Invalid,
             NativeMalformed,
             NativeZero,
+            NativeTicks,
+            NativeTicksZero,
+            NativeTicksMalformed,
             NativeUnpriced,
         }
 
@@ -1828,6 +1878,16 @@ mod tests {
                     Mode::SetupError => Err(crate::error::Error::api("compact request failed")),
                     Mode::Eof => Ok(serde_json::json!({"output": []})),
                     Mode::Done => Ok(serde_json::json!({"usage": {"cost": 0.25}})),
+                    Mode::NativeTicks => Ok(serde_json::json!({"usage": {
+                        "cost_in_usd_ticks": 2_500_000_000_u64
+                    }})),
+                    Mode::NativeTicksZero => Ok(serde_json::json!({"usage": {
+                        "cost_in_usd_ticks": 0
+                    }})),
+                    Mode::NativeTicksMalformed => Ok(serde_json::json!({"usage": {
+                        "cost": 0,
+                        "cost_in_usd_ticks": "invalid"
+                    }})),
                     Mode::NativeZero => Ok(serde_json::json!({"usage": {
                         "input_tokens": 0,
                         "output_tokens": 0
@@ -1886,6 +1946,9 @@ mod tests {
                     | Mode::SetupError
                     | Mode::NativeMalformed
                     | Mode::NativeZero
+                    | Mode::NativeTicks
+                    | Mode::NativeTicksZero
+                    | Mode::NativeTicksMalformed
                     | Mode::NativeUnpriced => unreachable!("request-only fixture"),
                 }
             }
@@ -2029,6 +2092,9 @@ mod tests {
                 Mode::Invalid,
                 Mode::NativeMalformed,
                 Mode::NativeZero,
+                Mode::NativeTicks,
+                Mode::NativeTicksZero,
+                Mode::NativeTicksMalformed,
                 Mode::NativeUnpriced,
             ] {
                 let budget = crate::cost::CostBudget::new(None, Some(0.4), 0.0).unwrap();
@@ -2050,26 +2116,32 @@ mod tests {
                         ));
                     }
                     Mode::SetupError => assert!(matches!(result, Poll::Ready(Err(_)))),
-                    Mode::Invalid | Mode::NativeMalformed => assert!(matches!(
-                        result,
-                        Poll::Ready(Err(crate::error::Error::Session(_)))
-                    )),
+                    Mode::Invalid | Mode::NativeMalformed | Mode::NativeTicksMalformed => {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(crate::error::Error::Session(_)))
+                        ));
+                    }
                     _ => assert!(matches!(result, Poll::Ready(Ok(_)))),
                 }
                 drop(request);
                 let expected = match mode {
-                    Mode::Done => 0.25,
-                    Mode::NativeZero => 0.0,
+                    Mode::Done | Mode::NativeTicks => 0.25,
+                    Mode::NativeZero | Mode::NativeTicksZero => 0.0,
                     Mode::Invalid => 0.5,
                     _ => 0.75,
                 };
                 assert_closed(&probe, &budget, expected);
                 match mode {
-                    Mode::Done | Mode::NativeZero => budget.admit().unwrap(),
-                    Mode::Invalid | Mode::NativeMalformed => assert!(matches!(
-                        budget.admit(),
-                        Err(crate::error::Error::Session(_))
-                    )),
+                    Mode::Done | Mode::NativeZero | Mode::NativeTicks | Mode::NativeTicksZero => {
+                        budget.admit().unwrap();
+                    }
+                    Mode::Invalid | Mode::NativeMalformed | Mode::NativeTicksMalformed => {
+                        assert!(matches!(
+                            budget.admit(),
+                            Err(crate::error::Error::Session(_))
+                        ));
+                    }
                     _ => assert!(matches!(
                         budget.admit(),
                         Err(crate::error::Error::CostCap { .. })
@@ -2384,9 +2456,116 @@ mod tests {
     }
 
     #[test]
+    fn reported_bills_validate_ticks_usd_and_conflicting_representations() {
+        for (wire, expected) in [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"cost": 0.25}), Some(0.25)),
+            (serde_json::json!({"cost_in_usd_ticks": 0}), Some(0.0)),
+            (
+                serde_json::json!({"cost_in_usd_ticks": 2_500_000_000_u64}),
+                Some(0.25),
+            ),
+            (
+                serde_json::json!({"cost": 0.25, "cost_in_usd_ticks": 2_500_000_000_u64}),
+                Some(0.25),
+            ),
+        ] {
+            assert_eq!(
+                reported_cost_total(wire.get("cost"), wire.get("cost_in_usd_ticks")).unwrap(),
+                expected,
+                "{wire}"
+            );
+        }
+        // Adjacent floating-point representations are harmless; a missing
+        // whole tick is a conflicting bill even at sub-cent prices.
+        let adjacent = f64::from_bits(0.04_f64.to_bits() + 1);
+        assert_eq!(
+            reported_cost_total(
+                Some(&serde_json::json!(adjacent)),
+                Some(&serde_json::json!(400_000_000))
+            )
+            .unwrap(),
+            Some(0.04)
+        );
+        for wire in [
+            serde_json::json!({"cost_in_usd_ticks": null}),
+            serde_json::json!({"cost_in_usd_ticks": -1}),
+            serde_json::json!({"cost_in_usd_ticks": 1.5}),
+            serde_json::json!({"cost_in_usd_ticks": 0.0}),
+            serde_json::json!({"cost_in_usd_ticks": "400000000"}),
+            serde_json::json!({"cost_in_usd_ticks": {"total": 400_000_000}}),
+            serde_json::json!({"cost": 0, "cost_in_usd_ticks": 1}),
+            serde_json::json!({"cost": 0.04, "cost_in_usd_ticks": 400_000_001}),
+            serde_json::json!({"cost": 0.03, "cost_in_usd_ticks": 400_000_000}),
+            serde_json::json!({"cost": null, "cost_in_usd_ticks": 0}),
+            serde_json::json!({"cost": "0", "cost_in_usd_ticks": 0}),
+            serde_json::json!({"cost": -1, "cost_in_usd_ticks": 0}),
+            serde_json::json!({"cost": 0, "cost_in_usd_ticks": null}),
+        ] {
+            assert!(
+                reported_cost_total(wire.get("cost"), wire.get("cost_in_usd_ticks")).is_err(),
+                "invalid billing was accepted: {wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_compaction_tick_bills_cover_tools_and_override_catalog_estimates() {
+        futures::executor::block_on(async {
+            for priced in [false, true] {
+                for (ticks, expected) in [(0_u64, 0.0), (2_500_000_000_u64, 0.25)] {
+                    let budget = crate::cost::CostBudget::new(None, Some(0.2), 0.0).unwrap();
+                    let mut probe = spend_probe(
+                        vec![],
+                        priced.then_some(ModelCost {
+                            input: 1_000_000.0,
+                            output: 1_000_000.0,
+                            ..Default::default()
+                        }),
+                    );
+                    let response = serde_json::json!({"usage": {
+                        "input_tokens": 10, "output_tokens": 1,
+                        "cost_in_usd_ticks": ticks
+                    }});
+                    Arc::get_mut(&mut probe).unwrap().native_response = Some(response.clone());
+                    let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                    let actual = provider
+                        .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(actual, response);
+                    assert_eq!(budget.spent(), expected);
+                    assert_eq!(budget.snapshot().pending, 0.0);
+                    if ticks == 0 {
+                        budget.admit().unwrap();
+                    } else {
+                        assert!(matches!(
+                            provider
+                                .stream(&Context::default(), &StreamOptions::default())
+                                .await,
+                            Err(crate::error::Error::CostCap { .. })
+                        ));
+                    }
+                    assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn native_compaction_quarantines_invalid_reported_cost_before_pricing() {
         futures::executor::block_on(async {
-            for reported in [serde_json::json!(-1.0), serde_json::json!("invalid")] {
+            for usage in [
+                serde_json::json!({"cost": -1.0}),
+                serde_json::json!({"cost": "invalid"}),
+                serde_json::json!({"cost_in_usd_ticks": null}),
+                serde_json::json!({"cost_in_usd_ticks": -1}),
+                serde_json::json!({"cost_in_usd_ticks": 0.5}),
+                serde_json::json!({"cost_in_usd_ticks": "0"}),
+                serde_json::json!({"cost": 0, "cost_in_usd_ticks": 1}),
+                serde_json::json!({"cost": null, "cost_in_usd_ticks": 0}),
+                serde_json::json!({"cost": 0, "cost_in_usd_ticks": null}),
+            ] {
                 let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
                 let mut probe = spend_probe(
                     vec![],
@@ -2398,7 +2577,8 @@ mod tests {
                         audio: None,
                     }),
                 );
-                Arc::get_mut(&mut probe).unwrap().native_cost = Some(reported);
+                Arc::get_mut(&mut probe).unwrap().native_response =
+                    Some(serde_json::json!({"usage": usage}));
                 let provider = guard_with_cost_budget(probe.clone(), budget.clone());
                 provider
                     .compact_native(&serde_json::json!({}), &StreamOptions::default())
