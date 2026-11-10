@@ -194,6 +194,10 @@ const MAX_TOTAL_RETAINED_SETTLED_JOBS: usize = 512;
 /// Bounds both owner-shutdown fence acquisition and job settlement.
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// An unrelated Pi process may stall while holding the shared artifact-budget
+/// lock. Admission must not wait forever while owning the lifecycle lane.
+const ARTIFACT_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How a background job settled (or is settling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1320,8 +1324,49 @@ fn ensure_artifact_budget(jobs_dir: &Path, max_bytes: u64, max_entries: usize) -
     .map(|_| ())
 }
 
+fn wait_for_artifact_budget_lock(
+    lock: std::fs::File,
+    checkpoint: impl Fn() -> Result<()>,
+    timeout: Duration,
+) -> Result<std::fs::File> {
+    let started = Instant::now();
+    loop {
+        checkpoint()?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_ARTIFACT_LOCK_TIMEOUT: another process is holding the jobs artifact budget lock; retry after it finishes",
+            ));
+        }
+        match fs4::FileExt::try_lock(&lock) {
+            Ok(()) => {
+                // The owner may have been cancelled while the OS granted the
+                // lock. Returning an error drops this handle and its lock.
+                checkpoint()?;
+                return Ok(lock);
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                std::thread::sleep(remaining.min(OUTPUT_PUMP_POLL_INTERVAL));
+            }
+            Err(fs4::TryLockError::Error(err))
+                if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(fs4::TryLockError::Error(err)) => {
+                return Err(Error::tool(
+                    "bash",
+                    format!("Failed to acquire jobs artifact budget lock: {err}"),
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
-fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
+fn acquire_artifact_budget_lock(
+    jobs_dir: &Path,
+    checkpoint: impl Fn() -> Result<()>,
+) -> Result<std::fs::File> {
+    checkpoint()?;
     let lock_path = jobs_dir.join(".artifact-budget.lock");
     let lock = rustix::fs::open(
         &lock_path,
@@ -1350,12 +1395,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             "Failed to open jobs artifact budget lock: path is not a regular file".to_string(),
         ));
     }
-    fs4::FileExt::lock(&lock).map_err(|err| {
-        Error::tool(
-            "bash",
-            format!("Failed to acquire jobs artifact budget lock: {err}"),
-        )
-    })?;
+    let lock = wait_for_artifact_budget_lock(lock, checkpoint, ARTIFACT_LOCK_WAIT_TIMEOUT)?;
     let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
@@ -1385,7 +1425,11 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
+fn acquire_artifact_budget_lock(
+    jobs_dir: &Path,
+    checkpoint: impl Fn() -> Result<()>,
+) -> Result<std::fs::File> {
+    checkpoint()?;
     let lock_path = jobs_dir.join(".artifact-budget.lock");
     let before = std::fs::symlink_metadata(&lock_path).ok();
     if before
@@ -1448,12 +1492,7 @@ fn acquire_artifact_budget_lock(jobs_dir: &Path) -> Result<std::fs::File> {
             "Failed to open jobs artifact budget lock: path identity changed".to_string(),
         ));
     }
-    fs4::FileExt::lock(&lock).map_err(|err| {
-        Error::tool(
-            "bash",
-            format!("Failed to acquire jobs artifact budget lock: {err}"),
-        )
-    })?;
+    let lock = wait_for_artifact_budget_lock(lock, checkpoint, ARTIFACT_LOCK_WAIT_TIMEOUT)?;
     let locked_identity = FileIdentity::of_open_file(&lock).map_err(|err| {
         Error::tool(
             "bash",
@@ -1837,7 +1876,10 @@ fn spawn_managed(
         .map_err(|e| Error::tool("bash", format!("Failed to create jobs artifact dir: {e}")))?;
 
     let (id, sequence, slot) = reserve_job_slot()?;
-    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir)?;
+    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir, || {
+        check_shell_job_owner(&owner)?;
+        ensure_session_spawn_generation(owner_session_id, spawn_generation)
+    })?;
     let retention_policy = ArtifactRetentionPolicy::from_environment()?;
     let artifact_cleanup = enforce_artifact_retention(
         &jobs_dir,
@@ -4912,12 +4954,215 @@ mod tests {
         std::fs::write(&victim, "preserve-me").expect("victim");
         symlink(&victim, jobs_dir.join(".artifact-budget.lock")).expect("planted symlink");
 
-        let error = acquire_artifact_budget_lock(&jobs_dir)
+        let error = acquire_artifact_budget_lock(&jobs_dir, || Ok(()))
             .expect_err("NOFOLLOW must reject a planted budget-lock symlink");
         assert!(error.to_string().contains("artifact budget lock"));
         assert_eq!(
             std::fs::read_to_string(&victim).expect("victim remains readable"),
             "preserve-me"
+        );
+    }
+
+    #[test]
+    fn artifact_budget_lock_cancellation_returns_while_the_holder_keeps_its_lock() {
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let holder = acquire_artifact_budget_lock(directory.path(), || Ok(()))
+            .expect("hold the artifact budget lock");
+        let path = directory.path().join(".artifact-budget.lock");
+        let waiter = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("independent waiting handle");
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let worker_owner = owner.clone();
+        let (contended, entered) = std::sync::mpsc::sync_channel(1);
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = wait_for_artifact_budget_lock(
+                waiter,
+                || {
+                    if calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                        // A second checkpoint requires an unsuccessful lock
+                        // attempt, not just a scheduling delay.
+                        contended.send(()).expect("announce lock contention");
+                    }
+                    worker_owner
+                        .checkpoint()
+                        .map_err(|_| shell_job_cancelled_error())
+                },
+                ARTIFACT_LOCK_WAIT_TIMEOUT,
+            )
+            .map(drop)
+            .map_err(|error| error.to_string());
+            let _ = completed.send(result.clone());
+            result
+        });
+        let did_contend = entered.recv_timeout(Duration::from_secs(3));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel a contended artifact admission"),
+        );
+        let before_release = completion.recv_timeout(Duration::from_secs(3));
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("lock ownership probe");
+        let holder_still_owned = matches!(
+            fs4::FileExt::try_lock(&probe),
+            Err(fs4::TryLockError::WouldBlock)
+        );
+        // Release and join before asserting, including when a mutation uses
+        // a blocking lock call and the waiter did not observe cancellation.
+        drop(holder);
+        let joined = worker.join().expect("artifact lock waiter");
+        assert!(did_contend.is_ok(), "waiter must encounter the held lock");
+        assert!(
+            matches!(before_release, Ok(Err(ref error)) if error.contains("PI_JOBS_CANCELLED")),
+            "cancellation must return before the holder releases its lock: {before_release:?}"
+        );
+        assert!(joined.is_err());
+        assert!(holder_still_owned, "cancelling a waiter cannot unlock its peer");
+        let next = acquire_artifact_budget_lock(directory.path(), || Ok(()))
+            .expect("subsequent admission can acquire the released lock");
+        assert!(matches!(
+            fs4::FileExt::try_lock(&probe),
+            Err(fs4::TryLockError::WouldBlock)
+        ));
+        drop(next);
+        fs4::FileExt::try_lock(&probe).expect("last successful owner released its lock");
+    }
+
+    #[test]
+    fn artifact_budget_lock_timeout_does_not_wait_for_the_holder_to_exit() {
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let holder = acquire_artifact_budget_lock(directory.path(), || Ok(()))
+            .expect("hold the artifact budget lock");
+        let waiter = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join(".artifact-budget.lock"))
+            .expect("independent waiting handle");
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = wait_for_artifact_budget_lock(
+                waiter,
+                || Ok(()),
+                Duration::from_millis(40),
+            )
+            .map(drop)
+            .map_err(|error| error.to_string());
+            let _ = completed.send(result.clone());
+            result
+        });
+        let before_release = completion.recv_timeout(Duration::from_secs(3));
+        drop(holder);
+        let joined = worker.join().expect("artifact timeout waiter");
+        assert!(
+            matches!(before_release, Ok(Err(ref error)) if error.contains("PI_JOBS_ARTIFACT_LOCK_TIMEOUT")),
+            "admission deadline must expire while the peer owns its lock: {before_release:?}"
+        );
+        assert!(joined.is_err());
+        acquire_artifact_budget_lock(directory.path(), || Ok(()))
+            .expect("timed out waiter leaves no lock behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_artifact_admission_releases_lifecycle_for_other_sessions() {
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().expect("blocked job artifact root");
+        let jobs_dir = root.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs directory");
+        let holder = acquire_artifact_budget_lock(&jobs_dir, || Ok(()))
+            .expect("hold shared artifact budget");
+        let owner_session_id = format!("blocked-job-{}", uuid::Uuid::new_v4().simple());
+        let worker_session_id = owner_session_id.clone();
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let worker_owner = owner.clone();
+        let worker_root = root.path().to_path_buf();
+        let baseline_starting = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .starting_jobs;
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _owner = worker_owner.cx().clone().set_current_restricted();
+            let result = spawn_background(
+                &worker_session_id,
+                &worker_root,
+                None,
+                None,
+                "printf should-not-launch",
+                Some(30),
+                Some(&worker_root),
+            )
+            .map(|snapshot| snapshot.id)
+            .map_err(|error| error.to_string());
+            let _ = completed.send(result.clone());
+            result
+        });
+        let observe_deadline = Instant::now() + Duration::from_secs(3);
+        let mut reserved = false;
+        while !worker.is_finished() && Instant::now() < observe_deadline {
+            reserved = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .starting_jobs
+                > baseline_starting;
+            if reserved {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel shell admission behind a peer lock"),
+        );
+        let before_release = completion.recv_timeout(Duration::from_secs(3));
+        // Exercise another real admission while the original artifact lock
+        // remains held. It must regain both the lifecycle lane and job slot.
+        let sibling = if matches!(&before_release, Ok(Err(_))) {
+            let sibling_root = tempfile::tempdir().expect("sibling artifact root");
+            Some(
+                spawn_background(
+                    "artifact-lock-sibling",
+                    sibling_root.path(),
+                    None,
+                    None,
+                    "printf sibling-launched",
+                    Some(30),
+                    Some(sibling_root.path()),
+                )
+                .and_then(|snapshot| {
+                    wait("artifact-lock-sibling", &snapshot.id, Duration::from_secs(10))
+                }),
+            )
+        } else {
+            None
+        };
+        // Never leave a failed regression waiting forever in flock.
+        drop(holder);
+        let joined = worker.join().expect("blocked shell admission");
+        assert!(reserved, "the launch must reserve capacity before cancellation");
+        assert!(
+            matches!(&before_release, Ok(Err(_))),
+            "cancellation must refuse launch without releasing the peer lock: {before_release:?}"
+        );
+        assert!(joined.is_err());
+        assert!(list(&owner_session_id).expect("cancelled owner jobs").is_empty());
+        assert!(take_completion_notices(&owner_session_id).is_empty());
+        let sibling = sibling.expect("sibling admission attempted").expect("sibling job");
+        assert_eq!(sibling.status, "exited");
+        assert!(sibling.output_tail.contains("sibling-launched"));
+        assert_eq!(
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .starting_jobs,
+            baseline_starting
         );
     }
 
@@ -5293,7 +5538,8 @@ mod tests {
         if mode == "probe" {
             std::fs::write(marker_dir.join("probe-attempted"), b"").expect("probe marker");
         }
-        let _lock = acquire_artifact_budget_lock(&jobs_dir).expect("child budget lock");
+        let _lock = acquire_artifact_budget_lock(&jobs_dir, || Ok(()))
+            .expect("child budget lock");
         match mode.as_str() {
             "holder" => {
                 std::fs::write(marker_dir.join("holder-acquired"), b"").expect("holder marker");

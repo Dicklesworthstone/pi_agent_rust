@@ -313,15 +313,27 @@ where
     let _lifecycle = lifecycle_lock()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned"))?;
-    ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
+    let check_admission = || {
+        check_owner(&work.owner)?;
+        ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
+        if started.elapsed() >= timeout {
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_TASK_TIMEOUT: original task deadline expired before launch",
+            ));
+        }
+        Ok(())
+    };
+    check_admission()?;
     let (id, sequence, slot) = reserve_job_slot()?;
-    let (artifact_path, artifact, artifact_cleanup) = task_artifact(artifact_root, &id)?;
+    let (artifact_path, artifact, artifact_cleanup) =
+        task_artifact(artifact_root, &id, &check_admission)?;
     let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
     let tail = Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
-    check_owner(&work.owner)?;
     // Shutdown can publish its fence while artifact I/O holds the lifecycle
-    // lane. Recheck both generation and cancellation before publication.
-    ensure_session_spawn_generation(owner_session_id, admission.0.generation())?;
+    // lane. Recheck generation, cancellation and the original deadline before
+    // publication; waiting for the artifact lock never renews that deadline.
+    check_admission()?;
     let source = {
         let mut reg = registry()
             .lock()
@@ -445,7 +457,9 @@ fn check_owner(owner: &AgentCx) -> Result<()> {
 fn task_artifact(
     root: Option<&Path>,
     id: &str,
+    checkpoint: impl Fn() -> Result<()>,
 ) -> Result<(std::path::PathBuf, std::fs::File, ArtifactCleanupOutcome)> {
+    checkpoint()?;
     let root = root.map_or_else(
         || crate::config::Config::global_dir().join("tool-output-artifacts"),
         Path::to_path_buf,
@@ -453,7 +467,7 @@ fn task_artifact(
     let directory = root.join("jobs");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Error::tool("jobs", format!("PI_JOBS_TASK_ARTIFACT: {error}")))?;
-    let _budget = acquire_artifact_budget_lock(&directory)?;
+    let _budget = acquire_artifact_budget_lock(&directory, checkpoint)?;
     let cleanup = enforce_artifact_retention(
         &directory,
         ArtifactRetentionPolicy::from_environment()?,
@@ -820,6 +834,115 @@ mod tests {
                 );
             }
             self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn artifact_contention_respects_native_owner_cancellation_and_original_deadline() {
+        let _guard = super::super::process_test_guard();
+        for cancel_owner in [false, true] {
+            let root = tempfile::tempdir().expect("native artifact root");
+            let directory = root.path().join("jobs");
+            std::fs::create_dir_all(&directory).expect("jobs directory");
+            let holder = super::super::acquire_artifact_budget_lock(&directory, || Ok(()))
+                .expect("hold shared artifact budget");
+            let session = owner_id();
+            let worker_session = session.clone();
+            let owner = AgentCx::for_request();
+            let worker_owner = owner.clone();
+            let worker_root = root.path().to_path_buf();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let worker_dropped = Arc::clone(&dropped);
+            let baseline_starting = super::super::registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .starting_jobs;
+            let (completed, completion) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                // The invoking thread retains live ambient authority. Only
+                // the explicitly captured task owner may cancel admission.
+                let _caller = asupersync::Cx::for_request().set_current_restricted();
+                let result = spawn_owned_task(
+                    &worker_session,
+                    "contended task",
+                    worker_owner,
+                    if cancel_owner {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_millis(40)
+                    },
+                    Some(&worker_root),
+                    privacy(),
+                    PendingDrop {
+                        dropped: worker_dropped,
+                        restricted_drop: None,
+                    },
+                )
+                .map(|snapshot| snapshot.id)
+                .map_err(|error| error.to_string());
+                let _ = completed.send(result.clone());
+                result
+            });
+            let mut reserved = !cancel_owner;
+            if cancel_owner {
+                let observe_deadline = Instant::now() + Duration::from_secs(3);
+                while !worker.is_finished() && Instant::now() < observe_deadline {
+                    reserved = super::super::registry()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .starting_jobs
+                        > baseline_starting;
+                    if reserved {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel captured task owner behind a peer lock"),
+                );
+            }
+            let before_release = completion.recv_timeout(Duration::from_secs(3));
+            // A regressed blocking lock is released before any assertion, so
+            // a failure cannot leave a worker stuck in the test process.
+            drop(holder);
+            let joined = worker.join().expect("native artifact admission");
+            assert!(reserved, "task must reach its reservation before cancellation");
+            let expected = if cancel_owner {
+                "PI_JOBS_TASK_CANCELLED"
+            } else {
+                "PI_JOBS_TASK_TIMEOUT"
+            };
+            assert!(
+                matches!(&before_release, Ok(Err(error)) if error.contains(expected)),
+                "task must refuse admission before the peer releases its lock: {before_release:?}"
+            );
+            assert!(joined.is_err());
+            assert!(dropped.load(Ordering::Acquire), "refusal must retire owned work");
+            assert!(super::super::list(&session).expect("owner jobs").is_empty());
+            assert!(super::super::take_completion_notices(&session).is_empty());
+            assert!(!super::super::has_pending_work(&session).expect("owner admission"));
+            assert_eq!(
+                super::super::registry()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .starting_jobs,
+                baseline_starting
+            );
+
+            let next = spawn_owned_task(
+                &session,
+                "later task",
+                AgentCx::for_request(),
+                Duration::from_secs(30),
+                Some(root.path()),
+                privacy(),
+                async { Ok(output("later task result")) },
+            )
+            .expect("subsequent task admission");
+            let completed = settle(&session, &next.id);
+            assert_eq!(completed.status, "exited");
+            assert!(completed.output_tail.contains("later task result"));
         }
     }
 
