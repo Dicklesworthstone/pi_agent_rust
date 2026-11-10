@@ -11556,6 +11556,8 @@ export default nativePath;
     modules.insert(
         "node:child_process".to_string(),
         compressed_js_literal!(r#"
+import { StringDecoder } from "node:string_decoder";
+
 const __pi_child_process_state = {
   // Native process IDs are u32. Provisional handles must never collide with
   // an admitted child's PID while another spawn is still awaiting admission.
@@ -11753,9 +11755,17 @@ function __spawnPersistent(cmd, argv, opts) {
   child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
   child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
   const streams = [child.stdout, child.stderr];
+  const decoders = new Map();
   for (const stream of streams) {
     if (!stream) continue;
-    stream.setEncoding = (encoding) => { stream.encoding = String(encoding); return stream; };
+    stream.setEncoding = (encoding) => {
+      // Validate before replacing the decoder so a rejected encoding does not
+      // discard a partially received character. Successful calls start fresh.
+      const decoder = new StringDecoder(encoding || "utf8");
+      decoders.set(stream, decoder);
+      stream.encoding = decoder.encoding;
+      return stream;
+    };
   }
   let handle = null;
   let timer = null;
@@ -11807,7 +11817,16 @@ function __spawnPersistent(cmd, argv, opts) {
       child.stdin.destroyed = true;
       child.stdin.closed = true;
     }
-    for (const stream of streams) if (stream) stream.emit("end");
+    for (const stream of streams) {
+      if (!stream) continue;
+      const decoder = decoders.get(stream);
+      decoders.delete(stream);
+      if (decoder) {
+        const tail = decoder.end();
+        if (tail.length > 0) stream.emit("data", tail);
+      }
+      stream.emit("end");
+    }
     if (error) child.emit("error", pipeError(error));
     if (spawned) {
       __emitCloseOnce(child, code, signal);
@@ -11840,7 +11859,9 @@ function __spawnPersistent(cmd, argv, opts) {
           const stream = frame.stream === "stdout" ? child.stdout : child.stderr;
           if (stream) {
             const bytes = Buffer.from(frame.data, "base64");
-            stream.emit("data", stream.encoding ? bytes.toString(stream.encoding) : bytes);
+            const decoder = decoders.get(stream);
+            const chunk = decoder ? decoder.write(bytes) : bytes;
+            if (chunk.length > 0) stream.emit("data", chunk);
           }
         } else if (frame.writeId !== undefined) {
           const error = frame.error ? pipeError(frame.error) : null;
@@ -16646,7 +16667,9 @@ export default {
     modules.insert(
         "node:string_decoder".to_string(),
         r"
-import { Buffer } from 'node:buffer';
+// The runtime bridge installs Buffer before loading modules. Reuse that
+// constructor without importing node:buffer, which replaces the global Buffer.
+const Buffer = globalThis.Buffer;
 
 export class StringDecoder {
   constructor(encoding = 'utf8') {
@@ -36939,6 +36962,229 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["readText"], serde_json::json!("value"));
             assert_eq!(r["names"], serde_json::json!(["value.txt"]));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_child_process_decodes_across_native_pipe_frames() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock_and_config(
+                DeterministicClock::new(0),
+                PiJsRuntimeConfig {
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                },
+            )
+            .await
+            .expect("create runtime");
+            {
+                let mut state = runtime.module_state.borrow_mut();
+                let source = state
+                    .static_virtual_modules
+                    .get("node:child_process")
+                    .expect("built-in child-process module")
+                    .clone();
+                // Lexical fixture hooks control exact native byte boundaries.
+                // The actual module, Buffer, and StringDecoder run unchanged;
+                // production native globals remain sealed and no process starts.
+                let fixture = r"
+                    let __fixture_next_poll = null;
+                    let __fixture_batch = { frames: [] };
+                    let __fixture_closed = 0;
+                    export function feed(batch) {
+                      if (typeof __fixture_next_poll !== 'function') throw new Error('No pending pipe poll');
+                      __fixture_batch = batch;
+                      const poll = __fixture_next_poll;
+                      __fixture_next_poll = null;
+                      poll();
+                    }
+                    export function closedSessions() { return __fixture_closed; }
+                    const setTimeout = (callback) => { __fixture_next_poll = callback; return 1; };
+                    const clearTimeout = () => { __fixture_next_poll = null; };
+                    const __pi_process_session_poll_native = () => {
+                      const batch = __fixture_batch;
+                      __fixture_batch = { frames: [] };
+                      return JSON.stringify(batch);
+                    };
+                    const __pi_process_session_close_native = () => { __fixture_closed++; };
+                    const __pi_process_session_kill_native = () => true;
+                    const globalThis = {
+                      pi: { exec: () => Promise.resolve({ session: 'decoder-peer', pid: 1 }) },
+                    };
+";
+                state.dynamic_virtual_modules.insert(
+                    "pijs://pipe-decoder-fixture".to_string(),
+                    format!("{fixture}\n{source}"),
+                );
+            }
+            runtime
+                .eval(
+                    r"
+                    const originalBuffer = Buffer;
+                    globalThis.__pipe_decoder_result = null;
+                    globalThis.__pipe_decoder_results = () => globalThis.__pipe_decoder_result;
+                    import('pijs://pipe-decoder-fixture').then(async ({ spawn, feed, closedSessions }) => {
+                      const result = { bufferConstructorPreserved: Buffer === originalBuffer };
+                      function frame(stream, bytes) {
+                        return { stream, data: Buffer.from(bytes).toString('base64') };
+                      }
+                      async function start(encoding) {
+                        const child = spawn('decoder-peer');
+                        const events = [];
+                        const trace = { child, events, stdout: [], stderr: [] };
+                        for (const name of ['stdout', 'stderr']) {
+                          const stream = child[name];
+                          if (encoding !== false) stream.setEncoding(encoding);
+                          stream.on('data', chunk => {
+                            const value = typeof chunk === 'string' ? chunk : Array.from(chunk);
+                            trace[name].push(value);
+                            events.push([name, 'data', value]);
+                          });
+                          stream.on('end', () => events.push([name, 'end']));
+                        }
+                        child.on('exit', (code, signal) => events.push(['exit', code, signal]));
+                        child.on('close', (code, signal) => events.push(['close', code, signal]));
+                        child.on('error', error => events.push(['error', String(error)]));
+                        await Promise.resolve();
+                        return trace;
+                      }
+                      function finish(trace, frames = []) {
+                        feed({ frames, terminal: { code: 0 } });
+                        return {
+                          stdout: trace.stdout,
+                          stderr: trace.stderr,
+                          events: trace.events,
+                          killedAfterClose: trace.child.kill(),
+                        };
+                      }
+
+                      const utf8 = await start('utf-8');
+                      feed({ frames: [frame('stdout', [0x41, 0xe2]), frame('stderr', [0xf0, 0x9f])] });
+                      feed({ frames: [frame('stdout', [0x82]), frame('stderr', [0x9a])] });
+                      result.utf8 = finish(utf8, [
+                        frame('stdout', [0xac, 0x42]),
+                        frame('stderr', [0x80, 0xe2]),
+                      ]);
+
+                      const utf16 = await start('ucs-2');
+                      feed({ frames: [frame('stdout', [0x41])] });
+                      feed({ frames: [frame('stdout', [0x00, 0xac, 0x20, 0x3d, 0xd8])] });
+                      feed({ frames: [frame('stdout', [0x80])] });
+                      result.utf16 = finish(utf16, [frame('stdout', [0xde, 0x21, 0x00])]);
+
+                      const base64 = await start('base64');
+                      feed({ frames: [frame('stdout', [1])] });
+                      feed({ frames: [frame('stdout', [2])] });
+                      feed({ frames: [frame('stdout', [3, 4])] });
+                      result.base64 = finish(base64, [frame('stdout', [5])]);
+
+                      const base64url = await start('base64url');
+                      feed({ frames: [frame('stdout', [251])] });
+                      feed({ frames: [frame('stdout', [255])] });
+                      feed({ frames: [frame('stdout', [255, 251])] });
+                      result.base64url = finish(base64url, [frame('stdout', [255])]);
+
+                      const raw = await start(false);
+                      result.raw = finish(raw, [frame('stdout', [0, 255, 128])]);
+
+                      const rejected = await start('utf8');
+                      feed({ frames: [frame('stdout', [0xe2])] });
+                      let invalidEncoding = false;
+                      try { rejected.child.stdout.setEncoding('not-an-encoding'); }
+                      catch (error) { invalidEncoding = error instanceof TypeError; }
+                      result.rejected = finish(rejected, [frame('stdout', [0x82, 0xac])]);
+                      result.rejected.invalidEncoding = invalidEncoding;
+
+                      const replaced = await start('utf8');
+                      feed({ frames: [frame('stdout', [0xe2])] });
+                      result.sameStream = replaced.child.stdout.setEncoding('hex') === replaced.child.stdout;
+                      result.replaced = finish(replaced, [frame('stdout', [0x82, 0xac])]);
+
+                      const reset = await start('utf8');
+                      feed({ frames: [frame('stdout', [0xe2])] });
+                      reset.child.stdout.setEncoding('utf8');
+                      result.reset = finish(reset, [frame('stdout', [0x82, 0xac])]);
+
+                      for (const [name, encoding] of [['default', undefined], ['null', null], ['empty', '']]) {
+                        const defaults = await start(encoding);
+                        feed({ frames: [frame('stdout', [0xe2])] });
+                        result[name] = finish(defaults, [frame('stdout', [0x82, 0xac])]);
+                      }
+                      result.closedSessions = closedSessions();
+                      globalThis.__pipe_decoder_result = result;
+                    }).catch(error => {
+                      globalThis.__pipe_decoder_result = { error: String(error.stack || error) };
+                    });
+",
+                )
+                .await
+                .expect("run child-process decoder fixture");
+
+            let actual = call_global_fn_json(&runtime, "__pipe_decoder_results").await;
+            assert!(actual.get("error").is_none(), "{actual}");
+            assert_eq!(actual["bufferConstructorPreserved"], true);
+            assert_eq!(
+                actual["utf8"]["events"],
+                serde_json::json!([
+                    ["stdout", "data", "A"],
+                    ["stdout", "data", "€B"],
+                    ["stderr", "data", "🚀"],
+                    ["stdout", "end"],
+                    ["stderr", "data", "\u{fffd}"],
+                    ["stderr", "end"],
+                    ["exit", 0, null],
+                    ["close", 0, null]
+                ])
+            );
+            assert_eq!(actual["utf16"]["stdout"], serde_json::json!(["A€", "🚀!"]));
+            assert_eq!(
+                actual["base64"]["events"],
+                serde_json::json!([
+                    ["stdout", "data", "AQID"],
+                    ["stdout", "data", "BAU="],
+                    ["stdout", "end"],
+                    ["stderr", "end"],
+                    ["exit", 0, null],
+                    ["close", 0, null]
+                ])
+            );
+            assert_eq!(
+                actual["base64url"]["stdout"],
+                serde_json::json!(["-___", "-_8"])
+            );
+            assert_eq!(actual["raw"]["stdout"], serde_json::json!([[0, 255, 128]]));
+            assert_eq!(actual["rejected"]["invalidEncoding"], true);
+            assert_eq!(actual["rejected"]["stdout"], serde_json::json!(["€"]));
+            assert_eq!(actual["sameStream"], true);
+            assert_eq!(actual["replaced"]["stdout"], serde_json::json!(["82ac"]));
+            assert_eq!(
+                actual["reset"]["stdout"],
+                serde_json::json!(["\u{fffd}\u{fffd}"])
+            );
+            for name in ["default", "null", "empty"] {
+                assert_eq!(actual[name]["stdout"], serde_json::json!(["€"]), "{name}");
+            }
+            for name in [
+                "utf8", "utf16", "base64", "base64url", "raw", "rejected", "replaced", "reset",
+                "default", "null", "empty",
+            ] {
+                let events = actual[name]["events"].as_array().expect("stream events");
+                assert!(
+                    !events.iter().any(|event| event[0] == "error"),
+                    "{name}: {events:?}"
+                );
+                assert_eq!(
+                    &events[events.len() - 2..],
+                    &[
+                        serde_json::json!(["exit", 0, null]),
+                        serde_json::json!(["close", 0, null]),
+                    ],
+                    "{name}"
+                );
+                assert_eq!(actual[name]["killedAfterClose"], false, "{name}");
+            }
+            assert_eq!(actual["closedSessions"], 11);
         });
     }
 

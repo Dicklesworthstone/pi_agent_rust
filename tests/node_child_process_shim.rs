@@ -1012,8 +1012,8 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                 const writeResults = [];
                 let stdout = '', stderr = '', exits = 0, closes = 0, drains = 0;
                 child.stdin.on('drain', () => {{ drains++; }});
-                child.stdout.on('data', (chunk) => {{
-                    stdout += chunk.toString('utf8');
+                child.stdout.setEncoding('utf8').on('data', (chunk) => {{
+                    stdout += chunk;
                     let newline;
                     while ((newline = stdout.indexOf('\n')) >= 0) {{
                         const line = stdout.slice(0, newline);
@@ -1024,7 +1024,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                         }} catch (_) {{}}
                     }}
                 }});
-                child.stderr.on('data', (chunk) => {{ stderr += chunk.toString('utf8'); }});
+                child.stderr.setEncoding('utf8').on('data', (chunk) => {{ stderr += chunk; }});
                 child.on('exit', () => {{ exits++; }});
                 const closed = new Promise((resolve, reject) => {{
                     child.on('error', reject);
