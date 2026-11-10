@@ -163,6 +163,7 @@ pub(super) struct Response {
 enum Billing<'a> {
     Vision(&'a str),
     Image(&'a str),
+    Speech(&'a str),
 }
 
 /// Inspect only billing envelopes before `Value` can overwrite repeated keys.
@@ -249,14 +250,19 @@ impl<'de> Visitor<'de> for BillingKeys {
     }
 }
 
-fn reject_duplicate_billing(bytes: &[u8], attempt: &mut crate::cost::CostAttempt) -> Result<()> {
+fn reject_duplicate_billing(
+    bytes: &[u8],
+    attempt: Option<&mut crate::cost::CostAttempt>,
+) -> Result<()> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     if let Ok(true) = (BillingKeys { envelope: true }).deserialize(&mut decoder)
         && decoder.end().is_ok()
     {
         // Do not select either conflicting bill or replace previously known
         // spend. The attempt's normal cleanup retains its valid observations.
-        let _ = attempt.observe(f64::NAN);
+        if let Some(attempt) = attempt {
+            let _ = attempt.observe(f64::NAN);
+        }
         return Err(Error::session(
             "native media response has duplicate billing fields",
         ));
@@ -325,6 +331,19 @@ impl Api<'_> {
             .json(self.tool)
     }
 
+    /// Speech SSE carries billing in its terminal audio event. Capture that
+    /// receipt before codec validation or publication can reject the output.
+    pub(super) async fn post_speech(
+        &self,
+        model: &str,
+        path: &str,
+        payload: &Value,
+        limit: usize,
+    ) -> Result<Response> {
+        self.post_inner(path, payload, limit, Some(Billing::Speech(model)))
+            .await
+    }
+
     fn vision_cost(&self, model: &str, response: &Value) -> Result<Option<f64>> {
         let Some(mut usage) = super::vision::response_usage(self.provider, response)? else {
             return Ok(None);
@@ -358,6 +377,7 @@ impl Api<'_> {
             Billing::Image(model) => {
                 super::generation::billing::response_cost(self.provider, model, response)
             }
+            Billing::Speech(model) => super::speech::response_cost(model, response),
         };
         match cost {
             Ok(Some(cost)) => attempt.finish(cost),
@@ -443,7 +463,7 @@ impl Api<'_> {
                 let detail = match response.bytes_limited(16 * 1024).await {
                     Ok(body) => {
                         if let (Some(billing), Some(attempt)) = (billing, attempt.as_mut()) {
-                            reject_duplicate_billing(&body, attempt)?;
+                            reject_duplicate_billing(&body, Some(&mut *attempt))?;
                             if let Ok(json) = serde_json::from_slice::<Value>(&body) {
                                 self.settle_usage(billing, &json, attempt)?;
                             }
@@ -457,7 +477,7 @@ impl Api<'_> {
                     format!("{} HTTP {status}: {detail}", self.provider),
                 ));
             }
-            let content_type = response
+            let mut content_type = response
                 .headers()
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
@@ -470,24 +490,54 @@ impl Api<'_> {
                         .to_ascii_lowercase()
                 })
                 .unwrap_or_default();
-            let bytes = response.bytes_limited(limit).await.map_err(|error| {
-                Error::tool(
-                    self.tool,
-                    format!(
-                        "{} response failed: {}",
-                        self.provider,
-                        self.scrub(&error.to_string(), 2048)
-                    ),
+            let (bytes, parsed_json) = if let Some(billing @ Billing::Speech(model)) = billing {
+                if content_type != "text/event-stream" {
+                    return Err(Error::tool(
+                        self.tool,
+                        "speech provider did not return the requested SSE stream",
+                    ));
+                }
+                let bytes = super::speech::read_stream(
+                    response.bytes_stream(),
+                    limit,
+                    |raw, event| {
+                        reject_duplicate_billing(raw, attempt.as_mut())?;
+                        if let Some(attempt) = attempt.as_mut() {
+                            self.settle_usage(billing, event, attempt)?;
+                        } else {
+                            super::speech::response_cost(model, event)?;
+                        }
+                        Ok(())
+                    },
                 )
-            })?;
-            let parsed_json = if let (Some(billing), Some(attempt)) = (billing, attempt.as_mut()) {
-                reject_duplicate_billing(&bytes, attempt)?;
-                let json = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|_| Error::tool(self.tool, "provider returned invalid JSON"))?;
-                self.settle_usage(billing, &json, attempt)?;
-                Some(json)
+                .await?;
+                // The wrapper is SSE; the adapter validates the requested
+                // audio codec against the reconstructed bytes themselves.
+                content_type.clear();
+                (bytes, None)
             } else {
-                None
+                let bytes = response.bytes_limited(limit).await.map_err(|error| {
+                    Error::tool(
+                        self.tool,
+                        format!(
+                            "{} response failed: {}",
+                            self.provider,
+                            self.scrub(&error.to_string(), 2048)
+                        ),
+                    )
+                })?;
+                let parsed_json =
+                    if let (Some(billing), Some(attempt)) = (billing, attempt.as_mut()) {
+                        reject_duplicate_billing(&bytes, Some(&mut *attempt))?;
+                        let json = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+                            Error::tool(self.tool, "provider returned invalid JSON")
+                        })?;
+                        self.settle_usage(billing, &json, attempt)?;
+                        Some(json)
+                    } else {
+                        None
+                    };
+                (bytes, parsed_json)
             };
             check_owner(self.tool, &self.owner)?;
             if self.started.elapsed() >= self.timeout {
@@ -1117,7 +1167,7 @@ pub(super) mod tests {
                     (
                         "audio/wav",
                         audio,
-                        serde_json::json!({"text":"Hello", "provider":"openai",
+                        serde_json::json!({"text":"Hello", "provider":"openai", "model":"tts-1",
                             "voice":"alloy", "output_path":"output.wav", "timeout_ms":2000}),
                     )
                 }

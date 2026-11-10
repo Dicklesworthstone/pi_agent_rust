@@ -6,6 +6,9 @@ use crate::http::client::Client;
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use async_trait::async_trait;
+use base64::Engine as _;
+use futures::{Stream, StreamExt};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -196,7 +199,15 @@ impl Tool for TtsTool {
             )
         };
         let (bytes, mime) = if let Some(api) = api.as_ref() {
-            let response = api.post(endpoint, &body, MAX_AUDIO_BYTES).await?;
+            let response = if body.get("stream_format").and_then(Value::as_str) == Some("sse") {
+                let model = body["model"]
+                    .as_str()
+                    .ok_or_else(|| Error::tool(NAME, "speech request is missing its model"))?;
+                api.post_speech(model, endpoint, &body, MAX_AUDIO_BYTES)
+                    .await?
+            } else {
+                api.post(endpoint, &body, MAX_AUDIO_BYTES).await?
+            };
             let mime = validate_audio(&response.bytes, format, &response.content_type)?;
             (response.bytes, mime)
         } else {
@@ -273,6 +284,9 @@ fn request(
             let model = transport::model_id(NAME, model.unwrap_or("gpt-4o-mini-tts"))?;
             let mut body =
                 json!({"model": model, "input": text, "voice": voice, "response_format": format});
+            if supports_speech_usage(model) {
+                body["stream_format"] = json!("sse");
+            }
             if let Some(instructions) = instructions {
                 if !model.starts_with("gpt-4o-mini-tts") || instructions.len() > 4096 {
                     return Err(Error::tool(
@@ -327,6 +341,138 @@ fn request(
         }
         _ => Err(Error::tool(NAME, "unsupported speech provider")),
     }
+}
+
+fn supports_speech_usage(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-4o-mini-tts" | "gpt-4o-mini-tts-2025-03-20" | "gpt-4o-mini-tts-2025-12-15"
+    )
+}
+
+/// Speech API prices checked 2026-11-10. These are text-input and audio-output
+/// tokens, not ordinary chat rates or estimates derived from audio duration.
+/// https://developers.openai.com/api/docs/models/gpt-4o-mini-tts
+pub(super) fn response_cost(model: &str, response: &Value) -> Result<Option<f64>> {
+    let Some(usage) = response.get("usage") else {
+        return Ok(None);
+    };
+    let invalid = || Error::tool(NAME, "invalid speech billing evidence");
+    let usage = usage.as_object().ok_or_else(invalid)?;
+    if let Some(total) = crate::provider::reported_cost_total(usage.get("cost"), None)
+        .map_err(|_| invalid())?
+    {
+        return Ok(Some(total));
+    }
+    let count = |name: &str| usage.get(name).and_then(Value::as_u64).ok_or_else(invalid);
+    let input = count("input_tokens")?;
+    let output = count("output_tokens")?;
+    if input.checked_add(output) != Some(count("total_tokens")?) {
+        return Err(invalid());
+    }
+    // Future or gateway-specific billing dimensions need their own tariff.
+    // Do not silently price cache/audio-input/service-tier evidence as text.
+    if !supports_speech_usage(model)
+        || usage.keys().any(|key| {
+            !matches!(key.as_str(), "input_tokens" | "output_tokens" | "total_tokens")
+        })
+    {
+        return Ok(None);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let cost = (input as f64).mul_add(0.60, output as f64 * 12.0) / 1_000_000.0;
+    Ok(Some(cost))
+}
+
+/// Decode ordered audio chunks under the transport's cancellation/deadline
+/// race. A terminal receipt is settled before returning audio to the adapter.
+/// Neither an incomplete stream nor a protocol error publishes partial audio.
+pub(super) async fn read_stream<S, F>(stream: S, limit: usize, mut on_usage: F) -> Result<Vec<u8>>
+where
+    S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin,
+    F: FnMut(&[u8], &Value) -> Result<()>,
+{
+    #[derive(Deserialize)]
+    struct EventType {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    #[derive(Deserialize)]
+    struct Delta {
+        audio: String,
+    }
+
+    let wire_limit = limit.saturating_mul(2).saturating_add(1024 * 1024);
+    let mut received = 0usize;
+    let bounded = stream.map(move |chunk| {
+        let chunk = chunk?;
+        received = received
+            .checked_add(chunk.len())
+            .filter(|size| *size <= wire_limit)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "speech stream exceeds byte limit",
+                )
+            })?;
+        Ok(chunk)
+    });
+    let mut events = crate::sse::SseStream::new(bounded);
+    let mut audio = Vec::new();
+    while let Some(event) = events.next().await {
+        let event =
+            event.map_err(|_| Error::tool(NAME, "speech stream failed or exceeded its limit"))?;
+        if event.event == "error" {
+            return Err(Error::tool(
+                NAME,
+                "speech provider reported a streaming error",
+            ));
+        }
+        let header: EventType = serde_json::from_str(&event.data)
+            .map_err(|_| Error::tool(NAME, "speech provider returned an invalid stream event"))?;
+        match header.kind.as_str() {
+            "speech.audio.delta" => {
+                let delta: Delta = serde_json::from_str(&event.data)
+                    .map_err(|_| Error::tool(NAME, "speech stream has invalid audio data"))?;
+                let remaining = limit.saturating_sub(audio.len());
+                let encoded_limit = remaining.saturating_add(2) / 3 * 4;
+                if delta.audio.len() > encoded_limit {
+                    return Err(Error::tool(NAME, "speech audio exceeds its byte limit"));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(delta.audio)
+                    .map_err(|_| Error::tool(NAME, "speech stream has invalid base64 audio"))?;
+                if bytes.len() > remaining {
+                    return Err(Error::tool(NAME, "speech audio exceeds its byte limit"));
+                }
+                audio.extend_from_slice(&bytes);
+            }
+            "speech.audio.done" => {
+                let terminal: Value = serde_json::from_str(&event.data)
+                    .map_err(|_| Error::tool(NAME, "speech stream has an invalid terminal event"))?;
+                if terminal.get("usage").is_none() {
+                    return Err(Error::tool(
+                        NAME,
+                        "speech stream ended without a usage receipt",
+                    ));
+                }
+                on_usage(event.data.as_bytes(), &terminal)?;
+                return Ok(audio);
+            }
+            "error" | "speech.audio.error" => {
+                return Err(Error::tool(
+                    NAME,
+                    "speech provider reported a streaming error",
+                ));
+            }
+            // New metadata events cannot complete the stream or add audio.
+            _ => {}
+        }
+    }
+    Err(Error::tool(
+        NAME,
+        "speech stream ended before speech.audio.done",
+    ))
 }
 
 fn validate_audio(bytes: &[u8], format: &str, content_type: &str) -> Result<&'static str> {
@@ -493,13 +639,36 @@ mod tests {
         bytes
     }
 
+    fn speech_sse(audio: &[u8], usage: &Value) -> Vec<u8> {
+        let mut wire = String::from(": speech heartbeat\n\n");
+        for chunk in audio.chunks(7) {
+            let delta = json!({
+                "type":"speech.audio.delta",
+                "audio":base64::engine::general_purpose::STANDARD.encode(chunk)
+            });
+            wire.push_str(&format!("data: {delta}\n\n"));
+        }
+        let done = json!({"type":"speech.audio.done","usage":usage});
+        wire.push_str(&format!("data: {done}\n\n"));
+        wire.into_bytes()
+    }
+
+    fn usage() -> Value {
+        json!({"input_tokens":10,"output_tokens":100,"total_tokens":110})
+    }
+
     #[test]
     fn native_synthesis_uses_provider_specific_requests_and_retains_audio_samples() {
         for (provider, voice, endpoint_path) in
             [("openai", "alloy", "audio/speech"), ("xai", "eve", "tts")]
         {
             let audio = wav();
-            let (endpoint, worker) = peer(200, "audio/wav", audio.clone());
+            let (mime, response) = if provider == "openai" {
+                ("text/event-stream", speech_sse(&audio, &usage()))
+            } else {
+                ("audio/wav", audio.clone())
+            };
+            let (endpoint, worker) = peer(200, mime, response);
             let dir = tempfile::tempdir().unwrap();
             let tool = TtsTool::with_defaults(dir.path(), Some(provider.into()), None)
                 .with_mock(false)
@@ -537,6 +706,7 @@ mod tests {
                 assert_eq!(request.body["input"], "Hello, world.");
                 assert_eq!(request.body["model"], "gpt-4o-mini-tts");
                 assert_eq!(request.body["response_format"], "wav");
+                assert_eq!(request.body["stream_format"], "sse");
             } else {
                 assert_eq!(request.body["text"], "Hello, world.");
                 assert_eq!(request.body["voice_id"], "eve");
@@ -544,6 +714,208 @@ mod tests {
                 assert_eq!(request.body["output_format"]["codec"], "wav");
                 assert!(request.body.get("model").is_none());
             }
+        }
+    }
+
+    #[test]
+    fn speech_stream_preserves_bytes_at_transport_and_audio_chunk_boundaries() {
+        let expected = wav();
+        let wire = speech_sse(&expected, &usage());
+        for chunk_size in [1, 2, 3, 17, wire.len()] {
+            let chunks = wire
+                .chunks(chunk_size)
+                .map(|chunk| Ok::<_, std::io::Error>(chunk.to_vec()))
+                .collect::<Vec<_>>();
+            let mut receipts = Vec::new();
+            let actual = futures::executor::block_on(read_stream(
+                futures::stream::iter(chunks),
+                expected.len(),
+                |_, event| {
+                    receipts.push(event["usage"].clone());
+                    Ok(())
+                },
+            ))
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(receipts, [usage()]);
+        }
+    }
+
+    #[test]
+    fn incomplete_invalid_and_oversized_speech_never_acknowledges_completion() {
+        let valid = speech_sse(&wav(), &usage());
+        let invalid_base64 = b"data: {\"type\":\"speech.audio.delta\",\"audio\":\"!invalid!\"}\n\n";
+        let incomplete = b"data: {\"type\":\"speech.audio.delta\",\"audio\":\"aGk=\"}\n\n";
+        let failed = b"event: error\ndata: {\"message\":\"provider-secret\"}\n\n";
+        for (wire, limit) in [
+            (valid.as_slice(), wav().len() - 1),
+            (invalid_base64.as_slice(), MAX_AUDIO_BYTES),
+            (incomplete.as_slice(), MAX_AUDIO_BYTES),
+            (failed.as_slice(), MAX_AUDIO_BYTES),
+            (b": heartbeat\n\n".as_slice(), MAX_AUDIO_BYTES),
+            (
+                b"data: {\"type\":\"speech.audio.done\"}\n\n".as_slice(),
+                MAX_AUDIO_BYTES,
+            ),
+        ] {
+            let mut acknowledged = false;
+            let result = futures::executor::block_on(read_stream(
+                futures::stream::iter([Ok::<_, std::io::Error>(wire.to_vec())]),
+                limit,
+                |_, _| {
+                    acknowledged = true;
+                    Ok(())
+                },
+            ));
+            assert!(result.is_err());
+            assert!(!acknowledged);
+            assert!(!result.unwrap_err().to_string().contains("provider-secret"));
+        }
+    }
+
+    #[test]
+    fn speech_charges_its_session_before_audio_validation_and_enforces_the_cap() {
+        for valid_audio in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let audio = if valid_audio {
+                wav()
+            } else {
+                b"invalid audio".to_vec()
+            };
+            let (endpoint, worker) = peer(200, "text/event-stream", speech_sse(&audio, &usage()));
+            let budget = crate::cost::CostBudget::new(None, Some(0.001), 0.0).unwrap();
+            let scope = crate::cost::CostScope::default();
+            scope.set(Some(budget.clone()));
+            let mut tool = TtsTool::new(directory.path())
+                .with_mock(false)
+                .with_api_key(Some("speech-test-key".into()))
+                .with_base_url(endpoint);
+            tool.bind_cost_scope(scope);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(tool.execute(
+                "charged",
+                json!({"text":"Hello","output_path":"out.wav"}),
+                None,
+            ));
+            assert_eq!(result.is_ok(), valid_audio);
+            assert_eq!(directory.path().join("out.wav").exists(), valid_audio);
+            assert!((budget.spent() - 0.001_206).abs() < 1e-12);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(
+                runtime.block_on(tool.execute(
+                    "refused",
+                    json!({"text":"Do not send","output_path":"second.wav"}),
+                    None,
+                )),
+                Err(Error::CostCap { .. })
+            ));
+            assert!(!directory.path().join("second.wav").exists());
+            let captured = worker.join().unwrap();
+            assert_eq!(captured.body["stream_format"], "sse");
+        }
+    }
+
+    #[test]
+    fn invalid_and_duplicate_speech_bills_quarantine_the_original_account() {
+        for terminal in [
+            r#"{"type":"speech.audio.done","usage":{"input_tokens":10,"output_tokens":100,"total_tokens":109}}"#,
+            r#"{"type":"speech.audio.done","usage":{"input_tokens":-1,"output_tokens":100,"total_tokens":99}}"#,
+            r#"{"type":"speech.audio.done","usage":null}"#,
+            r#"{"type":"speech.audio.done","usage":{"cost":1.25,"cost":0}}"#,
+            r#"{"type":"speech.audio.done","usage":{"cost":1.25},"usage":{"cost":0}}"#,
+        ] {
+            let (endpoint, worker) = peer(
+                200,
+                "text/event-stream",
+                format!("data: {terminal}\n\n").into_bytes(),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.25).unwrap();
+            let scope = crate::cost::CostScope::default();
+            scope.set(Some(budget.clone()));
+            let mut tool = TtsTool::new(directory.path())
+                .with_mock(false)
+                .with_api_key(Some("speech-test-key".into()))
+                .with_base_url(endpoint);
+            tool.bind_cost_scope(scope);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(tool.execute(
+                        "bad-bill",
+                        json!({"text":"Hello","output_path":"out.wav"}),
+                        None,
+                    ))
+                    .is_err()
+            );
+            assert_eq!(budget.spent(), 0.25);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(matches!(budget.admit(), Err(Error::Session(_))));
+            assert!(!directory.path().join("out.wav").exists());
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn speech_receipt_stays_with_the_account_captured_before_a_session_switch() {
+        let (endpoint, worker) = peer(200, "text/event-stream", speech_sse(&wav(), &usage()));
+        let original = crate::cost::CostBudget::new(None, Some(10.0), 0.25).unwrap();
+        let replacement = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(original.clone()));
+        let mut transport = transport::Transport::default().with_base_url(endpoint);
+        transport.bind_cost_scope(scope.clone());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let api = transport
+                .api(
+                    NAME,
+                    "openai",
+                    Some("speech-test-key"),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            scope.set(Some(replacement.clone()));
+            let (_, body) = request("openai", "alloy", "Hello", "wav", &json!({})).unwrap();
+            let response = api
+                .post_speech("gpt-4o-mini-tts", "audio/speech", &body, MAX_AUDIO_BYTES)
+                .await
+                .unwrap();
+            assert_eq!(response.bytes, wav());
+        });
+        assert!((original.spent() - 0.251_206).abs() < 1e-12);
+        assert_eq!(replacement.spent(), 0.0);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn speech_pricing_uses_known_tariffs_and_authoritative_reported_totals() {
+        assert_eq!(
+            response_cost("gpt-4o-mini-tts", &json!({"usage":{"cost":0}})).unwrap(),
+            Some(0.0)
+        );
+        assert!(response_cost("gpt-4o-mini-tts", &json!({"usage":{"cost":-1}})).is_err());
+        let response = json!({"usage":usage()});
+        assert_eq!(response_cost("custom-speech", &response).unwrap(), None);
+        let mut extended = response;
+        extended["usage"]["cached_tokens"] = json!(1);
+        assert_eq!(response_cost("gpt-4o-mini-tts", &extended).unwrap(), None);
+        for model in [
+            "tts-1",
+            "tts-1-hd",
+            "custom-speech",
+            "gpt-4o-mini-tts-unpriced",
+        ] {
+            let (_, body) =
+                request("openai", "alloy", "Hello", "wav", &json!({"model":model})).unwrap();
+            assert!(body.get("stream_format").is_none());
         }
     }
 
