@@ -1695,7 +1695,11 @@ fn write_text_tool_output_artifact_at_root(
         preview_bytes,
         content_type: "text/plain; charset=utf-8",
         retention_class: TOOL_OUTPUT_ARTIFACT_RETENTION_CLASS,
-        spillover_reason: TOOL_OUTPUT_ARTIFACT_SPILLOVER_REASON,
+        spillover_reason: if full_text.len() > TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
+            TOOL_OUTPUT_ARTIFACT_SPILLOVER_REASON
+        } else {
+            "sourceTextExceededPreviewLimit"
+        },
         redaction_summary: redacted.summary,
         safe_delete_candidate: true,
     };
@@ -1838,6 +1842,26 @@ fn attach_text_artifact_if_needed_at_root(
     if full_text.len() <= TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
         return false;
     }
+    attach_text_artifact_at_root(
+        root,
+        output_text,
+        details,
+        tool_name,
+        tool_call_id,
+        source_kind,
+        full_text,
+    )
+}
+
+fn attach_text_artifact_at_root(
+    root: &Path,
+    output_text: &mut String,
+    details: &mut Option<serde_json::Value>,
+    tool_name: &str,
+    tool_call_id: &str,
+    source_kind: &str,
+    full_text: &str,
+) -> bool {
     match write_text_tool_output_artifact_at_root(
         root,
         tool_name,
@@ -1859,6 +1883,36 @@ fn attach_text_artifact_if_needed_at_root(
             false
         }
     }
+}
+
+/// Preserve an already-truncated text result, including line-only overflow
+/// below the ordinary byte spill threshold. Persistence failure remains an
+/// explicit bounded-preview diagnostic; it does not change tool execution.
+pub(crate) fn attach_truncated_text_artifact(
+    root: Option<&Path>,
+    output_text: &mut String,
+    details: &mut Option<serde_json::Value>,
+    tool_name: &str,
+    tool_call_id: &str,
+    source_kind: &str,
+    full_text: &str,
+) -> bool {
+    let default_root;
+    let root = if let Some(root) = root {
+        root
+    } else {
+        default_root = tool_output_artifact_root();
+        &default_root
+    };
+    attach_text_artifact_at_root(
+        root,
+        output_text,
+        details,
+        tool_name,
+        tool_call_id,
+        source_kind,
+        full_text,
+    )
 }
 
 fn attach_text_artifact_if_needed(

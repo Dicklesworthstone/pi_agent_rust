@@ -146,7 +146,7 @@ impl Tool for McpTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> crate::error::Result<ToolOutput> {
@@ -154,12 +154,16 @@ impl Tool for McpTool {
             .manager
             .call_tool_with_updates(&self.server, &self.tool_name, input, on_update)
             .await?;
-        Ok(mcp_result_to_output(&result))
+        Ok(content::bound_tool_output(
+            mcp_result_to_output(&result),
+            &self.mounted,
+            tool_call_id,
+        ))
     }
 
     async fn execute_with_invocation(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         context: ToolInvocationContext<'_>,
@@ -171,7 +175,11 @@ impl Tool for McpTool {
             .manager
             .call_tool_with_sampling(&self.server, &self.tool_name, input, on_update, sampling)
             .await?;
-        Ok(mcp_result_to_output(&result))
+        Ok(content::bound_tool_output(
+            mcp_result_to_output(&result),
+            &self.mounted,
+            tool_call_id,
+        ))
     }
 }
 
@@ -505,7 +513,7 @@ impl Tool for McpContextTool {
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> crate::error::Result<ToolOutput> {
@@ -515,36 +523,36 @@ impl Tool for McpContextTool {
                 "[MCP_REQUEST_INVALID] expected a resource or prompt action with its declared fields",
             )
         })?;
-        match action {
+        let output = match action {
             McpContextAction::ListResources { cursor } => {
                 let result = self
                     .manager
                     .list_resources(&self.server, cursor.as_deref())
                     .await?;
-                Ok(resource_catalog_output(result, false))
+                resource_catalog_output(result, false)
             }
             McpContextAction::ListResourceTemplates { cursor } => {
                 let result = self
                     .manager
                     .list_resource_templates(&self.server, cursor.as_deref())
                     .await?;
-                Ok(resource_catalog_output(result, true))
+                resource_catalog_output(result, true)
             }
             McpContextAction::ReadResource { uri } => {
                 let result = self.manager.read_resource(&self.server, &uri).await?;
-                Ok(resource_read_output(&result))
+                resource_read_output(&result)
             }
-            McpContextAction::SubscribeResource { uri } => Ok(context_updates_output(
+            McpContextAction::SubscribeResource { uri } => context_updates_output(
                 self.manager.subscribe_resource(&self.server, &uri).await?,
-            )),
-            McpContextAction::UnsubscribeResource { uri } => Ok(context_updates_output(
+            ),
+            McpContextAction::UnsubscribeResource { uri } => context_updates_output(
                 self.manager
                     .unsubscribe_resource(&self.server, &uri)
                     .await?,
-            )),
-            McpContextAction::PollUpdates {} => Ok(context_updates_output(
+            ),
+            McpContextAction::PollUpdates {} => context_updates_output(
                 self.manager.poll_updates(&self.server).await?,
-            )),
+            ),
             McpContextAction::ReadResourceTemplate {
                 uri_template,
                 variables,
@@ -553,21 +561,21 @@ impl Tool for McpContextTool {
                     .manager
                     .read_resource_template(&self.server, &uri_template, &variables)
                     .await?;
-                Ok(resource_read_output(&result))
+                resource_read_output(&result)
             }
             McpContextAction::ListPrompts { cursor } => {
                 let result = self
                     .manager
                     .list_prompts(&self.server, cursor.as_deref())
                     .await?;
-                Ok(prompt_catalog_output(result))
+                prompt_catalog_output(result)
             }
             McpContextAction::GetPrompt { name, arguments } => {
                 let result = self
                     .manager
                     .get_prompt(&self.server, &name, arguments.as_ref())
                     .await?;
-                Ok(prompt_read_output(&result))
+                prompt_read_output(&result)
             }
             McpContextAction::CompleteArgument {
                 reference,
@@ -584,9 +592,10 @@ impl Tool for McpContextTool {
                         context.as_ref(),
                     )
                     .await?;
-                Ok(completion_output(result))
+                completion_output(result)
             }
-        }
+        };
+        Ok(content::bound_tool_output(output, &self.mounted, tool_call_id))
     }
 }
 
