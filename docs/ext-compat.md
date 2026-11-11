@@ -70,8 +70,52 @@ with a clear error message identifying the unsupported call.
 | Module | Supported | Unsupported | Notes |
 |--------|-----------|-------------|-------|
 | `node:net` | `createConnection` (stub), `Socket` (stub) | `createServer` | Stubbed sockets (no network I/O); use `pi.http()` |
-| `node:readline` | `createInterface`, `promises.createInterface` | Full interactive readline | Uses `pi.ui('input')` when available; non-interactive prompts resolve to empty strings |
+| `node:readline` | Stream-backed `createInterface`, line/close/error events, async iteration, `promises.createInterface` | Terminal editing and history | Reads UTF-8 protocol lines from supplied streams; console questions keep the `pi.ui('input')` fallback |
 | `node:timers` and global timers | Timeout handles, shared cancellation, `ref`, `unref`, `hasRef`, `refresh`, `close`, numeric coercion | Control over the host process's lifetime | Deterministic host scheduler; handles keep their original owner and session provenance |
+
+### Reading subprocess protocol lines
+
+Extensions can consume a child's stdout using the ordinary nonterminal readline
+pattern, including JSON-RPC and other newline-delimited protocols:
+
+```javascript
+import { createInterface } from "node:readline";
+
+const lines = createInterface({
+  input: child.stdout,
+  terminal: false,
+  crlfDelay: Infinity,
+});
+for await (const line of lines) {
+  const message = JSON.parse(line);
+  // Handle the protocol message.
+}
+```
+
+The interface decodes UTF-8 across input chunks, recognizes LF, CR, and CRLF,
+and emits a final unterminated line when input ends. `crlfDelay: Infinity`
+keeps a CR/LF pair together even when separate chunks arrive far apart; the
+default delay is 100 ms. Event-based consumers can use `on`, `once`, and
+`removeListener`. Both `node:readline` and `node:readline/promises` support async
+iteration. Ending input or calling `close()` emits `close` once and removes the
+interface's input listeners. An input error also closes the interface and
+rejects pending iterator reads. Leaving a `for await` loop closes the
+interface; it does not destroy the supplied stream or terminate its child.
+`pause()` and `resume()` forward to inputs that provide those methods.
+
+A logical line is limited to 4 MiB of UTF-8 text. An active async iterator may
+retain at most 1,024 lines totaling 4 MiB; inputs without pause support are
+subject to the same bounds. Exceeding either bound reports
+`ERR_PI_READLINE_LIMIT` and closes the interface. Event-only readers retain no
+iterator backlog. These limits are separate from native subprocess output
+limits and do not increase process or filesystem permissions.
+
+Stream-backed questions write their prompt to the supplied output and consume
+the next input line. Promise questions reject on abort or interface closure.
+Questions without a readable input, including the host console facade, retain
+the existing `pi.ui('input')` behavior and empty-string fallback when that UI
+is unavailable. Terminal editing, completion, history, and raw-key handling
+remain outside this interface.
 
 ### Timer handles and lifecycle
 

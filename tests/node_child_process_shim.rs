@@ -941,8 +941,8 @@ fn persistent_stdio_peer() {
         } else {
             serde_json::json!({"method": request["method"], "text": request["params"]["text"]})
         };
-        println!(
-            "{}",
+        print!(
+            "{}\r\n",
             serde_json::json!({
                 "jsonrpc": "2.0", "id": request["id"],
                 "result": result,
@@ -1000,6 +1000,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
     let source = format!(
         r#"
         import {{ spawn }} from 'node:child_process';
+        import {{ createInterface }} from 'node:readline';
         export default function(pi) {{
             async function exchange(explicitEnvironment) {{
                 const child = spawn({executable},
@@ -1010,20 +1011,19 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                 const replies = new Map();
                 const acks = [];
                 const writeResults = [];
-                let stdout = '', stderr = '', exits = 0, closes = 0, drains = 0;
+                let stderr = '', exits = 0, closes = 0, drains = 0, lineCloses = 0;
                 child.stdin.on('drain', () => {{ drains++; }});
-                child.stdout.setEncoding('utf8').on('data', (chunk) => {{
-                    stdout += chunk;
-                    let newline;
-                    while ((newline = stdout.indexOf('\n')) >= 0) {{
-                        const line = stdout.slice(0, newline);
-                        stdout = stdout.slice(newline + 1);
-                        try {{
-                            const message = JSON.parse(line.slice(line.indexOf('{{')));
-                            replies.get(message.id)?.(message.result);
-                        }} catch (_) {{}}
-                    }}
+                // Cover both raw pipe bytes and explicitly decoded streams,
+                // using the same readline pattern as RPC/NDJSON integrations.
+                if (explicitEnvironment) child.stdout.setEncoding('utf8');
+                const lines = createInterface({{ input: child.stdout, terminal: false, crlfDelay: Infinity }});
+                lines.on('line', (line) => {{
+                    try {{
+                        const message = JSON.parse(line.slice(line.indexOf('{{')));
+                        replies.get(message.id)?.(message.result);
+                    }} catch (_) {{}}
                 }});
+                lines.once('close', () => {{ lineCloses++; }});
                 child.stderr.setEncoding('utf8').on('data', (chunk) => {{ stderr += chunk; }});
                 child.on('exit', () => {{ exits++; }});
                 const closed = new Promise((resolve, reject) => {{
@@ -1056,7 +1056,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                 const status = await closed;
                 await Promise.resolve();
                 return {{ first, second, third, large, afterLarge, acks, status, exits, closes,
-                    oversizedRejected, writeResults, drains,
+                    oversizedRejected, writeResults, drains, lineCloses,
                     stderr, killAfterClose: child.kill(), ended: child.stdin.writableEnded }};
             }}
             pi.on('agent_start', async () => {{
@@ -1166,6 +1166,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
         );
         assert_eq!(result["exits"], 1, "{response}");
         assert_eq!(result["closes"], 1, "{response}");
+        assert_eq!(result["lineCloses"], 1, "{response}");
         assert_eq!(result["killAfterClose"], false, "{response}");
         assert_eq!(result["ended"], true, "{response}");
         assert!(
