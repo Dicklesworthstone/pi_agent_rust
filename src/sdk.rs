@@ -1414,6 +1414,24 @@ impl RpcControlHandle {
         self.send("follow_up", payload)
     }
 
+    /// Dispatch ordered text, image, audio, and video blocks as steering input
+    /// while another RPC operation owns stdout. Native text stays in its
+    /// authored position and is not interpreted as a slash command or template.
+    ///
+    /// Content is validated before allocating an ID or writing to the pipe.
+    /// The returned ID confirms dispatch, not server admission; the server
+    /// still applies its configured media limits and queue policy.
+    pub fn steer_with_content(&self, content: Vec<ContentBlock>) -> Result<String> {
+        self.send("steer", rpc_native_content_payload(content)?)
+    }
+
+    /// Dispatch ordered native content for a follow-up model turn without
+    /// borrowing the running operation's response reader. This has the same
+    /// validation and dispatch-only acknowledgement as [`Self::steer_with_content`].
+    pub fn follow_up_with_content(&self, content: Vec<ContentBlock>) -> Result<String> {
+        self.send("follow_up", rpc_native_content_payload(content)?)
+    }
+
     pub fn abort(&self) -> Result<String> {
         self.send("abort", Map::new())
     }
@@ -1427,6 +1445,21 @@ impl RpcControlHandle {
     pub fn abort_bash(&self) -> Result<String> {
         self.send("abort_bash", Map::new())
     }
+}
+
+/// Native prompts and queued inputs share one transport admission boundary.
+/// Validate before allocating a request ID, including normalized JSON size:
+/// payload bounds must not depend on which RPC control lane sends the input.
+fn rpc_native_content_payload(content: Vec<ContentBlock>) -> Result<Map<String, Value>> {
+    AgentSession::validate_user_content_blocks(&content)?;
+    let content = serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?;
+    let content = crate::rpc::parse_native_prompt_content(&content, 64 * 1024 * 1024)?;
+    let mut payload = Map::new();
+    payload.insert(
+        "content".to_string(),
+        serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
+    );
+    Ok(payload)
 }
 
 /// Unified adapter over in-process and subprocess-backed session control.
@@ -1750,6 +1783,24 @@ impl RpcTransportClient {
         let mut payload = Map::new();
         payload.insert("message".to_string(), Value::String(message.into()));
         self.request_no_data("follow_up", payload).await
+    }
+
+    /// Queue ordered native text, image, audio, and video steering input and
+    /// await the server's admission response. Content is validated before any
+    /// request ID is consumed; native text is not parsed as a command/template.
+    /// Use [`RpcControlHandle::steer_with_content`] while a prompt borrows this
+    /// client and owns its response reader.
+    pub async fn steer_with_content(&mut self, content: Vec<ContentBlock>) -> Result<()> {
+        self.request_no_data("steer", rpc_native_content_payload(content)?)
+            .await
+    }
+
+    /// Queue ordered native content for a follow-up turn and await server
+    /// admission. Validation and queue semantics match [`Self::steer_with_content`].
+    /// Use [`RpcControlHandle::follow_up_with_content`] during a live prompt.
+    pub async fn follow_up_with_content(&mut self, content: Vec<ContentBlock>) -> Result<()> {
+        self.request_no_data("follow_up", rpc_native_content_payload(content)?)
+            .await
     }
 
     pub async fn abort(&mut self) -> Result<()> {
@@ -2133,14 +2184,7 @@ impl RpcTransportClient {
         streaming_behavior: Option<&str>,
         on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
-        AgentSession::validate_user_content_blocks(&content)?;
-        let content = serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?;
-        let content = crate::rpc::parse_native_prompt_content(&content, 64 * 1024 * 1024)?;
-        let mut payload = Map::new();
-        payload.insert(
-            "content".to_string(),
-            serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
-        );
+        let payload = rpc_native_content_payload(content)?;
         self.prompt_payload_streaming(payload, streaming_behavior, on_event)
             .await
     }

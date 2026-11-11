@@ -842,6 +842,7 @@ RPC event stream.
 | Host action | Control-handle method |
 | --- | --- |
 | Steer or queue a follow-up during a prompt | `steer(message)`, `follow_up(message)` |
+| Send images, audio, video, or interleaved text during a prompt | `steer_with_content(content)`, `follow_up_with_content(content)` |
 | Abort a prompt, compaction, or handoff | `abort()` |
 | Cancel the pending Bash command | `abort_bash()` |
 | Reply to an extension UI request | `extension_ui_response(request_id, request_generation, response)` |
@@ -857,6 +858,18 @@ An expired UI reply can receive `resolved: false`, and a mismatched generation
 can receive an RPC error, even though control dispatch succeeded. Use the ordinary
 `RpcTransportClient` methods when you need an acknowledgement and no pending
 operation currently owns the read lane.
+
+The native content methods take `Vec<ContentBlock>` and preserve block order,
+attachment payloads, and text whitespace. They send the RPC `content` field, so
+text such as `/model ...` remains user content rather than a slash command or
+template. They share `prompt_with_content` validation: assistant-only blocks,
+malformed base64 or MIME types, excessive block counts, and content exceeding
+the transport budget are rejected before allocating an ID or writing a frame.
+The server still applies its own configured media and queue limits.
+`RpcTransportClient::steer_with_content(content).await` and
+`follow_up_with_content(content).await` provide acknowledged admission when the
+client's response reader is idle; admission does not mean the queued input has
+already reached the provider or been saved.
 
 The control lane and ordinary requests use one atomic id sequence and one mutexed
 writer, preventing duplicate IDs or interleaved JSON lines. Holding a control

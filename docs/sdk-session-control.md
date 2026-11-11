@@ -130,6 +130,26 @@ controlled turn holds the session. If the handle is replaced while idle, the
 next turn registers its fetchers on the replacement. Controls from an earlier
 turn remain closed and cannot affect the replacement session.
 
+## Native content over a subprocess control lane
+
+For subprocess sessions, clone `RpcTransportClient::control_handle()` before
+starting the prompt. Its `steer_with_content(Vec<ContentBlock>)` and
+`follow_up_with_content(Vec<ContentBlock>)` methods send ordered native text,
+images, audio, and video while the prompt retains the sole response reader.
+They use the same bounded validation as `RpcTransportClient::prompt_with_content`
+before allocating a request ID or writing. They preserve text as authored
+content, including a leading slash, rather than parsing it as a command or
+expanding a template.
+
+These synchronous methods return a dispatch ID after flushing the command.
+The server can still reject admission because of its media limits or queue
+state. When no operation owns the response reader, the async
+`RpcTransportClient::steer_with_content` and `follow_up_with_content` methods
+wait for that admission response. Neither form certifies provider consumption
+or durable storage. Subprocess controls use the RPC session's queues and
+lifetime; they do not expose the in-process mailbox's reclamation receipts or
+separate `authored_source` argument.
+
 ## Validation scope
 
 Regression coverage includes bounded admission, native blocks and authored

@@ -1092,6 +1092,109 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[],"control":%s}
     }
 
     #[test]
+    fn native_steering_and_follow_up_arrive_during_the_running_prompt() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 5 frame || exit 1
+printf '{"type":"response","command":"prompt","id":"rpc-1","success":true}\n'
+printf '{"type":"agent_start","sessionId":"native-rpc"}\n'
+IFS= read -r -t 5 steering || exit 1
+printf '{"type":"response","command":"steer","id":"rpc-2","success":true}\n'
+printf '{"type":"fixture_steered","frame":%s}\n' "$steering"
+IFS= read -r -t 5 follow_up || exit 1
+printf '{"type":"response","command":"follow_up","id":"rpc-3","success":true}\n'
+printf '{"type":"fixture_follow_up","frame":%s}\n' "$follow_up"
+printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
+"#,
+        );
+        let control = client.control_handle();
+        let mut steering = ordered_native_content();
+        steering[0] = ContentBlock::Text(TextContent::new("/model literal user content\n"));
+        let follow_up = vec![ContentBlock::Media(MediaContent {
+            data: "Yg".to_string(),
+            mime_type: "VIDEO/MP4".to_string(),
+            name: Some("  follow\nup.mp4  ".to_string()),
+        })];
+        // The peer cannot terminate this prompt until it receives both
+        // controls from the callback while the client is still borrowed.
+        let events = run_async(client.prompt_with_options_streaming(
+            "original prompt",
+            None,
+            None,
+            |event| match event["type"].as_str() {
+                Some("agent_start") => {
+                    assert_eq!(
+                        control
+                            .steer_with_content(steering.clone())
+                            .expect("live native steering"),
+                        "rpc-2"
+                    );
+                }
+                Some("fixture_steered") => {
+                    assert_eq!(
+                        control
+                            .follow_up_with_content(follow_up.clone())
+                            .expect("live native follow-up"),
+                        "rpc-3"
+                    );
+                }
+                _ => {}
+            },
+        ))
+        .expect("live native controls must reach the pending prompt");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["agent_start", "fixture_steered", "fixture_follow_up", "agent_end"]
+        );
+        assert_eq!(
+            events[1]["frame"],
+            json!({"type":"steer", "id":"rpc-2", "content":steering})
+        );
+        assert_eq!(
+            events[2]["frame"],
+            json!({
+                "type":"follow_up", "id":"rpc-3",
+                "content":[{"type":"media", "data":"Yg", "mimeType":"video/mp4", "name":"followup.mp4"}]
+            })
+        );
+        client.shutdown().expect("shutdown fixture");
+    }
+
+    #[test]
+    fn native_queue_methods_await_admission_and_preserve_a_rejected_connection() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 5 steering || exit 1
+printf '{"type":"response","command":"steer","id":"rpc-1","success":true}\n'
+IFS= read -r -t 5 follow_up || exit 1
+printf '{"type":"response","command":"follow_up","id":"rpc-2","success":false,"error":"follow-up queue is full"}\n'
+IFS= read -r -t 5 probe || exit 1
+printf '{"type":"response","command":"probe","id":"rpc-3","success":true,"data":{"steering":%s,"followUp":%s,"probe":%s}}\n' "$steering" "$follow_up" "$probe"
+"#,
+        );
+        let content = ordered_native_content();
+        run_async(client.steer_with_content(content.clone())).expect("steering admitted");
+        let error = run_async(client.follow_up_with_content(content.clone()))
+            .expect_err("server refusal must reach the caller");
+        assert!(error.to_string().contains("follow-up queue is full"));
+        let frames = run_async(client.request("probe", serde_json::Map::new()))
+            .expect("an acknowledged queue refusal must not close the connection");
+        assert_eq!(
+            frames["steering"],
+            json!({"type":"steer", "id":"rpc-1", "content":content})
+        );
+        assert_eq!(
+            frames["followUp"],
+            json!({"type":"follow_up", "id":"rpc-2", "content":content})
+        );
+        assert_eq!(frames["probe"], json!({"type":"probe", "id":"rpc-3"}));
+        client.shutdown().expect("shutdown fixture");
+    }
+
+    #[test]
     fn media_only_content_is_normalized_and_streaming_options_are_preserved() {
         for streaming in [false, true] {
             let mut client = client(
@@ -1190,6 +1293,7 @@ IFS= read -r -t 5 frame || exit 1
 printf '{"type":"response","command":"probe","id":"rpc-1","success":true,"data":%s}\n' "$frame"
 "#,
         );
+        let control = client.control_handle();
         let invalid = vec![
             Vec::new(),
             vec![ContentBlock::Thinking(ThinkingContent {
@@ -1219,6 +1323,10 @@ printf '{"type":"response","command":"probe","id":"rpc-1","success":true,"data":
             vec![ContentBlock::Text(TextContent::new("bounded")); 257],
         ];
         for content in invalid {
+            assert!(control.steer_with_content(content.clone()).is_err());
+            assert!(control.follow_up_with_content(content.clone()).is_err());
+            assert!(run_async(client.steer_with_content(content.clone())).is_err());
+            assert!(run_async(client.follow_up_with_content(content.clone())).is_err());
             assert!(run_async(client.prompt_with_content(content.clone())).is_err());
             assert!(
                 run_async(client.prompt_with_content_streaming(content, None, |_| {
