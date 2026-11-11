@@ -6890,6 +6890,292 @@ mod tests {
         });
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum NativeSelection {
+        Model,
+        Thinking,
+        Synchronize,
+    }
+
+    async fn invoke_native_selection(
+        session: &mut AgentSession,
+        operation: NativeSelection,
+        target: &ModelEntry,
+    ) -> Result<()> {
+        match operation {
+            NativeSelection::Model => {
+                session
+                    .set_provider_model(&target.model.provider, &target.model.id)
+                    .await
+            }
+            NativeSelection::Thinking => {
+                session
+                    .set_thinking_level(crate::model::ThinkingLevel::High)
+                    .await
+            }
+            NativeSelection::Synchronize => {
+                session.sync_runtime_selection_from_session_header().await
+            }
+        }
+    }
+
+    #[test]
+    fn native_selection_waits_before_session_locks_and_cancels_without_mutation() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                NativeSelection::Model,
+                NativeSelection::Thinking,
+                NativeSelection::Synchronize,
+            ] {
+                for wait_on_provider in [true, false] {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                    let store = Arc::clone(&session.session);
+                    let before = SessionEditSnapshot::capture(&store.try_lock().expect("store"))
+                        .expect("source snapshot");
+                    let before_options = session.agent.stream_options().clone();
+                    let gate = session.provider_admission_gate();
+                    let actions = session.session_action_admission_gate();
+                    let cx = AgentCx::for_current_or_request();
+                    let blocker = if wait_on_provider {
+                        gate.acquire(cx.cx()).await.expect("active provider")
+                    } else {
+                        actions.acquire(cx.cx()).await.expect("active callback")
+                    };
+                    let owner =
+                        AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+                    let mut selection = Box::pin(owner.with_current(invoke_native_selection(
+                        &mut session,
+                        operation,
+                        &models[1],
+                    )));
+                    assert!(futures::poll!(selection.as_mut()).is_pending());
+                    assert!(
+                        store.try_lock().is_ok(),
+                        "{operation:?}: a waiting selection must not block provider callbacks"
+                    );
+                    if wait_on_provider {
+                        let mut callback = Box::pin(actions.acquire(cx.cx()));
+                        let std::task::Poll::Ready(Ok(permit)) = futures::poll!(callback.as_mut())
+                        else {
+                            panic!("{operation:?}: Session actions must remain available");
+                        };
+                        drop(permit);
+                    }
+                    gate.ensure_allowed().expect("no persistence started");
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel selection"),
+                    );
+                    let std::task::Poll::Ready(Err(error)) = futures::poll!(selection.as_mut())
+                    else {
+                        panic!("{operation:?}: selection must inherit its owner's cancellation");
+                    };
+                    assert!(!error.is_session_persistence(), "{error}");
+                    drop(selection);
+                    drop(blocker);
+                    gate.ensure_allowed().expect("cancelled before persistence");
+                    assert!(
+                        SessionEditSnapshot::capture(&store.try_lock().expect("store"))
+                            .expect("unchanged snapshot")
+                            == before
+                    );
+                    assert_eq!(session.agent.provider().name(), provider.name());
+                    assert_eq!(session.agent.provider().model_id(), provider.model_id());
+                    assert_eq!(
+                        session.agent.stream_options().api_key,
+                        before_options.api_key
+                    );
+                    assert_eq!(
+                        session.agent.stream_options().headers,
+                        before_options.headers
+                    );
+                    assert_eq!(
+                        session.agent.stream_options().thinking_level,
+                        before_options.thinking_level
+                    );
+                    assert!(provider.calls().lock().expect("calls").is_empty());
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(5),
+                        invoke_native_selection(&mut session, operation, &models[1]),
+                    )
+                    .await
+                    .expect("cancelled selection releases every permit")
+                    .expect("fresh selection succeeds");
+                    gate.ensure_allowed().expect("committed selection");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_selection_preserves_provider_callback_edits_through_durable_installation() {
+        use crate::extensions::ExtensionSession as _;
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                NativeSelection::Model,
+                NativeSelection::Thinking,
+                NativeSelection::Synchronize,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let store = Arc::clone(&session.session);
+                let extension = SessionHandle(Arc::clone(&store));
+                let gate = session.provider_admission_gate();
+                let actions = session.session_action_admission_gate();
+                let cx = AgentCx::for_current_or_request();
+                let active_provider = gate.acquire(cx.cx()).await.expect("active provider");
+                let mut selection =
+                    Box::pin(invoke_native_selection(&mut session, operation, &models[1]));
+                assert!(futures::poll!(selection.as_mut()).is_pending());
+                assert!(
+                    store.try_lock().is_ok(),
+                    "provider callback needs the store"
+                );
+                let mut callback = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(callback_permit)) = futures::poll!(callback.as_mut())
+                else {
+                    panic!("provider callback needs Session-action admission");
+                };
+                extension
+                    .set_name("callback completed before selection".to_string(), None)
+                    .await
+                    .expect("provider callback writes session");
+                if matches!(operation, NativeSelection::Synchronize) {
+                    extension
+                        .set_model(
+                            models[1].model.provider.clone(),
+                            models[1].model.id.clone(),
+                            None,
+                        )
+                        .await
+                        .expect("provider callback selects a model");
+                }
+                drop(callback_permit);
+                drop(callback);
+                drop(active_provider);
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    selection,
+                )
+                .await
+                .expect("selection must not reacquire its own authority")
+                .expect("durable selection");
+                gate.ensure_allowed().expect("selection completed");
+
+                let path = store.try_lock().expect("store").path.clone().expect("path");
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen durable selection");
+                assert_eq!(
+                    reopened.get_name().as_deref(),
+                    Some("callback completed before selection")
+                );
+                assert_eq!(
+                    reopened.effective_model_for_current_path(),
+                    Some((
+                        session.agent.provider().name().to_string(),
+                        session.agent.provider().model_id().to_string(),
+                    ))
+                );
+                assert_eq!(
+                    reopened.effective_thinking_level_for_current_path(),
+                    session
+                        .agent
+                        .stream_options()
+                        .thinking_level
+                        .map(|level| level.to_string())
+                );
+                if !matches!(operation, NativeSelection::Thinking) {
+                    assert_eq!(session.agent.provider().name(), models[1].model.provider);
+                    assert_eq!(session.agent.provider().model_id(), models[1].model.id);
+                }
+                assert!(provider.calls().lock().expect("calls").is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn native_prompt_and_continuation_startup_leave_session_available_to_provider_callbacks() {
+        use crate::extensions::ExtensionSession as _;
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for entrypoint in ["text", "content", "continue"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, mut models) = public_recovery_fixture(dir.path());
+                models[0].model.reasoning = true;
+                models[0].model.input.push(InputType::Image);
+                session.set_model_registry(ModelRegistry::from_entries_for_tests(models));
+                session.save_enabled = false;
+                session.compaction_settings.enabled = false;
+                let store = Arc::clone(&session.session);
+                let extension = SessionHandle(Arc::clone(&store));
+                let gate = session.provider_admission_gate();
+                let actions = session.session_action_admission_gate();
+                let cx = AgentCx::for_current_or_request();
+                let active_provider = gate.acquire(cx.cx()).await.expect("active completion");
+                let mut request = Box::pin(async {
+                    match entrypoint {
+                        "text" => session.run_text("next prompt".to_string(), |_| {}).await,
+                        "content" => {
+                            session
+                                .run_with_content(
+                                    vec![
+                                        ContentBlock::Text(TextContent::new("next prompt")),
+                                        sample_image_block(),
+                                    ],
+                                    |_| {},
+                                )
+                                .await
+                        }
+                        "continue" => session.run_continue_with_abort(None, |_| {}).await,
+                        _ => unreachable!(),
+                    }
+                });
+                assert!(futures::poll!(request.as_mut()).is_pending());
+                assert!(
+                    store.try_lock().is_ok(),
+                    "{entrypoint}: startup must not lock out the in-flight provider"
+                );
+                let mut callback = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(callback_permit)) = futures::poll!(callback.as_mut())
+                else {
+                    panic!("{entrypoint}: startup must leave callback admission available");
+                };
+                extension
+                    .set_thinking_level("high".to_string(), None)
+                    .await
+                    .expect("provider callback updates reasoning");
+                drop(callback_permit);
+                drop(callback);
+                drop(active_provider);
+                let result = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    request,
+                )
+                .await
+                .expect("native startup must complete after the callback")
+                .expect("native provider request");
+                assert_eq!(result.stop_reason, StopReason::Stop);
+                let calls = provider.calls();
+                let calls = calls.lock().expect("calls");
+                assert_eq!(calls.len(), 1, "{entrypoint}");
+                assert_eq!(
+                    calls[0].thinking_level,
+                    Some(crate::model::ThinkingLevel::High),
+                    "startup must install the callback's latest selection"
+                );
+            }
+        });
+    }
+
     #[test]
     fn prepared_model_selection_updates_stream_credentials_and_headers() {
         let dir = tempfile::tempdir().expect("tempdir");

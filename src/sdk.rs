@@ -3557,10 +3557,11 @@ impl AgentSessionHandle {
     /// Override the per-prompt `max_tokens` cap.
     ///
     /// Persists for the lifetime of the in-process handle only; not written
-    /// to session metadata. Pass `None` to fall back to the provider's
-    /// default cap.
-    pub const fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
-        self.session.agent.stream_options_mut().max_tokens = max_tokens;
+    /// to session metadata. Model switches, retries and primary restoration
+    /// retain the override. Pass `None` to use the provider's default cap,
+    /// including after a model switch.
+    pub fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
+        self.session.set_max_tokens_override(max_tokens);
     }
 
     /// `/add-dir` driver (bd-cv653.3.12): validate + add an additional
@@ -11840,6 +11841,167 @@ export default function init(pi) {
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
     }
+
+    /// Keep registry identity while observing the options at the request boundary.
+    struct MaxTokensRecordingProvider {
+        identity: Arc<dyn Provider>,
+        requests: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MaxTokensRecordingProvider {
+        fn name(&self) -> &str {
+            self.identity.name()
+        }
+
+        fn api(&self) -> &str {
+            self.identity.api()
+        }
+
+        fn model_id(&self) -> &str {
+            self.identity.model_id()
+        }
+
+        async fn stream(
+            &self,
+            _context: &ProviderContext<'_>,
+            options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
+            self.requests.lock().unwrap().push(options.max_tokens);
+            let message = crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("recorded request cap"),
+                )],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                stop_reason: crate::model::StopReason::Stop,
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    fn record_max_tokens(handle: &mut AgentSessionHandle) -> Arc<Mutex<Vec<Option<u32>>>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = MaxTokensRecordingProvider {
+            identity: handle.session.agent.provider(),
+            requests: Arc::clone(&requests),
+        };
+        handle.session.agent.set_provider(Arc::new(provider));
+        requests
+    }
+
+    #[test]
+    fn max_tokens_override_reaches_prompts_continuations_and_model_changes() {
+        // The untouched case must follow registry updates; explicit None must
+        // remain a provider-default request rather than become a registry cap.
+        for (explicit, cap) in [(false, None), (true, Some(32_000)), (true, None)] {
+            let dir = tempdir().expect("tempdir");
+            run_async(async {
+                let mut handle = create_agent_session(hermetic_session_options(dir.path()))
+                    .await
+                    .expect("create session");
+                if explicit {
+                    handle.set_max_tokens(cap);
+                }
+                let expected_initial = handle.max_tokens();
+                let requests = record_max_tokens(&mut handle);
+                handle.continue_turn(|_| {}).await.expect("continue");
+                handle.prompt("first prompt", |_| {}).await.expect("prompt");
+                assert_eq!(
+                    *requests.lock().unwrap(),
+                    vec![expected_initial, expected_initial],
+                    "every public turn must retain the configured request cap"
+                );
+
+                let mut registry = handle.session.model_registry().unwrap().clone();
+                let mut current = registry.find("openai", "gpt-4o").unwrap();
+                current.model.max_tokens = 1_536;
+                let mut next = registry.find("openai", "gpt-4o-mini").unwrap();
+                next.model.max_tokens = 3_072;
+                registry.merge_entries(vec![current, next]);
+                handle.session.set_model_registry(registry);
+                handle
+                    .prompt("refreshed catalog", |_| {})
+                    .await
+                    .expect("refresh");
+                let expected_refreshed = if explicit { cap } else { Some(1_536) };
+                assert_eq!(requests.lock().unwrap().last(), Some(&expected_refreshed));
+                assert_eq!(handle.max_tokens(), expected_refreshed);
+
+                handle
+                    .set_model("openai", "gpt-4o-mini")
+                    .await
+                    .expect("switch model");
+                let expected_switched = if explicit { cap } else { Some(3_072) };
+                assert_eq!(handle.max_tokens(), expected_switched);
+                let switched_requests = record_max_tokens(&mut handle);
+                handle
+                    .prompt("new model", |_| {})
+                    .await
+                    .expect("switched prompt");
+                assert_eq!(*switched_requests.lock().unwrap(), vec![expected_switched]);
+
+                handle.set_max_tokens(Some(64_000));
+                handle
+                    .prompt("updated cap", |_| {})
+                    .await
+                    .expect("updated prompt");
+                assert_eq!(
+                    switched_requests.lock().unwrap().last(),
+                    Some(&Some(64_000))
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn max_tokens_override_survives_failover_and_primary_restoration() {
+        for cap in [Some(32_000), None] {
+            let (handle, _calls) =
+                flaky_handle_as(usize::MAX, "anthropic", "claude-3-5-haiku-latest");
+            let mut handle = with_chain_cooldown(
+                handle.with_retry(Some(crate::failover::RetryPolicy {
+                    max_retries: 1,
+                    max_failovers_per_turn: 1,
+                    model_fallback: true,
+                    fallback_on: crate::failover::FallbackOn::Any,
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                })),
+                "openai/gpt-4o-mini",
+                0,
+            );
+            handle.set_max_tokens(cap);
+            let _ = run_async(handle.prompt("trigger failover", |_| {}));
+            assert_eq!(handle.model().1, "gpt-4o-mini");
+            assert_eq!(
+                handle.max_tokens(),
+                cap,
+                "fallback retains the host override"
+            );
+
+            let (_seen, shared) = restore_recorder();
+            run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+            assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
+            assert_eq!(
+                handle.max_tokens(),
+                cap,
+                "restoration retains the host override"
+            );
+            let requests = record_max_tokens(&mut handle);
+            run_async(handle.prompt("restored primary", |_| {})).expect("restored prompt");
+            assert_eq!(*requests.lock().unwrap(), vec![cap]);
+        }
+    }
+
     #[test]
     fn empty_default_tool_registry_disables_configured_builtins() {
         let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.

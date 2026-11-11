@@ -7798,6 +7798,24 @@ struct InitializedCostJournal {
     path: Option<PathBuf>,
 }
 
+/// An explicit provider default is different from an untouched model default.
+/// Keep this process-local choice when a selection refreshes stream options.
+#[derive(Clone, Copy, Default)]
+enum MaxTokensOverride {
+    #[default]
+    RegistryDefault,
+    Explicit(Option<u32>),
+}
+
+impl MaxTokensOverride {
+    const fn resolve(self, model_max_tokens: u32) -> Option<u32> {
+        match self {
+            Self::RegistryDefault => Some(model_max_tokens),
+            Self::Explicit(max_tokens) => max_tokens,
+        }
+    }
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
@@ -7830,6 +7848,7 @@ pub struct AgentSession {
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<Arc<ModelRegistry>>,
+    max_tokens_override: MaxTokensOverride,
     auth_storage: Option<AuthStorage>,
     /// Distinguishes this owner from sessions reusing the same registry snapshots.
     media_auth_owner: Arc<()>,
@@ -18948,6 +18967,7 @@ impl AgentSession {
             runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
+            max_tokens_override: MaxTokensOverride::default(),
             auth_storage: None,
             media_auth_owner,
             api_key_override: None,
@@ -18962,6 +18982,14 @@ impl AgentSession {
 
     pub const fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+    }
+
+    /// Override the active request cap without persisting it in Session metadata.
+    /// `None` explicitly selects provider defaults, even after a model switch.
+    pub(crate) fn set_max_tokens_override(&mut self, max_tokens: Option<u32>) {
+        self.max_tokens_override = MaxTokensOverride::Explicit(max_tokens);
+        self.agent.stream_options_mut().max_tokens = max_tokens;
+        self.refresh_extension_completion_host_state();
     }
 
     /// Configure project memory learning without opening a store or making a request.
@@ -19605,7 +19633,8 @@ impl AgentSession {
                 let stream_options = self.agent.stream_options_mut();
                 stream_options.api_key = resolved_key;
                 stream_options.headers.clone_from(&entry.headers);
-                stream_options.max_tokens = Some(entry.model.max_tokens);
+                stream_options.max_tokens =
+                    self.max_tokens_override.resolve(entry.model.max_tokens);
                 stream_options.thinking_level = Some(thinking_level);
             }
             self.set_compaction_context_window(if entry.model.context_window == 0 {
@@ -19768,7 +19797,26 @@ impl AgentSession {
         automatic: bool,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        // An extension completion owns provider admission while its callbacks
+        // may still need Session actions and the store. Wait for that request
+        // before taking either Session lock. Automatic selections already own
+        // both permits and must not acquire them recursively.
+        let provider_authority = match admission {
+            ProviderSwapAdmission::Gate(gate) => {
+                Some(gate.acquire_transition_authority(cx.cx()).await?)
+            }
+            ProviderSwapAdmission::Held(_) => None,
+        };
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = if provider_authority.is_some() {
+            Some(session_actions.acquire(cx.cx()).await?)
+        } else {
+            None
+        };
+        let admission = provider_authority
+            .as_ref()
+            .map_or(admission, ProviderSwapAdmission::Held);
         let save_enabled = self.save_enabled;
         let session_store = Arc::clone(&self.session);
         let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
@@ -20016,7 +20064,11 @@ impl AgentSession {
     /// which holds an `AgentSession` rather than an SDK handle).
     pub async fn set_thinking_level(&mut self, level: crate::model::ThinkingLevel) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
         let save_enabled = self.save_enabled;
         let session_store = Arc::clone(&self.session);
         let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
@@ -20043,15 +20095,13 @@ impl AgentSession {
             candidate.append_thinking_level_change(level_string);
         }
         let _provider_transition = if changed {
-            Some(
-                self.provider_admission
-                    .begin_transition(
-                        "thinking-level persistence was interrupted before live installation completed"
-                            .to_string(),
-                        cx.cx(),
-                    )
-                    .await?,
-            )
+            ProviderSwapAdmission::Held(&authority)
+                .begin_transition(
+                    "thinking-level persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx.cx(),
+                )
+                .await?
         } else {
             None
         };
@@ -20141,7 +20191,11 @@ impl AgentSession {
 
     pub(crate) async fn sync_runtime_selection_from_session_header(&mut self) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
         let session_store = Arc::clone(&self.session);
         let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
             .await
@@ -20221,8 +20275,7 @@ impl AgentSession {
         if runtime_model_changed {
             self.invalidate_background_compaction();
         }
-        let _provider_transition = self
-            .provider_admission
+        let _provider_transition = ProviderSwapAdmission::Held(&authority)
             .begin_transition(
                 "Session-header synchronization persistence was interrupted before live installation completed"
                     .to_string(),
@@ -20785,7 +20838,7 @@ impl AgentSession {
             let stream_options = self.agent.stream_options_mut();
             stream_options.api_key = key;
             stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.max_tokens = self.max_tokens_override.resolve(entry.model.max_tokens);
             stream_options.thinking_level = Some(target_thinking);
         }
         self.set_compaction_context_window(context_window_tokens_for_entry(entry));
@@ -21162,7 +21215,7 @@ impl AgentSession {
             let stream_options = self.agent.stream_options_mut();
             stream_options.api_key.clone_from(&request.api_key);
             stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.max_tokens = self.max_tokens_override.resolve(entry.model.max_tokens);
             stream_options.thinking_level = Some(target_thinking);
         }
         self.set_compaction_context_window(context_window_tokens_for_entry(entry));
