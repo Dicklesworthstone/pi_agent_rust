@@ -498,6 +498,7 @@ impl Provider for GeminiProvider {
             // accepted, stream failures retain the normal agent retry policy.
             if let Some(prepared) = prepared.as_mut()
                 && Box::pin(prepared.recover(
+                    &self.files,
                     &self.client,
                     &upload_auth,
                     &mut body,

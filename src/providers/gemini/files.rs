@@ -380,11 +380,12 @@ impl FileCache {
             auth,
             owner: &owner,
         };
-        let files = owner
+        let mut files = BTreeMap::new();
+        owner
             .with_current(asupersync::time::timeout(
                 now,
                 remaining,
-                self.prepare_inner(&context, body, candidates),
+                self.prepare_inner(&context, body, candidates, &mut files),
             ))
             .await
             .map_err(|_| files_error("media staging timed out; generation was not started"))??;
@@ -404,14 +405,16 @@ impl FileCache {
         context: &UploadContext<'_>,
         body: &mut Value,
         candidates: Vec<Candidate>,
-    ) -> Result<BTreeMap<ContentKey, PreparedFile>> {
+        prepared: &mut BTreeMap<ContentKey, PreparedFile>,
+    ) -> Result<()> {
         if candidates.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(());
         }
         let mut request_bytes = serialized_bytes(body)?;
         // Repeated parts in a single request share the already-validated URI,
-        // without an extra files.get call for every occurrence.
-        let mut prepared: BTreeMap<ContentKey, PreparedFile> = BTreeMap::new();
+        // without an extra files.get call for every occurrence. Recovery adds
+        // to this same map so a newly staged duplicate reuses its replacement
+        // and cannot obtain another upload budget.
         for candidate in candidates {
             // Candidates are largest first. Once neither the per-part nor
             // complete-request policy requires another upload, all remaining
@@ -491,7 +494,7 @@ impl FileCache {
         }
         // If the prompt itself exceeds the media budget, every inline part
         // has been staged. Do not impose a new limit on the remaining text.
-        Ok(prepared)
+        Ok(())
     }
 
     fn slot(&self, key: ContentKey) -> Result<FileSlot> {
@@ -598,6 +601,7 @@ impl PreparedFiles {
     /// https://ai.google.dev/gemini-api/docs/generate-content/api-errors
     pub(super) async fn recover(
         &mut self,
+        cache: &FileCache,
         client: &Client,
         auth: &UploadAuth,
         body: &mut Value,
@@ -628,7 +632,7 @@ impl PreparedFiles {
             .with_current(asupersync::time::timeout(
                 now,
                 remaining,
-                recover_files(&context, self.policy, &mut self.files, body),
+                recover_files(&context, self.policy, cache, &mut self.files, body),
             ))
             .await
             .map_err(|_| files_error("media recovery timed out; generation was not retried"))??;
@@ -672,6 +676,7 @@ fn missing_resource_error(status: u16, body: &str) -> bool {
 async fn recover_files(
     context: &UploadContext<'_>,
     policy: StagingPolicy,
+    cache: &FileCache,
     files: &mut BTreeMap<ContentKey, PreparedFile>,
     body: &mut Value,
 ) -> Result<bool> {
@@ -759,6 +764,17 @@ async fn recover_files(
         }
         file.remote = replacement;
         changed = true;
+    }
+    if changed {
+        // A valid replacement URI can be longer than the resource it replaces.
+        // Recheck the complete wire body before the one allowed generation
+        // retry, including media left inline by initial staging. This runs
+        // under recover's original absolute deadline and shares the existing
+        // content slots, source bytes, and per-blob replacement budgets.
+        let candidates = staging_plan(body, policy)?;
+        cache
+            .prepare_inner(context, body, candidates, files)
+            .await?;
     }
     Ok(changed)
 }
@@ -1171,7 +1187,10 @@ mod tests {
         // Isolate HTTP/locking/processing transitions from the outer timeout;
         // provider-level tests below also cover prepare/recover's wrappers.
         let deadline = staging_deadline(&owner, owner_now(&owner), cache.policy.timeout);
-        let files = cache.prepare_inner(&context, body, candidates).await?;
+        let mut files = BTreeMap::new();
+        cache
+            .prepare_inner(&context, body, candidates, &mut files)
+            .await?;
         Ok(PreparedFiles {
             endpoint: endpoint.clone(),
             owner,
@@ -1184,6 +1203,7 @@ mod tests {
 
     async fn recover_fixture(
         prepared: &mut PreparedFiles,
+        cache: &FileCache,
         client: &Client,
         auth: &UploadAuth,
         body: &mut Value,
@@ -1196,7 +1216,7 @@ mod tests {
         };
         // Isolate HTTP/cache transitions; provider-level tests also exercise
         // recover's classification, ownership and absolute timeout wrapper.
-        recover_files(&context, prepared.policy, &mut prepared.files, body).await
+        recover_files(&context, prepared.policy, cache, &mut prepared.files, body).await
     }
 
     struct Reply {
@@ -2299,7 +2319,7 @@ mod tests {
             .unwrap();
             *file.slot.lock(prepared.owner.cx()).await.unwrap() = Some(concurrent.clone());
             assert!(
-                recover_fixture(&mut prepared, &client, &auth, &mut body)
+                recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
                     .await
                     .unwrap()
             );
@@ -2369,7 +2389,7 @@ mod tests {
                     .await
                     .unwrap();
             let original = body.clone();
-            let error = recover_fixture(&mut prepared, &client, &auth, &mut body)
+            let error = recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("after one replacement"));
@@ -2409,7 +2429,7 @@ mod tests {
                     .await
                     .unwrap();
             let original = body.clone();
-            let error = recover_fixture(&mut prepared, &client, &auth, &mut body)
+            let error = recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
                 .await
                 .unwrap_err();
             assert!(
@@ -2450,6 +2470,7 @@ mod tests {
                 }
                 let error = prepared
                     .recover(
+                        &cache,
                         &client,
                         &auth,
                         &mut body,
@@ -2571,6 +2592,156 @@ mod tests {
         expected["contents"][0]["parts"][1]["fileData"]["fileUri"] =
             part["fileData"]["fileUri"].clone();
         assert_eq!(retry, expected, "only the dead URI changes on resubmission");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn provider_recovery_restages_media_when_replacement_uris_outgrow_inline_budget() {
+        for (duplicate, generation_succeeds) in [(false, true), (true, true), (false, false)] {
+            let primary = vec![1; 1024];
+            let secondary = if duplicate {
+                primary.clone()
+            } else {
+                vec![2; 768]
+            };
+            let replacement_name = "r".repeat(128);
+            let server = Server::start(|endpoint| {
+                let mut replies = vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(
+                        endpoint, "a", "ACTIVE", primary.len()
+                    )})),
+                    Reply::generation_error(404, "NOT_FOUND", "first file disappeared"),
+                    Reply::status(404),
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(
+                        endpoint, &replacement_name, "ACTIVE", primary.len()
+                    )})),
+                ];
+                if !duplicate {
+                    replies.extend([
+                        Reply::start(endpoint),
+                        Reply::json(&json!({"file": file_metadata(
+                            endpoint, "secondary", "ACTIVE", secondary.len()
+                        )})),
+                    ]);
+                }
+                replies.push(if generation_succeeds {
+                    Reply::sse("recordings recovered within budget")
+                } else {
+                    Reply::generation_error(404, "NOT_FOUND", "second generation failed")
+                });
+                replies
+            });
+
+            let mut original = media_body(&primary);
+            original["contents"][0]["parts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"inline_data": {
+                    "mime_type": "audio/wav",
+                    "data": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&secondary)
+                }, "thoughtSignature": "retain-secondary-signature"}));
+            original["systemInstruction"] = json!({"parts": [{"text": "\u{0001}".repeat(20)}]});
+            let mut first_expected = original.clone();
+            let part = first_expected["contents"][0]["parts"][1]
+                .as_object_mut()
+                .unwrap();
+            part.remove("inlineData");
+            part.insert(
+                "fileData".into(),
+                json!({"mimeType": "audio/wav", "fileUri":
+                    server.endpoint.metadata_url("files/a").unwrap().as_str()}),
+            );
+            // Initial staging exactly fits. The longer replacement is valid,
+            // but leaving the second part inline would exceed this wire budget.
+            let budget = serde_json::to_vec(&first_expected).unwrap().len();
+            let mut provider = fixture_provider(&server);
+            provider.files.policy.inline_part_bytes = usize::MAX;
+            provider.files.policy.inline_total_bytes = budget;
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let called = Arc::clone(&hook_calls);
+            let hook_body = original.clone();
+            let options = StreamOptions {
+                before_provider_request: Some(BeforeProviderRequestHook::new(move |_| {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    let body = hook_body.clone();
+                    Box::pin(async move { Some(body) })
+                })),
+                ..fixture_options()
+            };
+            let result = run_async(fixture_events(&provider, &fixture_context(), &options));
+            if generation_succeeds {
+                let events = result.unwrap();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                        .count(),
+                    1
+                );
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::TextDelta { delta, .. }
+                        if delta == "recordings recovered within budget"
+                )));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("second generation failed"), "{error}");
+            }
+            assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+
+            let requests = server.finish();
+            assert_eq!(requests.len(), if duplicate { 7 } else { 9 });
+            assert_eq!(requests[1].body, primary);
+            assert_eq!(requests[5].body, primary, "one replacement upload");
+            if !duplicate {
+                assert_eq!(requests[7].body, secondary, "newly necessary inline media");
+            }
+            let generations: Vec<_> = requests
+                .iter()
+                .filter(|request| request.path.contains(":streamGenerateContent"))
+                .collect();
+            assert_eq!(
+                generations.len(),
+                2,
+                "restaging grants no extra generation retry"
+            );
+            for request in &generations {
+                assert!(
+                    request.body.len() <= budget,
+                    "outbound media budget exceeded"
+                );
+                assert_request_credentials(request);
+            }
+            let first: Value = serde_json::from_slice(&generations[0].body).unwrap();
+            let retry: Value = serde_json::from_slice(&generations[1].body).unwrap();
+            assert_eq!(
+                first, first_expected,
+                "initial request keeps secondary media inline"
+            );
+            let replacement_uri = retry["contents"][0]["parts"][1]["fileData"]["fileUri"]
+                .as_str()
+                .unwrap();
+            let secondary_uri = retry["contents"][0]["parts"][2]["fileData"]["fileUri"]
+                .as_str()
+                .unwrap();
+            assert!(replacement_uri.ends_with(&replacement_name));
+            let mut expected = first_expected;
+            expected["contents"][0]["parts"][1]["fileData"]["fileUri"] = json!(replacement_uri);
+            let secondary_part = expected["contents"][0]["parts"][2].as_object_mut().unwrap();
+            secondary_part.remove("inline_data");
+            secondary_part.insert(
+                "fileData".into(),
+                json!({"mimeType": "audio/wav", "fileUri": secondary_uri}),
+            );
+            assert_eq!(retry, expected, "restaging preserves all non-media fields");
+            if duplicate {
+                assert_eq!(secondary_uri, replacement_uri);
+            } else {
+                assert!(secondary_uri.ends_with("/secondary"));
+            }
+        }
     }
 
     #[test]
@@ -2817,8 +2988,9 @@ mod tests {
             let cache = cache();
             let mut body = media_body(b"abc");
             let plan = staging_plan(&body, cache.policy).unwrap();
+            let mut prepared = BTreeMap::new();
             let error = cache
-                .prepare_inner(&context, &mut body, plan)
+                .prepare_inner(&context, &mut body, plan, &mut prepared)
                 .await
                 .err()
                 .expect("cancelled staging");
