@@ -215,7 +215,7 @@ impl QueuedWriter {
                     // one lock. Once claimed, complete the frame before any
                     // cancellation control; never emit half a JSON-RPC frame.
                     if let Err(error) = pipe.write_all(&frame.bytes).and_then(|()| pipe.flush()) {
-                        break TransportError::Io(format!("server pipe write failed: {error}"));
+                        break TransportError::from_write_error("server pipe write failed", &error);
                     }
                     // Drop releases the byte reservation only after the entire
                     // frame was written. There is no replay on a partial write.

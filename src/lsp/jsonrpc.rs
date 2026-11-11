@@ -93,6 +93,21 @@ impl TransportError {
             Self::Backpressure(reason) => format!("transport capacity busy: {reason}"),
         }
     }
+
+    /// Classify failures that mean the peer or its writer has gone away as a
+    /// closed transport rather than generic I/O. This matters during process
+    /// exit: admission can race the reaper after the caller's liveness check.
+    fn from_write_error(context: &str, error: &std::io::Error) -> Self {
+        let reason = format!("{context}: {error}");
+        match error.kind() {
+            std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::UnexpectedEof => Self::Closed(reason),
+            _ => Self::Io(reason),
+        }
+    }
 }
 
 /// A server notification (method + params), queued for the client layer.
@@ -993,7 +1008,7 @@ impl JsonRpcClient {
             if err.kind() != std::io::ErrorKind::InvalidInput {
                 self.kill();
             }
-            return Err(TransportError::Io(format!("request queue failed: {err}")));
+            return Err(TransportError::from_write_error("request queue failed", &err));
         }
         request.frame = None;
         Ok((id, rx))
@@ -1041,9 +1056,10 @@ impl JsonRpcClient {
             if error.kind() != std::io::ErrorKind::InvalidInput {
                 self.kill();
             }
-            return Err(TransportError::Io(format!(
-                "notification queue failed: {error}"
-            )));
+            return Err(TransportError::from_write_error(
+                "notification queue failed",
+                &error,
+            ));
         }
         batch.frames = None;
         Ok(())
@@ -1067,9 +1083,10 @@ impl JsonRpcClient {
         };
         if let Err(err) = write_result {
             self.kill();
-            return Err(TransportError::Io(format!(
-                "notification queue failed: {err}"
-            )));
+            return Err(TransportError::from_write_error(
+                "notification queue failed",
+                &err,
+            ));
         }
         Ok(())
     }
