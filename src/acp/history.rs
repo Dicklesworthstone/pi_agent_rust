@@ -263,11 +263,18 @@ pub(super) async fn load(
     let response = session_setup_response(id, &guard)
         .map_err(|error| HistoryError::internal(error.to_string()))?
         .ok_or_else(HistoryError::busy)?;
-    if replay {
+    {
         let session = OwnedMutexGuard::lock(agent.session_store(), cx)
             .await
             .map_err(|_| HistoryError::internal("Session history is unavailable"))?;
-        replay_session(&session, id, out).await?;
+        if replay {
+            replay_session(&session, id, out).await?;
+        }
+        // The current task plan is session state, so resume restores it even
+        // when the client retains its conversation and requests no replay.
+        if let Some(update) = current_plan_update(&session) {
+            send_update(out, id, update).await?;
+        }
     }
     if guard.mcp.is_some() {
         // This is configuration, not replayed conversation content; resume
@@ -506,6 +513,12 @@ pub(super) async fn fork(
             .session()
             .refresh_extension_completion_host_state();
     }
+    let plan_notification = current_plan_update(&candidate).map(|update| {
+        json_rpc_notification(
+            "session/update",
+            json!({ "sessionId": fork_id, "update": update }),
+        )
+    });
     drop(candidate);
     let response = session_setup_response(&fork_id, &state)
         .map_err(|error| HistoryError::internal(error.to_string()))?
@@ -537,6 +550,9 @@ pub(super) async fn fork(
     drop(source);
     drop(action_permit);
     drop(live);
+    if let Some(notification) = plan_notification {
+        send_line(out, notification).await?;
+    }
     if let Some(notification) = mcp_notification {
         send_line(out, notification).await?;
     }
@@ -579,6 +595,26 @@ async fn send_update(out: &AcpOutput, id: &str, update: Value) -> HistoryResult<
         ),
     )
     .await
+}
+
+/// Restore the last accepted task list on the selected branch, including an
+/// explicitly empty list. Tool results in the transcript are not authoritative
+/// state and must not overwrite a later persisted mutation during replay.
+fn current_plan_update(session: &Session) -> Option<Value> {
+    session
+        .entries_for_current_path()
+        .into_iter()
+        .rev()
+        .find_map(|entry| {
+            let SessionEntry::Custom(custom) = entry else {
+                return None;
+            };
+            if custom.custom_type != crate::todo::TODO_LIST_SCHEMA {
+                return None;
+            }
+            let list = serde_json::from_value::<crate::todo::TodoList>(custom.data.clone()?).ok()?;
+            Some(content::plan_update(&list))
+        })
 }
 
 /// Use durable entries instead of provider context: compaction must not erase
@@ -1074,6 +1110,150 @@ mod tests {
         timeout(wall_now(), Duration::from_secs(30), Box::pin(work))
             .await
             .expect("ACP fork lifecycle watchdog expired")
+    }
+
+    #[test]
+    fn task_plan_load_and_resume_restore_only_the_selected_branch() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(bounded_fork(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut saved = fixture(root.path(), &cwd);
+            let selected = saved.append_custom_entry(
+                crate::todo::TODO_LIST_SCHEMA.into(),
+                Some(json!({ "phases": [{ "name": "Delivery", "tasks": [
+                    { "content": "Implement", "state": "done" },
+                    { "content": "Verify", "state": "in_progress" },
+                ] }] })),
+            );
+            saved.append_custom_entry(
+                crate::todo::TODO_LIST_SCHEMA.into(),
+                Some(json!({ "phases": [{ "tasks": [
+                    { "content": "Abandoned branch", "state": "in_progress" },
+                ] }] })),
+            );
+            assert!(saved.navigate_to(&selected));
+            saved.append_model_message(user("Continue the selected plan"));
+            // Native todo ignores invalid custom entries rather than clearing
+            // an earlier accepted list; ACP must make the same selection.
+            saved.append_custom_entry(crate::todo::TODO_LIST_SCHEMA.into(), Some(json!({})));
+            saved.save().await.unwrap();
+            let path = saved.path.as_ref().unwrap();
+            let before = std::fs::read(path).unwrap();
+            let options = test_options(root.path(), runtime.handle());
+            let cx = AgentCx::for_testing();
+            let (tx, rx) = std::sync::mpsc::sync_channel(32);
+            let out = AcpOutput::new(tx);
+            let client = fork_client(&out, &cx);
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let params = json!({ "sessionId": saved.header.id, "cwd": cwd, "mcpServers": [] });
+            let expected = json!({ "sessionUpdate": "plan", "entries": [
+                { "content": "Delivery: Implement", "priority": "medium", "status": "completed" },
+                { "content": "Delivery: Verify", "priority": "medium", "status": "in_progress" },
+            ] });
+            // First load is cold; subsequent resume uses the existing owner
+            // and restores the same current plan without replaying messages.
+            for replay in [true, false] {
+                load(&params, &options, &client, &sessions, &cx, &out, replay)
+                    .await
+                    .unwrap();
+                let notifications = rx
+                    .try_iter()
+                    .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                    .collect::<Vec<_>>();
+                let plans = notifications
+                    .iter()
+                    .filter(|line| line["params"]["update"]["sessionUpdate"] == "plan")
+                    .collect::<Vec<_>>();
+                assert_eq!(plans.len(), 1);
+                assert_eq!(plans[0]["params"]["sessionId"], saved.header.id);
+                assert_eq!(plans[0]["params"]["update"], expected);
+                assert_eq!(notifications.len(), if replay { 4 } else { 1 });
+                assert!(!serde_json::to_string(&notifications).unwrap().contains("Abandoned branch"));
+            }
+            assert_eq!(std::fs::read(path).unwrap(), before, "restore must not rewrite history");
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn forked_todo_tools_own_independent_lists_and_resume_empty_replacements() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(bounded_fork(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let mut options = test_options(root.path(), runtime.handle());
+            options.launch.tools = Some("todo".into());
+            options.launch.no_context_files = true;
+            let (source_id, source_state) = build_acp_session(
+                fixture(root.path(), &cwd), true, cwd.clone(), &options, None,
+            ).unwrap();
+            let source_handle = source_state.agent_session.as_ref().unwrap();
+            let source_store = source_handle.session_store();
+            let source_tools = source_handle.session().agent.shared_tools().snapshot();
+            let source_todo = source_tools.get("todo").expect("native ACP todo registration");
+            source_todo.execute("init", json!({ "op": "init", "tasks": ["Keep source task"] }), None)
+                .await.unwrap();
+            let source_state = Arc::new(Mutex::new(source_state));
+            let sessions = Arc::new(Mutex::new(HashMap::from([
+                (source_id.clone(), source_state),
+            ])));
+            let cx = AgentCx::for_testing();
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let out = AcpOutput::new(tx);
+            let client = fork_client(&out, &cx);
+            let response = fork(
+                &json!({ "sessionId": source_id, "cwd": cwd, "mcpServers": [] }),
+                &options, &client, &sessions, &cx, &out,
+            ).await.unwrap();
+            let fork_id = response["sessionId"].as_str().unwrap();
+            let notifications = rx.try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(notifications.len(), 1, "fork restores plan without transcript replay");
+            assert_eq!(notifications[0]["params"]["sessionId"], fork_id);
+            assert_eq!(notifications[0]["params"]["update"], json!({
+                "sessionUpdate": "plan", "entries": [
+                    { "content": "Keep source task", "priority": "medium", "status": "in_progress" },
+                ],
+            }));
+            let fork_state = sessions.lock(&cx).await.unwrap().get(fork_id).unwrap().clone();
+            let (fork_store, fork_tools) = {
+                let state = fork_state.lock(&cx).await.unwrap();
+                let handle = state.agent_session.as_ref().unwrap();
+                (handle.session_store(), handle.session().agent.shared_tools().snapshot())
+            };
+            assert!(!Arc::ptr_eq(&source_store, &fork_store));
+            let fork_todo = fork_tools.get("todo").unwrap();
+            fork_todo.execute("remove", json!({ "op": "rm", "task": "Keep source task" }), None)
+                .await.unwrap();
+            let source_view = source_todo.execute("view", json!({ "op": "view" }), None)
+                .await.unwrap();
+            assert_eq!(source_view.details.unwrap()["list"]["phases"][0]["tasks"][0]["content"], "Keep source task");
+            fork_store.lock(&cx).await.unwrap().save().await.unwrap();
+
+            let cold_sessions = Arc::new(Mutex::new(HashMap::new()));
+            load(
+                &json!({ "sessionId": fork_id, "cwd": cwd, "mcpServers": [] }),
+                &options, &client, &cold_sessions, &cx, &out, false,
+            ).await.unwrap();
+            let notifications = rx.try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(notifications.len(), 1);
+            assert_eq!(notifications[0]["params"]["sessionId"], fork_id);
+            assert_eq!(notifications[0]["params"]["update"], json!({
+                "sessionUpdate": "plan", "entries": [],
+            }));
+            let restored = cold_sessions.lock(&cx).await.unwrap().get(fork_id).unwrap().clone();
+            let tools = restored.lock(&cx).await.unwrap().agent_session.as_ref().unwrap()
+                .session().agent.shared_tools().snapshot();
+            let view = tools.get("todo").unwrap().execute("restored-view", json!({ "op": "view" }), None)
+                .await.unwrap();
+            assert_eq!(view.details.unwrap()["list"]["phases"][0]["tasks"], json!([]));
+        }));
     }
 
     #[test]

@@ -1401,13 +1401,14 @@ async fn bounded_launch_controls<F: Future>(work: F) -> F::Output {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit() {
+fn launch_prewalk_preserves_native_tasks_without_replaying_the_editor_edit() {
     use clap::Parser as _;
 
     let root = tempfile::tempdir().unwrap();
     let mut server = ProviderFixture::with_replies(
-        vec![200, 503, 200],
+        vec![200, 200, 503, 200],
         vec![
+            Some(("todo", json!({"op":"init", "tasks":["Implement the editor change", "Verify"]}))),
             Some(("write", json!({"path":"prewalk.txt", "content":"one edit"}))),
             None,
             None,
@@ -1424,7 +1425,7 @@ fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit
             "--smol",
             &target,
             "--tools",
-            "read,write",
+            "read,write,todo",
         ])
         .unwrap();
         options.launch = AcpLaunchOptions::from_cli(&cli);
@@ -1450,7 +1451,20 @@ fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit
                 .is_some_and(|text| text.contains("Prewalk switched"))
         }));
         assert_no_private_diagnostics(&updates);
+        let plans = updates
+            .iter()
+            .filter(|update| update["params"]["update"]["sessionUpdate"] == "plan")
+            .collect::<Vec<_>>();
+        assert_eq!(plans.len(), 1, "recovery must not replay task mutations");
+        assert_eq!(plans[0]["params"]["sessionId"], id);
+        assert_eq!(plans[0]["params"]["update"]["entries"], json!([
+            {"content":"Implement the editor change", "priority":"medium", "status":"in_progress"},
+            {"content":"Verify", "priority":"medium", "status":"pending"},
+        ]));
         let saved = reopen(&state).await;
+        let saved_tasks = crate::todo::latest_from_entries(saved.entries_for_current_path());
+        assert_eq!(saved_tasks.current().unwrap().content, "Implement the editor change");
+        assert_eq!(saved_tasks.progress(), (0, 2));
         assert_eq!(saved.header.provider.as_deref(), Some(FALLBACK_PROVIDER));
         assert_eq!(saved.header.model_id.as_deref(), Some(FALLBACK_MODEL));
         assert_eq!(
@@ -1467,7 +1481,7 @@ fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit
                 .iter()
                 .filter(|message| matches!(message, Message::ToolResult(_)))
                 .count(),
-            1,
+            2,
         );
         let observed = observed.lock().unwrap();
         for event_kind in ["start", "end", "switch", "tool"] {
@@ -1482,7 +1496,7 @@ fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit
                         _ => unreachable!(),
                     })
                     .count(),
-                1,
+                if event_kind == "tool" { 2 } else { 1 },
                 "{event_kind}",
             );
         }
@@ -1495,9 +1509,10 @@ fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit
             Some(512),
         );
     }));
-    let requests = server.finish(3);
+    let requests = server.finish(4);
     assert_eq!(requests[0].1["model"], PRIMARY_MODEL);
-    for (_, request) in &requests[1..] {
+    assert_eq!(requests[1].1["model"], PRIMARY_MODEL);
+    for (_, request) in &requests[2..] {
         assert_eq!(request["model"], FALLBACK_MODEL);
         assert_eq!(
             request["messages"]
@@ -1506,7 +1521,7 @@ fn launch_prewalk_continues_on_the_destination_without_replaying_the_editor_edit
                 .iter()
                 .filter(|message| message["role"] == "tool")
                 .count(),
-            1,
+            2,
         );
         assert!(!request.to_string().contains("## Prewalk"));
     }
@@ -1734,13 +1749,14 @@ fn launch_selected_tools_reach_the_live_registry_without_terminal_host_tools() {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert!(names.contains(&"read"));
+        assert!(names.contains(&"todo"));
         assert!(
             context["systemPrompt"]
                 .as_str()
                 .unwrap()
                 .contains("INCLUDED-ACP-SKILLS")
         );
-        for excluded in ["bash", "write", "edit", "ask", "todo", "submit_plan"] {
+        for excluded in ["bash", "write", "edit", "ask", "submit_plan"] {
             assert!(
                 !names.contains(&excluded),
                 "unexpected ACP tool: {excluded}"

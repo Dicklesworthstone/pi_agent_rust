@@ -2316,11 +2316,11 @@ fn build_acp_system_prompt(
 }
 
 /// Apply the host's requested tools or defaults plus trusted settings,
-/// excluding terminal-only tools with no ACP surface. Every call still reaches
+/// excluding approval tools with no ACP surface. Every call still reaches
 /// the editor's permission hook because ACP sessions carry no terminal approval
 /// state.
 fn acp_enabled_tools(cli: &crate::cli::Cli, config: &Config) -> Vec<String> {
-    const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
+    const HOST_COUPLED: [&str; 2] = ["ask", "submit_plan"];
     cli.enabled_tools(config)
         .into_iter()
         .filter(|name| !HOST_COUPLED.contains(name))
@@ -2412,6 +2412,10 @@ fn build_acp_session_with_budget(
     permission_client: Option<&AcpPermissionClient>,
     inherited_budget: Option<crate::cost::CostBudget>,
 ) -> Result<(String, AcpSessionState)> {
+    // ACP exposes both the saved transcript and task state. A bounded V2 tail
+    // may omit the last todo mutation, so restore the backing store before a
+    // newly registered tool can mistake the omitted state for an empty list.
+    session.ensure_full_v2_hydration_before_save()?;
     let session_id = session.header.id.clone();
     let mut auth = options.auth.clone();
     auth.set_command_working_directory(&cwd)?;
@@ -2560,6 +2564,15 @@ fn build_acp_session_with_budget(
             .with_api_key_override(cli.api_key.clone())
             .with_memory_settings(options.config.memory.as_ref());
     agent_session.set_child_fallback_policy(cli.subagent_fallback_policy.clone());
+    if enabled_tools.contains(&"todo") {
+        // The task list belongs to this session's authoritative branch-aware
+        // store. In particular, restored and forked sessions must not retain
+        // a tool bound to another session's state.
+        let todo_session = Arc::clone(&agent_session.session);
+        agent_session.agent.extend_tools(vec![
+            Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>,
+        ]);
+    }
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
     // fallback state; rebuilding a handle per prompt would lose that state.
@@ -3466,17 +3479,19 @@ fn build_acp_event_handler(
     session_id: String,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     move |event: AgentEvent| {
-        let interim_update = match &event {
+        let accepted_update = match &event {
             AgentEvent::ToolExecutionEnd {
                 tool_name,
                 result,
                 is_error,
                 ..
-            } => content::interim_response_update(
-                tool_name,
-                *is_error || result.is_error,
-                result.details.as_ref(),
-            ),
+            } => {
+                let is_error = *is_error || result.is_error;
+                content::interim_response_update(tool_name, is_error, result.details.as_ref())
+                    .or_else(|| {
+                        content::todo_plan_update(tool_name, is_error, result.details.as_ref())
+                    })
+            }
             _ => None,
         };
         let update = match &event {
@@ -3558,10 +3573,11 @@ fn build_acp_event_handler(
             _ => None,
         };
 
-        // Preserve the tool's completion before publishing its accepted reply.
+        // Preserve the tool's completion before publishing its accepted reply
+        // or task plan.
         // A ToolExecutionUpdate may contain the same metadata, but cannot yet
-        // commit assistant prose or end the ongoing agent turn.
-        for update in update.into_iter().chain(interim_update) {
+        // commit assistant prose or task state, or end the ongoing agent turn.
+        for update in update.into_iter().chain(accepted_update) {
             let _ = out_tx.send(json_rpc_notification(
                 "session/update",
                 json!({
@@ -4700,13 +4716,14 @@ mod tests {
             "hashline_edit",
             "ast_grep",
             "web_search",
+            "todo",
         ] {
             assert!(
                 tools.iter().any(|t| t == expected),
                 "{expected} in {tools:?}"
             );
         }
-        for host_only in ["ask", "todo", "submit_plan"] {
+        for host_only in ["ask", "submit_plan"] {
             assert!(
                 !tools.iter().any(|t| t == host_only),
                 "{host_only} in {tools:?}"
@@ -4768,7 +4785,12 @@ mod tests {
             for name in OPTIONAL {
                 assert_eq!(handle.has_tool(name), expected, "{name}");
             }
-            for name in ["ask", "todo", "submit_plan"] {
+            assert_eq!(
+                handle.has_tool("todo"),
+                acp_enabled_tools(&cli, &config).iter().any(|name| name == "todo"),
+                "native task registration follows the selected tools",
+            );
+            for name in ["ask", "submit_plan"] {
                 assert!(!handle.has_tool(name), "ACP host-only tool {name}");
             }
             if no_builtins {

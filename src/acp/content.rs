@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::model::{ContentBlock, ImageContent, MediaContent, TextContent};
+use crate::todo::{TODO_LIST_SCHEMA, TodoList, TodoStatus};
 
 const MAX_PROMPT_BLOCKS: usize = 1024;
 const MAX_PROMPT_BYTES: usize = 32 * 1024 * 1024;
@@ -36,6 +37,68 @@ pub(super) fn interim_response_update(
         "sessionUpdate": "agent_message_chunk",
         "content": { "type": "text", "text": text },
     }))
+}
+
+/// Project only a successful native task-list result, never requested input or
+/// streaming progress. ACP plans replace the client's entire prior plan.
+pub(super) fn todo_plan_update(
+    tool_name: &str,
+    is_error: bool,
+    details: Option<&Value>,
+) -> Option<Value> {
+    if is_error {
+        return None;
+    }
+    let details = details?;
+    let native_todo = tool_name == "todo"
+        || (tool_name == "xdev"
+            && details.get("dispatchedVia").and_then(Value::as_str) == Some("xdev")
+            && details.get("tool").and_then(Value::as_str) == Some("todo"));
+    if !native_todo {
+        return None;
+    }
+    if details.get("schema").and_then(Value::as_str) != Some(TODO_LIST_SCHEMA) {
+        return None;
+    }
+    let list = serde_json::from_value::<TodoList>(details.get("list")?.clone()).ok()?;
+    Some(plan_update(&list))
+}
+
+/// Keep native phase and blocked-state context without inventing ACP statuses.
+/// Dropped tasks leave the plan: ACP has no cancellation state, and marking
+/// abandoned work completed would misrepresent it. The native tool transcript
+/// retains the full list, including dropped tasks.
+pub(super) fn plan_update(list: &TodoList) -> Value {
+    let entries: Vec<Value> = list
+        .phases
+        .iter()
+        .flat_map(|phase| {
+            phase.tasks.iter().filter_map(move |task| {
+                let (status, blocked_reason) = match &task.status {
+                    TodoStatus::Open => ("pending", None),
+                    TodoStatus::InProgress => ("in_progress", None),
+                    TodoStatus::Done => ("completed", None),
+                    TodoStatus::Blocked { reason } => ("pending", Some(reason)),
+                    TodoStatus::Dropped => return None,
+                };
+                let mut content = phase.name.as_ref().map_or_else(
+                    || task.content.clone(),
+                    |name| format!("{name}: {}", task.content),
+                );
+                if let Some(reason) = blocked_reason {
+                    content.push_str(" (blocked: ");
+                    content.push_str(reason);
+                    content.push(')');
+                }
+                Some(json!({
+                    "content": content,
+                    "priority": "medium",
+                    "status": status,
+                }))
+            })
+        })
+        .collect();
+    json!({ "sessionUpdate": "plan", "entries": entries })
 }
 
 struct PromptBudget {
@@ -918,6 +981,133 @@ mod tests {
             details: Some(json!({ "private": "not-display-content" })),
             is_error: false,
         }
+    }
+
+    #[test]
+    fn native_todo_completion_replaces_the_plan_with_ordered_current_tasks() {
+        use crate::agent::AgentEvent;
+
+        let output = crate::tools::ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("Native task list"))],
+            details: Some(json!({
+                "schema": TODO_LIST_SCHEMA,
+                "list": { "phases": [
+                    { "name": "Delivery", "tasks": [
+                        { "content": "Investigate café 🦀", "state": "done" },
+                        { "content": "Implement", "state": "in_progress" },
+                        { "content": "Obsolete approach", "state": "dropped" },
+                    ] },
+                    { "tasks": [
+                        { "content": "Verify", "state": "blocked", "reason": "Waiting for access" },
+                        { "content": "Publish", "state": "open" },
+                    ] },
+                ] },
+                "private": "must-not-leak",
+            })),
+            is_error: false,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let handler = super::super::build_acp_event_handler(
+            super::super::AcpOutput::new(tx),
+            "editor-session".into(),
+        );
+        handler(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "tasks-1".into(),
+            tool_name: "todo".into(),
+            args: json!({ "op": "view" }),
+            partial_result: output.clone(),
+        });
+        handler(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tasks-1".into(),
+            tool_name: "todo".into(),
+            result: output,
+            is_error: false,
+        });
+        // An empty replacement must clear the client's old plan.
+        handler(AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tasks-2".into(),
+            tool_name: "todo".into(),
+            result: crate::tools::ToolOutput {
+                content: Vec::new(),
+                details: Some(json!({
+                    "schema": TODO_LIST_SCHEMA, "list": { "phases": [] },
+                })),
+                is_error: false,
+            },
+            is_error: false,
+        });
+        let lines = rx.try_iter().collect::<Vec<_>>();
+        let updates = lines
+            .iter()
+            .map(|line| {
+                let notification: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(notification["params"]["sessionId"], "editor-session");
+                notification["params"]["update"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 5, "progress must not publish a plan");
+        assert_eq!(updates[0]["status"], "in_progress");
+        assert_eq!(updates[1]["status"], "completed");
+        assert_eq!(updates[2], json!({
+            "sessionUpdate": "plan",
+            "entries": [
+                { "content": "Delivery: Investigate café 🦀", "priority": "medium", "status": "completed" },
+                { "content": "Delivery: Implement", "priority": "medium", "status": "in_progress" },
+                { "content": "Verify (blocked: Waiting for access)", "priority": "medium", "status": "pending" },
+                { "content": "Publish", "priority": "medium", "status": "pending" },
+            ],
+        }));
+        assert_eq!(updates[3]["status"], "completed");
+        assert_eq!(updates[4], json!({ "sessionUpdate": "plan", "entries": [] }));
+        assert!(!lines.join("\n").contains("must-not-leak"));
+    }
+
+    #[test]
+    fn failed_or_malformed_todo_results_do_not_replace_the_plan() {
+        let accepted = json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [] } });
+        for (name, result_error, event_error, details) in [
+            ("read", false, false, Some(accepted.clone())),
+            ("xdev", false, false, Some(accepted.clone())),
+            ("todo", true, false, Some(accepted.clone())),
+            ("todo", false, true, Some(accepted)),
+            ("todo", false, false, None),
+            ("todo", false, false, Some(json!({ "schema": "unknown", "list": { "phases": [] } }))),
+            ("todo", false, false, Some(json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [{}] } }))),
+            ("todo", false, false, Some(json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [{ "tasks": [{ "content": "invalid", "state": "invented" }] }] } }))),
+        ] {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            let handler = super::super::build_acp_event_handler(
+                super::super::AcpOutput::new(tx),
+                "editor-session".into(),
+            );
+            handler(crate::agent::AgentEvent::ToolExecutionEnd {
+                tool_call_id: "tasks".into(),
+                tool_name: name.into(),
+                result: crate::tools::ToolOutput {
+                    content: Vec::new(),
+                    details,
+                    is_error: result_error,
+                },
+                is_error: event_error,
+            });
+            let lines = rx.try_iter().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "{name}, {result_error}, {event_error}");
+            let notification: Value = serde_json::from_str(&lines[0]).unwrap();
+            assert_eq!(notification["params"]["update"]["sessionUpdate"], "tool_call_update");
+        }
+    }
+
+    #[test]
+    fn native_todo_dispatched_through_xdev_updates_the_plan() {
+        let details = json!({
+            "dispatchedVia": "xdev", "tool": "todo", "schema": TODO_LIST_SCHEMA,
+            "list": { "phases": [{ "tasks": [{ "content": "Finish", "state": "done" }] }] },
+        });
+        assert_eq!(todo_plan_update("xdev", false, Some(&details)), Some(json!({
+            "sessionUpdate": "plan", "entries": [
+                { "content": "Finish", "priority": "medium", "status": "completed" },
+            ],
+        })));
     }
 
     #[test]

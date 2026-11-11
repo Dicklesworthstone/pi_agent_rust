@@ -193,7 +193,10 @@ steering, retries, and cancellation keep their normal behavior.
 The launch flags explicitly arm each new session owner. Reattaching an already
 live editor session keeps its current prewalk state. The `prewalk.enabled`
 setting does not implicitly arm ACP sessions, and `--no-prewalk` disables launch
-arming. ACP's built-in tool set does not include `todo`, so an approved successful
-project edit can trigger the handoff without a todo prerequisite.
+arming. ACP includes the native `todo` tool by default, so the agent must record
+its task plan before a successful project edit can trigger the handoff. If
+`todo` is explicitly disabled, the successful edit alone can trigger it. The
+editor receives live task-plan updates and restores the selected branch's plan
+when loading, resuming, or forking a session.
 
 Behavior reference: [OMP v18.14.0 prewalk documentation](https://github.com/can1357/oh-my-pi/blob/v18.14.0/docs/prewalk.md).

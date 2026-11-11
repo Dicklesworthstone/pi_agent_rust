@@ -562,8 +562,10 @@ supplies the credential.
 
 ACP also applies the host's `--tools` and `--no-tools` controls. Disabling
 built-ins removes configured automatic tools as well; separately supplied MCP
-servers retain their existing trust and permission flow. Terminal-only tools
-(`ask`, `todo`, and `submit_plan`) remain unavailable in ACP.
+servers retain their existing trust and permission flow. The native `todo` tool
+publishes task progress through ACP plan notifications and restores the saved
+branch's plan on load, resume, or fork. Terminal-only approval tools (`ask` and
+`submit_plan`) remain unavailable in ACP.
 
 `--system-prompt`, `--append-system-prompt`, `--no-context-files`, and
 `--hide-cwd-in-prompt` apply when each editor session is constructed. An
