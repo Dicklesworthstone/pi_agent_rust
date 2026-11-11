@@ -1,4 +1,4 @@
-//! Borrowed RPC media projection and bounded attachment retrieval.
+//! Borrowed RPC media projection, retrieval and native input reuse.
 //!
 //! Native sessions, providers and extensions keep their complete content.
 //! Only explicitly negotiated RPC serialization replaces admitted image/media
@@ -11,6 +11,8 @@
 //! Registration may temporarily decode one bounded new blob; a chunk read pins
 //! its source while encoding at most MAX_CHUNK_BYTES. Unchanged base64 sources
 //! use a bounded fingerprint cache and are not repeatedly decoded.
+//! Input references resolve against this same catalog, pin their immutable
+//! bytes, and expose their expanded size before allocating native base64.
 
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopDetails, StopReason, Usage, UserContent,
@@ -19,7 +21,8 @@ use crate::session::SessionMessage;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use serde::ser::{SerializeMap, SerializeSeq};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::fmt;
@@ -34,7 +37,7 @@ const MAX_ATTACHMENT_ID_BYTES: usize = 128;
 
 type Fingerprint = [u8; 32];
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum Encoding {
     #[serde(rename = "base64")]
     Standard,
@@ -52,6 +55,68 @@ pub(super) struct AttachmentRef {
     pub digest: String,
     pub size_bytes: usize,
     encoding: Encoding,
+}
+
+/// Borrow strings while validating untrusted input, so an invalid reference
+/// cannot allocate another copy of a large or unexpected JSON field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct InputAttachmentRef<'a> {
+    attachment_id: &'a str,
+    #[serde(rename = "$piBlob")]
+    digest: &'a str,
+    size_bytes: usize,
+    encoding: Encoding,
+}
+
+/// An admitted reference pins its payload independently of later catalog
+/// changes. Callers must charge the expanded size before materializing it.
+pub(super) struct ResolvedAttachment {
+    bytes: Arc<[u8]>,
+    encoding: Encoding,
+}
+
+impl ResolvedAttachment {
+    pub(super) fn encoded_len(&self) -> usize {
+        // Catalog admission bounds each payload to 64 MiB, so both canonical
+        // encodings fit in usize even on 32-bit targets.
+        match self.encoding {
+            Encoding::Standard => self.bytes.len().div_ceil(3) * 4,
+            Encoding::NoPad => {
+                let remainder = self.bytes.len() % 3;
+                self.bytes.len() / 3 * 4 + if remainder == 0 { 0 } else { remainder + 1 }
+            }
+        }
+    }
+
+    pub(super) fn into_base64(self) -> String {
+        match self.encoding {
+            Encoding::Standard => STANDARD.encode(self.bytes.as_ref()),
+            Encoding::NoPad => STANDARD_NO_PAD.encode(self.bytes.as_ref()),
+        }
+    }
+}
+
+impl fmt::Debug for ResolvedAttachment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedAttachment")
+            .field("size_bytes", &self.bytes.len())
+            .field("encoding", &self.encoding)
+            .finish_non_exhaustive()
+    }
+}
+
+fn validate_attachment_id(attachment_id: &str) -> Result<(), AttachmentReadError> {
+    if attachment_id.is_empty()
+        || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES
+        || !attachment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-'))
+    {
+        return Err(AttachmentReadError::InvalidId);
+    }
+    Ok(())
 }
 
 struct StoredBlob {
@@ -210,6 +275,38 @@ impl AttachmentCatalog {
         }
     }
 
+    /// Resolve a complete projected `data` reference for a new native input.
+    /// IDs are scoped to this connection and current session generation;
+    /// neither a bare digest nor a filesystem path grants access. Metadata
+    /// must describe the immutable retained bytes. Both canonical base64
+    /// encodings are valid, including when they deduplicate to the same ID.
+    pub(super) fn resolve_input(
+        &self,
+        value: &Value,
+    ) -> Result<ResolvedAttachment, AttachmentReadError> {
+        if !value.is_object() {
+            return Err(AttachmentReadError::InvalidReference);
+        }
+        let reference = InputAttachmentRef::deserialize(value)
+            .map_err(|_| AttachmentReadError::InvalidReference)?;
+        validate_attachment_id(reference.attachment_id)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AttachmentReadError::Unavailable)?;
+        let blob = state
+            .blobs
+            .get(reference.attachment_id)
+            .ok_or(AttachmentReadError::UnknownId)?;
+        if reference.digest != blob.digest || reference.size_bytes != blob.bytes.len() {
+            return Err(AttachmentReadError::MetadataMismatch);
+        }
+        Ok(ResolvedAttachment {
+            bytes: Arc::clone(&blob.bytes),
+            encoding: reference.encoding,
+        })
+    }
+
     /// Read raw byte offsets from an issued ID, encoding only the bounded
     /// returned chunk. Decode each response before concatenating its bytes.
     pub(super) fn read(
@@ -218,14 +315,7 @@ impl AttachmentCatalog {
         offset: usize,
         max_bytes: usize,
     ) -> Result<AttachmentChunk, AttachmentReadError> {
-        if attachment_id.is_empty()
-            || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES
-            || !attachment_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-'))
-        {
-            return Err(AttachmentReadError::InvalidId);
-        }
+        validate_attachment_id(attachment_id)?;
         if max_bytes == 0 || max_bytes > MAX_CHUNK_BYTES {
             return Err(AttachmentReadError::InvalidLength);
         }
@@ -260,10 +350,14 @@ impl AttachmentCatalog {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum AttachmentReadError {
+    #[error("Invalid RPC attachment reference; expected attachmentId, $piBlob, sizeBytes and encoding")]
+    InvalidReference,
     #[error("Invalid RPC attachment ID")]
     InvalidId,
     #[error("RPC attachment ID is unknown or expired for the active session")]
     UnknownId,
+    #[error("RPC attachment reference metadata does not match the retained payload")]
+    MetadataMismatch,
     #[error("RPC attachment byte offset exceeds the retained payload")]
     InvalidOffset,
     #[error("RPC attachment maxBytes must be between 1 and 1048576")]
@@ -777,6 +871,184 @@ mod tests {
                 .unwrap(),
             b"x"
         );
+    }
+
+    #[test]
+    fn input_references_restore_exact_padding_and_charge_expanded_bytes() {
+        let catalog = AttachmentCatalog::default();
+        for length in 1..=16 {
+            let bytes = vec![0xf7; length];
+            for encoded in [STANDARD.encode(&bytes), STANDARD_NO_PAD.encode(&bytes)] {
+                let reference = catalog.register(&encoded).unwrap();
+                let value = serde_json::to_value(reference).unwrap();
+                let resolved = catalog.resolve_input(&value).unwrap();
+                assert_eq!(resolved.encoded_len(), encoded.len());
+                assert_eq!(resolved.into_base64(), encoded);
+            }
+        }
+
+        let encoded = STANDARD.encode(vec![0x36; 4 * 1024]);
+        let reference = serde_json::to_value(catalog.register(&encoded).unwrap()).unwrap();
+        let resolved = catalog.resolve_input(&reference).unwrap();
+        assert!(serde_json::to_vec(&reference).unwrap().len() < 512);
+        assert!(resolved.encoded_len() > 512);
+        assert_eq!(resolved.encoded_len(), encoded.len());
+        assert_eq!(resolved.into_base64(), encoded);
+    }
+
+    #[test]
+    fn admitted_input_survives_clear_but_old_references_cannot_be_readmitted() {
+        let catalog = AttachmentCatalog::default();
+        let original = "c3RpbGwtb3duZWQ=";
+        let reference = serde_json::to_value(catalog.register(original).unwrap()).unwrap();
+        let admitted = catalog.resolve_input(&reference).unwrap();
+        catalog.clear();
+        assert_eq!(
+            catalog.resolve_input(&reference).unwrap_err(),
+            AttachmentReadError::UnknownId
+        );
+        let replacement = serde_json::to_value(catalog.register(original).unwrap()).unwrap();
+        assert_ne!(reference["attachmentId"], replacement["attachmentId"]);
+        assert_eq!(reference["$piBlob"], replacement["$piBlob"]);
+        assert_eq!(
+            catalog.resolve_input(&reference).unwrap_err(),
+            AttachmentReadError::UnknownId
+        );
+        assert_eq!(admitted.encoded_len(), original.len());
+        assert_eq!(admitted.into_base64(), original);
+        assert_eq!(
+            catalog.resolve_input(&replacement).unwrap().into_base64(),
+            original
+        );
+    }
+
+    #[test]
+    fn input_references_are_scoped_to_the_issuing_connection() {
+        let first = AttachmentCatalog::default();
+        let second = AttachmentCatalog::default();
+        let original = "c2FtZS1ieXRlcw==";
+        let first_ref = serde_json::to_value(first.register(original).unwrap()).unwrap();
+        let second_ref = serde_json::to_value(second.register(original).unwrap()).unwrap();
+        assert_eq!(first_ref["$piBlob"], second_ref["$piBlob"]);
+        assert_ne!(first_ref["attachmentId"], second_ref["attachmentId"]);
+        assert_eq!(
+            first.resolve_input(&second_ref).unwrap_err(),
+            AttachmentReadError::UnknownId
+        );
+        assert_eq!(
+            second.resolve_input(&first_ref).unwrap_err(),
+            AttachmentReadError::UnknownId
+        );
+        assert_eq!(
+            first.clone().resolve_input(&first_ref).unwrap().into_base64(),
+            original
+        );
+    }
+
+    #[test]
+    fn input_reference_metadata_cannot_redirect_or_misdescribe_retained_bytes() {
+        let catalog = AttachmentCatalog::default();
+        let original = serde_json::to_value(catalog.register("eA==").unwrap()).unwrap();
+        let other = catalog.register("eQ==").unwrap();
+        for (field, value) in [
+            ("$piBlob", json!(format!("sha256:{}", "0".repeat(64)))),
+            ("$piBlob", json!("private-payload")),
+            ("sizeBytes", json!(0)),
+            ("sizeBytes", json!(2)),
+            ("attachmentId", json!(other.attachment_id)),
+        ] {
+            let mut reference = original.clone();
+            reference[field] = value;
+            let error = catalog.resolve_input(&reference).unwrap_err();
+            assert_eq!(error, AttachmentReadError::MetadataMismatch, "{field}");
+            assert!(!error.to_string().contains("private-payload"));
+        }
+
+        // Encoding controls only the canonical representation of bytes this
+        // catalog already owns. Padded and unpadded references share one ID.
+        let mut unpadded = original.clone();
+        unpadded["encoding"] = json!("base64NoPad");
+        let resolved = catalog.resolve_input(&unpadded).unwrap();
+        assert_eq!(resolved.encoded_len(), 2);
+        assert_eq!(resolved.into_base64(), "eA");
+        assert_eq!(catalog.resolve_input(&original).unwrap().into_base64(), "eA==");
+    }
+
+    #[test]
+    fn input_reference_requires_the_complete_strict_wire_shape() {
+        let catalog = AttachmentCatalog::default();
+        let original = serde_json::to_value(catalog.register("eA==").unwrap()).unwrap();
+        for missing in ["attachmentId", "$piBlob", "sizeBytes", "encoding"] {
+            let mut reference = original.clone();
+            reference.as_object_mut().unwrap().remove(missing);
+            assert_eq!(
+                catalog.resolve_input(&reference).unwrap_err(),
+                AttachmentReadError::InvalidReference,
+                "{missing}"
+            );
+        }
+        for (field, value) in [
+            ("path", json!("/private-payload")),
+            ("url", json!("https://example.invalid/private-payload")),
+            ("data", json!("eQ==")),
+            ("encoding", json!("utf8")),
+            ("encoding", Value::Null),
+            ("sizeBytes", json!(-1)),
+            ("sizeBytes", json!("1")),
+            ("sizeBytes", json!(1.0)),
+            ("attachmentId", json!(1)),
+            ("$piBlob", Value::Null),
+        ] {
+            let mut reference = original.clone();
+            reference[field] = value;
+            let error = catalog.resolve_input(&reference).unwrap_err();
+            assert_eq!(error, AttachmentReadError::InvalidReference, "{field}");
+            assert!(!error.to_string().contains("private-payload"));
+        }
+        for value in [
+            Value::Null,
+            json!("/private-payload"),
+            json!("sha256:abc"),
+            json!([]),
+            json!([
+                original["attachmentId"],
+                original["$piBlob"],
+                original["sizeBytes"],
+                original["encoding"]
+            ]),
+            json!({}),
+        ] {
+            assert_eq!(
+                catalog.resolve_input(&value).unwrap_err(),
+                AttachmentReadError::InvalidReference
+            );
+        }
+    }
+
+    #[test]
+    fn input_reference_ids_never_resolve_paths_or_bare_digests() {
+        let catalog = AttachmentCatalog::default();
+        let original = serde_json::to_value(catalog.register("eA==").unwrap()).unwrap();
+        for id in [
+            String::new(),
+            "../../private-payload".to_string(),
+            "rpc:\nprivate-payload".to_string(),
+            "a".repeat(MAX_ATTACHMENT_ID_BYTES + 1),
+        ] {
+            let mut reference = original.clone();
+            reference["attachmentId"] = json!(id);
+            let error = catalog.resolve_input(&reference).unwrap_err();
+            assert_eq!(error, AttachmentReadError::InvalidId);
+            assert!(!error.to_string().contains("private-payload"));
+        }
+        for id in [json!("rpc:unknown"), original["$piBlob"].clone()] {
+            let mut reference = original.clone();
+            reference["attachmentId"] = id;
+            assert_eq!(
+                catalog.resolve_input(&reference).unwrap_err(),
+                AttachmentReadError::UnknownId
+            );
+        }
     }
 
     #[test]

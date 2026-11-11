@@ -104,7 +104,9 @@ with a 20 MiB decoded per-image limit. Direct SDK images in `images` also have
 aggregate bounds of 256 native images and 64 MiB of encoded image payloads.
 
 Each media item requires `type: "media"`, an `audio/*` or `video/*` `mimeType`,
-and nonempty canonical standard base64 `data`; padding is optional. `name` is
+and nonempty canonical standard base64 `data`; padding is optional. In an
+exclusive `content` array, image and media `data` may instead be an issued
+attachment reference as described below. `name` is
 an optional source label, sanitized and bounded before entering session state.
 URLs, file paths, and session-local blob references are not accepted as payloads.
 Malformed media is rejected before acknowledgment, queue mutation, or session
@@ -301,8 +303,55 @@ Issued IDs remain readable across output mode changes. They expire after
 a successful `new_session`, `switch_session`, or `fork`, and when the RPC
 connection closes. Failed or cancelled session transitions keep existing IDs
 valid. Retrieval accepts issued IDs, not filesystem paths or bare digests.
-Attachment reference objects are an output format; they are not accepted in
-`prompt`, `steer`, or `follow_up` inputs.
+
+### Reuse an attachment in another input
+
+An exclusive `content` array in `prompt`, `steer`, or `follow_up` can reuse the
+complete `data` reference object returned by this connection. This avoids
+downloading the attachment and sending its base64 back over stdin. For example,
+use the actual reference from a preceding compact history or event response:
+
+```json
+{
+  "id":"reuse-1",
+  "type":"prompt",
+  "content":[
+    {"type":"text","text":"Compare this frame with the earlier recording."},
+    {
+      "type":"image",
+      "mimeType":"image/png",
+      "data":{
+        "attachmentId":"rpc:...",
+        "$piBlob":"sha256:...",
+        "sizeBytes":3,
+        "encoding":"base64"
+      }
+    }
+  ]
+}
+```
+
+Copy all four reference fields unchanged. Unknown fields, unsupported encodings,
+incorrect sizes or digests, expired IDs, and IDs from another connection are
+rejected before prompt acknowledgement or queue mutation. Bare digests,
+filesystem paths, URLs, and persistent session blob references do not grant
+access. References are accepted only in native image/media blocks in `content`;
+the separate `images` and `media` fields still require inline payloads.
+
+Native inline blocks and reference blocks may be freely interleaved. Block
+order, padding, text whitespace, and validated MIME/name metadata are preserved.
+The `content` text remains literal user content, including a leading slash.
+Reference reuse also works after switching output back to `full`, and in
+streaming prompts with `streamingBehavior: "steer"` or `"follow-up"`.
+
+References save transport bytes, not provider context or input capacity. Every
+occurrence counts at its expanded base64 size toward the 64 MiB native-content
+budget, including repeated references to the same blob. The normal image,
+configured media, normalized JSON, and queue limits still apply. The server
+checks the batch's expanded payload budget before constructing base64 copies.
+Accepted inputs carry complete native bytes through queueing, retries, and
+persistence; clearing the catalog later does not alter an already accepted
+input. A new input using an expired reference is refused.
 
 Compact output changes RPC serialization and retrieval. Native session loading,
 provider requests, and extension payloads continue to use their complete
