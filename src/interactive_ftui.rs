@@ -4252,6 +4252,7 @@ impl PiFtuiModel {
             PiMsg::HandoffFinished { .. }
             | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
+            | PiMsg::GoalFinished { .. }
             | PiMsg::BashFinished { .. }
             | PiMsg::FtuiToolProgress(_) => return Cmd::none(),
             PiMsg::AgentError(message)

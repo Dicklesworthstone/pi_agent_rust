@@ -535,6 +535,7 @@ impl PiApp {
 
     pub(super) fn quit_cmd(&mut self) -> Cmd {
         self.retire_login();
+        self.abort_agent();
         if let Some(handle) = self.abort_handle.take() {
             handle.abort();
         }
@@ -628,9 +629,7 @@ impl PiApp {
                 // Note: Copy and Clear both bound to Ctrl+C - Copy takes precedence in lookup
                 // When selection is implemented, Copy should only trigger with active selection
                 if self.agent_state != AgentState::Idle {
-                    if let Some(handle) = &self.abort_handle {
-                        handle.abort();
-                    }
+                    self.abort_agent();
                     self.status_message = Some("Aborting request...".to_string());
                     return None;
                 }

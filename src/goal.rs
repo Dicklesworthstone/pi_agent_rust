@@ -21,7 +21,6 @@ mod continuation;
 mod driver;
 mod reconciliation;
 mod rpc;
-#[cfg(feature = "ftui")]
 pub(crate) mod terminal;
 pub use driver::{GoalControl, GoalDecision, GoalRun, GoalRunReport, GoalRunStop, GoalSession};
 pub use reconciliation::GoalReconciliation;

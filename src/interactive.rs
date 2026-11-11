@@ -160,7 +160,8 @@ pub use self::state::{AgentState, InputMode, PendingInput};
 pub(crate) use self::state::AutocompleteState;
 use self::state::{
     BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, ExtensionCustomOverlay,
-    HistoryList, InjectedMessageQueue, InteractiveMessageQueue, LoginAttempt, LoginAttemptControl,
+    GoalCancellation, GoalInvocation, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
+    LoginAttempt, LoginAttemptControl,
     PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
     SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
     ToolProgress, format_count,
@@ -2281,6 +2282,14 @@ pub enum PiMsg {
         request_id: String,
         message: String,
     },
+    /// A classic goal releases foreground admission only after all native
+    /// prompts, journal persistence and its final report have settled.
+    GoalFinished {
+        request_id: String,
+        owner_session_id: String,
+        message: String,
+        pending: Vec<crate::session_control::PendingInput>,
+    },
     /// Only the matching operator request can end an MCP authentication wait.
     McpAuthFinished { request_id: String, message: String },
     /// A terminal handoff reply can settle only the request that admitted it.
@@ -3108,6 +3117,7 @@ pub struct PiApp {
     agent: Arc<Mutex<InteractiveAgent>>,
     save_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    goal_invocation: Option<GoalInvocation>,
     review_request_id: Option<String>,
     handoff_request_id: Option<String>,
     mcp_auth_request_id: Option<String>,
@@ -3648,6 +3658,7 @@ impl PiApp {
             status_message: None,
             save_enabled,
             abort_handle: None,
+            goal_invocation: None,
             review_request_id: None,
             handoff_request_id: None,
             mcp_auth_request_id: None,

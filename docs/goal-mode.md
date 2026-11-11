@@ -4,7 +4,7 @@
 [Command table](#goal-commands) · [SDK reference](#sdk-and-protocol-reference)
 
 A goal keeps an objective and a prompt/token budget in your session. Use
-`/goal` in a supported FrankenTUI build to inspect it, run bounded goal prompts,
+`/goal` in either current terminal interface to inspect it, run bounded goal prompts,
 pause, and record completion after reviewing the results.
 
 ## Availability
@@ -18,8 +18,8 @@ describe that release; this page describes current `main`.
 | Build and interface | Can I use `/goal`? | What to do |
 | --- | --- | --- |
 | Current `main`, default FrankenTUI (`pi`, `pi --ftui`, or `pi --inline`) | Yes | Enter `/goal status` in Pi's message editor while idle |
-| Current `main`, classic terminal (`pi --classic`) | No goal execution | Use the FrankenTUI interface |
-| Build without the `ftui` feature | No | Use a build that includes FrankenTUI and the goal feature |
+| Current `main`, classic terminal (`pi --classic`) | Yes | Enter `/goal status` while idle |
+| Current `main` built without the `ftui` feature | Yes | Use `/goal` in the classic terminal |
 | Published `v0.8.0` or `v0.7.1`, either terminal | No | Use the matching release docs; these releases predate the command |
 
 If you cannot find the command, run `pi --version` in your shell and retain the
@@ -34,7 +34,7 @@ described in the [reference below](#sdk-and-protocol-reference).
 
 ## Terminal quick start
 
-1. Start a supported FrankenTUI build in your project and enter:
+1. Start a current build in your project and enter:
 
    ```text
    /goal status
@@ -71,6 +71,12 @@ While a goal is running, the default Esc interrupt binding requests a pause.
 Wait for the result and review the returned state before continuing. If a modal
 prompt is open, its own keyboard controls take precedence.
 
+In the classic terminal, Ctrl+C also requests a pause. While goal work is active,
+new prompts and slash commands retain your draft and wait for the result; exit
+still cancels the invocation. A prompt finishing inside a multi-prompt run does
+not release the foreground session. The final report appears after the goal's
+session changes have settled, and any further run requires a fresh command.
+
 ## Goal commands
 
 Use these commands while idle. Replace `<review>` with the receipt from your
@@ -100,7 +106,7 @@ allowance; the detailed accounting rules are in the reference below.
 
 ### Default terminal: inspect and control a saved objective
 
-In the default FrankenTUI, run `/goal` or `/goal status` while idle. It displays
+In either terminal, run `/goal` or `/goal status` while idle. It displays
 the current branch's objective, state, prompt/token accounting, interruption
 status and a `Review: g1-...` revision receipt. No goal is also a reviewable
 state, so creation cannot be silently redirected to another queued session.

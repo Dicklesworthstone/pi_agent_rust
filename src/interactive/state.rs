@@ -170,6 +170,77 @@ pub enum AgentState {
     ToolRunning,
 }
 
+/// The classic editor owns the whole goal invocation, including the gaps
+/// between its native prompts. A pause requested before publication must
+/// still reach the eventual driver before that driver is first polled.
+#[derive(Clone, Default)]
+pub(super) struct GoalCancellation {
+    state: std::sync::Arc<std::sync::Mutex<GoalCancellationState>>,
+}
+
+#[derive(Default)]
+struct GoalCancellationState {
+    control: Option<crate::goal::GoalControl>,
+    paused: bool,
+}
+
+impl GoalCancellation {
+    pub(super) fn is_paused(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paused
+    }
+
+    pub(super) fn publish(&self, control: crate::goal::GoalControl) {
+        let pause = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pause = state.paused || state.control.is_some();
+            if state.control.is_none() {
+                state.control = Some(control.clone());
+            }
+            pause
+        };
+        if pause {
+            control.pause();
+        }
+    }
+
+    pub(super) fn pause(&self) {
+        let control = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.paused = true;
+            state.control.clone()
+        };
+        // Native abort can wake an event listener. Never hold the UI's
+        // control mutex while invoking it.
+        if let Some(control) = control {
+            control.pause();
+        }
+    }
+}
+
+pub(super) struct GoalInvocation {
+    pub(super) id: String,
+    pub(super) owner_session_id: String,
+    pub(super) cancellation: GoalCancellation,
+}
+
+impl Drop for GoalInvocation {
+    fn drop(&mut self) {
+        // A closed terminal cannot leave an autonomous goal running. Only
+        // this UI owner has Drop semantics; task-side cancellation clones do
+        // not pause a still-live invocation merely by going out of scope.
+        self.cancellation.pause();
+    }
+}
+
 /// Input mode for the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {

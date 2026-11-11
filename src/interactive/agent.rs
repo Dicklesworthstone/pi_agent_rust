@@ -80,6 +80,7 @@ struct UiStreamDeltaBatcher {
     /// a second `AgentError` block for the same failure.
     turn_error_surfaced: bool,
     retry_attempts: Option<(u32, u32)>,
+    delivery_failed: bool,
 }
 
 impl UiStreamDeltaBatcher {
@@ -105,6 +106,7 @@ impl UiStreamDeltaBatcher {
             pending_tool_update_events: 0,
             turn_error_surfaced: false,
             retry_attempts: None,
+            delivery_failed: false,
             last_tool_update_flush: now,
         }
     }
@@ -231,6 +233,7 @@ impl UiStreamDeltaBatcher {
                             self.pending.push_front(msg);
                         }
                         mpsc::SendError::Disconnected(_) | mpsc::SendError::Cancelled(_) => {
+                            self.delivery_failed = true;
                             self.pending.clear();
                             self.pending_bytes = 0;
                         }
@@ -821,6 +824,73 @@ async fn flush_ui_stream_batcher_with_backpressure(batcher: &StdMutex<UiStreamDe
     }
 }
 
+/// A scoped listener for every prompt in one classic goal. Closing it under
+/// the batcher's lock also fences callbacks already cloned by the SDK, so no
+/// old output can arrive after the final report releases foreground admission.
+struct GoalObservation {
+    listeners: crate::sdk::EventListeners,
+    subscription: crate::sdk::SubscriptionId,
+    batcher: Arc<StdMutex<UiStreamDeltaBatcher>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl GoalObservation {
+    fn attach(
+        listeners: &crate::sdk::EventListeners,
+        batcher: Arc<StdMutex<UiStreamDeltaBatcher>>,
+        cancellation: GoalCancellation,
+        compacting: Arc<AtomicBool>,
+    ) -> Self {
+        let closed = Arc::new(AtomicBool::new(false));
+        let callback_closed = Arc::clone(&closed);
+        let output = Arc::clone(&batcher);
+        let subscription = listeners.subscribe(Arc::new(move |event| {
+            let delivery_failed = {
+                let mut output = output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if callback_closed.load(Ordering::Acquire) {
+                    return;
+                }
+                match &event {
+                    AgentEvent::AutoCompactionStart { .. } => {
+                        compacting.store(true, Ordering::SeqCst);
+                    }
+                    AgentEvent::AutoCompactionEnd { .. } => {
+                        compacting.store(false, Ordering::SeqCst);
+                    }
+                    AgentEvent::AgentStart { .. } => output.retry_attempts = None,
+                    _ => {}
+                }
+                dispatch_agent_event_to_ui(&event, &mut output);
+                output.delivery_failed
+            };
+            if delivery_failed {
+                cancellation.pause();
+            }
+        }));
+        Self {
+            listeners: listeners.clone(),
+            subscription,
+            batcher,
+            closed,
+        }
+    }
+}
+
+impl Drop for GoalObservation {
+    fn drop(&mut self) {
+        {
+            let _output = self
+                .batcher
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.closed.store(true, Ordering::Release);
+        }
+        self.listeners.unsubscribe(self.subscription);
+    }
+}
+
 enum SessionEventOwnership {
     Current,
     Stale,
@@ -922,6 +992,39 @@ impl PiApp {
             return self
                 .handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
         }
+        if let PiMsg::GoalFinished {
+            request_id,
+            owner_session_id,
+            message,
+            pending,
+        } = msg
+        {
+            if !self.goal_invocation.as_ref().is_some_and(|goal| {
+                goal.id == request_id && goal.owner_session_id == owner_session_id
+            }) || self.displayed_session_id.as_deref() != Some(owner_session_id.as_str())
+            {
+                return None;
+            }
+            self.goal_invocation = None;
+            self.status_message = None;
+            // A goal's final report is a review boundary. Returned native
+            // payloads keep their captured blocks and cannot start more work.
+            self.pending_inputs_paused_by_time_cap = true;
+            for input in pending {
+                let content = match input.content {
+                    UserContent::Text(text) => vec![ContentBlock::Text(TextContent::new(text))],
+                    UserContent::Blocks(content) => content,
+                };
+                self.pending_inputs
+                    .push_back(PendingInput::ContentWithKeywordSource {
+                        content,
+                        keyword_scan_source: input.text,
+                    });
+            }
+            self.vcs_info = super::read_vcs_info(&self.cwd);
+            return self
+                .handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
+        }
         let (msg, handoff_completion) = match msg {
             PiMsg::HandoffFinished { request_id, event } => {
                 if self.handoff_request_id.as_deref() != Some(request_id.as_str()) {
@@ -934,14 +1037,24 @@ impl PiApp {
         if handoff_completion.is_some() && !matches!(&msg, PiMsg::ConversationReset { .. }) {
             self.finish_handoff_ui();
         }
+        // These unscoped completions may have been queued by an older
+        // operation. Session replacement already requires the agent owner,
+        // which the goal holds; a late display reset must not bypass it.
+        if self.goal_invocation.is_some()
+            && matches!(&msg, PiMsg::ConversationReset { .. } | PiMsg::BashResult { .. })
+        {
+            return None;
+        }
         match msg {
             PiMsg::HandoffFinished { .. }
             | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
+            | PiMsg::GoalFinished { .. }
             | PiMsg::BashFinished { .. } => return None,
             PiMsg::System(message) | PiMsg::AgentError(message)
                 if self.handoff_request_id.is_some()
                     || self.mcp_auth_request_id.is_some()
+                    || self.goal_invocation.is_some()
                     || self.bash_running
                     || self.login_attempt.is_some() =>
             {
@@ -1222,6 +1335,7 @@ impl PiApp {
 
                 if self.handoff_request_id.is_some()
                     || self.mcp_auth_request_id.is_some()
+                    || self.goal_invocation.is_some()
                     || self.bash_running
                 {
                     // A delayed terminal from an earlier turn may finalize its
@@ -1240,6 +1354,16 @@ impl PiApp {
                             message,
                             None,
                         ));
+                    }
+                    if self.goal_invocation.is_some() {
+                        // Each bounded goal prompt can finish independently;
+                        // only GoalFinished releases the whole invocation.
+                        self.agent_state = AgentState::Processing;
+                        self.current_tool = None;
+                        self.current_tool_id = None;
+                        self.current_tool_summary.clear();
+                        self.extension_compacting.store(false, Ordering::SeqCst);
+                        self.invalidate_input_cards_for_turn_end();
                     }
                     self.refresh_conversation_viewport(follow_tail);
                     return None;
@@ -3369,6 +3493,12 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     pub(super) fn queue_input(&mut self, kind: QueuedMessageKind) {
+        if self.goal_invocation.is_some() {
+            self.status_message = Some(
+                "Goal work is active; Escape pauses it. Your draft has been retained".to_string(),
+            );
+            return;
+        }
         let raw_text = self.input.value();
         let trimmed = raw_text.trim();
         if trimmed.is_empty() {
@@ -3558,10 +3688,108 @@ After approving access in the browser, press Enter in Pi to complete login."
         all.len()
     }
 
-    fn abort_agent(&self) {
+    pub(super) fn abort_agent(&self) {
+        if let Some(goal) = &self.goal_invocation {
+            goal.cancellation.pause();
+        }
         if let Some(handle) = &self.abort_handle {
             handle.abort();
         }
+    }
+
+    /// Use the same receipt-checked lifecycle and bounded driver as FrankenTUI.
+    /// Hold the session's agent owner until persistence and event delivery have
+    /// settled; an intermediate prompt end must not admit another operation.
+    #[allow(
+        clippy::significant_drop_in_scrutinee,
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines
+    )]
+    pub(super) fn handle_slash_goal(&mut self, args: &str) -> Option<Cmd> {
+        if let Some(reason) = self.session_transition_blocker() {
+            self.status_message = Some(reason.replace("changing sessions", "using /goal"));
+            return None;
+        }
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        if cx.is_cancel_requested() {
+            self.status_message = Some("Cancelled: no goal operation was started".to_string());
+            return None;
+        }
+        let Ok(mut agent) = OwnedMutexGuard::try_lock(Arc::clone(&self.agent)) else {
+            self.status_message = Some("Session busy; retry /goal when idle".to_string());
+            return None;
+        };
+        let owner_session_id = match self.session.try_lock() {
+            Ok(session) => session.header.id.clone(),
+            Err(_) => {
+                self.status_message = Some("Session busy; retry /goal when idle".to_string());
+                return None;
+            }
+        };
+        if self.displayed_session_id.as_deref() != Some(owner_session_id.as_str()) {
+            self.status_message = Some("Session display is catching up; retry /goal when idle".into());
+            return None;
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let cancellation = GoalCancellation::default();
+        self.goal_invocation = Some(GoalInvocation {
+            id: request_id.clone(),
+            owner_session_id: owner_session_id.clone(),
+            cancellation: cancellation.clone(),
+        });
+        self.pending_inputs_paused_by_time_cap = true;
+        self.review_request_id = None;
+        self.agent_state = AgentState::Processing;
+        self.extension_streaming.store(true, Ordering::SeqCst);
+        self.status_message = Some("Goal operation in progress; Escape pauses execution".to_string());
+        let batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
+            self.event_tx.clone(),
+            Arc::clone(&self.tui_pressure_frame_p99_us),
+        )));
+        let observation = GoalObservation::attach(
+            agent.handle.listeners(),
+            Arc::clone(&batcher),
+            cancellation.clone(),
+            Arc::clone(&self.extension_compacting),
+        );
+        let args = args.to_string();
+        let event_tx = self.event_tx.clone();
+        if let Err(error) = self.runtime_handle.try_spawn_with_cx(move |_task_cx| async move {
+            let mut pending = Vec::new();
+            let result = if cancellation.is_paused() {
+                Ok("Goal operation cancelled before it started".to_string())
+            } else {
+                Box::pin(crate::goal::terminal::run_with_control_and_pending(
+                    &mut agent.handle,
+                    &args,
+                    move |control| cancellation.publish(control),
+                    |inputs| pending = inputs,
+                ))
+                .await
+            };
+            drop(observation);
+            drop(agent);
+            flush_ui_stream_batcher_with_backpressure(&batcher).await;
+            let message = result.unwrap_or_else(|error| format!("Goal operation failed: {error}"));
+            enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::GoalFinished {
+                    request_id,
+                    owner_session_id,
+                    message,
+                    pending,
+                },
+            )
+            .await;
+        }) {
+            self.goal_invocation = None;
+            self.agent_state = AgentState::Idle;
+            self.extension_streaming.store(false, Ordering::SeqCst);
+            self.status_message = Some(format!("Could not start goal operation: {error}"));
+        }
+        self.scroll_to_bottom();
+        None
     }
 
     fn submit_continue(&mut self) -> Option<Cmd> {
@@ -3822,6 +4050,15 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
         if self.handle_ask_ui_input(message) {
+            return None;
+        }
+
+        if self.goal_invocation.is_some()
+            && !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _)))
+        {
+            self.status_message = Some(
+                "Goal work is active; Escape pauses it. Your draft has been retained".to_string(),
+            );
             return None;
         }
 
@@ -6657,6 +6894,274 @@ mod stream_delta_batcher_tests {
         batcher.flush(true);
         let second = rx.try_recv().expect("expected retained agent_done event");
         assert!(matches!(second, PiMsg::AgentDone { .. }));
+    }
+
+    fn classic_goal_command(
+        app: &mut PiApp,
+        receiver: &mut mpsc::Receiver<PiMsg>,
+        args: &str,
+    ) -> String {
+        let _ = app.submit_message(&format!("/goal {args}"));
+        assert!(app.goal_invocation.is_some(), "goal command was not admitted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    let report = match &event {
+                        PiMsg::GoalFinished { message, .. } => Some(message.clone()),
+                        _ => None,
+                    };
+                    let _ = app.handle_pi_message(event);
+                    if let Some(report) = report {
+                        assert!(app.agent.try_lock().is_ok(), "goal owner must be released");
+                        assert!(app.goal_invocation.is_none());
+                        assert_eq!(app.agent_state, AgentState::Idle);
+                        return report;
+                    }
+                    assert_eq!(
+                        app.agent_state,
+                        AgentState::Processing,
+                        "an intermediate goal event released foreground admission"
+                    );
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        panic!("classic goal did not finish: {:?}", app.status_message);
+    }
+
+    fn classic_goal_review(report: &str) -> &str {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix("Review: "))
+            .expect("goal report must retain its review receipt")
+    }
+
+    #[test]
+    fn classic_goal_lifecycle_runs_natively_and_rejects_stale_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("classic-goal.jsonl");
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) = build_test_app_with_session_configuration(
+            Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }),
+            retry_config(0, 1),
+            None,
+            |session| {
+                let mut stored = session.session.try_lock().unwrap();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(directory.path().to_path_buf());
+            },
+        );
+        let initial = classic_goal_command(&mut app, &mut receiver, "status");
+        assert!(initial.contains("No goal on the current session branch"));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        let initial_review = classic_goal_review(&initial);
+        let created = classic_goal_command(
+            &mut app,
+            &mut receiver,
+            &format!(
+                "create {initial_review} --tokens 100000 --prompts 4 -- inspect this branch"
+            ),
+        );
+        assert!(created.contains("Goal journal saved"), "{created}");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        let rejected = classic_goal_command(
+            &mut app,
+            &mut receiver,
+            &format!("run {initial_review} --steps 2"),
+        );
+        assert!(rejected.contains("GOAL_STALE"), "{rejected}");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .handle
+                .current_goal()
+                .unwrap()
+                .unwrap()
+                .prompts_started(),
+            0
+        );
+
+        let report = classic_goal_command(
+            &mut app,
+            &mut receiver,
+            &format!("run {} --steps 2", classic_goal_review(&created)),
+        );
+        assert!(report.contains("Goal run stopped: Paused"), "{report}");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        let goal = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .handle
+            .current_goal()
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status(), crate::goal::GoalStatus::Paused);
+        assert_eq!(goal.prompts_started(), 1);
+        assert!(!goal.interrupted());
+        assert!(app.pending_inputs_paused_by_time_cap);
+        let reopened = runtime()
+            .block_on(Session::open(path.to_str().unwrap()))
+            .unwrap();
+        let live = app.session.try_lock().unwrap();
+        assert_eq!(reopened.header.id, live.header.id);
+        assert_eq!(
+            serde_json::to_value(&reopened.entries).unwrap(),
+            serde_json::to_value(&live.entries).unwrap(),
+            "the final report must follow durable goal and native transcript persistence"
+        );
+    }
+
+    #[test]
+    fn classic_goal_keeps_foreground_ownership_and_the_authored_draft() {
+        let mut app = build_test_app();
+        let owner = app.session.try_lock().unwrap().header.id.clone();
+        app.goal_invocation = Some(GoalInvocation {
+            id: "running-goal".into(),
+            owner_session_id: owner.clone(),
+            cancellation: GoalCancellation::default(),
+        });
+        app.agent_state = AgentState::Processing;
+        app.extension_streaming.store(true, Ordering::SeqCst);
+        app.input.set_value("Retained draft @recording.webm");
+        let history_before = app.history.entries().len();
+        app.queue_input(QueuedMessageKind::Steering);
+        app.queue_input(QueuedMessageKind::FollowUp);
+        let _ = app.submit_message("do not start another provider turn");
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+        assert_eq!(app.input.value(), "Retained draft @recording.webm");
+        assert_eq!(app.history.entries().len(), history_before);
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        assert!(app.pending_inputs.is_empty());
+        app.current_response = "Settled bounded prompt output".into();
+        for event in [
+            PiMsg::AgentDone {
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+            },
+            PiMsg::System("unrelated background notice".into()),
+            PiMsg::AgentError("unrelated background error".into()),
+            PiMsg::AgentTimeCap {
+                usage: None,
+                message: "bounded prompt reached its cap".into(),
+            },
+            PiMsg::ConversationReset {
+                session_id: owner.clone(),
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("delayed reset from an earlier operation".into()),
+            },
+            PiMsg::GoalFinished {
+                request_id: "earlier-goal".into(),
+                owner_session_id: owner.clone(),
+                message: "stale goal report".into(),
+                pending: Vec::new(),
+            },
+        ] {
+            let _ = app.handle_pi_message(event);
+            assert_eq!(app.agent_state, AgentState::Processing);
+            assert!(app.goal_invocation.is_some());
+            assert!(app.extension_streaming.load(Ordering::SeqCst));
+            assert_eq!(app.input.value(), "Retained draft @recording.webm");
+        }
+        assert!(app.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content == "Settled bounded prompt output"
+        }));
+        assert!(app.messages.iter().all(|message| message.content != "stale goal report"));
+        let _ = app.handle_pi_message(PiMsg::GoalFinished {
+            request_id: "running-goal".into(),
+            owner_session_id: owner,
+            message: "Goal paused after saving its journal".into(),
+            pending: Vec::new(),
+        });
+        assert!(app.goal_invocation.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(!app.extension_streaming.load(Ordering::SeqCst));
+        assert!(app.pending_inputs_paused_by_time_cap);
+        assert_eq!(app.input.value(), "Retained draft @recording.webm");
+    }
+
+    #[test]
+    fn classic_goal_refuses_admission_while_the_displayed_session_lags() {
+        let mut app = build_test_app();
+        let original_messages = app.messages.len();
+        app.displayed_session_id = Some("previous-session".into());
+        let _ = app.submit_message("/goal status");
+        assert!(app.goal_invocation.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert_eq!(app.messages.len(), original_messages);
+        assert!(app.agent.try_lock().is_ok());
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn classic_goal_pause_and_ui_drop_latch_before_control_publication() {
+        for drop_ui in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = Arc::new(ContinueProbeState::default());
+            let (mut app, mut receiver) = build_test_app_with_session_configuration(
+                Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&state),
+                }),
+                retry_config(0, 1),
+                None,
+                |session| {
+                    let mut stored = session.session.try_lock().unwrap();
+                    stored.path = Some(directory.path().join("paused-goal.jsonl"));
+                    stored.session_dir = Some(directory.path().to_path_buf());
+                },
+            );
+            let initial = classic_goal_command(&mut app, &mut receiver, "status");
+            let created = classic_goal_command(
+                &mut app,
+                &mut receiver,
+                &format!(
+                    "create {} -- inspect this branch",
+                    classic_goal_review(&initial)
+                ),
+            );
+            let owner = app.session.try_lock().unwrap().header.id.clone();
+            let cancellation = GoalCancellation::default();
+            app.goal_invocation = Some(GoalInvocation {
+                id: "not-yet-published".into(),
+                owner_session_id: owner,
+                cancellation: cancellation.clone(),
+            });
+            app.agent_state = AgentState::Processing;
+            let agent = Arc::clone(&app.agent);
+            let mut app = Some(app);
+            if drop_ui {
+                drop(app.take());
+            } else {
+                app.as_ref().unwrap().abort_agent();
+            }
+            let report = runtime().block_on(Box::pin(async {
+                let mut agent = OwnedMutexGuard::try_lock(agent).unwrap();
+                let report = crate::goal::terminal::run_with_control(
+                    &mut agent.handle,
+                    &format!("step {}", classic_goal_review(&created)),
+                    move |control| cancellation.publish(control),
+                )
+                .await
+                .unwrap();
+                let goal = agent.handle.current_goal().unwrap().unwrap();
+                assert_eq!(goal.prompts_started(), 0);
+                // Pausing before an attempt starts leaves the journal unchanged.
+                assert_eq!(goal.status(), crate::goal::GoalStatus::Active);
+                assert!(!goal.interrupted());
+                report
+            }));
+            assert!(report.contains("Goal step stopped: Paused"), "{report}");
+            assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(app.is_none(), drop_ui);
+        }
     }
 
     #[test]

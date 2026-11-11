@@ -423,7 +423,7 @@ impl SlashCommand {
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
   /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
-  /goal              - Show goal-mode guidance (FrankenTUI only; unavailable in classic)
+  /goal              - Review goals, manage budgets, and run bounded goal work
   /prewalk [into]    - Arm a model handoff; restart [from] [into], status, off
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
   /handoff [focus]   - Compact context into a continuation brief in this session
@@ -2184,6 +2184,12 @@ impl PiApp {
     /// Handle a slash command.
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_command(&mut self, cmd: SlashCommand, args: &str) -> Option<Cmd> {
+        if self.goal_invocation.is_some() && cmd != SlashCommand::Exit {
+            self.status_message = Some(
+                "Goal work is active; Escape pauses it. Your draft has been retained".to_string(),
+            );
+            return None;
+        }
         self.retire_login();
         // Clear input
         self.input.reset();
@@ -2199,26 +2205,7 @@ impl PiApp {
                 self.scroll_to_last_match("Available commands:");
                 None
             }
-            SlashCommand::Goal => {
-                let guidance = if cfg!(feature = "ftui") {
-                    "Goal mode is unavailable in the classic interface. Quit and start \
-                     `pi --ftui`, then enter `/goal status`."
-                } else {
-                    "Goal mode requires FrankenTUI. This binary was built without \
-                     FrankenTUI; use a Pi build that includes it."
-                };
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: format!(
-                        "{guidance}\nGuide: https://github.com/Dicklesworthstone/\
-                         pi_agent_rust/blob/main/docs/goal-mode.md"
-                    ),
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-                None
-            }
+            SlashCommand::Goal => self.handle_slash_goal(args),
             SlashCommand::Login => self.handle_slash_login(args),
             SlashCommand::Logout => self.handle_slash_logout(args),
             SlashCommand::Clear => {
@@ -7278,39 +7265,20 @@ mod tests {
     }
 
     #[test]
-    fn classic_goal_explains_its_interface_without_starting_agent_work() {
-        let temp = TempDir::new().expect("tempdir");
-        let session = Arc::new(Mutex::new(Session::in_memory()));
-        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
-        app.save_enabled = false;
-        let entries_before = session.try_lock().expect("session").entries.len();
-
-        assert!(app.submit_message("/GoAl status").is_none());
-        assert_eq!(app.agent_state, AgentState::Idle);
+    fn classic_goal_is_discoverable_without_claiming_extension_prefixes() {
         assert_eq!(
-            session.try_lock().expect("session").entries.len(),
-            entries_before,
-            "classic /goal only displays guidance"
+            SlashCommand::parse("/GoAl status"),
+            Some((SlashCommand::Goal, "status"))
         );
-        let message = &app.messages.last().expect("goal guidance").content;
-        assert!(message.contains("FrankenTUI"));
-        assert!(message.contains("docs/goal-mode.md"));
-        if cfg!(feature = "ftui") {
-            assert!(message.contains("pi --ftui"));
-            assert!(message.contains("/goal status"));
-        } else {
-            assert!(message.contains("built without"));
-        }
-
         let help_line = SlashCommand::help_text()
             .lines()
             .find(|line| line.trim_start().starts_with("/goal"))
             .expect("/goal is discoverable in classic help");
-        assert!(help_line.contains("unavailable in classic"));
+        assert!(help_line.contains("bounded goal work"));
         assert_eq!(
             parse_extension_command("/goalkeeper status"),
             Some(("goalkeeper".to_string(), "status")),
-            "the guidance command must not claim extension prefixes"
+            "the goal command must not claim extension prefixes"
         );
     }
 
