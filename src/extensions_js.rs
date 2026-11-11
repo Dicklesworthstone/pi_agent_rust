@@ -5615,30 +5615,31 @@ fn resolve_extension_root_for_base<'a>(base: &str, roots: &'a [PathBuf]) -> Opti
         .max_by_key(|root| root.components().count())
 }
 
-fn is_proxy_blocklisted_package(spec: &str) -> bool {
-    if spec.starts_with("node:") {
-        return true;
-    }
+// Shared by the ESM resolver and node:module.createRequire. Missing system
+// modules must fail so callers can select a real implementation or report the
+// unsupported operation; a callable proxy would silently fabricate success.
+const PROXY_BLOCKLISTED_PACKAGE_ROOTS: &[&str] = &[
+    "fs",
+    "path",
+    "child_process",
+    "net",
+    "http",
+    "https",
+    "crypto",
+    "tls",
+    "dgram",
+    "dns",
+    "vm",
+    "worker_threads",
+    "cluster",
+    "module",
+    "os",
+    "process",
+];
 
-    let top = spec.split('/').next().unwrap_or(spec);
-    matches!(
-        top,
-        "fs" | "path"
-            | "child_process"
-            | "net"
-            | "http"
-            | "https"
-            | "crypto"
-            | "tls"
-            | "dgram"
-            | "dns"
-            | "vm"
-            | "worker_threads"
-            | "cluster"
-            | "module"
-            | "os"
-            | "process"
-    )
+fn is_proxy_blocklisted_package(spec: &str) -> bool {
+    spec.starts_with("node:")
+        || PROXY_BLOCKLISTED_PACKAGE_ROOTS.contains(&spec.split('/').next().unwrap_or(spec))
 }
 
 fn is_proxy_allowlisted_package(spec: &str) -> bool {
@@ -12728,6 +12729,18 @@ const __builtinModules = {
 };
 
 const __missingRequireCache = Object.create(null);
+// Populated from the Rust resolver's denylist when this module is assembled.
+const __proxyBlocklistedPackageRoots = new Set("__PIJS_PROXY_BLOCKLISTED_PACKAGE_ROOTS__".split(","));
+
+function __isProxyBlocklistedRequire(spec) {
+  return spec.startsWith("node:") || __proxyBlocklistedPackageRoots.has(spec.split("/")[0]);
+}
+
+function __missingRequireError(spec) {
+  const error = new Error(`Cannot find module '${spec}' in PiJS require()`);
+  error.code = "MODULE_NOT_FOUND";
+  return error;
+}
 
 function __isBarePackageSpecifier(spec) {
   return (
@@ -12779,27 +12792,33 @@ function __makeMissingRequireStub(spec) {
 
 export function createRequire(_path) {
   function require(id) {
-    const normalized = __normalizeBuiltin(id);
-    const builtIn = __builtinModules[normalized];
-    if (builtIn) {
+    const raw = String(id ?? "");
+    const normalized = __normalizeBuiltin(raw);
+    if (Object.prototype.hasOwnProperty.call(__builtinModules, normalized)) {
+      const builtIn = __builtinModules[normalized];
       if (normalized === "bun:sqlite") return builtIn;
       if (builtIn && Object.prototype.hasOwnProperty.call(builtIn, "default") && builtIn.default !== undefined) {
         return builtIn.default;
       }
       return builtIn;
     }
-    const raw = String(id ?? "");
-    if (raw.startsWith("node:") || __isBarePackageSpecifier(raw)) {
+    if (!__isProxyBlocklistedRequire(raw) && __isBarePackageSpecifier(raw)) {
       return __makeMissingRequireStub(raw);
     }
-    throw new Error(`Cannot find module '${raw}' in PiJS require()`);
+    throw __missingRequireError(raw);
   }
   require.resolve = function resolve(id) {
+    const raw = String(id ?? "unknown");
+    if (!Object.prototype.hasOwnProperty.call(__builtinModules, __normalizeBuiltin(raw)) &&
+        __isProxyBlocklistedRequire(raw)) {
+      throw __missingRequireError(raw);
+    }
     // Return a synthetic path for the requested module.  This satisfies
     // extensions that call require.resolve() to locate a binary entry
     // point (e.g. @sourcegraph/scip-python) without actually needing the
-    // real node_modules tree.
-    return `/pijs-virtual/${String(id ?? "unknown")}`;
+    // real node_modules tree. Unsupported system modules must still fail
+    // feature detection instead of advertising a nonexistent implementation.
+    return `/pijs-virtual/${raw}`;
   };
   require.resolve.paths = function() { return []; };
   return require;
@@ -12808,7 +12827,10 @@ export function createRequire(_path) {
 export default { createRequire };
 "#)
         .trim()
-        .to_string(),
+        .replace(
+            "__PIJS_PROXY_BLOCKLISTED_PACKAGE_ROOTS__",
+            &PROXY_BLOCKLISTED_PACKAGE_ROOTS.join(","),
+        ),
     );
 
     modules.insert(
@@ -28911,10 +28933,13 @@ mod tests {
             8_189,
             "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
         ),
+        // Fail-closed createRequire/resolve adds 917 assembled source bytes.
+        // Main already contained 8_060 bytes versus the old 7_418-byte receipt;
+        // only this reviewed module is re-pinned, including that prior drift.
         (
             "node:module",
-            7_418,
-            "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
+            8_977,
+            "0e7c7448477f35fb78e80b4bd2e28fdff0d27661bc0f592174a45ddb6fbd534e",
         ),
         (
             "jsonwebtoken",
@@ -37127,6 +37152,101 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             );
             assert_eq!(r["promptKind"], serde_json::json!("file"));
             assert_eq!(r["nestedKind"], serde_json::json!("dir"));
+        });
+    }
+
+    #[test]
+    fn pijs_create_require_rejects_missing_system_modules() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            let mut denied = vec![
+                "node:sqlite".to_string(),
+                "node:pijs-unsupported".to_string(),
+                "node:fs/pijs-unsupported".to_string(),
+                "dns".to_string(),
+                "dns/promises".to_string(),
+                "dgram".to_string(),
+                "cluster".to_string(),
+            ];
+            denied.extend(
+                PROXY_BLOCKLISTED_PACKAGE_ROOTS
+                    .iter()
+                    .map(|root| format!("{root}/pijs-unsupported")),
+            );
+            runtime
+                .eval(&format!(
+                    "globalThis.deniedRequireSpecifiers = {};",
+                    serde_json::to_string(&denied).expect("specifier JSON")
+                ))
+                .await
+                .expect("set denied specifiers");
+            runtime
+                .eval(
+                    r"
+                    globalThis.deniedRequireResult = null;
+                    import('node:module').then(({ createRequire }) => {
+                        const require = createRequire('/fixture/extension.mjs');
+                        const failures = [];
+                        for (const specifier of globalThis.deniedRequireSpecifiers) {
+                            for (const operation of ['require', 'resolve']) {
+                                try {
+                                    if (operation === 'require') require(specifier);
+                                    else require.resolve(specifier);
+                                    failures.push({ specifier, operation, succeeded: true });
+                                } catch (error) {
+                                    failures.push({ specifier, operation, code: error.code,
+                                        message: error.message });
+                                }
+                            }
+                        }
+                        globalThis.deniedRequireResult = { failures,
+                            pathAlias: require('path') === require('node:path'),
+                            fsAlias: require('fs') === require('node:fs'),
+                            fsPromisesAlias: require('fs/promises') === require('node:fs/promises'),
+                            pathJoin: require('path').join('a', 'b'),
+                            pathResolution: require.resolve('node:path'),
+                            utilityResolution: require.resolve('@sourcegraph/scip-python'),
+                            utilityStub: typeof require('left-pad').anyNestedProperty,
+                            prototypeNameIsUtilityStub: typeof require('__proto__') === 'function',
+                            constructorIsNotObject: require('constructor') !== Object,
+                        };
+                    }).catch(error => {
+                        globalThis.deniedRequireResult = { error: String(error.stack || error) };
+                    });
+                    ",
+                )
+                .await
+                .expect("evaluate require policy");
+
+            let result = get_global_json(&runtime, "deniedRequireResult").await;
+            assert!(result.get("error").is_none(), "{result}");
+            let failures = result["failures"].as_array().expect("require failures");
+            assert_eq!(failures.len(), denied.len() * 2);
+            for failure in failures {
+                assert_eq!(failure["code"], "MODULE_NOT_FOUND", "{failure}");
+                assert_eq!(
+                    failure["message"],
+                    format!(
+                        "Cannot find module '{}' in PiJS require()",
+                        failure["specifier"].as_str().expect("specifier")
+                    ),
+                    "{failure}"
+                );
+            }
+            assert_eq!(result["pathAlias"], true);
+            assert_eq!(result["fsAlias"], true);
+            assert_eq!(result["fsPromisesAlias"], true);
+            assert_eq!(result["pathJoin"], "a/b");
+            assert_eq!(result["pathResolution"], "/pijs-virtual/node:path");
+            assert_eq!(
+                result["utilityResolution"],
+                "/pijs-virtual/@sourcegraph/scip-python"
+            );
+            assert_eq!(result["utilityStub"], "function");
+            assert_eq!(result["prototypeNameIsUtilityStub"], true);
+            assert_eq!(result["constructorIsNotObject"], true);
         });
     }
 

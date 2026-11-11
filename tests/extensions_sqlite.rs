@@ -186,6 +186,58 @@ async fn evaluate(runtime: &PiJsRuntime<DeterministicClock>, source: &str) -> Va
 }
 
 #[test]
+fn missing_node_sqlite_selects_a_real_persistent_database_fallback() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = safe_canonicalize(temp.path());
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage directory");
+        let path = serde_json::to_string(&storage.join("fallback.db")).expect("database path");
+        let runtime = runtime(&root, "sqlite-fallback", None).await;
+        runtime
+            .add_persistent_storage_root(storage, "sqlite-fallback")
+            .expect("storage grant");
+        let result = evaluate(
+            &runtime,
+            &format!(
+                r"
+                const require = module.createRequire('file:///extension/index.mjs');
+                let Database;
+                let selected;
+                try {{
+                    Database = require('node:sqlite').DatabaseSync;
+                    selected = 'node:sqlite';
+                }} catch (error) {{
+                    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+                    Database = require('bun:sqlite').Database;
+                    selected = 'bun:sqlite';
+                }}
+                const database = new Database({path});
+                database.exec('CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+                database.prepare('INSERT INTO state VALUES (?, ?)').run('session', 'durable');
+                database.close();
+                const reopened = new sqlite.Database({path}, {{ readonly: true }});
+                globalThis.sqliteResult = {{ selected,
+                    sameConstructor: Database === sqlite.Database,
+                    rows: reopened.query('SELECT key, value FROM state').values() }};
+                reopened.close();
+                "
+            ),
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({
+                "selected": "bun:sqlite",
+                "sameConstructor": true,
+                "rows": [["session", "durable"]],
+            })
+        );
+    });
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");

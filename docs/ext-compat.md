@@ -361,6 +361,15 @@ execution, so an inactive optional native dependency does not prevent a Bun
 SQLite extension from loading. CommonJS function and primitive exports retain
 their actual values when consumed by another transformed module.
 
+`createRequire()` and its `resolve()` method throw an error with
+`code: "MODULE_NOT_FOUND"` for unsupported `node:*` modules and missing
+denylisted system modules such as `dns`, `dgram`, and their subpaths. They use
+the same sensitive-package denylist as the ESM resolver. Supported builtin
+aliases still select their real PiJS implementations; the existing optional
+utility-package stubs remain available. In particular, probing `node:sqlite`
+now fails explicitly so an extension can choose the supported `bun:sqlite`
+driver instead of receiving a callable no-op database.
+
 File URL helpers preserve spaces, Unicode, and literal URL delimiters in
 filenames, with explicit POSIX/Windows conversion and drive/UNC handling.
 The resolver decodes file URLs before applying the existing import-root
