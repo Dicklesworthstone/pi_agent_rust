@@ -81,7 +81,8 @@ impl ToolEffects {
     const APPEND: u8 = 1 << 2;
     const NETWORK: u8 = 1 << 3;
     const PROCESS: u8 = 1 << 4;
-    const BARRIER: u8 = Self::WRITE | Self::APPEND | Self::PROCESS;
+    const ORDERED: u8 = 1 << 5;
+    const BARRIER: u8 = Self::WRITE | Self::APPEND | Self::PROCESS | Self::ORDERED;
 
     /// Tool reads local state without mutating it.
     #[must_use]
@@ -115,6 +116,23 @@ impl ToolEffects {
         Self {
             bits: Self::PROCESS,
         }
+    }
+
+    /// Execute in tool-call order, including approval and result publication.
+    /// This scheduling constraint adds no filesystem or process capability:
+    /// session-state tools can retain their ordinary plan-mode permissions.
+    #[must_use]
+    pub const fn with_ordered_execution(self) -> Self {
+        Self {
+            bits: self.bits | Self::ORDERED,
+        }
+    }
+
+    /// Whether this tool requires a scheduling barrier independently of its
+    /// filesystem, network, or process effects.
+    #[must_use]
+    pub const fn requires_ordered_execution(self) -> bool {
+        self.bits & Self::ORDERED != 0
     }
 
     /// Combine multiple effect declarations for a single tool or batch.
@@ -158,7 +176,7 @@ impl ToolEffects {
     /// Stable labels for machine-readable scheduling evidence.
     #[must_use]
     pub fn labels(self) -> Vec<&'static str> {
-        let mut labels = Vec::with_capacity(5);
+        let mut labels = Vec::with_capacity(6);
         if self.reads() {
             labels.push("read");
         }
@@ -173,6 +191,9 @@ impl ToolEffects {
         }
         if self.processes() {
             labels.push("process");
+        }
+        if self.requires_ordered_execution() {
+            labels.push("ordered");
         }
         labels
     }

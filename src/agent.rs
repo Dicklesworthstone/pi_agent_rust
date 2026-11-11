@@ -543,6 +543,9 @@ const fn tool_effect_barrier_reason(effects: ToolEffects) -> Option<&'static str
         (true, false, false) => Some("write_barrier"),
         (false, true, false) => Some("append_barrier"),
         (false, false, true) => Some("process_barrier"),
+        (false, false, false) if effects.requires_ordered_execution() => {
+            Some("ordered_execution_barrier")
+        }
         (false, false, false) => Some("undeclared_effects_barrier"),
     }
 }
@@ -15114,6 +15117,111 @@ mod extensions_integration_tests {
 
     fn test_turn_latency() -> SharedTurnLatencyAccumulator {
         Arc::new(StdMutex::new(TurnLatencyAccumulator::started()))
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn todo_calls_wait_for_prior_approval_and_publish_current_state_in_plan_mode() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let todo = crate::todo::TodoTool::new(Arc::clone(&session));
+            todo.execute("init", json!({ "op": "init", "tasks": ["A", "B"] }), None)
+                .await
+                .expect("initial task list");
+            let root = tempfile::tempdir().expect("tool workspace");
+            let config: crate::config::Config = serde_json::from_value(json!({
+                "tools": { "loadMode": { "todo": "discoverable" } },
+            }))
+            .expect("todo discovery settings");
+            let mut tools = ToolRegistry::with_builtin_tool_policy(
+                &["todo"], root.path(), Some(&config), None, None, false, None, false,
+            );
+            tools.extend(vec![Box::new(todo) as Box<dyn Tool>]);
+            assert!(tools.get("xdev").is_some());
+            assert!(tools.is_discoverable("todo"));
+            let approvals = Arc::new(StdMutex::new(Vec::new()));
+            let observed_approvals = Arc::clone(&approvals);
+            let (release, released) = futures::channel::oneshot::channel::<()>();
+            let first_approval = Arc::new(StdMutex::new(Some(released)));
+            let mut agent = Agent::new(
+                Arc::new(NoopProvider),
+                tools,
+                AgentConfig {
+                    tool_approval: Some(Arc::new(move |request| {
+                        observed_approvals.lock().unwrap().push(request.tool_call_id.clone());
+                        let pending = if request.tool_call_id == "done-a" {
+                            first_approval.lock().unwrap().take()
+                        } else {
+                            None
+                        };
+                        Box::pin(async move {
+                            if let Some(pending) = pending {
+                                pending.await.expect("release first approval");
+                            }
+                            ToolApprovalDecision::Allow
+                        })
+                    })),
+                    ..AgentConfig::default()
+                },
+            );
+            agent.plan_state().enter_planning();
+            let calls = [
+                ToolCall {
+                    id: "done-a".into(), name: "todo".into(),
+                    arguments: json!({ "op": "done", "task": "A" }),
+                    thought_signature: None,
+                },
+                ToolCall {
+                    id: "done-b".into(), name: "xdev".into(),
+                    arguments: json!({ "action": "run", "name": "todo", "args": { "op": "done", "task": "B" } }),
+                    thought_signature: None,
+                },
+                ToolCall {
+                    id: "view".into(), name: "todo".into(),
+                    arguments: json!({ "op": "view" }),
+                    thought_signature: None,
+                },
+            ];
+            for call in &calls {
+                let effects = agent.effects_for_call(call);
+                assert!(effects.requires_ordered_execution());
+                assert!(agent.plan_state().allows_effects(effects));
+                assert!(!effects.writes() && !effects.appends() && !effects.processes());
+                assert_eq!(tool_effect_barrier_reason(effects), Some("ordered_execution_barrier"));
+            }
+            let completed = Arc::new(StdMutex::new(Vec::new()));
+            let observed = Arc::clone(&completed);
+            let on_event: AgentEventHandler = Arc::new(move |event| {
+                if let AgentEvent::ToolExecutionEnd { tool_call_id, result, is_error, .. } = event {
+                    assert!(!is_error && !result.is_error);
+                    observed.lock().unwrap().push((tool_call_id, result.details.unwrap()));
+                }
+            });
+            let mut new_messages = Vec::new();
+            let mut execution = Box::pin(agent.execute_tool_calls(
+                &calls, on_event, &mut new_messages, None, test_turn_latency(),
+            ));
+            assert!(futures::poll!(execution.as_mut()).is_pending());
+            // With concurrent read-effect scheduling, B and view would pass
+            // approval and snapshot the list before the first call is released.
+            assert_eq!(*approvals.lock().unwrap(), vec!["done-a".to_string()]);
+            assert!(completed.lock().unwrap().is_empty());
+            release.send(()).expect("pending first approval");
+            let outcome = execution.await.expect("ordered todo batch");
+            assert_eq!(outcome.tool_results.len(), 3);
+            assert!(outcome.tool_results.iter().all(|result| !result.is_error));
+            let stored = session.lock(&crate::agent_cx::AgentCx::for_request()).await.unwrap();
+            let list = crate::todo::latest_from_entries(stored.entries_for_current_path());
+            assert_eq!(list.progress(), (2, 2));
+            let state = serde_json::to_value(list).unwrap();
+            let completed = completed.lock().unwrap();
+            assert_eq!(completed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["done-a", "done-b", "view"]);
+            assert_eq!(completed[0].1["list"]["phases"][0]["tasks"][0]["state"], "done");
+            assert_eq!(completed[0].1["list"]["phases"][0]["tasks"][1]["state"], "in_progress");
+            assert_eq!(completed[1].1["list"], state);
+            assert_eq!(completed[2].1["list"], state);
+        });
     }
 
     #[test]

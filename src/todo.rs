@@ -526,7 +526,10 @@ impl crate::tools::Tool for TodoTool {
 
     fn effects(&self) -> crate::tools::ToolEffects {
         // Session-state mutation only; no filesystem or process effects.
-        crate::tools::ToolEffects::read()
+        // Keep approval, mutation, view snapshots, and completion events in
+        // call order. A mutex around the store alone does not prevent later
+        // calls from overtaking an earlier call awaiting editor approval.
+        crate::tools::ToolEffects::read().with_ordered_execution()
     }
 
     async fn execute(
