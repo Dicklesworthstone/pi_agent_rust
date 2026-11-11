@@ -8,7 +8,9 @@
 //! Layout references: Apple's QuickTime movie-header atom specification,
 //! RFC 8794 (EBML), Matroska's Info/Duration/TimestampScale elements,
 //! Microsoft's WAVEFORMATEX, RFC 9639 section 8.2 (FLAC STREAMINFO), and
-//! ID3v2.4 / MPEG layer III's Xing/Info frame-count metadata. Ogg uses RFC
+//! ID3v2.4, RFC 5219 section 3 (MPEG layer III framing), and Xing/Info
+//! frame-count metadata. MP3 streams without an index use a bounded walk of
+//! complete frame headers, never a bitrate extrapolation. Ogg uses RFC
 //! 3533, RFC 7845 sections 3–5, RFC 6716 section 3.1, and the Xiph Vorbis I
 //! specification's identification header and Appendix A encapsulation rules.
 
@@ -296,80 +298,218 @@ fn flac_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
     duration_from_units(samples, rate)
 }
 
-#[allow(clippy::useless_let_if_seq)]
-fn mp3_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
-    let mut offset = 0_usize;
-    if reader.read::<3>(0)? == *b"ID3" {
-        let tag = reader.read::<10>(0)?;
-        if !(2..=4).contains(&tag[3]) || tag[4] == 0xff {
+/// ID3v2 sizes exclude the ten-byte header and optional v2.4 footer. Only
+/// envelopes are inspected: an embedded picture or unsynchronised tag body
+/// can be large, but has no bearing on audio duration.
+fn id3v2_size(tag: &[u8; 10]) -> Option<(usize, bool)> {
+    let allowed_flags = match tag[3] {
+        2 => 0xc0,
+        3 => 0xe0,
+        4 => 0xf0,
+        _ => return None,
+    };
+    if tag[4] == 0xff || tag[5] & !allowed_flags != 0 {
+        return None;
+    }
+    let mut size = 0_usize;
+    for byte in &tag[6..10] {
+        if byte & 0x80 != 0 {
             return None;
         }
-        let mut tag_size = 0_usize;
-        for byte in &tag[6..10] {
-            if byte & 0x80 != 0 {
+        size = size.checked_mul(128)?.checked_add(usize::from(*byte))?;
+    }
+    let footer = tag[3] == 4 && tag[5] & 0x10 != 0;
+    Some((size.checked_add(if footer { 20 } else { 10 })?, footer))
+}
+
+fn mp3_audio_bounds(reader: &mut EncodedMedia<'_>) -> Option<(usize, usize)> {
+    let mut end = reader.len;
+    // ID3v1 is exactly 128 bytes. Do not treat arbitrary trailing bytes or a
+    // truncated tag as padding, or a partial last frame could become valid.
+    if end >= 128 && reader.read::<3>(end - 128)? == *b"TAG" {
+        end -= 128;
+    }
+    if end >= 10 {
+        let footer = reader.read::<10>(end - 10)?;
+        if &footer[..3] == b"3DI" {
+            let (size, has_footer) = id3v2_size(&footer)?;
+            if !has_footer {
                 return None;
             }
-            tag_size = tag_size.checked_mul(128)?.checked_add(usize::from(*byte))?;
+            let start = end.checked_sub(size)?;
+            let header = reader.read::<10>(start)?;
+            if &header[..3] != b"ID3" || header[3..] != footer[3..] {
+                return None;
+            }
+            end = start;
         }
-        // The v2.4 footer, when present, is outside the synchsafe tag size.
-        let footer = if tag[3] == 4 && tag[5] & 0x10 != 0 {
-            10
-        } else {
-            0
+    }
+    let mut start = 0_usize;
+    if reader.read::<3>(start)? == *b"ID3" {
+        let header = reader.read::<10>(start)?;
+        let (size, has_footer) = id3v2_size(&header)?;
+        if size > end {
+            return None;
+        }
+        if has_footer {
+            let footer = reader.read::<10>(size - 10)?;
+            if &footer[..3] != b"3DI" || footer[3..] != header[3..] {
+                return None;
+            }
+        }
+        start = size;
+    }
+    (start < end).then_some((start, end))
+}
+
+struct Mp3Frame {
+    version: u32,
+    rate: u64,
+    samples: u64,
+    bytes: usize,
+    side_info: usize,
+    protected: bool,
+}
+
+impl Mp3Frame {
+    fn read(reader: &mut EncodedMedia<'_>, offset: usize, end: usize) -> Option<Self> {
+        if offset.checked_add(4)? > end {
+            return None;
+        }
+        let header = reader.be_u32(offset)?;
+        let version = (header >> 19) & 3;
+        let rate_index = usize::try_from((header >> 10) & 3).ok()?;
+        let bitrate_index = usize::try_from((header >> 12) & 15).ok()?;
+        if header >> 21 != 0x7ff
+            || version == 1
+            || (header >> 17) & 3 != 1
+            || rate_index == 3
+            || !(1..=14).contains(&bitrate_index)
+            || header & 3 == 2
+        {
+            // Free-format audio has no table-derived frame size. Never hunt
+            // for sync bytes inside its payload or guess from a bitrate.
+            return None;
+        }
+        let divisor = match version {
+            3 => 1,
+            2 => 2,
+            _ => 4,
         };
-        offset = 10_usize.checked_add(tag_size)?.checked_add(footer)?;
+        let rate = [44_100_u64, 48_000, 32_000][rate_index] / divisor;
+        let samples = if version == 3 { 1_152 } else { 576 };
+        let bitrates = if version == 3 {
+            [
+                32_u64, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ]
+        } else {
+            [
+                8_u64, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
+            ]
+        };
+        let bytes = usize::try_from(
+            samples * 125 * bitrates[bitrate_index - 1] / rate + u64::from((header >> 9) & 1),
+        )
+        .ok()?;
+        let side_info = match (version == 3, (header >> 6) & 3 == 3) {
+            (true, false) => 32,
+            (true, true) | (false, false) => 17,
+            (false, true) => 9,
+        };
+        let protected = header & (1 << 16) == 0;
+        if bytes < 4 + usize::from(protected) * 2 + side_info
+            || offset.checked_add(bytes)? > end
+        {
+            return None;
+        }
+        Some(Self {
+            version,
+            rate,
+            samples,
+            bytes,
+            side_info,
+            protected,
+        })
     }
-    let header = reader.be_u32(offset)?;
-    let version = (header >> 19) & 3;
-    let rate_index = usize::try_from((header >> 10) & 3).ok()?;
-    let bitrate_index = usize::try_from((header >> 12) & 15).ok()?;
-    if header >> 21 != 0x7ff
-        || version == 1
-        || (header >> 17) & 3 != 1
-        || rate_index == 3
-        || !(1..=14).contains(&bitrate_index)
-        || header & (1 << 16) == 0
-    {
-        // CRC-protected or headerless streams retain the fallback estimate.
+}
+
+fn mp3_duration(reader: &mut EncodedMedia<'_>) -> Option<Duration> {
+    let (start, end) = mp3_audio_bounds(reader)?;
+    let first = Mp3Frame::read(reader, start, end)?;
+    let info = start.checked_add(4 + first.side_info)?;
+    let frame_end = start.checked_add(first.bytes)?;
+    // Retain the constant-work metadata path for indexed recordings. A CRC
+    // field makes encoder-specific index placement ambiguous; the frame walk
+    // still handles that stream, conservatively including its header frame.
+    if !first.protected && info.checked_add(4)? <= frame_end {
+        let kind = reader.read::<4>(info)?;
+        if matches!(&kind, b"Xing" | b"Info") {
+            return mp3_indexed_duration(reader, info, start, end, &first);
+        }
+    }
+    // Every frame independently describes its byte length, so bitrate,
+    // padding, channel mode and CRC presence may vary. MPEG version and
+    // sample rate must not change under one timing clock. Skip compressed
+    // payloads at checked offsets; do not resynchronise after malformed data.
+    let mut frames = 1_u64;
+    let mut offset = frame_end;
+    while offset < end {
+        let frame = Mp3Frame::read(reader, offset, end)?;
+        if frame.version != first.version || frame.rate != first.rate {
+            return None;
+        }
+        offset = offset.checked_add(frame.bytes)?;
+        frames = frames.checked_add(1)?;
+    }
+    // The shared metadata-read budget bounds even a flood of tiny frames.
+    // Exhausting it returns None, never the duration of a partial prefix.
+    // Encoder delay/padding is retained as a conservative context estimate;
+    // this header walk is not an audio decoder or a CRC/content validator.
+    duration_from_units(frames.checked_mul(first.samples)?, first.rate)
+}
+
+fn mp3_indexed_duration(
+    reader: &mut EncodedMedia<'_>,
+    info: usize,
+    start: usize,
+    end: usize,
+    first: &Mp3Frame,
+) -> Option<Duration> {
+    let frame_end = start.checked_add(first.bytes)?;
+    if info.checked_add(12)? > frame_end {
         return None;
     }
-    let divisor = match version {
-        3 => 1,
-        2 => 2,
-        _ => 4,
-    };
-    let rate = [44_100_u64, 48_000, 32_000][rate_index] / divisor;
-    let samples_per_frame = if version == 3 { 1_152_u64 } else { 576 };
-    let mono = (header >> 6) & 3 == 3;
-    let side_info = match (version == 3, mono) {
-        (true, false) => 32,
-        (true, true) | (false, false) => 17,
-        (false, true) => 9,
-    };
-    let bitrates = if version == 3 {
-        [
-            32_u64, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
-        ]
-    } else {
-        [
-            8_u64, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160,
-        ]
-    };
-    let bitrate = bitrates[bitrate_index - 1];
-    let frame_bytes = samples_per_frame * 125 * bitrate / rate + u64::from((header >> 9) & 1);
-    let frame_end = offset.checked_add(usize::try_from(frame_bytes).ok()?)?;
-    let info = offset.checked_add(4 + side_info)?;
-    if info.checked_add(12)? > frame_end || frame_end > reader.len {
+    let flags = reader.be_u32(info + 4)?;
+    if flags & 1 == 0 || flags & !15 != 0 {
         return None;
     }
-    let kind = reader.read::<4>(info)?;
-    if !matches!(&kind, b"Xing" | b"Info") || reader.be_u32(info + 4)? & 1 == 0 {
+    let fields_len = 12
+        + if flags & 2 != 0 { 4 } else { 0 }
+        + if flags & 4 != 0 { 100 } else { 0 }
+        + if flags & 8 != 0 { 4 } else { 0 };
+    if info.checked_add(fields_len)? > frame_end {
         return None;
     }
     let frames = u64::from(reader.be_u32(info + 8)?);
-    // Includes encoder padding conservatively; never infer duration from a
-    // nominal bitrate, which would undercount variable-bitrate recordings.
-    duration_from_units(frames.checked_mul(samples_per_frame)?, rate)
+    let stream_bytes = u64::try_from(end.checked_sub(start)?).ok()?;
+    if flags & 2 != 0 && u64::from(reader.be_u32(info + 12)?) != stream_bytes {
+        return None;
+    }
+    // Xing counts the audio frames, excluding the index frame; its byte count
+    // includes both. Reject impossible counts even when byte-size metadata is
+    // omitted. This preserves bounded inspection without claiming to verify
+    // compressed audio or every header of an indexed, possibly long file.
+    let audio_bytes = stream_bytes.checked_sub(u64::try_from(first.bytes).ok()?)?;
+    let (min_bitrate, max_bitrate) = if first.version == 3 { (32, 320) } else { (8, 160) };
+    let min_frame_bytes = first.samples * 125 * min_bitrate / first.rate;
+    let max_frame_bytes = first.samples * 125 * max_bitrate / first.rate + 1;
+    if frames == 0
+        || audio_bytes < frames.checked_mul(min_frame_bytes)?
+        || audio_bytes > frames.checked_mul(max_frame_bytes)?
+    {
+        return None;
+    }
+    duration_from_units(frames.checked_mul(first.samples)?, first.rate)
 }
 
 struct OggPage {
@@ -915,30 +1055,269 @@ mod tests {
         assert!(inspect(&encode(&bytes), "audio/flac").is_none());
     }
 
+    // The fixtures specify frame lengths independently of the parser. Bodies
+    // are metadata fixtures, not a claim to validate/decode compressed audio
+    // or its CRC. Zero side information leaves no bit-reservoir dependency.
+    fn mp3_frames(header: [u8; 4], frame_bytes: usize, count: usize) -> Vec<u8> {
+        let mut bytes = vec![0; frame_bytes * count];
+        for frame in bytes.chunks_exact_mut(frame_bytes) {
+            frame[..4].copy_from_slice(&header);
+        }
+        bytes
+    }
+
     #[test]
     fn mp3_duration_uses_frame_count_and_skips_id3_metadata() {
         for kind in [b"Xing", b"Info"] {
-            // MPEG1 layer III, 128 kbit/s, 48 kHz, stereo: 384-byte frame.
-            let mut frame = vec![0; 384];
-            frame[..4].copy_from_slice(&[0xff, 0xfb, 0x94, 0]);
-            frame[36..40].copy_from_slice(kind);
-            frame[40..44].copy_from_slice(&1_u32.to_be_bytes());
-            frame[44..48].copy_from_slice(&2_500_u32.to_be_bytes());
+            // MPEG1 layer III, 128 kbit/s, 48 kHz: one index frame followed
+            // by 2,500 audio frames. The index frame is not audible duration.
+            let mut bytes = mp3_frames([0xff, 0xfb, 0x94, 0], 384, 2_501);
+            bytes[36..40].copy_from_slice(kind);
+            bytes[40..44].copy_from_slice(&3_u32.to_be_bytes());
+            bytes[44..48].copy_from_slice(&2_500_u32.to_be_bytes());
+            let len = u32::try_from(bytes.len()).unwrap();
+            bytes[48..52].copy_from_slice(&len.to_be_bytes());
             assert_eq!(
-                inspect(&encode(&frame), "audio/mpeg"),
+                inspect(&encode(&bytes), "audio/mpeg"),
                 Some(Duration::from_secs(60))
             );
+            let data = encode(&bytes);
+            let mut reader = EncodedMedia::new(&data).unwrap();
+            assert_eq!(mp3_duration(&mut reader), Some(Duration::from_secs(60)));
+            assert!(MAX_HEADER_BYTES - reader.remaining < 256);
             let mut tagged = b"ID3\x04\x00\x00\x00\x00\x00\x03abc".to_vec();
-            tagged.extend_from_slice(&frame);
+            tagged.extend_from_slice(&bytes);
             assert_eq!(
                 inspect(&encode(&tagged), "audio/mpeg"),
                 Some(Duration::from_secs(60))
             );
-            frame[44..48].fill(0);
-            assert!(inspect(&encode(&frame), "audio/mpeg").is_none());
+            // A declared size includes the index frame, but not either ID3 tag.
+            tagged.extend_from_slice(b"TAG");
+            tagged.extend_from_slice(&[0; 125]);
+            assert_eq!(
+                inspect(&encode(&tagged), "audio/mpeg"),
+                Some(Duration::from_secs(60))
+            );
+            bytes[44..48].fill(0);
+            assert!(inspect(&encode(&bytes), "audio/mpeg").is_none());
             tagged[6] = 0x80;
             assert!(inspect(&encode(&tagged), "audio/mpeg").is_none());
         }
+    }
+
+    #[test]
+    fn mp3_without_an_index_counts_complete_frames_at_each_mpeg_clock() {
+        for (header, frame_bytes, frames, seconds) in [
+            ([0xff, 0xfb, 0x94, 0], 384, 2_500, 60), // MPEG1, 128k, 48kHz.
+            ([0xff, 0xfb, 0x90, 0], 417, 1_225, 32), // MPEG1, 128k, 44.1kHz.
+            ([0xff, 0xfb, 0xe8, 0], 1_440, 2_500, 90), // MPEG1, 320k, 32kHz.
+            ([0xff, 0xf3, 0x84, 0], 192, 2_500, 60), // MPEG2, 64k, 24kHz.
+            ([0xff, 0xe3, 0x44, 0], 192, 1_250, 60), // MPEG2.5, 32k, 12kHz.
+            ([0xff, 0xf3, 0x18, 0xc0], 36, 2_500, 90), // MPEG2 mono, 8k, 16kHz.
+        ] {
+            let bytes = mp3_frames(header, frame_bytes, frames);
+            for data in [
+                encode(&bytes),
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes),
+            ] {
+                assert_eq!(
+                    inspect(&data, "Audio/MP3; codecs=mp3"),
+                    Some(Duration::from_secs(seconds)),
+                    "header {header:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mp3_vbr_padding_crc_and_channel_changes_do_not_change_the_sample_clock() {
+        let mut bytes = Vec::new();
+        for _ in 0..1_000 {
+            // Each frame contains 1,152 samples at 48kHz despite very
+            // different byte lengths and optional CRC/padding/channel mode.
+            bytes.extend(mp3_frames([0xff, 0xfb, 0x14, 0], 96, 1));
+            bytes.extend(mp3_frames([0xff, 0xfb, 0x96, 0x40], 385, 1));
+            bytes.extend(mp3_frames([0xff, 0xfa, 0xe4, 0xc0], 960, 1));
+        }
+        assert_eq!(
+            inspect(&encode(&bytes), "audio/mpeg"),
+            Some(Duration::from_secs(72))
+        );
+        // Put the protected frame first too: CRC presence must not prevent
+        // an ordinary recording from getting a duration estimate.
+        let protected_first = mp3_frames([0xff, 0xfa, 0x94, 0], 384, 125);
+        assert_eq!(
+            inspect(&encode(&protected_first), "audio/mpeg"),
+            Some(Duration::from_secs(3))
+        );
+        // One 44.1kHz frame needs ceiling only after all samples are summed.
+        assert_eq!(
+            inspect(
+                &encode(&mp3_frames([0xff, 0xfb, 0x90, 0], 417, 1)),
+                "audio/mpeg"
+            ),
+            Some(Duration::from_nanos(26_122_449))
+        );
+    }
+
+    #[test]
+    fn mp3_without_an_index_skips_bounded_id3_envelopes_and_matching_footers() {
+        let recording = mp3_frames([0xff, 0xfb, 0x94, 0], 384, 125);
+        for version in 2..=4 {
+            for footer in [false, true] {
+                if footer && version != 4 {
+                    continue;
+                }
+                let header = [
+                    b'I', b'D', b'3', version, 0, if footer { 0x10 } else { 0 }, 0, 0, 0, 3,
+                ];
+                let mut tagged = header.to_vec();
+                tagged.extend_from_slice(b"abc");
+                if footer {
+                    tagged.extend_from_slice(b"3DI");
+                    tagged.extend_from_slice(&header[3..]);
+                }
+                tagged.extend_from_slice(&recording);
+                // An appended v2.4 tag must have a footer, with exactly the
+                // same size/version/flags as its header.
+                tagged.extend_from_slice(b"ID3\x04\0\x10\0\0\0\x03abc");
+                tagged.extend_from_slice(b"3DI\x04\0\x10\0\0\0\x03");
+                tagged.extend_from_slice(b"TAG");
+                tagged.extend_from_slice(&[0; 125]);
+                assert_eq!(
+                    inspect(&encode(&tagged), "audio/mpeg"),
+                    Some(Duration::from_secs(3)),
+                    "ID3v2.{version}, footer={footer}"
+                );
+            }
+        }
+        let mut large_tag = b"ID3\x04\0\0\x01\0\0\0".to_vec();
+        large_tag.resize(10 + 2 * 1024 * 1024, 0);
+        large_tag.extend_from_slice(&recording);
+        let data = encode(&large_tag);
+        let mut reader = EncodedMedia::new(&data).unwrap();
+        assert_eq!(mp3_duration(&mut reader), Some(Duration::from_secs(3)));
+        assert!(MAX_HEADER_BYTES - reader.remaining < 2_048);
+    }
+
+    #[test]
+    fn mp3_without_an_index_rejects_partial_frames_and_never_resynchronises() {
+        let valid = mp3_frames([0xff, 0xfb, 0x94, 0], 384, 3);
+        for removed in 1..384 {
+            assert!(inspect(&encode(&valid[..valid.len() - removed]), "audio/mpeg").is_none());
+        }
+        for tail in [&b"\xff\xfb\x94"[..], &b"\0"[..], &b"TAG"[..]] {
+            let mut malformed = valid.clone();
+            malformed.extend_from_slice(tail);
+            assert!(inspect(&encode(&malformed), "audio/mpeg").is_none());
+        }
+        let mut gap = valid.clone();
+        gap.insert(384, 0);
+        assert!(inspect(&encode(&gap), "audio/mpeg").is_none());
+        let mut prefix = vec![0];
+        prefix.extend_from_slice(&valid);
+        assert!(inspect(&encode(&prefix), "audio/mpeg").is_none());
+        // A physically valid shorter recording is legitimate; no metadata
+        // claims that frames beyond EOF should have existed.
+        assert_eq!(
+            inspect(&encode(&valid[..384]), "audio/mpeg"),
+            Some(Duration::from_millis(24))
+        );
+    }
+
+    #[test]
+    fn mp3_without_an_index_rejects_invalid_or_inconsistent_frame_headers() {
+        let valid = mp3_frames([0xff, 0xfb, 0x94, 0], 384, 3);
+        for header in [
+            [0xfe, 0xfb, 0x94, 0], // Invalid sync.
+            [0xff, 0xeb, 0x94, 0], // Reserved MPEG version.
+            [0xff, 0xfd, 0x94, 0], // Layer II, not MP3.
+            [0xff, 0xf9, 0x94, 0], // Reserved layer.
+            [0xff, 0xfb, 0x04, 0], // Free-format bitrate has no known length.
+            [0xff, 0xfb, 0xf4, 0], // Reserved bitrate.
+            [0xff, 0xfb, 0x9c, 0], // Reserved sample rate.
+            [0xff, 0xfb, 0x94, 2], // Reserved emphasis.
+            [0xff, 0xfb, 0x90, 0], // A different sample clock midstream.
+            [0xff, 0xf3, 0x84, 0], // A different MPEG version midstream.
+        ] {
+            let mut malformed = valid.clone();
+            malformed[384..388].copy_from_slice(&header);
+            assert!(
+                inspect(&encode(&malformed), "audio/mpeg").is_none(),
+                "header {header:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mp3_rejects_bad_id3_flags_sizes_and_footer_disagreements() {
+        let recording = mp3_frames([0xff, 0xfb, 0x94, 0], 384, 3);
+        let mut valid = b"ID3\x04\0\x10\0\0\0\x03abc3DI\x04\0\x10\0\0\0\x03".to_vec();
+        valid.extend_from_slice(&recording);
+        for (offset, value) in [
+            (3, 5),     // Unsupported major version.
+            (4, 0xff),  // Invalid revision.
+            (5, 0x11),  // Reserved flag.
+            (6, 0x80),  // Non-synchsafe size.
+            (6, 0x7f),  // Size extends past the file.
+            (13, b'X'), // Footer marker does not match.
+            (16, 3),    // Footer version does not match.
+            (22, 4),    // Footer size does not match.
+        ] {
+            let mut malformed = valid.clone();
+            malformed[offset] = value;
+            assert!(inspect(&encode(&malformed), "audio/mpeg").is_none());
+        }
+        for version in [2, 3] {
+            let mut invalid_flags = b"ID3\x04\0\x10\0\0\0\x03abc".to_vec();
+            invalid_flags[3] = version;
+            invalid_flags.extend_from_slice(&recording);
+            assert!(inspect(&encode(&invalid_flags), "audio/mpeg").is_none());
+        }
+        let mut orphan_footer = recording;
+        orphan_footer.extend_from_slice(b"3DI\x04\0\x10\0\0\0\x03");
+        assert!(inspect(&encode(&orphan_footer), "audio/mpeg").is_none());
+    }
+
+    #[test]
+    fn mp3_index_metadata_cannot_claim_absent_bytes_or_impossible_frame_counts() {
+        let mut valid = mp3_frames([0xff, 0xfb, 0x94, 0], 384, 126);
+        valid[36..40].copy_from_slice(b"Xing");
+        valid[40..44].copy_from_slice(&3_u32.to_be_bytes());
+        valid[44..48].copy_from_slice(&125_u32.to_be_bytes());
+        let len = u32::try_from(valid.len()).unwrap();
+        valid[48..52].copy_from_slice(&len.to_be_bytes());
+        for (offset, replacement) in [
+            (40, 0_u32),        // Missing frame count.
+            (40, 0x8000_0001),  // Reserved index flags.
+            (44, 0),           // No audio frames.
+            (44, u32::MAX),    // Impossible frame count.
+            (48, len - 1),     // Inconsistent total stream size.
+            (48, len + 1),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[offset..offset + 4].copy_from_slice(&replacement.to_be_bytes());
+            assert!(inspect(&encode(&malformed), "audio/mpeg").is_none());
+        }
+        assert!(inspect(&encode(&valid[..valid.len() - 1]), "audio/mpeg").is_none());
+        // Even without a byte-count field, the index cannot declare a
+        // minute of audio while providing only the index frame itself.
+        valid[40..44].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(inspect(&encode(&valid[..384]), "audio/mpeg").is_none());
+        let mut small_index = mp3_frames([0xff, 0xfb, 0x14, 0], 96, 2);
+        small_index[36..40].copy_from_slice(b"Info");
+        small_index[40..44].copy_from_slice(&5_u32.to_be_bytes());
+        small_index[44..48].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(inspect(&encode(&small_index), "audio/mpeg").is_none());
+    }
+
+    #[test]
+    fn mp3_frame_flood_exhausts_metadata_budget_without_returning_a_partial_duration() {
+        let bytes = mp3_frames([0xff, 0xfb, 0x14, 0], 96, 30_000);
+        let data = encode(&bytes);
+        let mut reader = EncodedMedia::new(&data).unwrap();
+        assert!(mp3_duration(&mut reader).is_none());
+        assert!(reader.remaining < 8);
     }
 
     fn ogg_fixture_page(

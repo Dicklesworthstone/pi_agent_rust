@@ -308,7 +308,7 @@ where
 impl MediaContent {
     /// Inspect the container's duration without decoding its audio/video or
     /// allocating a copy of the base64 payload. MP4/MOV/M4A, WebM, PCM/float
-    /// WAVE, FLAC, MP3 Xing/Info, and Ogg Vorbis/Opus metadata are supported.
+    /// WAVE, FLAC, MP3 frames and Xing/Info, and Ogg Vorbis/Opus are supported.
     /// Missing, malformed, ambiguous, or unsupported metadata returns `None`;
     /// this is an estimate, not media validation.
     #[must_use]
