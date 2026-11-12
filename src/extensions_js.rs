@@ -24063,6 +24063,25 @@ async function __pi_provider_stream_simple_start(provider_id, model, context, op
     return stream_id;
 }
 
+function __pi_provider_stream_simple_cleanup(id, record) {
+    if (record.cleanup) return record.cleanup;
+    // Install the shared promise before abort listeners or return() can run.
+    // A rejected next and a concurrent cancel must release the iterator once.
+    record.cleanup = Promise.resolve().then(async () => {
+        try {
+            record.controller.abort();
+        } catch (_) {}
+        if (record.iterator && typeof record.iterator.return === 'function') {
+            await record.iterator.return();
+        }
+        // A failed return retains both the record and its failure. Native
+        // callers must not retire their route without successful cleanup.
+        __pi_provider_streams.delete(id);
+        return true;
+    });
+    return record.cleanup;
+}
+
 async function __pi_provider_stream_simple_next(stream_id) {
     const id = String(stream_id || '').trim();
     const record = __pi_provider_streams.get(id);
@@ -24070,23 +24089,12 @@ async function __pi_provider_stream_simple_next(stream_id) {
         return { done: true, value: null };
     }
 
-    let result;
-    try {
-        result = await record.iterator.next();
-    } catch (err) {
-        try {
-            record.controller.abort();
-        } catch (_) {}
-        try {
-            if (record.iterator && typeof record.iterator.return === 'function') {
-                await record.iterator.return();
-            }
-        } catch (_) {}
-        __pi_provider_streams.delete(id);
-        throw err;
-    }
+    // Native ownership handles rejection under a fresh cleanup fence. Awaiting
+    // return() here would hide a next error behind an uncooperative cleanup
+    // promise for the full read deadline, and run return under the wrong fence.
+    const result = await record.iterator.next();
     if (!result || result.done) {
-        __pi_provider_streams.delete(id);
+        if (!record.cleanup) __pi_provider_streams.delete(id);
         return { done: true, value: null };
     }
 
@@ -24100,18 +24108,7 @@ async function __pi_provider_stream_simple_cancel(stream_id) {
         return false;
     }
 
-    try {
-        record.controller.abort();
-    } catch (_) {}
-
-    try {
-        if (record.iterator && typeof record.iterator.return === 'function') {
-            await record.iterator.return();
-        }
-    } catch (_) {}
-
-    __pi_provider_streams.delete(id);
-    return true;
+    return __pi_provider_stream_simple_cleanup(id, record);
 }
 
 const __pi_reserved_keys = new Set(['ctrl+c', 'ctrl+d', 'ctrl+l', 'ctrl+z']);
@@ -38957,6 +38954,9 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         }
                         globalThis.providerStreamErrorState.afterError =
                             __pi_runtime_registry_snapshot(__pi_test_secret).providerStreams;
+                        await __pi_provider_stream_simple_cancel(__pi_test_secret, streamId);
+                        globalThis.providerStreamErrorState.afterCleanup =
+                            __pi_runtime_registry_snapshot(__pi_test_secret).providerStreams;
                         globalThis.providerStreamErrorState.signalAbortedAfterError =
                             globalThis.providerStreamErrorSignal.aborted === true;
                         globalThis.providerStreamErrorState.done = true;
@@ -38973,7 +38973,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(state["first"]["value"], serde_json::json!("partial"));
             assert_eq!(state["threw"], serde_json::json!(true));
             assert_eq!(state["error"], serde_json::json!("stream explosion"));
-            assert_eq!(state["afterError"], serde_json::json!(0));
+            assert_eq!(state["afterError"], serde_json::json!(1));
+            assert_eq!(state["afterCleanup"], serde_json::json!(0));
             assert_eq!(state["cleanupRan"], serde_json::json!(true));
             assert_eq!(
                 state["signalAbortedDuringCleanup"],
