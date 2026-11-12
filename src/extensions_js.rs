@@ -16121,31 +16121,132 @@ class Stream extends EventEmitter {
 class Readable extends Stream {
   constructor(opts = {}) {
     super();
-    this._readableState = { flowing: null, ended: false, encoding: opts.encoding || null };
+    this._readableState = { flowing: null, ended: false, endEmitted: false, encoding: opts.encoding || null };
     this.readable = true;
     this._queue = [];
+    this._flowing = false;
+    this._flowScheduled = false;
+    this._endScheduled = false;
+    this._readRequested = false;
+    this._readWaiter = null;
     this._pipeCleanup = new Map();
     this._autoDestroy = opts.autoDestroy !== false;
   }
 
-  push(chunk) {
-    if (chunk === null) {
-      if (this._readableState.ended) return false;
-      this._readableState.ended = true;
+  get readableEnded() { return this._readableState.endEmitted; }
+  get readableFlowing() { return this._readableState.flowing; }
+  isPaused() { return this._readableState.flowing === false; }
+
+  on(event, listener) {
+    super.on(event, listener);
+    this._consumerAdded(event);
+    return this;
+  }
+
+  addListener(event, listener) { return this.on(event, listener); }
+
+  prependListener(event, listener) {
+    super.prependListener(event, listener);
+    this._consumerAdded(event);
+    return this;
+  }
+
+  _consumerAdded(event) {
+    if (event === "data" && this._readableState.flowing !== false) {
+      this.resume();
+    } else if (event === "readable") {
+      this.pause();
+      this._readRequested = true;
+      this._wakeRead();
       __streamQueueMicrotask(() => {
-        this.emit("end");
-        if (this._autoDestroy) this.emit("close");
+        if (!this.destroyed && this._queue.length > 0) this.emit("readable");
+        this._maybeEnd();
       });
+    }
+  }
+
+  _wakeRead() {
+    const wake = this._readWaiter;
+    this._readWaiter = null;
+    if (wake) wake();
+  }
+
+  // Only the source adapter waits here. A paused iterator or pipe must not
+  // pull another HTTP body/iterable chunk until its consumer asks for it.
+  async _waitForRead() {
+    while (!this.destroyed && !this._readableState.ended) {
+      if (this._queue.length === 0 &&
+          (this._readableState.flowing === true || this._readRequested)) {
+        this._readRequested = false;
+        return true;
+      }
+      await new Promise((resolve) => { this._readWaiter = resolve; });
+    }
+    return false;
+  }
+
+  _maybeEnd() {
+    if (!this._readableState.ended || this._readableState.endEmitted ||
+        this._queue.length > 0 || this.destroyed || this._endScheduled) return;
+    this._endScheduled = true;
+    __streamQueueMicrotask(() => {
+      this._endScheduled = false;
+      if (this.destroyed || this._queue.length > 0 || this._readableState.endEmitted) return;
+      this._readableState.endEmitted = true;
+      this.readable = false;
+      this.emit("end");
+      if (this._autoDestroy && !this.destroyed) this.destroy();
+    });
+  }
+
+  _flow() {
+    if (this._flowing || this.destroyed) return;
+    this._flowing = true;
+    try {
+      while (!this.destroyed && this._readableState.flowing === true && this._queue.length > 0) {
+        // Relinquish the queued copy before invoking consumers. Flowing
+        // streams must not retain every byte of a long-lived response.
+        this.emit("data", this._queue.shift());
+      }
+    } finally {
+      this._flowing = false;
+    }
+    this._maybeEnd();
+    this._wakeRead();
+  }
+
+  push(chunk) {
+    if (this.destroyed || this._readableState.ended) return false;
+    if (chunk === null) {
+      this._readableState.ended = true;
+      this._maybeEnd();
+      this._wakeRead();
       return false;
     }
     const normalized = __normalizeChunk(chunk, this._readableState.encoding);
     this._queue.push(normalized);
-    this.emit("data", normalized);
-    return true;
+    if (this._readableState.flowing === true) this._flow();
+    else this.emit("readable");
+    return this._queue.length === 0;
   }
 
   read(_size) {
-    return this._queue.length > 0 ? this._queue.shift() : null;
+    const value = this._queue.length > 0 ? this._queue.shift() : null;
+    if (this._queue.length === 0) {
+      this._readRequested = true;
+      this._wakeRead();
+      this._maybeEnd();
+    }
+    return value;
+  }
+
+  destroy(error) {
+    if (this.destroyed) return this;
+    this._queue.length = 0;
+    this._readRequested = false;
+    this.readable = false;
+    this._wakeRead();
+    return super.destroy(error);
   }
 
   pipe(dest) {
@@ -16191,6 +16292,7 @@ class Readable extends Stream {
       dest.on("drain", onDrain);
     }
     this._pipeCleanup.set(dest, cleanup);
+    this.resume();
     return dest;
   }
 
@@ -16198,17 +16300,28 @@ class Readable extends Stream {
     if (dest) {
       const cleanup = this._pipeCleanup.get(dest);
       if (cleanup) cleanup();
+      if (this._pipeCleanup.size === 0) this.pause();
       return this;
     }
     for (const cleanup of this._pipeCleanup.values()) {
       cleanup();
     }
     this._pipeCleanup.clear();
+    this.pause();
     return this;
   }
 
   resume() {
     this._readableState.flowing = true;
+    // Defer buffered delivery until callers have installed their end/error
+    // listeners too (notably readline and stream.pipe).
+    if (!this._flowScheduled) {
+      this._flowScheduled = true;
+      __streamQueueMicrotask(() => {
+        this._flowScheduled = false;
+        this._flow();
+      });
+    }
     return this;
   }
 
@@ -16222,7 +16335,7 @@ class Readable extends Stream {
     const queue = [];
     const waiters = [];
     let queuedBytes = 0;
-    let done = stream.destroyed || stream._readableState.ended;
+    let done = stream.destroyed || stream._readableState.endEmitted;
     let failure = null;
 
     const settleDone = () => {
@@ -16307,15 +16420,42 @@ class Readable extends Stream {
   }
 
   static from(iterable, opts = {}) {
+    const iterator = iterable?.[Symbol.asyncIterator]?.() || iterable?.[Symbol.iterator]?.();
+    if (!iterator || typeof iterator.next !== "function") {
+      throw new TypeError("Readable.from expects an iterable");
+    }
     const readable = new Readable(opts);
+    let complete = false;
+    let returned = false;
+    const closeIterator = () => {
+      if (complete || returned) return;
+      returned = true;
+      try { Promise.resolve(iterator.return?.()).catch(() => {}); } catch (_) {}
+    };
+    const originalDestroy = readable.destroy.bind(readable);
+    readable.destroy = (error) => {
+      if (readable.destroyed) return readable;
+      closeIterator();
+      return originalDestroy(error);
+    };
     (async () => {
       try {
-        for await (const chunk of iterable) {
+        while (await readable._waitForRead()) {
+          const item = await iterator.next();
+          if (readable.destroyed) break;
+          if (item.done) {
+            complete = true;
+            readable.push(null);
+            break;
+          }
+          const chunk = await item.value;
+          if (readable.destroyed) break;
           readable.push(chunk);
         }
-        readable.push(null);
       } catch (err) {
-        readable.emit("error", __streamToError(err));
+        if (!readable.destroyed) readable.destroy(__streamToError(err));
+      } finally {
+        closeIterator();
       }
     })();
     return readable;
@@ -16327,50 +16467,38 @@ class Readable extends Stream {
     }
     const reader = webReadable.getReader();
     const readable = new Readable(opts);
-    let resumeRead = null;
+    let complete = false;
     const originalDestroy = readable.destroy.bind(readable);
-    readable.pause = () => {
-      readable._readableState.flowing = false;
-      return readable;
-    };
-    readable.resume = () => {
-      readable._readableState.flowing = true;
-      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
-      return readable;
-    };
     readable.destroy = (error) => {
       if (readable.destroyed) return readable;
-      try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch (_) {}
-      if (resumeRead) { const resume = resumeRead; resumeRead = null; resume(); }
+      if (!complete) {
+        try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch (_) {}
+      }
       return originalDestroy(error);
     };
     (async () => {
       try {
-        while (!readable.destroyed) {
-          if (readable._readableState.flowing === false) {
-            await new Promise((resolve) => { resumeRead = resolve; });
-          }
-          if (readable.destroyed) break;
+        while (await readable._waitForRead()) {
           const { done, value } = await reader.read();
-          if (done || readable.destroyed) break;
+          if (readable.destroyed) break;
+          if (done) {
+            complete = true;
+            readable.push(null);
+            break;
+          }
           const normalized = __normalizeChunk(value, readable._readableState.encoding);
           const chunk = !opts.objectMode && typeof normalized !== 'string' &&
               typeof Buffer !== 'undefined' && !Buffer.isBuffer(normalized)
             ? Buffer.from(normalized)
             : normalized;
-          // Event consumers already receive the bytes. Retaining another copy
-          // in Readable._queue leaks an entire long-lived SSE response.
-          if (readable.listenerCount('data') > 0) {
-            readable.emit('data', chunk);
-          } else {
-            const retained = readable._queue.reduce((size, part) => size + (part.byteLength || part.length || 0), 0);
-            if (retained + (chunk.byteLength || chunk.length || 0) > 1024 * 1024) {
-              throw new Error('Readable.fromWeb buffer exceeds 1 MiB without a consumer');
-            }
-            readable._queue.push(chunk);
+          // A consumer can pause while reader.read() is pending. Retain at
+          // most that one in-flight chunk, under the existing byte bound.
+          if (readable._readableState.flowing !== true &&
+              (chunk.byteLength || chunk.length || 0) > 1024 * 1024) {
+            throw new Error('Readable.fromWeb buffer exceeds 1 MiB without a consumer');
           }
+          readable.push(chunk);
         }
-        if (!readable.destroyed) readable.push(null);
       } catch (err) {
         if (!readable.destroyed) readable.destroy(__streamToError(err));
       } finally {
@@ -16681,7 +16809,8 @@ class Transform extends Duplex {
     const finalize = () => {
       this.push(null);
       this.emit("finish");
-      this.emit("close");
+      // The readable side may still contain paused output. Its EOF owns
+      // close; closing here would strand a later iterator or pipe consumer.
       if (typeof cb === "function") cb(null);
     };
     if (chunk !== undefined && chunk !== null) {
@@ -28912,10 +29041,12 @@ mod tests {
             20_034,
             "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
         ),
+        // Buffered delivery and demand-driven adapters add 3_951 bytes.
+        // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            21_108,
-            "b35c1978b8bb6c50571e4b4c31f12582380a1b024d3dfe0ac918681ee65e882a",
+            25_059,
+            "f1da4bf3268a2cfeed59d88ab8e108a2855f8323cf6b2a848905ac8dfa9270e4",
         ),
         // Re-pinned with native tool factory execution.
         (
@@ -41109,6 +41240,248 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     "afterEach"
                 ])
             );
+        });
+    }
+
+    #[test]
+    fn pijs_readable_delayed_consumers_preserve_data_before_end() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.delayedReadable = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough } = await import("node:stream");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        const received = {};
+                        const buffered = new Readable();
+                        buffered.push("alpha");
+                        buffered.push("-omega");
+                        buffered.push(null);
+                        const transformed = new PassThrough();
+                        transformed.write("alpha");
+                        transformed.end("-omega");
+                        const streams = {
+                            buffered,
+                            transformed,
+                            iterable: Readable.from(["alpha", "-omega"]),
+                            web: Readable.fromWeb(new ReadableStream({
+                                start(controller) {
+                                    controller.enqueue(Buffer.from("alpha"));
+                                    controller.enqueue(Buffer.from("-omega"));
+                                    controller.close();
+                                },
+                            })),
+                        };
+                        // Let eager adapters finish before the consumer exists.
+                        // Each source must still deliver its complete bytes.
+                        await settle();
+                        for (const [name, stream] of Object.entries(streams)) {
+                            const order = [];
+                            stream.on("end", () => order.push("end"));
+                            stream.on("close", () => order.push("close"));
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(String(chunk));
+                            await settle();
+                            received[name] = { text: chunks.join(""), order, buffered: stream._queue.length };
+                        }
+                        globalThis.delayedReadable = { done: true, received };
+                    })().catch(error => {
+                        globalThis.delayedReadable.error = String(error);
+                    });
+                    "#,
+                )
+                .await
+                .expect("evaluate delayed readable consumers");
+
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "delayedReadable").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for name in ["buffered", "transformed", "iterable", "web"] {
+                assert_eq!(result["received"][name]["text"], json!("alpha-omega"));
+                assert_eq!(result["received"][name]["order"], json!(["end", "close"]));
+                assert_eq!(result["received"][name]["buffered"], json!(0));
+            }
+        });
+    }
+
+    #[test]
+    fn pijs_readable_flowing_delivery_releases_bytes_and_respects_pipe_backpressure() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableFlow = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const { EventEmitter } = await import("node:events");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        const source = Readable.from((function* () {
+                            for (let i = 0; i < 512; i++) yield Buffer.alloc(8192, 65);
+                        })());
+                        let bytes = 0;
+                        let retainedChunks = 0;
+                        source.on("data", chunk => {
+                            bytes += chunk.length;
+                            retainedChunks = Math.max(retainedChunks, source._queue.length);
+                        });
+                        await new Promise((resolve, reject) => source.on("end", resolve).on("error", reject));
+
+                        const input = new Readable();
+                        const sink = new EventEmitter();
+                        const chunks = [];
+                        let ended = 0;
+                        sink.write = chunk => { chunks.push(String(chunk)); return chunks.length > 1; };
+                        sink.end = () => { ended++; };
+                        input.pipe(sink);
+                        input.push("first");
+                        input.push("second");
+                        input.push(null);
+                        await settle();
+                        const paused = { chunks: [...chunks], ended };
+                        sink.emit("drain");
+                        await settle();
+                        globalThis.readableFlow = {
+                            done: true, bytes, retainedChunks, paused,
+                            drained: { chunks, ended, buffered: input._queue.length },
+                        };
+                    })().catch(error => {
+                        globalThis.readableFlow.error = String(error);
+                    });
+                    "#,
+                )
+                .await
+                .expect("evaluate readable flow and backpressure");
+
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableFlow").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["bytes"], json!(4 * 1024 * 1024));
+            assert_eq!(result["retainedChunks"], json!(0));
+            assert_eq!(result["paused"], json!({"chunks":["first"],"ended":0}));
+            assert_eq!(
+                result["drained"],
+                json!({"chunks":["first","second"],"ended":1,"buffered":0})
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_readable_adapters_pull_on_demand_and_cancel_owned_sources() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableDemand = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        let reads = 0;
+                        let cancelled = 0;
+                        let released = 0;
+                        const web = Readable.fromWeb({
+                            getReader() {
+                                return {
+                                    async read() {
+                                        reads++;
+                                        return reads <= 8 ? { value: Buffer.from("one"), done: false } : { done: true };
+                                    },
+                                    async cancel() { cancelled++; },
+                                    releaseLock() { released++; },
+                                };
+                            },
+                        });
+                        let iterations = 0;
+                        let returned = 0;
+                        const iterable = Readable.from({
+                            [Symbol.iterator]() { return this; },
+                            next() {
+                                iterations++;
+                                return iterations <= 8 ? { value: "two", done: false } : { done: true };
+                            },
+                            return() { returned++; return { done: true }; },
+                        });
+                        await settle();
+                        const before = { reads, iterations };
+                        const webIterator = web[Symbol.asyncIterator]();
+                        const iterableIterator = iterable[Symbol.asyncIterator]();
+                        const first = [String((await webIterator.next()).value), (await iterableIterator.next()).value];
+                        await settle();
+                        const waiting = { reads, iterations };
+                        await webIterator.return();
+                        await iterableIterator.return();
+                        await settle();
+
+                        let finishRead;
+                        let pendingCancelled = 0;
+                        let pendingReleased = 0;
+                        const pendingStream = Readable.fromWeb({
+                            getReader() {
+                                return {
+                                    read() { return new Promise(resolve => { finishRead = resolve; }); },
+                                    async cancel() { pendingCancelled++; finishRead({ done: true }); },
+                                    releaseLock() { pendingReleased++; },
+                                };
+                            },
+                        });
+                        const pendingIterator = pendingStream[Symbol.asyncIterator]();
+                        const pendingRead = pendingIterator.next();
+                        await settle();
+                        await pendingIterator.return();
+                        const pendingDone = (await pendingRead).done;
+                        await settle();
+
+                        globalThis.readableDemand = {
+                            done: true, before, first, waiting, reads, iterations,
+                            cancelled, released, returned, pendingCancelled, pendingReleased, pendingDone,
+                            destroyed: web.destroyed && iterable.destroyed && pendingStream.destroyed,
+                            listeners: web.listenerCount("data") + iterable.listenerCount("data"),
+                        };
+                    })().catch(error => {
+                        globalThis.readableDemand.error = String(error);
+                    });
+                    "#,
+                )
+                .await
+                .expect("evaluate readable adapter demand and cancellation");
+
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableDemand").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["before"], json!({"reads":0,"iterations":0}));
+            assert_eq!(result["first"], json!(["one", "two"]));
+            assert_eq!(result["waiting"], json!({"reads":1,"iterations":1}));
+            assert_eq!(result["reads"], json!(1));
+            assert_eq!(result["iterations"], json!(1));
+            assert_eq!(result["cancelled"], json!(1));
+            assert_eq!(result["released"], json!(1));
+            assert_eq!(result["returned"], json!(1));
+            assert_eq!(result["pendingCancelled"], json!(1));
+            assert_eq!(result["pendingReleased"], json!(1));
+            assert_eq!(result["pendingDone"], json!(true));
+            assert_eq!(result["destroyed"], json!(true));
+            assert_eq!(result["listeners"], json!(0));
         });
     }
 
