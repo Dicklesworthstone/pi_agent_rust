@@ -61,8 +61,12 @@ impl AnthropicProvider {
         // Hooks and later stream consumers may run under other task contexts.
         // They must not replace the authority or cancellation owner of this call.
         let owner = AgentCx::for_current_or_request();
-        let original = vertex_request(serde_json::to_value(self.build_request(context, options))?)
-            .map_err(|message| Error::provider(self.name(), message))?;
+        let original = vertex_request(serde_json::to_value(self.build_request_for_api(
+            context,
+            options,
+            "google-vertex",
+        ))?)
+        .map_err(|message| Error::provider(self.name(), message))?;
         let rewritten = super::super::offer_before_provider_request(
             options,
             self.name(),
@@ -562,7 +566,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::StopReason;
+    use crate::model::{
+        Message, StopReason, TextContent, ToolResultMessage, UserContent, UserMessage,
+    };
     use asupersync::runtime::RuntimeBuilder;
     use futures::FutureExt as _;
     use std::collections::VecDeque;
@@ -1034,6 +1040,97 @@ mod tests {
             panic!("expected opaque thinking");
         };
         assert_eq!(redacted.data, "b3BhcXVl");
+    }
+
+    #[test]
+    fn streamed_thinking_survives_session_round_trip_and_tool_result_continuation() {
+        for (api, provider_name) in [
+            ("anthropic-messages", "anthropic"),
+            ("anthropic-messages", "configured-claude-relay"),
+            ("google-vertex", "google-vertex"),
+        ] {
+            let events = collect_wire_for_api(
+                [
+                    start(),
+                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}),
+                    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "c2lnLWVtcHR5"}}),
+                    stop(0),
+                    json!({"type": "content_block_start", "index": 1, "content_block": {"type": "redacted_thinking", "data": "b3BhcXVlCg=="}}),
+                    stop(1),
+                    json!({"type": "content_block_start", "index": 2, "content_block": {"type": "thinking"}}),
+                    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "thinking_delta", "thinking": "Read the file."}}),
+                    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "signature_delta", "signature": "c2lnLXZpc2libGU="}}),
+                    stop(2),
+                    tool_start(3, "call_read", &json!({})),
+                    tool_delta(3, r#"{"path":"src/lib.rs"}"#),
+                    stop(3),
+                ]
+                .into_iter()
+                .chain(finish()),
+                api,
+                provider_name,
+            );
+            assert!(events.iter().all(Result::is_ok), "{events:?}");
+            let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+                panic!("expected Done");
+            };
+            assert_eq!(message.api, api);
+            assert_eq!(message.provider, provider_name);
+            assert_eq!(message.stop_reason, StopReason::ToolUse);
+
+            // Use the session's serialized Message shape before replaying the
+            // completed tool call. No credentials or external API are involved.
+            let saved = serde_json::to_vec(&Message::assistant(message.clone())).unwrap();
+            let restored: Message = serde_json::from_slice(&saved).unwrap();
+            let context = Context {
+                messages: vec![
+                    Message::User(UserMessage {
+                        content: UserContent::Text("Read src/lib.rs".to_string()),
+                        timestamp: 0,
+                    }),
+                    restored,
+                    Message::tool_result(ToolResultMessage {
+                        tool_call_id: "call_read".to_string(),
+                        tool_name: "read".to_string(),
+                        content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+                        details: None,
+                        is_error: false,
+                        timestamp: 0,
+                    }),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let provider =
+                AnthropicProvider::new("claude-sonnet-4-6").with_provider_name(provider_name);
+            let options = StreamOptions::default();
+            let request = if api == "google-vertex" {
+                provider.build_request_for_api(&context, &options, api)
+            } else {
+                provider.build_request(&context, &options)
+            };
+            let mut body = serde_json::to_value(request).unwrap();
+            if api == "google-vertex" {
+                body = vertex_request(body).unwrap();
+            }
+            assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                body["messages"][1],
+                json!({"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "c2lnLWVtcHR5"},
+                    {"type": "redacted_thinking", "data": "b3BhcXVlCg=="},
+                    {"type": "thinking", "thinking": "Read the file.", "signature": "c2lnLXZpc2libGU="},
+                    {"type": "tool_use", "id": "call_read", "name": "read", "input": {"path": "src/lib.rs"}}
+                ]}),
+                "{provider_name}/{api}"
+            );
+            assert_eq!(
+                body["messages"][2],
+                json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_read",
+                    "content": [{"type": "text", "text": "file contents"}]}]})
+            );
+            assert_eq!(serde_json::to_vec(&context.messages[1]).unwrap(), saved);
+        }
     }
 
     #[test]
