@@ -142,10 +142,55 @@ struct CostState {
     // Canonical saved-session sinks, activated by an acknowledged live save
     // or a committed handoff. Both retain the same absolute writer counter.
     retired: BTreeMap<std::path::PathBuf, Retirement>,
+    // A live save must durably identify its registered writer before another
+    // request can start. Already-owned attempts may settle during this save.
+    registration_pending: bool,
     closure_deadline: Option<Instant>,
 }
 
 impl CostState {
+    fn check_health(&self) -> Result<()> {
+        if let Some(failure) = &self.failure {
+            return Err(Error::session(format!(
+                "model cost accounting unavailable; no further requests admitted: {failure}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_admission(&self) -> Result<()> {
+        self.check_health()?;
+        if self.registration_pending {
+            return Err(Error::session_persistence(
+                "model cost journal registration is not durably acknowledged; new requests are blocked",
+            ));
+        }
+        let spent = self.snapshot.admission_spend();
+        if let Some(cap) = self.snapshot.max_cost
+            && spent >= cap
+        {
+            return Err(Error::CostCap { spent, cap });
+        }
+        Ok(())
+    }
+
+    fn registration_checkpoint_needed(&self, session: &Session) -> Result<bool> {
+        let Some(canonical) = self.retired.values().next() else {
+            return Ok(false);
+        };
+        let checkpoint = saved_checkpoint(session, &self.account)?;
+        if !checkpoint_registered(checkpoint)? {
+            return Ok(true);
+        }
+        let references: LedgerRefs = checkpoint
+            .get("lateSources")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        validate_references(&references)?;
+        Ok(references.get(&self.account) != Some(&canonical.origin.reference()))
+    }
+
     fn finalize(&mut self, cost: f64, deadline: Option<Instant>) -> Result<()> {
         self.closure_deadline = deadline;
         self.snapshot.spent = add_cost(self.snapshot.spent, cost);
@@ -389,6 +434,7 @@ impl CostBudget {
                 own_finalized: 0.0,
                 imported: Writers::new(),
                 retired: BTreeMap::new(),
+                registration_pending: false,
                 closure_deadline: None,
             })),
             remote: None,
@@ -410,6 +456,7 @@ impl CostBudget {
                 own_finalized: 0.0,
                 imported: Writers::new(),
                 retired: BTreeMap::new(),
+                registration_pending: false,
                 closure_deadline: None,
             })),
             remote: Some(remote),
@@ -679,16 +726,10 @@ impl CostBudget {
     }
 
     fn check_health(&self) -> Result<()> {
-        let state = self
-            .state
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(failure) = &state.failure {
-            return Err(Error::session(format!(
-                "model cost accounting unavailable; no further requests admitted: {failure}"
-            )));
-        }
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .check_health()
     }
 
     fn accept_remote(&self, result: Result<CostSnapshot>) -> Result<()> {
@@ -734,14 +775,11 @@ impl CostBudget {
     }
 
     pub fn admit(&self) -> Result<()> {
-        let snapshot = self.refresh()?;
-        let spent = snapshot.admission_spend();
-        if let Some(cap) = snapshot.max_cost
-            && spent >= cap
-        {
-            return Err(Error::CostCap { spent, cap });
-        }
-        Ok(())
+        self.refresh()?;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .check_admission()
     }
 
     /// Establish ownership before provider dispatch. Parent processes retain
@@ -762,6 +800,9 @@ impl CostBudget {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Registration or a final bill may have changed admission after
+            // refresh. Serialize this last check with owning the new attempt.
+            state.check_admission()?;
             if state.pending.len() >= MAX_PENDING_ATTEMPTS {
                 return Err(Error::session("too many active model cost attempts"));
             }
@@ -827,7 +868,6 @@ impl CostBudget {
             self.refresh_origin()?;
         }
         let origins = self.retained_origins()?;
-        let (_, own_reference) = self.reference_authority();
         let mut source_accounts = BTreeMap::new();
         for (key, origin) in &origins {
             if origin.all_accounts {
@@ -841,6 +881,18 @@ impl CostBudget {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Snapshot registration and its reference together. A concurrent
+        // acknowledgement must not produce a marked receipt without its ref.
+        let registered_reference = state
+            .retired
+            .values()
+            .next()
+            .map(|retired| retired.origin.reference());
+        let own_reference = registered_reference.clone().or_else(|| {
+            self.prepared_origin
+                .as_ref()
+                .map(|origin| origin.reference())
+        });
         if recorded_billing_unavailable(session) && state.failure.is_none() {
             state.quarantine(RECORDED_BILLING_FAILURE);
         }
@@ -895,6 +947,9 @@ impl CostBudget {
         if !references.is_empty() {
             data["lateSources"] = serde_json::to_value(references)?;
         }
+        if registered_reference.is_some() {
+            data["lateRegistered"] = serde_json::json!(true);
+        }
         if !closed.is_empty() {
             data["lateClosed"] = serde_json::to_value(closed)?;
         }
@@ -935,10 +990,33 @@ impl CostBudget {
         Ok(())
     }
 
+    /// Fence new requests before the first live transcript save begins.
+    ///
+    /// Unlike a speculative checkpoint or prepared handoff, this begins the
+    /// live registration protocol. Its owner must finish both saves and their
+    /// acknowledgement, or quarantine the budget if the operation fails or is
+    /// interrupted. Already-owned requests may still settle their final bills.
+    pub fn begin_saved_registration(&self) {
+        if self.remote.is_some() {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retired.is_empty() {
+            state.registration_pending = true;
+        }
+    }
+
     /// Retain finalized charges after an acknowledged save of the live session.
     ///
-    /// The caller must checkpoint this account, observe a successful transcript
-    /// save, and invoke this before reporting that live save as complete. A
+    /// The caller must first call [`Self::begin_saved_registration`], checkpoint
+    /// this account, observe a successful transcript save, and invoke this
+    /// before reporting that live save as complete. If
+    /// [`Self::registration_checkpoint_needed`] then returns true, checkpoint
+    /// and save the registered-writer receipt and acknowledge it again. New
+    /// requests remain blocked until that receipt is durably acknowledged. A
     /// merely prepared candidate must not activate a sink. Once activated,
     /// provider settlement persists independently of later transcript saves,
     /// including auxiliary work that never appends an assistant message.
@@ -954,13 +1032,31 @@ impl CostBudget {
         if self.remote.is_some() {
             return Ok(());
         }
-        let result = if session.path.is_none() {
-            Err(Error::session(
-                "active model cost accounting requires a saved session",
-            ))
-        } else {
-            self.retire_session(session, owner)
-        };
+        let result = (|| {
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.retired.is_empty() || state.registration_checkpoint_needed(session)? {
+                    state.registration_pending = true;
+                }
+            }
+            if session.path.is_none() {
+                return Err(Error::session(
+                    "active model cost accounting requires a saved session",
+                ));
+            }
+            self.retire_session(session, owner)?;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // A staged checkpoint is not a receipt. Only the persisted entry
+            // may reopen admission, and only after journal validation succeeds.
+            state.registration_pending = state.registration_checkpoint_needed(session)?;
+            Ok(())
+        })();
         if let Err(error) = &result {
             // A mid-turn checkpoint caller may retain the transcript cursor
             // and continue its provider loop after a persistence error. The
@@ -970,6 +1066,22 @@ impl CostBudget {
             self.quarantine(&format!("model cost save acknowledgement failed: {error}"));
         }
         result
+    }
+
+    /// Whether the registered writer still needs a durable transcript receipt.
+    ///
+    /// Call after [`Self::acknowledge_saved_session`]. A true result requires
+    /// another checkpoint, completed save, and acknowledgement before exposing
+    /// the live session. This query never clears the admission fence, even when
+    /// a matching receipt has been saved since the preceding acknowledgement.
+    pub fn registration_checkpoint_needed(&self, session: &Session) -> Result<bool> {
+        if self.remote.is_some() {
+            return Ok(false);
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .registration_checkpoint_needed(session)
     }
 
     /// Retain final-bill persistence for a saved source used by a replacement
@@ -1276,6 +1388,14 @@ fn latest_checkpoint(session: &Session) -> Option<&serde_json::Value> {
     })
 }
 
+fn checkpoint_registered(checkpoint: &serde_json::Value) -> Result<bool> {
+    match checkpoint.get("lateRegistered") {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(registered)) => Ok(*registered),
+        Some(_) => Err(Error::session("invalid model cost registration receipt")),
+    }
+}
+
 fn saved_checkpoint<'a>(session: &'a Session, account: &str) -> Result<&'a serde_json::Value> {
     session
         .entries
@@ -1380,6 +1500,28 @@ fn load_session_ledgers(
         return Err(Error::session("invalid persisted model cost ancestry"));
     }
     validate_references(&references)?;
+    let registered_account = if let Some(checkpoint) = checkpoint
+        && checkpoint_registered(checkpoint)?
+    {
+        let account = checkpoint
+            .get("account")
+            .and_then(serde_json::Value::as_str)
+            .filter(|account| uuid::Uuid::parse_str(account).is_ok())
+            .ok_or_else(|| Error::session("invalid model cost registration receipt"))?;
+        if checkpoint
+            .get("lateVersion")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || !references.contains_key(account)
+            || !covered.contains_key(account)
+            || closed.contains(account)
+        {
+            return Err(Error::session("invalid model cost registration receipt"));
+        }
+        Some(account)
+    } else {
+        None
+    };
     let source = Origin::for_session(session)?;
     let source_reference = source.as_ref().map(|source| source.reference());
     let mut journal = source.as_ref().map_or_else(
@@ -1429,7 +1571,11 @@ fn load_session_ledgers(
             {
                 return Err(Error::session("prepared model cost source changed"));
             }
-            continue;
+            // A prepared reference may not exist yet. An acknowledged writer
+            // must remain readable even while its live account is preserved.
+            if registered_account != Some(account.as_str()) {
+                continue;
+            }
         }
         let group = grouped
             .entry(reference.key())
@@ -1459,7 +1605,9 @@ fn load_session_ledgers(
             let required = accounts
                 .iter()
                 .filter(|account| {
-                    prospective != Some(account.as_str()) || root_accounts.contains(*account)
+                    registered_account == Some(account.as_str())
+                        || prospective != Some(account.as_str())
+                        || root_accounts.contains(*account)
                 })
                 .cloned()
                 .collect();
@@ -1471,7 +1619,7 @@ fn load_session_ledgers(
         };
         let observed = origin.read()?;
         for (account, writer) in &observed.writers {
-            if (writer.closed || required)
+            if (writer.closed || required || registered_account == Some(account.as_str()))
                 && covered
                     .get(account)
                     .is_some_and(|covered| *covered > writer.own_total)
@@ -1717,6 +1865,20 @@ mod tests {
                 ..AssistantMessage::default()
             },
         }
+    }
+
+    async fn complete_saved_registration(
+        budget: &CostBudget,
+        session: &mut Session,
+        owner: &asupersync::Cx,
+    ) {
+        budget.acknowledge_saved_session(session, owner).unwrap();
+        if budget.registration_checkpoint_needed(session).unwrap() {
+            budget.checkpoint(session).unwrap();
+            session.save().await.unwrap();
+            budget.acknowledge_saved_session(session, owner).unwrap();
+        }
+        assert!(!budget.registration_checkpoint_needed(session).unwrap());
     }
 
     #[test]
@@ -2604,7 +2766,11 @@ mod tests {
             let unrelated = CostBudget::new(None, Some(5.0), 0.0).unwrap();
             assert!(unrelated.acknowledge_saved_session(&candidate, owner.cx()).is_err());
             assert!(!origin.key.exists());
-            budget.acknowledge_saved_session(&candidate, owner.cx()).unwrap();
+            runtime.block_on(complete_saved_registration(
+                &budget,
+                &mut candidate,
+                owner.cx(),
+            ));
             assert_eq!(recorded_spend(&candidate).unwrap(), 0.5);
             budget.record(0.25).unwrap();
             assert_eq!(recorded_spend(&candidate).unwrap(), 0.75);
@@ -2648,6 +2814,210 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn live_registration_blocks_new_work_until_the_saved_receipt_is_acknowledged() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        let retained = budget.clone();
+        let mut first = budget.start_attempt().unwrap();
+        first.observe(0.25).unwrap();
+        let mut later = retained.start_attempt().unwrap();
+        later.observe(0.125).unwrap();
+        let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        let assert_pending = || {
+            assert!(budget.admit().unwrap_err().is_session_persistence());
+            assert!(matches!(
+                retained.start_attempt(),
+                Err(error) if error.is_session_persistence()
+            ));
+        };
+
+        budget.begin_saved_registration();
+        assert_pending();
+        budget.checkpoint(&mut source).unwrap();
+        assert!(
+            latest_checkpoint(&source)
+                .unwrap()
+                .get("lateRegistered")
+                .is_none()
+        );
+        // Owned work can finish while the very first transcript save is pending.
+        first.finish(0.5).unwrap();
+        assert_eq!(budget.refresh().unwrap().spent, 0.5);
+        runtime.block_on(source.save()).unwrap();
+        assert_pending();
+        budget
+            .acknowledge_saved_session(&source, owner.cx())
+            .unwrap();
+        assert!(budget.registration_checkpoint_needed(&source).unwrap());
+        assert_pending();
+
+        budget.checkpoint(&mut source).unwrap();
+        assert_eq!(latest_checkpoint(&source).unwrap()["lateRegistered"], true);
+        // These final bills arrive after the registered receipt's snapshot.
+        later.finish(0.25).unwrap();
+        budget.record(0.125).unwrap();
+        assert_eq!(budget.refresh().unwrap().spent, 0.875);
+        assert!(budget.registration_checkpoint_needed(&source).unwrap());
+        budget
+            .acknowledge_saved_session(&source, owner.cx())
+            .unwrap();
+        assert_pending();
+        runtime.block_on(source.save()).unwrap();
+        assert!(!budget.registration_checkpoint_needed(&source).unwrap());
+        // Reading a saved receipt is insufficient: its journal ACK still owns
+        // the release of the admission fence.
+        assert_pending();
+        budget
+            .acknowledge_saved_session(&source, owner.cx())
+            .unwrap();
+        assert!(!budget.registration_checkpoint_needed(&source).unwrap());
+        budget.begin_saved_registration();
+        retained.admit().unwrap();
+        let mut next = retained.start_attempt().unwrap();
+        next.finish(0.125).unwrap();
+        assert_eq!(budget.spent(), 1.0);
+        assert_eq!(budget.snapshot().pending, 0.0);
+
+        let reopened = runtime
+            .block_on(Session::open(
+                source.path.as_ref().unwrap().to_str().unwrap(),
+            ))
+            .unwrap();
+        let resumed = CostBudget::from_session(&reopened, None, Some(1.0)).unwrap();
+        assert_eq!(resumed.spent(), 1.0);
+        assert!(matches!(resumed.admit(), Err(Error::CostCap { .. })));
+    }
+
+    #[test]
+    fn registered_writer_receipts_refuse_missing_or_replaced_journals_on_cold_resume() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        for corruption in [
+            "missing-journal",
+            "empty-writers",
+            "replaced-writer",
+            "replaced-session",
+            "decreased-covered-total",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            let budget = CostBudget::new(None, Some(2.0), 0.0).unwrap();
+            budget.record(0.5).unwrap();
+            budget.begin_saved_registration();
+            budget.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            runtime.block_on(complete_saved_registration(
+                &budget,
+                &mut source,
+                owner.cx(),
+            ));
+            budget.record(0.75).unwrap();
+            let account = budget.account_id();
+            let path = source.path.clone().unwrap();
+            let transcript = std::fs::read(&path).unwrap();
+            let origin = Origin::for_session(&source).unwrap().unwrap();
+            let mut journal = serde_json::to_value(origin.read().unwrap()).unwrap();
+            assert_eq!(journal["writers"][&account]["ownTotal"], 1.25);
+            std::fs::rename(&origin.key, directory.path().join("retained-journal.json")).unwrap();
+            match corruption {
+                "missing-journal" => {}
+                "empty-writers" => journal["writers"] = serde_json::json!({}),
+                "replaced-writer" => {
+                    let writers = journal["writers"].as_object_mut().unwrap();
+                    let writer = writers.remove(&account).unwrap();
+                    writers.insert(uuid::Uuid::new_v4().to_string(), writer);
+                }
+                "replaced-session" => {
+                    journal["sessionId"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+                }
+                "decreased-covered-total" => {
+                    journal["writers"][&account]["baselineOwn"] = serde_json::json!(0.0);
+                    journal["writers"][&account]["ownTotal"] = serde_json::json!(0.25);
+                }
+                _ => unreachable!(),
+            }
+            if corruption != "missing-journal" {
+                std::fs::write(&origin.key, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            let damaged = std::fs::read(&origin.key).ok();
+            // Reopen only the on-disk transcript. No read through the original
+            // budget may supply the lost writer's in-memory observations.
+            let reopened = runtime
+                .block_on(Session::open(path.to_str().unwrap()))
+                .unwrap();
+            assert_eq!(
+                latest_checkpoint(&reopened).unwrap()["lateRegistered"],
+                true
+            );
+            assert!(recorded_spend(&reopened).is_err(), "{corruption}");
+            assert!(
+                CostBudget::from_session(&reopened, None, Some(2.0)).is_err(),
+                "{corruption}"
+            );
+            assert!(
+                budget.for_replacement(&reopened, true).is_err(),
+                "{corruption}"
+            );
+            assert_eq!(budget.spent(), 1.25, "{corruption}");
+            assert_eq!(std::fs::read(&origin.key).ok(), damaged, "{corruption}");
+            assert_eq!(std::fs::read(&path).unwrap(), transcript, "{corruption}");
+        }
+    }
+
+    #[test]
+    fn failed_registration_ack_cannot_reopen_admission_or_recreate_the_journal() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        budget.record(0.5).unwrap();
+        let mut owned = budget.start_attempt().unwrap();
+        budget.begin_saved_registration();
+        budget.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        budget
+            .acknowledge_saved_session(&source, owner.cx())
+            .unwrap();
+        budget.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        assert!(!budget.registration_checkpoint_needed(&source).unwrap());
+        let origin = Origin::for_session(&source).unwrap().unwrap();
+        let transcript = std::fs::read(source.path.as_ref().unwrap()).unwrap();
+        std::fs::rename(&origin.key, directory.path().join("retained-journal.json")).unwrap();
+
+        assert!(
+            budget
+                .acknowledge_saved_session(&source, owner.cx())
+                .is_err()
+        );
+        assert!(budget.admit().is_err());
+        assert!(budget.start_attempt().is_err());
+        assert!(owned.finish(0.75).is_err());
+        assert_eq!(budget.spent(), 1.25);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert!(!origin.key.exists());
+        assert_eq!(
+            std::fs::read(source.path.as_ref().unwrap()).unwrap(),
+            transcript
+        );
+        let reopened = runtime
+            .block_on(Session::open(
+                source.path.as_ref().unwrap().to_str().unwrap(),
+            ))
+            .unwrap();
+        assert!(CostBudget::from_session(&reopened, None, Some(5.0)).is_err());
     }
 
     #[test]
@@ -2714,9 +3084,11 @@ mod tests {
             let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
             budget.checkpoint(&mut source).unwrap();
             runtime.block_on(source.save()).unwrap();
-            budget
-                .acknowledge_saved_session(&source, owner.cx())
-                .unwrap();
+            runtime.block_on(complete_saved_registration(
+                &budget,
+                &mut source,
+                owner.cx(),
+            ));
             budget.record(1.0).unwrap();
             let mut outstanding = budget.start_attempt().unwrap();
             let account = budget.state.lock().unwrap().account.clone();
@@ -2727,7 +3099,7 @@ mod tests {
             let peer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
             peer.checkpoint(&mut source).unwrap();
             runtime.block_on(source.save()).unwrap();
-            peer.acknowledge_saved_session(&source, owner.cx()).unwrap();
+            runtime.block_on(complete_saved_registration(&peer, &mut source, owner.cx()));
             peer.record(2.0).unwrap();
             assert_eq!(latest_checkpoint(&source).unwrap()["spent"], 1.0);
             assert_eq!(recorded_spend(&source).unwrap(), 3.0);
@@ -2781,15 +3153,17 @@ mod tests {
                 let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
                 budget.checkpoint(&mut source).unwrap();
                 runtime.block_on(source.save()).unwrap();
-                budget
-                    .acknowledge_saved_session(&source, owner.cx())
-                    .unwrap();
+                runtime.block_on(complete_saved_registration(
+                    &budget,
+                    &mut source,
+                    owner.cx(),
+                ));
                 budget.record(1.0).unwrap();
                 let mut outstanding = budget.start_attempt().unwrap();
                 let peer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
                 peer.checkpoint(&mut source).unwrap();
                 runtime.block_on(source.save()).unwrap();
-                peer.acknowledge_saved_session(&source, owner.cx()).unwrap();
+                runtime.block_on(complete_saved_registration(&peer, &mut source, owner.cx()));
                 peer.record(2.0).unwrap();
                 let known_spent = if observe_by_refresh {
                     assert_eq!(budget.refresh().unwrap().spent, 3.0);
@@ -2837,9 +3211,11 @@ mod tests {
             let original = CostBudget::new(None, Some(10.0), 0.0).unwrap();
             original.checkpoint(&mut source).unwrap();
             runtime.block_on(source.save()).unwrap();
-            original
-                .acknowledge_saved_session(&source, owner.cx())
-                .unwrap();
+            runtime.block_on(complete_saved_registration(
+                &original,
+                &mut source,
+                owner.cx(),
+            ));
             original.record(1.0).unwrap();
             let observer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
             observer.checkpoint(&mut source).unwrap();
@@ -2883,17 +3259,21 @@ mod tests {
         let original = CostBudget::new(None, Some(10.0), 0.0).unwrap();
         original.checkpoint(&mut source).unwrap();
         runtime.block_on(source.save()).unwrap();
-        original
-            .acknowledge_saved_session(&source, owner.cx())
-            .unwrap();
+        runtime.block_on(complete_saved_registration(
+            &original,
+            &mut source,
+            owner.cx(),
+        ));
         original.record(1.0).unwrap();
         let account = original.state.lock().unwrap().account.clone();
         let observer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
         observer.checkpoint(&mut source).unwrap();
         runtime.block_on(source.save()).unwrap();
-        observer
-            .acknowledge_saved_session(&source, owner.cx())
-            .unwrap();
+        runtime.block_on(complete_saved_registration(
+            &observer,
+            &mut source,
+            owner.cx(),
+        ));
         drop(original);
         assert_eq!(observer.refresh().unwrap().spent, 1.0);
         let origin = Origin::for_session(&source).unwrap().unwrap();
@@ -3295,8 +3675,20 @@ mod tests {
         drop(prepared);
         assert!(!source_origin.key.exists());
         budget.admit().unwrap();
+        assert!(!budget.registration_checkpoint_needed(&source).unwrap());
+        let reopened = runtime
+            .block_on(Session::open(
+                source.path.as_ref().unwrap().to_str().unwrap(),
+            ))
+            .unwrap();
+        assert!(
+            latest_checkpoint(&reopened)
+                .unwrap()
+                .get("lateRegistered")
+                .is_none()
+        );
         assert_eq!(
-            CostBudget::from_session(&source, None, Some(10.0))
+            CostBudget::from_session(&reopened, None, Some(10.0))
                 .unwrap()
                 .spent(),
             1.0

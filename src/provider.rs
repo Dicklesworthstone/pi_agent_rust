@@ -2293,6 +2293,13 @@ mod tests {
             budget
                 .acknowledge_saved_session(&session, owner.cx())
                 .unwrap();
+            assert!(budget.registration_checkpoint_needed(&session).unwrap());
+            budget.checkpoint(&mut session).unwrap();
+            runtime.block_on(session.save()).unwrap();
+            budget
+                .acknowledge_saved_session(&session, owner.cx())
+                .unwrap();
+            assert!(!budget.registration_checkpoint_needed(&session).unwrap());
             let path = session.path.clone().unwrap();
             let transcript = std::fs::read(&path).unwrap();
             let lock = std::fs::read_dir(directory.path())

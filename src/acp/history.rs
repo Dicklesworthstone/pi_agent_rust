@@ -392,13 +392,30 @@ pub(super) async fn fork(
     };
     if save_source {
         if let Some(budget) = &budget {
-            budget.checkpoint(&mut source).map_err(|error| {
-                HistoryError::internal(format!("Cannot checkpoint source model spend: {error}"))
+            // ACP construction is lazy: a live session can be forked before
+            // its first prompt. Register its durable writer before a child
+            // can bill the shared account or publish that source reference.
+            let source_admission = handle
+                .map(|handle| handle.session().provider_admission_gate())
+                .unwrap_or_default();
+            if let Err(error) = crate::agent::flush_turn_autosave(
+                &mut source,
+                &source_admission,
+                crate::session::AutosaveFlushTrigger::Manual,
+                Some((budget, cx.cx())),
+            )
+            .await
+            {
+                source_admission.block(error.to_string());
+                return Err(HistoryError::internal(format!(
+                    "Cannot save source model spend: {error}"
+                )));
+            }
+        } else {
+            source.save().await.map_err(|error| {
+                HistoryError::internal(format!("Cannot save source session: {error}"))
             })?;
         }
-        source.save().await.map_err(|error| {
-            HistoryError::internal(format!("Cannot save source session: {error}"))
-        })?;
         if let Some(active) = &budget {
             let prepared = active.prepare_handoff(&source).map_err(|error| {
                 HistoryError::internal(format!("Cannot prepare fork model spend: {error}"))
@@ -1470,6 +1487,16 @@ mod tests {
                 let state = source.lock(&cx).await.unwrap();
                 state.agent_session.as_ref().unwrap().session().ensure_provider_reentry_allowed().unwrap();
             }
+            // The live source has never run a prompt. Fork acknowledgement
+            // must still leave a durable registration, not just a prospective
+            // reference that cold reopen may treat as optional.
+            let saved_source = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            let receipt = saved_source.entries.iter().rev().find_map(|entry| match entry {
+                SessionEntry::Custom(entry) if entry.custom_type == "cost_budget" => entry.data.as_ref(),
+                _ => None,
+            }).unwrap();
+            assert_eq!(receipt["lateRegistered"], true);
+            drop(saved_source);
             // Continuing source work is charged to the fork immediately.
             budget.record(0.5).unwrap();
             assert_eq!(fork_budget.spent(), 0.75);
@@ -1495,6 +1522,10 @@ mod tests {
             let recovered = crate::cost::resolve_budget(&cold, None, None, Some(2.0), None).unwrap().unwrap();
             assert_eq!(recovered.spent(), 2.0);
             assert!(matches!(recovered.admit(), Err(crate::error::Error::CostCap { spent: 2.0, cap: 2.0 })));
+            let cold_source = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            let source_cost = crate::cost::resolve_budget(&cold_source, None, None, Some(2.0), None).unwrap().unwrap();
+            assert_eq!(source_cost.spent(), 2.0);
+            assert!(matches!(source_cost.admit(), Err(crate::error::Error::CostCap { .. })));
         }));
     }
 

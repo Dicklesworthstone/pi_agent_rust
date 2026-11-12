@@ -5593,6 +5593,14 @@ pub async fn run(
 
                     let session_id = new_session.header.id.clone();
                     let cost_budget = guard.agent.replacement_cost_budget(&new_session, false)?;
+                    prepare_rpc_cost_target(
+                        cost_budget.as_ref(),
+                        guard.agent.cost_budget(),
+                        &mut new_session,
+                        guard.save_enabled(),
+                        cx.cx(),
+                    )
+                    .await?;
                     guard.invalidate_background_compaction();
                     state.provider_admission.ensure_allowed()?;
                     {
@@ -5609,6 +5617,7 @@ pub async fn run(
                                 guard.save_enabled(),
                                 &guard.provider_admission_gate(),
                                 AutosaveFlushTrigger::Manual,
+                                cx.cx(),
                             )
                             .await?;
                             if guard.save_enabled() {
@@ -5849,24 +5858,33 @@ pub async fn run(
                                 .replacement_cost_budget(&new_session, preserve_cost)?;
                             let mut retiring_budget = None;
                             if let Some(budget) = guard.agent.cost_budget() {
+                                let prepared = prepare_rpc_cost_handoff(
+                                    budget,
+                                    &mut inner_session,
+                                    guard.save_enabled(),
+                                    &guard.provider_admission_gate(),
+                                    AutosaveFlushTrigger::Manual,
+                                    cx.cx(),
+                                )
+                                .await?;
+                                if preserve_cost {
+                                    cost_budget = Some(prepared.for_replacement(&new_session, true)?);
+                                }
                                 if retiring_session {
-                                    let prepared = prepare_rpc_cost_handoff(
-                                        budget,
-                                        &mut inner_session,
-                                        guard.save_enabled(),
-                                        &guard.provider_admission_gate(),
-                                        AutosaveFlushTrigger::Manual,
-                                    )
-                                    .await?;
-                                    if preserve_cost {
-                                        cost_budget = Some(prepared.for_replacement(&new_session, true)?);
-                                    }
                                     retiring_budget = Some(prepared);
                                 }
                                 if preserve_cost && let Some(budget) = &cost_budget {
                                     budget.checkpoint(&mut new_session)?;
                                 }
                             }
+                            prepare_rpc_cost_target(
+                                cost_budget.as_ref(),
+                                guard.agent.cost_budget(),
+                                &mut new_session,
+                                guard.save_enabled(),
+                                cx.cx(),
+                            )
+                            .await?;
                             guard.invalidate_background_compaction();
                             state.provider_admission.ensure_allowed()?;
                             if guard.save_enabled()
@@ -6148,6 +6166,7 @@ pub async fn run(
                                 save_enabled,
                                 &guard.provider_admission_gate(),
                                 AutosaveFlushTrigger::Manual,
+                                cx.cx(),
                             )
                             .await?;
                             prepared.checkpoint(&mut new_session)?;
@@ -6943,21 +6962,56 @@ fn find_represented_rpc_deliveries(
     Ok(represented)
 }
 
-/// Publish the source's canonical ledger reference before a replacement can
-/// escape. Preparation itself grants no write sink; only the caller's final
-/// retirement, after candidate persistence, activates late-bill settlement.
+/// Register an independent replacement before any session-switch hook can bill
+/// it. A failed candidate must not quarantine the current session's account;
+/// shared-account targets inherit the already registered source instead.
+async fn prepare_rpc_cost_target(
+    budget: Option<&crate::cost::CostBudget>,
+    source_budget: Option<&crate::cost::CostBudget>,
+    target: &mut Session,
+    save_enabled: bool,
+    owner: &asupersync::Cx,
+) -> Result<()> {
+    let Some(budget) =
+        budget.filter(|budget| source_budget.is_none_or(|source| !source.same_tree(budget)))
+    else {
+        return Ok(());
+    };
+    if !save_enabled {
+        return Ok(());
+    }
+    let admission = ProviderAdmissionGate::default();
+    crate::agent::flush_turn_autosave(
+        target,
+        &admission,
+        AutosaveFlushTrigger::Manual,
+        Some((budget, owner)),
+    )
+    .await
+    .map_err(|error| Error::session_persistence(error.to_string()))
+}
+
+/// Publish the source's acknowledged writer and canonical reference before a
+/// replacement can escape. A never-prompted session must complete registration
+/// too, since a later fork can bill that shared account without another save.
 async fn prepare_rpc_cost_handoff(
     budget: &crate::cost::CostBudget,
     source: &mut Session,
     save_enabled: bool,
     admission: &ProviderAdmissionGate,
     trigger: AutosaveFlushTrigger,
+    owner: &asupersync::Cx,
 ) -> Result<crate::cost::CostBudget> {
-    budget.checkpoint(source)?;
     if !save_enabled {
+        budget.checkpoint(source)?;
         return Ok(budget.clone());
     }
-    crate::agent::persist_session_mutations(source, admission, trigger).await?;
+    if let Err(error) =
+        crate::agent::flush_turn_autosave(source, admission, trigger, Some((budget, owner))).await
+    {
+        admission.block(error.to_string());
+        return Err(Error::session_persistence(error.to_string()));
+    }
     let prepared = budget.prepare_handoff(source)?;
     prepared.checkpoint(source)?;
     crate::agent::persist_session_mutations(source, admission, trigger).await?;
@@ -6985,6 +7039,7 @@ async fn flush_rpc_session_on_shutdown(
             true,
             &guard.provider_admission_gate(),
             AutosaveFlushTrigger::Shutdown,
+            cx.cx(),
         )
         .await?;
         prepared.retire_session(&inner, cx.cx())

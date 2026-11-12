@@ -140,6 +140,336 @@ impl Provider for PlannedProvider {
     }
 }
 
+/// Bills without appending a primary assistant row, as native compaction and
+/// other auxiliary requests do. Only the guarded provider owns accounting.
+#[derive(Default)]
+struct AuxiliaryBillingProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Provider for AuxiliaryBillingProvider {
+    fn name(&self) -> &str {
+        "auxiliary-billing"
+    }
+
+    fn api(&self) -> &str {
+        "openai-responses"
+    }
+
+    fn model_id(&self) -> &str {
+        "auxiliary-billing"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+        Err(Error::api("this fixture must not make a primary request"))
+    }
+
+    async fn compact_native(&self, _body: &Value, _options: &StreamOptions) -> Result<Value> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"output": [], "usage": {"cost": 0.75}}))
+    }
+}
+
+fn cost_session(
+    stored: Session,
+    budget: &pi::cost::CostBudget,
+    provider: &Arc<AuxiliaryBillingProvider>,
+) -> AgentSession {
+    let agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::without_builtins(None),
+        AgentConfig {
+            cost_budget: Some(budget.clone()),
+            ..AgentConfig::default()
+        },
+    );
+    AgentSession::new(
+        agent,
+        Arc::new(asupersync::sync::Mutex::new(stored)),
+        true,
+        ResolvedCompactionSettings {
+            enabled: false,
+            ..ResolvedCompactionSettings::default()
+        },
+    )
+}
+
+fn registered_cost_journal(saved: &Session) -> PathBuf {
+    let receipt = saved
+        .entries
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            SessionEntry::Custom(entry) if entry.custom_type == "cost_budget" => {
+                entry.data.as_ref()
+            }
+            _ => None,
+        })
+        .expect("saved cost receipt");
+    assert_eq!(
+        receipt["lateRegistered"], true,
+        "a successful registration must survive a fresh session open"
+    );
+    let account = receipt["account"].as_str().expect("saved account identity");
+    let reference = &receipt["lateSources"][account];
+    PathBuf::from(reference["directory"].as_str().expect("journal directory"))
+        .join(reference["journal"].as_str().expect("journal filename"))
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // Exact quarter-dollar bills expose refunds or duplicate accounting.
+fn cold_resume_keeps_auxiliary_bills_across_successive_registered_writers() {
+    run_async_test(async {
+        for (extension, kind) in [
+            ("jsonl", SessionStoreKind::Jsonl),
+            #[cfg(feature = "sqlite-sessions")]
+            ("sqlite", SessionStoreKind::Sqlite),
+        ] {
+            let root = tempfile::tempdir().expect("cold billing session");
+            let path = root.path().join(format!("saved.{extension}"));
+            let mut stored =
+                Session::create_with_dir_and_store(Some(root.path().to_path_buf()), kind);
+            stored.path = Some(path.clone());
+            let provider = Arc::new(AuxiliaryBillingProvider::default());
+            let first = pi::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let mut live = cost_session(stored, &first, &provider);
+            live.initialize_cost_journal().await.unwrap();
+            let durable = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert!(registered_cost_journal(&durable).is_file());
+            drop(durable);
+            let first_receipt = std::fs::read(&path).unwrap();
+
+            live.agent
+                .provider()
+                .compact_native(&json!({}), &StreamOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(first.spent(), 0.75);
+            assert_eq!(std::fs::read(&path).unwrap(), first_receipt);
+            drop(live);
+            drop(first);
+
+            // Reconstruct solely from disk: neither a live Session clone nor
+            // a shared CostBudget may carry the first writer's final bill.
+            let cold = Session::open(path.to_str().unwrap()).await.unwrap();
+            let second = pi::cost::resolve_budget(&cold, None, None, Some(1.0), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(second.spent(), 0.75);
+            let mut resumed = cost_session(cold, &second, &provider);
+            resumed.persist_session().await.unwrap();
+            let durable = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert!(registered_cost_journal(&durable).is_file());
+            drop(durable);
+            let second_receipt = std::fs::read(&path).unwrap();
+            resumed
+                .agent
+                .provider()
+                .compact_native(&json!({}), &StreamOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(second.spent(), 1.5);
+            drop(resumed);
+            drop(second);
+            assert_eq!(std::fs::read(&path).unwrap(), second_receipt);
+
+            let cold = Session::open(path.to_str().unwrap()).await.unwrap();
+            let recovered = pi::cost::resolve_budget(&cold, None, None, Some(1.0), None)
+                .unwrap()
+                .unwrap();
+            for _ in 0..3 {
+                assert_eq!(recovered.refresh().unwrap().spent, 1.5);
+            }
+            assert!(matches!(
+                recovered.admit(),
+                Err(Error::CostCap {
+                    spent: 1.5,
+                    cap: 1.0
+                })
+            ));
+            let refused = pi::provider::guard_with_cost_budget(provider.clone(), recovered);
+            assert!(matches!(
+                refused
+                    .compact_native(&json!({}), &StreamOptions::default())
+                    .await,
+                Err(Error::CostCap { .. })
+            ));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        }
+    });
+}
+
+#[test]
+fn every_initial_cost_save_requires_its_journal_on_cold_reopen() {
+    run_async_test(async {
+        for (extension, kind) in [
+            ("jsonl", SessionStoreKind::Jsonl),
+            #[cfg(feature = "sqlite-sessions")]
+            ("sqlite", SessionStoreKind::Sqlite),
+        ] {
+            for boundary in ["initialize", "persist", "index", "retry"] {
+                let root = tempfile::tempdir().expect("registered billing session");
+                let path = root.path().join(format!("{boundary}.{extension}"));
+                let mut stored =
+                    Session::create_with_dir_and_store(Some(root.path().to_path_buf()), kind);
+                stored.path = Some(path.clone());
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("saved retry input".to_string()),
+                    timestamp: Some(0),
+                });
+                let provider = Arc::new(AuxiliaryBillingProvider::default());
+                let budget = pi::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let mut live = cost_session(stored, &budget, &provider);
+                match boundary {
+                    "initialize" => live.initialize_cost_journal().await.unwrap(),
+                    "persist" => live.persist_session().await.unwrap(),
+                    "index" => live.save_and_index().await.unwrap(),
+                    _ => {
+                        let input = live.prepare_retry_content().await.unwrap();
+                        assert!(matches!(
+                            input,
+                            UserContent::Text(text) if text == "saved retry input"
+                        ));
+                    }
+                }
+                let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                let journal = registered_cost_journal(&saved);
+                drop(saved);
+                let receipt = std::fs::read(&path).unwrap();
+                live.agent
+                    .provider()
+                    .compact_native(&json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                drop(live);
+                drop(budget);
+                assert_eq!(std::fs::read(&path).unwrap(), receipt);
+
+                // Preserve the journal as evidence, but remove it from its
+                // required location only after every writer has been dropped.
+                let preserved = root.path().join("preserved-billing-journal.json");
+                std::fs::rename(&journal, &preserved).unwrap();
+                let journal_bytes = std::fs::read(&preserved).unwrap();
+                let cold = Session::open(path.to_str().unwrap()).await.unwrap();
+                let error = pi::cost::resolve_budget(&cold, None, None, Some(5.0), None)
+                    .expect_err("cold resume must not refund uncheckpointed auxiliary work");
+                assert!(matches!(error, Error::Session(_)), "{boundary}: {error}");
+                assert!(
+                    !journal.exists(),
+                    "failed recovery must not create an empty replacement journal"
+                );
+                assert_eq!(std::fs::read(&preserved).unwrap(), journal_bytes);
+                assert_eq!(std::fs::read(&path).unwrap(), receipt);
+            }
+        }
+    });
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // Exact quarters distinguish an owned bill from a refused new request.
+fn pending_and_interrupted_cost_registration_fence_escaped_provider_handles() {
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("runtime with serial persistence");
+    runtime.block_on(async {
+        for (registered, interrupt) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("registration.jsonl");
+            let mut stored = Session::create_with_dir(Some(root.path().to_path_buf()));
+            stored.path = Some(path.clone());
+            stored.append_message(SessionMessage::User {
+                content: UserContent::Text("existing transcript".to_string()),
+                timestamp: Some(0),
+            });
+            let budget = pi::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let mut owned = budget.start_attempt().unwrap();
+            if registered {
+                budget.checkpoint(&mut stored).unwrap();
+            }
+            stored.save().await.unwrap();
+            if registered {
+                // Stage a real first journal acknowledgement, leaving only
+                // its durable registration receipt to be saved. The lock
+                // below now blocks that second protocol stage specifically.
+                let owner = pi::agent_cx::AgentCx::for_testing_with_io();
+                budget
+                    .acknowledge_saved_session(&stored, owner.cx())
+                    .unwrap();
+            }
+            let baseline = std::fs::read(&path).unwrap();
+            let provider = Arc::new(AuxiliaryBillingProvider::default());
+            let mut live = cost_session(stored, &budget, &provider);
+            let escaped = live.agent.provider();
+            let mut lock_path = path.as_os_str().to_os_string();
+            lock_path.push(".lock");
+            let file_lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(PathBuf::from(lock_path))
+                .unwrap();
+            fs4::FileExt::try_lock(&file_lock).expect("hold registration save");
+            let mut registration = Box::pin(live.initialize_cost_journal());
+            assert!(futures::poll!(registration.as_mut()).is_pending());
+            let error = escaped
+                .compact_native(&json!({}), &StreamOptions::default())
+                .await
+                .expect_err("an escaped provider cannot bypass pending registration");
+            assert!(matches!(error, Error::Session(_)));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&path).unwrap(), baseline);
+            owned
+                .finish(0.25)
+                .expect("already owned billing must settle");
+            drop(owned);
+
+            if interrupt {
+                drop(registration);
+                fs4::FileExt::unlock(&file_lock).unwrap();
+                drain_interrupted_turn_save().await;
+                assert!(
+                    live.initialize_cost_journal()
+                        .await
+                        .unwrap_err()
+                        .is_session_persistence()
+                );
+                assert!(
+                    escaped
+                        .compact_native(&json!({}), &StreamOptions::default())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(budget.spent(), 0.25);
+            } else {
+                fs4::FileExt::unlock(&file_lock).unwrap();
+                registration.await.unwrap();
+                escaped
+                    .compact_native(&json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                drop(escaped);
+                drop(live);
+                drop(budget);
+                let cold = Session::open(path.to_str().unwrap()).await.unwrap();
+                let restored = pi::cost::resolve_budget(&cold, None, None, Some(5.0), None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(restored.spent(), 1.0);
+            }
+        }
+    });
+}
+
 fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,

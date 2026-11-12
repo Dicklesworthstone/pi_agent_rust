@@ -2521,15 +2521,15 @@ pub(crate) struct PreparedSessionShutdown {
 }
 
 impl PreparedSessionShutdown {
-    /// A prospective source reference that can be written into a fork before
-    /// its first save. Cloning it does not activate a journal or retire work.
+    /// The saved source account and ancestry that a fork must retain before
+    /// its first save. Cloning it does not activate a candidate writer.
     pub(crate) fn prepared_cost_budget(&self) -> Option<&crate::cost::CostBudget> {
         self.cost_budget.as_ref()
     }
 
-    /// Persist a shared candidate's ancestry, then arm late billing as the
-    /// final action. The caller must install it synchronously after this
-    /// succeeds; dropping a preparation leaves the source live and unretired.
+    /// Persist a shared candidate's ancestry, then acknowledge the source
+    /// handoff as the final action. The caller must install it synchronously
+    /// after this succeeds; dropping a preparation leaves the source live.
     pub(crate) async fn retire_cost_for(&self, replacement: &mut AgentSessionHandle) -> Result<()> {
         let Some(budget) = &self.cost_budget else {
             return Ok(());
@@ -2567,13 +2567,13 @@ impl PreparedSessionShutdown {
             replacement
                 .session
                 .refresh_extension_completion_host_state();
-            // Same-file reload carries the prospective reference forward but
-            // keeps foreground billing live until a later real retirement.
+            // Same-file reload reuses the registered source and keeps its
+            // foreground account live.
             if same_target {
                 return Ok(());
             }
         }
-        // No await or fallible candidate preparation may follow activation.
+        // No await or fallible candidate preparation may follow final handoff.
         budget.retire_session(&self.session, &self.owner)
     }
 }
@@ -2748,27 +2748,37 @@ impl AgentSessionHandle {
             }
         };
         let owner_session_id = session.header.id.clone();
-        if self.session.save_enabled()
-            && let Some(budget) = self.session.agent.cost_budget()
-            && let Err(error) = budget.checkpoint(&mut session)
-        {
-            let mut report = SessionResourceShutdown::default();
-            report.fail(format!("failed to checkpoint model spend: {error}"));
-            return Err(report);
-        }
         // Replacing the only live handle must preserve every pending mutation,
         // even when final process shutdown is configured as best-effort or
-        // skips its flush. A failed preflight leaves this handle available.
-        if self.session.save_enabled()
-            && let Err(err) = session
-                .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+        // skips its flush. Prebuilt handles may never have prompted, so their
+        // live cost source also needs its durable registration receipt before
+        // a handoff can capture that source.
+        if self.session.save_enabled() {
+            let budget = self.session.agent.cost_budget();
+            let admission = self.session.provider_admission_gate();
+            let persisted = if let Some(budget) = budget {
+                crate::agent::flush_turn_autosave(
+                    &mut session,
+                    &admission,
+                    crate::session::AutosaveFlushTrigger::Shutdown,
+                    Some((budget, cx.cx())),
+                )
                 .await
-        {
-            let warning = format!("failed to flush session autosave: {err}");
-            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
-            let mut report = SessionResourceShutdown::default();
-            report.fail(warning);
-            return Err(report);
+            } else {
+                session
+                    .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                    .await
+            };
+            if let Err(err) = persisted {
+                if budget.is_some() {
+                    admission.block(err.to_string());
+                }
+                let warning = format!("failed to flush session autosave: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                let mut report = SessionResourceShutdown::default();
+                report.fail(warning);
+                return Err(report);
+            }
         }
         let cost_budget = if self.session.save_enabled() {
             match self
@@ -2930,29 +2940,28 @@ impl AgentSessionHandle {
                 let owner_session_id = session.header.id.clone();
                 if self.session.save_enabled() {
                     let budget = self.session.agent.cost_budget();
-                    let checkpointed = if let Some(budget) = budget {
-                        match budget.checkpoint(&mut session) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                report.fail(format!("failed to checkpoint model spend: {error}"));
-                                false
-                            }
-                        }
-                    } else {
-                        true
-                    };
                     // A late-cost journal needs an acknowledged baseline,
-                    // even when transcript shutdown is normally best-effort.
-                    let persisted = if budget.is_some() {
-                        session
-                            .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
-                            .await
+                    // including its durable registration receipt, even when
+                    // transcript shutdown is normally best-effort.
+                    let persisted = if let Some(budget) = budget {
+                        let admission = self.session.provider_admission_gate();
+                        let persisted = crate::agent::flush_turn_autosave(
+                            &mut session,
+                            &admission,
+                            crate::session::AutosaveFlushTrigger::Shutdown,
+                            Some((budget, cx.cx())),
+                        )
+                        .await;
+                        if let Err(error) = &persisted {
+                            admission.block(error.to_string());
+                        }
+                        persisted
                     } else {
                         session.flush_autosave_on_shutdown().await
                     };
                     match persisted {
                         Ok(()) => {
-                            if checkpointed && let Some(budget) = budget {
+                            if let Some(budget) = budget {
                                 let preserved: Result<()> = async {
                                     let prepared = budget.prepare_handoff(&session)?;
                                     prepared.checkpoint(&mut session)?;
@@ -2978,6 +2987,19 @@ impl AgentSessionHandle {
                                 "{warning}"
                             );
                             report.fail(warning);
+                            // Accounting can fail before it checkpoints, but
+                            // ordinary queued transcript mutations must still
+                            // get their final save attempt. This does not
+                            // acknowledge the failed account or reopen it.
+                            if budget.is_some()
+                                && let Err(error) = session
+                                    .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                                    .await
+                            {
+                                report.fail(format!(
+                                    "failed to flush remaining session autosave: {error}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -5464,6 +5486,30 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
             crate::compaction::ResolvedCompactionSettings::default(),
         );
         AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
+    }
+
+    fn saved_cost_journal(saved: &Session) -> PathBuf {
+        let receipt = saved
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(entry)
+                    if entry.custom_type == "cost_budget" =>
+                {
+                    entry.data.as_ref()
+                }
+                _ => None,
+            })
+            .expect("saved cost receipt");
+        assert_eq!(
+            receipt["lateRegistered"], true,
+            "a prebuilt handle must save the registration receipt before handoff"
+        );
+        let account = receipt["account"].as_str().expect("saved cost account");
+        let source = &receipt["lateSources"][account];
+        PathBuf::from(source["directory"].as_str().expect("journal directory"))
+            .join(source["journal"].as_str().expect("journal filename"))
     }
 
     fn workspace_handle_with_store(
@@ -11119,13 +11165,21 @@ printf sdk-owned-command-key
             budget.record(0.25).unwrap();
             handle.session.agent.set_cost_budget(Some(budget.clone()));
             run_async(async {
+                assert!(handle.session.agent.messages().is_empty());
+                assert!(handle.session_store().try_lock().unwrap().path.is_none());
                 let prepared = handle.preflight_replacement().await.unwrap();
                 let source_path = prepared.session.path.clone().unwrap();
                 let source_bytes = std::fs::read(&source_path).unwrap();
+                let saved = Session::open(source_path.to_str().unwrap()).await.unwrap();
+                assert!(saved_cost_journal(&saved).is_file());
 
                 // This charge races with candidate construction, after the
                 // exact source checkpoint has already reached storage.
                 budget.record(0.5).unwrap();
+                assert!(
+                    (crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON,
+                    "preflight must register a never-prompted source before retirement"
+                );
                 let mut next = saving_handle_with_store(tmp.path(), store_kind);
                 prepared.retire_cost_for(&mut next).await.unwrap();
                 let old = std::mem::replace(&mut handle, next);
@@ -11138,13 +11192,15 @@ printf sdk-owned-command-key
                 // A captured request keeps its original account after the
                 // foreground has installed a different session.
                 budget.record(0.75).unwrap();
+                drop(budget);
                 assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
                 let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
                 assert!(
                     (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
                 );
-                let resumed = budget.for_replacement(&reopened, false).unwrap();
-                assert!(!resumed.same_tree(&budget));
+                let resumed = crate::cost::resolve_budget(&reopened, None, None, Some(10.0), None)
+                    .unwrap()
+                    .unwrap();
                 assert!((resumed.spent() - 1.5).abs() < f64::EPSILON);
                 assert!(handle.shutdown_owned_resources().await.completed_cleanly());
             });
@@ -11222,8 +11278,12 @@ printf sdk-owned-command-key
         outstanding.observe(0.5).unwrap();
         handle.session.agent.set_cost_budget(Some(budget.clone()));
         run_async(async {
+            assert!(handle.session.agent.messages().is_empty());
+            assert!(store.try_lock().unwrap().path.is_none());
             assert!(handle.shutdown_owned_resources().await.completed_cleanly());
             let source = store.try_lock().unwrap().path.clone().unwrap();
+            let saved = Session::open(source.to_str().unwrap()).await.unwrap();
+            assert!(saved_cost_journal(&saved).is_file());
             let copy = tmp.path().join("copied-session.jsonl");
             std::fs::copy(&source, &copy).unwrap();
             let bytes = std::fs::read(&copy).unwrap();
@@ -11310,11 +11370,13 @@ printf sdk-owned-command-key
                     .completed_cleanly()
             );
 
-            // The outgoing file is still a live source with an optional
-            // prospective self-reference; preparation must not start writes.
+            // The rejected target never activates, while the registered
+            // source remains live and continues durably accepting charges.
+            handle.session.ensure_provider_reentry_allowed().unwrap();
+            budget.admit().unwrap();
             budget.record(0.5).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
-            assert_eq!(crate::cost::recorded_spend(&reopened).unwrap(), 0.25);
+            assert_eq!(crate::cost::recorded_spend(&reopened).unwrap(), 0.75);
             assert_eq!(budget.spent(), 0.75);
             assert!(handle.shutdown_owned_resources().await.completed_cleanly());
         });
@@ -11333,7 +11395,7 @@ printf sdk-owned-command-key
             drop(prepared);
             budget.record(0.5).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
-            assert!((crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON);
+            assert!((crate::cost::recorded_spend(&reopened).unwrap() - 0.75).abs() < f64::EPSILON);
 
             let prepared = handle.preflight_replacement().await.unwrap();
             let mut next = saving_handle(tmp.path());
@@ -11349,8 +11411,8 @@ printf sdk-owned-command-key
             budget.record(0.25).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
             assert!(
-                (crate::cost::recorded_spend(&reopened).unwrap() - 0.75).abs() < f64::EPSILON,
-                "same-file foreground usage must wait for its normal checkpoint"
+                (crate::cost::recorded_spend(&reopened).unwrap() - 1.0).abs() < f64::EPSILON,
+                "same-file foreground usage must keep its registered journal"
             );
 
             assert!(handle.shutdown_owned_resources().await.completed_cleanly());
@@ -11392,6 +11454,70 @@ printf sdk-owned-command-key
             warnings.is_empty(),
             "ephemeral sessions have no persistence path and must not attempt autosave: {warnings:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_cost_checkpoint_still_flushes_transcript_and_stops_owned_jobs() {
+        let _guard = crate::jobs::process_test_guard();
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        handle.session.agent.set_cost_budget(Some(budget.clone()));
+        run_async(async {
+            handle.session.initialize_cost_journal().await.unwrap();
+            let store = handle.session_store();
+            let (path, owner) = {
+                let session = store.try_lock().unwrap();
+                (session.path.clone().unwrap(), session.header.id.clone())
+            };
+            let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+            let journal = saved_cost_journal(&saved);
+            let evidence = tmp.path().join("unavailable-cost-journal.json");
+            std::fs::rename(&journal, &evidence).unwrap();
+            store
+                .try_lock()
+                .unwrap()
+                .append_session_info(Some("pending despite accounting failure".to_string()));
+            let job = crate::jobs::spawn_background(
+                &owner,
+                tmp.path(),
+                None,
+                None,
+                "sleep 300",
+                Some(300),
+                None,
+            )
+            .expect("owned job before failed shutdown checkpoint");
+
+            let report = handle.shutdown_owned_resources().await;
+            assert!(!report.completed_cleanly());
+            assert!(
+                report
+                    .messages()
+                    .any(|message| message.contains("failed to flush session autosave"))
+            );
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(
+                reopened.get_name().as_deref(),
+                Some("pending despite accounting failure")
+            );
+            assert_eq!(
+                store
+                    .try_lock()
+                    .unwrap()
+                    .autosave_metrics()
+                    .pending_mutations,
+                0
+            );
+            assert!(budget.admit().is_err());
+            assert!(!journal.exists(), "failed accounting must not be recreated");
+            assert!(evidence.is_file());
+            assert!(crate::jobs::list(&owner).unwrap().iter().any(|snapshot| {
+                snapshot.id == job.id && snapshot.status == crate::jobs::JobStatus::Killed.as_str()
+            }));
+            let _ = crate::jobs::take_completion_notices(&owner);
+        });
     }
 
     #[cfg(unix)]

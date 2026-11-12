@@ -6258,6 +6258,82 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // Exact quarters distinguish durable bills from a refunded attempt.
+    fn rejected_cost_candidate_keeps_the_live_account_admitted_and_durable() {
+        for preserve_cost in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+            initial.header.cwd = temp.path().display().to_string();
+            initial.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("keep this live conversation".to_string()),
+                timestamp: Some(0),
+            });
+            let messages = initial.to_messages_for_current_path();
+            let session = Arc::new(Mutex::new(initial));
+            let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+            let original_id = current_session_id(&app);
+            let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            {
+                let mut agent = app.agent.try_lock().unwrap();
+                agent.set_cost_budget(Some(budget.clone()));
+                agent.replace_messages(messages.clone());
+            }
+            let blocked = temp.path().join("not-a-session-directory");
+            std::fs::write(&blocked, "keep the candidate failure evidence").unwrap();
+            let candidate = Session::create_with_dir(Some(blocked.clone()));
+            let result = runtime().block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                candidate,
+                Vec::new(),
+                None,
+                preserve_cost,
+            ));
+            assert!(result.is_err(), "the candidate save must actually fail");
+            assert_eq!(current_session_id(&app), original_id);
+            {
+                let agent = app.agent.try_lock().unwrap();
+                assert!(agent.cost_budget().unwrap().same_tree(&budget));
+                assert_eq!(
+                    serde_json::to_value(agent.messages()).unwrap(),
+                    serde_json::to_value(&messages).unwrap()
+                );
+                agent
+                    .handle
+                    .session()
+                    .ensure_provider_reentry_allowed()
+                    .expect("a rejected candidate must not quarantine the source");
+            }
+            let source_path = session.try_lock().unwrap().path.clone().unwrap();
+            let source_bytes = std::fs::read(&source_path).unwrap();
+            let mut admitted = budget
+                .start_attempt()
+                .expect("later source work remains admitted");
+            admitted.finish(0.5).unwrap();
+            drop(admitted);
+            assert_eq!(budget.spent(), 0.75);
+            drop(app);
+            drop(session);
+            drop(budget);
+            assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+            assert_eq!(
+                std::fs::read_to_string(&blocked).unwrap(),
+                "keep the candidate failure evidence"
+            );
+            let cold = runtime()
+                .block_on(Session::open(source_path.to_str().unwrap()))
+                .unwrap();
+            let recovered = crate::cost::resolve_budget(&cold, None, None, Some(2.0), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.spent(), 0.75);
+            recovered.admit().unwrap();
+        }
+    }
+
+    #[test]
     fn new_without_extensions_saves_departing_shared_spend_before_reset() {
         let temp = TempDir::new().unwrap();
         let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
@@ -6311,6 +6387,28 @@ mod tests {
         assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.875).abs() < f64::EPSILON);
         assert_eq!(std::fs::read(&source_path).unwrap(), original_transcript);
         assert!(active.spent().abs() < f64::EPSILON);
+
+        // A side question may bill immediately after /new, before the next
+        // primary prompt has a chance to save or initialize the replacement.
+        let active_path = app
+            .session
+            .try_lock()
+            .unwrap()
+            .path
+            .clone()
+            .expect("new cost account saved before the reset acknowledgement");
+        let active_transcript = std::fs::read(&active_path).unwrap();
+        active.record(0.5).unwrap();
+        drop(active);
+        drop(app);
+        let cold = runtime()
+            .block_on(Session::open(active_path.to_str().unwrap()))
+            .unwrap();
+        let recovered = crate::cost::resolve_budget(&cold, None, None, Some(1.0), None)
+            .unwrap()
+            .unwrap();
+        assert!((recovered.spent() - 0.5).abs() < f64::EPSILON);
+        assert_eq!(std::fs::read(&active_path).unwrap(), active_transcript);
     }
 
     #[test]

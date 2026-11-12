@@ -718,14 +718,19 @@ impl PiApp {
         let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
         let mut retiring_budget = agent_guard.cost_budget().cloned();
         if let Some(budget) = &retiring_budget {
-            budget
-                .checkpoint(&mut session_guard)
-                .map_err(|_| "Failed to read model spend; session change was not applied")?;
             if save_enabled {
-                session_guard
-                    .save()
-                    .await
-                    .map_err(|_| "Failed to save model spend; session change was not applied")?;
+                let source_admission = agent_guard.handle.session().provider_admission_gate();
+                crate::agent::flush_turn_autosave(
+                    &mut session_guard,
+                    &source_admission,
+                    crate::session::AutosaveFlushTrigger::Manual,
+                    Some((budget, cx.cx())),
+                )
+                .await
+                .map_err(|error| {
+                    source_admission.block(error.to_string());
+                    "Failed to save model spend; session change was not applied"
+                })?;
                 if retiring_session {
                     let prepared = budget.prepare_handoff(&session_guard).map_err(
                         |_| "Failed to prepare model cost ancestry; session change was not applied",
@@ -738,6 +743,10 @@ impl PiApp {
                     )?;
                     retiring_budget = Some(prepared);
                 }
+            } else {
+                budget
+                    .checkpoint(&mut session_guard)
+                    .map_err(|_| "Failed to read model spend; session change was not applied")?;
             }
         }
         let mut cost_budget = retiring_budget
@@ -745,6 +754,25 @@ impl PiApp {
             .map(|budget| budget.for_replacement(&new_session, preserve_cost))
             .transpose()
             .map_err(|_| "Invalid model spend; session change was not applied")?;
+        if save_enabled
+            && let Some(budget) = &cost_budget
+            && retiring_budget
+                .as_ref()
+                .is_none_or(|source| !source.same_tree(budget))
+        {
+            // Session-switch hooks and /btw may run before the next main turn.
+            // Register the fresh account while this candidate is still private;
+            // its failure must leave the previous live view and account intact.
+            let candidate_admission = crate::agent::ProviderAdmissionGate::default();
+            crate::agent::flush_turn_autosave(
+                &mut new_session,
+                &candidate_admission,
+                crate::session::AutosaveFlushTrigger::Manual,
+                Some((budget, cx.cx())),
+            )
+            .await
+            .map_err(|_| "Failed to initialize model spend; session change was not applied")?;
+        }
         if preserve_cost
             && let (Some(candidate_budget), Some(source_budget)) = (&cost_budget, &retiring_budget)
         {
