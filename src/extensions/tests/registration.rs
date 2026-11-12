@@ -2467,14 +2467,12 @@ fn issued_provider_stream_ids_require_canonical_in_range_sequence() {
 // --- streamSimple JS runtime integration tests ---
 
 #[allow(clippy::too_many_lines)]
-async fn provider_cancellation_fixture(
+async fn provider_cancellation_runtime(
     directory: &Path,
-    mode: &str,
 ) -> (
     ExtensionManager,
     JsExtensionRuntimeHandle,
     Arc<MockHostActions>,
-    String,
 ) {
     let manager = ExtensionManager::new();
     let actions = Arc::new(MockHostActions::new());
@@ -2498,11 +2496,28 @@ async fn provider_cancellation_fixture(
                 baseUrl: "https://not-used.example.com",
                 models: [{ id: "cancel-model", name: "Cancel Model" }],
                 streamSimple(_model, _context, options) {
+                    if (options.mode === "factory-loop") {
+                        while (true) {}
+                    }
+                    if (options.mode === "iterator-getter-loop") {
+                        return {
+                            next() { return { done: true }; },
+                            get [Symbol.asyncIterator]() { while (true) {} },
+                        };
+                    }
+                    if (options.mode === "promise-start") {
+                        return Promise.resolve({ next() { return { done: true }; } });
+                    }
                     options.signal.addEventListener("abort", () => { aborts++; });
-                    return {
+                    const iterator = {
                         next() {
                             nextCalls++;
                             pi.sendMessage({ customType: "provider-next", content: "waiting" });
+                            if (options.mode === "readable") {
+                                return { done: false, value: {
+                                    chunk: nextCalls, aborted: options.signal.aborted,
+                                } };
+                            }
                             if (options.mode === "rejected-next") {
                                 return Promise.reject(new Error("natural next failure"));
                             }
@@ -2522,6 +2537,10 @@ async fn provider_cancellation_fixture(
                         },
                         [Symbol.asyncIterator]() { return this; },
                     };
+                    if (options.mode === "created-start") {
+                        pi.sendMessage({ customType: "provider-created", content: "created" });
+                    }
+                    return iterator;
                 },
             });
         }
@@ -2540,6 +2559,10 @@ async fn provider_cancellation_fixture(
     let js_runtime = JsExtensionRuntimeHandle::start(
         PiJsRuntimeConfig {
             cwd: directory.display().to_string(),
+            limits: crate::extensions_js::PiJsRuntimeLimits {
+                interrupt_budget: None,
+                ..Default::default()
+            },
             ..Default::default()
         },
         Arc::new(ToolRegistry::new(&[], directory, None)),
@@ -2555,6 +2578,19 @@ async fn provider_cancellation_fixture(
         ])
         .await
         .expect("load provider and independent peer");
+    (manager, js_runtime, actions)
+}
+
+async fn provider_cancellation_fixture(
+    directory: &Path,
+    mode: &str,
+) -> (
+    ExtensionManager,
+    JsExtensionRuntimeHandle,
+    Arc<MockHostActions>,
+    String,
+) {
+    let (manager, js_runtime, actions) = provider_cancellation_runtime(directory).await;
     let stream_id = js_runtime
         .provider_stream_simple_start(
             "cancellation-provider".to_string(),
@@ -2568,7 +2604,7 @@ async fn provider_cancellation_fixture(
     (manager, js_runtime, actions, stream_id)
 }
 
-async fn wait_for_provider_next(actions: &MockHostActions) {
+async fn wait_for_provider_message(actions: &MockHostActions, custom_type: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if actions
@@ -2576,11 +2612,26 @@ async fn wait_for_provider_next(actions: &MockHostActions) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .any(|message| message.custom_type == "provider-next")
+            .any(|message| message.custom_type == custom_type)
         {
             return;
         }
-        assert!(Instant::now() < deadline, "provider next never started");
+        assert!(Instant::now() < deadline, "{custom_type} never arrived");
+        extension_wait_cooperate(deadline).await;
+    }
+}
+
+async fn wait_for_provider_next(actions: &MockHostActions) {
+    wait_for_provider_message(actions, "provider-next").await;
+}
+
+async fn wait_for_provider_start(actor: &JsActorLifecycle) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !actor.provider_start_entered.load(StdOrdering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "provider start was never admitted"
+        );
         extension_wait_cooperate(deadline).await;
     }
 }
@@ -2597,6 +2648,231 @@ async fn provider_fixture_command(
             1_000,
         )
         .await
+}
+
+async fn assert_provider_start_quarantines_only_its_owner(
+    runtime: &JsExtensionRuntimeHandle,
+    mode: &str,
+) {
+    assert_eq!(
+        provider_fixture_command(runtime, "healthy-provider-peer")
+            .await
+            .expect("interrupted provider start must release the actor"),
+        json!({"ready": true}),
+        "peer after {mode}",
+    );
+    let error = provider_fixture_command(runtime, "provider-counts")
+        .await
+        .expect_err("an interrupted factory or iterator getter cannot keep executing");
+    assert!(error.to_string().contains("quarantined"), "{mode}: {error}");
+}
+
+#[test]
+fn dropping_provider_start_interrupts_factory_and_iterator_getter_loops() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        for mode in ["factory-loop", "iterator-getter-loop"] {
+            let directory = tempdir().expect("tempdir");
+            let (manager, js, _actions) = provider_cancellation_runtime(directory.path()).await;
+            let actor = js.actor_lifecycle.upgrade().expect("live actor");
+            let mut start = Box::pin(js.provider_stream_simple_start(
+                "cancellation-provider".to_string(),
+                json!({"id": "cancel-model"}),
+                json!({"messages": []}),
+                json!({"mode": mode}),
+                30_000,
+            ));
+            assert!(futures::poll!(start.as_mut()).is_pending());
+            wait_for_provider_start(&actor).await;
+            drop(start);
+            assert_provider_start_quarantines_only_its_owner(&js, mode).await;
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        }
+    });
+}
+
+#[test]
+fn provider_start_deadline_interrupts_factory_and_iterator_getter_loops() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        for mode in ["factory-loop", "iterator-getter-loop"] {
+            let directory = tempdir().expect("tempdir");
+            let (manager, js, _actions) = provider_cancellation_runtime(directory.path()).await;
+            let actor = js.actor_lifecycle.upgrade().expect("live actor");
+            let mut start = Box::pin(js.provider_stream_simple_start(
+                "cancellation-provider".to_string(),
+                json!({"id": "cancel-model"}),
+                json!({"messages": []}),
+                json!({"mode": mode}),
+                500,
+            ));
+            assert!(futures::poll!(start.as_mut()).is_pending());
+            wait_for_provider_start(&actor).await;
+            let error = timeout(wall_now(), Duration::from_secs(2), start)
+                .await
+                .expect("provider start must obey its own deadline")
+                .expect_err("synchronous provider code cannot outlive the start deadline");
+            assert!(
+                error.to_string().contains("timed out") || error.to_string().contains("deadline"),
+                "{mode}: {error}",
+            );
+            assert_provider_start_quarantines_only_its_owner(&js, mode).await;
+            assert!(manager.shutdown(Duration::from_secs(2)).await);
+        }
+    });
+}
+
+#[test]
+fn actor_stop_interrupts_provider_factory_and_iterator_getter_loops() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        for mode in ["factory-loop", "iterator-getter-loop"] {
+            let directory = tempdir().expect("tempdir");
+            let (manager, js, _actions) = provider_cancellation_runtime(directory.path()).await;
+            let actor = js.actor_lifecycle.upgrade().expect("live actor");
+            let mut start = Box::pin(js.provider_stream_simple_start(
+                "cancellation-provider".to_string(),
+                json!({"id": "cancel-model"}),
+                json!({"messages": []}),
+                json!({"mode": mode}),
+                30_000,
+            ));
+            assert!(futures::poll!(start.as_mut()).is_pending());
+            wait_for_provider_start(&actor).await;
+            actor.stop();
+            assert!(
+                js.shutdown(Duration::from_secs(1)).await,
+                "actor stop must interrupt active {mode} before the queued shutdown command",
+            );
+            assert!(
+                timeout(wall_now(), Duration::from_secs(1), start)
+                    .await
+                    .expect("stopped actor must settle the start caller")
+                    .is_err(),
+                "stopped {mode} cannot publish a successful route",
+            );
+            assert!(manager.shutdown(Duration::from_secs(1)).await);
+        }
+    });
+}
+
+#[test]
+fn provider_start_rejects_promise_factories_and_success_keeps_the_route_readable() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let directory = tempdir().expect("tempdir");
+        let (manager, js, _actions) = provider_cancellation_runtime(directory.path()).await;
+        let error = js
+            .provider_stream_simple_start(
+                "cancellation-provider".to_string(),
+                json!({"id": "cancel-model"}),
+                json!({"messages": []}),
+                json!({"mode": "promise-start"}),
+                1_000,
+            )
+            .await
+            .expect_err("the factory must return an iterator directly");
+        assert!(error.to_string().contains("async iterator"), "{error}");
+        let stream_id = js
+            .provider_stream_simple_start(
+                "cancellation-provider".to_string(),
+                json!({"id": "cancel-model"}),
+                json!({"messages": []}),
+                json!({"mode": "readable"}),
+                1_000,
+            )
+            .await
+            .expect("a rejected factory leaves its owner usable");
+        for chunk in [1, 2] {
+            assert_eq!(
+                js.provider_stream_simple_next(stream_id.clone(), 1_000)
+                    .await
+                    .expect("successful start guard must not cancel the published route"),
+                Some(json!({"chunk": chunk, "aborted": false})),
+            );
+        }
+        assert_eq!(
+            provider_fixture_command(&js, "provider-counts")
+                .await
+                .expect("readable provider owner"),
+            json!({"nextCalls": 2, "returnCalls": 0, "aborts": 0}),
+        );
+        js.provider_stream_simple_cancel(stream_id, 1_000)
+            .await
+            .expect("release successful stream");
+        assert!(manager.shutdown(Duration::from_secs(2)).await);
+    });
+}
+
+#[test]
+fn abandoned_provider_start_releases_a_created_iterator_once() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let directory = tempdir().expect("tempdir");
+        let (manager, js, actions) = provider_cancellation_runtime(directory.path()).await;
+        let actor = js.actor_lifecycle.upgrade().expect("live actor");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let invocation = JsEventInvocationGuard(Arc::clone(&cancelled));
+        actor.register_provider_start(&cancelled);
+        let (reply, receiver) = oneshot::channel();
+        let cx = Cx::for_request();
+        // Keep the reply unconsumed even if the actor has already returned its
+        // ID. Either task recovery or the handoff guard must own the iterator.
+        js.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ProviderStreamSimpleStart {
+                    kind: JsProviderStreamKind::Assistant,
+                    provider_id: "cancellation-provider".to_string(),
+                    model: json!({"id": "cancel-model"}),
+                    context: json!({"messages": []}),
+                    options: json!({"mode": "created-start"}),
+                    origin: None,
+                    timeout_ms: 30_000,
+                    deadline: js_runtime_request_deadline(30_000),
+                    cancelled: Arc::clone(&cancelled),
+                    guard: JsProviderStreamStartGuard {
+                        runtime: js.clone(),
+                        stream_id: None,
+                    },
+                    reply,
+                },
+            )
+            .await
+            .expect("enqueue a start whose result remains unclaimed");
+        wait_for_provider_message(&actions, "provider-created").await;
+        drop(receiver);
+        drop(invocation);
+        wait_for_provider_message(&actions, "provider-return").await;
+        assert_eq!(
+            provider_fixture_command(&js, "healthy-provider-peer")
+                .await
+                .expect("created-iterator cleanup releases the actor"),
+            json!({"ready": true}),
+        );
+        assert_eq!(
+            actions
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|message| message.custom_type == "provider-return")
+                .count(),
+            1,
+            "recovery and reply abandonment must not both call iterator.return",
+        );
+        assert!(manager.shutdown(Duration::from_secs(2)).await);
+    });
 }
 
 #[test]

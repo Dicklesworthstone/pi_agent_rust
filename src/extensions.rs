@@ -11614,6 +11614,7 @@ enum JsRuntimeCommand {
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
+        cancelled: Arc<AtomicBool>,
         guard: JsProviderStreamStartGuard,
         reply: oneshot::Sender<Result<JsProviderStreamStartGuard>>,
     },
@@ -12170,6 +12171,11 @@ struct JsActorLifecycle {
     /// callers while an actor command is running. Dead routes do not keep
     /// streams, handles, or their runtime alive.
     provider_streams: Mutex<HashMap<String, Weak<JsProviderStreamControl>>>,
+    /// Factories run before a route exists, so shutdown also needs access to
+    /// their caller-owned cancellation flags during synchronous JS execution.
+    provider_starts: Mutex<Vec<Weak<AtomicBool>>>,
+    #[cfg(test)]
+    provider_start_entered: AtomicBool,
 }
 
 impl JsActorLifecycle {
@@ -12187,6 +12193,15 @@ impl JsActorLifecycle {
             .filter_map(Weak::upgrade)
         {
             control.cancelled.store(true, StdOrdering::Release);
+        }
+        for cancelled in self
+            .provider_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            cancelled.store(true, StdOrdering::Release);
         }
         // An empty receive must wake. A full queue already wakes the
         // actor, which checks the latch before processing more work.
@@ -12207,6 +12222,18 @@ impl JsActorLifecycle {
             control.cancelled.store(true, StdOrdering::Release);
         }
         streams.insert(stream_id, Arc::downgrade(control));
+    }
+
+    fn register_provider_start(&self, cancelled: &Arc<AtomicBool>) {
+        let mut starts = self
+            .provider_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        starts.retain(|cancelled| cancelled.strong_count() > 0);
+        if self.is_stopped() {
+            cancelled.store(true, StdOrdering::Release);
+        }
+        starts.push(Arc::downgrade(cancelled));
     }
 
     fn provider_stream_control(&self, stream_id: &str) -> Option<Arc<JsProviderStreamControl>> {
@@ -12356,6 +12383,9 @@ impl JsExtensionRuntimeHandle {
             stopped: std::sync::atomic::AtomicBool::new(false),
             sender: tx.downgrade(),
             provider_streams: Mutex::new(HashMap::new()),
+            provider_starts: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            provider_start_entered: AtomicBool::new(false),
         });
         runtime_owner_lifetime.register_actor(&actor_lifecycle);
         let actor_lifecycle_ref = Arc::downgrade(&actor_lifecycle);
@@ -12798,10 +12828,17 @@ impl JsExtensionRuntimeHandle {
                             origin,
                             timeout_ms: _,
                             deadline,
+                            cancelled,
                             mut guard,
                             reply,
                         } => {
                             if reply.is_closed() {
+                                continue;
+                            }
+                            if cancelled.load(StdOrdering::Acquire) {
+                                let _ = reply.send(&cx, Err(Error::extension(
+                                    "JS extension provider stream start cancelled before execution",
+                                )));
                                 continue;
                             }
                             if let Err(err) = js_runtime_remaining_timeout_ms(
@@ -12830,6 +12867,9 @@ impl JsExtensionRuntimeHandle {
                                             options,
                                             origin: origin.as_ref(),
                                             deadline,
+                                            cancelled: &cancelled,
+                                            #[cfg(test)]
+                                            entered: &actor_lifecycle.provider_start_entered,
                                         },
                                     )
                                     .await?;
@@ -12884,7 +12924,10 @@ impl JsExtensionRuntimeHandle {
                                     }
                                     return Err(err);
                                 }
-                                if reply.is_closed() {
+                                if reply.is_closed()
+                                    || cancelled.load(StdOrdering::Acquire)
+                                    || actor_lifecycle.is_stopped()
+                                {
                                     if let Err(cleanup_err) =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
@@ -12956,7 +12999,10 @@ impl JsExtensionRuntimeHandle {
                                 Ok(guard)
                             }
                             .await;
-                            if reply.is_closed() {
+                            if reply.is_closed()
+                                || cancelled.load(StdOrdering::Acquire)
+                                || actor_lifecycle.is_stopped()
+                            {
                                 if let Ok(guard) = result.as_mut()
                                     && let Some(outer_stream_id) = guard.stream_id.as_deref()
                                     && let Some(route) = shard_set
@@ -12990,6 +13036,13 @@ impl JsExtensionRuntimeHandle {
                                             );
                                         }
                                     }
+                                }
+                                if !reply.is_closed() {
+                                    let _ = reply.send(&cx, result.and_then(|_| {
+                                        Err(Error::extension(
+                                            "JS extension provider stream start cancelled before route handoff",
+                                        ))
+                                    }));
                                 }
                                 continue;
                             }
@@ -13973,6 +14026,11 @@ impl JsExtensionRuntimeHandle {
         timeout_ms: u64,
     ) -> Result<String> {
         let deadline = js_runtime_request_deadline(timeout_ms);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _invocation_guard = JsEventInvocationGuard(Arc::clone(&cancelled));
+        if let Some(actor) = self.actor_lifecycle.upgrade() {
+            actor.register_provider_start(&cancelled);
+        }
         let cx = Cx::for_request();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleStart {
@@ -13984,6 +14042,7 @@ impl JsExtensionRuntimeHandle {
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            cancelled: Arc::clone(&cancelled),
             guard: JsProviderStreamStartGuard {
                 runtime: self.clone(),
                 stream_id: None,
@@ -14014,7 +14073,19 @@ impl JsExtensionRuntimeHandle {
         })
         // Claim ownership only after the timeout wrapper has accepted the
         // reply. There must be no await between disarming and returning the ID.
-        .and_then(JsProviderStreamStartGuard::into_stream_id)
+        .and_then(|guard| {
+            if cancelled.load(StdOrdering::Acquire)
+                || self
+                    .actor_lifecycle
+                    .upgrade()
+                    .is_some_and(|actor| actor.is_stopped())
+            {
+                return Err(Error::extension(
+                    "JS extension provider stream start cancelled before caller handoff",
+                ));
+            }
+            guard.into_stream_id()
+        })
     }
 
     pub async fn provider_stream_simple_next(
@@ -17389,9 +17460,54 @@ struct JsProviderStreamStart<'a> {
     options: Value,
     origin: Option<&'a SessionActionOrigin>,
     deadline: Instant,
+    cancelled: &'a Arc<AtomicBool>,
+    #[cfg(test)]
+    entered: &'a AtomicBool,
 }
 
+/// A start result owns an iterator ID. Preserve a resolved value even when
+/// cancellation races its consumption; a settlement bit alone cannot clean
+/// up the iterator that value identifies.
 #[allow(clippy::future_not_send)]
+async fn await_js_provider_start_task(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> JsCancellableTaskOutcome {
+    loop {
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            return JsCancellableTaskOutcome::Stopped { settled: false };
+        }
+        let shard = &mut shards.shards[shard_index];
+        let state = match take_js_task_state(&shard.runtime, task_id).await {
+            Ok(state) => state,
+            Err(err) => return JsCancellableTaskOutcome::Fault(err),
+        };
+        if matches!(
+            state,
+            JsTaskTakeResult::Missing | JsTaskTakeResult::Snapshot(_)
+        ) {
+            return JsCancellableTaskOutcome::Fault(Error::extension(
+                "provider start task state lost before settlement",
+            ));
+        }
+        match finish_js_task_take(state) {
+            Ok(Some(value)) => return JsCancellableTaskOutcome::Finished(Ok(value)),
+            Err(err) => return JsCancellableTaskOutcome::Finished(Err(err)),
+            Ok(None) => {
+                if let Err(err) = pump_active_runtime_shard(shard, host).await {
+                    return JsCancellableTaskOutcome::Fault(err);
+                }
+                extension_wait_cooperate(deadline).await;
+            }
+        }
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn start_extension_provider_stream_simple_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
@@ -17406,84 +17522,184 @@ async fn start_extension_provider_stream_simple_sharded(
         options,
         origin,
         deadline,
+        cancelled,
+        #[cfg(test)]
+        entered,
     } = start;
     shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "provider stream start")?;
+    let _ = remaining_js_task_timeout(deadline, "provider stream start")?;
+    if cancelled.load(StdOrdering::Acquire) {
+        return Err(Error::extension(
+            "JS extension provider stream start cancelled",
+        ));
+    }
     let task_id = next_runtime_task_id("task-provider-stream-start");
-    let origin_guard = {
-        let runtime = &shards
-            .shards
-            .get(shard_index)
-            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let start_name = match kind {
-                    JsProviderStreamKind::Assistant => "__pi_provider_stream_simple_start",
-                    JsProviderStreamKind::Http => "__pi_virtual_http_start",
-                };
-                let start_fn: rquickjs::Function<'_> = global.get(start_name)?;
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let model_js = json_to_js(&ctx, &model)?;
-                let promise: rquickjs::Value<'_> = match kind {
-                    JsProviderStreamKind::Http => {
-                        start_fn.call((bridge_secret.as_str(), provider_id, model_js))?
-                    }
-                    JsProviderStreamKind::Assistant => {
-                        let context_js = json_to_js(&ctx, &context)?;
-                        let options_js = json_to_js(&ctx, &options)?;
-                        start_fn.call((
-                            bridge_secret.as_str(),
-                            provider_id,
-                            model_js,
-                            context_js,
-                            options_js,
-                        ))?
-                    }
-                };
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
+    let runtime = Rc::clone(&shards.shards[shard_index].runtime);
+    let origin_guard = runtime.enter_session_action_origin(origin.cloned());
+    let fence = runtime.enter_execution_fence(Arc::clone(cancelled), deadline);
+    let bridge_secret = runtime.bridge_secret().to_string();
+    #[cfg(test)]
+    entered.store(true, StdOrdering::Release);
+    let started = runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let start_name = match kind {
+                JsProviderStreamKind::Assistant => "__pi_provider_stream_simple_start",
+                JsProviderStreamKind::Http => "__pi_virtual_http_start",
+            };
+            let start_fn: rquickjs::Function<'_> = global.get(start_name)?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let model_js = json_to_js(&ctx, &model)?;
+            let promise: rquickjs::Value<'_> = match kind {
+                JsProviderStreamKind::Http => {
+                    start_fn.call((bridge_secret.as_str(), provider_id, model_js))?
+                }
+                JsProviderStreamKind::Assistant => {
+                    let context_js = json_to_js(&ctx, &context)?;
+                    let options_js = json_to_js(&ctx, &options)?;
+                    start_fn.call((
+                        bridge_secret.as_str(),
+                        provider_id,
+                        model_js,
+                        context_js,
+                        options_js,
+                    ))?
+                }
+            };
+            let _task: String =
+                task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+            Ok(())
+        })
+        .await;
+    let outcome = match started {
+        Ok(()) => {
+            await_js_provider_start_task(shards, host, shard_index, &task_id, cancelled, deadline)
+                .await
+        }
+        Err(err) => JsCancellableTaskOutcome::Fault(err),
+    };
+    let (mut inner_stream_id, mut failure, task_consumed) = match outcome {
+        JsCancellableTaskOutcome::Finished(Ok(value)) => match value.as_str() {
+            Some(stream_id) => (Some(stream_id.to_string()), None, true),
+            None => (
+                None,
+                Some(quarantine_runtime_shard(
+                    shards,
+                    shard_index,
+                    "provider start settled without a recoverable iterator ID",
+                )),
+                true,
+            ),
+        },
+        JsCancellableTaskOutcome::Finished(Err(err)) => (None, Some(err), true),
+        JsCancellableTaskOutcome::Stopped { .. } => (
+            None,
+            Some(Error::extension(
+                "JS extension provider stream start cancelled or timed out",
+            )),
+            false,
+        ),
+        JsCancellableTaskOutcome::Fault(err) => (
+            None,
+            Some(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("provider start execution or runtime pump failed: {err}"),
+            )),
+            false,
+        ),
+    };
+    if failure.is_none()
+        && !cancelled.load(StdOrdering::Acquire)
+        && Instant::now() < deadline
+        && let Err(err) = refresh_runtime_shard_snapshot(shards, shard_index).await
+    {
+        failure = Some(err);
+    }
+    if fence.was_interrupted() {
+        failure = Some(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            "provider start cancellation or deadline interrupted JavaScript execution",
+        ));
+    } else if failure.is_none()
+        && (cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline)
+    {
+        failure = Some(Error::extension(
+            "JS extension provider stream start cancelled or timed out before publication",
+        ));
+    }
+    drop(fence);
+    let Some(mut error) = failure else {
+        drop(origin_guard);
+        return inner_stream_id
+            .ok_or_else(|| Error::extension("provider stream start: expected stream id"));
     };
 
-    let value =
-        await_js_task_in_shards(shards, host, shard_index, &task_id, timeout, deadline).await?;
-    drop(origin_guard);
-    let inner_stream_id = value
-        .as_str()
-        .map(ToString::to_string)
-        .ok_or_else(|| Error::extension("provider stream start: expected stream id".to_string()))?;
-
-    if let Err(refresh_err) = refresh_runtime_shard_snapshot(shards, shard_index).await {
+    // Once cancellation wins, share one fresh budget between recovering a
+    // settled start's identity and releasing its iterator. The original
+    // origin remains active throughout, including registry refresh above.
+    let cleanup_deadline = Instant::now() + Duration::from_millis(100);
+    let mut cleanup_failure = None;
+    if inner_stream_id.is_none() && !task_consumed {
+        let recovery_cancelled = Arc::new(AtomicBool::new(false));
+        let recovery_fence =
+            runtime.enter_execution_fence(Arc::clone(&recovery_cancelled), cleanup_deadline);
+        let recovered = await_js_provider_start_task(
+            shards,
+            host,
+            shard_index,
+            &task_id,
+            &recovery_cancelled,
+            cleanup_deadline,
+        )
+        .await;
+        match recovered {
+            JsCancellableTaskOutcome::Finished(Ok(value)) => {
+                inner_stream_id = value.as_str().map(ToString::to_string);
+                if inner_stream_id.is_none() {
+                    cleanup_failure =
+                        Some("provider start recovery returned no iterator ID".to_string());
+                }
+            }
+            JsCancellableTaskOutcome::Finished(Err(err)) | JsCancellableTaskOutcome::Fault(err) => {
+                cleanup_failure = Some(format!("provider start recovery failed: {err}"));
+            }
+            JsCancellableTaskOutcome::Stopped { .. } => {
+                cleanup_failure = Some(
+                    "provider start did not settle within its 100ms cleanup budget".to_string(),
+                );
+            }
+        }
+        if recovery_fence.was_interrupted() {
+            cleanup_failure =
+                Some("provider start recovery exceeded its cleanup fence".to_string());
+        }
+        drop(recovery_fence);
+    }
+    if let Some(inner_stream_id) = inner_stream_id {
         if let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
             shards,
             host,
             shard_index,
             &inner_stream_id,
-            Instant::now() + Duration::from_millis(100),
+            cleanup_deadline,
             origin,
             None,
         )
         .await
         {
-            tracing::warn!(
-                event = "extension_runtime.provider_stream.start_refresh_cleanup_failed",
-                inner_stream_id,
-                shard_index,
-                error = %cleanup_err,
-                "Failed to cancel an inner provider stream after registry refresh rejected its shard"
-            );
+            cleanup_failure = Some(format!(
+                "provider start iterator cleanup failed: {cleanup_err}"
+            ));
         }
-        return Err(refresh_err);
     }
-
-    Ok(inner_stream_id)
+    if let Some(cleanup_failure) = cleanup_failure {
+        let quarantine = quarantine_runtime_shard(shards, shard_index, &cleanup_failure);
+        error = Error::extension(format!("{error}; {quarantine}"));
+    }
+    drop(origin_guard);
+    Err(error)
 }
 
 struct JsProviderStreamNextOutcome {
