@@ -193,6 +193,9 @@ impl Provider for CostGuardedProvider {
             // Missing response metadata cannot erase that known charge.
             accounting.settle();
         }
+        if let Some(error) = accounting.failure() {
+            return Err(error);
+        }
         Ok(response)
     }
 }
@@ -564,6 +567,13 @@ impl CostAccounting {
             // observer clones after the request owner has finished.
             let mut attempt = self.attempt.take().expect("active cost attempt");
             if let Err(error) = attempt.finish(self.known_cost) {
+                // A valid final bill can still lose its journal or parent
+                // acknowledgement. Retain that failure for the request owner:
+                // quarantining only the next request would publish success
+                // for a charge which was not durably acknowledged.
+                if self.failure.is_none() {
+                    self.failure = Some(error.to_string());
+                }
                 tracing::warn!(%error, "provider spend accounting failed; budget quarantined");
             }
         }
@@ -727,14 +737,21 @@ impl Stream for CostMeteredStream {
                 }
                 if terminal {
                     self.accounting.settle();
+                    // Preserve an existing failed/aborted provider outcome,
+                    // but never publish successful completion after final
+                    // billing settlement failed.
+                    if matches!(&event, StreamEvent::Done { .. })
+                        && let Some(error) = self.accounting.failure()
+                    {
+                        return Poll::Ready(Some(Err(error)));
+                    }
                 }
                 Poll::Ready(Some(Ok(event)))
             }
             Poll::Ready(None) => {
                 drop(self.inner.take());
-                let error = self.accounting.failure();
                 self.accounting.settle();
-                Poll::Ready(error.map(Err))
+                Poll::Ready(self.accounting.failure().map(Err))
             }
             Poll::Ready(Some(Err(error))) => {
                 drop(self.inner.take());
@@ -1960,6 +1977,305 @@ mod tests {
                 observer: Mutex::new(None),
                 drops: Arc::new(AtomicUsize::new(0)),
             })
+        }
+
+        struct LostFinalAck {
+            parent: crate::cost::CostBudget,
+            finishes: Arc<AtomicUsize>,
+        }
+
+        struct LostFinalAckAttempt {
+            parent: crate::cost::CostBudget,
+            attempt: crate::cost::CostAttempt,
+            finishes: Arc<AtomicUsize>,
+        }
+
+        impl crate::cost::CostRemote for LostFinalAck {
+            fn snapshot(&self) -> crate::error::Result<crate::cost::CostSnapshot> {
+                self.parent.refresh()
+            }
+
+            fn record(&self, cost: f64) -> crate::error::Result<crate::cost::CostSnapshot> {
+                self.parent.record(cost)?;
+                Ok(self.parent.snapshot())
+            }
+
+            fn start_attempt(
+                &self,
+            ) -> crate::error::Result<(
+                crate::cost::CostSnapshot,
+                Box<dyn crate::cost::CostRemoteAttempt>,
+            )> {
+                let attempt = self.parent.start_attempt()?;
+                Ok((
+                    self.parent.snapshot(),
+                    Box::new(LostFinalAckAttempt {
+                        parent: self.parent.clone(),
+                        attempt,
+                        finishes: Arc::clone(&self.finishes),
+                    }),
+                ))
+            }
+        }
+
+        impl crate::cost::CostRemoteAttempt for LostFinalAckAttempt {
+            fn observe(&mut self, cost: f64) -> crate::error::Result<crate::cost::CostSnapshot> {
+                self.attempt.observe(cost)?;
+                Ok(self.parent.snapshot())
+            }
+
+            fn observe_authoritative(
+                &mut self,
+                cost: f64,
+            ) -> crate::error::Result<crate::cost::CostSnapshot> {
+                self.attempt.observe_authoritative(cost)?;
+                Ok(self.parent.snapshot())
+            }
+
+            fn finish(
+                &mut self,
+                cost: Option<f64>,
+                _deadline: Option<std::time::Instant>,
+            ) -> crate::error::Result<crate::cost::CostSnapshot> {
+                self.finishes.fetch_add(1, Ordering::SeqCst);
+                self.attempt.finish(cost.unwrap_or(f64::NAN))?;
+                // The parent really settled this attempt. Losing only its
+                // acknowledgement must neither publish success nor replay it.
+                Err(crate::error::Error::session("final billing ACK was lost"))
+            }
+        }
+
+        fn lost_final_ack_budget() -> (
+            crate::cost::CostBudget,
+            crate::cost::CostBudget,
+            Arc<AtomicUsize>,
+        ) {
+            let parent = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let child = crate::cost::CostBudget::remote(Arc::new(LostFinalAck {
+                parent: parent.clone(),
+                finishes: Arc::clone(&finishes),
+            }))
+            .unwrap();
+            (child, parent, finishes)
+        }
+
+        #[test]
+        fn final_charge_ack_failure_cannot_publish_success_or_clean_eof() {
+            futures::executor::block_on(async {
+                for native in [false, true] {
+                    for mode in [Mode::Done, Mode::Eof] {
+                        let (child, parent, finishes) = lost_final_ack_budget();
+                        let probe = probe(mode);
+                        let provider = guard_with_cost_budget(probe.clone(), child.clone());
+                        let error = if native {
+                            provider
+                                .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                                .await
+                                .expect_err("native response requires final billing ACK")
+                        } else {
+                            let mut stream = provider
+                                .stream(&Context::default(), &StreamOptions::default())
+                                .await
+                                .unwrap();
+                            let error = stream
+                                .next()
+                                .await
+                                .expect("clean EOF must expose failed final settlement")
+                                .expect_err("Done requires final billing ACK");
+                            assert!(stream.next().await.is_none(), "one terminal error only");
+                            error
+                        };
+                        assert!(matches!(error, crate::error::Error::Session(_)));
+                        assert!(error.to_string().contains("final billing ACK was lost"));
+                        let expected = if matches!(mode, Mode::Done) {
+                            0.25
+                        } else if native {
+                            0.75
+                        } else {
+                            1.25
+                        };
+                        assert_closed(&probe, &parent, expected);
+                        assert!(matches!(
+                            child.admit(),
+                            Err(crate::error::Error::Session(_))
+                        ));
+                        assert!(
+                            provider
+                                .stream(&Context::default(), &StreamOptions::default())
+                                .await
+                                .is_err()
+                        );
+                        drop(provider);
+                        assert_eq!(finishes.load(Ordering::SeqCst), 1);
+                        assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn final_charge_ack_failure_preserves_provider_error_and_abort_outcomes() {
+            futures::executor::block_on(async {
+                for reason in [
+                    crate::model::StopReason::Error,
+                    crate::model::StopReason::Aborted,
+                ] {
+                    let (child, parent, finishes) = lost_final_ack_budget();
+                    let mut message = cost_message(0.25, 0);
+                    message.stop_reason = reason;
+                    message.error_message = Some("original provider outcome".to_string());
+                    let probe = spend_probe(
+                        vec![StreamEvent::Error {
+                            reason,
+                            error: message,
+                        }],
+                        None,
+                    );
+                    let provider = guard_with_cost_budget(probe, child.clone());
+                    let mut stream = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    let event = stream.next().await.unwrap().expect("retain failed outcome");
+                    let StreamEvent::Error {
+                        reason: actual,
+                        error,
+                    } = event
+                    else {
+                        panic!("provider failure must not become success or a different event");
+                    };
+                    assert_eq!(actual, reason);
+                    assert_eq!(error.stop_reason, reason);
+                    assert_eq!(
+                        error.error_message.as_deref(),
+                        Some("original provider outcome")
+                    );
+                    assert!(stream.next().await.is_none());
+                    assert_eq!(parent.spent(), 0.25);
+                    assert_eq!(parent.snapshot().pending, 0.0);
+                    assert!(matches!(
+                        child.admit(),
+                        Err(crate::error::Error::Session(_))
+                    ));
+                    assert_eq!(finishes.load(Ordering::SeqCst), 1);
+                }
+                for mode in [Mode::SetupError, Mode::Error] {
+                    let (child, parent, finishes) = lost_final_ack_budget();
+                    let probe = probe(mode);
+                    let provider = guard_with_cost_budget(probe.clone(), child.clone());
+                    let error = match provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                    {
+                        Ok(mut stream) => stream.next().await.unwrap().unwrap_err(),
+                        Err(error) => error,
+                    };
+                    let expected = if matches!(mode, Mode::SetupError) {
+                        "setup failed"
+                    } else {
+                        "wire failed"
+                    };
+                    assert!(
+                        matches!(error, crate::error::Error::Api(message) if message == expected)
+                    );
+                    assert_closed(
+                        &probe,
+                        &parent,
+                        if matches!(mode, Mode::SetupError) {
+                            0.75
+                        } else {
+                            1.25
+                        },
+                    );
+                    assert!(matches!(
+                        child.admit(),
+                        Err(crate::error::Error::Session(_))
+                    ));
+                    assert_eq!(finishes.load(Ordering::SeqCst), 1);
+                }
+            });
+        }
+
+        #[test]
+        fn cancelled_requests_settle_once_even_when_final_ack_is_lost() {
+            for native in [false, true] {
+                let (child, parent, finishes) = lost_final_ack_budget();
+                let probe = probe(Mode::SetupPending);
+                let provider = guard_with_cost_budget(probe.clone(), child.clone());
+                let context = Context::default();
+                let options = StreamOptions::default();
+                let body = serde_json::json!({});
+                let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                if native {
+                    let mut request = Box::pin(provider.compact_native(&body, &options));
+                    assert!(std::future::Future::poll(request.as_mut(), &mut cx).is_pending());
+                    drop(request);
+                } else {
+                    let mut request = Box::pin(provider.stream(&context, &options));
+                    assert!(std::future::Future::poll(request.as_mut(), &mut cx).is_pending());
+                    drop(request);
+                }
+                assert_closed(&probe, &parent, 0.75);
+                assert!(matches!(
+                    child.admit(),
+                    Err(crate::error::Error::Session(_))
+                ));
+                drop(provider);
+                assert_eq!(finishes.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn final_charge_journal_failure_rejects_a_successful_native_response() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let mut session =
+                crate::session::Session::create_with_dir(Some(directory.path().to_path_buf()));
+            budget.checkpoint(&mut session).unwrap();
+            runtime.block_on(session.save()).unwrap();
+            budget
+                .acknowledge_saved_session(&session, owner.cx())
+                .unwrap();
+            let path = session.path.clone().unwrap();
+            let transcript = std::fs::read(&path).unwrap();
+            let lock = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(".pi-cost-") && name.ends_with(".json.lock")
+                        })
+                })
+                .expect("registered journal lock");
+            std::fs::rename(&lock, directory.path().join("retained-journal-lock")).unwrap();
+            std::fs::create_dir(&lock).unwrap();
+
+            let probe = probe(Mode::Done);
+            let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+            let error = runtime
+                .block_on(
+                    provider.compact_native(&serde_json::json!({}), &StreamOptions::default()),
+                )
+                .expect_err("journal refusal must not publish a successful response");
+            assert!(matches!(error, crate::error::Error::Session(_)));
+            assert!(error.to_string().contains("model cost accounting failed"));
+            assert_closed(&probe, &budget, 0.25);
+            assert!(matches!(
+                budget.admit(),
+                Err(crate::error::Error::Session(_))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), transcript);
+            assert!(
+                lock.is_dir(),
+                "failed settlement must leave the refused path untouched"
+            );
         }
 
         #[test]
