@@ -556,7 +556,11 @@ impl CostAccounting {
 
     fn failure(&self) -> Option<crate::error::Error> {
         self.failure.as_ref().map(|message| {
-            crate::error::Error::session(format!("model cost accounting failed: {message}"))
+            // Stream errors are flattened into assistant messages. Retain the
+            // terminal marker so recovery cannot replay an unacknowledged bill.
+            crate::error::Error::session_persistence(format!(
+                "model cost accounting failed: {message}"
+            ))
         })
     }
 
@@ -1793,6 +1797,9 @@ mod tests {
 
     mod usage_observation {
         use super::*;
+        use crate::failover::{
+            FallbackOn, RetryPolicy, TerminalReason, TurnDecision, TurnOutcome, TurnProgress,
+        };
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2060,6 +2067,42 @@ mod tests {
             (child, parent, finishes)
         }
 
+        fn recovery_decision(outcome: TurnOutcome<'_>) -> TurnDecision {
+            let policy = RetryPolicy {
+                model_fallback: true,
+                fallback_on: FallbackOn::Any,
+                max_retries: 3,
+                max_failovers_per_turn: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            };
+            let progress = TurnProgress {
+                retry_count: 0,
+                failovers_this_turn: 0,
+                stream_can_retry: true,
+            };
+            crate::failover::decide(outcome, &progress, &policy, None)
+        }
+
+        fn assert_settlement_failure_is_terminal(error: &crate::error::Error) {
+            assert!(error.is_session_persistence());
+            // The agent builds this message from a failed stream item.
+            // Recovery must retain the same decision after that flattening.
+            let mut message = cost_message(0.0, 0);
+            message.stop_reason = crate::model::StopReason::Error;
+            message.error_message = Some(error.to_string());
+            for outcome in [TurnOutcome::Failed(error), TurnOutcome::Completed(&message)] {
+                assert_eq!(
+                    recovery_decision(outcome),
+                    TurnDecision::Terminal(TerminalReason::SessionPersistence)
+                );
+                assert!(
+                    !crate::failover::is_credential_rate_limit(outcome),
+                    "a lost billing acknowledgement must not penalize a credential"
+                );
+            }
+        }
+
         #[test]
         fn final_charge_ack_failure_cannot_publish_success_or_clean_eof() {
             futures::executor::block_on(async {
@@ -2086,7 +2129,7 @@ mod tests {
                             assert!(stream.next().await.is_none(), "one terminal error only");
                             error
                         };
-                        assert!(matches!(error, crate::error::Error::Session(_)));
+                        assert_settlement_failure_is_terminal(&error);
                         assert!(error.to_string().contains("final billing ACK was lost"));
                         let expected = if matches!(mode, Mode::Done) {
                             0.25
@@ -2117,14 +2160,22 @@ mod tests {
         #[test]
         fn final_charge_ack_failure_preserves_provider_error_and_abort_outcomes() {
             futures::executor::block_on(async {
-                for reason in [
-                    crate::model::StopReason::Error,
-                    crate::model::StopReason::Aborted,
+                for (reason, diagnostic, decision) in [
+                    (
+                        crate::model::StopReason::Error,
+                        "HTTP 401: unauthorized; quota exceeded",
+                        TurnDecision::Finish { success: false },
+                    ),
+                    (
+                        crate::model::StopReason::Aborted,
+                        "original provider outcome",
+                        TurnDecision::Terminal(TerminalReason::Aborted),
+                    ),
                 ] {
                     let (child, parent, finishes) = lost_final_ack_budget();
                     let mut message = cost_message(0.25, 0);
                     message.stop_reason = reason;
-                    message.error_message = Some("original provider outcome".to_string());
+                    message.error_message = Some(diagnostic.to_string());
                     let probe = spend_probe(
                         vec![StreamEvent::Error {
                             reason,
@@ -2147,10 +2198,11 @@ mod tests {
                     };
                     assert_eq!(actual, reason);
                     assert_eq!(error.stop_reason, reason);
-                    assert_eq!(
-                        error.error_message.as_deref(),
-                        Some("original provider outcome")
-                    );
+                    assert_eq!(error.error_message.as_deref(), Some(diagnostic));
+                    assert_eq!(recovery_decision(TurnOutcome::Completed(&error)), decision);
+                    assert!(!crate::failover::is_credential_rate_limit(
+                        TurnOutcome::Completed(&error)
+                    ));
                     assert!(stream.next().await.is_none());
                     assert_eq!(parent.spent(), 0.25);
                     assert_eq!(parent.snapshot().pending, 0.0);
@@ -2264,7 +2316,7 @@ mod tests {
                     provider.compact_native(&serde_json::json!({}), &StreamOptions::default()),
                 )
                 .expect_err("journal refusal must not publish a successful response");
-            assert!(matches!(error, crate::error::Error::Session(_)));
+            assert_settlement_failure_is_terminal(&error);
             assert!(error.to_string().contains("model cost accounting failed"));
             assert_closed(&probe, &budget, 0.25);
             assert!(matches!(
