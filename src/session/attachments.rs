@@ -202,6 +202,19 @@ impl BlobDirectory {
         Ok(())
     }
 
+    fn sync_for_publication(&self) -> Result<()> {
+        self.validate()?;
+        #[cfg(all(test, unix))]
+        tests::directory_sync_fault(&self.path)?;
+        // A failed publication can leave a valid blob visible after rename
+        // without acknowledging its directory sync. Reusing those bytes must
+        // not let a retry publish their JSONL reference past that failure.
+        // Sync the retained directory once per save, including reused blobs.
+        #[cfg(unix)]
+        self.handle.sync_all().map_err(blob_error)?;
+        self.validate()
+    }
+
     fn read(&self, reference: &BlobRef) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         self.visit_verified(reference, |chunk| {
@@ -344,7 +357,7 @@ impl<'a> EntryEncoder<'a> {
 
     pub(super) fn validate(&self) -> Result<()> {
         if let Some(directory) = &self.directory {
-            directory.validate()?;
+            directory.sync_for_publication()?;
         }
         Ok(())
     }
@@ -871,6 +884,67 @@ mod tests {
     use crate::session::{Session, SessionMessage, V2OpenMode};
     use serde_json::json;
     use std::fs;
+
+    #[cfg(unix)]
+    struct DirectorySyncFault {
+        path: PathBuf,
+        remaining_failures: usize,
+        calls: usize,
+    }
+
+    #[cfg(unix)]
+    thread_local! {
+        static DIRECTORY_SYNC_FAULT: std::cell::RefCell<Option<DirectorySyncFault>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    #[cfg(unix)]
+    struct DirectorySyncFaultGuard;
+
+    #[cfg(unix)]
+    impl DirectorySyncFaultGuard {
+        fn new(path: PathBuf, failures: usize) -> Self {
+            DIRECTORY_SYNC_FAULT.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                assert!(slot.is_none(), "directory sync fault is already installed");
+                *slot = Some(DirectorySyncFault {
+                    path,
+                    remaining_failures: failures,
+                    calls: 0,
+                });
+            });
+            Self
+        }
+
+        fn calls(&self) -> usize {
+            DIRECTORY_SYNC_FAULT
+                .with(|slot| slot.borrow().as_ref().expect("installed sync fault").calls)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DirectorySyncFaultGuard {
+        fn drop(&mut self) {
+            DIRECTORY_SYNC_FAULT.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn directory_sync_fault(path: &Path) -> Result<()> {
+        DIRECTORY_SYNC_FAULT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(fault) = slot.as_mut().filter(|fault| fault.path == path) else {
+                return Ok(());
+            };
+            fault.calls += 1;
+            if fault.remaining_failures == 0 {
+                return Ok(());
+            }
+            fault.remaining_failures -= 1;
+            Err(blob_error("injected attachment directory sync failure"))
+        })
+    }
 
     fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -1664,6 +1738,88 @@ mod tests {
             1,
             "unreferenced damaged blob does not hide committed text"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_directory_sync_failure_fences_rewrite_and_append_retries() {
+        for append in [false, true] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("blob-sync-retry.jsonl");
+            let mut session = session_at(&path);
+            session.append_message(text_message("committed before media"));
+            save(&mut session);
+            let original = fs::read(&path).unwrap();
+            let bytes = vec![0x72; INLINE_BYTES + 2];
+            let encoded = STANDARD.encode(&bytes);
+            session.append_message(message(vec![media(encoded, "audio/wav")]));
+            let entries_before = serde_json::to_value(&session.entries).unwrap();
+            let pending = session.entries[1].clone();
+            let persist = || {
+                if append {
+                    crate::session::append_jsonl_entries_blocking(
+                        &path,
+                        directory.path(),
+                        &session.header.id,
+                        vec![pending.clone()],
+                        &std::collections::HashMap::new(),
+                    )
+                    .map(|_| ())
+                } else {
+                    crate::session::save_jsonl_full_rewrite_blocking(
+                        &path,
+                        directory.path(),
+                        &session.header,
+                        &session.entries,
+                        false,
+                    )
+                    .map(|_| ())
+                }
+            };
+            let resolved_path = fs::canonicalize(&path).expect("saved source path");
+            let fault = DirectorySyncFaultGuard::new(sidecar_path(&resolved_path), 2);
+            let mut published_blob = None;
+            for attempt in 1..=2 {
+                assert_attachment_error(
+                    persist().expect_err("unacknowledged blob must not be referenced"),
+                    "directory sync failure",
+                );
+                assert_eq!(fault.calls(), attempt, "retry must cross the sync boundary");
+                assert_eq!(fs::read(&path).unwrap(), original);
+                assert_eq!(
+                    serde_json::to_value(&session.entries).unwrap(),
+                    entries_before
+                );
+                let stored = blobs(&path);
+                assert_eq!(stored.len(), 1, "retry must reuse the same immutable blob");
+                let blob = &stored[0];
+                assert_eq!(fs::read(blob).unwrap(), bytes);
+                let identity = FileIdentity::of_path_nofollow(blob).unwrap();
+                if let Some(expected) = published_blob {
+                    assert_eq!(identity, expected, "retry cannot replace the existing blob");
+                }
+                published_blob = Some(identity);
+            }
+
+            persist().expect("retry may publish after directory sync succeeds");
+            assert_eq!(fault.calls(), 3);
+            drop(fault);
+            let wire = wire_entries(&path);
+            assert_eq!(
+                wire.len(),
+                2,
+                "failed attempts must not duplicate the entry"
+            );
+            let reference = BlobRef::parse(&wire[1]["message"]["content"][0]["data"])
+                .expect("committed attachment reference");
+            assert_eq!(reference.digest, digest(&bytes));
+            assert_eq!(reference.size_bytes, bytes.len());
+            assert_eq!(blobs(&path).len(), 1);
+            assert_eq!(
+                serde_json::to_value(open(&path).expect("reopen committed media").entries).unwrap(),
+                entries_before
+            );
+        }
     }
 
     #[test]
