@@ -4017,7 +4017,94 @@ impl ExtensionManager {
                 if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
     }
 
-    /// Dynamically register an MCP server at runtime (from a hostcall).
+    /// Publish one accepted realm's MCP definitions without replacing host or
+    /// peer registrations. The actor and load generation own the delta; the
+    /// guest-provided spec never supplies its own principal.
+    pub(super) fn replace_runtime_mcp_specs(
+        &self,
+        extension_id: &str,
+        actor: &Weak<JsActorLifecycle>,
+        provider_generation: Option<Uuid>,
+        previous: &[Value],
+        replacements: &[Value],
+    ) -> Result<bool> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(&guard.runtime, Some(ExtensionRuntimeHandle::Js(runtime))
+            if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
+            || provider_generation.is_none()
+            || guard.js_provider_generation != provider_generation
+            || !guard.js_provider_catalog_ready
+            || Self::extension_index_for_owner(&guard, extension_id).is_err()
+            || (!replacements.is_empty() && actor.upgrade().is_none_or(|actor| actor.is_stopped()))
+        {
+            return Ok(false);
+        }
+
+        let owned_spec = |spec: &Value| -> Result<Value> {
+            let mut spec = spec.clone();
+            let object = spec.as_object_mut().ok_or_else(|| {
+                Error::extension("registerMcpServer: server spec must be an object")
+            })?;
+            // Validate the trimmed identity without rewriting the definition:
+            // retirement must also match the raw spec installed at startup.
+            object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Error::extension("registerMcpServer: name is required"))?;
+            object.insert(
+                "extension_id".to_string(),
+                Value::String(extension_id.to_string()),
+            );
+            Ok(spec)
+        };
+        let previous = previous
+            .iter()
+            .map(&owned_spec)
+            .collect::<Result<Vec<_>>>()?;
+        let replacements = replacements
+            .iter()
+            .map(owned_spec)
+            .collect::<Result<Vec<_>>>()?;
+        // A host may have replaced an owned row since the last publication.
+        // Retire only the exact accepted definition, never a name alone.
+        let mut servers = guard
+            .mcp_servers
+            .iter()
+            .filter(|server| !previous.contains(server))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut names = servers
+            .iter()
+            .filter_map(|server| server.get("name").and_then(Value::as_str))
+            .map(|name| name.trim().to_string())
+            .collect::<HashSet<_>>();
+        for replacement in replacements {
+            let name = replacement
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .ok_or_else(|| Error::extension("registerMcpServer: name is required"))?;
+            if !names.insert(name.to_string()) {
+                return Err(Error::extension(format!(
+                    "registerMcpServer: server name collision: {name}"
+                )));
+            }
+            servers.push(replacement);
+        }
+        if servers == guard.mcp_servers {
+            return Ok(true);
+        }
+        guard.mcp_servers = servers;
+        self.refresh_snapshot_with_guard_release(guard);
+        Ok(true)
+    }
+
+    /// Dynamically register an MCP server from native host code.
     pub fn register_mcp_server(&self, mut spec: Value) {
         let name = spec
             .get("name")

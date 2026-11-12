@@ -21,6 +21,7 @@ mod core;
 mod enforcement;
 mod event_timeouts;
 mod exec_security;
+mod mcp_registration;
 mod policy_transition;
 mod reactor;
 mod registration;

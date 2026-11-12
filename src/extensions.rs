@@ -11671,6 +11671,7 @@ struct JsRuntimeShard {
     runtime: Rc<PiJsRuntime>,
     snapshot: JsExtensionSnapshot,
     published_provider_specs: Vec<Value>,
+    published_mcp_specs: Vec<Value>,
     provider_actor: Weak<JsActorLifecycle>,
     provider_generation: Option<Uuid>,
     /// An idle turn polls at most one FIFO dispatch. Retaining its future here
@@ -12549,6 +12550,7 @@ impl JsExtensionRuntimeHandle {
                                     candidate.next_provider_stream_id = next_provider_stream_id;
                                     let snapshots = candidate.snapshots();
                                     let shard_count = candidate.shards.len();
+                                    retire_runtime_registrations(&shard_set);
                                     if let Some(manager) = host.manager()
                                         && manager.begin_runtime_provider_generation(
                                             &Arc::downgrade(&actor_lifecycle),
@@ -13231,7 +13233,7 @@ impl JsExtensionRuntimeHandle {
                 // Release retained dispatch futures and their admission/UI
                 // leases before acknowledging shutdown to application code.
                 // Each shard cancels its pending call before dropping its realm.
-                retire_runtime_provider_catalog(&shard_set);
+                retire_runtime_registrations(&shard_set);
                 drop(shard_set);
                 // Signal that the runtime thread has exited its event loop.
                 let _ = exit_tx.send(&cx, ());
@@ -15466,6 +15468,7 @@ async fn build_js_runtime_shards(
             tool_generation: Uuid::new_v4(),
             runtime: Rc::new(runtime),
             published_provider_specs: snapshot.providers.clone(),
+            published_mcp_specs: snapshot.mcp_servers.clone(),
             provider_actor: Weak::new(),
             provider_generation: None,
             snapshot,
@@ -15593,7 +15596,7 @@ async fn scrub_and_drop_runtime_shards(
     // the only supported next step: drop every attempted realm and every
     // route/fault rather than retaining a Rust snapshot that cannot be proven
     // equivalent to a fresh realm.
-    retire_runtime_provider_catalog(shards);
+    retire_runtime_registrations(shards);
     let next_provider_stream_id = shards.next_provider_stream_id;
     *shards = JsRuntimeShardSet {
         next_provider_stream_id,
@@ -15762,11 +15765,11 @@ async fn refresh_runtime_shard_snapshot(
         }
     };
     if new_snapshot == shards.shards[shard_index].snapshot {
-        return publish_runtime_shard_providers(shards, shard_index).map_err(|error| {
+        return publish_runtime_shard_registrations(shards, shard_index).map_err(|error| {
             quarantine_runtime_shard(
                 shards,
                 shard_index,
-                &format!("provider registry publication failed: {error}"),
+                &format!("runtime registry publication failed: {error}"),
             )
         });
     }
@@ -15794,30 +15797,36 @@ async fn refresh_runtime_shard_snapshot(
         );
         return Err(quarantine_runtime_shard(shards, shard_index, &reason));
     }
-    if let Err(error) = publish_runtime_shard_providers(shards, shard_index) {
+    if let Err(error) = publish_runtime_shard_registrations(shards, shard_index) {
         shards.shards[shard_index].snapshot = old_snapshot;
         let _ = shards.rebuild_indexes();
         return Err(quarantine_runtime_shard(
             shards,
             shard_index,
-            &format!("provider registry publication failed: {error}"),
+            &format!("runtime registry publication failed: {error}"),
         ));
     }
     Ok(())
 }
 
-fn publish_runtime_shard_providers(
+fn publish_runtime_shard_registrations(
     shards: &mut JsRuntimeShardSet,
     shard_index: usize,
 ) -> Result<()> {
     let shard = &mut shards.shards[shard_index];
-    if shard.published_provider_specs == shard.snapshot.providers {
+    if shard.published_provider_specs == shard.snapshot.providers
+        && shard.published_mcp_specs == shard.snapshot.mcp_servers
+    {
         return Ok(());
     }
-    if let Some(manager) = shards
+    let Some(manager) = shards
         .provider_manager
         .as_ref()
         .and_then(ExtensionManagerHandle::upgrade)
+    else {
+        return Ok(());
+    };
+    if shard.published_provider_specs != shard.snapshot.providers
         && manager.replace_runtime_provider_specs(
             &shard.extension_id,
             &shard.provider_actor,
@@ -15830,10 +15839,44 @@ fn publish_runtime_shard_providers(
             .published_provider_specs
             .clone_from(&shard.snapshot.providers);
     }
+    if shard.published_mcp_specs != shard.snapshot.mcp_servers
+        && manager.replace_runtime_mcp_specs(
+            &shard.extension_id,
+            &shard.provider_actor,
+            shard.provider_generation,
+            &shard.published_mcp_specs,
+            &shard.snapshot.mcp_servers,
+        )?
+    {
+        shard
+            .published_mcp_specs
+            .clone_from(&shard.snapshot.mcp_servers);
+    }
     Ok(())
 }
 
-fn retire_runtime_provider_catalog(shards: &JsRuntimeShardSet) {
+fn retire_runtime_shard_registrations(manager: &ExtensionManager, shard: &JsRuntimeShard) {
+    if let Err(error) = manager.replace_runtime_provider_specs(
+        &shard.extension_id,
+        &shard.provider_actor,
+        shard.provider_generation,
+        &shard.published_provider_specs,
+        &[],
+    ) {
+        tracing::warn!(%error, "Failed to retire stopped provider registrations");
+    }
+    if let Err(error) = manager.replace_runtime_mcp_specs(
+        &shard.extension_id,
+        &shard.provider_actor,
+        shard.provider_generation,
+        &shard.published_mcp_specs,
+        &[],
+    ) {
+        tracing::warn!(%error, "Failed to retire stopped MCP registrations");
+    }
+}
+
+fn retire_runtime_registrations(shards: &JsRuntimeShardSet) {
     let Some(manager) = shards
         .provider_manager
         .as_ref()
@@ -15842,15 +15885,7 @@ fn retire_runtime_provider_catalog(shards: &JsRuntimeShardSet) {
         return;
     };
     for shard in &shards.shards {
-        if let Err(error) = manager.replace_runtime_provider_specs(
-            &shard.extension_id,
-            &shard.provider_actor,
-            shard.provider_generation,
-            &shard.published_provider_specs,
-            &[],
-        ) {
-            tracing::warn!(%error, "Failed to retire stopped provider registrations");
-        }
+        retire_runtime_shard_registrations(&manager, shard);
     }
 }
 
@@ -15879,15 +15914,8 @@ fn quarantine_runtime_shard(
             .provider_manager
             .as_ref()
             .and_then(ExtensionManagerHandle::upgrade)
-            && let Err(error) = manager.replace_runtime_provider_specs(
-                &extension_id,
-                &shard.provider_actor,
-                shard.provider_generation,
-                &shard.published_provider_specs,
-                &[],
-            )
         {
-            tracing::warn!(%error, "Failed to retire quarantined provider registrations");
+            retire_runtime_shard_registrations(&manager, shard);
         }
         // Iterator cleanup may temporarily clear pump_fault to run return().
         // It must never regain authority to publish registrations.
@@ -18493,6 +18521,7 @@ mod idle_runtime_tests {
                 snapshot: serde_json::from_value(json!({ "id": "tool-pump-fixture" }))
                     .expect("fixture snapshot"),
                 published_provider_specs: Vec::new(),
+                published_mcp_specs: Vec::new(),
                 provider_actor: Weak::new(),
                 provider_generation: None,
                 pending_idle_dispatch: None,
@@ -18791,6 +18820,7 @@ mod idle_runtime_tests {
                 snapshot: serde_json::from_value(json!({ "id": "idle-fifo-fixture" }))
                     .expect("fixture snapshot"),
                 published_provider_specs: Vec::new(),
+                published_mcp_specs: Vec::new(),
                 provider_actor: Weak::new(),
                 provider_generation: None,
                 pending_idle_dispatch: Some(pending),
