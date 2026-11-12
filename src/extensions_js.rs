@@ -16104,23 +16104,42 @@ function __normalizeChunk(chunk, encoding) {
 }
 
 class Stream extends EventEmitter {
-  constructor() {
+  constructor(opts = {}) {
     super();
     this.destroyed = false;
+    this.closed = false;
+    this.errored = null;
+    this._destroyImpl = typeof opts.destroy === "function" ? opts.destroy.bind(this) : null;
+  }
+
+  _destroy(err, callback) {
+    if (this._destroyImpl) this._destroyImpl(err, callback);
+    else callback(err);
   }
 
   destroy(err) {
     if (this.destroyed) return this;
     this.destroyed = true;
-    if (err) this.emit("error", __streamToError(err));
-    this.emit("close");
+    this.errored = err ? __streamToError(err) : this.errored;
+    __abortWrites(this, this.errored || __streamError("ERR_STREAM_DESTROYED", "stream destroyed"));
+    let completed = false;
+    const done = (error) => {
+      if (completed) return;
+      completed = true;
+      if (!this.errored && error) this.errored = __streamToError(error);
+      if (this.errored) this.emit("error", this.errored);
+      this.closed = true;
+      this.emit("close");
+    };
+    try { this._destroy(this.errored, done); }
+    catch (error) { done(error); }
     return this;
   }
 }
 
 class Readable extends Stream {
   constructor(opts = {}) {
-    super();
+    super(opts);
     this._readableState = { flowing: null, ended: false, endEmitted: false, encoding: opts.encoding || null };
     this.readable = true;
     this._queue = [];
@@ -16195,7 +16214,7 @@ class Readable extends Stream {
       this._readableState.endEmitted = true;
       this.readable = false;
       this.emit("end");
-      if (this._autoDestroy && !this.destroyed) this.destroy();
+      __maybeDestroyStream(this);
     });
   }
 
@@ -16545,110 +16564,190 @@ class Readable extends Stream {
   }
 }
 
+function __streamError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function __maybeDestroyStream(stream) {
+  if (stream._autoDestroy && !stream.destroyed &&
+      (!stream._readableState || stream._readableState.endEmitted) &&
+      (!stream._writableState || stream._writableState.finished)) stream.destroy();
+}
+
+function __initWritable(stream, opts) {
+  const objectMode = !!(opts.writableObjectMode ?? opts.objectMode);
+  const highWaterMark = opts.writableHighWaterMark ?? opts.highWaterMark ?? (objectMode ? 16 : 16384);
+  if (!Number.isSafeInteger(highWaterMark) || highWaterMark < 0) {
+    throw new RangeError("writable highWaterMark must be a nonnegative safe integer");
+  }
+  stream._writableState = {
+    ended: false, finished: false, finalizing: false, error: null,
+    queue: [], active: null, length: 0, needDrain: false,
+    highWaterMark, objectMode, endCallbacks: [],
+  };
+  stream.writable = true;
+  stream._autoDestroy = opts.autoDestroy !== false;
+  stream._writeImpl = typeof opts.write === "function" ? opts.write.bind(stream) : null;
+  stream._finalImpl = typeof opts.final === "function" ? opts.final.bind(stream) : null;
+}
+
+function __writeCallback(callback, error) {
+  if (typeof callback !== "function") return;
+  try { callback(error); }
+  catch (thrown) { __streamQueueMicrotask(() => { throw thrown; }); }
+}
+
+function __settleWrite(entry, error) {
+  if (!entry || entry.settled) return;
+  entry.settled = true;
+  __writeCallback(entry.callback, error);
+}
+
+function __abortWrites(stream, error) {
+  const state = stream._writableState;
+  if (!state || state.finished) return;
+  state.error = state.error || error;
+  state.ended = true;
+  stream.writable = false;
+  const pending = state.queue.splice(0);
+  if (state.active) pending.unshift(state.active);
+  state.active = null;
+  state.length = 0;
+  state.needDrain = false;
+  const callbacks = state.endCallbacks.splice(0);
+  for (const entry of pending) __settleWrite(entry, state.error);
+  for (const callback of callbacks) __writeCallback(callback, state.error);
+}
+
+function __finishWritable(stream) {
+  const state = stream._writableState;
+  if (!state.ended || state.finalizing || state.finished || state.active ||
+      state.queue.length || state.error || stream.destroyed) return;
+  state.finalizing = true;
+  let completed = false;
+  const done = (error) => {
+    if (completed) return;
+    completed = true;
+    __streamQueueMicrotask(() => {
+      if (state.error || stream.destroyed) return;
+      if (error) { stream.destroy(__streamToError(error)); return; }
+      state.finished = true;
+      stream.writable = false;
+      for (const callback of state.endCallbacks.splice(0)) __writeCallback(callback, null);
+      stream.emit("finish");
+      __maybeDestroyStream(stream);
+    });
+  };
+  try { stream._final(done); }
+  catch (error) { done(error); }
+}
+
+function __drainWrites(stream) {
+  const state = stream._writableState;
+  if (state.active || state.error || stream.destroyed) return;
+  const entry = state.queue.shift();
+  if (!entry) {
+    if (state.ended) __finishWritable(stream);
+    else if (state.needDrain) {
+      state.needDrain = false;
+      stream.emit("drain");
+    }
+    return;
+  }
+  state.active = entry;
+  let completed = false;
+  const done = (error) => {
+    if (completed) return;
+    completed = true;
+    // Even synchronous implementations must not emit drain before write()
+    // returns false and its producer has had a chance to pause.
+    __streamQueueMicrotask(() => {
+      if (state.active !== entry || stream.destroyed) return;
+      if (error) { stream.destroy(__streamToError(error)); return; }
+      state.active = null;
+      state.length -= entry.size;
+      __settleWrite(entry, null);
+      __drainWrites(stream);
+    });
+  };
+  try { stream._write(entry.chunk, entry.encoding, done); }
+  catch (error) { done(error); }
+}
+
 class Writable extends Stream {
   constructor(opts = {}) {
-    super();
-    this._writableState = { ended: false, finished: false };
-    this.writable = true;
-    this._autoDestroy = opts.autoDestroy !== false;
-    this._writeImpl = typeof opts.write === "function" ? opts.write.bind(this) : null;
-    this._finalImpl = typeof opts.final === "function" ? opts.final.bind(this) : null;
+    super(opts);
+    __initWritable(this, opts);
   }
 
+  get writableEnded() { return this._writableState.ended; }
+  get writableFinished() { return this._writableState.finished; }
+  get writableLength() { return this._writableState.length; }
+  get writableNeedDrain() { return this._writableState.needDrain; }
+  get writableHighWaterMark() { return this._writableState.highWaterMark; }
+  get writableObjectMode() { return this._writableState.objectMode; }
+
   _write(chunk, encoding, callback) {
-    if (this._writeImpl) {
-      this._writeImpl(chunk, encoding, callback);
-      return;
-    }
-    callback(null);
+    if (this._writeImpl) this._writeImpl(chunk, encoding, callback);
+    else callback(null);
+  }
+
+  _final(callback) {
+    if (this._finalImpl) this._finalImpl(callback);
+    else callback(null);
   }
 
   write(chunk, encoding, callback) {
-    let cb = callback;
-    let enc = encoding;
-    if (typeof encoding === "function") {
-      cb = encoding;
-      enc = undefined;
-    }
-    if (this._writableState.ended) {
-      const err = new Error("write after end");
-      if (typeof cb === "function") cb(err);
-      this.emit("error", err);
-      return false;
-    }
-
-    try {
-      this._write(chunk, enc, (err) => {
-        if (err) {
-          const normalized = __streamToError(err);
-          if (typeof cb === "function") cb(normalized);
-          this.emit("error", normalized);
-          return;
-        }
-        if (typeof cb === "function") cb(null);
-        this.emit("drain");
+    const cb = typeof encoding === "function" ? encoding : callback;
+    const enc = typeof encoding === "string" ? encoding : undefined;
+    const state = this._writableState;
+    if (this.destroyed || state.ended || state.error) {
+      const error = state.error || this.errored || (this.destroyed
+        ? __streamError("ERR_STREAM_DESTROYED", "stream destroyed")
+        : __streamError("ERR_STREAM_WRITE_AFTER_END", "write after end"));
+      __streamQueueMicrotask(() => {
+        __writeCallback(cb, error);
+        if (!this.destroyed) this.destroy(error);
       });
-    } catch (err) {
-      const normalized = __streamToError(err);
-      if (typeof cb === "function") cb(normalized);
-      this.emit("error", normalized);
       return false;
     }
-    return true;
-  }
-
-  _finish(callback) {
-    if (this._finalImpl) {
-      try {
-        this._finalImpl(callback);
-      } catch (err) {
-        callback(__streamToError(err));
-      }
-      return;
-    }
-    callback(null);
+    const size = state.objectMode ? 1 : typeof chunk === "string"
+      ? (typeof Buffer !== "undefined" && typeof Buffer.byteLength === "function"
+        ? Buffer.byteLength(chunk, enc) : new TextEncoder().encode(chunk).byteLength)
+      : (chunk && chunk.byteLength) || 1;
+    state.length += size;
+    const writable = state.length < state.highWaterMark;
+    if (!writable) state.needDrain = true;
+    state.queue.push({ chunk, encoding: enc, callback: cb, size, settled: false });
+    __drainWrites(this);
+    return writable;
   }
 
   end(chunk, encoding, callback) {
     let cb = callback;
     let enc = encoding;
-    if (typeof encoding === "function") {
+    if (typeof chunk === "function") {
+      cb = chunk;
+      chunk = undefined;
+      enc = undefined;
+    } else if (typeof encoding === "function") {
       cb = encoding;
       enc = undefined;
     }
-
-    const finalize = () => {
-      if (this._writableState.ended) {
-        if (typeof cb === "function") cb(null);
-        return;
-      }
-      this._writableState.ended = true;
-      this._finish((err) => {
-        if (err) {
-          const normalized = __streamToError(err);
-          if (typeof cb === "function") cb(normalized);
-          this.emit("error", normalized);
-          return;
-        }
-        this._writableState.finished = true;
-        this.emit("finish");
-        if (this._autoDestroy) this.emit("close");
-        if (typeof cb === "function") cb(null);
-      });
-    };
-
-    if (chunk !== undefined && chunk !== null) {
-      this.write(chunk, enc, (err) => {
-        if (err) {
-          if (typeof cb === "function") cb(err);
-          return;
-        }
-        finalize();
-      });
+    const state = this._writableState;
+    if (state.error || this.destroyed || state.finished) {
+      const error = state.error || (state.finished ? null : this.errored ||
+        __streamError("ERR_STREAM_DESTROYED", "stream destroyed"));
+      __streamQueueMicrotask(() => __writeCallback(cb, error));
       return this;
     }
-
-    finalize();
+    if (typeof cb === "function") state.endCallbacks.push(cb);
+    if (chunk !== undefined && chunk !== null) this.write(chunk, enc);
+    state.ended = true;
+    this.writable = false;
+    __drainWrites(this);
     return this;
   }
 
@@ -16656,23 +16755,38 @@ class Writable extends Stream {
     if (!webWritable || typeof webWritable.getWriter !== "function") {
       throw new Error("Writable.fromWeb expects a Web WritableStream");
     }
-    const writer = webWritable.getWriter();
-    return new Writable({
+    let writer;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      try { writer.releaseLock(); } catch (_) {}
+    };
+    const writable = new Writable({
       ...opts,
       write(chunk, _encoding, callback) {
-        Promise.resolve(writer.write(chunk))
+        Promise.resolve().then(() => writer.write(chunk))
           .then(() => callback(null))
           .catch((err) => callback(__streamToError(err)));
       },
       final(callback) {
-        Promise.resolve(writer.close())
+        Promise.resolve().then(() => writer.close())
           .then(() => {
-            try { writer.releaseLock(); } catch (_) {}
+            release();
             callback(null);
           })
-          .catch((err) => callback(__streamToError(err)));
+          .catch((err) => { release(); callback(__streamToError(err)); });
+      },
+      destroy(error, callback) {
+        if (released) { callback(null); return; }
+        Promise.resolve().then(() => writer.abort(error))
+          .then(() => { release(); callback(null); })
+          .catch((err) => { release(); callback(__streamToError(err)); });
       },
     });
+    // Validate options before taking exclusive ownership of the Web writer.
+    writer = webWritable.getWriter();
+    return writable;
   }
 
   static toWeb(nodeWritable) {
@@ -16682,12 +16796,54 @@ class Writable extends Stream {
     if (!nodeWritable || typeof nodeWritable.write !== "function") {
       throw new Error("Writable.toWeb expects a Node Writable stream");
     }
+    let controller;
+    let completed = false;
+    let pendingClose = null;
+    const cleanup = () => {
+      nodeWritable.removeListener?.("error", onError);
+      nodeWritable.removeListener?.("close", onClose);
+    };
+    const onError = (error) => {
+      const failure = __streamToError(error);
+      controller.error(failure);
+      if (pendingClose) {
+        const pending = pendingClose;
+        pendingClose = null;
+        pending.reject(failure);
+      }
+    };
+    const finishClose = () => {
+      completed = true;
+      if (pendingClose) {
+        const pending = pendingClose;
+        pendingClose = null;
+        pending.resolve();
+      }
+      cleanup();
+    };
+    const onClose = () => {
+      if (nodeWritable.errored) onError(nodeWritable.errored);
+      else if (!completed && !nodeWritable.writableFinished && !nodeWritable._writableState?.finished) {
+        onError(nodeWritable.errored || __streamError("ERR_STREAM_PREMATURE_CLOSE", "premature stream close"));
+      } else finishClose();
+      cleanup();
+    };
     return new WritableStream({
+      start(value) {
+        controller = value;
+        nodeWritable.on?.("error", onError);
+        nodeWritable.on?.("close", onClose);
+        if (nodeWritable.errored) onError(nodeWritable.errored);
+        else if (nodeWritable.closed) onClose();
+      },
       write(chunk) {
         return new Promise((resolve, reject) => {
           try {
             const ok = nodeWritable.write(chunk, (err) => {
-              if (err) reject(__streamToError(err));
+              if (err) {
+                onError(err);
+                reject(__streamToError(err));
+              }
               else resolve();
             });
             if (ok === true) resolve();
@@ -16698,20 +16854,42 @@ class Writable extends Stream {
       },
       close() {
         return new Promise((resolve, reject) => {
+          pendingClose = { resolve, reject };
           try {
             nodeWritable.end((err) => {
-              if (err) reject(__streamToError(err));
-              else resolve();
+              if (err) {
+                onError(err);
+              } else {
+                // Auto-destroy can own asynchronous resource cleanup. Keep
+                // its observers and Web close pending until that owner closes.
+                const expectsClose = (nodeWritable._autoDestroy ??
+                  nodeWritable._writableState?.autoDestroy) === true &&
+                  nodeWritable._writableState?.emitClose !== false;
+                if (nodeWritable.closed) onClose();
+                else if (!expectsClose) finishClose();
+              }
             });
           } catch (err) {
-            reject(__streamToError(err));
+            onError(err);
+            cleanup();
           }
         });
       },
       abort(reason) {
-        if (typeof nodeWritable.destroy === "function") {
-          nodeWritable.destroy(__streamToError(reason ?? "stream aborted"));
-        }
+        return new Promise((resolve, reject) => {
+          const done = () => { cleanup(); resolve(); };
+          if (nodeWritable.closed || typeof nodeWritable.destroy !== "function") {
+            done();
+            return;
+          }
+          nodeWritable.once?.("close", done);
+          try { nodeWritable.destroy(__streamToError(reason ?? "stream aborted")); }
+          catch (error) {
+            nodeWritable.removeListener?.("close", done);
+            cleanup();
+            reject(__streamToError(error));
+          }
+        });
       },
     });
   }
@@ -16720,31 +16898,22 @@ class Writable extends Stream {
 class Duplex extends Readable {
   constructor(opts = {}) {
     super(opts);
-    this._writableState = { ended: false, finished: false };
-    this.writable = true;
-    this._autoDestroy = opts.autoDestroy !== false;
-    this._writeImpl = typeof opts.write === "function" ? opts.write.bind(this) : null;
-    this._finalImpl = typeof opts.final === "function" ? opts.final.bind(this) : null;
+    __initWritable(this, opts);
   }
+
+  get writableEnded() { return this._writableState.ended; }
+  get writableFinished() { return this._writableState.finished; }
+  get writableLength() { return this._writableState.length; }
+  get writableNeedDrain() { return this._writableState.needDrain; }
+  get writableHighWaterMark() { return this._writableState.highWaterMark; }
+  get writableObjectMode() { return this._writableState.objectMode; }
 
   _write(chunk, encoding, callback) {
-    if (this._writeImpl) {
-      this._writeImpl(chunk, encoding, callback);
-      return;
-    }
-    callback(null);
+    return Writable.prototype._write.call(this, chunk, encoding, callback);
   }
 
-  _finish(callback) {
-    if (this._finalImpl) {
-      try {
-        this._finalImpl(callback);
-      } catch (err) {
-        callback(__streamToError(err));
-      }
-      return;
-    }
-    callback(null);
+  _final(callback) {
+    return Writable.prototype._final.call(this, callback);
   }
 
   write(chunk, encoding, callback) {
@@ -16760,6 +16929,7 @@ class Transform extends Duplex {
   constructor(opts = {}) {
     super(opts);
     this._transformImpl = typeof opts.transform === "function" ? opts.transform.bind(this) : null;
+    this._flushImpl = typeof opts.flush === "function" ? opts.flush.bind(this) : null;
   }
 
   _transform(chunk, encoding, callback) {
@@ -16770,61 +16940,40 @@ class Transform extends Duplex {
     callback(null, chunk);
   }
 
-  write(chunk, encoding, callback) {
-    let cb = callback;
-    let enc = encoding;
-    if (typeof encoding === "function") {
-      cb = encoding;
-      enc = undefined;
-    }
-    try {
-      this._transform(chunk, enc, (err, data) => {
-        if (err) {
-          const normalized = __streamToError(err);
-          if (typeof cb === "function") cb(normalized);
-          this.emit("error", normalized);
-          return;
-        }
-        if (data !== undefined && data !== null) {
-          this.push(data);
-        }
-        if (typeof cb === "function") cb(null);
-      });
-    } catch (err) {
-      const normalized = __streamToError(err);
-      if (typeof cb === "function") cb(normalized);
-      this.emit("error", normalized);
-      return false;
-    }
-    return true;
+  _write(chunk, encoding, callback) {
+    let completed = false;
+    this._transform(chunk, encoding, (error, data) => {
+      if (completed) return;
+      completed = true;
+      if (!error && data !== undefined && data !== null) this.push(data);
+      callback(error);
+    });
   }
 
-  end(chunk, encoding, callback) {
-    let cb = callback;
-    let enc = encoding;
-    if (typeof encoding === "function") {
-      cb = encoding;
-      enc = undefined;
-    }
-    const finalize = () => {
-      this.push(null);
-      this.emit("finish");
-      // The readable side may still contain paused output. Its EOF owns
-      // close; closing here would strand a later iterator or pipe consumer.
-      if (typeof cb === "function") cb(null);
-    };
-    if (chunk !== undefined && chunk !== null) {
-      this.write(chunk, enc, (err) => {
-        if (err) {
-          if (typeof cb === "function") cb(err);
-          return;
+  _flush(callback) {
+    if (this._flushImpl) this._flushImpl(callback);
+    else callback(null);
+  }
+
+  _final(callback) {
+    let finalized = false;
+    super._final((error) => {
+      if (finalized) return;
+      finalized = true;
+      if (error || this.destroyed) { callback(error); return; }
+      let flushed = false;
+      const done = (flushError, data) => {
+        if (flushed) return;
+        flushed = true;
+        if (!flushError && !this.destroyed) {
+          if (data !== undefined && data !== null) this.push(data);
+          this.push(null);
         }
-        finalize();
-      });
-      return this;
-    }
-    finalize();
-    return this;
+        callback(flushError);
+      };
+      try { this._flush(done); }
+      catch (flushError) { done(flushError); }
+    });
   }
 }
 
@@ -29041,12 +29190,12 @@ mod tests {
             20_034,
             "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
         ),
-        // Buffered delivery and demand-driven adapters add 3_951 bytes.
+        // Serialized writes, finalization and writer cleanup add 7_073 bytes.
         // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            25_059,
-            "f1da4bf3268a2cfeed59d88ab8e108a2855f8323cf6b2a848905ac8dfa9270e4",
+            32_132,
+            "03f4de4e2de167b5ca6183aeec19bd83067a43b187b115cffa895fac8b8b9f8a",
         ),
         // Re-pinned with native tool factory execution.
         (
@@ -41482,6 +41631,594 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(result["pendingDone"], json!(true));
             assert_eq!(result["destroyed"], json!(true));
             assert_eq!(result["listeners"], json!(0));
+        });
+    }
+
+    #[test]
+    fn pijs_writable_serializes_pending_writes_and_defers_finalization() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.writableLifecycle = { done: false };
+                    (async () => {
+                        const { Writable } = await import("node:stream");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        const pending = [], started = [], completed = [], errors = [];
+                        let active = 0, peak = 0, drains = 0, finals = 0, finishes = 0, ended = 0;
+                        let releaseFinal;
+                        class OrderedWriter extends Writable {
+                            constructor() { super({ objectMode: true, highWaterMark: 2 }); }
+                            _write(chunk, _encoding, callback) {
+                                started.push(String(chunk));
+                                active++;
+                                peak = Math.max(peak, active);
+                                pending.push(() => { active--; callback(null); });
+                            }
+                            _final(callback) { finals++; releaseFinal = callback; }
+                        }
+                        const sink = new OrderedWriter();
+                        sink.on("error", error => errors.push(error.message));
+                        sink.on("drain", () => drains++);
+                        sink.on("finish", () => finishes++);
+                        const record = name => error => {
+                            completed.push(name);
+                            if (error) errors.push(error.message);
+                        };
+                        const accepted = [sink.write("alpha", record("alpha")), sink.write("beta", record("beta"))];
+                        await settle();
+                        const before = { started: [...started], completed: [...completed], drains };
+                        pending.shift()();
+                        await settle();
+                        const afterFirst = { started: [...started], completed: [...completed], drains };
+                        pending.shift()();
+                        await settle();
+                        const drained = drains;
+                        sink.write("tail", record("tail"));
+                        // This overload must not become a function-valued chunk.
+                        sink.end(error => {
+                            ended++;
+                            if (error) errors.push(error.message);
+                        });
+                        await settle();
+                        const whileWriting = { finals, finishes, ended };
+                        pending.shift()();
+                        await settle();
+                        const whileFinalizing = { finals, finishes, ended };
+                        releaseFinal(null);
+                        await settle();
+                        globalThis.writableLifecycle = {
+                            done: true, accepted, before, afterFirst, drained,
+                            whileWriting, whileFinalizing, started, completed,
+                            peak, finals, finishes, ended, errors,
+                        };
+                    })().catch(error => { globalThis.writableLifecycle.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate pending writable lifecycle");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "writableLifecycle").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["accepted"], json!([true, false]));
+            assert_eq!(
+                result["before"],
+                json!({"started":["alpha"],"completed":[],"drains":0})
+            );
+            assert_eq!(
+                result["afterFirst"],
+                json!({"started":["alpha","beta"],"completed":["alpha"],"drains":0})
+            );
+            assert_eq!(result["drained"], json!(1));
+            assert_eq!(
+                result["whileWriting"],
+                json!({"finals":0,"finishes":0,"ended":0})
+            );
+            assert_eq!(
+                result["whileFinalizing"],
+                json!({"finals":1,"finishes":0,"ended":0})
+            );
+            assert_eq!(result["started"], json!(["alpha", "beta", "tail"]));
+            assert_eq!(result["completed"], json!(["alpha", "beta", "tail"]));
+            for field in ["peak", "finals", "finishes", "ended"] {
+                assert_eq!(result[field], json!(1), "{field}: {result}");
+            }
+            assert_eq!(result["errors"], json!([]));
+        });
+    }
+
+    #[test]
+    fn pijs_transform_waits_for_async_writes_and_flush_before_readable_eof() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.transformLifecycle = { done: false };
+                    (async () => {
+                        const { Transform } = await import("node:stream");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        const pending = [], started = [], errors = [];
+                        let flushes = 0, finishes = 0, ends = 0, closes = 0, releaseFlush;
+                        class DelayedTransform extends Transform {
+                            _transform(chunk, _encoding, callback) {
+                                started.push(String(chunk));
+                                pending.push(() => callback(null, String(chunk).toUpperCase()));
+                            }
+                            _flush(callback) { flushes++; releaseFlush = callback; }
+                        }
+                        const transform = new DelayedTransform();
+                        transform.on("error", error => errors.push(error.message));
+                        transform.on("finish", () => finishes++);
+                        transform.on("end", () => ends++);
+                        transform.on("close", () => closes++);
+                        transform.write("alpha");
+                        transform.write("-omega");
+                        transform.end();
+                        await settle();
+                        const before = { started: [...started], flushes, finishes, ends, closes };
+                        pending.shift()();
+                        await settle();
+                        const between = { started: [...started], flushes, finishes, ends, closes };
+                        pending.shift()();
+                        await settle();
+                        const flushing = { flushes, finishes, ends, closes };
+                        releaseFlush(null, "-tail");
+                        await settle();
+                        // Writable finish cannot discard output before a reader exists.
+                        const unread = { flushes, finishes, ends, closes };
+                        const chunks = [];
+                        for await (const chunk of transform) chunks.push(String(chunk));
+                        await settle();
+                        globalThis.transformLifecycle = {
+                            done: true, before, between, flushing, unread,
+                            text: chunks.join(""), flushes, finishes, ends, closes, errors,
+                        };
+                    })().catch(error => { globalThis.transformLifecycle.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate asynchronous transform lifecycle");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "transformLifecycle").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(
+                result["before"],
+                json!({"started":["alpha"],"flushes":0,"finishes":0,"ends":0,"closes":0})
+            );
+            assert_eq!(
+                result["between"],
+                json!({"started":["alpha","-omega"],"flushes":0,"finishes":0,"ends":0,"closes":0})
+            );
+            assert_eq!(
+                result["flushing"],
+                json!({"flushes":1,"finishes":0,"ends":0,"closes":0})
+            );
+            assert_eq!(
+                result["unread"],
+                json!({"flushes":1,"finishes":1,"ends":0,"closes":0})
+            );
+            assert_eq!(result["text"], json!("ALPHA-OMEGA-tail"));
+            for field in ["flushes", "finishes", "ends", "closes"] {
+                assert_eq!(result[field], json!(1), "{field}: {result}");
+            }
+            assert_eq!(result["errors"], json!([]));
+        });
+    }
+
+    #[test]
+    fn pijs_writable_error_settles_active_queued_and_end_callbacks_once() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.writableFailure = { done: false };
+                    (async () => {
+                        const { Writable } = await import("node:stream");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        const started = [], callbacks = [], errors = [];
+                        let release, releaseDestroy, finishes = 0, closes = 0, finals = 0, destroys = 0;
+                        class FailedSink extends Writable {
+                            _write(chunk, _encoding, callback) { started.push(String(chunk)); release = callback; }
+                            _final(callback) { finals++; callback(null); }
+                            _destroy(error, callback) {
+                                destroys++;
+                                releaseDestroy = () => callback(error);
+                            }
+                        }
+                        const sink = new FailedSink();
+                        sink.on("error", error => errors.push(error.message));
+                        sink.on("finish", () => finishes++);
+                        sink.on("close", () => closes++);
+                        const record = name => error => callbacks.push({ name, failed: Boolean(error) });
+                        sink.write("active", record("active"));
+                        sink.write("queued", record("queued"));
+                        sink.end(undefined, undefined, record("end"));
+                        release(new Error("write refused"));
+                        await settle();
+                        sink.destroy(new Error("duplicate teardown"));
+                        sink.destroy();
+                        await settle();
+                        const beforeCleanup = {
+                            destroyed: sink.destroyed, destroys, closes,
+                            errors: [...errors], callbacks: callbacks.length,
+                        };
+                        releaseDestroy();
+                        releaseDestroy();
+                        await settle();
+                        globalThis.writableFailure = {
+                            done: true, started,
+                            callbacks: callbacks.sort((left, right) => left.name.localeCompare(right.name)),
+                            errors, finishes, closes, finals, destroys, beforeCleanup, destroyed: sink.destroyed,
+                        };
+                    })().catch(error => { globalThis.writableFailure.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate failed writable settlement");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "writableFailure").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["started"], json!(["active"]));
+            assert_eq!(
+                result["callbacks"],
+                json!([
+                    {"name":"active","failed":true},
+                    {"name":"end","failed":true},
+                    {"name":"queued","failed":true}
+                ])
+            );
+            assert_eq!(result["errors"], json!(["write refused"]));
+            assert_eq!(
+                result["beforeCleanup"],
+                json!({"destroyed":true,"destroys":1,"closes":0,"errors":[],"callbacks":3})
+            );
+            assert_eq!(result["destroys"], json!(1));
+            assert_eq!(result["finishes"], json!(0));
+            assert_eq!(result["finals"], json!(0));
+            assert_eq!(result["closes"], json!(1));
+            assert_eq!(result["destroyed"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_writable_from_web_aborts_and_releases_its_owned_writer_once() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.webWritableOwnership = { done: false };
+                    (async () => {
+                        const { Writable } = await import("node:stream");
+                        const settle = async () => {
+                            for (let i = 0; i < 20; i++) await Promise.resolve();
+                        };
+                        const writes = [], callbacks = [], errors = [];
+                        let aborts = 0, releases = 0, writerCloses = 0, finishes = 0, closes = 0;
+                        let finishWrite, finishAbort;
+                        const sink = Writable.fromWeb({
+                            getWriter() {
+                                return {
+                                    write(chunk) {
+                                        writes.push(String(chunk));
+                                        return new Promise(resolve => { finishWrite = resolve; });
+                                    },
+                                    close() { writerCloses++; return Promise.resolve(); },
+                                    abort() { aborts++; return new Promise(resolve => { finishAbort = resolve; }); },
+                                    releaseLock() { releases++; },
+                                };
+                            },
+                        });
+                        sink.on("error", error => errors.push(error.message));
+                        sink.on("finish", () => finishes++);
+                        sink.on("close", () => closes++);
+                        const record = name => error => callbacks.push({ name, failed: Boolean(error) });
+                        sink.write("active", record("active"));
+                        sink.write("queued", record("queued"));
+                        sink.end(undefined, undefined, record("end"));
+                        await settle();
+                        sink.destroy(new Error("cancel owned writer"));
+                        sink.destroy(new Error("duplicate teardown"));
+                        await settle();
+                        const pendingAbort = { aborts, releases, closes };
+                        // A late transport completion cannot dispatch the queued write.
+                        finishWrite();
+                        await settle();
+                        finishAbort();
+                        await settle();
+                        sink.destroy();
+                        await settle();
+
+                        const normal = { writes: [], closes: 0, aborts: 0, releases: 0, ended: 0 };
+                        const completed = Writable.fromWeb({
+                            getWriter() {
+                                return {
+                                    write(chunk) { normal.writes.push(String(chunk)); return Promise.resolve(); },
+                                    close() { normal.closes++; return Promise.resolve(); },
+                                    abort() { normal.aborts++; return Promise.resolve(); },
+                                    releaseLock() { normal.releases++; },
+                                };
+                            },
+                        });
+                        completed.on("error", error => errors.push(error.message));
+                        completed.end("complete", error => {
+                            normal.ended++;
+                            if (error) errors.push(error.message);
+                        });
+                        await settle();
+                        globalThis.webWritableOwnership = {
+                            done: true, writes, pendingAbort, aborts, releases, writerCloses, finishes, closes,
+                            callbacks: callbacks.sort((left, right) => left.name.localeCompare(right.name)),
+                            errors, normal,
+                        };
+                    })().catch(error => { globalThis.webWritableOwnership.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate Web writable ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "webWritableOwnership").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["writes"], json!(["active"]));
+            assert_eq!(
+                result["pendingAbort"],
+                json!({"aborts":1,"releases":0,"closes":0})
+            );
+            assert_eq!(result["aborts"], json!(1));
+            assert_eq!(result["releases"], json!(1));
+            assert_eq!(result["writerCloses"], json!(0));
+            assert_eq!(result["finishes"], json!(0));
+            assert_eq!(result["closes"], json!(1));
+            assert_eq!(
+                result["callbacks"],
+                json!([
+                    {"name":"active","failed":true},
+                    {"name":"end","failed":true},
+                    {"name":"queued","failed":true}
+                ])
+            );
+            assert_eq!(result["errors"], json!(["cancel owned writer"]));
+            assert_eq!(
+                result["normal"],
+                json!({"writes":["complete"],"closes":1,"aborts":0,"releases":1,"ended":1})
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_writable_from_web_rejects_options_before_acquiring_writer() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.webWritableConstruction = { done: false };
+                    (async () => {
+                        const { Writable } = await import("node:stream");
+                        const ownership = { acquired: 0, released: 0, closes: 0, aborts: 0, locked: false };
+                        const web = {
+                            getWriter() {
+                                if (ownership.locked) throw new Error("writer is already locked");
+                                ownership.acquired++;
+                                ownership.locked = true;
+                                return {
+                                    write() { return Promise.resolve(); },
+                                    close() { ownership.closes++; return Promise.resolve(); },
+                                    abort() { ownership.aborts++; return Promise.resolve(); },
+                                    releaseLock() { ownership.released++; ownership.locked = false; },
+                                };
+                            },
+                        };
+                        const refused = [];
+                        for (const options of [
+                            { highWaterMark: -1 },
+                            { writableHighWaterMark: -1 },
+                            { highWaterMark: Number.MAX_SAFE_INTEGER + 1 },
+                        ]) {
+                            try { Writable.fromWeb(web, options); refused.push(false); }
+                            catch (error) { refused.push(error instanceof RangeError); }
+                        }
+                        const afterRefusals = { ...ownership };
+                        const sink = Writable.fromWeb(web, { highWaterMark: 1 });
+                        const errors = [];
+                        sink.on("error", error => errors.push(error.message));
+                        await new Promise((resolve, reject) => {
+                            sink.end(error => error ? reject(error) : resolve());
+                        });
+                        for (let i = 0; i < 20; i++) await Promise.resolve();
+                        globalThis.webWritableConstruction = {
+                            done: true, refused, afterRefusals, ownership, errors,
+                        };
+                    })().catch(error => { globalThis.webWritableConstruction.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate Web writer construction ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "webWritableConstruction").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["refused"], json!([true, true, true]));
+            assert_eq!(
+                result["afterRefusals"],
+                json!({"acquired":0,"released":0,"closes":0,"aborts":0,"locked":false})
+            );
+            assert_eq!(
+                result["ownership"],
+                json!({"acquired":1,"released":1,"closes":1,"aborts":0,"locked":false})
+            );
+            assert_eq!(result["errors"], json!([]));
+        });
+    }
+
+    #[test]
+    fn pijs_writable_to_web_awaits_owned_cleanup_and_reports_late_failure() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.webWritableClose = { done: false };
+                    (async () => {
+                        const { Writable } = await import("node:stream");
+                        const originalWebWritable = globalThis.WritableStream;
+                        // QuickJS need not provide Web WritableStream. This
+                        // adapter invokes the actual bridge sink lifecycle;
+                        // it does not substitute Node cleanup or skip coverage.
+                        if (typeof originalWebWritable !== "function") {
+                            globalThis.WritableStream = class {
+                                constructor(sink) {
+                                    this.sink = sink;
+                                    this.failure = null;
+                                    sink.start?.({ error: error => { this.failure = error; } });
+                                }
+                                getWriter() {
+                                    return {
+                                        close: () => Promise.resolve().then(() => this.sink.close()).then(() => {
+                                            if (this.failure) throw this.failure;
+                                        }),
+                                        releaseLock() {},
+                                    };
+                                }
+                            };
+                        }
+                        try {
+                            const settle = async () => {
+                                for (let i = 0; i < 20; i++) await Promise.resolve();
+                            };
+                            const outcomes = [];
+                            for (const [fail, lateBridge] of [
+                                [false, false], [true, false], [false, true], [true, true],
+                            ]) {
+                                let finishDestroy, destroys = 0, finishes = 0, closes = 0;
+                                let outcome = "pending", escaped = null;
+                                const sink = new Writable({
+                                    destroy(_error, callback) { destroys++; finishDestroy = callback; },
+                                });
+                                sink.on("finish", () => finishes++);
+                                sink.on("close", () => closes++);
+                                if (lateBridge) {
+                                    // destroyed becomes true before an asynchronous
+                                    // cleanup finishes. The bridge must still own
+                                    // error/close observation for that live owner.
+                                    sink.end();
+                                    await settle();
+                                }
+                                const writer = Writable.toWeb(sink).getWriter();
+                                const closing = writer.close().then(
+                                    () => { outcome = "closed"; },
+                                    error => { outcome = error.message; },
+                                );
+                                await settle();
+                                const pending = {
+                                    outcome, destroys, finishes, closes,
+                                    observesErrors: sink.listenerCount("error") > 0,
+                                };
+                                try {
+                                    finishDestroy(fail ? new Error("asynchronous cleanup failed") : null);
+                                    finishDestroy(new Error("ignored duplicate cleanup"));
+                                } catch (error) { escaped = error.message; }
+                                await settle();
+                                sink.destroy(new Error("ignored repeated destroy"));
+                                await closing;
+                                writer.releaseLock();
+                                outcomes.push({
+                                    fail, lateBridge, pending, outcome, destroys, finishes, closes, escaped,
+                                    destroyed: sink.destroyed, closed: sink.closed,
+                                    retainedErrors: sink.listenerCount("error"),
+                                });
+                            }
+                            let destroys = 0, finishes = 0, closes = 0;
+                            const reusable = new Writable({
+                                autoDestroy: false,
+                                destroy(_error, callback) { destroys++; callback(null); },
+                            });
+                            reusable.on("finish", () => finishes++);
+                            reusable.on("close", () => closes++);
+                            const writer = Writable.toWeb(reusable).getWriter();
+                            await writer.close();
+                            writer.releaseLock();
+                            await settle();
+                            const retained = {
+                                destroys, finishes, closes,
+                                destroyed: reusable.destroyed, closed: reusable.closed,
+                                retainedErrors: reusable.listenerCount("error"),
+                            };
+                            reusable.destroy();
+                            globalThis.webWritableClose = { done: true, outcomes, retained };
+                        } finally {
+                            globalThis.WritableStream = originalWebWritable;
+                        }
+                    })().catch(error => { globalThis.webWritableClose.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate Web close resource settlement");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "webWritableClose").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            let outcomes = result["outcomes"].as_array().expect("cleanup outcomes");
+            assert_eq!(outcomes.len(), 4);
+            for (index, outcome) in outcomes.iter().enumerate() {
+                assert_eq!(
+                    outcome["pending"],
+                    json!({
+                        "outcome":"pending","destroys":1,"finishes":1,"closes":0,
+                        "observesErrors":true
+                    }),
+                    "{outcome}"
+                );
+                assert_eq!(outcome["fail"], json!(index % 2 == 1));
+                assert_eq!(outcome["lateBridge"], json!(index >= 2));
+                assert_eq!(
+                    outcome["outcome"],
+                    json!(if index % 2 == 0 {
+                        "closed"
+                    } else {
+                        "asynchronous cleanup failed"
+                    })
+                );
+                assert_eq!(outcome["escaped"], Value::Null, "{outcome}");
+                for field in ["destroys", "finishes", "closes"] {
+                    assert_eq!(outcome[field], json!(1), "{field}: {outcome}");
+                }
+                assert_eq!(outcome["destroyed"], json!(true));
+                assert_eq!(outcome["closed"], json!(true));
+                assert_eq!(outcome["retainedErrors"], json!(0));
+            }
+            assert_eq!(
+                result["retained"],
+                json!({
+                    "destroys":0,"finishes":1,"closes":0,"destroyed":false,"closed":false,
+                    "retainedErrors":0
+                })
+            );
         });
     }
 

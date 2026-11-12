@@ -1652,7 +1652,11 @@ mod tests {
 
     fn assert_terminal_file_error(error: &Error) {
         assert!(!crate::failover::call_error_is_retryable(error), "{error}");
-        assert_eq!(crate::failover::classify_call_failover(error), None, "{error}");
+        assert_eq!(
+            crate::failover::classify_call_failover(error),
+            None,
+            "{error}"
+        );
         assert!(
             !crate::failover::error_result_is_retryable(&failed_turn(error), None),
             "flattening a refusal must not reopen retry admission: {error}"
@@ -1712,7 +1716,10 @@ mod tests {
             Error::api(format!("HTTP 422: timeout at {private}")),
             Error::validation(format!("invalid header; connection reset at {private}")),
             Error::session_persistence(format!("failed save: HTTP 503 {private}")),
-            Error::CostCap { spent: 1.0, cap: 1.0 },
+            Error::CostCap {
+                spent: 1.0,
+                cap: 1.0,
+            },
             std::io::Error::new(std::io::ErrorKind::InvalidData, private).into(),
         ] {
             let aborted = matches!(&cause, Error::Aborted);
@@ -1829,7 +1836,11 @@ mod tests {
                 .count();
             assert_eq!(
                 uploads,
-                if boundary.starts_with("lookup-") { 1 } else { 2 },
+                if boundary.starts_with("lookup-") {
+                    1
+                } else {
+                    2
+                },
                 "{boundary}"
             );
         }
@@ -1837,7 +1848,13 @@ mod tests {
 
     #[test]
     fn complete_invalid_or_oversized_metadata_stays_terminal() {
-        for failure in ["invalid-json", "oversized", "wrong-identity", "forbidden", "failed"] {
+        for failure in [
+            "invalid-json",
+            "oversized",
+            "wrong-identity",
+            "forbidden",
+            "failed",
+        ] {
             let server = Server::start(|endpoint| {
                 let mut reply = match failure {
                     "oversized" => Reply {
@@ -1865,13 +1882,21 @@ mod tests {
                 vec![Reply::start(endpoint), reply]
             });
             let provider = fixture_provider(&server);
-            let error = run_async(fixture_events(&provider, &fixture_context(), &fixture_options()))
-                .expect_err("complete unusable metadata must not be treated as transport loss");
+            let error = run_async(fixture_events(
+                &provider,
+                &fixture_context(),
+                &fixture_options(),
+            ))
+            .expect_err("complete unusable metadata must not be treated as transport loss");
             assert_terminal_file_error(&error);
             let diagnostic = format!("{error:?} {error}");
             assert!(!diagnostic.contains("secret-file-data"));
             assert!(!diagnostic.contains("test-capability"));
-            assert_eq!(server.finish().len(), 2, "no generation or replay: {failure}");
+            assert_eq!(
+                server.finish().len(),
+                2,
+                "no generation or replay: {failure}"
+            );
         }
     }
 
