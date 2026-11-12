@@ -20,7 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -625,9 +625,20 @@ pub struct LogPage {
 #[derive(Default)]
 struct ServiceRegistry {
     services: HashMap<String, ServiceEntry>,
+    shutting_down: bool,
 }
 
 impl ServiceRegistry {
+    fn ensure_accepting_starts(&self) -> Result<()> {
+        if self.shutting_down {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SHUTTING_DOWN: service startup is closed for process shutdown",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reserve before any filesystem or process side effects. The ring's Arc
     /// identity is also the incarnation token, so stopped names can be reused
     /// without letting an old monitor or readiness waiter mutate the new run.
@@ -637,6 +648,7 @@ impl ServiceRegistry {
         ring: &Arc<Mutex<Ring>>,
         log_path: &std::path::Path,
     ) -> Result<()> {
+        self.ensure_accepting_starts()?;
         if let Some(existing) = self.services.get(&spec.name)
             && existing.status.live()
         {
@@ -906,6 +918,15 @@ fn registry() -> &'static Mutex<ServiceRegistry> {
     &REGISTRY
 }
 
+/// Order child creation through monitor handoff before shutdown's snapshot.
+/// Independent startups retain parallel read access until shutdown closes it.
+/// Never wait for this lock while retaining the registry lock: a startup owns
+/// this lock first and needs the registry to publish or clean up its child.
+fn startup_lock() -> &'static RwLock<()> {
+    static LOCK: RwLock<()> = RwLock::new(());
+    &LOCK
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -998,6 +1019,10 @@ pub(crate) fn start_for_request(
 
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<ServiceSnapshot> {
+    registry()
+        .lock()
+        .map_err(|_| registry_err())?
+        .ensure_accepting_starts()?;
     if let Some(request) = request {
         request.check_spawn()?;
     }
@@ -1024,6 +1049,9 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
         ));
     }
 
+    #[cfg(test)]
+    run_startup_test_hook(&name, StartupTestStage::BeforeReservation);
+    let startup = startup_lock().read().map_err(|_| registry_err())?;
     let mut output = Ring::new(RING_LINE_CAP);
     output.watch_readiness(log_regex);
     let ring = Arc::new(Mutex::new(output));
@@ -1043,8 +1071,11 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
         reader,
         writer,
     } = spawn_pty(spec, request)?;
+    #[cfg(test)]
+    run_startup_test_hook(&name, StartupTestStage::BeforePublication);
     let initial_snapshot = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
+        reg.ensure_accepting_starts()?;
         let entry = reg
             .current_mut(&name, &ring)
             .ok_or_else(|| stale_service(&name))?;
@@ -1101,6 +1132,9 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
             )
         })?;
     pending.armed = false;
+    // Readiness can wait for user code or a network listener. The monitor now
+    // owns the child, so shutdown can cancel it without waiting for readiness.
+    drop(startup);
 
     // No-gate starts acknowledge the publication above, even if a very short
     // command has since exited. Never resurrect its settled registry entry.
@@ -1216,6 +1250,12 @@ fn spawn_pty(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Spaw
     if let Some(request) = request {
         request.check_spawn()?;
     }
+    #[cfg(test)]
+    run_startup_test_hook(&spec.name, StartupTestStage::BeforeSpawn);
+    registry()
+        .lock()
+        .map_err(|_| registry_err())?
+        .ensure_accepting_starts()?;
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1680,6 +1720,7 @@ fn restart_inner(name: &str, request: Option<&ServiceRequest>) -> Result<Service
     }
     let (spec, control) = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
+        reg.ensure_accepting_starts()?;
         let Some(entry) = reg.services.get_mut(name) else {
             return Err(Error::tool(
                 "hub",
@@ -1717,13 +1758,15 @@ pub fn describe(name: &str) -> Result<ServiceSnapshot> {
     Ok(ServiceSnapshot::from_entry(entry))
 }
 
-/// Kill every non-detached service (session exit). Called once from the
-/// main shutdown chokepoint next to `jobs::kill_all`.
+/// Kill the current non-detached services, leaving admission open for later
+/// starts. Use [`shutdown_session_services`] for final process shutdown.
 // The registry lock covers both marking the victims and persisting that
 // state, so the detached-state file never records a half-applied stop.
 #[allow(clippy::significant_drop_tightening)]
 pub fn kill_session_services() {
-    let deadline = Instant::now() + SETTLEMENT_BUDGET;
+    let startup = startup_lock()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let controls = {
         let mut reg = registry()
             .lock()
@@ -1741,10 +1784,57 @@ pub fn kill_session_services() {
         persist_detached_state(&reg);
         victims
     };
+    drop(startup);
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
     for (name, control) in controls {
         // All victims receive their request before any wait. A foreign OS
         // wait that exceeds the shared bound remains truthfully `stopping`.
         let _ = control.wait_until(&name, deadline);
+    }
+}
+
+/// Permanently close service admission, then stop all non-detached services.
+///
+/// The fence is published before waiting for an in-flight startup. That
+/// startup either refuses before child creation, reaps its unpublished child,
+/// or hands ownership to the monitor before the shutdown snapshot is taken.
+/// Existing detached services retain their explicit cleanup exemption, but no
+/// new starts or restarts (including detached ones) are admitted after this.
+pub fn shutdown_session_services() {
+    registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .shutting_down = true;
+    kill_session_services();
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupTestStage {
+    BeforeReservation,
+    BeforeSpawn,
+    BeforePublication,
+}
+
+#[cfg(test)]
+type StartupTestHook = Arc<dyn Fn(StartupTestStage) + Send + Sync>;
+
+#[cfg(test)]
+fn startup_test_hook() -> &'static Mutex<Option<(String, StartupTestHook)>> {
+    static HOOK: Mutex<Option<(String, StartupTestHook)>> = Mutex::new(None);
+    &HOOK
+}
+
+#[cfg(test)]
+fn run_startup_test_hook(name: &str, stage: StartupTestStage) {
+    let hook = startup_test_hook()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(owner, _)| owner == name)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook(stage);
     }
 }
 
@@ -2299,6 +2389,236 @@ mod tests {
         assert_eq!(settled.status, ServiceStatus::Killed);
         assert_eq!(settled.pid, None);
         assert_eq!(settled.exit_code, Some(137));
+    }
+
+    #[test]
+    fn final_shutdown_closes_new_and_reused_service_names() {
+        let mut reg = ServiceRegistry::default();
+        let mut launch = spec("hub-shutdown-reservation", "unused", &[], None);
+        let ring = Arc::new(Mutex::new(Ring::new(8)));
+        reg.reserve(&launch, &ring, &PathBuf::from("previous.log"))
+            .expect("initial reservation");
+        assert!(reg.settle(&launch.name, &ring, 0));
+        reg.shutting_down = true;
+
+        for (name, detached) in [
+            ("hub-shutdown-reservation", false),
+            ("hub-shutdown-new", false),
+            ("hub-shutdown-detached", true),
+        ] {
+            launch.name = name.to_string();
+            launch.detached = detached;
+            let error = reg
+                .reserve(&launch, &ring, &PathBuf::from("never-created.log"))
+                .expect_err("process shutdown permanently closes admission");
+            assert!(error.to_string().contains("PI_HUB_SHUTTING_DOWN"));
+        }
+        assert_eq!(reg.services.len(), 1);
+        assert_eq!(
+            reg.services["hub-shutdown-reservation"].status,
+            ServiceStatus::Exited
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_shutdown_fences_in_flight_startups() {
+        const CHILD_STAGE: &str = "PI_HUB_SHUTDOWN_TEST_STAGE";
+        let Ok(mode) = std::env::var(CHILD_STAGE) else {
+            // Closing admission is intentionally irreversible. Each schedule
+            // runs in a fresh process, with no test-only reopening of the fence.
+            for mode in ["reservation", "spawn", "publication", "detached_restart"] {
+                let proof = tempfile::tempdir().expect("shutdown proof directory");
+                let completed = proof.path().join("completed");
+                let output =
+                    std::process::Command::new(std::env::current_exe().expect("test binary"))
+                        .args([
+                            "--exact",
+                            "hub::tests::final_shutdown_fences_in_flight_startups",
+                            "--nocapture",
+                        ])
+                        .env(CHILD_STAGE, mode)
+                        .env("PI_HUB_SHUTDOWN_TEST_PROOF", &completed)
+                        .env("PI_CODING_AGENT_DIR", proof.path())
+                        .output()
+                        .expect("isolated shutdown fixture");
+                assert!(
+                    output.status.success(),
+                    "shutdown schedule {mode} failed:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    std::fs::read(&completed).expect("selected child test completed"),
+                    b"closed-and-reaped"
+                );
+            }
+            return;
+        };
+
+        let root = tempfile::tempdir().expect("fixture directory");
+        if mode == "detached_restart" {
+            let launch = LaunchSpec {
+                name: "hub-shutdown-detached".to_string(),
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exec sleep 300".to_string()],
+                cwd: root.path().to_path_buf(),
+                env: Vec::new(),
+                ready: None,
+                detached: true,
+            };
+            let initial = start(&launch).expect("start detached service");
+            shutdown_session_services();
+            let restarted = restart(&launch.name);
+            let retained = describe(&launch.name);
+            // Clean up before assertions so a regression cannot orphan the
+            // explicit detached fixture when its child test fails.
+            let stopped = stop(&launch.name);
+            let error = restarted.expect_err("shutdown must refuse detached restarts");
+            assert!(error.to_string().contains("PI_HUB_SHUTTING_DOWN"));
+            let retained = retained.expect("retained detached service");
+            assert_eq!(retained.pid, initial.pid);
+            assert_eq!(retained.status, "running");
+            let stopped = stopped.expect("explicit stop remains available");
+            assert_eq!(stopped.status, "killed");
+            assert!(stopped.pid.is_none());
+            let pid = initial.pid.expect("detached child PID");
+            let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("PID fits i32"))
+                .expect("positive PID");
+            assert!(
+                rustix::process::test_kill_process(pid).is_err(),
+                "explicit stop must reap the detached fixture"
+            );
+            std::fs::write(
+                std::env::var_os("PI_HUB_SHUTDOWN_TEST_PROOF").expect("shutdown proof path"),
+                b"closed-and-reaped",
+            )
+            .expect("record completed detached shutdown assertions");
+            return;
+        }
+
+        let target_stage = match mode.as_str() {
+            "reservation" => StartupTestStage::BeforeReservation,
+            "spawn" => StartupTestStage::BeforeSpawn,
+            "publication" => StartupTestStage::BeforePublication,
+            _ => panic!("unknown shutdown schedule"),
+        };
+        let marker = root.path().join("child.pid");
+        let launch = LaunchSpec {
+            name: "hub-shutdown-race".to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf '%s' \"$$\" > child.pid; exec sleep 300".to_string(),
+            ],
+            cwd: root.path().to_path_buf(),
+            env: Vec::new(),
+            ready: None,
+            detached: false,
+        };
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let resume_rx = Mutex::new(resume_rx);
+        let child_spawned = Arc::new(AtomicBool::new(false));
+        let hook_spawned = Arc::clone(&child_spawned);
+        let hook: StartupTestHook = Arc::new(move |stage| {
+            if stage == StartupTestStage::BeforePublication {
+                hook_spawned.store(true, Ordering::Release);
+            }
+            if stage == target_stage {
+                reached_tx.send(()).expect("announce startup pause");
+                resume_rx
+                    .lock()
+                    .expect("resume receiver")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("resume startup after shutdown fence");
+            }
+        });
+        *startup_test_hook().lock().expect("startup hook") = Some((launch.name.clone(), hook));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let startup = std::thread::spawn(move || {
+            started_tx.send(start(&launch)).expect("startup result");
+        });
+        reached_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("startup reached deterministic pause");
+
+        let child_pid = if target_stage == StartupTestStage::BeforePublication {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = pid.parse::<i32>()
+                {
+                    break Some(pid);
+                }
+                assert!(Instant::now() < deadline, "child did not record its PID");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            None
+        };
+        let (closed_tx, closed_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown = std::thread::spawn(move || {
+            shutdown_session_services();
+            closed_tx.send(()).expect("shutdown result");
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if registry().lock().expect("registry").shutting_down {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shutdown must publish admission fence before waiting for startup"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if target_stage != StartupTestStage::BeforeReservation {
+            assert!(
+                matches!(
+                    closed_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "shutdown must await ownership handoff or failed-start cleanup"
+            );
+        }
+        resume_tx.send(()).expect("release paused startup");
+        let error = started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("startup completed")
+            .expect_err("shutdown refuses the in-flight launch");
+        assert!(error.to_string().contains("PI_HUB_SHUTTING_DOWN"));
+        closed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown completed");
+        startup.join().expect("startup thread");
+        shutdown.join().expect("shutdown thread");
+        assert!(
+            ps().expect("services")
+                .iter()
+                .all(|entry| entry.pid.is_none())
+        );
+        if let Some(pid) = child_pid {
+            let pid = rustix::process::Pid::from_raw(pid).expect("positive PID");
+            assert!(
+                rustix::process::test_kill_process(pid).is_err(),
+                "unpublished child must be reaped before shutdown returns"
+            );
+        } else {
+            assert!(
+                !child_spawned.load(Ordering::Acquire),
+                "shutdown must refuse the launch before creating an OS child"
+            );
+            assert!(
+                !marker.exists(),
+                "refused startup must not execute user code"
+            );
+        }
+        std::fs::write(
+            std::env::var_os("PI_HUB_SHUTDOWN_TEST_PROOF").expect("shutdown proof path"),
+            b"closed-and-reaped",
+        )
+        .expect("record completed shutdown assertions");
     }
 
     #[test]

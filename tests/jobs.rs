@@ -5,7 +5,8 @@
 //!    arrives in the follow-up drain with the output tail.
 //! 2. cancel mid-run kills the whole process tree (child-spawning script).
 //! 3. Owner-scoped session shutdown kills only that session's jobs.
-//! 4. `kill_all` (process exit) with 2 running jobs leaves zero survivors.
+//! 4. Final `shutdown_all` with 2 running jobs drains output, leaves zero
+//!    survivors, and rejects subsequent admission from new owners.
 //! 5. The concurrency cap rejects the 9th job with `PI_JOBS_AT_CAPACITY`.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
@@ -968,6 +969,23 @@ fn owner_scoped_session_shutdown_preserves_foreign_jobs() {
 
 #[test]
 fn process_exit_kills_all_survivors() {
+    const CHILD: &str = "PI_JOBS_FINAL_SHUTDOWN_INTEGRATION";
+    const VERIFIED: &str = "final job shutdown assertions completed";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "process_exit_kills_all_survivors", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated process-shutdown test");
+        assert!(
+            result.status.success(),
+            "isolated shutdown failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains(VERIFIED));
+        return;
+    }
     let _guard = JOBS_TEST_LOCK.lock().expect("jobs test lock"); // ubs:ignore test guard
     let case = "process_exit_kills_all_survivors";
     let harness = TestHarness::new(case);
@@ -976,11 +994,11 @@ fn process_exit_kills_all_survivors() {
     let tool = bash_tool(&root);
     let first = execute(
         &tool,
-        json!({"command": "sleep 300", "background": true, "timeout": 300}),
+        json!({"command": "printf first-ready; sleep 300", "background": true, "timeout": 300}),
     );
     let second = execute(
         &tool,
-        json!({"command": "sleep 300", "background": true, "timeout": 300}),
+        json!({"command": "printf second-ready; sleep 300", "background": true, "timeout": 300}),
     );
     let first_pid = u32::try_from(
         first.details.as_ref().expect("first details")["pid"] // ubs:ignore test fixture
@@ -999,17 +1017,61 @@ fn process_exit_kills_all_survivors() {
         format!("running jobs pids: {first_pid}, {second_pid}"),
     );
 
-    pi::jobs::kill_all();
+    let first_id = job_id(&first);
+    let second_id = job_id(&second);
+    for (id, marker) in [(&first_id, "first-ready"), (&second_id, "second-ready")] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = pi::jobs::wait(TEST_SESSION_ID, id, Duration::ZERO)
+                .expect("observe running output");
+            if snapshot.output_tail.contains(marker) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job never emitted {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    pi::jobs::shutdown_all();
     std::thread::sleep(Duration::from_millis(500));
 
     for pid in [first_pid, second_pid] {
         let proc_path = format!("/proc/{pid}"); // ubs:ignore two-iteration test loop
         let alive = std::path::Path::new(&proc_path).exists() || kill_zero(pid);
-        let message = format!("pid {pid} alive after kill_all: {alive}"); // ubs:ignore test loop
+        let message = format!("pid {pid} alive after shutdown_all: {alive}"); // ubs:ignore test loop
         harness.log().info("verify", message);
-        assert!(!alive, "job process {pid} survived session-exit kill_all");
+        assert!(!alive, "job process {pid} survived final shutdown");
     }
+    for (id, marker) in [(&first_id, "first-ready"), (&second_id, "second-ready")] {
+        let settled =
+            pi::jobs::wait(TEST_SESSION_ID, id, Duration::ZERO).expect("settled shutdown snapshot");
+        assert_eq!(settled.status, "killed");
+        assert!(
+            settled.output_complete,
+            "final shutdown must drain its owned output"
+        );
+        assert!(settled.output_tail.contains(marker));
+        assert!(
+            std::fs::read_to_string(&settled.artifact_path)
+                .expect("sealed output artifact")
+                .contains(marker)
+        );
+    }
+    let refused = pi::jobs::spawn_background(
+        "new-session-after-final-shutdown",
+        &root,
+        None,
+        None,
+        "true",
+        Some(1),
+        Some(&root),
+    )
+    .expect_err("final shutdown must permanently close admission");
+    assert!(refused.to_string().contains("PI_JOBS_SHUTTING_DOWN"));
     finish_case(&harness, case);
+    println!("{VERIFIED}");
 }
 
 #[test]

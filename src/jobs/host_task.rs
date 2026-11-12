@@ -7,9 +7,9 @@ use super::{
     JobEntry, JobSnapshot, JobSnapshotSource, JobStatus, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES,
     MAX_TOTAL_ARTIFACT_BYTES, MIN_RETAINED_ARTIFACT_FILES, OUTPUT_TAIL_BYTES, TailBuffer,
     acquire_artifact_budget_lock, capture_session_spawn_generation, create_job_artifact,
-    enforce_artifact_retention, ensure_session_spawn_generation, lifecycle_lock, now_ms, registry,
-    reserve_job_slot, session_closing_error, settle_job_and_enqueue_notice,
-    settle_job_without_notice,
+    enforce_artifact_retention, ensure_process_accepting_jobs, ensure_session_spawn_generation,
+    lifecycle_lock, now_ms, registry, reserve_job_slot, session_closing_error,
+    settle_job_and_enqueue_notice, settle_job_without_notice,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -125,7 +125,7 @@ pub fn with_owned_task_progress<T>(
             && job.process_live
             && !job.cancel_requested
     });
-    if !live || reg.closing_owners.contains_key(owner_session_id) {
+    if !live || reg.shutting_down || reg.closing_owners.contains_key(owner_session_id) {
         return Err(stopped());
     }
     let (value, notice) = commit()?;
@@ -193,7 +193,7 @@ pub fn publish_owned_task_progress(
         )
     };
     let mut reg = registry().lock().map_err(|_| stopped())?;
-    if reg.closing_owners.contains_key(owner_session_id) {
+    if reg.shutting_down || reg.closing_owners.contains_key(owner_session_id) {
         return Err(stopped());
     }
     let job = reg
@@ -334,10 +334,13 @@ where
     // lane. Recheck generation, cancellation and the original deadline before
     // publication; waiting for the artifact lock never renews that deadline.
     check_admission()?;
+    #[cfg(test)]
+    super::invoke_before_native_registry_publication_hook(owner_session_id);
     let source = {
         let mut reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        ensure_process_accepting_jobs(&reg)?;
         let generation = reg
             .owner_shutdown_generations
             .get(owner_session_id)
@@ -539,12 +542,10 @@ impl<F: Future<Output = Result<ToolOutput>>> OwnedWork<F> {
 }
 
 fn task_cancelled(id: &str) -> bool {
-    registry()
+    let reg = registry()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .jobs
-        .get(id)
-        .is_none_or(|job| job.cancel_requested)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.shutting_down || reg.jobs.get(id).is_none_or(|job| job.cancel_requested)
 }
 
 struct TaskResources {
@@ -1210,6 +1211,98 @@ mod tests {
         .expect("start task"); // ubs:ignore original-context cancellation requires a live fixture task
         context.set_cancel_requested(true);
         assert_eq!(settle(&owner, &started.id).status, "killed"); // ubs:ignore assert the monitor observes original-owner cancellation
+    }
+
+    #[test]
+    fn final_shutdown_refuses_admitted_and_unpublished_native_work() {
+        let Ok(case) = std::env::var("PI_JOBS_FINAL_SHUTDOWN_CASE") else {
+            for case in ["captured", "before_publication"] {
+                super::super::tests::run_final_shutdown_fixture(
+                    "jobs::host_task::tests::final_shutdown_refuses_admitted_and_unpublished_native_work",
+                    case,
+                );
+            }
+            return;
+        };
+        let _guard = super::super::process_test_guard();
+        let root = tempfile::tempdir().expect("final-shutdown task artifacts");
+        let session = owner_id();
+        let gate = Arc::new(super::super::tests::SpawnHookGate::default());
+        let paused_gate = Arc::clone(&gate);
+        let pause: Arc<dyn Fn() + Send + Sync> = Arc::new(move || paused_gate.enter_and_wait());
+        let _hooks = super::super::tests::install_spawn_background_test_hooks(
+            super::super::SpawnBackgroundTestHooks {
+                owner_session_id: Some(session.clone()),
+                after_initial_owner_check: (case == "captured").then(|| Arc::clone(&pause)),
+                before_native_registry_publication: (case == "before_publication")
+                    .then(|| Arc::clone(&pause)),
+                ..super::super::SpawnBackgroundTestHooks::default()
+            },
+        );
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed_poll = Arc::clone(&polled);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owned_drop = PendingDrop {
+            dropped: Arc::clone(&dropped),
+            restricted_drop: None,
+        };
+        let task_session = session.clone();
+        let artifact_root = root.path().to_path_buf();
+        let starter = std::thread::spawn(move || {
+            spawn_owned_task(
+                &task_session,
+                "queued final-shutdown task",
+                AgentCx::for_request(),
+                Duration::from_secs(30),
+                Some(&artifact_root),
+                privacy(),
+                async move {
+                    let _owned_drop = owned_drop;
+                    observed_poll.store(true, Ordering::Release);
+                    Ok(output("work after final shutdown is forbidden"))
+                },
+            )
+        });
+        gate.wait_until_entered();
+        let shutdown = std::thread::spawn(super::super::shutdown_all);
+        let fenced_before_release = super::super::tests::observe_final_shutdown_fence();
+        gate.release();
+        let result = starter.join().expect("paused native starter");
+        shutdown.join().expect("final shutdown worker");
+        if let Ok(snapshot) = &result {
+            let _ = super::super::cancel(&session, &snapshot.id);
+        }
+        assert!(
+            fenced_before_release,
+            "shutdown must fence before waiting for lifecycle"
+        );
+        gate.assert_not_timed_out();
+        let error = result.expect_err("final shutdown must refuse queued native work");
+        assert!(
+            error.to_string().contains("PI_JOBS_SHUTTING_DOWN"),
+            "{error}"
+        );
+        assert!(
+            !polled.load(Ordering::Acquire),
+            "rejected future must never run"
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "rejection must retire owned work"
+        );
+        assert!(super::super::list(&session).expect("owner jobs").is_empty());
+        assert!(super::super::take_completion_notices(&session).is_empty());
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(reg.starting_jobs, 0);
+        assert!(reg.owner_spawns_in_flight.is_empty());
+        drop(reg);
+        let error = admit_owned_task("new-native-owner-after-shutdown")
+            .err()
+            .expect("new native admission must remain closed");
+        assert!(error.to_string().contains("PI_JOBS_SHUTTING_DOWN"));
+        super::super::tests::record_final_shutdown_fixture_completion();
     }
 
     #[test]

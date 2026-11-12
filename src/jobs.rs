@@ -13,8 +13,8 @@
 //!
 //! Session scoping: the registry lives for the process, but every descriptor,
 //! management operation, and completion notice carries its originating
-//! session id. Cross-session ids fail exactly like unknown ids. `kill_all`
-//! remains the final process-shutdown chokepoint so no child survives exit.
+//! session id. Cross-session ids fail exactly like unknown ids. `shutdown_all`
+//! permanently closes admission before the final process-shutdown cleanup.
 //! Native tasks share the same admission, cancellation and retention fences;
 //! their complete privacy-protected tool results are available in `result`.
 
@@ -628,6 +628,7 @@ impl TailBuffer {
 #[derive(Default)]
 struct JobRegistry {
     jobs: HashMap<String, JobEntry>,
+    shutting_down: bool,
     closing_owners: HashMap<String, OwnerShutdownState>,
     owner_shutdown_generations: HashMap<String, u64>,
     owner_spawns_in_flight: HashMap<String, usize>,
@@ -666,6 +667,7 @@ struct SpawnBackgroundTestHooks {
     after_initial_owner_check: Option<Arc<dyn Fn() + Send + Sync>>,
     before_os_spawn: Option<Arc<dyn Fn() + Send + Sync>>,
     before_registry_publication: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    before_native_registry_publication: Option<Arc<dyn Fn() + Send + Sync>>,
     after_registry_publication: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     fail_monitor_spawn: bool,
     panic_monitor_after_start: bool,
@@ -727,6 +729,22 @@ fn invoke_before_registry_publication_hook(owner_session_id: &str, pid: u32) {
 }
 
 #[cfg(test)]
+fn invoke_before_native_registry_publication_hook(owner_session_id: &str) {
+    let hooks = spawn_background_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hook = if hooks.owner_session_id.as_deref() == Some(owner_session_id) {
+        hooks.before_native_registry_publication.clone()
+    } else {
+        None
+    };
+    drop(hooks);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
 fn invoke_after_registry_publication_hook(owner_session_id: &str, id: &str) {
     let hooks = spawn_background_test_hooks()
         .lock()
@@ -780,6 +798,16 @@ fn session_closing_error(owner_session_id: &str) -> Error {
     )
 }
 
+fn ensure_process_accepting_jobs(reg: &JobRegistry) -> Result<()> {
+    if reg.shutting_down {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SHUTTING_DOWN: process shutdown has closed background job admission",
+        ));
+    }
+    Ok(())
+}
+
 fn remove_quiescent_owner_generation(reg: &mut JobRegistry, owner_session_id: &str) {
     if !reg.closing_owners.contains_key(owner_session_id)
         && reg
@@ -798,6 +826,7 @@ fn ensure_session_accepting_jobs(owner_session_id: &str) -> Result<()> {
         let reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+        ensure_process_accepting_jobs(&reg)?;
         let Some(state) = reg.closing_owners.get(owner_session_id) else {
             return Ok(());
         };
@@ -827,6 +856,7 @@ fn ensure_session_accepting_jobs(owner_session_id: &str) -> Result<()> {
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    ensure_process_accepting_jobs(&reg)?;
     let Some(state) = reg.closing_owners.get(owner_session_id) else {
         // Another spawn may have reconciled the same stale fence while this
         // caller waited for the lifecycle lane. The owner is already open.
@@ -885,6 +915,7 @@ fn capture_session_spawn_generation(owner_session_id: &str) -> Result<SessionSpa
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    ensure_process_accepting_jobs(&reg)?;
     if reg.closing_owners.contains_key(owner_session_id) {
         return Err(session_closing_error(owner_session_id));
     }
@@ -918,6 +949,7 @@ fn ensure_session_spawn_generation(owner_session_id: &str, expected: u64) -> Res
     let reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    ensure_process_accepting_jobs(&reg)?;
     let current = reg
         .owner_shutdown_generations
         .get(owner_session_id)
@@ -958,6 +990,7 @@ fn reserve_job_slot() -> Result<(String, u64, StartingJobSlot)> {
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+    ensure_process_accepting_jobs(&reg)?;
     if running_count(&reg).saturating_add(reg.starting_jobs) >= MAX_CONCURRENT_JOBS {
         return Err(Error::tool(
             "bash",
@@ -1588,7 +1621,8 @@ impl Drop for BackgroundChild {
 ///
 /// # Errors
 /// Named `PI_JOBS_AT_CAPACITY` when 8 jobs are already running,
-/// `PI_JOBS_SESSION_CLOSING` when owner teardown has started, or tool errors
+/// `PI_JOBS_SESSION_CLOSING` when owner teardown has started,
+/// `PI_JOBS_SHUTTING_DOWN` after final process shutdown begins, or tool errors
 /// for spawn/artifact failures.
 pub fn spawn_background(
     owner_session_id: &str,
@@ -2022,7 +2056,9 @@ fn spawn_managed(
             .get(owner_session_id)
             .copied()
             .unwrap_or_default();
-        let admission_error = if owner.checkpoint().is_err() {
+        let admission_error = if let Err(error) = ensure_process_accepting_jobs(&reg) {
+            Some(error)
+        } else if owner.checkpoint().is_err() {
             Some(shell_job_cancelled_error())
         } else if reg.closing_owners.contains_key(owner_session_id)
             || current_generation != spawn_generation
@@ -3971,8 +4007,31 @@ pub async fn kill_session(owner_session_id: &str) -> Result<()> {
     }
 }
 
-/// Kill every running job (process exit). Called once from the main
-/// shutdown chokepoint; documented behavior — no orphan daemons.
+/// Permanently close job admission and cancel every published job.
+///
+/// Final process shutdown must publish this fence before waiting for an
+/// in-flight spawn's lifecycle lock. Otherwise a queued spawn can start after
+/// the cleanup snapshot and leave a child outside the shutdown sweep. Shells
+/// and native tasks recheck this fence before publication, while existing
+/// owners retain their normal reap, output-drain and settlement paths.
+pub fn shutdown_all() {
+    {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.shutting_down = true;
+        for job in reg.jobs.values_mut() {
+            if !job.status.settled() && job.process_live {
+                job.cancel_requested = true;
+            }
+        }
+    }
+    kill_all();
+}
+
+/// Cancel the current job snapshot without closing admission for later work.
+/// Final process teardown must use [`shutdown_all`] instead so queued spawns
+/// cannot escape the cancellation snapshot.
 pub fn kill_all() {
     let _lifecycle = lifecycle_lock()
         .lock()
@@ -4015,7 +4074,7 @@ mod tests {
 
     const TEST_SESSION_ID: &str = "jobs-test-session";
 
-    struct SpawnBackgroundTestHookGuard;
+    pub(super) struct SpawnBackgroundTestHookGuard;
 
     impl Drop for SpawnBackgroundTestHookGuard {
         fn drop(&mut self) {
@@ -4026,7 +4085,7 @@ mod tests {
         }
     }
 
-    fn install_spawn_background_test_hooks(
+    pub(super) fn install_spawn_background_test_hooks(
         hooks: SpawnBackgroundTestHooks,
     ) -> SpawnBackgroundTestHookGuard {
         *spawn_background_test_hooks()
@@ -4072,6 +4131,7 @@ mod tests {
             }),
             fail_monitor_spawn: true,
             panic_monitor_after_start: true,
+            before_native_registry_publication: None,
         });
 
         invoke_after_initial_owner_check_hook("foreign-owner");
@@ -4098,7 +4158,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct SpawnHookGate {
+    pub(super) struct SpawnHookGate {
         state: Mutex<SpawnHookGateState>,
         changed: Condvar,
     }
@@ -4114,7 +4174,7 @@ mod tests {
     // across the wait, so tightening drops would change lock-hold semantics.
     #[allow(clippy::significant_drop_tightening)]
     impl SpawnHookGate {
-        fn enter_and_wait(&self) {
+        pub(super) fn enter_and_wait(&self) {
             let mut state = self
                 .state
                 .lock()
@@ -4130,7 +4190,7 @@ mod tests {
             }
         }
 
-        fn wait_until_entered(&self) {
+        pub(super) fn wait_until_entered(&self) {
             let state = self
                 .state
                 .lock()
@@ -4145,7 +4205,7 @@ mod tests {
             );
         }
 
-        fn release(&self) {
+        pub(super) fn release(&self) {
             let mut state = self
                 .state
                 .lock()
@@ -4154,7 +4214,7 @@ mod tests {
             self.changed.notify_all();
         }
 
-        fn assert_not_timed_out(&self) {
+        pub(super) fn assert_not_timed_out(&self) {
             assert!(
                 !self
                     .state
@@ -5647,6 +5707,165 @@ mod tests {
         );
         deadline.finish();
         second.join().expect("second starter thread");
+    }
+
+    pub(super) fn run_final_shutdown_fixture(test_name: &str, case: &str) {
+        let proof = tempfile::tempdir().expect("final-shutdown proof directory");
+        let completed = proof.path().join("completed");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .env("PI_JOBS_FINAL_SHUTDOWN_CASE", case)
+            .env("PI_JOBS_FINAL_SHUTDOWN_PROOF", &completed);
+        crate::tools::isolate_command_process_group(&mut command);
+        let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+            .expect("spawn isolated final-shutdown fixture");
+        let mut child = BackgroundChild::new(child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll final-shutdown fixture") {
+                if let Some(pid) = child.id() {
+                    crate::tools::terminate_reaped_child_discipline(pid);
+                }
+                child.disarm();
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "final-shutdown fixture {case:?} exceeded its deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "final-shutdown fixture {case:?}: {status}"
+        );
+        assert!(
+            completed.is_file(),
+            "the selected child test must execute its assertions"
+        );
+    }
+
+    pub(super) fn record_final_shutdown_fixture_completion() {
+        let completed =
+            std::env::var_os("PI_JOBS_FINAL_SHUTDOWN_PROOF").expect("isolated fixture proof path");
+        std::fs::write(completed, b"completed").expect("record completed shutdown assertions");
+    }
+
+    pub(super) fn observe_final_shutdown_fence() -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutting_down
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_shutdown_fences_shell_admission_before_and_after_os_spawn() {
+        let Ok(case) = std::env::var("PI_JOBS_FINAL_SHUTDOWN_CASE") else {
+            for case in ["captured", "before_spawn", "before_publication"] {
+                run_final_shutdown_fixture(
+                    "jobs::tests::final_shutdown_fences_shell_admission_before_and_after_os_spawn",
+                    case,
+                );
+            }
+            return;
+        };
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("final-shutdown-{}", uuid::Uuid::new_v4().simple());
+        let gate = Arc::new(SpawnHookGate::default());
+        let paused_gate = Arc::clone(&gate);
+        let pause: Arc<dyn Fn() + Send + Sync> = Arc::new(move || paused_gate.enter_and_wait());
+        let spawned_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hook_pid = Arc::clone(&spawned_pid);
+        let publication_gate = Arc::clone(&gate);
+        let pause_at_publication = case == "before_publication";
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner.clone()),
+            after_initial_owner_check: (case == "captured").then(|| Arc::clone(&pause)),
+            before_os_spawn: (case == "before_spawn").then(|| Arc::clone(&pause)),
+            before_registry_publication: Some(Arc::new(move |pid| {
+                hook_pid.store(pid, Ordering::Release);
+                if pause_at_publication {
+                    publication_gate.enter_and_wait();
+                }
+            })),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let spawn_owner = owner.clone();
+        let spawn_root = root.clone();
+        let starter = std::thread::spawn(move || {
+            spawn_background(
+                &spawn_owner,
+                &spawn_root,
+                None,
+                None,
+                "sleep 300",
+                Some(300),
+                Some(&spawn_root),
+            )
+        });
+        gate.wait_until_entered();
+        let shutdown = std::thread::spawn(shutdown_all);
+        let fenced_before_release = observe_final_shutdown_fence();
+        gate.release();
+        let result = starter.join().expect("paused shell starter");
+        shutdown.join().expect("final shutdown worker");
+        if let Ok(snapshot) = &result {
+            let _ = cancel(&owner, &snapshot.id);
+        }
+        assert!(
+            fenced_before_release,
+            "shutdown must fence before waiting for lifecycle"
+        );
+        gate.assert_not_timed_out();
+        let error = result.expect_err("final shutdown must reject the paused launch");
+        assert!(
+            error.to_string().contains("PI_JOBS_SHUTTING_DOWN"),
+            "{error}"
+        );
+        let pid = spawned_pid.load(Ordering::Acquire);
+        if pause_at_publication {
+            assert_ne!(pid, 0, "publication fixture must create a real child");
+            assert!(
+                !process_exists(pid),
+                "refused child must be killed and reaped"
+            );
+        } else {
+            assert_eq!(pid, 0, "shutdown must reject before OS spawn");
+        }
+        assert!(list(&owner).expect("owner jobs").is_empty());
+        assert!(take_completion_notices(&owner).is_empty());
+        let reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(reg.starting_jobs, 0, "failed launch must release capacity");
+        assert!(reg.owner_spawns_in_flight.is_empty());
+        drop(reg);
+        let error = spawn_background(
+            "new-owner-after-shutdown",
+            &root,
+            None,
+            None,
+            "true",
+            Some(1),
+            Some(&root),
+        )
+        .expect_err("new owners must not reopen final shutdown");
+        assert!(error.to_string().contains("PI_JOBS_SHUTTING_DOWN"));
+        record_final_shutdown_fixture_completion();
     }
 
     #[test]
