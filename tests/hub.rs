@@ -367,6 +367,81 @@ fn cancelling_a_log_wait_preserves_the_running_service() {
 
 #[cfg(unix)]
 #[test]
+fn cancelling_backpressured_pty_input_releases_the_tool_without_killing_the_service() {
+    let _guard = hub_test_guard();
+    let case = "cancelling_backpressured_pty_input_releases_the_tool_without_killing_the_service";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-cancel-pty-input";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import select, time, tty
+tty.setraw(0)
+print('input-fixture-ready', flush=True)
+if select.select([0], [], [], 20)[0]:
+    print('input-is-queued', flush=True)
+time.sleep(30)
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "input-fixture-ready", "timeoutSecs": 10}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let before = pi::hub::describe(name).expect("running service");
+    let tool = pi::tools::HubTool::new(&root);
+    let owner = pi::agent_cx::AgentCx::for_request();
+    let output = block_on_local(async {
+        let mut call = Box::pin(with_hub_owner(
+            &owner,
+            tool.execute(
+                "cancel-backpressured-send",
+                json!({"op": "send", "name": name, "text": "x".repeat(2 * 1024 * 1024), "enter": false}),
+                None,
+            ),
+        ));
+        let queued = async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let page = pi::hub::logs(name, None, None, None, 0).expect("service logs");
+                if page.lines.iter().any(|line| line == "input-is-queued") {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "fixture must observe queued input");
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+            }
+        };
+        match futures::future::select(call.as_mut(), Box::pin(queued)).await {
+            futures::future::Either::Left((result, _)) => {
+                panic!("send must remain backpressured until cancelled: {result:?}");
+            }
+            futures::future::Either::Right(((), _)) => {}
+        }
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel backpressured input fixture"),
+        );
+        let timeout = asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_secs(2));
+        match futures::future::select(call, Box::pin(timeout)).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => {
+                panic!("input cancellation must not wait for the service to read or exit");
+            }
+        }
+    })
+    .expect("hub cancellation is a domain result");
+    assert!(output.is_error);
+    assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
+    let after = pi::hub::describe(name).expect("service survives input cancellation");
+    assert_eq!(after.status, "running");
+    assert_eq!(after.pid, before.pid);
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
 #[allow(clippy::too_many_lines)]
 fn noisy_service_caps_raw_artifact_without_losing_readiness_or_later_input() {
     let _guard = hub_test_guard();
@@ -540,6 +615,98 @@ fn short_service_output_is_complete_and_unchanged() {
         std::str::from_utf8(&artifact).expect("raw text").trim_end(),
         "ordinary service output"
     );
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+fn service_settlement_closes_a_pty_retained_past_process_exit() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let _guard = hub_test_guard();
+    let case = "service_settlement_closes_a_pty_retained_past_process_exit";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let name = "hub-retained-pty";
+    let _cleanup = ServiceCleanup(name);
+    let script = r"import os, pathlib, time, tty
+tty.setraw(0)
+pathlib.Path('service-tty').write_text(os.ttyname(0))
+print('retained-pty-ready', flush=True)
+deadline = time.monotonic() + 30
+while not pathlib.Path('exit-now').exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+os.write(1, b'final output before exit')
+";
+    let started = hub_exec(
+        &root,
+        json!({
+            "op": "start", "name": name, "application": "python3",
+            "args": ["-u", "-c", script],
+            "ready": {"log": "retained-pty-ready", "timeoutSecs": 10}
+        }),
+    );
+    assert!(!started.is_error, "{}", first_text(&started));
+    let pid = pi::hub::describe(name)
+        .expect("running service")
+        .pid
+        .expect("pid");
+    let tty_path = std::fs::read_to_string(root.join("service-tty")).expect("PTY path");
+    // An independently held slave models an escaped descendant without
+    // leaving an orphan process behind if an assertion fails.
+    let flags = rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::NONBLOCK;
+    let mut retained_slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(i32::try_from(flags.bits()).expect("PTY open flags fit i32"))
+        .open(tty_path.trim())
+        .expect("retain service slave");
+    std::fs::write(root.join("exit-now"), b"exit").expect("release child exit");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let settled = loop {
+        let snapshot = pi::hub::describe(name).expect("service");
+        if matches!(snapshot.status.as_str(), "exited" | "failed" | "killed") {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a retained slave must not strand service settlement"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(settled.status, "exited");
+    assert_eq!(settled.exit_code, Some(0));
+    assert!(settled.pid.is_none());
+    assert_reaped(pid);
+    assert_eq!(
+        settled.log_capture.drain_state,
+        pi::hub::LogDrainState::Failed
+    );
+    assert!(
+        settled
+            .log_capture
+            .read_error
+            .as_deref()
+            .is_some_and(|error| error.contains("PI_HUB_LOG_DRAIN_INCOMPLETE"))
+    );
+    assert!(
+        retained_slave
+            .write_all(b"late output after settlement")
+            .is_err(),
+        "terminal publication must release every master handle, including the output reader"
+    );
+    let page = pi::hub::logs(name, None, None, None, 0).expect("settled logs");
+    assert_eq!(
+        page.lines,
+        vec!["retained-pty-ready", "final output before exit"]
+    );
+    assert_eq!(
+        page.log_capture.observed_bytes,
+        settled.log_capture.observed_bytes
+    );
+    let artifact = std::fs::read(&settled.log_path).expect("settled artifact");
+    assert_eq!(artifact, b"retained-pty-ready\nfinal output before exit");
+    assert_eq!(artifact.len() as u64, settled.log_capture.retained_bytes);
     finish_case(&harness, case);
 }
 

@@ -50,6 +50,9 @@ const TRUNCATED_LINE_PREFIX: &str = "[...truncated...] ";
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 const SETTLEMENT_BUDGET: Duration = Duration::from_secs(8);
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const INPUT_BUDGET: Duration = Duration::from_secs(8);
 
 /// Keep service identifiers portable and bounded before deriving artifact
 /// names from them.
@@ -120,12 +123,14 @@ impl ServiceStatus {
 struct ServiceControl {
     stop_requested: AtomicBool,
     force_requested: AtomicBool,
+    input_closed: AtomicBool,
     completion: Mutex<Option<ServiceSnapshot>>,
     completed: Condvar,
 }
 
 impl ServiceControl {
     fn request_stop(&self, force: bool) {
+        self.input_closed.store(true, Ordering::Release);
         if force {
             self.force_requested.store(true, Ordering::Release);
         }
@@ -166,7 +171,7 @@ impl ServiceControl {
                 "hub",
                 format!(
                     "PI_HUB_STOP_TIMEOUT: service '{name}' has not finished cleanup; \
-                     its name remains reserved until the process is reaped"
+                     its name remains reserved until process and output cleanup finish"
                 ),
             )
         })
@@ -536,28 +541,50 @@ impl Ring {
     }
 }
 
+type ServiceWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
 struct ServiceEntry {
     spec: LaunchSpec,
     status: ServiceStatus,
     pid: Option<u32>,
     started_ms: i64,
     exit_code: Option<i32>,
+    /// Preserve the process outcome while its output owner finishes cleanup.
+    pending_status: Option<ServiceStatus>,
     log_path: PathBuf,
     ring: Arc<Mutex<Ring>>,
     /// Cached PTY writer, taken once before spawn —
     /// portable-pty's `UnixMasterWriter::drop` sends `\n`+VEOF, so caching
     /// the writer is what keeps the child's stdin open across sends.
-    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    writer: ServiceWriter,
     control: Arc<ServiceControl>,
 }
 
 impl ServiceEntry {
+    /// Return the old owner so its backend-specific destructor runs without
+    /// retaining the registry lock. Existing sends retain this incarnation's
+    /// control and abort before retrying any blocked write.
+    fn close_input(&mut self) -> ServiceWriter {
+        self.control.input_closed.store(true, Ordering::Release);
+        std::mem::replace(&mut self.writer, Arc::new(Mutex::new(None)))
+    }
+
     fn current_status(&self) -> ServiceStatus {
         if self.status.live() && self.control.stop_requested.load(Ordering::Acquire) {
             ServiceStatus::Stopping
         } else {
             self.status
         }
+    }
+}
+
+fn release_service_input(writer: Option<ServiceWriter>) {
+    if let Some(writer) = writer {
+        let handle = writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(handle);
     }
 }
 
@@ -668,6 +695,7 @@ impl ServiceRegistry {
                 pid: None,
                 started_ms: now_ms(),
                 exit_code: None,
+                pending_status: None,
                 log_path: log_path.to_path_buf(),
                 ring: Arc::clone(ring),
                 writer: Arc::new(Mutex::new(None)),
@@ -706,11 +734,38 @@ impl ServiceRegistry {
         Ok(ServiceSnapshot::from_entry(entry))
     }
 
+    fn begin_draining(
+        &mut self,
+        name: &str,
+        ring: &Arc<Mutex<Ring>>,
+        code: i32,
+    ) -> Option<ServiceWriter> {
+        let entry = self.current_mut(name, ring)?;
+        entry.pending_status = Some(
+            if entry.status == ServiceStatus::Stopping
+                || entry.control.stop_requested.load(Ordering::Acquire)
+            {
+                ServiceStatus::Killed
+            } else if code == 0 {
+                ServiceStatus::Exited
+            } else {
+                ServiceStatus::Failed
+            },
+        );
+        // Keep the name reserved until the log pump releases its resources.
+        entry.status = ServiceStatus::Stopping;
+        entry.pid = None;
+        entry.exit_code = Some(code);
+        Some(entry.close_input())
+    }
+
     fn settle(&mut self, name: &str, ring: &Arc<Mutex<Ring>>, code: i32) -> bool {
         let Some(entry) = self.current_mut(name, ring) else {
             return false;
         };
-        if entry.status == ServiceStatus::Stopping
+        if let Some(status) = entry.pending_status.take() {
+            entry.status = status;
+        } else if entry.status == ServiceStatus::Stopping
             || entry.control.stop_requested.load(Ordering::Acquire)
         {
             entry.status = ServiceStatus::Killed;
@@ -723,6 +778,7 @@ impl ServiceRegistry {
         }
         entry.exit_code = Some(code);
         entry.pid = None;
+        entry.control.input_closed.store(true, Ordering::Release);
         entry.control.finish(ServiceSnapshot::from_entry(entry));
         true
     }
@@ -783,6 +839,12 @@ impl PendingService {
 impl Drop for PendingService {
     fn drop(&mut self) {
         if self.armed {
+            let writer = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .current_mut(&self.name, &self.ring)
+                .map(ServiceEntry::close_input);
+            release_service_input(writer);
             if !self.output_started {
                 let mut ring = self
                     .ring
@@ -892,6 +954,145 @@ struct SpawnedService {
     master: Box<dyn portable_pty::MasterPty + Send>,
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
+}
+
+/// The monitor owns the output thread until its final bytes and capture state
+/// are published. A surviving descendant must not retain a detached reader
+/// after the service is reported as finished.
+struct ServiceOutputPump {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    ring: Arc<Mutex<Ring>>,
+}
+
+impl ServiceOutputPump {
+    fn spawn<R, W>(name: &str, reader: R, artifact: W, ring: &Arc<Mutex<Ring>>) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump_stop = Arc::clone(&stop);
+        let pump_ring = Arc::clone(ring);
+        let handle = std::thread::Builder::new()
+            .name(format!("hub-output-{name}"))
+            .spawn(move || pump_service_stream(reader, artifact, &pump_ring, &pump_stop))
+            .map_err(|error| {
+                Error::tool(
+                    "hub",
+                    format!("Failed to start service output pump: {error}"),
+                )
+            })?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+            ring: Arc::clone(ring),
+        })
+    }
+
+    fn drain_and_join(&mut self) {
+        let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+        while self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::park_timeout(
+                IO_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::Release);
+        handle.thread().unpark();
+        // Unix readers are nonblocking and observe stop between reads. Other
+        // backends may still be releasing a blocking read; retain ownership
+        // and keep the service stopping instead of claiming a completed drain.
+        if handle.join().is_err() {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ring.finish_partial();
+            ring.capture.drain_state = LogDrainState::Failed;
+            ring.capture.read_error =
+                Some("PI_HUB_LOG_PUMP_FAILED: service output thread panicked".to_string());
+        }
+    }
+}
+
+impl Drop for ServiceOutputPump {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Keep cleanup ordering explicit on successful handoff, thread-start failure,
+/// and unwinding: reap the process, close the PTY owner, join output, then make
+/// the reservation available for reuse.
+struct ServiceMonitorResources {
+    child: Option<ServiceChild>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    output: Option<ServiceOutputPump>,
+    pending: PendingService,
+}
+
+impl ServiceMonitorResources {
+    fn run(mut self) {
+        let code = self
+            .child
+            .take()
+            .expect("service monitor owns its child")
+            .monitor(&self.pending.control);
+        let writer = {
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let writer = reg.begin_draining(&self.pending.name, &self.pending.ring, code);
+            persist_detached_state(&reg);
+            writer
+        };
+        release_service_input(writer);
+        drop(self.master.take());
+        if let Some(mut output) = self.output.take() {
+            output.drain_and_join();
+        }
+        {
+            let mut reg = registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if reg.settle(&self.pending.name, &self.pending.ring, code) {
+                persist_detached_state(&reg);
+            }
+        }
+        self.pending.armed = false;
+    }
+}
+
+impl Drop for ServiceMonitorResources {
+    fn drop(&mut self) {
+        self.pending
+            .control
+            .input_closed
+            .store(true, Ordering::Release);
+        drop(self.child.take());
+        let writer = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_mut(&self.pending.name, &self.pending.ring)
+            .map(ServiceEntry::close_input);
+        release_service_input(writer);
+        drop(self.master.take());
+        drop(self.output.take());
+        // PendingService drops after these owners, so even failed handoff
+        // cannot publish a terminal snapshot while output is still changing.
+    }
 }
 
 fn readiness_deadline(now: Instant, budget: Duration) -> Result<Instant> {
@@ -1057,7 +1258,7 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
     let ring = Arc::new(Mutex::new(output));
     let log_dir = hub_artifact_dir();
     let log_path = log_dir.join(format!("{name}-{}.log", uuid::Uuid::new_v4()));
-    let mut pending = PendingService::reserve(spec, &ring, &log_path)?;
+    let pending = PendingService::reserve(spec, &ring, &log_path)?;
     if let Some(request) = request {
         request.own_startup(&name, &pending.control)?;
     }
@@ -1096,42 +1297,23 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
         snapshot
     };
 
-    let pump_ring = Arc::clone(&ring);
-    std::thread::Builder::new()
-        .name(format!("hub-output-{name}"))
-        .spawn(move || pump_service_stream(reader, artifact, &pump_ring))
-        .map_err(|error| {
-            Error::tool(
-                "hub",
-                format!("Failed to start service output pump: {error}"),
-            )
-        })?;
-    pending.output_started = true;
-
-    let monitor_name = name.clone();
-    let monitor_ring = Arc::clone(&ring);
-    let monitor_control = Arc::clone(&pending.control);
+    let mut monitor = ServiceMonitorResources {
+        child: Some(child),
+        master: Some(master),
+        output: None,
+        pending,
+    };
+    monitor.output = Some(ServiceOutputPump::spawn(&name, reader, artifact, &ring)?);
+    monitor.pending.output_started = true;
     std::thread::Builder::new()
         .name(format!("hub-monitor-{name}"))
-        .spawn(move || {
-            // Keep the PTY owner alive for the whole child lifetime, not just
-            // the readiness call. Reader/writer handles need not own it.
-            let _master = master;
-            let code = child.monitor(&monitor_control);
-            let mut reg = registry()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if reg.settle(&monitor_name, &monitor_ring, code) {
-                persist_detached_state(&reg);
-            }
-        })
+        .spawn(move || monitor.run())
         .map_err(|error| {
             Error::tool(
                 "hub",
                 format!("Failed to start service exit monitor: {error}"),
             )
         })?;
-    pending.armed = false;
     // Readiness can wait for user code or a network listener. The monitor now
     // owns the child, so shutdown can cancel it without waiting for readiness.
     drop(startup);
@@ -1239,6 +1421,12 @@ fn spawn_pty(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Spaw
         cmd.env(key, value);
     }
 
+    // The portable PTY reader preserves its EOF/EIO handling. On Unix, share
+    // nonblocking mode through the existing safe duplicated-master helper so
+    // neither a silent descendant nor a full input queue can strand a worker.
+    #[cfg(unix)]
+    crate::tools::prepare_bash_pty_master(pair.master.as_ref())
+        .map_err(|error| Error::tool("hub", format!("Failed to prepare PTY I/O: {error}")))?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -1332,7 +1520,12 @@ fn write_service_artifact<W: Write>(artifact: &mut W, capture: &mut LogCapture, 
 // The ring is locked while a chunk is pushed and its capture counters are
 // copied, so readers never see bytes without the matching counts.
 #[allow(clippy::significant_drop_tightening)]
-fn pump_service_stream<R: Read, W: Write>(mut reader: R, mut artifact: W, ring: &Mutex<Ring>) {
+fn pump_service_stream<R: Read, W: Write>(
+    mut reader: R,
+    mut artifact: W,
+    ring: &Mutex<Ring>,
+    stop: &AtomicBool,
+) {
     let mut capture = LogCapture {
         drain_state: LogDrainState::Streaming,
         ..LogCapture::default()
@@ -1344,8 +1537,17 @@ fn pump_service_stream<R: Read, W: Write>(mut reader: R, mut artifact: W, ring: 
     let mut chunk = [0u8; 8192];
     let mut pending = Vec::with_capacity(chunk.len() + 3);
     loop {
+        if stop.load(Ordering::Acquire) {
+            capture.drain_state = LogDrainState::Failed;
+            capture.read_error =
+                Some("PI_HUB_LOG_DRAIN_INCOMPLETE: output capture stopped before EOF".to_string());
+            break;
+        }
         match reader.read(&mut chunk) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::park_timeout(IO_POLL_INTERVAL);
+            }
             Ok(0) => {
                 capture.drain_state = LogDrainState::Complete;
                 break;
@@ -1517,15 +1719,22 @@ fn logs_inner(
 ///
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` / `PI_HUB_NOT_RUNNING` for invalid targets.
-#[allow(clippy::significant_drop_tightening)]
+/// Cancellation or `PI_HUB_INPUT_TIMEOUT` can follow partial input delivery.
 pub fn send_text(name: &str, text: &str, enter: bool) -> Result<()> {
-    write_to_master(name, |writer| {
-        writer.write_all(text.as_bytes())?;
-        if enter {
-            writer.write_all(b"\r")?;
-        }
-        writer.flush()
-    })
+    send_text_for_request(name, text, enter, &ServiceRequest::new())
+}
+
+pub(crate) fn send_text_for_request(
+    name: &str,
+    text: &str,
+    enter: bool,
+    request: &ServiceRequest,
+) -> Result<()> {
+    write_to_master(
+        name,
+        &[text.as_bytes(), if enter { b"\r" } else { b"" }],
+        request,
+    )
 }
 
 /// Send named keys: ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT,
@@ -1534,18 +1743,24 @@ pub fn send_text(name: &str, text: &str, enter: bool) -> Result<()> {
 /// # Errors
 /// Named validation error for unknown key names.
 pub fn send_keys(name: &str, keys: &[String]) -> Result<()> {
+    send_keys_for_request(name, keys, &ServiceRequest::new())
+}
+
+pub(crate) fn send_keys_for_request(
+    name: &str,
+    keys: &[String],
+    request: &ServiceRequest,
+) -> Result<()> {
     // Map every key up front so the write loop carries no allocation.
     let mapped: Vec<&[u8]> = keys
         .iter()
         .map(|key| key_bytes(key))
         .collect::<Result<_>>()?;
-    for bytes in mapped {
-        write_to_master(name, |writer| {
-            writer.write_all(bytes)?;
-            writer.flush()
-        })?;
+    if mapped.is_empty() {
+        return request.check();
     }
-    Ok(())
+    // Retain one incarnation and one deadline across the entire key sequence.
+    write_to_master(name, &mapped, request)
 }
 
 fn key_bytes(key: &str) -> Result<&'static [u8]> {
@@ -1567,11 +1782,10 @@ fn key_bytes(key: &str) -> Result<&'static [u8]> {
 }
 
 #[allow(clippy::significant_drop_tightening)]
-fn write_to_master(
-    name: &str,
-    write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
-) -> Result<()> {
-    let writer = {
+fn write_to_master(name: &str, chunks: &[&[u8]], request: &ServiceRequest) -> Result<()> {
+    let deadline = Instant::now() + INPUT_BUDGET;
+    request.check()?;
+    let (writer, control) = {
         let reg = registry().lock().map_err(|_| registry_err())?;
         let Some(entry) = reg.services.get(name) else {
             return Err(Error::tool(
@@ -1588,17 +1802,90 @@ fn write_to_master(
                 ),
             ));
         }
-        Arc::clone(&entry.writer)
+        (Arc::clone(&entry.writer), Arc::clone(&entry.control))
     };
-    let mut guard = writer.lock().map_err(|_| registry_err())?;
+    let mut guard = loop {
+        input_checkpoint(name, &control, request, deadline)?;
+        match writer.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(registry_err()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::park_timeout(IO_POLL_INTERVAL);
+            }
+        }
+    };
     let Some(writer) = guard.as_mut() else {
         return Err(Error::tool(
             "hub",
             format!("PI_HUB_NO_INPUT: service '{name}' has no writable PTY master"),
         ));
     };
-    write(writer.as_mut())
-        .map_err(|e| Error::tool("hub", format!("Failed to write to service stdin: {e}")))
+    for chunk in chunks {
+        let mut remaining = *chunk;
+        while !remaining.is_empty() {
+            input_checkpoint(name, &control, request, deadline)?;
+            match writer.write(remaining) {
+                Ok(0) => {
+                    return Err(Error::tool(
+                        "hub",
+                        "PI_HUB_INPUT_FAILED: service stdin writer made no progress",
+                    ));
+                }
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::park_timeout(IO_POLL_INTERVAL);
+                }
+                Err(error) => {
+                    return Err(Error::tool(
+                        "hub",
+                        format!("Failed to write to service stdin: {error}"),
+                    ));
+                }
+            }
+        }
+    }
+    loop {
+        input_checkpoint(name, &control, request, deadline)?;
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::park_timeout(IO_POLL_INTERVAL);
+            }
+            Err(error) => {
+                return Err(Error::tool(
+                    "hub",
+                    format!("Failed to flush service stdin: {error}"),
+                ));
+            }
+        }
+    }
+}
+
+fn input_checkpoint(
+    name: &str,
+    control: &ServiceControl,
+    request: &ServiceRequest,
+    deadline: Instant,
+) -> Result<()> {
+    request.check()?;
+    if control.input_closed.load(Ordering::Acquire) {
+        return Err(Error::tool(
+            "hub",
+            format!("PI_HUB_NOT_RUNNING: service '{name}' stdin is closed"),
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(Error::tool(
+            "hub",
+            format!(
+                "PI_HUB_INPUT_TIMEOUT: service '{name}' did not accept input within the \
+                 send deadline; some input may already have been written"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Send a signal to the service's process tree.
@@ -1995,7 +2282,7 @@ mod tests {
                 };
                 let ring = Mutex::new(Ring::new(8));
                 let mut artifact = Vec::new();
-                pump_service_stream(reader, &mut artifact, &ring);
+                pump_service_stream(reader, &mut artifact, &ring, &AtomicBool::new(false));
                 let ring = ring.into_inner().expect("ring");
                 assert_eq!(artifact, input);
                 assert_eq!(ring.since(0).0, vec!["first", "prêt 界🙂 tail"]);
@@ -2035,7 +2322,7 @@ mod tests {
             };
             let ring = Mutex::new(Ring::new(8));
             let mut artifact = Vec::new();
-            pump_service_stream(reader, &mut artifact, &ring);
+            pump_service_stream(reader, &mut artifact, &ring, &AtomicBool::new(false));
             assert_eq!(artifact, input);
             assert_eq!(ring.into_inner().expect("ring").since(0).0, expected);
         }
@@ -2046,7 +2333,12 @@ mod tests {
         let input = format!("{}final", "x".repeat(RING_BYTE_CAP * 2));
         let ring = Mutex::new(Ring::new(8));
         let mut artifact = Vec::new();
-        pump_service_stream(input.as_bytes(), &mut artifact, &ring);
+        pump_service_stream(
+            input.as_bytes(),
+            &mut artifact,
+            &ring,
+            &AtomicBool::new(false),
+        );
         let ring = ring.into_inner().expect("ring");
         assert_eq!(artifact, input.as_bytes());
         let (lines, cursor) = ring.since(0);
@@ -2070,7 +2362,7 @@ mod tests {
         ));
         let ring = Mutex::new(output);
         let mut artifact = Vec::new();
-        pump_service_stream(reader, &mut artifact, &ring);
+        pump_service_stream(reader, &mut artifact, &ring, &AtomicBool::new(false));
         assert_eq!(artifact.len() as u64, SERVICE_LOG_BYTE_CAP);
         assert!(artifact.iter().all(|byte| *byte == b'x'));
         let ring = ring.into_inner().expect("ring");
@@ -2156,7 +2448,7 @@ mod tests {
             let mut output = Ring::new(8);
             output.watch_readiness(Some(ready_log.clone()));
             let ring = Mutex::new(output);
-            pump_service_stream(reader, &mut artifact, &ring);
+            pump_service_stream(reader, &mut artifact, &ring, &AtomicBool::new(false));
             assert_eq!(artifact.bytes, &input[..7]);
             assert_eq!(artifact.writes_after_failure, 0);
             let ring = ring.into_inner().expect("ring");
@@ -2193,7 +2485,12 @@ mod tests {
             flush_error: true,
         };
         let ring = Mutex::new(Ring::new(8));
-        pump_service_stream(input.as_slice(), &mut artifact, &ring);
+        pump_service_stream(
+            input.as_slice(),
+            &mut artifact,
+            &ring,
+            &AtomicBool::new(false),
+        );
         assert_eq!(artifact.bytes, input);
         let capture = ring.into_inner().expect("ring").capture;
         assert_eq!(capture.observed_bytes, input.len() as u64);
@@ -2212,19 +2509,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn process_settlement_does_not_seal_output_before_the_reader_finishes() {
+    fn process_settlement_waits_for_output_and_preserves_the_reaped_outcome() {
         let (reader, mut writer) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        reader.set_nonblocking(true).expect("nonblocking reader");
         let ring = Arc::new(Mutex::new(Ring::new(8)));
         let mut reg = ServiceRegistry::default();
         let launch = spec("hub-output-settlement", "unused", &[], None);
         reg.reserve(&launch, &ring, &PathBuf::from("settlement.log"))
             .expect("reserve");
-        let pump_ring = Arc::clone(&ring);
-        let pump = std::thread::spawn(move || {
-            let mut artifact = Vec::new();
-            pump_service_stream(reader, &mut artifact, &pump_ring);
-            artifact
-        });
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("output.log");
+        let artifact = create_service_log(&log_path).expect("artifact");
+        let mut pump =
+            ServiceOutputPump::spawn(&launch.name, reader, artifact, &ring).expect("output pump");
         writer.write_all(b"before exit\n").expect("first bytes");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2237,21 +2534,223 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(reg.settle(&launch.name, &ring, 0));
+        release_service_input(reg.begin_draining(&launch.name, &ring, 0));
         let snapshot =
             ServiceSnapshot::from_entry(reg.current(&launch.name, &ring).expect("entry"));
-        assert_eq!(snapshot.status, "exited");
+        assert_eq!(snapshot.status, "stopping");
         assert_eq!(snapshot.log_capture.drain_state, LogDrainState::Streaming);
+        assert!(reg.reserve(&launch, &ring, &log_path).is_err());
+        let control = Arc::clone(&reg.current(&launch.name, &ring).expect("entry").control);
+        assert!(control.completion.lock().expect("completion").is_none());
+        // A stop arriving during output cleanup must not rewrite an already
+        // observed normal exit as a killed process.
+        control.request_stop(true);
         writer.write_all(b"trailing output").expect("tail bytes");
         drop(writer);
-        assert_eq!(pump.join().expect("pump"), b"before exit\ntrailing output");
+        pump.drain_and_join();
+        assert!(pump.handle.is_none(), "the output owner must be joined");
+        assert!(reg.settle(&launch.name, &ring, 0));
+        assert_eq!(
+            std::fs::read(log_path).expect("artifact"),
+            b"before exit\ntrailing output"
+        );
         let snapshot =
             ServiceSnapshot::from_entry(reg.current(&launch.name, &ring).expect("entry"));
         assert_eq!(snapshot.status, "exited");
         assert_eq!(snapshot.log_capture.drain_state, LogDrainState::Complete);
+        let completed = control
+            .wait_until(&launch.name, Instant::now())
+            .expect("settled completion");
+        assert_eq!(completed.log_capture.drain_state, LogDrainState::Complete);
+        assert_eq!(
+            completed.log_capture.observed_bytes,
+            snapshot.log_capture.observed_bytes
+        );
         assert_eq!(
             ring.lock().expect("ring").since(1),
             (vec!["trailing output".to_string()], 2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_owner_closes_a_retained_descriptor_on_drain_expiry_or_failed_handoff() {
+        for drain in [true, false] {
+            let (reader, mut retained_slave) =
+                std::os::unix::net::UnixStream::pair().expect("stream pair");
+            reader.set_nonblocking(true).expect("nonblocking reader");
+            retained_slave
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("bounded peer read");
+            let ring = Arc::new(Mutex::new(Ring::new(8)));
+            let mut pump =
+                ServiceOutputPump::spawn("hub-retained-output", reader, std::io::sink(), &ring)
+                    .expect("pump");
+            let partial = b"tail \xf0\x9f";
+            retained_slave.write_all(partial).expect("partial output");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ring.lock().expect("ring").capture.observed_bytes != partial.len() as u64 {
+                assert!(
+                    Instant::now() < deadline,
+                    "pump must observe partial output"
+                );
+                std::thread::sleep(IO_POLL_INTERVAL);
+            }
+            let started = Instant::now();
+            if drain {
+                pump.drain_and_join();
+            }
+            drop(pump);
+            assert!(
+                started.elapsed() < OUTPUT_DRAIN_GRACE + Duration::from_secs(2),
+                "a retained descriptor must not strand the output owner"
+            );
+            let output = ring.lock().expect("ring");
+            assert_eq!(output.capture.drain_state, LogDrainState::Failed);
+            assert!(
+                output
+                    .capture
+                    .read_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("PI_HUB_LOG_DRAIN_INCOMPLETE"))
+            );
+            assert_eq!(output.since(0).0, vec!["tail \u{fffd}"]);
+            drop(output);
+            assert_eq!(
+                retained_slave.read(&mut [0u8; 1]).expect("reader closed"),
+                0,
+                "joining the pump must release the actual reader descriptor"
+            );
+        }
+    }
+
+    struct PartialInput {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        attempts: usize,
+        flush_blocked: bool,
+    }
+
+    impl Write for PartialInput {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            self.attempts += 1;
+            match self.attempts {
+                1 => Err(std::io::ErrorKind::Interrupted.into()),
+                3 => Err(std::io::ErrorKind::WouldBlock.into()),
+                _ => {
+                    let count = input.len().min(2);
+                    self.bytes
+                        .lock()
+                        .expect("input bytes")
+                        .extend_from_slice(&input[..count]);
+                    Ok(count)
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if std::mem::replace(&mut self.flush_blocked, false) {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn reserve_input_fixture(name: &str, writer: Box<dyn Write + Send>) -> PendingService {
+        let launch = spec(name, "unused", &[], None);
+        let ring = Arc::new(Mutex::new(Ring::new(8)));
+        let pending = PendingService::reserve(&launch, &ring, &PathBuf::from("input.log"))
+            .expect("input reservation");
+        registry()
+            .lock()
+            .expect("registry")
+            .current_mut(name, &ring)
+            .expect("input fixture")
+            .writer = Arc::new(Mutex::new(Some(writer)));
+        pending
+    }
+
+    #[test]
+    fn service_input_retries_partial_writes_without_duplicate_or_missing_bytes() {
+        let _lock = test_lock();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let pending = reserve_input_fixture(
+            "hub-partial-input",
+            Box::new(PartialInput {
+                bytes: Arc::clone(&bytes),
+                attempts: 0,
+                flush_blocked: true,
+            }),
+        );
+        send_text(&pending.name, "prêt 界🙂", true).expect("partial text writes");
+        send_keys(&pending.name, &["UP".to_string(), "ENTER".to_string()])
+            .expect("partial key writes");
+        assert_eq!(
+            &*bytes.lock().expect("input bytes"),
+            "prêt 界🙂\r\x1b[A\r".as_bytes()
+        );
+    }
+
+    struct StalledInput {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        blocked: Option<std::sync::mpsc::SyncSender<()>>,
+    }
+
+    impl Write for StalledInput {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            let mut bytes = self.bytes.lock().expect("input bytes");
+            if bytes.is_empty() {
+                let count = input.len().min(2);
+                bytes.extend_from_slice(&input[..count]);
+                return Ok(count);
+            }
+            drop(bytes);
+            if let Some(blocked) = self.blocked.take() {
+                blocked.send(()).expect("blocked input observation");
+            }
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_backpressured_input_without_stopping_the_service() {
+        let _lock = test_lock();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::sync_channel(1);
+        let pending = reserve_input_fixture(
+            "hub-cancel-input",
+            Box::new(StalledInput {
+                bytes: Arc::clone(&bytes),
+                blocked: Some(blocked_tx),
+            }),
+        );
+        let request = ServiceRequest::new();
+        let worker_request = request.clone();
+        let name = pending.name.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = send_text_for_request(&name, "blocked input", true, &worker_request);
+            done_tx.send(result).expect("send result");
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("backpressure reached");
+        request.cancel();
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled input returns promptly")
+            .expect_err("cancelled input");
+        worker.join().expect("input worker");
+        assert!(error.to_string().contains("PI_HUB_CANCELLED"));
+        assert_eq!(&*bytes.lock().expect("input bytes"), b"bl");
+        assert!(!pending.control.stop_requested.load(Ordering::Acquire));
+        assert_eq!(
+            describe(&pending.name).expect("live service").status,
+            "starting"
         );
     }
 
@@ -2661,7 +3160,7 @@ mod tests {
             interrupt_next: true,
             terminal_error: false,
         };
-        pump_service_stream(reader, std::io::sink(), &ring);
+        pump_service_stream(reader, std::io::sink(), &ring, &AtomicBool::new(false));
         let output = ring.into_inner().expect("ring");
         assert_eq!(output.since(0).0, vec!["b", "c", "d"]);
         assert!(

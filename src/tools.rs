@@ -8860,7 +8860,7 @@ fn prepare_bash_pipe(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn prepare_bash_pty_master(master: &dyn portable_pty::MasterPty) -> Result<()> {
+pub(crate) fn prepare_bash_pty_master(master: &dyn portable_pty::MasterPty) -> Result<()> {
     use std::os::fd::{AsRawFd, RawFd};
 
     // MasterPty exposes only a raw descriptor. Keep its owner borrowed while
@@ -11918,14 +11918,14 @@ impl HubTool {
                     let mut actions = Vec::new();
                     if let Some(text) = text.as_deref() {
                         request.check()?;
-                        crate::hub::send_text(&name, text, enter)?;
+                        crate::hub::send_text_for_request(&name, text, enter, request)?;
                         actions.push(format!("sent {} byte(s) of text", text.len()));
                     }
                     if let Some(keys) = keys.as_ref()
                         && !keys.is_empty()
                     {
                         request.check()?;
-                        crate::hub::send_keys(&name, keys)?;
+                        crate::hub::send_keys_for_request(&name, keys, request)?;
                         actions.push(format!("sent keys: {}", keys.join(", ")));
                     }
                     if let Some(signal) = signal.as_deref() {
