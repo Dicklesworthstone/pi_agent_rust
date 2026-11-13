@@ -13648,6 +13648,31 @@ async fn run_bash_ui_command(
     abort_signal: &crate::agent::AbortSignal,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<crate::session::SessionMessage> {
+    let (output, terminal_msgs) = run_bash_ui_command_inner(
+        cwd,
+        shell,
+        command,
+        exclude,
+        extensions,
+        abort_signal,
+        agent_tx,
+    )
+    .await;
+    for msg in terminal_msgs {
+        let _ = agent_tx.send(msg);
+    }
+    output
+}
+
+async fn run_bash_ui_command_inner(
+    cwd: &std::path::Path,
+    shell: &BashUiShell,
+    command: &str,
+    exclude: bool,
+    extensions: Option<&crate::extensions::ExtensionManager>,
+    abort_signal: &crate::agent::AbortSignal,
+    agent_tx: &Sender<PiMsg>,
+) -> (Option<crate::session::SessionMessage>, Vec<PiMsg>) {
     // Start the running status immediately. The driver publishes the matching
     // BashFinished only after saving the returned record, so cancellation and
     // foreground admission stay owned through history completion.
@@ -13686,6 +13711,7 @@ async fn run_bash_ui_command(
     let is_error = result
         .as_ref()
         .map_or(true, |result| result.cancelled || result.exit_code != 0);
+    let mut terminal_msgs = Vec::with_capacity(2);
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -13708,7 +13734,7 @@ async fn run_bash_ui_command(
                     serde_json::Value::Bool(true),
                 );
             }
-            let _ = agent_tx.send(PiMsg::BashResult { display: shown });
+            terminal_msgs.push(PiMsg::BashResult { display: shown });
             Some(crate::session::SessionMessage::BashExecution {
                 command: command.to_string(),
                 output: result.output,
@@ -13724,7 +13750,7 @@ async fn run_bash_ui_command(
             // ToolEnd must precede AgentError: the error sweep settles
             // pending cards, and a card already settled there makes this
             // ToolEnd fall back to a duplicate trace line.
-            let _ = agent_tx.send(PiMsg::ToolEnd {
+            terminal_msgs.push(PiMsg::ToolEnd {
                 name: String::from("bash"),
                 tool_id: String::from("ftui-bash"),
                 is_error: true,
@@ -13735,12 +13761,12 @@ async fn run_bash_ui_command(
             } else {
                 format!("bash: {err}")
             };
-            let _ = agent_tx.send(PiMsg::AgentError(message));
+            terminal_msgs.push(PiMsg::AgentError(message));
             None
         }
     };
     if output.is_some() {
-        let _ = agent_tx.send(PiMsg::ToolEnd {
+        terminal_msgs.push(PiMsg::ToolEnd {
             name: String::from("bash"),
             tool_id: String::from("ftui-bash"),
             is_error,
@@ -13749,7 +13775,7 @@ async fn run_bash_ui_command(
             output: None,
         });
     }
-    output
+    (output, terminal_msgs)
 }
 
 /// Keep the cancellation owner published until output is recorded and the
@@ -13770,7 +13796,7 @@ async fn run_bash_driver_command(
         queued_compaction::OperationAbort::publish(turn_abort, turn_control, &request.abort);
     let abort_signal = request.abort.signal();
     let extensions = handle.extension_manager().cloned();
-    if let Some(record) = run_bash_ui_command(
+    let (record, terminal_msgs) = run_bash_ui_command_inner(
         cwd,
         shell,
         command,
@@ -13779,9 +13805,16 @@ async fn run_bash_driver_command(
         &abort_signal,
         agent_tx,
     )
-    .await
-        && let Err(err) = handle.record_bash_execution(record).await
-    {
+    .await;
+    let save_err = if let Some(record) = record {
+        handle.record_bash_execution(record).await.err()
+    } else {
+        None
+    };
+    for msg in terminal_msgs {
+        let _ = agent_tx.send(msg);
+    }
+    if let Some(err) = save_err {
         let _ = agent_tx.send(PiMsg::AgentError(format!(
             "The command ran, but its result could not be saved to the session: {err}",
         )));
