@@ -64,16 +64,42 @@
 // paths the same way integration tests do.
 extern crate self as pi;
 
+#[cfg(test)]
+pub(crate) struct TestCurrentDirLockGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl Drop for TestCurrentDirLockGuard {
+    fn drop(&mut self) {
+        TEST_CWD_LOCK_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CWD_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Serialize unit tests that temporarily change the process-wide current
 /// directory. Rust's test runner executes modules concurrently, so separate
 /// per-module locks do not prevent one module from observing another module's
-/// temporary directory.
+/// temporary directory. Re-entrant on the holding thread so nested guards do
+/// not self-deadlock.
 #[cfg(test)]
-pub(crate) fn test_current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn test_current_dir_lock() -> TestCurrentDirLockGuard {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    let current_depth = TEST_CWD_LOCK_DEPTH.with(std::cell::Cell::get);
+    if current_depth > 0 {
+        TEST_CWD_LOCK_DEPTH.with(|depth| depth.set(current_depth + 1));
+        return TestCurrentDirLockGuard(None);
+    }
+    let guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    TEST_CWD_LOCK_DEPTH.with(|depth| depth.set(1));
+    TestCurrentDirLockGuard(Some(guard))
 }
 
 // Gap H: jemalloc allocator for allocation-heavy paths.

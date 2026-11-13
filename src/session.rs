@@ -5215,6 +5215,9 @@ impl Session {
     /// pending work exists.
     pub async fn flush_autosave(&mut self, trigger: AutosaveFlushTrigger) -> Result<()> {
         let Some(ticket) = self.autosave_queue.begin_flush(trigger) else {
+            if self.persisted_path.is_some() && self.should_full_rewrite() {
+                return self.save_inner().await;
+            }
             return Ok(());
         };
         let result = self.save_inner().await;
@@ -7616,8 +7619,10 @@ impl SessionHeader {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             cwd: std::env::current_dir()
+                .ok()
                 .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_string()),
             additional_roots: None,
             provider: None,
             model_id: None,
@@ -10488,25 +10493,33 @@ mod tests {
             .expect("create tempdir under TMPDIR")
     }
 
-    fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn current_dir_lock() -> crate::TestCurrentDirLockGuard {
         crate::test_current_dir_lock()
     }
 
     struct CurrentDirGuard {
         previous: PathBuf,
+        _lock: crate::TestCurrentDirLockGuard,
     }
 
     impl CurrentDirGuard {
         fn new(path: &Path) -> Self {
-            let previous = env::current_dir().expect("current dir");
+            let lock = current_dir_lock();
+            let previous =
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
             env::set_current_dir(path).expect("set current dir");
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
+            if env::set_current_dir(&self.previous).is_err() {
+                let _ = env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+            }
         }
     }
 
