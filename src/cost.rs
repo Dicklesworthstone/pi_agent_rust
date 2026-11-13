@@ -1348,20 +1348,61 @@ fn main_spend(session: &Session) -> f64 {
         })
 }
 
+#[allow(clippy::float_cmp)] // An authoritative bill is copied verbatim into the persisted total.
 fn recorded_billing_unavailable(session: &Session) -> bool {
     session.entries.iter().any(|entry| match entry {
         SessionEntry::Message(entry) => match &entry.message {
-            SessionMessage::Assistant { message } => matches!(
-                message.usage.billing,
-                Some(crate::model::BillingUsage::Unavailable { .. })
-            ),
+            SessionMessage::Assistant { message } => {
+                let usage = &message.usage;
+                if [
+                    usage.cost.input,
+                    usage.cost.output,
+                    usage.cost.cache_read,
+                    usage.cost.cache_write,
+                    usage.cost.total,
+                ]
+                .iter()
+                .any(|cost| !cost.is_finite() || *cost < 0.0)
+                {
+                    return true;
+                }
+                match &usage.billing {
+                    Some(crate::model::BillingUsage::Unavailable { .. }) => true,
+                    Some(crate::model::BillingUsage::ReportedTotal { total })
+                    | Some(crate::model::BillingUsage::Tokens {
+                        reported_total: Some(total),
+                        ..
+                    }) => {
+                        // Live pricing copies an authoritative bill into the
+                        // stored total. Resume cannot guess which side of a
+                        // contradictory receipt was included in a checkpoint.
+                        // The component estimates need not sum to that bill.
+                        !total.is_finite() || *total < 0.0 || *total != usage.cost.total
+                    }
+                    // Legacy/unpriced usage and explicit free token buckets
+                    // remain valid. Never reprice history using today's model
+                    // catalog or infer cost from context-window token counts.
+                    None | Some(crate::model::BillingUsage::Tokens { .. }) => false,
+                }
+            }
             _ => false,
         },
-        SessionEntry::Custom(entry) if entry.custom_type == CHECKPOINT_TYPE => entry
-            .data
-            .as_ref()
-            .and_then(|data| data.get("failure"))
-            .is_some_and(|failure| !failure.is_null()),
+        SessionEntry::Custom(entry) if entry.custom_type == CHECKPOINT_TYPE => {
+            entry.data.as_ref().is_some_and(|data| {
+                // Missing fields in old partial receipts remain compatible.
+                // Explicit malformed amounts are evidence of lost accounting,
+                // even when a newer checkpoint otherwise looks complete.
+                ["spent", "mainSpent"].into_iter().any(|field| {
+                    data.get(field).is_some_and(|value| {
+                        !value
+                            .as_f64()
+                            .is_some_and(|amount| amount.is_finite() && amount >= 0.0)
+                    })
+                }) || data
+                    .get("failure")
+                    .is_some_and(|failure| !failure.is_null())
+            })
+        }
         _ => false,
     })
 }
@@ -1933,6 +1974,120 @@ mod tests {
             assert_eq!(budget.spent(), 2.0);
             assert!(budget.admit().is_err());
             assert!(budget.record(1.0).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_recorded_usage_quarantines_without_laundering_a_checkpoint() {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for field in [
+                "input",
+                "output",
+                "cache_read",
+                "cache_write",
+                "total",
+                "reported_total",
+                "token_reported_total",
+            ] {
+                let mut session = Session::in_memory();
+                session.append_message(assistant(1.0));
+                let mut malformed = assistant(0.25);
+                let SessionMessage::Assistant { message } = &mut malformed else {
+                    unreachable!();
+                };
+                match field {
+                    "input" => message.usage.cost.input = invalid,
+                    "output" => message.usage.cost.output = invalid,
+                    "cache_read" => message.usage.cost.cache_read = invalid,
+                    "cache_write" => message.usage.cost.cache_write = invalid,
+                    "total" => message.usage.cost.total = invalid,
+                    "reported_total" => {
+                        message.usage.billing =
+                            Some(crate::model::BillingUsage::ReportedTotal { total: invalid });
+                    }
+                    "token_reported_total" => {
+                        message.usage.billing = Some(crate::model::BillingUsage::Tokens {
+                            text: crate::model::BillingTokenCounts::default(),
+                            audio: crate::model::BillingTokenCounts::default(),
+                            reported_total: Some(invalid),
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                session.append_message(malformed);
+                assert!(
+                    matches!(recorded_spend(&session),
+                        Err(Error::Session(message)) if message == RECORDED_BILLING_FAILURE),
+                    "accepted {field} = {invalid}"
+                );
+                assert!(CostBudget::from_session(&session, None, Some(10.0)).is_err());
+
+                // A later healthy checkpoint cannot bless malformed history.
+                // Keep the account's known lower bound and a stable refusal,
+                // rather than erasing an invalid bill as a fabricated zero.
+                let budget = CostBudget::new(None, Some(10.0), 1.0).unwrap();
+                budget.checkpoint(&mut session).unwrap();
+                let receipt = latest_checkpoint(&session).unwrap();
+                assert_eq!(receipt["spent"], 1.0);
+                assert_eq!(receipt["failure"], RECORDED_BILLING_FAILURE);
+                assert_eq!(budget.spent(), 1.0);
+                assert!(budget.admit().is_err());
+                assert!(CostBudget::from_session(&session, None, Some(10.0)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_checkpoint_amounts_are_not_silently_skipped() {
+        for field in ["spent", "mainSpent"] {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(-0.25),
+                serde_json::json!("1.25"),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let mut session = Session::in_memory();
+                session.append_message(assistant(1.0));
+                let mut data = serde_json::json!({"spent": 1.25, "mainSpent": 1.0});
+                data[field] = invalid;
+                session.append_custom_entry(CHECKPOINT_TYPE.to_string(), Some(data));
+                assert!(matches!(recorded_spend(&session),
+                    Err(Error::Session(message)) if message == RECORDED_BILLING_FAILURE));
+                assert!(CostBudget::from_session(&session, None, Some(10.0)).is_err());
+
+                let budget = CostBudget::new(None, Some(10.0), 1.0).unwrap();
+                budget.checkpoint(&mut session).unwrap();
+                let receipt = latest_checkpoint(&session).unwrap();
+                assert_eq!(receipt["spent"], 1.0);
+                assert_eq!(receipt["failure"], RECORDED_BILLING_FAILURE);
+                assert_eq!(budget.spent(), 1.0);
+                assert!(budget.admit().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn absent_legacy_checkpoint_amounts_preserve_existing_accounting() {
+        for (data, expected) in [
+            (None, 1.0),
+            (Some(serde_json::Value::Null), 1.0),
+            (Some(serde_json::json!({})), 1.0),
+            (Some(serde_json::json!({"spent": 1.25})), 1.0),
+            (Some(serde_json::json!({"mainSpent": 1.0})), 1.0),
+            (
+                Some(serde_json::json!({"spent": 1.25, "mainSpent": 1.0})),
+                1.25,
+            ),
+        ] {
+            let mut session = Session::in_memory();
+            session.append_message(assistant(1.0));
+            session.append_custom_entry(CHECKPOINT_TYPE.to_string(), data);
+            assert_eq!(recorded_spend(&session).unwrap(), expected);
+            let restored = CostBudget::from_session(&session, None, Some(10.0)).unwrap();
+            assert_eq!(restored.spent(), expected);
+            restored.admit().unwrap();
         }
     }
 
@@ -4552,23 +4707,213 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the saved-history and replacement invariants together.
+    fn malformed_saved_billing_cannot_hide_in_an_inactive_branch() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for (store_kind, lazy_v2) in [
+            (crate::session::SessionStoreKind::Jsonl, false),
+            (crate::session::SessionStoreKind::Jsonl, true),
+            #[cfg(feature = "sqlite-sessions")]
+            (crate::session::SessionStoreKind::Sqlite, false),
+        ] {
+            for malformed in [
+                "negative_total",
+                "negative_component",
+                "negative_reported_total",
+                "contradictory_reported_total",
+                "negative_token_reported_total",
+                "contradictory_token_reported_total",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut session = Session::create_with_dir_and_store(
+                    Some(directory.path().to_path_buf()),
+                    store_kind,
+                );
+                let completed = session.append_message(assistant(1.0));
+                let mut invalid = assistant(0.25);
+                let SessionMessage::Assistant { message } = &mut invalid else {
+                    unreachable!();
+                };
+                match malformed {
+                    "negative_total" => message.usage.cost.total = -0.25,
+                    "negative_component" => message.usage.cost.input = -0.25,
+                    "negative_reported_total" | "contradictory_reported_total" => {
+                        let total = if malformed == "negative_reported_total" {
+                            -0.25
+                        } else {
+                            0.0
+                        };
+                        message.usage.billing =
+                            Some(crate::model::BillingUsage::ReportedTotal { total });
+                    }
+                    "negative_token_reported_total" | "contradictory_token_reported_total" => {
+                        let total = if malformed == "negative_token_reported_total" {
+                            -0.25
+                        } else {
+                            0.5
+                        };
+                        message.usage.billing = Some(crate::model::BillingUsage::Tokens {
+                            text: crate::model::BillingTokenCounts::default(),
+                            audio: crate::model::BillingTokenCounts::default(),
+                            reported_total: Some(total),
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                session.append_message(invalid);
+                assert!(session.create_branch_from(&completed));
+                let active = session.append_message(assistant(0.0));
+                // An older writer could save malformed billing without the
+                // explicit Unavailable marker. A later plausible checkpoint
+                // on a healthy branch must not hide that retained evidence.
+                session.append_custom_entry(
+                    CHECKPOINT_TYPE.to_string(),
+                    Some(serde_json::json!({"spent": 1.25, "mainSpent": 1.25})),
+                );
+                assert!(session.navigate_to(&active));
+                runtime.block_on(session.save()).unwrap();
+                let path = session.path.clone().unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                let reopened = if lazy_v2 {
+                    let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+                    let (mut reopened, diagnostics) = Session::open_from_v2(
+                        &store,
+                        session.header.clone(),
+                        crate::session::V2OpenMode::ActivePath,
+                    )
+                    .unwrap();
+                    assert!(diagnostics.skipped_entries.is_empty());
+                    assert!(reopened.has_partial_v2_hydration());
+                    reopened.path = Some(path.clone());
+                    reopened
+                } else {
+                    runtime
+                        .block_on(Session::open(path.to_str().unwrap()))
+                        .unwrap()
+                };
+
+                assert!(
+                    matches!(recorded_spend(&reopened),
+                        Err(Error::Session(message)) if message == RECORDED_BILLING_FAILURE),
+                    "accepted {malformed} from {store_kind:?} (lazy={lazy_v2})"
+                );
+                assert!(CostBudget::from_session(&reopened, None, Some(10.0)).is_err());
+                let current = CostBudget::new(None, Some(10.0), 2.0).unwrap();
+                for preserve in [false, true] {
+                    assert!(current.for_replacement(&reopened, preserve).is_err());
+                }
+                current.admit().unwrap();
+                assert_eq!(current.spent(), 2.0, "a rejected switch keeps its source");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn saved_legacy_checkpoint_failures_survive_newer_receipts_and_branch_switches() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for (store_kind, lazy_v2) in [
+            (crate::session::SessionStoreKind::Jsonl, false),
+            (crate::session::SessionStoreKind::Jsonl, true),
+            #[cfg(feature = "sqlite-sessions")]
+            (crate::session::SessionStoreKind::Sqlite, false),
+        ] {
+            for field in ["spent", "mainSpent"] {
+                for with_newer_receipt in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut session = Session::create_with_dir_and_store(
+                        Some(directory.path().to_path_buf()),
+                        store_kind,
+                    );
+                    let completed = session.append_message(assistant(1.0));
+                    let healthy = CostBudget::new(None, Some(10.0), 1.25).unwrap();
+                    let mut template = session.clone();
+                    healthy.checkpoint(&mut template).unwrap();
+                    let newer_receipt = latest_checkpoint(&template).unwrap().clone();
+
+                    let mut malformed = serde_json::json!({"spent": 1.25, "mainSpent": 1.0});
+                    malformed[field] = serde_json::Value::Null;
+                    session.append_custom_entry(CHECKPOINT_TYPE.to_string(), Some(malformed));
+                    assert!(session.create_branch_from(&completed));
+                    let active = session.append_message(assistant(0.0));
+                    if with_newer_receipt {
+                        // This receipt was generated from healthy history.
+                        // Using checkpoint() on the tainted source here would
+                        // already write a failure marker and mask the bug.
+                        session
+                            .append_custom_entry(CHECKPOINT_TYPE.to_string(), Some(newer_receipt));
+                    }
+                    assert!(session.navigate_to(&active));
+                    runtime.block_on(session.save()).unwrap();
+                    let path = session.path.clone().unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    let reopened = if lazy_v2 {
+                        let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+                        let (mut reopened, diagnostics) = Session::open_from_v2(
+                            &store,
+                            session.header.clone(),
+                            crate::session::V2OpenMode::ActivePath,
+                        )
+                        .unwrap();
+                        assert!(diagnostics.skipped_entries.is_empty());
+                        assert!(reopened.has_partial_v2_hydration());
+                        reopened.path = Some(path.clone());
+                        reopened
+                    } else {
+                        runtime
+                            .block_on(Session::open(path.to_str().unwrap()))
+                            .unwrap()
+                    };
+
+                    assert!(matches!(recorded_spend(&reopened),
+                        Err(Error::Session(message)) if message == RECORDED_BILLING_FAILURE));
+                    assert!(CostBudget::from_session(&reopened, None, Some(10.0)).is_err());
+                    for preserve in [false, true] {
+                        assert!(healthy.for_replacement(&reopened, preserve).is_err());
+                    }
+                    healthy.admit().unwrap();
+                    assert_eq!(healthy.spent(), 1.25);
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn explicit_zero_bills_remain_valid_after_durable_restore() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
-        for billing in [
-            crate::model::BillingUsage::ReportedTotal { total: 0.0 },
-            crate::model::BillingUsage::Tokens {
+        let tokens = |reported_total, audio_input| {
+            Some(crate::model::BillingUsage::Tokens {
                 text: crate::model::BillingTokenCounts {
                     input: 20,
                     ..Default::default()
                 },
                 audio: crate::model::BillingTokenCounts {
-                    input: 5,
+                    input: audio_input,
                     ..Default::default()
                 },
-                reported_total: Some(0.0),
-            },
+                reported_total,
+            })
+        };
+        for (billing, expected_bill) in [
+            (None, 0.0),
+            (
+                Some(crate::model::BillingUsage::ReportedTotal { total: 0.0 }),
+                0.0,
+            ),
+            (
+                Some(crate::model::BillingUsage::ReportedTotal { total: 0.125 }),
+                0.125,
+            ),
+            (tokens(Some(0.0), 5), 0.0),
+            (tokens(Some(0.125), 0), 0.125),
+            (tokens(None, 5), 0.0),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("zero-bill.jsonl");
@@ -4577,10 +4922,29 @@ mod tests {
             session.append_message(assistant(0.25));
             let mut free = assistant(0.0);
             if let SessionMessage::Assistant { message } = &mut free {
-                message.usage.billing = Some(billing);
+                let authoritative = matches!(
+                    &billing,
+                    Some(crate::model::BillingUsage::ReportedTotal { .. })
+                        | Some(crate::model::BillingUsage::Tokens {
+                            reported_total: Some(_),
+                            ..
+                        })
+                );
+                message.usage.billing = billing;
+                if authoritative {
+                    // Exercise the same pricing path as a finished provider
+                    // response. An explicit zero/discount overrides catalog
+                    // estimates, including when audio rates are unavailable.
+                    let rates = crate::provider::ModelCost {
+                        input: 25_000.0,
+                        ..Default::default()
+                    };
+                    rates.price_usage(&mut message.usage).unwrap();
+                }
             }
             session.append_message(free);
-            let budget = CostBudget::new(None, Some(1.0), 0.25).unwrap();
+            let expected_spend = 0.25 + expected_bill;
+            let budget = CostBudget::new(None, Some(1.0), expected_spend).unwrap();
             budget.checkpoint(&mut session).unwrap();
             let SessionEntry::Custom(checkpoint) = session.entries.last().unwrap() else {
                 panic!("cost checkpoint");
@@ -4590,9 +4954,9 @@ mod tests {
             let reopened = runtime
                 .block_on(Session::open(path.to_str().unwrap()))
                 .unwrap();
-            assert_eq!(recorded_spend(&reopened).unwrap(), 0.25);
+            assert_eq!(recorded_spend(&reopened).unwrap(), expected_spend);
             let resumed = CostBudget::from_session(&reopened, None, Some(1.0)).unwrap();
-            assert_eq!(resumed.spent(), 0.25);
+            assert_eq!(resumed.spent(), expected_spend);
             resumed.admit().unwrap();
             resumed
                 .for_replacement(&reopened, true)
