@@ -1623,6 +1623,7 @@ pub fn retry_delay_ms(base_delay_ms: u32, max_delay_ms: u32, attempt: u32) -> u3
 #[must_use]
 pub fn marks_session_persistence(error_text: &str) -> bool {
     error_text.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
+        || error_text.contains("SESSION_PERSISTENCE_FAILED")
 }
 
 /// No credential is available until a local cooldown expires. Repeating the
