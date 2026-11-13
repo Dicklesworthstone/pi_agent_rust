@@ -5451,7 +5451,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         runtime.block_on(Box::pin(future))
     }
 
-    fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn current_dir_lock() -> crate::TestCurrentDirLockGuard {
         crate::test_current_dir_lock()
     }
 
@@ -7955,19 +7955,27 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
 
     struct CurrentDirGuard {
         previous: PathBuf,
+        _lock: crate::TestCurrentDirLockGuard,
     }
 
     impl CurrentDirGuard {
         fn new(path: &Path) -> Self {
-            let previous = env::current_dir().expect("current dir");
+            let lock = current_dir_lock();
+            let previous =
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
             env::set_current_dir(path).expect("set current dir");
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
+            if env::set_current_dir(&self.previous).is_err() {
+                let _ = env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+            }
         }
     }
 
@@ -12322,12 +12330,13 @@ export default function init(pi) {
                     "every public turn must retain the configured request cap"
                 );
 
-                let mut registry = handle.session.model_registry().unwrap().clone();
-                let mut current = registry.find("openai", "gpt-4o").unwrap();
+                let existing_registry = handle.session.model_registry().unwrap();
+                let mut current = existing_registry.find("openai", "gpt-4o").unwrap();
                 current.model.max_tokens = 1_536;
-                let mut next = registry.find("openai", "gpt-4o-mini").unwrap();
+                let mut next = existing_registry.find("openai", "gpt-4o-mini").unwrap();
                 next.model.max_tokens = 3_072;
-                registry.merge_entries(vec![current, next]);
+                let registry =
+                    crate::models::ModelRegistry::from_entries_for_tests(vec![current, next]);
                 handle.session.set_model_registry(registry);
                 handle
                     .prompt("refreshed catalog", |_| {})
