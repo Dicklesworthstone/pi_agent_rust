@@ -1048,17 +1048,23 @@ mod tests {
         assert_eq!(updates.len(), 5, "progress must not publish a plan");
         assert_eq!(updates[0]["status"], "in_progress");
         assert_eq!(updates[1]["status"], "completed");
-        assert_eq!(updates[2], json!({
-            "sessionUpdate": "plan",
-            "entries": [
-                { "content": "Delivery: Investigate café 🦀", "priority": "medium", "status": "completed" },
-                { "content": "Delivery: Implement", "priority": "medium", "status": "in_progress" },
-                { "content": "Verify (blocked: Waiting for access)", "priority": "medium", "status": "pending" },
-                { "content": "Publish", "priority": "medium", "status": "pending" },
-            ],
-        }));
+        assert_eq!(
+            updates[2],
+            json!({
+                "sessionUpdate": "plan",
+                "entries": [
+                    { "content": "Delivery: Investigate café 🦀", "priority": "medium", "status": "completed" },
+                    { "content": "Delivery: Implement", "priority": "medium", "status": "in_progress" },
+                    { "content": "Verify (blocked: Waiting for access)", "priority": "medium", "status": "pending" },
+                    { "content": "Publish", "priority": "medium", "status": "pending" },
+                ],
+            })
+        );
         assert_eq!(updates[3]["status"], "completed");
-        assert_eq!(updates[4], json!({ "sessionUpdate": "plan", "entries": [] }));
+        assert_eq!(
+            updates[4],
+            json!({ "sessionUpdate": "plan", "entries": [] })
+        );
         assert!(!lines.join("\n").contains("must-not-leak"));
     }
 
@@ -1071,9 +1077,26 @@ mod tests {
             ("todo", true, false, Some(accepted.clone())),
             ("todo", false, true, Some(accepted)),
             ("todo", false, false, None),
-            ("todo", false, false, Some(json!({ "schema": "unknown", "list": { "phases": [] } }))),
-            ("todo", false, false, Some(json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [{}] } }))),
-            ("todo", false, false, Some(json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [{ "tasks": [{ "content": "invalid", "state": "invented" }] }] } }))),
+            (
+                "todo",
+                false,
+                false,
+                Some(json!({ "schema": "unknown", "list": { "phases": [] } })),
+            ),
+            (
+                "todo",
+                false,
+                false,
+                Some(json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [{}] } })),
+            ),
+            (
+                "todo",
+                false,
+                false,
+                Some(
+                    json!({ "schema": TODO_LIST_SCHEMA, "list": { "phases": [{ "tasks": [{ "content": "invalid", "state": "invented" }] }] } }),
+                ),
+            ),
         ] {
             let (tx, rx) = std::sync::mpsc::sync_channel(2);
             let handler = super::super::build_acp_event_handler(
@@ -1093,7 +1116,10 @@ mod tests {
             let lines = rx.try_iter().collect::<Vec<_>>();
             assert_eq!(lines.len(), 1, "{name}, {result_error}, {event_error}");
             let notification: Value = serde_json::from_str(&lines[0]).unwrap();
-            assert_eq!(notification["params"]["update"]["sessionUpdate"], "tool_call_update");
+            assert_eq!(
+                notification["params"]["update"]["sessionUpdate"],
+                "tool_call_update"
+            );
         }
     }
 
@@ -1103,11 +1129,14 @@ mod tests {
             "dispatchedVia": "xdev", "tool": "todo", "schema": TODO_LIST_SCHEMA,
             "list": { "phases": [{ "tasks": [{ "content": "Finish", "state": "done" }] }] },
         });
-        assert_eq!(todo_plan_update("xdev", false, Some(&details)), Some(json!({
-            "sessionUpdate": "plan", "entries": [
-                { "content": "Finish", "priority": "medium", "status": "completed" },
-            ],
-        })));
+        assert_eq!(
+            todo_plan_update("xdev", false, Some(&details)),
+            Some(json!({
+                "sessionUpdate": "plan", "entries": [
+                    { "content": "Finish", "priority": "medium", "status": "completed" },
+                ],
+            }))
+        );
     }
 
     #[test]

@@ -3344,8 +3344,7 @@ mod tests {
             let error = cache
                 .prepare_inner(&context, &mut body, plan, &mut prepared)
                 .await
-                .err()
-                .expect("cancelled staging");
+                .expect_err("cancelled staging");
             assert!(error.to_string().contains("cancelled"));
             assert!(cache.state.lock().unwrap().entries.is_empty());
         });

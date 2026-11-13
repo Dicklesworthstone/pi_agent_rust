@@ -910,6 +910,17 @@ impl FileMutationRecorder {
         self.persist(inner, false);
     }
 
+    /// Discard a pending snapshot when a CAS precheck rejected the edit before
+    /// touching the destination file, so an external concurrent edit does not
+    /// leave a spurious `Unrecorded` poison unit on this session's undo stack.
+    pub fn discard(&self, tool_call_id: &str) {
+        let mut inner = self.inner.lock().expect("undo recorder lock"); // ubs:ignore poisoned lock means a prior snapshot panicked; propagating cannot help
+        let inner = &mut *inner;
+        if let Some(unit) = inner.pending.remove(tool_call_id) {
+            release_unit(&mut inner.store, &unit);
+        }
+    }
+
     /// A failed call is discardable only after its pre-state is restored.
     /// Failed rollback or a post-publication error leaves an explicit gap,
     /// including across restart, instead of permitting undo through it.

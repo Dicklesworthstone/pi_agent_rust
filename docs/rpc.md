@@ -131,6 +131,10 @@ billing; see [model configuration](models.md#native-audio-with-openai-chat-compl
 
 ### Bash commands
 
+- **bash**: Execute a shell command with bounded output capture and history persistence.
+  - Params: `command` (string).
+- **abort_bash**: Request cancellation of the active foreground Bash command.
+
 Send `bash` with a string `command`; only one Bash request can run at a time.
 Send `abort_bash` to request cancellation while its response is pending:
 
@@ -372,6 +376,19 @@ in-memory content; session resume still hydrates saved sidecar payloads.
   - Params: `focus` (optional string, at most 4096 UTF-8 bytes, no NUL).
 - **fork**: Fork from a message.
   - Params: `entryId`.
+- **checkpoint**: Mark a named restore point in the active session.
+  - Params: `name` (optional, defaults to `"checkpoint"`), `note` (optional).
+- **rewind**: Collapse session history back to a checkpoint using optimistic concurrency control while idle.
+  - Params: `name` (optional; defaults to the latest checkpoint).
+- **fresh**: Mint a fresh provider-cache session ID and reset stream bookkeeping without discarding transcript history.
+
+### Plan Mode & Goals
+- **goal**: Inspect or mutate the active session objective (`op: "get"` works while busy or idle; lifecycle mutations require an idle session).
+  - Params: `op` (`"get"`, `"set"`, `"clear"`, etc.) plus operation-specific goal fields.
+- **set_plan_mode**: Enter or exit read-only planning mode.
+  - Params: `mode` (`"on"` or `"off"`).
+- **approve_plan**: Approve the currently submitted plan and persist the approval record.
+- **reject_plan**: Reject the currently submitted plan and persist the rejection record.
 
 ### Manual compaction progress
 
@@ -477,7 +494,10 @@ already admitted handoff through its terminal response before shutdown.
   - `contextWindow` is the resolved model's positive context capacity, or `null`
     when unknown. Read these values at an idle boundary for context scheduling.
 - **get_messages**: Get conversation history in the negotiated output mode.
+- **get_session_stats**: Get cumulative token, cost, and message statistics for the active session.
+- **get_last_assistant_text**: Return `{text}` for the most recent assistant message on the active branch.
 - **get_fork_messages**: Get `{entryId, text}` previews of branchable user messages.
+- **get_commands**: List available slash, prompt-template, skill, and extension commands (`{commands}`).
 - **set_output_mode**: Negotiate `full` (default) or `compact` output while idle.
   - Params: `mode`.
 - **get_attachment**: Read a bounded byte range from an issued attachment ID.
@@ -485,10 +505,21 @@ already admitted handoff through its terminal response before shutdown.
 - **get_available_models**: List models.
 - **set_model**: Change model.
   - Params: `provider`, `modelId`.
+- **cycle_model**: Advance to the next configured or scoped model.
 - **set_thinking_level**: Set thinking budget.
   - Params: `level` ("off", "low", etc.).
+- **cycle_thinking_level**: Advance to the next supported thinking level.
 - **set_steering_mode**: "one-at-a-time" or "all".
 - **set_follow_up_mode**: "one-at-a-time" or "all".
+- **set_auto_compaction**: Enable or disable automatic context compaction.
+  - Params: `enabled` (boolean).
+- **set_auto_retry**: Enable or disable automatic transient-error retries.
+  - Params: `enabled` (boolean).
+- **abort_retry**: Cancel a pending automatic retry backoff.
+- **mcp_reauth**: Re-authenticate an MCP server and refresh its tool catalog while idle.
+  - Params: `server`, `clientId` (optional).
+- **mcp_unauth**: Clear stored credentials for an MCP server and refresh its tool catalog while idle.
+  - Params: `server`.
 
 ### Extension UI
 - **extension_ui_response**: Reply to a pending extension UI request.

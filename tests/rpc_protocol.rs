@@ -375,3 +375,59 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
         assert_eq!(tool_result["content"][0]["text"], "ok");
     });
 }
+
+#[test]
+fn rpc_dispatch_arms_match_docs_rpc_inventory() {
+    use std::collections::BTreeSet;
+
+    let rpc_src = std::fs::read_to_string("src/rpc.rs").expect("read src/rpc.rs");
+    let dispatch_start = rpc_src
+        .find("        match command_type {\n            \"prompt\" => {")
+        .expect("locate main RPC command_type match");
+    let dispatch_tail = &rpc_src[dispatch_start..];
+    let dispatch_end = dispatch_tail
+        .find("            _ => {\n                let _ = out_tx.send(response_error(\n                    id,\n                    command_type_raw,")
+        .expect("locate main RPC fallback arm");
+    let dispatch_block = &dispatch_tail[..dispatch_end];
+
+    let mut dispatch_commands = BTreeSet::new();
+    for line in dispatch_block.lines() {
+        let Some(rest) = line.strip_prefix("            \"") else {
+            continue;
+        };
+        if !rest.contains("=>") {
+            continue;
+        }
+        let pattern_part = rest.split("=>").next().unwrap_or_default();
+        for piece in pattern_part.split('|') {
+            let trimmed = piece.trim().trim_matches('"');
+            if !trimmed.is_empty() {
+                dispatch_commands.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    let docs_rpc = std::fs::read_to_string("docs/rpc.md").expect("read docs/rpc.md");
+    let mut documented_commands = BTreeSet::new();
+    for line in docs_rpc.lines() {
+        if let Some(rest) = line.trim().strip_prefix("- **")
+            && let Some((cmd, _)) = rest.split_once("**:")
+        {
+            documented_commands.insert(cmd.trim().to_string());
+        }
+    }
+
+    assert!(
+        dispatch_commands.len() >= 43,
+        "expected at least 43 RPC commands in src/rpc.rs, found {}",
+        dispatch_commands.len()
+    );
+    assert!(
+        !documented_commands.contains("nonexistent_rpc_command"),
+        "planted negative command must not appear in docs/rpc.md"
+    );
+    assert_eq!(
+        dispatch_commands, documented_commands,
+        "src/rpc.rs command_type dispatch arms and docs/rpc.md command bullets drifted"
+    );
+}

@@ -1778,8 +1778,11 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
         "AGENTS.md must not describe jemalloc as enabled by default"
     );
     assert!(
-        agents.contains("<48 MiB") && readme.contains("48.0 MiB"),
-        "AGENTS.md and README.md must agree on the release binary size budget"
+        agents.contains("--profile dist")
+            && agents.contains("opt-level = 3")
+            && readme.contains("--profile dist")
+            && readme.contains("opt-level = 3"),
+        "AGENTS.md and README.md must agree that DSR shipping builds use --profile dist (opt-level = 3)"
     );
 }
 

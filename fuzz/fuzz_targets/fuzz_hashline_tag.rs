@@ -13,10 +13,7 @@ use regex::Regex;
 fn hashline_tag_regex() -> &'static Regex {
     use std::sync::OnceLock;
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"^(\d+)#([a-zA-Z]{2})$")
-            .expect("valid hashline regex")
-    })
+    REGEX.get_or_init(|| Regex::new(r"^(\d+)#([a-zA-Z]{2})$").expect("valid hashline regex"))
 }
 
 /// Parse a hashline tag reference string into (1-indexed line number, 2-byte hash).

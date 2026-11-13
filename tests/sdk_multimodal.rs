@@ -1147,7 +1147,12 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
                 .iter()
                 .map(|event| event["type"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["agent_start", "fixture_steered", "fixture_follow_up", "agent_end"]
+            [
+                "agent_start",
+                "fixture_steered",
+                "fixture_follow_up",
+                "agent_end"
+            ]
         );
         assert_eq!(
             events[1]["frame"],

@@ -474,7 +474,10 @@ impl ProcessSessions {
         Ok(json!({"session": handle, "pid": pid}))
     }
 
-    fn environment(&self, explicit: Option<&Value>) -> Result<BTreeMap<String, String>, String> {
+    pub(super) fn environment(
+        &self,
+        explicit: Option<&Value>,
+    ) -> Result<BTreeMap<String, String>, String> {
         let mut environment = BTreeMap::new();
         if let Some(explicit) = explicit {
             let values = explicit
@@ -641,7 +644,7 @@ impl ProcessSessions {
 /// this restriction so `{ ...process.env }` remains usable with the process
 /// bridge. Individual reads still use the realm's disclosure policy (for
 /// example, an allowlisted secret or a Windows per-drive `=D:` value).
-pub(super) fn safe_environment_name(name: &str) -> bool {
+pub fn safe_environment_name(name: &str) -> bool {
     if name.is_empty() || name.contains(['\0', '=']) || !super::is_env_var_allowed(name) {
         return false;
     }

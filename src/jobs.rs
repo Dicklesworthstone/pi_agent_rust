@@ -1382,8 +1382,8 @@ fn wait_for_artifact_budget_lock(
             Err(fs4::TryLockError::WouldBlock) => {
                 std::thread::sleep(remaining.min(OUTPUT_PUMP_POLL_INTERVAL));
             }
-            Err(fs4::TryLockError::Error(err))
-                if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(fs4::TryLockError::Error(err)) if err.kind() == std::io::ErrorKind::Interrupted => {
+            }
             Err(fs4::TryLockError::Error(err)) => {
                 return Err(Error::tool(
                     "bash",
@@ -5084,7 +5084,10 @@ mod tests {
             "cancellation must return before the holder releases its lock: {before_release:?}"
         );
         assert!(joined.is_err());
-        assert!(holder_still_owned, "cancelling a waiter cannot unlock its peer");
+        assert!(
+            holder_still_owned,
+            "cancelling a waiter cannot unlock its peer"
+        );
         let next = acquire_artifact_budget_lock(directory.path(), || Ok(()))
             .expect("subsequent admission can acquire the released lock");
         assert!(matches!(
@@ -5107,13 +5110,10 @@ mod tests {
             .expect("independent waiting handle");
         let (completed, completion) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
-            let result = wait_for_artifact_budget_lock(
-                waiter,
-                || Ok(()),
-                Duration::from_millis(40),
-            )
-            .map(drop)
-            .map_err(|error| error.to_string());
+            let result =
+                wait_for_artifact_budget_lock(waiter, || Ok(()), Duration::from_millis(40))
+                    .map(drop)
+                    .map_err(|error| error.to_string());
             let _ = completed.send(result.clone());
             result
         });
@@ -5197,7 +5197,11 @@ mod tests {
                     Some(sibling_root.path()),
                 )
                 .and_then(|snapshot| {
-                    wait("artifact-lock-sibling", &snapshot.id, Duration::from_secs(10))
+                    wait(
+                        "artifact-lock-sibling",
+                        &snapshot.id,
+                        Duration::from_secs(10),
+                    )
                 }),
             )
         } else {
@@ -5206,15 +5210,24 @@ mod tests {
         // Never leave a failed regression waiting forever in flock.
         drop(holder);
         let joined = worker.join().expect("blocked shell admission");
-        assert!(reserved, "the launch must reserve capacity before cancellation");
+        assert!(
+            reserved,
+            "the launch must reserve capacity before cancellation"
+        );
         assert!(
             matches!(&before_release, Ok(Err(_))),
             "cancellation must refuse launch without releasing the peer lock: {before_release:?}"
         );
         assert!(joined.is_err());
-        assert!(list(&owner_session_id).expect("cancelled owner jobs").is_empty());
+        assert!(
+            list(&owner_session_id)
+                .expect("cancelled owner jobs")
+                .is_empty()
+        );
         assert!(take_completion_notices(&owner_session_id).is_empty());
-        let sibling = sibling.expect("sibling admission attempted").expect("sibling job");
+        let sibling = sibling
+            .expect("sibling admission attempted")
+            .expect("sibling job");
         assert_eq!(sibling.status, "exited");
         assert!(sibling.output_tail.contains("sibling-launched"));
         assert_eq!(
@@ -5598,8 +5611,7 @@ mod tests {
         if mode == "probe" {
             std::fs::write(marker_dir.join("probe-attempted"), b"").expect("probe marker");
         }
-        let _lock = acquire_artifact_budget_lock(&jobs_dir, || Ok(()))
-            .expect("child budget lock");
+        let _lock = acquire_artifact_budget_lock(&jobs_dir, || Ok(())).expect("child budget lock");
         match mode.as_str() {
             "holder" => {
                 std::fs::write(marker_dir.join("holder-acquired"), b"").expect("holder marker");

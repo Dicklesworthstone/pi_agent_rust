@@ -1509,8 +1509,11 @@ mod tests {
 "#;
 
     fn real_component_fixture() -> Vec<u8> {
-        let registration =
-            serde_json::to_string(&registration_payload()).expect("serialize registration");
+        real_component_fixture_with_registration(&registration_payload())
+    }
+
+    fn real_component_fixture_with_registration(payload: &RegisterPayload) -> Vec<u8> {
+        let registration = serde_json::to_string(payload).expect("serialize registration");
         let tool_output = serde_json::to_string(&ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("wasm-tool-ok"))],
             details: None,
@@ -2487,6 +2490,83 @@ mod tests {
             err.message.contains("allowlist"),
             "expected allowlist guidance, got: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn extension_manager_executes_wasm_slash_command_end_to_end() {
+        let dir = tempdir().expect("tempdir");
+        let component_path = dir.path().join("slash-extension.wasm");
+        let mut payload = registration_payload();
+        payload.slash_commands = vec![json!({
+            "name": "fixture",
+            "description": "WASM fixture slash command"
+        })];
+        std::fs::write(
+            &component_path,
+            real_component_fixture_with_registration(&payload),
+        )
+        .expect("write WASM slash component");
+
+        let manifest_value = json!({
+            "schema": "pi.ext.manifest.v1",
+            "extension_id": "wasm-slash-ext",
+            "name": payload.name,
+            "version": payload.version,
+            "api_version": PROTOCOL_VERSION,
+            "runtime": "wasm",
+            "entrypoint": "slash-extension.wasm",
+            "capability_manifest": payload.capability_manifest,
+        });
+        let manifest: ExtensionManifest =
+            serde_json::from_value(manifest_value.clone()).expect("parse manifest");
+        let spec = WasmExtensionLoadSpec {
+            manifest,
+            manifest_json: serde_json::to_string(&manifest_value).expect("serialize manifest"),
+            root: dir.path().to_path_buf(),
+            entry_path: component_path,
+        };
+
+        let host = WasmExtensionHost::new(dir.path(), permissive_policy())
+            .expect("create WASM extension host");
+        let manager = ExtensionManager::new();
+        let tools = crate::tools::SharedToolRegistry::new(crate::tools::ToolRegistry::new(
+            &["read"],
+            dir.path(),
+            None,
+        ));
+
+        run_async(manager.load_wasm_extensions(&host, vec![spec], tools))
+            .expect("load WASM extension into manager");
+
+        assert!(manager.has_command("fixture"));
+        assert!(manager.has_command("/fixture"));
+        assert!(manager.has_callable_command("fixture"));
+        assert!(
+            manager
+                .list_commands()
+                .iter()
+                .any(|cmd| cmd.get("name").and_then(Value::as_str) == Some("fixture")),
+            "RegistrySnapshot must publish WASM slash commands immediately"
+        );
+
+        let result = run_async(manager.execute_command("/fixture", "alpha \"beta gamma\"", 5_000))
+            .expect("execute WASM slash command via ExtensionManager without JS runtime");
+        let slash_output: ToolOutput =
+            serde_json::from_value(result).expect("parse WASM slash output");
+        assert!(matches!(
+            &slash_output.content[0],
+            ContentBlock::Text(text) if text.text == "wasm-slash-ok"
+        ));
+
+        // Planted negative: unregistered command with no JS runtime must fail closed.
+        let missing_err = run_async(manager.execute_command("nonexistent-wasm-cmd", "", 5_000))
+            .expect_err("unregistered command without JS runtime must fail");
+        assert!(
+            missing_err
+                .to_string()
+                .contains("Extension runtime not configured"),
+            "unexpected error: {missing_err}"
         );
     }
 }

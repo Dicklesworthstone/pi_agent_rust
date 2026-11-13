@@ -7374,10 +7374,10 @@ fn tui_state_collapse_changelog_toggle_off_then_on() {
         build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
     log_initial_state(&harness, &app);
 
-    // Open settings and navigate to CollapseChangelog (entry 6).
+    // Open settings and navigate to CollapseChangelog (entry 10).
     type_text(&harness, &mut app, "/settings");
     press_enter(&harness, &mut app);
-    for _ in 0..6 {
+    for _ in 0..10 {
         press_down(&harness, &mut app);
     }
     // Toggle off.
@@ -7390,7 +7390,7 @@ fn tui_state_collapse_changelog_toggle_off_then_on() {
     // Reopen and toggle back on.
     type_text(&harness, &mut app, "/settings");
     press_enter(&harness, &mut app);
-    for _ in 0..6 {
+    for _ in 0..10 {
         press_down(&harness, &mut app);
     }
     let step = press_enter(&harness, &mut app);

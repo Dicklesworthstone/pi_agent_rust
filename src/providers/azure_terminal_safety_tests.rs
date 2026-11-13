@@ -1170,7 +1170,8 @@ fn reported_bills_price_usage_when_counts_or_lifetimes_cannot() {
                         assert_eq!(message.usage.cost.total, bill);
                         assert!(matches!(
                             message.usage.billing,
-                            Some(crate::model::BillingUsage::ReportedTotal { total }) if total == bill
+                            Some(crate::model::BillingUsage::ReportedTotal { total })
+                                if (total - bill).abs() < f64::EPSILON
                         ));
                     }
                 }

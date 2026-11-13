@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 mod http;
 mod projection;
 
-const TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
-const VIEWER_IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
-const PROPOSAL_LIFETIME: Duration = Duration::from_secs(2 * 60);
+const TOKEN_LIFETIME: Duration = Duration::from_mins(10);
+const VIEWER_IDLE_LIMIT: Duration = Duration::from_mins(10);
+const PROPOSAL_LIFETIME: Duration = Duration::from_mins(2);
 const PROPOSAL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_PENDING_TOKENS: usize = 16;
 const MAX_VIEWERS: usize = 16;
@@ -252,11 +252,14 @@ impl State {
     fn expire(&mut self, now: Instant) {
         self.tokens.retain(|_, grant| now < grant.deadline);
         let previous_viewers = self.viewers.len();
-        self.viewers
-            .retain(|_, viewer| now.saturating_duration_since(viewer.last_seen) < VIEWER_IDLE_LIMIT);
-        if self.proposal.as_ref().is_some_and(|slot| {
-            now >= slot.deadline || !self.viewers.contains_key(&slot.client)
-        }) {
+        self.viewers.retain(|_, viewer| {
+            now.saturating_duration_since(viewer.last_seen) < VIEWER_IDLE_LIMIT
+        });
+        if self
+            .proposal
+            .as_ref()
+            .is_some_and(|slot| now >= slot.deadline || !self.viewers.contains_key(&slot.client))
+        {
             self.reject_proposal("The browser proposal expired. Submit it again when ready.");
             self.record("proposal_expired");
         }
@@ -368,7 +371,11 @@ impl CompanionHandle {
             state.busy = true;
         }
         state.changed();
-        state.record(if accepted { "proposal_admitted" } else { "proposal_rejected" });
+        state.record(if accepted {
+            "proposal_admitted"
+        } else {
+            "proposal_rejected"
+        });
         true
     }
 
@@ -386,7 +393,7 @@ impl CompanionHandle {
     /// Refresh only at a driver boundary after the operation has completed.
     /// The projection omits incomplete deltas and never exports FTUI drafts,
     /// login text, permission cards, tool arguments, or binary attachments.
-    pub async fn refresh(&self, handle: &crate::sdk::AgentSessionHandle) -> crate::Result<()> {
+    pub async fn refresh(&self, handle: &crate::sdk::AgentSessionHandle) -> crate::PiResult<()> {
         let identity = handle
             .with_session(|session| {
                 let name = session.get_name_ref().unwrap_or("Pi session");
@@ -411,7 +418,10 @@ impl CompanionHandle {
         };
         let agent = &handle.session().agent;
         let provider = agent.provider();
-        if provider.name().len().saturating_add(provider.model_id().len())
+        if provider
+            .name()
+            .len()
+            .saturating_add(provider.model_id().len())
             >= crate::text_completion::MAX_INPUT_BYTES
         {
             self.clear_view();
@@ -436,9 +446,8 @@ impl CompanionHandle {
         state.reject_proposal("The current session is unavailable.");
         state.owner_session_id = None;
         state.generation = state.generation.saturating_add(1);
-        state.snapshot = Arc::from(
-            r#"{"name":"Session unavailable","model":"","messages":[],"omitted":true}"#,
-        );
+        state.snapshot =
+            Arc::from(r#"{"name":"Session unavailable","model":"","messages":[],"omitted":true}"#);
         state.changed();
     }
 

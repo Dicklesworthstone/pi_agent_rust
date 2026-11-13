@@ -4230,10 +4230,12 @@ fn expected_system_prompt(custom: &str) -> String {
 
 fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
     fn tool_json(tool: &dyn pi::tools::Tool) -> serde_json::Value {
+        let raw_schema = tool.parameters();
+        let schema = pi::providers::anthropic_tool_schema(&raw_schema);
         json!({
             "name": tool.name(),
             "description": tool.description(),
-            "input_schema": tool.parameters(),
+            "input_schema": schema,
         })
     }
 
@@ -4252,18 +4254,19 @@ fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
         .collect();
 
     // Session-coupled tools join via extend_tools in main.rs, in this
-    // order: todo (when enabled), submit_plan (always registered — it
-    // self-errors outside plan mode), ask (when enabled).
+    // order: todo (when enabled), submit_plan (when enabled), ask (when enabled).
     if enabled.contains(&"todo") {
         let session = Arc::new(asupersync::sync::Mutex::new(
             pi::session::Session::in_memory(),
         ));
         defs.push(tool_json(&pi::todo::TodoTool::new(session)));
     }
-    defs.push(tool_json(&pi::plan::SubmitPlanTool::new(
-        pi::plan::PlanState::new(),
-        false,
-    )));
+    if enabled.contains(&"submit_plan") {
+        defs.push(tool_json(&pi::plan::SubmitPlanTool::new(
+            pi::plan::PlanState::new(),
+            false,
+        )));
+    }
     if enabled.contains(&"ask") {
         defs.push(tool_json(&pi::ask::AskTool::new(
             pi::ask::AskPolicy::from_config(None),
@@ -6540,7 +6543,7 @@ fn e2e_cli_print_background_results_wake_only_when_enabled() {
 }
 
 /// Exercise the actual parent -> built-in task -> native Bash path. The job
-/// cannot finish before the child's provisional agent_end is persisted, so
+/// cannot finish before the child's provisional `agent_end` is persisted, so
 /// accepting the final answer requires the one-shot child's idle wake loop.
 #[test]
 #[cfg(target_os = "linux")]

@@ -27,15 +27,15 @@ written. Do not re-enable it.
 
 `dsr quality` reads checks only from the registry file, so a host without the
 `pi_agent_rust` entry cannot run the gate. The registry subset of the recipe
-is checked in at `.dsr/repos.yaml` (six checks: fmt, `cargo check`, Clippy,
-`cargo test`, installer regression, module reachability; Cargo runs through
+is checked in at `.dsr/repos.yaml` (fmt, `cargo check --keep-going`, Clippy `--keep-going`, `wasm-host` Clippy,
+`cargo test`, `wasm-host` tests, installer regression, module reachability, and fixture read patience; Cargo runs through
 `rch` under `RCH_REQUIRE_REMOTE=1`, so a missing fleet fails the check instead
 of silently compiling on the host, with build/test timeouts raised to fit a
 cold all-targets run). Either point DSR at it for a one-off run or merge it
 into the host registry once:
 
 ```bash
-DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust --dry-run   # expect 6 planned
+DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust --dry-run   # expect 9 planned
 yq -i '.tools.pi_agent_rust = load(".dsr/repos.yaml").tools.pi_agent_rust' ~/.config/dsr/repos.yaml
 dsr quality --tool pi_agent_rust
 ```

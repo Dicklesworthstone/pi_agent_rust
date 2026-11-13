@@ -1551,7 +1551,8 @@ pub fn detect_extension_permission_drift_json(
 use protocol::validate_register;
 #[cfg(test)]
 use protocol::{
-    HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS, HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK,
+    HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS,
+    HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE, HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK,
     HOSTCALL_MARSHALLING_PATH_FAST_OPCODE, HOSTCALL_REACTOR_DEFAULT_LANE_CAPACITY,
     HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION, parse_common_hostcall_opcode_code,
     reset_hostcall_superinstruction_state_for_tests, superinstruction_test_lock,
@@ -3490,6 +3491,8 @@ struct ConformalState {
     observation_count: u64,
     /// Number of observations that fell outside the prediction interval.
     anomaly_count: u64,
+    /// Gibbs-Candès (2021) Adaptive Conformal Inference miscoverage level `alpha_t`.
+    adaptive_alpha: Option<f64>,
 }
 
 impl Default for ConformalState {
@@ -3500,6 +3503,7 @@ impl Default for ConformalState {
             running_m2: 0.0,
             observation_count: 0,
             anomaly_count: 0,
+            adaptive_alpha: None,
         }
     }
 }
@@ -3510,9 +3514,30 @@ impl Default for ConformalState {
     clippy::cast_sign_loss
 )]
 impl ConformalState {
+    const ACI_STEP_SIZE: f64 = 0.05;
+
+    fn effective_confidence(&self, nominal_confidence: f64) -> f64 {
+        let clamped_nominal = if nominal_confidence.is_finite() {
+            nominal_confidence.clamp(0.5, 0.999)
+        } else {
+            0.95
+        };
+        self.adaptive_alpha
+            .map_or(clamped_nominal, |alpha| (1.0 - alpha).clamp(0.5, 0.999))
+    }
+
     /// Feed a new observation and return `true` if it is anomalous (outside
-    /// the conformal prediction interval at the configured confidence level).
+    /// the conformal prediction interval at the adaptive confidence level).
     fn observe(&mut self, value: f64, confidence: f64, max_calibration: usize) -> bool {
+        let clamped_nominal = if confidence.is_finite() {
+            confidence.clamp(0.5, 0.999)
+        } else {
+            0.95
+        };
+        let target_alpha = (1.0 - clamped_nominal).clamp(0.001, 0.5);
+        let alpha_t = *self.adaptive_alpha.get_or_insert(target_alpha);
+        let effective_conf = (1.0 - alpha_t).clamp(0.5, 0.999);
+
         // Welford online mean/variance update.
         self.observation_count += 1;
         let n = self.observation_count as f64;
@@ -3526,7 +3551,7 @@ impl ConformalState {
 
         // Check against current prediction interval before adding to calibration.
         let is_anomaly = if self.calibration_scores.len() >= 2 {
-            let quantile_idx = self.conformal_quantile_index(confidence);
+            let quantile_idx = self.conformal_quantile_index(effective_conf);
             let threshold = self.sorted_score_at(quantile_idx);
             score > threshold
         } else {
@@ -3537,9 +3562,19 @@ impl ConformalState {
             self.anomaly_count += 1;
         }
 
+        // Gibbs-Candès ACI online update: alpha_{t+1} = alpha_t + gamma * (alpha - err_t).
+        // When an anomaly fires (err_t = 1), alpha_t drops, widening future quantiles;
+        // when covered (err_t = 0), alpha_t relaxes back toward target_alpha.
+        let err_t = if is_anomaly { 1.0 } else { 0.0 };
+        let next_alpha = Self::ACI_STEP_SIZE
+            .mul_add(target_alpha - err_t, alpha_t)
+            .clamp(0.001, 0.5);
+        self.adaptive_alpha = Some(next_alpha);
+
         // Add to calibration set (bounded).
-        self.calibration_scores.push_back(score);
-        while self.calibration_scores.len() > max_calibration {
+        self.calibration_scores.push_back(score.max(0.0));
+        let max_cal = max_calibration.max(1);
+        while self.calibration_scores.len() > max_cal {
             let _ = self.calibration_scores.pop_front();
         }
 
@@ -3577,7 +3612,7 @@ impl ConformalState {
         if self.calibration_scores.len() < 2 {
             return f64::INFINITY;
         }
-        let idx = self.conformal_quantile_index(confidence);
+        let idx = self.conformal_quantile_index(self.effective_confidence(confidence));
         self.sorted_score_at(idx)
     }
 }
@@ -10079,8 +10114,13 @@ pub const EXTENSION_SHORTCUT_BUDGET_MS: u64 = 30_000;
 /// native hostcall settlement and generated-turn ownership.
 #[derive(Debug, Clone)]
 pub(crate) enum ExtensionInteraction {
-    Command { name: String, args: String },
-    Shortcut { key_id: String },
+    Command {
+        name: String,
+        args: String,
+    },
+    Shortcut {
+        key_id: String,
+    },
     MessageRenderer {
         custom_type: String,
         message: Value,
@@ -12261,6 +12301,8 @@ impl JsExtensionRuntimeHandle {
         policy: Option<ExtensionPolicy>,
     ) -> Result<Self> {
         let compat_scan_mode = config.compat_scan_mode();
+        let allow_loopback_http =
+            config.env.get("PI_HTTP_ALLOW_LOOPBACK").map(String::as_str) == Some("1");
         let (tx, mut rx) = mpsc::channel(32);
         let (init_tx, mut init_rx) = oneshot::channel();
         let (exit_tx, exit_rx) = oneshot::channel();
@@ -12277,13 +12319,18 @@ impl JsExtensionRuntimeHandle {
 
         apply_env_capability(&mut config, &policy);
 
+        let mut http_config = crate::connectors::http::HttpConnectorConfig::default();
+        if allow_loopback_http {
+            http_config.allow_loopback_http = true;
+        }
+
         let manager_ref = Arc::downgrade(&manager.inner);
         let host = JsRuntimeHost {
             tools: tools.into(),
             manager_ref: manager_ref.clone(),
             manager_snapshot: Arc::clone(&manager.snapshot),
             manager_snapshot_version: Arc::clone(&manager.snapshot_version),
-            http: Arc::new(HttpConnector::with_defaults()),
+            http: Arc::new(HttpConnector::new(http_config)),
             policy,
             interceptor,
         };
@@ -12298,15 +12345,28 @@ impl JsExtensionRuntimeHandle {
                 let warm_pool = crate::extensions_js::WarmIsolatePool::new(runtime_config.clone());
                 let cold_init_started = Instant::now();
                 let init_config = warm_pool.make_config();
-                let init = PiJsRuntime::with_clock_and_config_with_policy(
-                    crate::scheduler::WallClock,
-                    init_config.clone(),
-                    Some(runtime_policy.clone()),
-                )
-                .await;
+                let needs_tight_limit_probe = init_config
+                    .limits
+                    .memory_limit_bytes
+                    .is_some_and(|bytes| bytes < 8 * 1024 * 1024)
+                    || init_config
+                        .limits
+                        .max_stack_bytes
+                        .is_some_and(|bytes| bytes < 256 * 1024);
+                let init = if needs_tight_limit_probe {
+                    PiJsRuntime::with_clock_and_config_with_policy(
+                        crate::scheduler::WallClock,
+                        init_config.clone(),
+                        Some(runtime_policy.clone()),
+                    )
+                    .await
+                    .map(drop)
+                } else {
+                    Ok(())
+                };
                 let cold_init_latency_ms = duration_ms_u64(cold_init_started.elapsed());
                 match init {
-                    Ok(runtime_probe) => {
+                    Ok(()) => {
                         tracing::info!(
                             event = "extension_runtime.shards.startup",
                             phase = "cold_init",
@@ -12318,9 +12378,6 @@ impl JsExtensionRuntimeHandle {
                             pool_reset_count = warm_pool.reset_count(),
                             "QuickJS shard runtime configuration validated"
                         );
-                        // The probe executes no extension code. Production realms are
-                        // created below with an immutable Rust-owned extension id.
-                        drop(runtime_probe);
                         let _ = init_tx.send(&cx, Ok(()));
                     }
                     Err(err) => {
@@ -13685,7 +13742,7 @@ impl JsExtensionRuntimeHandle {
         };
         let completion = timeout(
             wall_now(),
-            js_runtime_remaining_timeout(deadline),
+            js_runtime_remaining_timeout(deadline).saturating_add(Duration::from_millis(150)),
             Box::pin(completion),
         )
         .await;
@@ -15141,6 +15198,83 @@ fn js_runtime_shard_config(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub(crate) fn sanitize_extension_data_id(extension_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let trimmed = extension_id.trim();
+    let is_windows_reserved = |s: &str| {
+        matches!(
+            s.to_ascii_lowercase().as_str(),
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
+        )
+    };
+    let is_clean_slug = !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && !trimmed.starts_with('-')
+        && !is_windows_reserved(trimmed)
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if is_clean_slug {
+        return trimmed.to_string();
+    }
+
+    let mut slug = String::with_capacity(40);
+    let mut prev_sep = false;
+    for ch in trimmed.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            prev_sep = false;
+            ch.to_ascii_lowercase()
+        } else if (ch == '_' || ch == '-') && !slug.is_empty() && !prev_sep {
+            prev_sep = true;
+            ch
+        } else if !slug.is_empty() && !prev_sep {
+            prev_sep = true;
+            '-'
+        } else {
+            continue;
+        };
+        slug.push(mapped);
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches(['-', '_']);
+    let prefix = if slug.is_empty() || is_windows_reserved(slug) {
+        "ext"
+    } else {
+        slug
+    };
+    let digest = Sha256::digest(trimmed.as_bytes());
+    let mut suffix = String::with_capacity(12);
+    for byte in &digest[..6] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    format!("{prefix}-{suffix}")
+}
+
 async fn build_js_runtime_shards(
     warm_pool: &crate::extensions_js::WarmIsolatePool,
     policy: &ExtensionPolicy,
@@ -15227,6 +15361,12 @@ async fn build_js_runtime_shards(
                     .flat_map(|namespace| npm_configuration_read_files(namespace))
                     .filter_map(|file| runtime.application_storage_root(file)),
             );
+        }
+        if let Some(data_root) =
+            runtime.extension_data_root(&sanitize_extension_data_id(&extension_id))
+            && !roots.contains(&data_root)
+        {
+            roots.push(data_root);
         }
         application_roots_by_id.push((extension_id.clone(), roots));
         configuration_files_by_id.push((extension_id.clone(), configuration_files));
@@ -15526,10 +15666,14 @@ async fn load_one_extension(
         runtime.add_extension_root_with_id(root.clone(), Some(spec.extension_id.as_str()));
     }
 
+    let data_dir = runtime
+        .extension_data_root(&sanitize_extension_data_id(&spec.extension_id))
+        .map(|path| path.to_string_lossy().into_owned());
     let meta = json!({
         "name": spec.name,
         "version": spec.version,
         "apiVersion": spec.api_version,
+        "dataDir": data_dir,
     });
 
     for (entry_index, entry_path) in entry_paths.iter().enumerate() {
@@ -15589,14 +15733,20 @@ fn resolve_extension_load_entry_paths(
     package_entries: &mut JsPackageEntryCache,
 ) -> Result<Vec<PathBuf>> {
     let explicit_primary = safe_canonicalize(&spec.entry_path);
+    let primary_provenance = js_extension_provenance(&explicit_primary, package_entries)?;
     let mut entry_paths =
         discover_related_extension_entries_with_cache(&spec.entry_path, package_entries)?;
-    if explicit_entry_paths.len() > 1 {
-        entry_paths.retain(|entry_path| {
-            let canonical = safe_canonicalize(entry_path);
-            canonical == explicit_primary || !explicit_entry_paths.contains(&canonical)
-        });
-    }
+    entry_paths.retain(|entry_path| {
+        let canonical = safe_canonicalize(entry_path);
+        if canonical == explicit_primary {
+            return true;
+        }
+        if explicit_entry_paths.len() > 1 && explicit_entry_paths.contains(&canonical) {
+            return false;
+        }
+        js_extension_provenance(&canonical, package_entries)
+            .is_ok_and(|provenance| provenance == primary_provenance)
+    });
     Ok(entry_paths)
 }
 
@@ -15984,8 +16134,16 @@ async fn dispatch_extension_event_phase_sharded(
         .await;
     let outcome = match started {
         Ok(()) => {
-            await_js_cancellable_task(shards, host, shard_index, &task_id, cancelled, deadline)
-                .await
+            await_js_cancellable_task(
+                shards,
+                host,
+                shard_index,
+                &task_id,
+                cancelled,
+                deadline,
+                None,
+            )
+            .await
         }
         Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
@@ -16002,11 +16160,15 @@ async fn dispatch_extension_event_phase_sharded(
     } else {
         match outcome {
             JsCancellableTaskOutcome::Finished(result) => {
-                let refreshed = refresh_runtime_shard_snapshot(shards, shard_index).await;
-                if fence.was_interrupted()
-                    || cancelled.load(StdOrdering::Acquire)
-                    || Instant::now() >= deadline
-                {
+                let phase_absent = result
+                    .as_ref()
+                    .is_ok_and(|value| value.get("present") == Some(&Value::Bool(false)));
+                let refreshed = if phase_absent {
+                    Ok(())
+                } else {
+                    refresh_runtime_shard_snapshot(shards, shard_index).await
+                };
+                if fence.was_interrupted() || cancelled.load(StdOrdering::Acquire) {
                     Err(quarantine_runtime_shard(
                         shards,
                         shard_index,
@@ -16457,6 +16619,7 @@ async fn dispatch_extension_event_across_shards_until(
     }
 
     let mut last = None;
+    let mut hook_errors = Vec::new();
     for phase in ["direct", "event_bus"] {
         for &shard_index in &owners {
             let Some(value) = dispatch_extension_event_phase_sharded(
@@ -16478,6 +16641,10 @@ async fn dispatch_extension_event_across_shards_until(
             else {
                 continue;
             };
+            if let Some(errs) = value.get("__pi_hook_errors").and_then(Value::as_array) {
+                hook_errors.extend(errs.iter().cloned());
+                continue;
+            }
             if event_name == "user_bash" {
                 return Ok(value);
             }
@@ -16490,6 +16657,9 @@ async fn dispatch_extension_event_across_shards_until(
                 return Ok(last.expect("value assigned above"));
             }
         }
+    }
+    if !hook_errors.is_empty() {
+        return Ok(json!({ "__pi_hook_errors": hook_errors }));
     }
     Ok(last.unwrap_or(Value::Null))
 }
@@ -16812,17 +16982,17 @@ async fn execute_extension_tool_sharded(
             } else {
                 None
             };
-            let promise: rquickjs::Value<'_> = exec_fn.call((
-                bridge_secret.as_str(),
-                tool_name,
-                tool_call_id,
-                input_js,
-                ctx_js,
-                invocation_id.as_str(),
-                on_update,
-                registration.map(|registration| registration.revision),
-                admitted_parameters,
-            ))?;
+            let mut exec_args = rquickjs::function::Args::new(ctx.clone(), 9);
+            exec_args.push_arg(bridge_secret.as_str())?;
+            exec_args.push_arg(tool_name)?;
+            exec_args.push_arg(tool_call_id)?;
+            exec_args.push_arg(input_js)?;
+            exec_args.push_arg(ctx_js)?;
+            exec_args.push_arg(invocation_id.as_str())?;
+            exec_args.push_arg(on_update)?;
+            exec_args.push_arg(registration.map(|registration| registration.revision))?;
+            exec_args.push_arg(admitted_parameters)?;
+            let promise: rquickjs::Value<'_> = exec_args.apply(&exec_fn)?;
             let _task: String =
                 task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
             Ok(())
@@ -16837,6 +17007,7 @@ async fn execute_extension_tool_sharded(
                 &task_id,
                 &invocation.cancelled,
                 deadline,
+                None,
             )
             .await
         }
@@ -16953,13 +17124,14 @@ async fn await_js_cancellable_task(
     task_id: &str,
     cancelled: &AtomicBool,
     deadline: Instant,
+    hostcall_deadline: Option<Instant>,
 ) -> JsCancellableTaskOutcome {
     loop {
         if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
             return JsCancellableTaskOutcome::Stopped { settled: false };
         }
         let shard = &mut shards.shards[shard_index];
-        if let Err(err) = pump_active_runtime_shard(shard, host).await {
+        if let Err(err) = pump_active_runtime_shard(shard, host, hostcall_deadline).await {
             return JsCancellableTaskOutcome::Fault(err);
         }
         if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
@@ -16982,6 +17154,29 @@ async fn await_js_cancellable_task(
             Err(err) => return JsCancellableTaskOutcome::Finished(Err(err)),
             Ok(None) => extension_wait_cooperate(deadline).await,
         }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn settle_timed_out_interaction_hostcalls(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    deadline: Instant,
+) -> JsCancellableTaskOutcome {
+    let shard = &mut shards.shards[shard_index];
+    if let Err(err) = pump_active_runtime_shard(shard, host, Some(deadline)).await {
+        return JsCancellableTaskOutcome::Fault(err);
+    }
+    let state = match take_js_task_state(&shard.runtime, task_id).await {
+        Ok(state) => state,
+        Err(err) => return JsCancellableTaskOutcome::Fault(err),
+    };
+    match finish_js_task_take(state) {
+        Ok(Some(value)) => JsCancellableTaskOutcome::Finished(Ok(value)),
+        Err(err) => JsCancellableTaskOutcome::Finished(Err(err)),
+        Ok(None) => JsCancellableTaskOutcome::Stopped { settled: false },
     }
 }
 
@@ -17017,7 +17212,7 @@ async fn abort_js_tool_task(
                 "tool did not settle within 100ms after abort",
             ));
         }
-        pump_active_runtime_shard(shard, host).await?;
+        pump_active_runtime_shard(shard, host, None).await?;
         match take_js_task_state(&shard.runtime, task_id).await? {
             JsTaskTakeResult::Pending => extension_wait_cooperate(deadline).await,
             // A rejection is also successful cancellation cleanup. Its value
@@ -17045,8 +17240,16 @@ async fn await_js_interaction_task(
     deadline: Instant,
     previous_hostcalls: &HashSet<String>,
 ) -> JsCancellableTaskOutcome {
-    let outcome =
-        await_js_cancellable_task(shards, host, shard_index, task_id, cancelled, deadline).await;
+    let outcome = await_js_cancellable_task(
+        shards,
+        host,
+        shard_index,
+        task_id,
+        cancelled,
+        deadline,
+        Some(deadline),
+    )
+    .await;
     let JsCancellableTaskOutcome::Finished(result) = outcome else {
         return outcome;
     };
@@ -17067,7 +17270,7 @@ async fn await_js_interaction_task(
         {
             return JsCancellableTaskOutcome::Finished(result);
         }
-        if let Err(err) = pump_active_runtime_shard(shard, host).await {
+        if let Err(err) = pump_active_runtime_shard(shard, host, Some(deadline)).await {
             return JsCancellableTaskOutcome::Fault(err);
         }
         extension_wait_cooperate(deadline).await;
@@ -17156,7 +17359,7 @@ async fn execute_extension_interaction_sharded(
             Ok(())
         })
         .await;
-    let outcome = match started {
+    let mut outcome = match started {
         Ok(()) => {
             await_js_interaction_task(
                 shards,
@@ -17171,10 +17374,33 @@ async fn execute_extension_interaction_sharded(
         }
         Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
+    let mut was_interrupted = fence.was_interrupted();
+    drop(fence);
+    // If an operator handler was idle awaiting a blocked hostcall when its
+    // deadline elapsed (no JS engine interruption and no explicit caller abort),
+    // give the hostcall timeout rejection a bounded 100ms settlement fence so
+    // catch/finally handlers can settle cleanly without quarantining the shard.
+    if !was_interrupted
+        && !cancelled.load(StdOrdering::Acquire)
+        && matches!(
+            outcome,
+            JsCancellableTaskOutcome::Stopped { settled: false }
+        )
+        && Instant::now() >= deadline
+    {
+        let settlement_deadline = Instant::now() + Duration::from_millis(100);
+        let settlement_fence =
+            runtime.enter_execution_fence(Arc::clone(cancelled), settlement_deadline);
+        outcome =
+            settle_timed_out_interaction_hostcalls(shards, host, shard_index, &task_id, deadline)
+                .await;
+        was_interrupted = settlement_fence.was_interrupted();
+        drop(settlement_fence);
+    }
     // Operator handlers have no guest AbortSignal contract. As with event
     // hooks, an unfinished or interrupted handler must lose its entire realm
     // so timers and hostcalls cannot resume after the operator cancels it.
-    let result = if fence.was_interrupted() {
+    let result = if was_interrupted {
         Err(quarantine_runtime_shard(
             shards,
             shard_index,
@@ -17184,10 +17410,7 @@ async fn execute_extension_interaction_sharded(
         match outcome {
             JsCancellableTaskOutcome::Finished(result) => {
                 let refreshed = refresh_runtime_shard_snapshot(shards, shard_index).await;
-                if fence.was_interrupted()
-                    || cancelled.load(StdOrdering::Acquire)
-                    || Instant::now() >= deadline
-                {
+                if cancelled.load(StdOrdering::Acquire) {
                     Err(quarantine_runtime_shard(
                         shards,
                         shard_index,
@@ -17211,7 +17434,6 @@ async fn execute_extension_interaction_sharded(
             )),
         }
     };
-    drop(fence);
     drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
@@ -17836,6 +18058,7 @@ fn retain_hostcall_dispatch(
     shard: &JsRuntimeShard,
     host: &JsRuntimeHost,
     request: HostcallRequest,
+    root_deadline: Option<Instant>,
 ) -> PendingIdleHostcall {
     let call_id = request.call_id.clone();
     let runtime = Rc::clone(&shard.runtime);
@@ -17846,7 +18069,8 @@ fn retain_hostcall_dispatch(
         future: Box::pin(async move {
             // Saved Session provenance belongs to the call id. An overlapping
             // tool cannot relabel it or shorten a background call's lifetime.
-            dispatch_js_hostcall_for_owner(&runtime, &host, Some(&owner), None, request).await
+            dispatch_js_hostcall_for_owner(&runtime, &host, Some(&owner), root_deadline, request)
+                .await
         }),
     }
 }
@@ -17924,6 +18148,7 @@ const MAX_RETAINED_ACTIVE_HOSTCALLS: usize = 16;
 async fn pump_active_runtime_shard(
     shard: &mut JsRuntimeShard,
     host: &JsRuntimeHost,
+    root_deadline: Option<Instant>,
 ) -> Result<IdleRuntimeProgress> {
     let jobs_drained = shard.runtime.drain_microtasks().await?;
     // Preserve the shared conservative scheduling veto. Existing dispatches
@@ -17944,7 +18169,7 @@ async fn pump_active_runtime_shard(
             break;
         };
         publish_providers_before_model_hostcall(shard, host, &request).await?;
-        let pending = retain_hostcall_dispatch(shard, host, request);
+        let pending = retain_hostcall_dispatch(shard, host, request, root_deadline);
         shard.pending_tool_dispatches.push_back(pending);
     }
     poll_idle_hostcall(shard).await;
@@ -17976,14 +18201,14 @@ async fn pump_idle_runtime_shard(
     host: &JsRuntimeHost,
 ) -> Result<IdleRuntimeProgress> {
     if !shard.pending_tool_dispatches.is_empty() {
-        return pump_active_runtime_shard(shard, host).await;
+        return pump_active_runtime_shard(shard, host, None).await;
     }
     let jobs_drained = shard.runtime.drain_microtasks().await?;
     if shard.pending_idle_dispatch.is_none()
         && let Some(request) = shard.runtime.pop_hostcall_request()
     {
         publish_providers_before_model_hostcall(shard, host, &request).await?;
-        shard.pending_idle_dispatch = Some(retain_hostcall_dispatch(shard, host, request));
+        shard.pending_idle_dispatch = Some(retain_hostcall_dispatch(shard, host, request, None));
     }
     poll_idle_hostcall(shard).await;
     let tick = shard.runtime.tick().await?;
@@ -18081,7 +18306,7 @@ async fn pump_runtime_shard_for_command(
         // Installed stream callbacks need the same owned publication and
         // bounded dispatch path as commands. Cold initialization still uses
         // the standalone runtime pump before a shard can publish providers.
-        pump_active_runtime_shard(shard, host)
+        pump_active_runtime_shard(shard, host, root_deadline)
             .await
             .map(|progress| progress.has_pending)
     }
@@ -18245,7 +18470,7 @@ mod idle_runtime_tests {
             fixture.shard.pending_idle_dispatch =
                 Some(held_hostcall(request, &gate, &polls, &drops));
 
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("poll blocked request and its successor");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18260,7 +18485,7 @@ mod idle_runtime_tests {
                     .unwrap_or_else(PoisonError::into_inner),
                 ["release"]
             );
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("complete released earlier request");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18290,7 +18515,7 @@ mod idle_runtime_tests {
                 )
                 .await
                 .expect("queue more than one admission window");
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("bounded first admission window");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18302,7 +18527,7 @@ mod idle_runtime_tests {
                     .len(),
                 1 + MAX_RETAINED_ACTIVE_HOSTCALLS
             );
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("admit remaining queued request");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18344,7 +18569,7 @@ mod idle_runtime_tests {
                 .shard
                 .pending_tool_dispatches
                 .push_back(held_hostcall(request, &gate, &polls, &drops));
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("initial tool poll");
             pump_idle_runtime_shard(&mut fixture.shard, &fixture.host)
@@ -18389,7 +18614,7 @@ mod idle_runtime_tests {
                 .shard
                 .pending_tool_dispatches
                 .push_back(held_hostcall(request, &gate, &polls, &drops));
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("start retained native resource guard");
             let runtime = Rc::clone(&fixture.shard.runtime);
@@ -18564,7 +18789,7 @@ mod idle_runtime_tests {
                 .shard
                 .pending_tool_dispatches
                 .push_back(held_hostcall(second, &second_gate, &polls, &drops));
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("start both retained dispatch guards");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18597,7 +18822,7 @@ mod idle_runtime_tests {
                 .eval("pi.tool('after-veto-one', {}); pi.tool('after-veto-two', {});")
                 .await
                 .expect("queue requests after the safety transition");
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("poll existing work while admission is vetoed");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18614,10 +18839,10 @@ mod idle_runtime_tests {
             );
 
             first_gate.store(true, StdOrdering::SeqCst);
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("drain the older idle dispatch");
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("one live dispatch still fills the conservative window");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18632,12 +18857,12 @@ mod idle_runtime_tests {
             );
 
             second_gate.store(true, StdOrdering::SeqCst);
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("drain the older tool dispatch");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert_eq!(drops.get(), 2);
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("admit exactly one request under the veto");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18648,7 +18873,7 @@ mod idle_runtime_tests {
                     .unwrap_or_else(PoisonError::into_inner),
                 ["after-veto-one"]
             );
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("admit the next request on its own turn");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -18669,7 +18894,7 @@ mod idle_runtime_tests {
                 .eval("pi.tool('recovered-one', {}); pi.tool('recovered-two', {});")
                 .await
                 .expect("queue work after safety recovery");
-            pump_active_runtime_shard(&mut fixture.shard, &fixture.host)
+            pump_active_runtime_shard(&mut fixture.shard, &fixture.host, None)
                 .await
                 .expect("restore the bounded parallel window");
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
@@ -21712,6 +21937,16 @@ async fn dispatch_hostcall_exec_ref_with_limit(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let child_env = match runtime.map(|rt| rt.process_environment(options.get("env"))) {
+        Some(Ok(env)) => Some(env),
+        Some(Err(message)) => {
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message,
+            };
+        }
+        None => None,
+    };
 
     if stream && let Some(runtime) = runtime {
         if !runtime.is_hostcall_active(call_id) {
@@ -21742,6 +21977,10 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
 
+                if let Some(ref env) = child_env {
+                    command.env_clear();
+                    command.envs(env);
+                }
                 if let Some(cwd) = cwd.as_ref() {
                     command.current_dir(cwd);
                 }
@@ -21911,6 +22150,10 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
+            if let Some(ref env) = child_env {
+                command.env_clear();
+                command.envs(env);
+            }
             if let Some(cwd) = cwd.as_ref() {
                 command.current_dir(cwd);
             }
@@ -23390,7 +23633,7 @@ async fn dispatch_hostcall_events_ref(
                     fields.keys().any(|key| {
                         !matches!(
                             key.as_str(),
-                            "preparation" | "options" | "strategy" | "request"
+                            "op" | "preparation" | "options" | "strategy" | "request"
                         )
                     })
                 })
@@ -24247,6 +24490,9 @@ struct ExtensionManagerInner {
     replay_config: Option<crate::extension_replay::ReplayLaneConfig>,
     /// Completed replay trace bundles from recent dispatch cycles.
     replay_bundles: VecDeque<crate::extension_replay::ReplayTraceBundle>,
+    /// Non-fatal extension startup / `session_start` hook diagnostics surfaced
+    /// to interactive frontends (GH #279).
+    startup_warnings: Vec<String>,
 }
 
 struct PendingExtensionUi {

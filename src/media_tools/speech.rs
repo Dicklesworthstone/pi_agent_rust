@@ -359,8 +359,8 @@ pub(super) fn response_cost(model: &str, response: &Value) -> Result<Option<f64>
     };
     let invalid = || Error::tool(NAME, "invalid speech billing evidence");
     let usage = usage.as_object().ok_or_else(invalid)?;
-    if let Some(total) = crate::provider::reported_cost_total(usage.get("cost"), None)
-        .map_err(|_| invalid())?
+    if let Some(total) =
+        crate::provider::reported_cost_total(usage.get("cost"), None).map_err(|_| invalid())?
     {
         return Ok(Some(total));
     }
@@ -374,7 +374,10 @@ pub(super) fn response_cost(model: &str, response: &Value) -> Result<Option<f64>
     // Do not silently price cache/audio-input/service-tier evidence as text.
     if !supports_speech_usage(model)
         || usage.keys().any(|key| {
-            !matches!(key.as_str(), "input_tokens" | "output_tokens" | "total_tokens")
+            !matches!(
+                key.as_str(),
+                "input_tokens" | "output_tokens" | "total_tokens"
+            )
         })
     {
         return Ok(None);
@@ -448,8 +451,9 @@ where
                 audio.extend_from_slice(&bytes);
             }
             "speech.audio.done" => {
-                let terminal: Value = serde_json::from_str(&event.data)
-                    .map_err(|_| Error::tool(NAME, "speech stream has an invalid terminal event"))?;
+                let terminal: Value = serde_json::from_str(&event.data).map_err(|_| {
+                    Error::tool(NAME, "speech stream has an invalid terminal event")
+                })?;
                 if terminal.get("usage").is_none() {
                     return Err(Error::tool(
                         NAME,

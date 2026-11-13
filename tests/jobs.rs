@@ -1017,9 +1017,9 @@ fn process_exit_kills_all_survivors() {
         format!("running jobs pids: {first_pid}, {second_pid}"),
     );
 
-    let first_id = job_id(&first);
-    let second_id = job_id(&second);
-    for (id, marker) in [(&first_id, "first-ready"), (&second_id, "second-ready")] {
+    let id_one = job_id(&first);
+    let id_two = job_id(&second);
+    for (id, marker) in [(&id_one, "first-ready"), (&id_two, "second-ready")] {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let snapshot = pi::jobs::wait(TEST_SESSION_ID, id, Duration::ZERO)
@@ -1044,7 +1044,7 @@ fn process_exit_kills_all_survivors() {
         harness.log().info("verify", message);
         assert!(!alive, "job process {pid} survived final shutdown");
     }
-    for (id, marker) in [(&first_id, "first-ready"), (&second_id, "second-ready")] {
+    for (id, marker) in [(&id_one, "first-ready"), (&id_two, "second-ready")] {
         let settled =
             pi::jobs::wait(TEST_SESSION_ID, id, Duration::ZERO).expect("settled shutdown snapshot");
         assert_eq!(settled.status, "killed");

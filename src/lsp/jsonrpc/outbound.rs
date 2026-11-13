@@ -1395,7 +1395,13 @@ mod tests {
         let result = receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("failure delivered");
-        assert!(matches!(result, Err(TransportError::Io(_))));
+        assert!(
+            matches!(
+                &result,
+                Err(TransportError::Closed(reason)) if reason.contains("server pipe write failed")
+            ),
+            "{result:?}"
+        );
         assert!(!alive.load(Ordering::Acquire));
         assert!(lock(&pending).is_empty());
         assert_eq!(

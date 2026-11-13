@@ -20,8 +20,38 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 // ============================================================================
-// Provider Trait
+// Provider Capabilities & Trait
 // ============================================================================
+
+/// Honest capability descriptor advertised by a [`Provider`] backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    /// Preserves prior conversation turns (`user`, `assistant`, `toolResult`) across requests.
+    pub multi_turn: bool,
+    /// Supports structured tool schemas and `ToolCall` / `ToolResult` round-trips.
+    pub tool_use: bool,
+    /// Uses native wire-level tool-call framing (`true`) rather than prompt-envelope bridging (`false`).
+    pub native_tool_wire: bool,
+    /// Yields incremental streaming deltas (`true`) rather than a finite batch response (`false`).
+    pub streaming: bool,
+    /// Accepts multimodal image content blocks (`ContentBlock::Image`).
+    pub vision: bool,
+    /// Reports authoritative server-side token usage (`true`) rather than client-estimated counts (`false`).
+    pub authoritative_usage: bool,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: true,
+            streaming: true,
+            vision: true,
+            authoritative_usage: true,
+        }
+    }
+}
 
 /// An LLM backend capable of streaming assistant output (and tool calls).
 ///
@@ -37,6 +67,11 @@ pub trait Provider: Send + Sync {
 
     /// Get the model identifier used by this provider.
     fn model_id(&self) -> &str;
+
+    /// Honest protocol capability descriptor for this provider backend.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
 
     /// Catalog pricing for the model this provider serves, when known
     /// (gh #221). The agent prices `usage` on every finished assistant
@@ -123,6 +158,10 @@ impl Provider for CostGuardedProvider {
 
     fn model_id(&self) -> &str {
         self.inner.model_id()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
     }
 
     fn model_cost(&self) -> Option<ModelCost> {
@@ -847,6 +886,104 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value, // JSON Schema
+}
+
+pub(crate) const PI_TOOL_CALL_OPEN: &str = "<pi_tool_call>";
+pub(crate) const PI_TOOL_CALL_CLOSE: &str = "</pi_tool_call>";
+
+pub(crate) fn format_prompt_tool_instructions(tools: &[ToolDef]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let catalog = serde_json::to_string(
+        &tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "You have access to the following local tools (JSON Schema):\n{catalog}\n\n\
+         When you need to invoke one or more tools, emit each invocation inside an exact \
+         `{PI_TOOL_CALL_OPEN}{{\"id\":\"call_1\",\"name\":\"<tool_name>\",\"arguments\":{{...}}}}{PI_TOOL_CALL_CLOSE}` \
+         tag with valid JSON matching the tool's `parameters` schema, then stop and wait for the tool result."
+    )
+}
+
+pub(crate) fn parse_prompt_tool_call_json(
+    raw_json: &str,
+    allowed_tools: &std::collections::HashSet<String>,
+    fallback_index: usize,
+) -> Option<crate::model::ToolCall> {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw_json.trim()).ok()?;
+    let obj = parsed.as_object()?;
+    let name = obj.get("name")?.as_str()?.trim();
+    if name.is_empty() || !allowed_tools.contains(name) {
+        return None;
+    }
+    let arguments = match obj.get("arguments") {
+        Some(val @ serde_json::Value::Object(_)) => val.clone(),
+        Some(serde_json::Value::String(raw_args)) => serde_json::from_str(raw_args)
+            .ok()
+            .filter(serde_json::Value::is_object)?,
+        None => serde_json::json!({}),
+        _ => return None,
+    };
+    let id = obj
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map_or_else(
+            || format!("pi_call_{fallback_index}"),
+            std::string::ToString::to_string,
+        );
+    Some(crate::model::ToolCall {
+        id,
+        name: name.to_string(),
+        arguments,
+        thought_signature: None,
+    })
+}
+
+pub(crate) fn extract_prompt_tool_calls(
+    raw: &str,
+    allowed_tools: &std::collections::HashSet<String>,
+) -> (String, Vec<crate::model::ToolCall>) {
+    if allowed_tools.is_empty() || !raw.contains(PI_TOOL_CALL_OPEN) {
+        return (raw.to_string(), Vec::new());
+    }
+    let mut prose = String::with_capacity(raw.len());
+    let mut calls = Vec::new();
+    let mut rest = raw;
+
+    while let Some(open_idx) = rest.find(PI_TOOL_CALL_OPEN) {
+        prose.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + PI_TOOL_CALL_OPEN.len()..];
+        let Some(close_idx) = after_open.find(PI_TOOL_CALL_CLOSE) else {
+            prose.push_str(&rest[open_idx..]);
+            rest = "";
+            break;
+        };
+        let inner = &after_open[..close_idx];
+        if let Some(call) = parse_prompt_tool_call_json(inner, allowed_tools, calls.len() + 1) {
+            calls.push(call);
+        } else {
+            prose.push_str(
+                &rest[open_idx
+                    ..open_idx + PI_TOOL_CALL_OPEN.len() + close_idx + PI_TOOL_CALL_CLOSE.len()],
+            );
+        }
+        rest = &after_open[close_idx + PI_TOOL_CALL_CLOSE.len()..];
+    }
+    prose.push_str(rest);
+    (prose, calls)
 }
 
 // ============================================================================
@@ -2301,8 +2438,9 @@ mod tests {
                 .unwrap();
             assert!(!budget.registration_checkpoint_needed(&session).unwrap());
             let path = session.path.clone().unwrap();
+            let session_dir = path.parent().expect("session dir");
             let transcript = std::fs::read(&path).unwrap();
-            let lock = std::fs::read_dir(directory.path())
+            let lock = std::fs::read_dir(session_dir)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .find(|path| {
@@ -2313,7 +2451,7 @@ mod tests {
                         })
                 })
                 .expect("registered journal lock");
-            std::fs::rename(&lock, directory.path().join("retained-journal-lock")).unwrap();
+            std::fs::rename(&lock, session_dir.join("retained-journal-lock")).unwrap();
             std::fs::create_dir(&lock).unwrap();
 
             let probe = probe(Mode::Done);
@@ -2380,12 +2518,19 @@ mod tests {
                     let observer = probe.observer.lock().unwrap().clone().unwrap();
                     observer.observe(&cost_message(2.0, 0).usage).unwrap();
                     assert_eq!(budget.snapshot().pending, 2.5);
-                    assert!(matches!(budget.admit(), Err(crate::error::Error::CostCap { .. })));
+                    assert!(matches!(
+                        budget.admit(),
+                        Err(crate::error::Error::CostCap { .. })
+                    ));
 
                     observer
                         .observe_authoritative(&mut crate::model::Usage::default())
                         .unwrap();
-                    assert_eq!(budget.snapshot().pending, 2.5, "unknown pricing is not a refund");
+                    assert_eq!(
+                        budget.snapshot().pending,
+                        2.5,
+                        "unknown pricing is not a refund"
+                    );
                     let mut bill = crate::model::Usage {
                         billing: Some(crate::model::BillingUsage::ReportedTotal {
                             total: corrected,

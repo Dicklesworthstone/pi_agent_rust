@@ -231,14 +231,19 @@ pub(super) async fn load(
         if loaded_id != id {
             return Err(HistoryError::internal("Restored session identity changed"));
         }
-        super::arm_acp_prewalk(&mut state, options)
-            .await
-            .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
         let mcp_state = super::mcp::prepare(&cwd, &state.global_dir, supplied.unwrap_or_default());
         if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
             super::mcp::mount(agent.session_mut(), mcp_state);
         }
         state.mcp = mcp_state;
+        super::boot_acp_extensions(&mut state, options)
+            .await
+            .map_err(|error| {
+                HistoryError::internal(format!("Cannot load ACP extensions: {error}"))
+            })?;
+        super::arm_acp_prewalk(&mut state, options)
+            .await
+            .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
         let state = Arc::new(Mutex::new(state));
         let mut guard = sessions
             .lock(cx)
@@ -484,6 +489,11 @@ pub(super) async fn fork(
     if let (Some(agent), Some(mcp)) = (state.agent_session.as_mut(), state.mcp.as_ref()) {
         super::mcp::mount(agent.session_mut(), mcp);
     }
+    super::boot_acp_extensions(&mut state, &options)
+        .await
+        .map_err(|error| {
+            HistoryError::internal(format!("Cannot load fork ACP extensions: {error}"))
+        })?;
     super::arm_acp_prewalk(&mut state, &options)
         .await
         .map_err(|error| HistoryError::invalid(format!("Cannot arm fork prewalk: {error}")))?;
@@ -629,7 +639,8 @@ fn current_plan_update(session: &Session) -> Option<Value> {
             if custom.custom_type != crate::todo::TODO_LIST_SCHEMA {
                 return None;
             }
-            let list = serde_json::from_value::<crate::todo::TodoList>(custom.data.clone()?).ok()?;
+            let list =
+                serde_json::from_value::<crate::todo::TodoList>(custom.data.clone()?).ok()?;
             Some(content::plan_update(&list))
         })
 }
@@ -1187,9 +1198,17 @@ mod tests {
                 assert_eq!(plans[0]["params"]["sessionId"], saved.header.id);
                 assert_eq!(plans[0]["params"]["update"], expected);
                 assert_eq!(notifications.len(), if replay { 4 } else { 1 });
-                assert!(!serde_json::to_string(&notifications).unwrap().contains("Abandoned branch"));
+                assert!(
+                    !serde_json::to_string(&notifications)
+                        .unwrap()
+                        .contains("Abandoned branch")
+                );
             }
-            assert_eq!(std::fs::read(path).unwrap(), before, "restore must not rewrite history");
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                before,
+                "restore must not rewrite history"
+            );
         }));
     }
 

@@ -270,7 +270,7 @@ fn better_sqlite3_persists_across_realms_without_widening_storage_or_write_autho
         );
 
         let peer = runtime(&root, "peer", None).await;
-        peer.add_persistent_storage_root(storage.clone(), "owner")
+        peer.register_foreign_persistent_storage_root(storage.clone(), "owner")
             .expect("foreign owner grant");
         assert_eq!(
             evaluate(

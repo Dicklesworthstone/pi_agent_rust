@@ -678,9 +678,19 @@ fn provider_empty_response_does_not_crash() {
         }
     });
 
-    // Empty response should still succeed (just no text content)
-    let message = result.expect("empty response should not error");
-    assert_eq!(message.stop_reason, StopReason::Stop);
+    // Under default Conservative turn recovery, persistent empty responses
+    // exhaust 2 bounded continuations and surface `PI_EMPTY_RESPONSE` cleanly
+    // without panicking.
+    let message = result.expect("empty response should not crash");
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|err| err.contains("PI_EMPTY_RESPONSE")),
+        "Expected PI_EMPTY_RESPONSE diagnostic, got: {:?}",
+        message.error_message
+    );
     assert!(
         assistant_text(&message).is_empty(),
         "Expected no text content"

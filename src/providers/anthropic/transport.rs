@@ -2404,7 +2404,12 @@ mod tests {
                 let (events, yields) = drain_with_poll_budget(&mut output);
                 assert!(yields > 0);
                 assert_eq!(events.len(), 2 + MAX_READY_EVENTS_PER_YIELD * 3);
-                for (index, group) in events[1..events.len() - 1].chunks_exact(3).enumerate() {
+                for (index, group) in events[1..events.len() - 1]
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
                     assert!(matches!(
                         &group[0], Ok(StreamEvent::ToolCallStart { content_index, id, .. })
                             if *content_index == index && id == &format!("call-{index}")

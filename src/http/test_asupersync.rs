@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use asupersync::http::client::HttpClient;
     use asupersync::Cx;
+    use asupersync::http::client::HttpClient;
 
     #[test]
     fn test_imports() {

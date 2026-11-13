@@ -652,13 +652,55 @@ fn ws_imports() {
         r#"(() => {
             const ws = new WebSocket("ws://example");
             const server = new WebSocketServer();
+            let sendCode = "";
+            try { ws.send("payload"); } catch (err) { sendCode = err.code || ""; }
             return typeof ws.send === 'function'
                 && ws.readyState === WebSocket.CONNECTING
+                && sendCode === 'ERR_PI_SHIM_UNSUPPORTED_OPERATION'
                 && typeof server.on === 'function'
                 && typeof WebSocket.Server === 'function';
         })()"#,
     );
     assert_eq!(result, "true");
+}
+
+#[test]
+fn zod_enforces_runtime_schema_validation_and_rejects_bad_types() {
+    let result = eval_ext(
+        r#"import { z, ZodError } from "zod";"#,
+        r#"(() => {
+            const Schema = z.object({
+                name: z.string().min(2),
+                count: z.number().int().nonnegative().default(1),
+                mode: z.enum(["fast", "safe"]),
+            }).strict();
+            const ok = Schema.parse({ name: "pi", mode: "safe" });
+            const badType = Schema.safeParse({ name: 42, mode: "safe" });
+            const badStrict = Schema.safeParse({ name: "pi", mode: "safe", extra: true });
+            return ok.count === 1
+                && badType.success === false
+                && (badType.error instanceof ZodError)
+                && badStrict.success === false;
+        })()"#,
+    );
+    assert_eq!(result, "true");
+}
+
+#[test]
+fn node_pty_write_fails_closed_with_unsupported_code() {
+    let result = eval_ext(
+        r#"import { spawn } from "node-pty";"#,
+        r#"(() => {
+            const p = spawn('/bin/sh', []);
+            try {
+                p.write('echo secret\n');
+                return 'SILENT_DROP';
+            } catch (err) {
+                return err.code || err.message;
+            }
+        })()"#,
+    );
+    assert_eq!(result, "ERR_PI_SHIM_UNSUPPORTED_OPERATION");
 }
 
 // ─── axios ─────────────────────────────────────────────────────────────────

@@ -961,4 +961,72 @@ fn thread_execution_and_assignment_options_are_not_silently_ignored() {
     assert_eq!(input.assignment_value().unwrap(), "");
 }
 
+#[test]
+fn debug_settings_enforce_adapter_allowlist_overrides_timeouts_and_capacity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("target.py"), "x = 1\n").expect("write target.py");
+    let config: Config = serde_json::from_value(json!({
+        "debug": {
+            "allowedAdapters": ["lldb-dap"],
+            "maxSessions": 2,
+            "startupTimeoutMs": 45_000,
+            "stepTimeoutMs": 3_500,
+            "adapters": {
+                "lldb-dap": {
+                    "command": "/nonexistent/custom-lldb-dap",
+                    "args": ["--custom-flag"]
+                }
+            }
+        }
+    }))
+    .expect("parse DebugSettings");
+
+    let tool = DebugTool::new(temp.path(), Some(&config));
+    assert_eq!(tool.max_sessions, 2);
+    assert_eq!(tool.default_startup_timeout_ms, 45_000);
+    assert_eq!(tool.step_timeout_ms, 3_500);
+    let lldb = tool
+        .adapters
+        .iter()
+        .find(|spec| spec.id == "lldb-dap")
+        .expect("lldb-dap spec");
+    assert_eq!(
+        lldb.command_candidates,
+        vec!["/nonexistent/custom-lldb-dap"]
+    );
+    assert_eq!(lldb.adapter_args, vec!["--custom-flag"]);
+
+    let rt = runtime();
+    // Planted negative 1: local launch with debugpy is blocked by allowedAdapters.
+    let err = run(
+        &tool,
+        &rt,
+        json!({"action":"launch","program":"target.py","adapter":"debugpy"}),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("DAP_ADAPTER_BLOCKED"),
+        "expected DAP_ADAPTER_BLOCKED, got {err}"
+    );
+
+    // Planted negative 2: remote debugpy port attach is also blocked by allowedAdapters.
+    let remote_err = run(&tool, &rt, json!({"action":"attach","port":5678})).unwrap_err();
+    assert!(
+        remote_err.to_string().contains("DAP_ADAPTER_BLOCKED"),
+        "expected remote DAP_ADAPTER_BLOCKED, got {remote_err}"
+    );
+
+    // Positive admission for allowlisted lldb-dap proceeds past allowlist to executable resolution.
+    let allowed_err = run(
+        &tool,
+        &rt,
+        json!({"action":"launch","program":"target.py","adapter":"lldb-dap"}),
+    )
+    .unwrap_err();
+    assert!(
+        allowed_err.to_string().contains("DAP_ADAPTER_MISSING"),
+        "expected allowlisted adapter to reach command resolution, got {allowed_err}"
+    );
+}
+
 include!("delve_tests.rs");

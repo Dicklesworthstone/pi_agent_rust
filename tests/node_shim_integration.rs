@@ -183,13 +183,16 @@ fn net_create_connection_stub_shape() {
         r#"import net from "node:net";"#,
         r#"(() => {
         const socket = net.createConnection({ port: 1234, host: "example.test" });
+        let writeCode = "";
+        try { socket.write("hello"); } catch (err) { writeCode = err.code || ""; }
         return Boolean(socket)
           && socket.connecting === true
           && socket.readyState === "opening"
           && socket.remotePort === 1234
           && socket.remoteAddress === "example.test"
           && typeof socket.write === "function"
-          && typeof socket.end === "function";
+          && typeof socket.end === "function"
+          && writeCode === "ERR_PI_SHIM_UNSUPPORTED_OPERATION";
     })()"#,
     );
     assert_eq!(result, "true");

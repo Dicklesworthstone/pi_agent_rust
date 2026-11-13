@@ -1282,9 +1282,50 @@ pub mod snapshot {
     /// 3. For each file, feed `"file\0"`, relative path, `"\0"`, file bytes,
     ///    `"\0"` into the hasher.
     /// 4. Return lowercase hex digest (64 chars).
+    fn repo_root_explicit_artifact_ignores(dir: &Path) -> std::collections::HashSet<PathBuf> {
+        let mut ignored = std::collections::HashSet::new();
+        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        for ancestor in canonical_dir.ancestors() {
+            if !ancestor.join("Cargo.toml").is_file() {
+                continue;
+            }
+            let gitignore = ancestor.join(".gitignore");
+            let Ok(contents) = std::fs::read_to_string(&gitignore) else {
+                break;
+            };
+            for raw_line in contents.lines() {
+                let line = raw_line.trim();
+                if line.is_empty()
+                    || line.starts_with('#')
+                    || line.starts_with('!')
+                    || line.contains('*')
+                {
+                    continue;
+                }
+                if line.starts_with("tests/ext_conformance/artifacts/") {
+                    let candidate = ancestor.join(line);
+                    let canonical_candidate =
+                        std::fs::canonicalize(&candidate).unwrap_or(candidate);
+                    if canonical_candidate.starts_with(&canonical_dir) {
+                        ignored.insert(canonical_candidate);
+                    }
+                }
+            }
+            break;
+        }
+        ignored
+    }
+
     pub fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
         let mut files = Vec::new();
         collect_files_recursive(dir, &mut files)?;
+        let explicit_ignores = repo_root_explicit_artifact_ignores(dir);
+        if !explicit_ignores.is_empty() {
+            files.retain(|path| {
+                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                !explicit_ignores.contains(&canonical)
+            });
+        }
         files.sort_by_key(|p| relative_posix(dir, p));
 
         let mut hasher = Sha256::new();

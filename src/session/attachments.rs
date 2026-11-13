@@ -917,6 +917,7 @@ mod tests {
             Self
         }
 
+        #[allow(clippy::unused_self)]
         fn calls(&self) -> usize {
             DIRECTORY_SYNC_FAULT
                 .with(|slot| slot.borrow().as_ref().expect("installed sync fault").calls)

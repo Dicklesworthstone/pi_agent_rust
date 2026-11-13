@@ -129,6 +129,41 @@ impl ExtensionManager {
         }
     }
 
+    /// Clear recorded extension startup warnings before a fresh boot or `/reload`.
+    pub fn clear_startup_warnings(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.startup_warnings.clear();
+    }
+
+    /// Record a non-fatal startup or `session_start` hook failure so interactive
+    /// frontends can surface an actionable warning banner (GH #279).
+    pub fn record_startup_warning(&self, warning: impl Into<String>) {
+        let warning = warning.into();
+        if warning.trim().is_empty() {
+            return;
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inner.startup_warnings.contains(&warning) {
+            inner.startup_warnings.push(warning);
+        }
+    }
+
+    /// Return recorded startup / `session_start` hook warnings.
+    #[must_use]
+    pub fn startup_warnings(&self) -> Vec<String> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.startup_warnings.clone()
+    }
+
     // ── RCU snapshot helpers ───────────────────────────────────────────
 
     /// Build a `RegistrySnapshot` from the current inner state.
@@ -918,16 +953,19 @@ impl ExtensionManager {
             let _ = state.overload_timestamps_ms.pop_front();
         }
 
-        // Feed regime-shift detectors with inter-arrival interval.
+        // Compute inter-arrival interval BEFORE advancing last_observation_ms so
+        // both regime-shift detectors and the safety envelope observe real elapsed ms
+        // rather than `now_ms - now_ms == 0.0`.
         #[allow(clippy::cast_precision_loss)]
-        let regime_shift_triggered = if config.regime_shift.enabled {
-            let interval_ms = state
-                .regime_shift
-                .cusum
-                .last_observation_ms
-                .map_or(0.0, |prev| (now_ms - prev) as f64);
-            state.regime_shift.cusum.last_observation_ms = Some(now_ms);
+        let interval_ms = state
+            .regime_shift
+            .cusum
+            .last_observation_ms
+            .map_or(0.0, |prev| (now_ms.saturating_sub(prev)) as f64);
+        state.regime_shift.cusum.last_observation_ms = Some(now_ms);
 
+        // Feed regime-shift detectors with inter-arrival interval.
+        let regime_shift_triggered = if config.regime_shift.enabled {
             let cusum_alarm = state.regime_shift.cusum.observe(
                 interval_ms,
                 config.regime_shift.cusum_k,
@@ -953,17 +991,11 @@ impl ExtensionManager {
             false
         };
 
-        // Feed safety envelope with the overload signal (failure, latency = inter-arrival).
-        #[allow(clippy::cast_precision_loss)]
+        // Feed safety envelope with the true inter-arrival latency observation.
         let safety_veto = if config.safety_envelope.enabled {
-            let latency_proxy = state
-                .regime_shift
-                .cusum
-                .last_observation_ms
-                .map_or(0.0, |prev| (now_ms - prev) as f64);
             state
                 .safety_envelope
-                .evaluate(latency_proxy, false, &config.safety_envelope)
+                .evaluate(interval_ms, false, &config.safety_envelope)
         } else {
             false
         };
@@ -3574,11 +3606,14 @@ impl ExtensionManager {
                     &registration.name,
                     &registration.version,
                 );
+                for hook in &registration.event_hooks {
+                    guard.hook_bitmap.insert(hook.clone());
+                }
             }
             guard.extensions.extend(registrations);
             guard.extension_ids.extend(registration_ids);
             guard.wasm_extensions.extend(wasm_handles);
-            drop(guard);
+            self.refresh_snapshot_with_guard_release(guard);
         }
         Ok(())
     }
@@ -3639,6 +3674,9 @@ impl ExtensionManager {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.current_provider == provider && guard.current_model_id == model_id {
+            return;
+        }
         guard.current_provider = provider;
         guard.current_model_id = model_id;
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
@@ -3655,6 +3693,9 @@ impl ExtensionManager {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.current_thinking_level == level {
+            return;
+        }
         guard.current_thinking_level = level;
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
         self.refresh_snapshot_with_guard_release(guard);
@@ -3672,6 +3713,9 @@ impl ExtensionManager {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *guard.extension_models == models {
+            return;
+        }
         guard.extension_models = Arc::new(models);
         guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
         self.refresh_snapshot_with_guard_release(guard);
@@ -3724,6 +3768,44 @@ impl ExtensionManager {
     pub fn has_command(&self, name: &str) -> bool {
         let needle = normalize_command(name);
         self.read_snapshot().command_names.contains(&needle)
+    }
+
+    pub fn has_callable_command(&self, name: &str) -> bool {
+        self.has_command(name) && (self.runtime().is_some() || self.has_wasm_command(name))
+    }
+
+    #[cfg(feature = "wasm-host")]
+    fn has_wasm_command(&self, name: &str) -> bool {
+        self.find_wasm_slash_handler(name).is_some()
+    }
+
+    #[cfg(not(feature = "wasm-host"))]
+    #[allow(clippy::unused_self)]
+    const fn has_wasm_command(&self, _name: &str) -> bool {
+        false
+    }
+
+    #[cfg(feature = "wasm-host")]
+    fn find_wasm_slash_handler(&self, command_name: &str) -> Option<WasmExtensionHandle> {
+        let needle = normalize_command(command_name);
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .wasm_extensions
+            .iter()
+            .rev()
+            .find(|handle| {
+                handle
+                    .registration()
+                    .slash_commands
+                    .iter()
+                    .filter(|cmd| !is_non_callable_compat_inferred(cmd))
+                    .filter_map(extract_slash_command_name)
+                    .any(|cmd| normalize_command(&cmd) == needle)
+            })
+            .cloned()
     }
 
     /// Dynamically register a slash command at runtime (from a hostcall).
@@ -4153,6 +4235,14 @@ impl ExtensionManager {
         timeout_ms: u64,
         abort: Option<crate::agent::AbortSignal>,
     ) -> Result<Value> {
+        #[cfg(feature = "wasm-host")]
+        if let ExtensionInteraction::Command { name, args } = &interaction
+            && let Some(wasm_handle) = self.find_wasm_slash_handler(name)
+        {
+            return self
+                .execute_wasm_command_with_abort(&wasm_handle, name, args, timeout_ms, abort)
+                .await;
+        }
         let timeout_ms = self.effective_timeout(timeout_ms);
         let runtime = self
             .runtime()
@@ -4181,6 +4271,135 @@ impl ExtensionManager {
             .await
     }
 
+    #[cfg(feature = "wasm-host")]
+    async fn execute_wasm_command_with_abort(
+        &self,
+        wasm_handle: &WasmExtensionHandle,
+        command_name: &str,
+        args: &str,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
+        if let Some(actions) = self.host_actions() {
+            actions.refresh_model_catalog()?;
+        }
+        let snapshot = self.read_snapshot();
+        let context = Self::build_ctx_payload(&snapshot);
+        let context = if let Some(abort) = &abort {
+            let cancelled = abort.wait();
+            futures::pin_mut!(context, cancelled);
+            match futures::future::select(cancelled, context).await {
+                futures::future::Either::Left(_) => return Err(Error::Aborted),
+                futures::future::Either::Right((context, _)) => context,
+            }
+        } else {
+            context.await
+        };
+        drop(snapshot);
+
+        let normalized_name = normalize_command(command_name);
+        let parsed_args = Self::split_slash_args(args);
+        let input_payload = json!({
+            "command": normalized_name,
+            "raw_args": args,
+            "args": parsed_args,
+            "context": context,
+        });
+
+        let slash_fut = wasm_handle.handle_slash(&normalized_name, &parsed_args, &input_payload);
+        let slash_with_abort = async {
+            if let Some(abort) = &abort {
+                let cancelled = abort.wait();
+                futures::pin_mut!(slash_fut, cancelled);
+                match futures::future::select(cancelled, slash_fut).await {
+                    futures::future::Either::Left(_) => Err(Error::Aborted),
+                    futures::future::Either::Right((result, _)) => result,
+                }
+            } else {
+                slash_fut.await
+            }
+        };
+
+        let response_json = if timeout_ms > 0 {
+            match timeout(
+                wall_now(),
+                Duration::from_millis(timeout_ms),
+                Box::pin(slash_with_abort),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(Error::extension(format!(
+                        "WASM command '/{normalized_name}' timed out after {timeout_ms}ms"
+                    )));
+                }
+            }
+        } else {
+            slash_with_abort.await?
+        };
+
+        let trimmed = response_json.trim();
+        if trimmed.is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::from_str::<Value>(trimmed).unwrap_or(Value::String(response_json)))
+    }
+
+    #[cfg(feature = "wasm-host")]
+    fn split_slash_args(raw: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        let mut in_token = false;
+
+        for ch in raw.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                in_token = true;
+                continue;
+            }
+            if ch == '\\' && quote != Some('\'') {
+                escaped = true;
+                in_token = true;
+                continue;
+            }
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+                in_token = true;
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+                in_token = true;
+                continue;
+            }
+            if ch.is_whitespace() {
+                if in_token {
+                    out.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            } else {
+                current.push(ch);
+                in_token = true;
+            }
+        }
+        if escaped {
+            current.push('\\');
+        }
+        if in_token {
+            out.push(current);
+        }
+        out
+    }
+
     /// Render a displayed custom message with its registered extension renderer.
     ///
     /// Missing renderers are an ordinary fallback condition: the caller should
@@ -4195,8 +4414,9 @@ impl ExtensionManager {
     ) -> Result<Option<String>> {
         let interaction = ExtensionInteraction::MessageRenderer {
             custom_type: message.custom_type.clone(),
-            message: serde_json::to_value(message)
-                .map_err(|error| Error::extension(format!("Failed to serialize custom message: {error}")))?,
+            message: serde_json::to_value(message).map_err(|error| {
+                Error::extension(format!("Failed to serialize custom message: {error}"))
+            })?,
             expanded,
             width,
         };
@@ -4206,7 +4426,10 @@ impl ExtensionManager {
         {
             Ok(Value::String(rendered)) if !rendered.is_empty() => Ok(Some(rendered)),
             Ok(Value::String(_) | Value::Null) => Ok(None),
-            Ok(other) => Ok(other.as_str().filter(|text| !text.is_empty()).map(ToString::to_string)),
+            Ok(other) => Ok(other
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)),
             Err(error)
                 if error
                     .to_string()

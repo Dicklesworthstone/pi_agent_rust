@@ -796,7 +796,7 @@ fn redact_text(
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
     for (start, end) in spans {
         if let Some(last) = merged.last_mut()
-            && start <= last.1
+            && start < last.1
         {
             last.1 = last.1.max(end);
         } else {
@@ -852,7 +852,7 @@ fn overlapping_known_spans(text: &str, known: &regex::Regex) -> Vec<(usize, usiz
     let mut offset = 0;
     while let Some(hit) = known.find_at(text, offset) {
         if let Some(previous) = spans.last_mut()
-            && hit.start() <= previous.1
+            && hit.start() < previous.1
         {
             previous.1 = previous.1.max(hit.end());
         } else {

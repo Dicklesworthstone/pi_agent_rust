@@ -11,7 +11,7 @@ const COMBINATORS: [&str; 3] = ["allOf", "anyOf", "oneOf"];
 /// combinators. Expose their fields as an object while keeping the exact
 /// constraint in the description. This is a permissive wire projection, not
 /// a replacement for the original tool's argument validation.
-pub(super) fn anthropic_tool_schema(schema: &Value) -> Cow<'_, Value> {
+pub fn anthropic_tool_schema(schema: &Value) -> Cow<'_, Value> {
     let Some(root) = schema.as_object() else {
         return Cow::Borrowed(schema);
     };
@@ -586,7 +586,7 @@ mod tests {
         assert_accepts(&absolute, &json!({"alias":"valid","value":"valid"}));
         assert!(matches!(anthropic_tool_schema(&absolute), Cow::Borrowed(_)));
 
-        let mut encoded = absolute.clone();
+        let mut encoded = absolute;
         encoded["properties"]["alias"]["$ref"] =
             json!("https://example.test/root#%2FanyOf%2F0%2Fproperties%2Fvalue");
         assert!(matches!(anthropic_tool_schema(&encoded), Cow::Borrowed(_)));
@@ -827,7 +827,7 @@ mod tests {
             json!({"type":"array"}),
             json!({"type":["array","null"]}),
             json!({"type":"array","prefixItems":[{"type":"string"}]}),
-            json!({"prefixItems":[]}),
+            json!({"prefixItems":[{"type":"string"}]}),
         ] {
             let original = schema.clone();
             let wire = codex_tool_schema(&schema);

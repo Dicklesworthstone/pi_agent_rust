@@ -34,6 +34,10 @@ async fn load(harness: &common::TestHarness, source: &str, allow_http: bool) -> 
         PiJsRuntimeConfig {
             cwd: harness.temp_dir().display().to_string(),
             disk_cache_dir: None,
+            env: std::collections::HashMap::from([(
+                "PI_HTTP_ALLOW_LOOPBACK".to_string(),
+                "1".to_string(),
+            )]),
             ..Default::default()
         },
         tools,

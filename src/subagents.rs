@@ -960,7 +960,7 @@ impl SubagentRequest {
         if selected.ne(&1) {
             return Err(Error::tool(
                 "subagent",
-                "Provide exactly one of agent+(task or taskFile), tasks, or chain.",
+                "Provide exactly one of agent+task, tasks, or chain (or agent+taskFile).",
             ));
         }
         if self.agent.is_some() != (self.task.is_some() || self.task_file.is_some()) {
@@ -2315,7 +2315,7 @@ mod tests {
         assert!(args.windows(2).any(|pair| {
             pair == [
                 "--tools",
-                "read,bash,edit,write,grep,find,ls,hashline_edit,hub",
+                "read,bash,edit,write,grep,find,ls,hashline_edit,jobs,hub",
             ]
         }));
         assert!(!args.iter().any(|arg| arg == "subagent"));

@@ -470,13 +470,7 @@ mod tests {
             let remaining = advisor.remaining_time().expect("bounded advisor");
             assert!(remaining <= Duration::from_secs(10));
             drop(advisor);
-            scope
-                .session
-                .agent
-                .run_budget
-                .as_mut()
-                .unwrap()
-                .iterations += 1;
+            scope.session.agent.run_budget.as_mut().unwrap().iterations += 1;
             drop(scope);
             let restored = session.agent.run_budget.expect("surviving run");
             assert_eq!(restored.started, prewalk_started);
@@ -662,7 +656,11 @@ mod tests {
                 ResolvedCompactionSettings::default(),
             )));
             let remaining_owner = Arc::clone(&original);
-            for text in ["already delivered", "first undelivered", "second undelivered"] {
+            for text in [
+                "already delivered",
+                "first undelivered",
+                "second undelivered",
+            ] {
                 crate::jobs::push_completion_notice(&owner, text).expect("queue notice");
             }
             let cx = AgentCx::for_current_or_request();
@@ -672,7 +670,9 @@ mod tests {
                 let delivered = session.agent.pop_follow_up_for_current_session().await;
                 assert_eq!(delivered.len(), 1);
                 assert_user_text(delivered[0].message(), "already delivered");
-                session.agent.queue_follow_up(user_message("ordinary input"));
+                session
+                    .agent
+                    .queue_follow_up(user_message("ordinary input"));
             }
             drop(original);
             assert!(
@@ -693,7 +693,11 @@ mod tests {
             drop(remaining_owner);
 
             let restored = crate::jobs::take_completion_notices(&owner);
-            assert_eq!(restored.len(), 3, "consumed and ordinary input cannot replay");
+            assert_eq!(
+                restored.len(),
+                3,
+                "consumed and ordinary input cannot replay"
+            );
             for (notice, expected) in restored.iter().zip([
                 "first undelivered",
                 "second undelivered",
@@ -779,7 +783,11 @@ mod tests {
                 .await
                 .expect("saved session")
                 .to_messages_for_current_path();
-            assert_eq!(messages.len(), 2, "notice and response are recorded exactly once");
+            assert_eq!(
+                messages.len(),
+                2,
+                "notice and response are recorded exactly once"
+            );
             assert_user_text(&messages[0], "completed work after cancellation");
             assert!(matches!(&messages[1], Message::Assistant(_)));
         });
@@ -860,7 +868,7 @@ mod tests {
             );
             let ordinary_fetcher: MessageFetcher = Arc::new(|| {
                 Box::pin(async move {
-                    (0..=MAX_FOLLOW_UP_QUEUE_SIZE)
+                    (0..MAX_FOLLOW_UP_QUEUE_SIZE)
                         .map(|index| {
                             QueuedAgentMessage::generated(Message::User(UserMessage {
                                 content: UserContent::Text(format!("ordinary-{index}")),
@@ -3090,7 +3098,11 @@ mod tests {
                 };
             agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
             agent.begin_logical_run();
-            agent.run_budget.as_mut().expect("active logical run").started = Instant::now()
+            agent
+                .run_budget
+                .as_mut()
+                .expect("active logical run")
+                .started = Instant::now()
                 .checked_sub(Duration::from_secs(120))
                 .expect("the clock origin is over 120 s ago");
 
@@ -5006,7 +5018,11 @@ mod tests {
         let events = Arc::new(StdTestMutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let progress = ManualCompactionProgress::start(
-            move |event| sink.lock().unwrap().push(serde_json::to_value(event).unwrap()),
+            move |event| {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            },
             Some("shake".to_string()),
         );
         let callback = progress.callback();
@@ -5039,7 +5055,11 @@ mod tests {
         let events = Arc::new(StdTestMutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let progress = ManualCompactionProgress::start(
-            move |event| sink.lock().unwrap().push(serde_json::to_value(event).unwrap()),
+            move |event| {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            },
             None,
         );
         let error = Error::session_persistence("summary save failed");
@@ -8573,8 +8593,7 @@ mod tests {
         runtime.block_on(async {
             for shake in [false, true] {
                 let directory = tempfile::tempdir().expect("session directory");
-                let mut original =
-                    Session::create_with_dir(Some(directory.path().to_path_buf()));
+                let mut original = Session::create_with_dir(Some(directory.path().to_path_buf()));
                 original.append_message(user_message("Inspect report.txt").into());
                 let mut tool_message = assistant_message("");
                 tool_message.content = vec![ContentBlock::ToolCall(ToolCall {
@@ -8644,9 +8663,7 @@ mod tests {
                         .entries_for_current_path()
                         .into_iter()
                         .find_map(|entry| match entry {
-                            crate::session::SessionEntry::Compaction(entry) => {
-                                Some(entry.clone())
-                            }
+                            crate::session::SessionEntry::Compaction(entry) => Some(entry.clone()),
                             _ => None,
                         })
                         .expect("installed compaction")
@@ -8695,7 +8712,10 @@ mod tests {
                         },
                     );
                     replay.replace_messages(canonical.clone());
-                    replay.run("continue", |_| {}).await.expect("replay archive");
+                    replay
+                        .run("continue", |_| {})
+                        .await
+                        .expect("replay archive");
                     let requests = replay_calls.lock().expect("replay requests");
                     assert_eq!(requests.len(), 1);
                     let messages = &requests[0].messages;
@@ -8759,7 +8779,15 @@ mod tests {
                 .expect("provider admission");
 
             agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None, None, None)
+                .apply_compaction_result(
+                    result,
+                    on_event,
+                    provider_admission,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 .expect("apply compaction result");
 
@@ -9085,7 +9113,10 @@ mod tests {
                 .execute_command("compact-late-abort-probe", "", 5_000)
                 .await
                 .expect("read late abort outcome");
-            assert_eq!(probe, json!({ "listenersAfterResult": 0, "lateAborted": true }));
+            assert_eq!(
+                probe,
+                json!({ "listenersAfterResult": 0, "lateAborted": true })
+            );
             let reopened = Session::open(path.to_str().expect("UTF-8 test path"))
                 .await
                 .expect("reopen durable compaction");
@@ -9259,7 +9290,15 @@ mod tests {
                 .expect("provider admission");
 
             let err = agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None, None, None)
+                .apply_compaction_result(
+                    result,
+                    on_event,
+                    provider_admission,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 .expect_err("blocked persistence must fail");
             assert!(
@@ -9362,7 +9401,10 @@ mod tests {
                         ..ResolvedCompactionSettings::default()
                     },
                 );
-                let origin = agent_session.current_compaction_origin().await.expect("origin");
+                let origin = agent_session
+                    .current_compaction_origin()
+                    .await
+                    .expect("origin");
                 let (path, before_install) = {
                     let cx = AgentCx::for_request();
                     let mut live = session.lock(cx.cx()).await.expect("session lock");
@@ -9372,7 +9414,9 @@ mod tests {
                         "short descendant turn".to_string()
                     };
                     live.append_message(user_message(&tail).into());
-                    live.save().await.expect("persist descendant before installation");
+                    live.save()
+                        .await
+                        .expect("persist descendant before installation");
                     (
                         live.path.clone().expect("saved path"),
                         SessionEditSnapshot::capture(&live).expect("live snapshot"),
@@ -9417,7 +9461,10 @@ mod tests {
                 if oversized_tail {
                     let error = outcome.expect_err("the enlarged tail no longer fits");
                     assert!(error.to_string().contains("still reaches the live trigger"));
-                    assert_eq!(std::fs::read(&path).expect("read rejected store"), saved_before);
+                    assert_eq!(
+                        std::fs::read(&path).expect("read rejected store"),
+                        saved_before
+                    );
                     let cx = AgentCx::for_request();
                     let live = session.lock(cx.cx()).await.expect("session lock");
                     assert!(
@@ -9441,9 +9488,10 @@ mod tests {
                 let reopened = Session::open(path.to_str().expect("UTF-8 path"))
                     .await
                     .expect("reopen accepted store");
-                let installed = reopened.entries_for_current_path().into_iter().any(|entry| {
-                    matches!(entry, crate::session::SessionEntry::Compaction(_))
-                });
+                let installed = reopened
+                    .entries_for_current_path()
+                    .into_iter()
+                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_)));
                 assert_eq!(installed, !oversized_tail);
                 let history = serde_json::to_string(&reopened.to_messages_for_current_path())
                     .expect("reopened history");
@@ -9480,7 +9528,10 @@ mod tests {
                 false,
                 ResolvedCompactionSettings::default(),
             );
-            let origin = agent_session.current_compaction_origin().await.expect("origin");
+            let origin = agent_session
+                .current_compaction_origin()
+                .await
+                .expect("origin");
             assert!(
                 agent_session
                     .compaction_origin_matches_current(&origin)
@@ -9525,7 +9576,11 @@ mod tests {
             drop(live);
 
             let error = install.await.expect_err("the old origin must be rejected");
-            assert!(error.to_string().contains("source changed while awaiting installation"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("source changed while awaiting installation")
+            );
             assert!(agent_session.ensure_provider_reentry_allowed().is_ok());
             let live = session.lock(cx.cx()).await.expect("unchanged branch");
             assert!(SessionEditSnapshot::capture(&live).expect("live snapshot") == selected);
@@ -10895,11 +10950,8 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     }))
                     .unwrap();
                     let cli = crate::cli::Cli::parse_from(["pi"]);
-                    let mut tools = ToolRegistry::new(
-                        &cli.enabled_tools(&config),
-                        root.path(),
-                        Some(&config),
-                    );
+                    let mut tools =
+                        ToolRegistry::new(&cli.enabled_tools(&config), root.path(), Some(&config));
                     assert!(tools.get(name).is_some());
                     assert!(tools.is_discoverable(name));
                     let executions = Arc::new(StdMutex::new(Vec::new()));
@@ -10908,8 +10960,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         origin: crate::tools::ToolOrigin::BuiltIn,
                         executions: Arc::clone(&executions),
                     }));
-                    let requests =
-                        Arc::new(StdMutex::new(Vec::<(String, String, Value)>::new()));
+                    let requests = Arc::new(StdMutex::new(Vec::<(String, String, Value)>::new()));
                     let observed = Arc::clone(&requests);
                     let agent = Agent::new(
                         Arc::new(SilentProvider),
@@ -11057,7 +11108,10 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             assert_eq!(results[0].tool_call_id, provider_call.id);
             assert_eq!(results[0].tool_name, "xdev");
             assert!(!results[0].is_error);
-            assert_eq!(results[0].details.as_ref().unwrap()["dispatchedVia"], "xdev");
+            assert_eq!(
+                results[0].details.as_ref().unwrap()["dispatchedVia"],
+                "xdev"
+            );
             assert_eq!(results[0].details.as_ref().unwrap()["tool"], "bash");
             assert_eq!(executions.lock().unwrap().len(), 2);
             assert_eq!(executions.lock().unwrap()[1].0, provider_call.id);
@@ -11186,8 +11240,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 } else {
                     crate::tools::ToolOrigin::BuiltIn
                 };
-                let mut tools =
-                    xdev_policy_tools(root.path(), "github", origin, &executions);
+                let mut tools = xdev_policy_tools(root.path(), "github", origin, &executions);
                 if revoked == "xdev" {
                     tools.push(Box::new(XdevPolicyProbeTool {
                         name: "xdev",
@@ -11195,8 +11248,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         executions: Arc::clone(&executions),
                     }));
                 }
-                let mut agent =
-                    Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+                let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
                 let shared = agent.shared_tools();
                 let updates = shared.clone();
                 let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
@@ -11241,8 +11293,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             assert!(tools.get("github").is_none());
             assert!(tools.is_discoverable("github"));
             assert!(tools.get("xdev").is_some());
-            let mut agent =
-                Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
             let shared = agent.shared_tools();
             let updates = shared.clone();
             let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
@@ -11258,11 +11309,9 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     ToolApprovalDecision::Allow
                 })
             })));
-            let (output, failed) = execute_xdev_policy_call(
-                &agent,
-                xdev_call("run", Some("github"), Some(json!({}))),
-            )
-            .await;
+            let (output, failed) =
+                execute_xdev_policy_call(&agent, xdev_call("run", Some("github"), Some(json!({}))))
+                    .await;
             assert!(failed && output.is_error, "{output:?}");
             assert!(
                 requests.lock().unwrap().is_empty(),
@@ -11318,16 +11367,16 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 (crate::cli::Cli::parse_from(["pi"]), false),
                 (crate::cli::Cli::parse_from(["pi", "--tools", name]), true),
             ] {
-                let tools = ToolRegistry::new(
-                    &cli.enabled_tools(&config),
-                    temp.path(),
-                    Some(&config),
-                );
+                let tools =
+                    ToolRegistry::new(&cli.enabled_tools(&config), temp.path(), Some(&config));
                 assert_eq!(tools.get(name).is_some(), included, "{name}");
-                let mut agent =
-                    Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+                let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
                 assert_eq!(
-                    agent.build_context().tools.iter().any(|tool| tool.name == name),
+                    agent
+                        .build_context()
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == name),
                     included,
                     "{name} must follow effective selection in the provider request"
                 );
@@ -11353,8 +11402,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             assert!(tools.get("ast_grep").is_some());
             assert!(tools.is_discoverable("ast_grep"));
             assert!(tools.get("xdev").is_none());
-            let mut agent =
-                Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
             for action in ["run", "promote"] {
                 let call = xdev_call(
                     action,

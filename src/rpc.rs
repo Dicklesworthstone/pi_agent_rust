@@ -2094,6 +2094,294 @@ fn run_rpc_handoff(
     }
 }
 
+struct RpcRewindCompletion {
+    id: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    abort: crate::agent::AbortSignal,
+    answered: bool,
+}
+
+impl RpcRewindCompletion {
+    fn finish(&mut self, result: Result<Value>) {
+        if self.answered {
+            return;
+        }
+        let response = match result {
+            Ok(data) => response_ok(self.id.clone(), "rewind", Some(data)),
+            Err(error) => response_error_with_hints(self.id.clone(), "rewind", &error),
+        };
+        let _ = self.out_tx.send(response);
+        self.answered = true;
+    }
+}
+
+impl Drop for RpcRewindCompletion {
+    fn drop(&mut self) {
+        if !self.answered {
+            let error = if self.abort.is_aborted() {
+                Error::Aborted
+            } else {
+                Error::session("Rewind ended without a terminal response")
+            };
+            self.finish(Err(error));
+        }
+        self.is_compacting.store(false, Ordering::SeqCst);
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_rpc_rewind(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    shared_state: Arc<Mutex<RpcSharedState>>,
+    id: Option<String>,
+    name: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+) -> impl Future<Output = ()> {
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let mut completion = RpcRewindCompletion {
+        id,
+        out_tx,
+        is_compacting,
+        abort: abort_signal.clone(),
+        answered: false,
+    };
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        let future = owner.with_current(async {
+            let result: Result<Value> = async {
+                {
+                    let mut slot =
+                        OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &supervisor)
+                            .await
+                            .map_err(|err| Error::session(format!("abort lock failed: {err}")))?;
+                    if retry_abort.load(Ordering::SeqCst) {
+                        abort_handle.abort();
+                    }
+                    *slot = Some(abort_handle.clone());
+                }
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+
+                // Phase 1 (Read & Snapshot under locks): capture OCC snapshot,
+                // active checkpoint span, and provider parameters, then release
+                // all session/state mutexes before network summarization.
+                let (
+                    source_snapshot,
+                    mut candidate,
+                    checkpoint,
+                    span,
+                    provider,
+                    stream_options,
+                    settings,
+                    privacy,
+                    provider_admission,
+                    _compacting_activity,
+                    provider_call,
+                ) = {
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &owner)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let provider_admission = guard.provider_admission_gate();
+                    {
+                        let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &owner)
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                        state.bind_provider_admission(provider_admission.clone());
+                        state.ensure_session_advancement_allowed()?;
+                    }
+                    guard.invalidate_background_compaction();
+                    let compacting_activity = guard.start_compaction_activity();
+                    let provider_call = provider_admission.acquire(&owner).await?;
+                    provider_admission.ensure_allowed()?;
+
+                    let (source_snapshot, mut candidate) = {
+                        let mut inner = OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
+                            .await
+                            .map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                        inner.ensure_full_v2_hydration_before_save()?;
+                        (SessionEditSnapshot::capture(&inner)?, inner.clone())
+                    };
+                    candidate.ensure_entry_ids();
+                    let Some(checkpoint) =
+                        crate::checkpoint::find_checkpoint(&candidate, name.as_deref())
+                    else {
+                        return Err(Error::validation(name.as_ref().map_or_else(
+                            || "No checkpoints yet".to_string(),
+                            |name| format!("No checkpoint named '{name}'"),
+                        )));
+                    };
+                    let (projected_messages, boundary) = checkpoint
+                        .entry_id
+                        .as_deref()
+                        .and_then(|entry_id| candidate.context_for_checkpoint(entry_id))
+                        .ok_or_else(|| {
+                            Error::session(format!(
+                                "Checkpoint '{}' is no longer in the active context after compaction or rewind; restore its branch or mark a new checkpoint",
+                                checkpoint.name
+                            ))
+                        })?;
+                    let span = projected_messages[boundary..].to_vec();
+                    if span.is_empty() {
+                        return Ok(json!({
+                            "checkpoint": checkpoint.name,
+                            "collapsedMessages": 0,
+                            "note": "active context already at checkpoint"
+                        }));
+                    }
+
+                    let provider = guard.agent.provider();
+                    let mut stream_options = guard.agent.stream_options().clone();
+                    guard.refresh_compaction_credential(&mut stream_options)?;
+                    let settings = crate::compaction::ResolvedCompactionSettings {
+                        enabled: true,
+                        ..Default::default()
+                    };
+                    let privacy = guard.agent.compaction_privacy();
+
+                    (
+                        source_snapshot,
+                        candidate,
+                        checkpoint,
+                        span,
+                        provider,
+                        stream_options,
+                        settings,
+                        privacy,
+                        provider_admission,
+                        compacting_activity,
+                        provider_call,
+                    )
+                };
+
+                // Phase 2 (Lock-free summarization): session, store, and shared
+                // state locks are all free so get_state, get_messages, host
+                // callbacks, and abort frames execute without deadlock.
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let summarize_fut = crate::checkpoint::summarize_span(
+                    &span,
+                    provider,
+                    &stream_options,
+                    &settings,
+                    &privacy,
+                );
+                let cancelled = abort_signal.wait();
+                futures::pin_mut!(summarize_fut, cancelled);
+                let summary = match futures::future::select(cancelled, summarize_fut).await {
+                    futures::future::Either::Left(_) => return Err(Error::Aborted),
+                    futures::future::Either::Right((summary_result, _)) => summary_result?,
+                };
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+
+                // Phase 3 (Kung-Robinson OCC validation & atomic commit):
+                // reacquire locks, verify snapshot unchanged, persist candidate,
+                // and install the projected context atomically.
+                let collapsed = span.len();
+                let outcome = crate::checkpoint::RewindOutcome {
+                    schema: crate::checkpoint::CHECKPOINT_SCHEMA.to_string(),
+                    checkpoint: checkpoint.name.clone(),
+                    checkpoint_entry_id: checkpoint.entry_id.clone(),
+                    collapsed_messages: collapsed,
+                    summary: summary.clone(),
+                    summary_tokens_estimate: u64::try_from(summary.len() / 4).unwrap_or(u64::MAX),
+                    tree_preserved: true,
+                };
+                candidate.append_custom_entry(
+                    "rewind".to_string(),
+                    Some(serde_json::to_value(&outcome)?),
+                );
+
+                let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                if let Some(budget) = guard.agent.cost_budget() {
+                    budget.checkpoint(&mut candidate)?;
+                }
+                let session_actions = guard.session_action_admission_gate();
+                let _session_action = session_actions.acquire(&owner).await?;
+                let mut inner = OwnedMutexGuard::lock(Arc::clone(&guard.session), &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                provider_admission.ensure_allowed()?;
+                if SessionEditSnapshot::capture(&inner)? != source_snapshot {
+                    return Err(Error::session(
+                        "Session changed while the rewind summary was running; retry rewind against the current session",
+                    ));
+                }
+
+                let rewound_messages = candidate.to_messages_for_current_path();
+                let save_enabled = guard.save_enabled();
+                if save_enabled {
+                    provider_admission.block(
+                        "rewind persistence was interrupted before live installation completed"
+                            .to_string(),
+                    );
+                    if let Err(first_err) = candidate.save().await
+                        && let Err(retry_err) = candidate.save().await
+                    {
+                        let reason = format!(
+                            "rewind persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                        );
+                        provider_admission.block(reason.clone());
+                        return Err(Error::session_persistence(reason));
+                    }
+                }
+                guard.invalidate_background_compaction();
+                *inner = candidate;
+                guard.agent.replace_messages(rewound_messages);
+                if save_enabled {
+                    provider_admission.clear();
+                }
+                drop(provider_call);
+                Ok(serde_json::to_value(&outcome)?)
+            }
+            .await;
+
+            if let Ok(mut slot) = OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await {
+                *slot = None;
+            }
+            completion.finish(result);
+        });
+        supervisor
+            .with_current(async {
+                let cancellation = async {
+                    loop {
+                        if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                            retry_abort.store(true, Ordering::SeqCst);
+                            abort_handle.abort();
+                            break;
+                        }
+                        supervisor.time().sleep(Duration::from_millis(25)).await;
+                    }
+                };
+                futures::pin_mut!(cancellation, future);
+                if let futures::future::Either::Left(((), pending)) =
+                    futures::future::select(cancellation, future).await
+                {
+                    pending.await;
+                }
+            })
+            .await;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RpcTurnPhase {
     Idle,
@@ -4950,14 +5238,14 @@ pub async fn run(
                     // neither can observe completion before the response is
                     // available. Command cancellation cannot prevent cleanup.
                     let completion_cx = asupersync::Cx::for_request();
-                    if let Ok(mut running) = bash_state.lock(&completion_cx).await {
-                        if running.as_ref().is_some_and(|r| r.id == run_id) {
-                            *running = None;
-                        }
-                        let _ = out_tx.send(response);
-                    } else {
-                        let _ = out_tx.send(response);
+                    let mut running_guard = bash_state.lock(&completion_cx).await.ok();
+                    if let Some(running) = running_guard.as_mut()
+                        && running.as_ref().is_some_and(|r| r.id == run_id)
+                    {
+                        **running = None;
                     }
+                    let _ = out_tx.send(response);
+                    drop(running_guard);
                 });
             }
 
@@ -5176,119 +5464,43 @@ pub async fn run(
                     .get("name")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let result: Result<Value> = async {
-                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                    state.bind_provider_admission(guard.provider_admission_gate());
-                    state.ensure_session_advancement_allowed()?;
-                    let session_store = Arc::clone(&guard.session);
-                    let mut inner = OwnedMutexGuard::lock(session_store, &cx)
-                        .await
-                        .map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                    let checkpoint = crate::checkpoint::find_checkpoint(&inner, name.as_deref());
-                    let Some(checkpoint) = checkpoint else {
-                        return Err(Error::validation(name.as_ref().map_or_else(
-                            || "No checkpoints yet".to_string(),
-                            |name| format!("No checkpoint named '{name}'"),
-                        )));
-                    };
-                    let messages = guard.agent.messages().to_vec();
-                    let span: Vec<Message> =
-                        messages[checkpoint.message_count.min(messages.len())..].to_vec();
-                    if span.is_empty() {
-                        return Ok(json!({
-                            "checkpoint": checkpoint.name,
-                            "collapsedMessages": 0,
-                            "note": "active context already at checkpoint"
-                        }));
-                    }
-                    guard.invalidate_background_compaction();
-                    let _provider_transition = state.provider_admission.acquire(&cx).await?;
-                    state.provider_admission.ensure_allowed()?;
-                    let provider = guard.agent.provider();
-                    let stream_options = guard.agent.stream_options().clone();
-                    let settings = crate::compaction::ResolvedCompactionSettings {
-                        enabled: true,
-                        ..Default::default()
-                    };
-                    let privacy = guard.agent.compaction_privacy();
-                    let summary = crate::checkpoint::summarize_span(
-                        &span,
-                        provider,
-                        &stream_options,
-                        &settings,
-                        &privacy,
-                    )
+                let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
                     .await
-                    .unwrap_or_else(|err| {
-                        format!("(summarization failed: {err}; collapsed without a report)")
-                    });
-                    let mut agent_messages = messages;
-                    agent_messages.truncate(checkpoint.message_count.min(agent_messages.len()));
-                    let collapsed = span.len();
-                    if !summary.is_empty() {
-                        agent_messages.push(Message::User(UserMessage {
-                            content: UserContent::Text(crate::checkpoint::rewind_report_text(
-                                &checkpoint.name,
-                                &summary,
-                            )),
-                            timestamp: 0,
-                        }));
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+                    .is_some();
+                let admitted = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if !bash_running
+                        && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
+                    {
+                        retry_abort.store(false, Ordering::SeqCst);
+                        is_compacting.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
                     }
-                    let outcome = crate::checkpoint::RewindOutcome {
-                        schema: crate::checkpoint::CHECKPOINT_SCHEMA.to_string(),
-                        checkpoint: checkpoint.name.clone(),
-                        checkpoint_entry_id: checkpoint.entry_id.clone(),
-                        collapsed_messages: collapsed,
-                        summary: summary.clone(),
-                        summary_tokens_estimate: (summary.len() / 4) as u64,
-                        tree_preserved: true,
-                    };
-                    let mut candidate = inner.clone();
-                    candidate.append_custom_entry(
-                        "rewind".to_string(),
-                        Some(serde_json::to_value(&outcome).unwrap_or_default()),
-                    );
-                    let save_enabled = guard.save_enabled();
-                    if save_enabled {
-                        state.provider_admission.block(
-                            "rewind persistence was interrupted before live installation completed"
-                                .to_string(),
-                        );
-                    }
-                    if save_enabled
-                        && let Err(first_err) = candidate.save().await
-                            && let Err(retry_err) = candidate.save().await
-                        {
-                            let reason = format!(
-                                "rewind persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                            );
-                            state.provider_admission.block(reason.clone());
-                            return Err(Error::session_persistence(reason));
-                        }
-                    guard.invalidate_background_compaction();
-                    *inner = candidate;
-                    guard.agent.replace_messages(agent_messages);
-                    if save_enabled {
-                        state.provider_admission.clear();
-                    }
-                    Ok(serde_json::to_value(&outcome)?)
+                };
+                if !admitted {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "rewind",
+                        "Agent is currently busy; wait before rewinding",
+                    ));
+                    continue;
                 }
-                .await;
-                match result {
-                    Ok(data) => {
-                        let _ = out_tx.send(response_ok(id, "rewind", Some(data)));
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "rewind", &err));
-                    }
-                }
+                let task = run_rpc_rewind(
+                    options.runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    id,
+                    name,
+                    out_tx.clone(),
+                    Arc::clone(&is_compacting),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle),
+                );
+                let _ = options.runtime_handle.try_spawn(task);
             }
 
             "fresh" => {
@@ -9934,6 +10146,7 @@ mod retry_tests {
                 ]
             } else {
                 // Second call succeeds.
+                partial.content = vec![ContentBlock::Text(TextContent::new("ok"))];
                 vec![
                     Ok(crate::model::StreamEvent::Start {
                         partial: partial.clone(),
@@ -17999,7 +18212,7 @@ mod tests {
             >,
         > {
             let message = AssistantMessage {
-                content: Vec::new(),
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
                 api: self.api().to_string(),
                 provider: self.name().to_string(),
                 model: self.model_id().to_string(),
@@ -18596,15 +18809,8 @@ mod tests {
                 let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
                 budget.record(0.25).unwrap();
                 budget.checkpoint(&mut stored).unwrap();
-                if mode == "save-failure" {
-                    let blocked = temp.path().join("blocked.jsonl");
-                    std::fs::create_dir(&blocked).unwrap();
-                    stored.path = Some(blocked);
-                } else {
-                    stored.save().await.unwrap();
-                }
+                stored.save().await.unwrap();
                 let path = stored.path.clone().unwrap();
-                let initial = serde_json::to_value(&stored.entries).unwrap();
                 let observed_keys = Arc::new(Mutex::new(Vec::new()));
                 let provider = Arc::new(BilledCompactionProvider {
                     observed_keys: Arc::clone(&observed_keys),
@@ -18617,6 +18823,15 @@ mod tests {
                     .enable_extensions(&[], temp.path(), None, &[extension_path])
                     .await
                     .expect("real compaction hooks load");
+                let initial = {
+                    let mut inner = agent_session.session.try_lock().unwrap();
+                    if mode == "save-failure" {
+                        let blocked = temp.path().join("blocked.jsonl");
+                        std::fs::create_dir(&blocked).unwrap();
+                        inner.path = Some(blocked);
+                    }
+                    serde_json::to_value(&inner.entries).unwrap()
+                };
                 let manager = agent_session.extensions.as_ref().unwrap().manager().clone();
                 let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
                 let compacting = Arc::new(AtomicBool::new(true));
@@ -19612,7 +19827,7 @@ mod tests {
             }
 
             let message = AssistantMessage {
-                content: Vec::new(),
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
                 api: self.api().to_string(),
                 provider: self.name().to_string(),
                 model: self.model_id().to_string(),
@@ -20082,7 +20297,7 @@ mod tests {
     impl RpcDeadlineProbeProvider {
         fn assistant_message(&self) -> AssistantMessage {
             AssistantMessage {
-                content: Vec::new(),
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
                 api: self.api().to_string(),
                 provider: self.name().to_string(),
                 model: self.model_id().to_string(),
@@ -25195,7 +25410,8 @@ export default function init(pi) {
                 });
                 let agent_session = build_test_agent_session_with_provider(source, provider);
                 let inner_session = Arc::clone(&agent_session.session);
-                let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
                 let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
                 let out_rx = Arc::new(Mutex::new(out_rx));
@@ -25288,20 +25504,26 @@ export default function init(pi) {
                 }
                 drop(in_tx);
                 server.await.expect("RPC server run");
-                let captured = calls.lock().expect("captured provider calls");
-                assert_eq!(captured.len(), 2, "{command} {behavior:?}");
-                let users: Vec<_> = captured[1]
-                    .messages
-                    .iter()
-                    .filter_map(|message| match message {
-                        Message::User(user) => Some(serde_json::to_value(&user.content).unwrap()),
-                        _ => None,
-                    })
-                    .collect();
-                assert!(users.ends_with(&[expected.clone(), expected.clone()]));
-                drop(captured);
+                {
+                    let captured = calls.lock().expect("captured provider calls");
+                    assert_eq!(captured.len(), 2, "{command} {behavior:?}");
+                    let users: Vec<_> = captured[1]
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            Message::User(user) => {
+                                Some(serde_json::to_value(&user.content).unwrap())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(users.ends_with(&[expected.clone(), expected.clone()]));
+                }
                 let cx = AgentCx::for_request();
-                let saved = inner_session.lock(&cx).await.expect("native session contents");
+                let saved = inner_session
+                    .lock(&cx)
+                    .await
+                    .expect("native session contents");
                 let users: Vec<_> = saved
                     .to_messages_for_current_path()
                     .into_iter()
@@ -29242,9 +29464,7 @@ export default function init(pi) {
         }
         let mut ambiguous = request.clone();
         ambiguous["images"] = json!([]);
-        assert!(
-            parse_prompt_attachments(&ambiguous, &Config::default(), Some(&catalog)).is_err()
-        );
+        assert!(parse_prompt_attachments(&ambiguous, &Config::default(), Some(&catalog)).is_err());
         catalog.clear();
         let error =
             parse_prompt_attachments(&request, &Config::default(), Some(&catalog)).unwrap_err();
@@ -29267,7 +29487,9 @@ export default function init(pi) {
         let error =
             parse_prompt_attachments(&request, &Config::default(), Some(&catalog)).unwrap_err();
         assert!(
-            error.to_string().contains("encoded attachments exceed 64 MiB"),
+            error
+                .to_string()
+                .contains("encoded attachments exceed 64 MiB"),
             "small references must not evade native payload admission: {error}"
         );
     }
@@ -31614,5 +31836,415 @@ export default function init(pi) {
         assert!(failure_event.contains(
             "\"errorMessage\":\"Failed to persist compaction to session: disk write error\""
         ));
+    }
+
+    struct FailingRewindSummaryProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for FailingRewindSummaryProvider {
+        fn name(&self) -> &str {
+            "failing-rewind-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            Err(Error::provider(
+                "failing-rewind-provider",
+                "synthetic upstream summarizer 503",
+            ))
+        }
+    }
+
+    fn seed_checkpoint_rewind_session() -> Session {
+        let mut session = Session::in_memory();
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("initial prompt before checkpoint".to_string()),
+            timestamp: Some(10),
+        });
+        let initial_messages = session.to_messages_for_current_path();
+        crate::checkpoint::mark_checkpoint(
+            &mut session,
+            "alpha",
+            Some("safe point"),
+            &initial_messages,
+        );
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("exploratory branch turn 1".to_string()),
+            timestamp: Some(20),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "exploratory assistant reply",
+                ))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 30,
+            },
+        });
+        session
+    }
+
+    #[test]
+    fn rpc_rewind_admits_live_queries_and_cancels_cleanly_without_mutating_transcript() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (entered_tx, mut entered_rx) = oneshot::channel();
+            let (_gate_tx, gate_rx) = oneshot::channel();
+            let provider = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::new(AtomicUsize::new(1)),
+                compaction_entered: Mutex::new(Some(entered_tx)),
+                compaction_gate: Mutex::new(Some(gate_rx)),
+            });
+            let mut agent_session =
+                handoff_agent_session(seed_checkpoint_rewind_session(), false, provider);
+            agent_session.agent.stream_options_mut().api_key =
+                Some("test-rewind-token".to_string());
+            let inner = Arc::clone(&agent_session.session);
+            let before_entries =
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap();
+            let before_messages = serde_json::to_value(agent_session.agent.messages()).unwrap();
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(
+                        &cx,
+                        json!({"id":"rw-1","type":"rewind","name":"alpha"}).to_string(),
+                    )
+                    .await
+                    .unwrap();
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    entered_rx.recv(&cx),
+                )
+                .await
+                .expect("rewind summary starts")
+                .unwrap();
+
+                // 1) Callback/query admission while rewind summary is in flight (no lock deadlock!).
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"st-1","type":"get_state"}"#,
+                    "get_state during rewind",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["isCompacting"], true);
+
+                let msgs = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"gm-1","type":"get_messages"}"#,
+                    "get_messages during rewind",
+                )
+                .await;
+                assert_ok(&msgs, "get_messages");
+                assert_eq!(msgs["data"]["messages"], before_messages);
+
+                // 2) In-flight cancellation via abort preserves transcript untouched.
+                let abort = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"ab-1","type":"abort"}"#,
+                    "abort in-flight rewind",
+                )
+                .await;
+                assert_ok(&abort, "abort");
+
+                let rw_resp = parse_response(
+                    &recv_line(&out_rx, "rewind cancelled response")
+                        .await
+                        .unwrap(),
+                );
+                assert_err(&rw_resp, "rewind");
+                assert_eq!(rw_resp["id"], "rw-1");
+
+                let post_msgs = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"gm-2","type":"get_messages"}"#,
+                    "get_messages after cancelled rewind",
+                )
+                .await;
+                assert_ok(&post_msgs, "get_messages");
+                assert_eq!(post_msgs["data"]["messages"], before_messages);
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("cancelled rewind drains cleanly");
+            assert_eq!(
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap(),
+                before_entries
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_rewind_summary_failure_fails_closed_preserving_transcript() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut agent_session = handoff_agent_session(
+                seed_checkpoint_rewind_session(),
+                false,
+                Arc::new(FailingRewindSummaryProvider),
+            );
+            agent_session.agent.stream_options_mut().api_key =
+                Some("test-rewind-token".to_string());
+            let inner = Arc::clone(&agent_session.session);
+            let before_entries =
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap();
+            let before_messages = serde_json::to_value(agent_session.agent.messages()).unwrap();
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let rw_resp = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"rw-fail","type":"rewind","name":"alpha"}"#,
+                    "rewind with failing provider",
+                )
+                .await;
+                assert_err(&rw_resp, "rewind");
+                assert!(
+                    rw_resp["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("synthetic upstream summarizer 503"),
+                    "expected upstream error surfaced, got: {rw_resp}"
+                );
+
+                let msgs = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"gm-after","type":"get_messages"}"#,
+                    "messages untouched after failed rewind",
+                )
+                .await;
+                assert_ok(&msgs, "get_messages");
+                assert_eq!(msgs["data"]["messages"], before_messages);
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("failed rewind drains cleanly");
+            assert_eq!(
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap(),
+                before_entries
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_rewind_occ_rejects_concurrent_session_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (entered_tx, mut entered_rx) = oneshot::channel();
+            let (gate_tx, gate_rx) = oneshot::channel();
+            let provider = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::new(AtomicUsize::new(1)),
+                compaction_entered: Mutex::new(Some(entered_tx)),
+                compaction_gate: Mutex::new(Some(gate_rx)),
+            });
+            let mut agent_session =
+                handoff_agent_session(seed_checkpoint_rewind_session(), false, provider);
+            agent_session.agent.stream_options_mut().api_key =
+                Some("test-rewind-token".to_string());
+            let inner = Arc::clone(&agent_session.session);
+            let before_messages = serde_json::to_value(agent_session.agent.messages()).unwrap();
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(
+                        &cx,
+                        json!({"id":"rw-occ","type":"rewind","name":"alpha"}).to_string(),
+                    )
+                    .await
+                    .unwrap();
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    entered_rx.recv(&cx),
+                )
+                .await
+                .expect("rewind summary starts")
+                .unwrap();
+
+                // Mutate the session concurrently while rewind summary is in flight
+                // (proves Phase 2 holds no lock on `agent_session.session` and arms
+                // Phase 3's Kung-Robinson OCC snapshot validation).
+                inner
+                    .try_lock()
+                    .expect("Phase 2 must release the inner session lock while summarizing")
+                    .set_name("concurrent-edit");
+
+                // Release the summary gate so Phase 3 runs its Kung-Robinson snapshot check.
+                gate_tx.send(&cx, ()).unwrap();
+
+                let rw_resp =
+                    parse_response(&recv_line(&out_rx, "rewind occ response").await.unwrap());
+                assert_err(&rw_resp, "rewind");
+                assert!(
+                    rw_resp["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Session changed while the rewind summary was running"),
+                    "expected OCC snapshot conflict error, got: {rw_resp}"
+                );
+
+                // Concurrent session rename and original messages must both remain intact!
+                let msgs = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"gm-occ","type":"get_messages"}"#,
+                    "messages intact after OCC rejection",
+                )
+                .await;
+                assert_ok(&msgs, "get_messages");
+                assert_eq!(msgs["data"]["messages"], before_messages);
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("OCC rewind drains cleanly");
+            assert_eq!(
+                inner.try_lock().unwrap().get_name().as_deref(),
+                Some("concurrent-edit")
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_rewind_commits_atomically_and_rejects_compacted_checkpoint() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut session = seed_checkpoint_rewind_session();
+            let kept_id = session.leaf_id().unwrap().to_string();
+            // First verify happy-path atomic commit on an active checkpoint.
+            let mut happy_session = handoff_agent_session(
+                seed_checkpoint_rewind_session(),
+                false,
+                Arc::new(CompactionSummaryProvider),
+            );
+            happy_session.agent.stream_options_mut().api_key =
+                Some("test-rewind-token".to_string());
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let happy_client = async {
+                let rw_resp = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"rw-ok","type":"rewind","name":"alpha"}"#,
+                    "happy rewind",
+                )
+                .await;
+                assert_ok(&rw_resp, "rewind");
+                assert_eq!(rw_resp["data"]["collapsedMessages"], 2);
+                assert_eq!(rw_resp["data"]["treePreserved"], true);
+                drop(in_tx);
+            };
+            let (res, ()) = futures::future::join(
+                Box::pin(run(happy_session, options, in_rx, out_tx)),
+                happy_client,
+            )
+            .await;
+            res.unwrap();
+
+            // Now compact past checkpoint "alpha" so "alpha" is hidden behind compaction.
+            session.append_compaction("compacted past alpha".to_string(), kept_id, 100, None, None);
+            let mut compacted_agent =
+                handoff_agent_session(session, false, Arc::new(CompactionSummaryProvider));
+            compacted_agent.agent.stream_options_mut().api_key =
+                Some("test-rewind-token".to_string());
+            let options2 = build_test_rpc_options(&runtime_handle, temp.path().join("auth2.json"));
+            let (in_tx2, in_rx2) = mpsc::channel(8);
+            let (out_tx2, out_rx2) = std::sync::mpsc::sync_channel(64);
+            let out_rx2 = Arc::new(Mutex::new(out_rx2));
+            let hidden_client = async {
+                let rw_resp = send_recv(
+                    &in_tx2,
+                    &out_rx2,
+                    r#"{"id":"rw-hidden","type":"rewind","name":"alpha"}"#,
+                    "rewind to compacted checkpoint",
+                )
+                .await;
+                assert_err(&rw_resp, "rewind");
+                assert!(
+                    rw_resp["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("no longer in the active context"),
+                    "expected hidden checkpoint rejection, got: {rw_resp}"
+                );
+                drop(in_tx2);
+            };
+            let (res2, ()) = futures::future::join(
+                Box::pin(run(compacted_agent, options2, in_rx2, out_tx2)),
+                hidden_client,
+            )
+            .await;
+            res2.unwrap();
+        }));
     }
 }

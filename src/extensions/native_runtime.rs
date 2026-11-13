@@ -984,11 +984,11 @@ impl ExtensionRuntimeHandle {
                     ExtensionInteraction::Shortcut { key_id } => {
                         runtime.execute_shortcut(key_id, timeout_ms).await
                     }
-                    ExtensionInteraction::MessageRenderer { custom_type, .. } => Err(
-                        Error::extension(format!(
+                    ExtensionInteraction::MessageRenderer { custom_type, .. } => {
+                        Err(Error::extension(format!(
                             "native-rust message renderer `{custom_type}` is not executable"
-                        )),
-                    ),
+                        )))
+                    }
                 };
                 if abort
                     .as_ref()

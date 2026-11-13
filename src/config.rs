@@ -117,6 +117,8 @@ pub struct Config {
     pub advisor: Option<AdvisorSettings>,
     /// LSP tool settings (bd-cv653.1.1).
     pub lsp: Option<LspSettings>,
+    /// DAP debug tool settings (bd-xdev-registry-tool-discovery-17sy3).
+    pub debug: Option<DebugSettings>,
     /// Approval mode settings (bd-cv653.3.19).
     pub approval: Option<ApprovalSettings>,
 
@@ -507,6 +509,10 @@ pub struct SessionSettings {
     pub warn_cost: Option<f64>,
     #[serde(alias = "max_cost", deserialize_with = "deserialize_cost_threshold")]
     pub max_cost: Option<f64>,
+    #[serde(alias = "backend")]
+    pub store: Option<String>,
+    #[serde(alias = "v2_sidecar")]
+    pub v2_sidecar: Option<bool>,
 }
 
 fn deserialize_cost_threshold<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
@@ -724,6 +730,36 @@ pub struct LspServerSettings {
     /// Workspace settings exposed during initialization and notified after it.
     /// Must be an object; each higher-precedence value replaces the whole object.
     pub settings: Option<serde_json::Value>,
+}
+
+/// DAP debug-tool configuration (`debug` settings key).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugSettings {
+    /// Per-adapter executable/argument overrides keyed by adapter ID.
+    pub adapters: Option<std::collections::HashMap<String, DebugAdapterSettings>>,
+    /// Optional allowlist of adapter IDs permitted to launch or attach.
+    #[serde(alias = "allowedAdapters")]
+    pub allowed_adapters: Option<Vec<String>>,
+    /// Maximum retained debugger sessions across conversations (`1..=16`, default `4`).
+    #[serde(alias = "maxSessions")]
+    pub max_sessions: Option<usize>,
+    /// Default startup/launch timeout in milliseconds (`1..=300_000`, default `120_000`).
+    #[serde(alias = "startupTimeoutMs")]
+    pub startup_timeout_ms: Option<u64>,
+    /// Step wait timeout in milliseconds (`1..=60_000`, default `5_000`).
+    #[serde(alias = "stepTimeoutMs")]
+    pub step_timeout_ms: Option<u64>,
+}
+
+/// One `debug.adapters.<id>` override entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugAdapterSettings {
+    /// Override executable path or command candidate.
+    pub command: Option<String>,
+    /// Override adapter argv.
+    pub args: Option<Vec<String>>,
 }
 
 /// Approval mode configuration (bd-cv653.3.19).
@@ -1163,6 +1199,7 @@ impl Config {
             keywords: merge_keywords(base.keywords, other.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
             lsp: merge_lsp(base.lsp, other.lsp),
+            debug: merge_debug(base.debug, other.debug),
             approval: merge_approval(base.approval, other.approval),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
             http: merge_http_settings(base.http, other.http),
@@ -1180,6 +1217,8 @@ impl Config {
                 (Some(base), Some(other)) => Some(SessionSettings {
                     warn_cost: other.warn_cost.or(base.warn_cost),
                     max_cost: other.max_cost.or(base.max_cost),
+                    store: other.store.or(base.store),
+                    v2_sidecar: other.v2_sidecar.or(base.v2_sidecar),
                 }),
                 (base, other) => other.or(base),
             },
@@ -1281,6 +1320,34 @@ impl Config {
             .as_ref()
             .and_then(|settings| settings.print_wake)
             .unwrap_or(false)
+    }
+
+    /// Whether live JSONL saves should maintain a synchronized `.v2` segmented
+    /// sidecar store (`session_store = "v2"`, `session.store = "v2"`, or
+    /// `session.v2Sidecar = true`).
+    #[must_use]
+    pub fn session_v2_sidecar_enabled(&self) -> bool {
+        if self
+            .session
+            .as_ref()
+            .and_then(|settings| settings.v2_sidecar)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let configured_store = self
+            .session
+            .as_ref()
+            .and_then(|settings| settings.store.as_deref())
+            .or(self.session_store.as_deref())
+            .map(str::trim);
+        matches!(
+            configured_store,
+            Some(v)
+                if v.eq_ignore_ascii_case("v2")
+                    || v.eq_ignore_ascii_case("jsonl_v2")
+                    || v.eq_ignore_ascii_case("v2_sidecar")
+        )
     }
 
     /// Discover project-local MCP definitions when the workspace is also trusted.
@@ -2549,6 +2616,40 @@ fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<Ls
                 },
                 request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
                 idle_shutdown_secs: other.idle_shutdown_secs.or(base.idle_shutdown_secs),
+            })
+        }
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_debug(base: Option<DebugSettings>, other: Option<DebugSettings>) -> Option<DebugSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut adapters = base.adapters.unwrap_or_default();
+            if let Some(other_adapters) = other.adapters {
+                for (id, other_adapter) in other_adapters {
+                    let merged = match adapters.remove(&id) {
+                        Some(base_adapter) => DebugAdapterSettings {
+                            command: other_adapter.command.or(base_adapter.command),
+                            args: other_adapter.args.or(base_adapter.args),
+                        },
+                        None => other_adapter,
+                    };
+                    adapters.insert(id, merged);
+                }
+            }
+            Some(DebugSettings {
+                adapters: if adapters.is_empty() {
+                    None
+                } else {
+                    Some(adapters)
+                },
+                allowed_adapters: other.allowed_adapters.or(base.allowed_adapters),
+                max_sessions: other.max_sessions.or(base.max_sessions),
+                startup_timeout_ms: other.startup_timeout_ms.or(base.startup_timeout_ms),
+                step_timeout_ms: other.step_timeout_ms.or(base.step_timeout_ms),
             })
         }
         (None, Some(other)) => Some(other),

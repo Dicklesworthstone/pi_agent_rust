@@ -396,6 +396,113 @@ fn render_user_content(content: &UserContent) -> String {
     }
 }
 
+/// Build the effective `(custom_system_prompt, user_text)` pair for Cursor's
+/// unary-request / streaming-response `AgentService/Run` endpoint, preserving
+/// multi-turn conversation history, tool schemas, and `ToolResult` continuations.
+fn build_cursor_turn_context(context: &Context<'_>) -> Option<(Option<String>, String)> {
+    let last_user_idx = context
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, msg)| matches!(msg, Message::User(_)).then_some(idx))?;
+
+    let latest_user = match &context.messages[last_user_idx] {
+        Message::User(user) => render_user_content(&user.content),
+        _ => unreachable!(),
+    };
+    let has_trailing_tool_turns = context.messages[last_user_idx + 1..]
+        .iter()
+        .any(|msg| matches!(msg, Message::Assistant(_) | Message::ToolResult(_)));
+    let history_end = if has_trailing_tool_turns {
+        context.messages.len()
+    } else {
+        last_user_idx
+    };
+
+    let mut system_sections = Vec::new();
+    if let Some(sys) = context.system_prompt.as_deref()
+        && !sys.is_empty()
+    {
+        system_sections.push(sys.to_string());
+    }
+    if !context.tools.is_empty() {
+        system_sections.push(crate::provider::format_prompt_tool_instructions(
+            &context.tools,
+        ));
+    }
+    if history_end > 0 {
+        let mut transcript = Vec::new();
+        for msg in &context.messages[..history_end] {
+            match msg {
+                Message::User(user) => {
+                    let text = render_user_content(&user.content);
+                    if !text.trim().is_empty() {
+                        transcript.push(format!("[User]\n{text}"));
+                    }
+                }
+                Message::Assistant(asst) => {
+                    let mut parts = Vec::new();
+                    for block in &asst.content {
+                        match block {
+                            ContentBlock::Text(t) if !t.text.trim().is_empty() => {
+                                parts.push(t.text.clone());
+                            }
+                            ContentBlock::ToolCall(tc) => {
+                                let args = serde_json::to_string(&tc.arguments)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                parts.push(format!(
+                                    "{}{{\"id\":{},\"name\":{},\"arguments\":{args}}}{}",
+                                    crate::provider::PI_TOOL_CALL_OPEN,
+                                    serde_json::to_string(&tc.id)
+                                        .unwrap_or_else(|_| "\"call\"".to_string()),
+                                    serde_json::to_string(&tc.name)
+                                        .unwrap_or_else(|_| "\"tool\"".to_string()),
+                                    crate::provider::PI_TOOL_CALL_CLOSE,
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !parts.is_empty() {
+                        transcript.push(format!("[Assistant]\n{}", parts.join("\n")));
+                    }
+                }
+                Message::ToolResult(tr) => {
+                    let body = tr
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    transcript.push(format!(
+                        "[ToolResult id={} name={} is_error={}]\n{body}",
+                        tr.tool_call_id, tr.tool_name, tr.is_error
+                    ));
+                }
+                Message::Custom(_) => {}
+            }
+        }
+        if !transcript.is_empty() {
+            system_sections.push(format!(
+                "<conversation_history>\n{}\n</conversation_history>",
+                transcript.join("\n\n")
+            ));
+        }
+    }
+
+    let user_text = if has_trailing_tool_turns {
+        "Continue from the latest [ToolResult] entries in <conversation_history>. Emit <pi_tool_call> if another tool step is needed, otherwise provide your final answer.".to_string()
+    } else {
+        latest_user
+    };
+    let effective_system = (!system_sections.is_empty()).then(|| system_sections.join("\n\n"));
+    Some((effective_system, user_text))
+}
+
 // ============================================================================
 // Response decoding: AgentServerMessage bytes -> semantic events
 // ============================================================================
@@ -602,6 +709,9 @@ struct StreamState {
     /// released with the wire source at the terminal boundary.
     diagnostic_token: Option<String>,
     error_message: Option<String>,
+    allowed_tools: std::collections::HashSet<String>,
+    tool_tag_buffer: String,
+    tool_call_count: usize,
     started: bool,
     finalized: bool,
     done: bool,
@@ -626,11 +736,19 @@ impl StreamState {
             usage_observer: None,
             diagnostic_token: None,
             error_message: None,
+            allowed_tools: std::collections::HashSet::new(),
+            tool_tag_buffer: String::new(),
+            tool_call_count: 0,
             started: false,
             finalized: false,
             done: false,
             transient_error_count: 0,
         }
+    }
+
+    fn with_allowed_tools(mut self, allowed_tools: std::collections::HashSet<String>) -> Self {
+        self.allowed_tools = allowed_tools;
+        self
     }
 
     fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
@@ -761,21 +879,125 @@ impl StreamState {
         index
     }
 
+    fn emit_raw_text_delta(&mut self, delta: String) {
+        if delta.is_empty() {
+            return;
+        }
+        self.ensure_started();
+        let index = self.ensure_block(BlockKind::Text);
+        if let Some(ContentBlock::Text(text)) = self.partial.content.get_mut(index) {
+            text.text.push_str(&delta);
+        }
+        self.pending.push_back(StreamEvent::TextDelta {
+            content_index: index,
+            delta,
+        });
+    }
+
+    fn emit_tool_call(&mut self, tool_call: crate::model::ToolCall) {
+        self.ensure_started();
+        self.close_open_block();
+        let index = self.partial.content.len();
+        let args_json =
+            serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string());
+        let id = tool_call.id.clone();
+        let name = tool_call.name.clone();
+        self.partial
+            .content
+            .push(ContentBlock::ToolCall(tool_call.clone()));
+        self.pending.push_back(StreamEvent::ToolCallStart {
+            content_index: index,
+            id,
+            name,
+        });
+        self.pending.push_back(StreamEvent::ToolCallDelta {
+            content_index: index,
+            delta: args_json,
+        });
+        self.pending.push_back(StreamEvent::ToolCallEnd {
+            content_index: index,
+            tool_call,
+        });
+        self.tool_call_count = self.tool_call_count.saturating_add(1);
+    }
+
+    fn drain_tool_tag_buffer(&mut self, flush_incomplete: bool) {
+        const OPEN: &str = crate::provider::PI_TOOL_CALL_OPEN;
+        const CLOSE: &str = crate::provider::PI_TOOL_CALL_CLOSE;
+
+        loop {
+            if self.tool_tag_buffer.is_empty() {
+                break;
+            }
+            if let Some(open_pos) = self.tool_tag_buffer.find(OPEN) {
+                if open_pos > 0 {
+                    let prefix = self.tool_tag_buffer[..open_pos].to_string();
+                    self.tool_tag_buffer.drain(..open_pos);
+                    self.emit_raw_text_delta(prefix);
+                }
+                let after_open = &self.tool_tag_buffer[OPEN.len()..];
+                if let Some(close_rel) = after_open.find(CLOSE) {
+                    let raw_json = after_open[..close_rel].to_string();
+                    let consumed = OPEN.len() + close_rel + CLOSE.len();
+                    let raw_segment = self.tool_tag_buffer[..consumed].to_string();
+                    self.tool_tag_buffer.drain(..consumed);
+                    if let Some(call) = crate::provider::parse_prompt_tool_call_json(
+                        &raw_json,
+                        &self.allowed_tools,
+                        self.tool_call_count + 1,
+                    ) {
+                        self.emit_tool_call(call);
+                    } else {
+                        self.emit_raw_text_delta(raw_segment);
+                    }
+                    continue;
+                }
+                if flush_incomplete {
+                    let leftover = std::mem::take(&mut self.tool_tag_buffer);
+                    self.emit_raw_text_delta(leftover);
+                }
+                break;
+            }
+
+            if flush_incomplete {
+                let leftover = std::mem::take(&mut self.tool_tag_buffer);
+                self.emit_raw_text_delta(leftover);
+                break;
+            }
+
+            // Hold back only a trailing suffix that could still complete `<pi_tool_call>`.
+            let mut hold_from = self.tool_tag_buffer.len();
+            let max_suffix = OPEN.len().saturating_sub(1).min(self.tool_tag_buffer.len());
+            for suffix_len in (1..=max_suffix).rev() {
+                let candidate_start = self.tool_tag_buffer.len() - suffix_len;
+                if self.tool_tag_buffer.is_char_boundary(candidate_start)
+                    && OPEN.starts_with(&self.tool_tag_buffer[candidate_start..])
+                {
+                    hold_from = candidate_start;
+                    break;
+                }
+            }
+            if hold_from > 0 {
+                let ready = self.tool_tag_buffer[..hold_from].to_string();
+                self.tool_tag_buffer.drain(..hold_from);
+                self.emit_raw_text_delta(ready);
+            }
+            break;
+        }
+    }
+
     fn apply(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::TextDelta(delta) => {
                 if delta.is_empty() {
                     return;
                 }
-                self.ensure_started();
-                let index = self.ensure_block(BlockKind::Text);
-                if let Some(ContentBlock::Text(text)) = self.partial.content.get_mut(index) {
-                    text.text.push_str(&delta);
+                if self.allowed_tools.is_empty() {
+                    self.emit_raw_text_delta(delta);
+                } else {
+                    self.tool_tag_buffer.push_str(&delta);
+                    self.drain_tool_tag_buffer(false);
                 }
-                self.pending.push_back(StreamEvent::TextDelta {
-                    content_index: index,
-                    delta,
-                });
             }
             ServerEvent::ThinkingDelta(delta) => {
                 if delta.is_empty() {
@@ -872,6 +1094,9 @@ impl StreamState {
         // the caller to drop the stream without consuming Done or Error.
         self.record_usage(true)?;
         self.finalized = true;
+        if !self.tool_tag_buffer.is_empty() {
+            self.drain_tool_tag_buffer(true);
+        }
         self.ensure_started();
         self.close_open_block();
 
@@ -883,9 +1108,14 @@ impl StreamState {
                 error: self.partial.clone(),
             });
         } else {
-            self.partial.stop_reason = StopReason::Stop;
+            let reason = if self.tool_call_count > 0 {
+                StopReason::ToolUse
+            } else {
+                StopReason::Stop
+            };
+            self.partial.stop_reason = reason;
             self.pending.push_back(StreamEvent::Done {
-                reason: StopReason::Stop,
+                reason,
                 message: self.partial.clone(),
             });
         }
@@ -1046,6 +1276,17 @@ impl Provider for CursorProvider {
         &self.model
     }
 
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: false,
+            streaming: true,
+            vision: false,
+            authoritative_usage: true,
+        }
+    }
+
     async fn stream(
         &self,
         context: &Context<'_>,
@@ -1062,9 +1303,8 @@ impl Provider for CursorProvider {
                 )
             })?;
 
-        let user_text = latest_user_text(&context.messages)
+        let (effective_system, user_text) = build_cursor_turn_context(context)
             .ok_or_else(|| Error::provider(&self.provider, "No user message to send to Cursor"))?;
-        let system_prompt = context.system_prompt.as_deref();
         let conversation_id = Uuid::new_v4().to_string();
         let message_id = Uuid::new_v4().to_string();
         let request_id = Uuid::new_v4().to_string();
@@ -1074,7 +1314,7 @@ impl Provider for CursorProvider {
         // hook's JSON-payload rewrite contract cannot apply.
         let request_body = build_run_request(
             &self.model,
-            system_prompt,
+            effective_system.as_deref(),
             &user_text,
             &conversation_id,
             &message_id,
@@ -1119,7 +1359,10 @@ impl Provider for CursorProvider {
             ..AssistantMessage::default()
         };
 
+        let allowed_tools: std::collections::HashSet<String> =
+            context.tools.iter().map(|t| t.name.clone()).collect();
         let mut state = StreamState::new(response.bytes_stream(), partial)
+            .with_allowed_tools(allowed_tools)
             .with_usage_observer(options.usage_observer.clone())
             .with_diagnostic_token(token);
         state.encoding = encoding;
@@ -1547,5 +1790,99 @@ mod tests {
         assert_eq!(provider.name(), "cursor");
         assert_eq!(provider.api(), CURSOR_API_NAME);
         assert_eq!(provider.model_id(), "claude-4.5-sonnet");
+        let caps = provider.capabilities();
+        assert!(caps.multi_turn && caps.tool_use && !caps.native_tool_wire && caps.streaming);
+    }
+
+    #[test]
+    fn cursor_multi_turn_context_and_split_frame_tool_call_stream() {
+        use crate::model::{ToolResultMessage, UserMessage};
+        use crate::provider::ToolDef;
+
+        let empty: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> =
+            Box::pin(stream::empty());
+        let allowed = std::collections::HashSet::from(["read".to_string()]);
+        let mut state =
+            StreamState::new(empty, AssistantMessage::default()).with_allowed_tools(allowed);
+
+        // Split `<pi_tool_call>` across multiple Connect frames to prove chunk-boundary safety!
+        let frames = [
+            interaction_update(1, "Checking file... <pi_tool"),
+            interaction_update(
+                1,
+                "_call>{\"id\":\"cur_1\",\"name\":\"read\",\"arguments\":{\"path\":\"Cargo.toml\"}}</pi_tool_",
+            ),
+            interaction_update(1, "call>"),
+            token_delta_message(14),
+            checkpoint_message(64),
+        ];
+        for frame in &frames {
+            state
+                .process_frame(&ConnectFrame {
+                    end_stream: false,
+                    compressed: false,
+                    payload: frame.clone(),
+                })
+                .expect("data frame");
+        }
+        state
+            .process_frame(&ConnectFrame {
+                end_stream: true,
+                compressed: false,
+                payload: b"{}".to_vec(),
+            })
+            .expect("end stream");
+
+        let events: Vec<StreamEvent> = state.pending.drain(..).collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallEnd { tool_call, .. }
+                if tool_call.id == "cur_1"
+                    && tool_call.name == "read"
+                    && tool_call.arguments["path"] == "Cargo.toml"
+        )));
+        let Some(StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: asst1,
+        }) = events.last().cloned()
+        else {
+            panic!("expected StopReason::ToolUse, got {events:?}");
+        };
+        assert_eq!(asst1.usage.output, 14);
+        assert_eq!(asst1.usage.total_tokens, 64);
+
+        // Turn 2: verify multi-turn history + ToolResult serialize into custom_system_prompt.
+        let ctx2 = Context::owned(
+            Some("Base system.".to_string()),
+            vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Read Cargo.toml".to_string()),
+                    timestamp: 1,
+                }),
+                Message::assistant(asst1),
+                Message::ToolResult(std::sync::Arc::new(ToolResultMessage {
+                    tool_call_id: "cur_1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new(
+                        "[package]\nname = \"pi\"",
+                    ))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 2,
+                })),
+            ],
+            vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        );
+        let (effective_sys, cont_prompt) =
+            build_cursor_turn_context(&ctx2).expect("turn 2 context");
+        let sys = effective_sys.expect("system prompt present");
+        assert!(sys.contains("Base system."));
+        assert!(sys.contains("<conversation_history>"));
+        assert!(sys.contains("[package]\nname = \"pi\""));
+        assert!(cont_prompt.contains("Continue from the latest [ToolResult]"));
     }
 }

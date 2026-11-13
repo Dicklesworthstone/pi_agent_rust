@@ -1583,12 +1583,8 @@ fn exception_policy_covers_full_conformance_failures() {
         .join("conformance")
         .join("conformance_report.json");
 
-    if !baseline_path.exists() || !full_report_path.exists() {
-        eprintln!(
-            "Missing exception policy inputs (baseline={}, full_report={}) — skipping",
-            baseline_path.exists(),
-            full_report_path.exists()
-        );
+    if !baseline_path.exists() {
+        eprintln!("Missing exception policy baseline — skipping");
         return;
     }
 
@@ -1662,7 +1658,30 @@ fn exception_policy_covers_full_conformance_failures() {
         );
     }
 
+    if !full_report_path.exists() {
+        eprintln!(
+            "Missing gitignored full_report — policy schema/expiry validated, skipping report diff"
+        );
+        return;
+    }
+
     let full_report = read_json_file(&full_report_path).expect("parse conformance_report.json");
+    let policy_generated_at = exception_policy
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok());
+    let report_generated_at = full_report
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok());
+    if let (Some(policy_ts), Some(report_ts)) = (policy_generated_at, report_generated_at)
+        && report_ts < policy_ts
+    {
+        eprintln!(
+            "Skipping full_report diff: gitignored conformance_report.json ({report_ts}) predates exception_policy ({policy_ts})"
+        );
+        return;
+    }
     let failures = full_report
         .get("failures")
         .and_then(Value::as_array)

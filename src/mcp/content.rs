@@ -412,7 +412,10 @@ fn text_projection_size(content: &[ContentBlock]) -> (usize, usize) {
             }
         }
     }
-    (bytes, newlines + usize::from(bytes > 0 && !ends_with_newline))
+    (
+        bytes,
+        newlines + usize::from(bytes > 0 && !ends_with_newline),
+    )
 }
 
 fn bound_tool_output_with_limits(
@@ -484,10 +487,12 @@ fn bound_tool_output_with_limits(
             remaining -= keep;
         }
     }
-    output.content.retain(|block| {
-        !matches!(block, ContentBlock::Text(text) if text.text.is_empty())
-    });
-    output.content.push(ContentBlock::Text(TextContent::new(notice)));
+    output
+        .content
+        .retain(|block| !matches!(block, ContentBlock::Text(text) if text.text.is_empty()));
+    output
+        .content
+        .push(ContentBlock::Text(TextContent::new(notice)));
 
     let mut details = match output.details.take() {
         Some(Value::Object(details)) => details,
@@ -637,8 +642,7 @@ mod tests {
     }
 
     fn spilled_text(output: &ToolOutput) -> String {
-        let path = output.details.as_ref().expect("details")["mcpTextOutput"]["artifact"]
-            ["path"]
+        let path = output.details.as_ref().expect("details")["mcpTextOutput"]["artifact"]["path"]
             .as_str()
             .expect("artifact path");
         std::fs::read_to_string(path).expect("read complete text artifact")
@@ -660,10 +664,21 @@ mod tests {
         let (bytes, lines) = text_projection_size(&output.content);
         assert_eq!((bytes, lines), (3, 2), "empty tail follows a separator");
         let output = bound_tool_output_with_limits(
-            output, "mcp__docs__small", "small", lines, bytes, Some(&root),
+            output,
+            "mcp__docs__small",
+            "small",
+            lines,
+            bytes,
+            Some(&root),
         );
-        assert_eq!(serde_json::to_value(output).expect("serialize bounded"), before);
-        assert!(!root.exists(), "small results do not touch artifact storage");
+        assert_eq!(
+            serde_json::to_value(output).expect("serialize bounded"),
+            before
+        );
+        assert!(
+            !root.exists(),
+            "small results do not touch artifact storage"
+        );
     }
 
     #[test]
@@ -679,10 +694,16 @@ mod tests {
             {"type":"text", "text":"trailing text"}
         ]}));
         let _session = crate::tools::register_tool_output_artifact_session(
-            "mcp-preview-unicode", "mcp-preview-session",
+            "mcp-preview-unicode",
+            "mcp-preview-session",
         );
         let output = bound_tool_output_with_limits(
-            output, "mcp__docs__mixed", "mcp-preview-unicode", 100, 11, Some(root.path()),
+            output,
+            "mcp__docs__mixed",
+            "mcp-preview-unicode",
+            100,
+            11,
+            Some(root.path()),
         );
         assert!(!output.is_error);
         assert_eq!(output.content.len(), 5);
@@ -692,7 +713,10 @@ mod tests {
         assert!(matches!(&output.content[3], ContentBlock::Media(a) if a.data == audio));
         assert!(text(&output).contains("MCP text preview truncated"));
         assert!(!text(&output).contains("trailing text"));
-        assert_eq!(spilled_text(&output), "h\u{e9}llo\n\u{4e16}\u{754c}\ntrailing text");
+        assert_eq!(
+            spilled_text(&output),
+            "h\u{e9}llo\n\u{4e16}\u{754c}\ntrailing text"
+        );
         let diagnostic = &output.details.as_ref().expect("details")["mcpTextOutput"];
         assert_eq!(diagnostic["outputBytes"], 10);
         assert_eq!(diagnostic["truncatedBy"], "bytes");
@@ -710,7 +734,12 @@ mod tests {
             {"type":"text", "text":"second\nthird\n"}
         ]}));
         let output = bound_tool_output_with_limits(
-            output, "mcp__docs__lines", "lines", 3, 1000, Some(root.path()),
+            output,
+            "mcp__docs__lines",
+            "lines",
+            3,
+            1000,
+            Some(root.path()),
         );
         assert!(matches!(&output.content[0], ContentBlock::Text(t) if t.text == "first\n"));
         assert!(matches!(&output.content[1], ContentBlock::Image(_)));
@@ -720,7 +749,10 @@ mod tests {
         assert_eq!(diagnostic["truncatedBy"], "lines");
         assert_eq!(diagnostic["outputLines"], 3);
         assert_eq!(diagnostic["totalLines"], 4);
-        assert_eq!(diagnostic["artifact"]["spilloverReason"], "sourceTextExceededPreviewLimit");
+        assert_eq!(
+            diagnostic["artifact"]["spilloverReason"],
+            "sourceTextExceededPreviewLimit"
+        );
     }
 
     #[test]
@@ -736,7 +768,11 @@ mod tests {
             "isError":true
         });
         let output = bound_tool_output_with_limits(
-            tool_output(&result), "mcp__docs__structured", "structured", 100, 12,
+            tool_output(&result),
+            "mcp__docs__structured",
+            "structured",
+            100,
+            12,
             Some(root.path()),
         );
         assert!(output.is_error, "truncation retains the server's outcome");
@@ -758,9 +794,16 @@ mod tests {
         std::fs::write(&root, "keep").expect("root fixture");
         let output = bound_tool_output_with_limits(
             tool_output(&json!({"content":[{"type":"text", "text":"first\nsecond"}]})),
-            "mcp__docs__failed", "failed", 1, 1000, Some(&root),
+            "mcp__docs__failed",
+            "failed",
+            1,
+            1000,
+            Some(&root),
         );
-        assert!(!output.is_error, "storage does not change completed remote execution");
+        assert!(
+            !output.is_error,
+            "storage does not change completed remote execution"
+        );
         let visible = text(&output);
         assert!(visible.contains("Tool output artifact persistence failed"));
         assert!(!visible.contains("Full tool output artifact:"));
@@ -768,7 +811,10 @@ mod tests {
         let diagnostic = &output.details.as_ref().expect("details")["mcpTextOutput"];
         assert!(diagnostic.get("artifactError").is_some());
         assert!(diagnostic.get("artifact").is_none());
-        assert_eq!(std::fs::read_to_string(root).expect("root unchanged"), "keep");
+        assert_eq!(
+            std::fs::read_to_string(root).expect("root unchanged"),
+            "keep"
+        );
     }
 
     #[test]
@@ -777,10 +823,18 @@ mod tests {
         let mut output = tool_output(&json!({"content":[{"type":"text", "text":"long text"}]}));
         output.details = Some(json!({"mcpTextOutput":{"server":"exact value"}, "other":42}));
         let output = bound_tool_output_with_limits(
-            output, "mcp_context_docs", "collision", 10, 2, Some(root.path()),
+            output,
+            "mcp_context_docs",
+            "collision",
+            10,
+            2,
+            Some(root.path()),
         );
         let details = output.details.expect("details");
-        assert_eq!(details["mcpTextOutput"]["originalValue"], json!({"server":"exact value"}));
+        assert_eq!(
+            details["mcpTextOutput"]["originalValue"],
+            json!({"server":"exact value"})
+        );
         assert_eq!(details["other"], 42);
     }
 
@@ -789,9 +843,12 @@ mod tests {
         let root = tempfile::tempdir().expect("artifact root");
         let document = "document payload ".repeat(12);
         let outputs = [
-            super::super::resource_catalog_output(json!({"resources":[{
+            super::super::resource_catalog_output(
+                json!({"resources":[{
                 "uri":"repo://item", "name":"item", "description":document
-            }], "nextCursor":"continue", "_meta":{"private":"PRIVATE_CONTEXT_VALUE"}}), false),
+            }], "nextCursor":"continue", "_meta":{"private":"PRIVATE_CONTEXT_VALUE"}}),
+                false,
+            ),
             super::super::resource_read_output(&json!({"contents":[{
                 "uri":"repo://item", "text":document
             }], "_meta":{"private":"PRIVATE_CONTEXT_VALUE"}})),
@@ -809,7 +866,11 @@ mod tests {
             let original_text = text(&original);
             let original_details = original.details.clone().expect("original details");
             let output = bound_tool_output_with_limits(
-                original, "mcp_context_docs", &format!("context-{index}"), 10, 40,
+                original,
+                "mcp_context_docs",
+                &format!("context-{index}"),
+                10,
+                40,
                 Some(root.path()),
             );
             assert_eq!(spilled_text(&output), original_text);

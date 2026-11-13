@@ -542,17 +542,17 @@ impl Tool for McpContextTool {
                 let result = self.manager.read_resource(&self.server, &uri).await?;
                 resource_read_output(&result)
             }
-            McpContextAction::SubscribeResource { uri } => context_updates_output(
-                self.manager.subscribe_resource(&self.server, &uri).await?,
-            ),
+            McpContextAction::SubscribeResource { uri } => {
+                context_updates_output(self.manager.subscribe_resource(&self.server, &uri).await?)
+            }
             McpContextAction::UnsubscribeResource { uri } => context_updates_output(
                 self.manager
                     .unsubscribe_resource(&self.server, &uri)
                     .await?,
             ),
-            McpContextAction::PollUpdates {} => context_updates_output(
-                self.manager.poll_updates(&self.server).await?,
-            ),
+            McpContextAction::PollUpdates {} => {
+                context_updates_output(self.manager.poll_updates(&self.server).await?)
+            }
             McpContextAction::ReadResourceTemplate {
                 uri_template,
                 variables,
@@ -595,7 +595,11 @@ impl Tool for McpContextTool {
                 completion_output(result)
             }
         };
-        Ok(content::bound_tool_output(output, &self.mounted, tool_call_id))
+        Ok(content::bound_tool_output(
+            output,
+            &self.mounted,
+            tool_call_id,
+        ))
     }
 }
 
@@ -688,7 +692,7 @@ pub fn reconcile_tools(
 ) -> usize {
     manager.set_ask_tool(registry.snapshot().host_ask_tool());
     registry.bind_mcp_manager(manager);
-    registry.reconcile_mcp_tools(manager, mount_tools(manager))
+    registry.reconcile_mcp_tools(manager, mount_admitted_tools(manager))
 }
 
 /// Refresh stale catalogs at the provider-request boundary, including requests

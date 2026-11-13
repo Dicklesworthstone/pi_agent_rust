@@ -12,11 +12,11 @@ certification contract and its provenance-matched verdict.
 
 ```toml
 [dependencies]
-pi = { package = "pi_agent_rust", version = "0.2.0" }
+pi = { package = "pi_agent_rust", version = "0.8.0" }
 futures = "0.3"
 ```
 
-When developing against a local checkout, replace `version = "0.2.0"` with
+When developing against a local checkout, replace `version = "0.8.0"` with
 `path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
 ### Raise your crate's `recursion_limit`
@@ -41,13 +41,15 @@ integration tests needed the attribute, `examples/basic_sdk.rs` included.
 ## SemVer Surface
 
 The supported library surface is the crate root aliases `pi::Error`,
-`pi::PiResult`, and the `pi::sdk` module. Other root modules are implementation
-details for the CLI, examples, and in-repository tests; they are hidden from the
-published API documentation and may change without SemVer guarantees.
+`pi::PiResult`, and the `pi::sdk` module. Other root modules carry
+`#[doc(hidden)]` as implementation details for the CLI, examples, and
+in-repository tests; they are excluded from the supported API documentation and
+may change without SemVer guarantees.
 
-The `semver` GitHub Actions workflow runs `cargo-semver-checks` on PRs and
-`main` pushes that touch the SDK/API surface. It compares the current public
-API to the PR target branch or previous push baseline. An incompatible change
+GitHub Actions is permanently disabled for this repository (`docs/releasing.md`);
+SemVer compatibility for `pi::sdk` is audited locally (`cargo-semver-checks`) and
+gated through the Doodlestein Self-Releaser (`dsr`) quality and release lane.
+An incompatible change
 to a stable item requires a SemVer-incompatible bump (`0.y` to `0.(y+1)` before
 1.0, or a major-version bump after 1.0). Only semver-compatible additions
 remain compatible; adding public enum variants or required struct fields can
@@ -64,7 +66,7 @@ be breaking for Rust consumers.
 | `pi::sdk::{Agent, AgentConfig, AgentEvent, AgentSession, QueueMode}` | Stable | In-process agent/session integration exports. |
 | `pi::sdk::{AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, MediaContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage}` | Stable | Message, content, streaming, and accounting model types. |
 | `pi::sdk::{Config, ExtensionManager, ExtensionPolicy, ExtensionRegion, Session, ThinkingLevel}` | Stable | Configuration, extension, session, and thinking-control exports. |
-| `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}` | Stable | Provider integration exports. |
+| `pi::sdk::{InputType, Model, ModelCost, Provider, ProviderCapabilities, ProviderContext, ProviderThinkingBudgets, StreamOptions, ToolDef}` | Stable | Provider integration and capability metadata exports. |
 | `pi::sdk::{ModelEntry, ModelRegistry}` | Stable | Model registry exports. |
 | `pi::sdk::{Tool, ToolDefinition, ToolOutput, ToolRegistry, ToolUpdate}` | Stable | Tool integration exports. |
 | `pi::sdk::BUILTIN_TOOL_NAMES` | Stable | Canonical default non-delegating tool-name inventory; opt-in `subagent` is separate. |

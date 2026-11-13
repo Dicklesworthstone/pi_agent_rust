@@ -304,6 +304,20 @@ fn lifecycle_state_after_model_switch() {
     let options = test_session_options(&harness);
 
     let mut handle = run_async(create_agent_session(options)).expect("create session");
+    let mut auth = pi::auth::AuthStorage::empty_at(harness.temp_path("auth.json"));
+    auth.set(
+        "anthropic",
+        pi::auth::AuthCredential::ApiKey {
+            key: "test-anthropic-key".to_string(),
+        },
+    );
+    auth.set(
+        "openai",
+        pi::auth::AuthCredential::ApiKey {
+            key: "test-openai-key".to_string(),
+        },
+    );
+    handle.adopt_auth_storage(auth);
     let (state_before, state_after) = run_async(async move {
         let state_before = handle.state().await?;
         handle.set_model("openai", "gpt-4o").await?;

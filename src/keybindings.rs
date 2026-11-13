@@ -1219,31 +1219,13 @@ pub fn format_hotkeys_for_ftui(keybindings: &KeyBindings) -> String {
 
 /// Checks whether an action is currently unrouted/inert on the FTUI interactive stack.
 ///
-/// The session and session-picker actions belong to the classic stack's
-/// picker and branch navigation. FTUI's `/resume` is a plain filtered list
-/// and it has no sibling-branch keys (nor does OMP), so `/hotkeys` there
-/// advertised ctrl+shift+left/right and the picker's ctrl+p/s/n/d to no
-/// effect.
+/// All `AppAction` variants in the shared keybinding catalog are now routed on
+/// the FTUI stack (including kill-ring yank/yank-pop, selection copy, sibling
+/// branch navigation, session actions, and `/resume` picker toggles/actions).
 #[must_use]
 pub const fn is_inert_on_ftui(action: AppAction) -> bool {
-    matches!(
-        action,
-        AppAction::Copy
-            | AppAction::Yank
-            | AppAction::YankPop
-            | AppAction::NewSession
-            | AppAction::Tree
-            | AppAction::Fork
-            | AppAction::BranchPicker
-            | AppAction::BranchNextSibling
-            | AppAction::BranchPrevSibling
-            | AppAction::ToggleSessionPath
-            | AppAction::ToggleSessionSort
-            | AppAction::ToggleSessionNamedFilter
-            | AppAction::RenameSession
-            | AppAction::DeleteSession
-            | AppAction::DeleteSessionNoninvasive
-    )
+    let _ = action;
+    false
 }
 
 /// Complete keybindings configuration.
@@ -3320,15 +3302,20 @@ mod tests {
             assert!(ftui_hotkeys.contains("Clear editor"));
 
             assert!(ftui_hotkeys.contains("Open settings"));
-            // Inert actions on FTUI are omitted:
-            assert!(!ftui_hotkeys.contains("Copy selection"));
-            assert!(!ftui_hotkeys.contains("Switch to next sibling branch"));
-            assert!(!ftui_hotkeys.contains("Switch to previous sibling branch"));
-            assert!(!ftui_hotkeys.contains("Session Picker"));
-            // The classic list still has them.
+            // Newly wired actions on FTUI now appear in `/hotkeys`:
+            assert!(ftui_hotkeys.contains("Copy selection"));
+            assert!(ftui_hotkeys.contains("Switch to next sibling branch"));
+            assert!(ftui_hotkeys.contains("Switch to previous sibling branch"));
+            assert!(ftui_hotkeys.contains("Session Picker"));
             assert!(format_hotkeys(&bindings).contains("Switch to next sibling branch"));
             // Routed: the pasted image becomes an `@file` attachment.
             assert!(ftui_hotkeys.contains("Paste image from clipboard"));
+            for action in AppAction::all() {
+                assert!(
+                    !is_inert_on_ftui(*action),
+                    "expected {action:?} to be routed on FTUI"
+                );
+            }
         }
     }
 }

@@ -5063,7 +5063,15 @@ mod tests {
                     .collect::<String>()
             };
             let follow_up = if codex {
-                ndjson_body_from_events(&[completed_response_event()])
+                ndjson_body_from_events(&[
+                    json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_1",
+                        "content_index": 0,
+                        "delta": "ok",
+                    }),
+                    completed_response_event(),
+                ])
             } else {
                 success_sse_body()
             };
@@ -7738,13 +7746,13 @@ mod tests {
                         let Some(StreamEvent::Done { message, .. }) = events.last() else {
                             panic!("expected completed bill for {mode:?}/{case}");
                         };
-                        if case != "unpriced" {
+                        if case == "unpriced" {
+                            assert!(!message.usage.has_explicit_billing());
+                            assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
+                        } else {
                             assert_eq!(message.usage.cost.total, expected);
                             assert!(message.usage.has_explicit_billing());
                             fixture.budget.admit().unwrap();
-                        } else {
-                            assert!(!message.usage.has_explicit_billing());
-                            assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
                         }
                         assert_eq!(fixture.budget.spent(), expected);
                         assert_eq!(fixture.budget.snapshot().pending, 0.0);
@@ -7893,7 +7901,8 @@ mod tests {
                         };
                         assert!(matches!(
                             message.usage.billing.as_ref(),
-                            Some(BillingUsage::ReportedTotal { total }) if *total == 2.5
+                            Some(BillingUsage::ReportedTotal { total })
+                                if (*total - 2.5).abs() < f64::EPSILON
                         ));
                         assert_eq!(message.usage.cost.total, 2.5);
                         assert_eq!(fixture.budget.spent(), 2.5);

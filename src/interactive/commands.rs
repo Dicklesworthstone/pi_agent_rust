@@ -198,6 +198,7 @@ pub enum SlashCommand {
     Crash,
     Btw,
     Tan,
+    Web,
 }
 
 impl SlashCommand {
@@ -264,6 +265,7 @@ impl SlashCommand {
             Self::Crash => "/crash",
             Self::Omfg => "/omfg",
             Self::Commit => "/commit",
+            Self::Web => "/web",
         }
     }
 
@@ -325,6 +327,7 @@ impl SlashCommand {
         Self::Crash,
         Self::Omfg,
         Self::Commit,
+        Self::Web,
     ];
 
     /// Parse a slash command from input.
@@ -387,6 +390,7 @@ impl SlashCommand {
             "/crash" => Self::Crash,
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
+            "/web" => Self::Web,
             _ => return None,
         };
 
@@ -445,6 +449,7 @@ impl SlashCommand {
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
   /usage [refresh]   - Show provider usage/quota state
+  /web               - Browser companion (requires FrankenTUI; run without --classic)
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2225,6 +2230,19 @@ impl PiApp {
             SlashCommand::Thinking => self.handle_slash_thinking(args),
             SlashCommand::Fast => self.handle_slash_fast(args),
             SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
+            SlashCommand::Web => {
+                let msg = "Browser companion (/web) requires FrankenTUI; restart without --classic (`pi web`)"
+                    .to_string();
+                self.status_message = Some(msg.clone());
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: msg,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                None
+            }
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
                 self.messages.push(ConversationMessage {
@@ -7000,13 +7018,13 @@ mod tests {
         let extension = directory.path().join("live-model.mjs");
         std::fs::write(
             &extension,
-            r#"
+            r"
             export default function(pi) {
                 pi.registerCommand('publish-model', { handler: raw => {
                     pi.registerProvider('live-classic', JSON.parse(raw));
                 }});
             }
-            "#,
+            ",
         )
         .unwrap();
         let session = Arc::new(Mutex::new(Session::in_memory()));
@@ -7027,7 +7045,7 @@ mod tests {
             app.extensions = Some(manager.clone());
             let mut original_provider = None;
             for revision in [1, 2] {
-                let spec = json!({
+                let spec = serde_json::json!({
                     "api": "openai-completions",
                     "baseUrl": format!("https://revision-{revision}.example.test/v1"),
                     "apiKey": "classic-metadata-fixture-key",
@@ -7124,8 +7142,15 @@ mod tests {
             assert!(error.contains("unknown provider/model live-classic/chat"));
             assert_eq!(session.try_lock().unwrap().entries.len(), entries);
             assert_eq!(app.model_entry.model.name, "Revision 2");
-            let mut agent = app.agent.try_lock().unwrap();
-            assert!(Arc::ptr_eq(&rebound, &agent.provider()));
+            assert!(Arc::ptr_eq(
+                &rebound,
+                &app.agent.try_lock().unwrap().provider()
+            ));
+            let agent = Arc::try_unwrap(app.agent)
+                .ok()
+                .expect("sole InteractiveAgent owner")
+                .into_inner()
+                .expect("unpoisoned mutex");
             assert!(
                 agent
                     .handle
@@ -7770,9 +7795,24 @@ mod tests {
         app: &mut PiApp,
         auth_path: &Path,
     ) -> (String, u16, crate::agent::AbortSignal) {
+        static NEXT_CALLBACK_TEST_PORT: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(21000);
         let attempt_id = app.begin_login_attempt(auth_path).expect("login attempt");
-        let (server, redirect_uri) =
-            crate::auth::start_oauth_callback_server_random_port().expect("callback listener");
+        // Bind outside Linux's ephemeral outbound port range (32768..60999) so
+        // concurrent test clients cannot steal the released port before the
+        // immediate re-bind assertion in `login_cancel_command_quit_and_drop...`.
+        let (server, redirect_uri) = (0..2048u16)
+            .find_map(|_| {
+                let raw =
+                    NEXT_CALLBACK_TEST_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let candidate = 20000 + (raw % 10000);
+                let uri = format!("http://localhost:{candidate}/callback");
+                crate::auth::start_oauth_callback_server(&uri)
+                    .ok()
+                    .map(|srv| (srv, uri))
+            })
+            .or_else(|| crate::auth::start_oauth_callback_server_random_port().ok())
+            .expect("callback listener");
         let port = server.port;
         let attempt = app.login_attempt.as_mut().expect("login owner");
         let signal = attempt.control.signal();

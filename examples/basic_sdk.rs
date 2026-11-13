@@ -48,7 +48,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pi::sdk::{AgentEvent, AgentSessionHandle, ContentBlock, SessionOptions, create_agent_session};
+use pi::sdk::{
+    AgentCx, AgentEvent, AgentSessionHandle, ApprovalMode, ApprovalState, AssistantMessageEvent,
+    ContentBlock, PlanChange, PlanMode, PlanPersistence, SessionOptions, SessionPlanReview,
+    create_agent_session,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the async runtime (pi uses asupersync, not tokio).
@@ -99,8 +103,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if invocation != Invocation::Demo {
         // Plan submission and tool approval are separate decisions. Keep file
         // mutation denied until this example's explicit human confirmation.
-        options.approval_state = Some(pi::approval::ApprovalState::new(
-            pi::approval::ApprovalMode::AlwaysAsk,
+        options.approval_state = Some(ApprovalState::new(
+            ApprovalMode::AlwaysAsk,
             false,
             Vec::new(),
         ));
@@ -166,15 +170,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .prompt("What is 2 + 2? Reply in one sentence.", |event| {
             match &event {
                 AgentEvent::MessageUpdate {
-                    assistant_message_event,
+                    assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
                     ..
                 } => {
                     // Print streaming text deltas to stderr as they arrive.
-                    use pi::model::AssistantMessageEvent;
-                    if let AssistantMessageEvent::TextDelta { delta, .. } = assistant_message_event
-                    {
-                        eprint!("{delta}");
-                    }
+                    eprint!("{delta}");
                 }
                 AgentEvent::ToolExecutionStart { tool_name, .. } => {
                     eprintln!("\n[event] executing tool: {tool_name}");
@@ -416,8 +416,8 @@ async fn print_session_path(handle: &AgentSessionHandle) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn check_plan_change(change: &pi::plan::PlanChange) -> Result<(), std::io::Error> {
-    if let pi::plan::PlanPersistence::Unconfirmed { reason } = &change.persistence {
+fn check_plan_change(change: &PlanChange) -> Result<(), std::io::Error> {
+    if let PlanPersistence::Unconfirmed { reason } = &change.persistence {
         return Err(std::io::Error::other(format!(
             "Live plan state is {:?}, but saving was not confirmed: {reason}",
             change.mode,
@@ -431,7 +431,7 @@ async fn run_reviewed_plan(
     invocation: &Invocation,
     expected_resume: Option<&ResumeIdentity>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let owner = pi::agent_cx::AgentCx::for_current_or_request();
+    let owner = AgentCx::for_current_or_request();
     match invocation {
         Invocation::Plan { task, .. } => {
             check_plan_change(&handle.enter_plan_mode(&owner).await?)?;
@@ -454,8 +454,8 @@ async fn run_reviewed_plan(
             check_plan_change(&restored)?;
             print_session_path(handle).await?;
             match restored.mode {
-                pi::plan::PlanMode::PendingApproval => {}
-                pi::plan::PlanMode::Planning => {
+                PlanMode::PendingApproval => {}
+                PlanMode::Planning => {
                     let draft = handle
                         .session()
                         .agent
@@ -468,13 +468,13 @@ async fn run_reviewed_plan(
                          Do not execute the plan.\n\n{draft}"
                     ), |_| {}).await?;
                 }
-                pi::plan::PlanMode::Off => {
+                PlanMode::Off => {
                     println!(
                         "This saved plan was exited. No provider turn or execution was started."
                     );
                     return Ok(());
                 }
-                pi::plan::PlanMode::Approved => {
+                PlanMode::Approved => {
                     return Err(io::Error::other(
                         "recovery unexpectedly granted approval; execution refused",
                     )
@@ -493,8 +493,8 @@ async fn run_reviewed_plan(
     review_and_execute(handle, &owner, &review).await
 }
 
-fn check_checkpoint(persistence: pi::plan::PlanPersistence) -> Result<(), io::Error> {
-    if let pi::plan::PlanPersistence::Unconfirmed { reason } = persistence {
+fn check_checkpoint(persistence: PlanPersistence) -> Result<(), io::Error> {
+    if let PlanPersistence::Unconfirmed { reason } = persistence {
         return Err(io::Error::other(format!(
             "Plan remains live, but checkpoint saving was not confirmed: {reason}"
         )));
@@ -537,8 +537,8 @@ fn read_decision(input: impl io::BufRead) -> Result<ReviewDecision, io::Error> {
 
 async fn review_and_execute(
     handle: &mut AgentSessionHandle,
-    owner: &pi::agent_cx::AgentCx,
-    review: &pi::plan::SessionPlanReview,
+    owner: &AgentCx,
+    review: &SessionPlanReview,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
     println!("\n--- Exact submitted plan (control characters escaped) ---");
@@ -755,7 +755,6 @@ mod tests {
 
     #[test]
     fn unconfirmed_save_prevents_execution_while_acknowledging_the_live_decision() {
-        use pi::plan::{PlanChange, PlanMode, PlanPersistence};
         for persistence in [
             PlanPersistence::Saved,
             PlanPersistence::MemoryOnly,

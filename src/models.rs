@@ -1770,6 +1770,35 @@ pub(crate) fn model_entry_is_ready(entry: &ModelEntry) -> bool {
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+pub(crate) fn refresh_entries_stored_credentials(
+    entries: &mut [ModelEntry],
+    previous: Option<&AuthStorage>,
+    next: &AuthStorage,
+) {
+    let mut prev_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut next_cache: HashMap<String, Option<String>> = HashMap::new();
+    for entry in entries {
+        let provider = entry.model.provider.clone();
+        let canonical = canonical_provider_key(&provider);
+        let prev_resolved = prev_cache
+            .entry(canonical.clone())
+            .or_insert_with(|| {
+                previous
+                    .and_then(|auth| normalize_api_key_opt(auth.resolve_api_key(&provider, None)))
+            })
+            .clone();
+        let next_resolved = next_cache
+            .entry(canonical)
+            .or_insert_with(|| normalize_api_key_opt(next.resolve_api_key(&provider, None)))
+            .clone();
+        let current = normalize_api_key_opt(entry.api_key.clone());
+        // ubs:ignore[rust.security.constant-time-compare] Local credential cache synchronization, not authentication verification.
+        if current.is_none() || current == prev_resolved {
+            entry.api_key = next_resolved;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelRegistryLoadMode {
     Full,
@@ -1991,6 +2020,18 @@ impl ModelRegistry {
 
     pub fn get_available(&self) -> Vec<ModelEntry> {
         self.available_models().into_iter().cloned().collect()
+    }
+
+    /// Synchronize cached `ModelEntry::api_key` values with a newly adopted
+    /// [`AuthStorage`] (`/login` or `/logout`), preserving inline `models.json`
+    /// keys that did not originate from `previous` while clearing logged-out
+    /// keys and populating newly logged-in keys.
+    pub(crate) fn refresh_stored_credentials(
+        &mut self,
+        previous: Option<&AuthStorage>,
+        next: &AuthStorage,
+    ) {
+        refresh_entries_stored_credentials(&mut self.models, previous, next);
     }
 
     /// Refresh admitted choices without replacing their order or declared
@@ -11323,7 +11364,12 @@ mod tests {
         let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         for m in models.iter().filter(|m| m.model.provider == "openai") {
             assert!(m.auth_header, "openai uses Authorization header");
-            assert_eq!(m.model.api, "openai-responses");
+            let expected_api = if m.model.id == "gpt-audio-1.5" {
+                "openai-completions"
+            } else {
+                "openai-responses"
+            };
+            assert_eq!(m.model.api, expected_api);
         }
     }
 

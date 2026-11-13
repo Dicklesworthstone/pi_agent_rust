@@ -52,7 +52,6 @@ fn actionable_events_use_full_timeout() {
     // changes to the tool result content.
     let actionable_events = [
         ExtensionEventName::Input,
-        ExtensionEventName::BeforeAgentStart,
         ExtensionEventName::Context,
         ExtensionEventName::ToolCall,
         ExtensionEventName::ToolResult,
@@ -72,6 +71,13 @@ fn actionable_events_use_full_timeout() {
             "{event} should use the full default timeout"
         );
     }
+    // GH #279: BeforeAgentStart is actionable and uses the dedicated extended
+    // startup timeout budget.
+    assert!(!ExtensionEventName::BeforeAgentStart.is_informational());
+    assert_eq!(
+        ExtensionEventName::BeforeAgentStart.default_timeout_ms(),
+        EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
+    );
 }
 
 #[test]

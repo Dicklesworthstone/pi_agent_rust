@@ -1,9 +1,10 @@
 //! CLI argument parsing using Clap.
 
 use clap::error::ErrorKind;
-use clap::{Parser, Subcommand};
-use std::collections::HashSet;
+use clap::{CommandFactory, Parser, Subcommand};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCliFlag {
@@ -65,95 +66,54 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
-    let (takes_value, optional_value) = match name {
-        "version"
-        | "continue"
-        | "resume"
-        | "no-session"
-        | "no-migrations"
-        | "no-mouse-capture"
-        | "print"
-        | "rpc"
-        | "acp"
-        | "verbose"
-        | "no-tools"
-        | "no-implicit-tools"
-        | "no-mcp"
-        | "no-extensions"
-        | "plan-mode"
-        | "plan-yolo"
-        | "prewalk"
-        | "no-prewalk"
-        | "yolo"
-        | "auto-approve"
-        | "explain-extension-policy"
-        | "explain-repair-policy"
-        | "no-skills"
-        | "no-context-files"
-        // bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1: the pre-parser
-        // must pass these through to clap — any top-level long missing from
-        // this match gets silently diverted to extension-flag extraction.
-        | "crash-test"
-        | "profile"
-        | "no-prompt-templates"
-        | "no-themes"
-        | "list-providers"
-        | "refresh-models"
-        | "persist-models"
-        | "trust"
-        // ftui migration flags (bd-cv653.9.1). Listed unconditionally: on
-        // non-ftui builds clap still rejects them with a proper error instead
-        // of the pre-parser silently diverting them to extension flags.
-        | "ftui"
-        | "classic"
-        | "classic-tui"
-        | "charmed"
-        | "bubbletea"
-        | "inline"
-        | "hide-cwd-in-prompt" => (false, false),
-        "provider"
-        | "model"
-        | "api-key"
-        | "models"
-        | "smol"
-        | "slow"
-        | "plan"
-        | "advisor"
-        | "warn-cost"
-        | "max-cost"
-        | "prewalk-into"
-        | "subagent-fallback-policy"
-        | "approval-mode"
-        | "thinking"
-        | "system-prompt"
-        | "append-system-prompt"
-        | "session"
-        | "session-workdir"
-        | "session-dir"
-        | "add-dir"
-        | "session-durability"
-        | "mode"
-        | "tools"
-        | "extension"
-        | "mcp-config"
-        | "extension-policy"
-        | "repair-policy"
-        | "skill"
-        | "prompt-template"
-        | "theme"
-        | "theme-path"
-        | "max-tool-iterations"
-        | "max-time"
-        | "request-timeout"
-        | "export"
-        | "fetch-models" => (true, false),
-        "list-models" => (true, true),
-        _ => return None,
-    };
-    Some(LongOptionSpec {
-        takes_value,
-        optional_value,
-    })
+    static KNOWN_LONG_OPTIONS: OnceLock<HashMap<String, LongOptionSpec>> = OnceLock::new();
+    let specs = KNOWN_LONG_OPTIONS.get_or_init(|| {
+        let mut map = HashMap::new();
+        // ftui migration flags (bd-cv653.9.1) + help: listed unconditionally so
+        // on non-ftui builds clap still rejects `--ftui` / `--inline` with a
+        // proper error instead of silently diverting them to extension flags,
+        // and `--my-ext-flag --help` preserves `--help` for Clap.
+        for always_known_bool in [
+            "help",
+            "ftui",
+            "classic",
+            "classic-tui",
+            "charmed",
+            "bubbletea",
+            "inline",
+        ] {
+            map.insert(
+                always_known_bool.to_string(),
+                LongOptionSpec {
+                    takes_value: false,
+                    optional_value: false,
+                },
+            );
+        }
+
+        let cmd = <Cli as CommandFactory>::command();
+        for arg in cmd.get_arguments() {
+            let takes_value = arg.get_action().takes_values();
+            let optional_value = takes_value
+                && arg
+                    .get_num_args()
+                    .is_some_and(|range| range.min_values() == 0);
+            let spec = LongOptionSpec {
+                takes_value,
+                optional_value,
+            };
+            if let Some(long) = arg.get_long() {
+                map.insert(long.to_string(), spec);
+            }
+            if let Some(aliases) = arg.get_all_aliases() {
+                for alias in aliases {
+                    map.insert(alias.to_string(), spec);
+                }
+            }
+        }
+        map
+    });
+    specs.get(name).copied()
 }
 
 fn is_known_short_flag(token: &str) -> bool {
@@ -286,13 +246,32 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
             index += 1;
             continue;
         }
-        if ROOT_SUBCOMMANDS.contains(&token.as_str()) {
+        if is_root_subcommand_or_alias(token) {
             in_subcommand = true;
         }
         filtered.push(token.clone());
         index += 1;
     }
     (filtered, extracted)
+}
+
+fn is_root_subcommand_or_alias(token: &str) -> bool {
+    use clap::CommandFactory as _;
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+
+    static SUBCOMMANDS: OnceLock<HashSet<String>> = OnceLock::new();
+    let names = SUBCOMMANDS.get_or_init(|| {
+        let mut set = HashSet::new();
+        for subcommand in Cli::command().get_subcommands() {
+            set.insert(subcommand.get_name().to_string());
+            for alias in subcommand.get_all_aliases() {
+                set.insert(alias.to_string());
+            }
+        }
+        set
+    });
+    names.contains(token)
 }
 
 pub fn parse_with_extension_flags(raw_args: Vec<String>) -> Result<ParsedCli, clap::Error> {
@@ -1608,6 +1587,55 @@ mod tests {
             missing.is_empty(),
             "top-level Clap options missing from extension pre-parser: {missing:?}"
         );
+    }
+
+    #[test]
+    fn command_factory_preparser_preserves_arity_subcommands_and_unknown_extension_flags() {
+        let wait_spec = known_long_option("wait-async").expect("wait-async derived from Clap");
+        assert!(!wait_spec.takes_value && !wait_spec.optional_value);
+        let model_spec = known_long_option("model").expect("model derived from Clap");
+        assert!(model_spec.takes_value && !model_spec.optional_value);
+        let list_models_spec =
+            known_long_option("list-models").expect("list-models derived from Clap");
+        assert!(list_models_spec.takes_value && list_models_spec.optional_value);
+        assert!(known_long_option("unknown-ext-flag").is_none());
+
+        // Mixed native `--wait-async` + unknown `--custom-ext=42` flag:
+        let mixed = parse_with_extension_flags(
+            [
+                "pi",
+                "-p",
+                "--wait-async",
+                "--custom-ext=42",
+                "check background jobs",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("mixed wait-async + extension flag");
+        assert!(mixed.cli.wait_async);
+        assert_eq!(
+            mixed.extension_flags,
+            vec![ExtensionCliFlag {
+                name: "custom-ext".to_string(),
+                value: Some("42".to_string()),
+            }]
+        );
+
+        // Subcommand options (`doctor --only`) must never be extracted as extension flags:
+        let doctor_parsed = parse_with_extension_flags(
+            ["pi", "doctor", "--only", "config"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("doctor --only subcommand");
+        assert!(doctor_parsed.extension_flags.is_empty());
+        assert!(matches!(
+            doctor_parsed.cli.command,
+            Some(Commands::Doctor { .. })
+        ));
     }
 
     #[test]
@@ -3325,6 +3353,7 @@ pub enum Commands {
     },
 
     /// Start the local TUI with a supervised browser companion or live terminal view
+    #[command(visible_alias = "web-remote")]
     Web {
         /// Mirror the live fullscreen terminal; remote control requires local approval
         #[arg(long)]
@@ -3332,8 +3361,8 @@ pub enum Commands {
         /// Port to bind web server (default: 8080)
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Network binding; tailscale and lan require --terminal and a local terminal
-        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan"])]
+        /// Network binding; tailscale and lan require --terminal and TLS (or --allow-insecure-lan)
+        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan", "127.0.0.1", "localhost", "0.0.0.0", "all", "tailnet"])]
         bind: String,
         /// Offer viewing only; otherwise prompts or terminal control require local approval
         #[arg(long)]
@@ -3341,6 +3370,15 @@ pub enum Commands {
         /// Maximum connected viewers: 1-16, or 1-64 with --terminal (default: 4)
         #[arg(long, default_value_t = 4)]
         max_viewers: usize,
+        /// PEM certificate chain path for HTTPS/WSS (required on non-loopback bindings unless --allow-insecure-lan is passed)
+        #[arg(long, value_name = "PATH")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key path for HTTPS/WSS (required on non-loopback bindings unless --allow-insecure-lan is passed)
+        #[arg(long, value_name = "PATH")]
+        tls_key: Option<PathBuf>,
+        /// Explicitly permit cleartext HTTP/WS on non-loopback bindings (LAN/Tailscale) without TLS
+        #[arg(long)]
+        allow_insecure_lan: bool,
     },
 
     /// Visual component gallery harness (bd-cv653.9.10)

@@ -620,6 +620,174 @@ impl AdmittedSql {
             )
         )
     }
+
+    fn normalized_sql<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        let has_text_busy_timeout = self.statements.iter().any(|tokens| {
+            tokens.first().and_then(Token::word) == Some("pragma")
+                && tokens
+                    .get(1)
+                    .and_then(Token::name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("busy_timeout"))
+                && matches!(tokens.get(3), Some(Token::Text(_)))
+        });
+        if !has_text_busy_timeout {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        let slices = split_sql_statement_slices(sql);
+        if slices.len() != self.statements.len() {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        let rewritten = slices
+            .into_iter()
+            .zip(&self.statements)
+            .map(|(slice, tokens)| {
+                if tokens.first().and_then(Token::word) == Some("pragma")
+                    && tokens
+                        .get(1)
+                        .and_then(Token::name)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("busy_timeout"))
+                {
+                    if tokens.len() == 2 {
+                        return "PRAGMA busy_timeout".to_string();
+                    }
+                    if let Some(ms) = tokens
+                        .get(3)
+                        .and_then(Token::name)
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        return format!("PRAGMA busy_timeout = {ms}");
+                    }
+                }
+                slice.trim().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        std::borrow::Cow::Owned(rewritten)
+    }
+}
+
+fn split_sql_statement_slices(sql: &str) -> Vec<&str> {
+    let mut slices = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b';' => {
+                let slice = sql[start..i].trim();
+                if !slice.is_empty() {
+                    slices.push(slice);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        slices.push(tail);
+    }
+    slices
+}
+
+async fn dml_returning_column_names(
+    conn: &Connection,
+    stmt: Option<&SqlStatement>,
+) -> NativeResult<Vec<String>> {
+    let (table_name, returning) = match stmt {
+        Some(SqlStatement::Insert(ins)) => (ins.table.name.as_str(), ins.returning.as_slice()),
+        Some(SqlStatement::Update(upd)) => (upd.table.name.name.as_str(), upd.returning.as_slice()),
+        Some(SqlStatement::Delete(del)) => (del.table.name.name.as_str(), del.returning.as_slice()),
+        _ => return Ok(Vec::new()),
+    };
+    if returning.is_empty() {
+        return Ok(Vec::new());
+    }
+    let needs_star = returning.iter().any(|col| {
+        matches!(
+            col,
+            fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_)
+        )
+    });
+    let table_cols = if needs_star {
+        let escaped = table_name.replace('"', "\"\"");
+        let rows = conn
+            .query(&format!("PRAGMA table_info(\"{escaped}\")"))
+            .await
+            .map_err(SqliteFailure::from)?;
+        rows.into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(SqliteValue::Text(name)) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut cols = Vec::with_capacity(returning.len().max(table_cols.len()));
+    for (idx, col) in returning.iter().enumerate() {
+        match col {
+            fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_) => {
+                cols.extend(table_cols.iter().cloned());
+            }
+            fsqlite_ast::ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => {
+                cols.push(alias.clone());
+            }
+            fsqlite_ast::ResultColumn::Expr {
+                expr: fsqlite_ast::Expr::Column(col_ref, _),
+                alias: None,
+            } => {
+                cols.push(col_ref.column.to_string());
+            }
+            fsqlite_ast::ResultColumn::Expr { alias: None, .. } => {
+                cols.push(format!("column{}", idx + 1));
+            }
+        }
+    }
+    Ok(cols)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1622,14 +1790,20 @@ async fn execute_request(
     match request {
         Request::Prepare { sql, .. } => {
             let admitted = admit_sql(&sql, true)?;
+            let exec_sql = admitted.normalized_sql(&sql);
             let columns = if admitted.uses_native_prepare() {
                 budget.reserve_database(database, true)?;
-                database
+                let mut cols = database
                     .conn
-                    .prepare(&sql)
+                    .prepare(exec_sql.as_ref())
                     .await
                     .map_err(SqliteFailure::from)?
-                    .column_names()
+                    .column_names();
+                if cols.is_empty() && admitted.is_dml() {
+                    cols =
+                        dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
+                }
+                cols
             } else {
                 // DDL/control syntax was parsed above, with no mutations.
                 // Those statements produce no result columns; native engine
@@ -1645,6 +1819,7 @@ async fn execute_request(
             ..
         } => {
             let admitted = admit_sql(&sql, true)?;
+            let exec_sql = admitted.normalized_sql(&sql);
             budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
             if !admitted.uses_native_prepare() {
@@ -1654,13 +1829,13 @@ async fn execute_request(
                     // dispatcher does not publish that source in 0.4.10.
                     database
                         .conn
-                        .execute(&sql)
+                        .execute(exec_sql.as_ref())
                         .await
                         .map_err(SqliteFailure::from)?;
                 } else {
                     database
                         .conn
-                        .execute_with_params(&sql, &params)
+                        .execute_with_params(exec_sql.as_ref(), &params)
                         .await
                         .map_err(SqliteFailure::from)?;
                 }
@@ -1673,7 +1848,7 @@ async fn execute_request(
             budget.reserve_database(database, true)?;
             let statement = database
                 .conn
-                .prepare(&sql)
+                .prepare(exec_sql.as_ref())
                 .await
                 .map_err(SqliteFailure::from)?;
             if matches!(mode, QueryMode::Run) {
@@ -1683,7 +1858,11 @@ async fn execute_request(
                     .map_err(SqliteFailure::from)?;
                 return change_result(database, budget).await;
             }
-            let columns = statement.column_names();
+            let mut columns = statement.column_names();
+            if columns.is_empty() && admitted.is_dml() {
+                columns =
+                    dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
+            }
             let mut bytes = serde_json::to_vec(&columns)
                 .map_err(|error| error.to_string())?
                 .len()
@@ -1747,7 +1926,11 @@ async fn execute_request(
                 // This API also applies the engine's DQS rewrites and error
                 // offsets. Its for_each variant omits those wrappers, while
                 // materializing DML rows in exactly the same way.
-                match database.conn.query_with_params(&sql, &params).await {
+                match database
+                    .conn
+                    .query_with_params(exec_sql.as_ref(), &params)
+                    .await
+                {
                     Ok(native_rows) => native_rows.iter().try_for_each(&mut accept),
                     Err(error) => {
                         preserve_native_constraint = is_native_constraint_error(&error);
@@ -1790,9 +1973,10 @@ async fn execute_request(
             });
             budget.reserve_database(database, may_prepare)?;
             if !admitted.statements.is_empty() {
+                let exec_sql = admitted.normalized_sql(&sql);
                 database
                     .conn
-                    .execute_batch(&sql)
+                    .execute_batch(exec_sql.as_ref())
                     .await
                     .map_err(SqliteFailure::from)?;
             }

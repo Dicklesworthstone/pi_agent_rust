@@ -400,9 +400,9 @@ fn pending_and_interrupted_cost_registration_fence_escaped_provider_handles() {
                 // Stage a real first journal acknowledgement, leaving only
                 // its durable registration receipt to be saved. The lock
                 // below now blocks that second protocol stage specifically.
-                let owner = pi::agent_cx::AgentCx::for_testing_with_io();
+                let test_cx = pi::agent_cx::AgentCx::for_testing_with_io();
                 budget
-                    .acknowledge_saved_session(&stored, owner.cx())
+                    .acknowledge_saved_session(&stored, test_cx.cx())
                     .unwrap();
             }
             let baseline = std::fs::read(&path).unwrap();

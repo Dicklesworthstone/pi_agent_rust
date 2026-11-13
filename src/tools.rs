@@ -6795,6 +6795,20 @@ impl ToolRegistry {
         }
     }
 
+    pub(crate) fn reuse_generated_dispatcher_from(&mut self, other: &Self) {
+        if let (Some(self_gen), Some(other_gen)) = (
+            self.generated_dispatcher.as_ref(),
+            other.generated_dispatcher.as_ref(),
+        ) && self_gen.discoverable() == other_gen.discoverable()
+        {
+            let owned: Arc<dyn Tool> = self_gen.clone();
+            if let Some(index) = self.tools.iter().position(|tool| Arc::ptr_eq(tool, &owned)) {
+                self.tools[index] = other_gen.clone();
+                self.generated_dispatcher = Some(other_gen.clone());
+            }
+        }
+    }
+
     /// Names + one-liners of currently discoverable tools (for the
     /// system-prompt index).
     #[must_use]
@@ -7722,6 +7736,12 @@ fn notebook_source_read_output(
     mut details: serde_json::Value,
 ) -> Result<ToolOutput> {
     if source.len() > crate::notebook::MAX_NOTEBOOK_BYTES {
+        if input.rendered {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+            ));
+        }
         return Err(Error::tool(
             "read",
             "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit",
@@ -8179,6 +8199,12 @@ impl Tool for ReadTool {
         if !input.raw && crate::notebook::is_notebook_path(&path) {
             let bound = crate::notebook::MAX_NOTEBOOK_BYTES;
             if meta.len() > bound as u64 {
+                if input.rendered {
+                    return Err(Error::tool(
+                        "read",
+                        "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+                    ));
+                }
                 return Err(Error::tool(
                     "read",
                     "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit; use raw=true to inspect the JSON source",
@@ -10424,9 +10450,62 @@ impl Tool for BashTool {
         options: &serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        validate_builtin_factory_options("bash", options, &["commandPrefix"])?;
+        validate_builtin_factory_options(
+            "bash",
+            options,
+            &["commandPrefix", "spawnEnv", "spawnEnvUnset"],
+        )?;
         let mut tool = self.clone();
         tool.cwd = builtin_factory_cwd("bash", cwd, &self.cwd, &WorkspaceHandle::default())?;
+        let valid_shell_ident = |name: &str| {
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                })
+        };
+        let mut env_preamble = String::new();
+        if let Some(unset_list) = options.get("spawnEnvUnset") {
+            let arr = unset_list
+                .as_array()
+                .ok_or_else(|| Error::validation("bash factory spawnEnvUnset must be an array"))?;
+            for item in arr {
+                let key = item.as_str().ok_or_else(|| {
+                    Error::validation("bash factory spawnEnvUnset entries must be strings")
+                })?;
+                if !crate::extensions_js::process_session::safe_environment_name(key)
+                    || !valid_shell_ident(key)
+                {
+                    return Err(Error::validation(format!(
+                        "bash factory spawnHook cannot unset restricted or invalid env variable '{key}'"
+                    )));
+                }
+                let _ = writeln!(env_preamble, "unset {key}");
+            }
+        }
+        if let Some(spawn_env) = options.get("spawnEnv") {
+            let obj = spawn_env
+                .as_object()
+                .ok_or_else(|| Error::validation("bash factory spawnEnv must be an object"))?;
+            for (key, raw_val) in obj {
+                let val = raw_val.as_str().ok_or_else(|| {
+                    Error::validation("bash factory spawnEnv values must be strings")
+                })?;
+                if !crate::extensions_js::process_session::safe_environment_name(key)
+                    || !valid_shell_ident(key)
+                {
+                    return Err(Error::validation(format!(
+                        "bash factory spawnHook cannot set restricted or invalid env variable '{key}'"
+                    )));
+                }
+                if val.contains('\0') {
+                    return Err(Error::validation(format!(
+                        "bash factory spawnHook env '{key}' contains NUL"
+                    )));
+                }
+                let escaped = val.replace('\'', "'\\''");
+                let _ = writeln!(env_preamble, "export {key}='{escaped}'");
+            }
+        }
         if let Some(prefix) = options.get("commandPrefix") {
             let prefix = prefix
                 .as_str()
@@ -10439,6 +10518,11 @@ impl Tool for BashTool {
                 let command = format!("{prefix}\n{command}");
                 input["command"] = serde_json::Value::String(command);
             }
+        }
+        if !env_preamble.is_empty()
+            && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
+        {
+            input["command"] = serde_json::Value::String(format!("{env_preamble}{command}"));
         }
         // The factory contract returns the completed command. Background
         // promotion would end streaming and abandon the supplied AbortSignal.
@@ -13643,10 +13727,12 @@ impl Tool for EditTool {
         .await
         .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")));
         if let Some(recorder) = &self.mutation_recorder {
-            if persisted.is_ok() {
-                recorder.commit(tool_call_id);
-            } else {
-                recorder.abort(tool_call_id);
+            match &persisted {
+                Ok(()) => recorder.commit(tool_call_id),
+                Err(err) if err.to_string().contains("after rename") => {
+                    recorder.abort(tool_call_id);
+                }
+                Err(_) => recorder.discard(tool_call_id),
             }
         }
         persisted?;
@@ -19715,10 +19801,12 @@ impl Tool for HashlineEditTool {
         .await
         .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")));
         if let Some(recorder) = &self.mutation_recorder {
-            if persisted.is_ok() {
-                recorder.commit(tool_call_id);
-            } else {
-                recorder.abort(tool_call_id);
+            match &persisted {
+                Ok(()) => recorder.commit(tool_call_id),
+                Err(err) if err.to_string().contains("after rename") => {
+                    recorder.abort(tool_call_id);
+                }
+                Err(_) => recorder.discard(tool_call_id),
             }
         }
         persisted?;

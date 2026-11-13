@@ -1045,7 +1045,10 @@ mod tests {
                 &json!({"version": VERSION, "token": remote.token, "cost": operation}),
             )
         };
-        assert_eq!(send(json!({"operation":"begin", "attempt":7}))["status"], "ok");
+        assert_eq!(
+            send(json!({"operation":"begin", "attempt":7}))["status"],
+            "ok"
+        );
         assert_eq!(
             send(json!({"operation":"observe", "attempt":7, "sequence":1, "amount":2.0}))["status"],
             "ok"
@@ -1062,7 +1065,9 @@ mod tests {
             "ok"
         );
         assert_eq!(
-            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":1, "amount":9.0}))["status"],
+            send(
+                json!({"operation":"observeAuthoritative", "attempt":7, "sequence":1, "amount":9.0})
+            )["status"],
             "ok"
         );
         for conflicting in [
@@ -1076,7 +1081,9 @@ mod tests {
             assert_eq!(parent.snapshot().pending, 0.25);
         }
         assert_eq!(
-            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":3, "amount":0.0}))["status"],
+            send(
+                json!({"operation":"observeAuthoritative", "attempt":7, "sequence":3, "amount":0.0})
+            )["status"],
             "ok"
         );
         assert_eq!(parent.snapshot().pending, 0.0);
@@ -1086,15 +1093,21 @@ mod tests {
             "ok"
         );
         assert_eq!(
-            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":3, "amount":2.0}))["status"],
+            send(
+                json!({"operation":"observeAuthoritative", "attempt":7, "sequence":3, "amount":2.0})
+            )["status"],
             "ok"
         );
         assert_eq!(
-            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":4, "amount":0.0}))["status"],
+            send(
+                json!({"operation":"observeAuthoritative", "attempt":7, "sequence":4, "amount":0.0})
+            )["status"],
             "error"
         );
         assert_eq!(
-            send(json!({"operation":"observeAuthoritative", "attempt":7, "sequence":5, "amount":2.0}))["status"],
+            send(
+                json!({"operation":"observeAuthoritative", "attempt":7, "sequence":5, "amount":2.0})
+            )["status"],
             "error"
         );
         assert_eq!(parent.spent(), 0.0);

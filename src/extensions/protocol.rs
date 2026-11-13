@@ -240,7 +240,8 @@ pub(super) const HOSTCALL_MARSHALLING_PATH_FAST_OPCODE: &str = "interned_opcode_
 pub(super) const HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK: &str = "canonical_fallback_v1";
 pub(super) const HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS: &str =
     "opcode_payload_shape_miss";
-const HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE: &str = "rewrite_semantic_divergence";
+pub(super) const HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE: &str =
+    "rewrite_semantic_divergence";
 const HOSTCALL_REWRITE_RULE_BASELINE: &str = "baseline_canonical";
 pub(super) const HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION: &str = "fuse_hash_dispatch_fast_opcode";
 const HOSTCALL_REWRITE_COST_BASELINE: u32 = 100;
@@ -564,6 +565,12 @@ pub(super) struct HostcallPayloadArena<'a> {
     opcode: Option<CommonHostcallOpcode>,
 }
 
+enum FastOpcodeHashOutcome {
+    Exact(String, String),
+    Diverged,
+    ShapeMiss,
+}
+
 impl<'a> HostcallPayloadArena<'a> {
     pub(super) const fn new(
         method: &'a str,
@@ -579,12 +586,6 @@ impl<'a> HostcallPayloadArena<'a> {
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn marshal(&self) -> HostcallMarshallingArtifacts {
-        let baseline_started = Instant::now();
-        let baseline_params_hash = hostcall_params_hash(self.method, self.params);
-        let baseline_args_shape_hash = hostcall_params_shape_hash(self.method, self.params);
-        let baseline_latency_us =
-            u64::try_from(baseline_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-
         let baseline_plan = HostcallRewritePlan {
             kind: HostcallRewritePlanKind::BaselineCanonical,
             estimated_cost: HOSTCALL_REWRITE_COST_BASELINE,
@@ -600,19 +601,25 @@ impl<'a> HostcallPayloadArena<'a> {
 
         if let Some(opcode) = self.opcode {
             let fast_started = Instant::now();
-            let maybe_fast = self.hash_fast_opcode(opcode);
+            let fast_outcome = self.hash_fast_opcode(opcode);
             let fast_latency =
                 u64::try_from(fast_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            if let Some((fast_params_hash, fast_args_shape_hash)) = maybe_fast {
-                if fast_params_hash == baseline_params_hash
-                    && fast_args_shape_hash == baseline_args_shape_hash
-                {
+            match fast_outcome {
+                FastOpcodeHashOutcome::Exact(fast_params_hash, fast_args_shape_hash) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert_eq!(
+                            fast_params_hash,
+                            hostcall_params_hash(self.method, self.params)
+                        );
+                        debug_assert_eq!(
+                            fast_args_shape_hash,
+                            hostcall_params_shape_hash(self.method, self.params)
+                        );
+                    }
                     fallback_reason = None;
                     fast_candidate_latency_us = fast_latency;
                     fast_candidate_hashes = Some((fast_params_hash, fast_args_shape_hash));
-                    // Hash equivalence just authorized the fast lane. The
-                    // e-graph search may refine what that lane is estimated to
-                    // cost; when it declines, the static constant stands.
                     let (estimated_cost, rule_id) = egraph_fast_opcode_cost().unwrap_or((
                         HOSTCALL_REWRITE_COST_FAST_OPCODE,
                         HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION,
@@ -622,49 +629,55 @@ impl<'a> HostcallPayloadArena<'a> {
                         estimated_cost,
                         rule_id,
                     });
-                } else {
+                }
+                FastOpcodeHashOutcome::Diverged => {
                     fallback_reason =
                         Some(HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE.to_string());
                 }
+                FastOpcodeHashOutcome::ShapeMiss => {}
             }
         }
 
         let rewrite_decision =
             hostcall_rewrite_engine().select_plan(baseline_plan, &rewrite_candidates);
-        // Only FastOpcodeFusion takes the fast lane here, because only it is
-        // authorized by the hash equivalence checked above. A candidate of any
-        // other kind -- HostcallRewritePlanKind::FusedIntrinsic, say -- would
-        // fall through to the canonical path even if it priced cheaper, which
-        // is the safe direction: this gate wants matching evidence, not a
-        // smaller number.
         let use_fast_rewrite = rewrite_decision.selected.kind
             == HostcallRewritePlanKind::FastOpcodeFusion
             && fast_candidate_hashes.is_some();
 
-        let (params_hash, args_shape_hash, path, latency_us, rewrite_rule) = if use_fast_rewrite {
-            let (params_hash, args_shape_hash) =
-                fast_candidate_hashes.expect("fast rewrite selected without hashes");
-            (
-                params_hash,
-                args_shape_hash,
-                HOSTCALL_MARSHALLING_PATH_FAST_OPCODE.to_string(),
-                fast_candidate_latency_us,
-                Some(rewrite_decision.selected.rule_id.to_string()),
-            )
-        } else {
-            let path = if self.opcode.is_some() {
-                HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK.to_string()
+        let (params_hash, args_shape_hash, path, latency_us, rewrite_rule, baseline_latency_us) =
+            if use_fast_rewrite {
+                let (params_hash, args_shape_hash) =
+                    fast_candidate_hashes.expect("fast rewrite selected without hashes");
+                (
+                    params_hash,
+                    args_shape_hash,
+                    HOSTCALL_MARSHALLING_PATH_FAST_OPCODE.to_string(),
+                    fast_candidate_latency_us,
+                    Some(rewrite_decision.selected.rule_id.to_string()),
+                    None,
+                )
             } else {
-                HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string()
+                // Compute canonical payload & shape hashes lazily ONCE only when
+                // no exact fast-opcode fusion plan was selected.
+                let baseline_started = Instant::now();
+                let baseline_params_hash = hostcall_params_hash(self.method, self.params);
+                let baseline_args_shape_hash = hostcall_params_shape_hash(self.method, self.params);
+                let measured_baseline_us =
+                    u64::try_from(baseline_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let path = if self.opcode.is_some() {
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK.to_string()
+                } else {
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string()
+                };
+                (
+                    baseline_params_hash,
+                    baseline_args_shape_hash,
+                    path,
+                    measured_baseline_us,
+                    None,
+                    Some(measured_baseline_us),
+                )
             };
-            (
-                baseline_params_hash,
-                baseline_args_shape_hash,
-                path,
-                baseline_latency_us,
-                None,
-            )
-        };
 
         let rewrite_fallback_reason = if use_fast_rewrite {
             None
@@ -672,10 +685,11 @@ impl<'a> HostcallPayloadArena<'a> {
             rewrite_decision.fallback_reason.map(str::to_string)
         };
         let rewrite_observed_cost_delta = if use_fast_rewrite {
-            let baseline_latency = i64::try_from(baseline_latency_us).unwrap_or(i64::MAX);
+            let estimated_baseline = i64::from(HOSTCALL_REWRITE_COST_BASELINE);
             let fast_latency = i64::try_from(fast_candidate_latency_us).unwrap_or(i64::MAX);
-            baseline_latency.saturating_sub(fast_latency)
+            estimated_baseline.saturating_sub(fast_latency)
         } else {
+            let _ = baseline_latency_us;
             0
         };
         let superinstruction = hostcall_superinstruction_telemetry(self.opcode);
@@ -703,28 +717,37 @@ impl<'a> HostcallPayloadArena<'a> {
         }
     }
 
-    fn hash_fast_opcode(&self, opcode: CommonHostcallOpcode) -> Option<(String, String)> {
+    fn hash_fast_opcode(&self, opcode: CommonHostcallOpcode) -> FastOpcodeHashOutcome {
         if let Some(tool_name) = hostcall_tool_opcode_name(opcode) {
             return self.hash_fast_tool_payload(tool_name);
         }
         if let Some(op_value) = hostcall_opcode_param_op(opcode) {
             return self.hash_fast_op_only_payload(op_value);
         }
-        None
+        FastOpcodeHashOutcome::ShapeMiss
     }
 
-    fn hash_fast_tool_payload(&self, expected_name: &str) -> Option<(String, String)> {
+    fn hash_fast_tool_payload(&self, expected_name: &str) -> FastOpcodeHashOutcome {
         use sha2::Digest as _;
 
-        let map = self.params.as_object()?;
+        let Some(map) = self.params.as_object() else {
+            return FastOpcodeHashOutcome::ShapeMiss;
+        };
         if map.len() != 2 {
-            return None;
+            return FastOpcodeHashOutcome::ShapeMiss;
         }
-        let name = map.get("name").and_then(Value::as_str)?;
+        let Some(name) = map.get("name").and_then(Value::as_str) else {
+            return FastOpcodeHashOutcome::ShapeMiss;
+        };
         if !token_eq_ascii_folded(name, expected_name) {
-            return None;
+            return FastOpcodeHashOutcome::ShapeMiss;
         }
-        let input = map.get("input")?;
+        if name != expected_name {
+            return FastOpcodeHashOutcome::Diverged;
+        }
+        let Some(input) = map.get("input") else {
+            return FastOpcodeHashOutcome::ShapeMiss;
+        };
         let mut hasher = sha2::Sha256::new();
         hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
             h.update(b"{");
@@ -757,19 +780,26 @@ impl<'a> HostcallPayloadArena<'a> {
             },
         );
         let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
-        Some((params_hash, args_shape_hash))
+        FastOpcodeHashOutcome::Exact(params_hash, args_shape_hash)
     }
 
-    fn hash_fast_op_only_payload(&self, expected_op: &str) -> Option<(String, String)> {
+    fn hash_fast_op_only_payload(&self, expected_op: &str) -> FastOpcodeHashOutcome {
         use sha2::Digest as _;
 
-        let map = self.params.as_object()?;
+        let Some(map) = self.params.as_object() else {
+            return FastOpcodeHashOutcome::ShapeMiss;
+        };
         if map.len() != 1 {
-            return None;
+            return FastOpcodeHashOutcome::ShapeMiss;
         }
-        let op = map.get("op").and_then(Value::as_str)?;
+        let Some(op) = map.get("op").and_then(Value::as_str) else {
+            return FastOpcodeHashOutcome::ShapeMiss;
+        };
         if !token_eq_ascii_folded(op, expected_op) {
-            return None;
+            return FastOpcodeHashOutcome::ShapeMiss;
+        }
+        if op != expected_op {
+            return FastOpcodeHashOutcome::Diverged;
         }
         let mut hasher = sha2::Sha256::new();
         hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
@@ -795,7 +825,7 @@ impl<'a> HostcallPayloadArena<'a> {
             },
         );
         let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
-        Some((params_hash, args_shape_hash))
+        FastOpcodeHashOutcome::Exact(params_hash, args_shape_hash)
     }
 }
 

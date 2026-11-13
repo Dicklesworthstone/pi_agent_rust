@@ -273,10 +273,10 @@ pub enum AuthCredential {
         refresh_token: String,
         expires: i64, // Unix ms
         /// Token endpoint URL for self-contained refresh (optional; backward-compatible).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, alias = "tokenUrl", skip_serializing_if = "Option::is_none")]
         token_url: Option<String>,
         /// Client ID for self-contained refresh (optional; backward-compatible).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, alias = "clientId", skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
         /// Any additional keys present in an upstream-written OAuth credential,
         /// preserved verbatim so a load→save round-trip never drops fields
@@ -2341,6 +2341,29 @@ impl AuthStorage {
                         &refresh_token,
                     ))
                     .await
+                }
+                "openai-codex" => {
+                    let token_url = std::env::var("PI_OPENAI_CODEX_REFRESH_URL")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .or(stored_token_url)
+                        .unwrap_or_else(openai_codex_oauth_token_url);
+                    let client_id = stored_client_id.unwrap_or_else(openai_codex_oauth_client_id);
+                    if refresh_token.trim().is_empty() {
+                        Err(Error::auth(
+                            "openai-codex OAuth credential is expired and has no refresh_token; run `/login openai-codex` to re-authenticate".to_string(),
+                        ))
+                    } else {
+                        Box::pin(refresh_self_contained_oauth_token(
+                            client,
+                            &token_url,
+                            &client_id,
+                            &refresh_token,
+                            &provider,
+                        ))
+                        .await
+                    }
                 }
                 _ => {
                     if let (Some(url), Some(cid)) = (&stored_token_url, &stored_client_id) {
@@ -15225,5 +15248,121 @@ sso_region = us-east-1
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn openai_codex_oauth_refresh_uses_override_or_canonical_defaults_and_rejects_empty_refresh_token()
+     {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind codex oauth mock");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).expect("read");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let hdrs = String::from_utf8_lossy(&raw[..hdr_end]);
+                    let content_len = hdrs
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= hdr_end + 4 + content_len {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&raw[hdr_end + 4..hdr_end + 4 + content_len])
+                                .expect("json");
+                        assert_eq!(body["grant_type"], "refresh_token");
+                        assert_eq!(body["client_id"], OPENAI_CODEX_OAUTH_CLIENT_ID);
+                        assert_eq!(body["refresh_token"], "rt_codex_valid");
+                        break;
+                    }
+                }
+            }
+            let resp = r#"{"access_token":"at_codex_fresh","refresh_token":"rt_codex_next","expires_in":3600}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp.len(),
+                resp
+            )
+            .expect("write");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        // Stored without explicit `client_id` so canonical Codex OAuth fallback is exercised;
+        // `token_url` points to our local mock server.
+        let initial = serde_json::json!({
+            "openai-codex": {
+                "type": "oauth",
+                "access": "at_codex_expired",
+                "refresh": "rt_codex_valid",
+                "expires": 1000,
+                "tokenUrl": format!("http://{addr}/oauth/token")
+            }
+        });
+        std::fs::write(&auth_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mut storage = AuthStorage::load(auth_path.clone()).expect("load");
+            let client = crate::http::client::Client::new();
+            let report = storage
+                .refresh_expired_oauth_tokens_report_with_client(&client)
+                .await;
+            assert_eq!(report.refreshed, vec!["openai-codex".to_string()]);
+            assert!(
+                report.failed.is_empty(),
+                "unexpected failures: {:?}",
+                report.failed
+            );
+            assert_eq!(
+                storage.resolve_api_key("openai-codex", None).as_deref(),
+                Some("at_codex_fresh")
+            );
+
+            // Planted negative: expired credential with empty refresh_token fails with re-login hint.
+            let broken_path = dir.path().join("broken_auth.json");
+            let broken = serde_json::json!({
+                "openai-codex": {
+                    "type": "oauth",
+                    "access": "at_codex_expired",
+                    "refresh": "   ",
+                    "expires": 1000
+                }
+            });
+            std::fs::write(&broken_path, serde_json::to_string_pretty(&broken).unwrap()).unwrap();
+            let mut broken_storage = AuthStorage::load(broken_path).expect("load broken");
+            let broken_report = broken_storage
+                .refresh_expired_oauth_tokens_report_with_client(&client)
+                .await;
+            assert_eq!(broken_report.failed.len(), 1);
+            assert!(
+                broken_report.failed[0]
+                    .error
+                    .contains("/login openai-codex"),
+                "expected actionable re-login hint, got: {}",
+                broken_report.failed[0].error
+            );
+        });
+        server.join().expect("server");
     }
 }

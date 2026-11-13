@@ -3352,10 +3352,35 @@ impl Agent {
                 .expect("cache populated above"),
         );
 
+        let live_synced_prompt = self.config.system_prompt.as_deref().and_then(|base| {
+            if !base.contains(crate::xdev::DISCOVERABLE_PROMPT_HEADER) {
+                return None;
+            }
+            let registry = self.tools.snapshot();
+            let live_index = if registry.get("xdev").is_some() {
+                let promoted = self
+                    .promoted_tools
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default();
+                registry
+                    .discoverable_index()
+                    .into_iter()
+                    .filter(|(name, _)| !promoted.contains(name))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            crate::xdev::sync_discoverable_prompt_section(base, &live_index)
+        });
         let system_prompt = if self.run_budget.is_some() && self.prewalk.is_some() {
-            let mut prompt = self.config.system_prompt.clone().unwrap_or_default();
+            let mut prompt = live_synced_prompt
+                .or_else(|| self.config.system_prompt.clone())
+                .unwrap_or_default();
             prompt.push_str("\n\n## Prewalk\nInvestigate the request and plan the implementation before making changes. If the todo tool is available, record a concrete todo list before editing project files. Begin the first real implementation change; the session will automatically hand off after that completed tool batch. Do not stop to announce or request the handoff. For discussion or read-only requests, answer normally without making an artificial edit.");
             Some(Cow::Owned(prompt))
+        } else if let Some(synced) = live_synced_prompt {
+            Some(Cow::Owned(synced))
         } else {
             self.config.system_prompt.as_deref().map(Cow::Borrowed)
         };
@@ -4216,6 +4241,14 @@ impl Agent {
         let mut turn_keyword_words = std::collections::HashSet::new();
         let turn_baseline_thinking = self.config.stream_options.thinking_level;
         let turn_baseline_system_prompt = self.config.system_prompt.clone();
+        if !self.tools.snapshot().tools().is_empty() && !self.provider.capabilities().tool_use {
+            tracing::warn!(
+                provider = %self.provider.name(),
+                api = %self.provider.api(),
+                model = %self.provider.model_id(),
+                "Active provider advertises tool_use=false while tools are enabled in Agent"
+            );
+        }
 
         if prompts.is_empty() && !self.retry_keyword_activations.is_empty() {
             let mut retry_hits = self.retry_keyword_activations.clone();
@@ -8440,11 +8473,19 @@ impl ExtensionAiCompletionHostState {
         let Some(manager) = self.compaction_models.provider_manager.upgrade() else {
             return Ok(());
         };
-        let Some(catalog) =
-            manager.extension_provider_catalog(self.compaction_models.provider_revision)?
-        else {
+        let previous_revision = self.compaction_models.provider_revision;
+        let Some(catalog) = manager.extension_provider_catalog(previous_revision)? else {
             return Ok(());
         };
+        if previous_revision.is_none()
+            && catalog.revision == 0
+            && catalog.bindings.is_empty()
+            && catalog.entries.is_empty()
+        {
+            self.compaction_models.provider_revision = Some(0);
+            self.compaction_models.js_provider_ids = catalog.stream_provider_ids;
+            return Ok(());
+        }
         let mut registry = self
             .compaction_models
             .registry
@@ -18745,8 +18786,7 @@ struct TurnPersistenceGuard<'a> {
 impl Drop for TurnPersistenceGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            let message =
-                "turn persistence was interrupted before its durable result was observed";
+            let message = "turn persistence was interrupted before its durable result was observed";
             let mut reason = self
                 .admission
                 .reason
@@ -18783,7 +18823,11 @@ pub(crate) async fn flush_turn_autosave(
             budget.begin_saved_registration();
             budget.checkpoint(session)?;
         }
-        session.flush_autosave(trigger).await?;
+        if matches!(trigger, AutosaveFlushTrigger::Manual) {
+            session.save().await?;
+        } else {
+            session.flush_autosave(trigger).await?;
+        }
         if let Some((budget, owner)) = cost_account {
             acknowledge_saved_cost(session, admission, budget, owner).await?;
         }
@@ -19216,6 +19260,8 @@ impl AgentSession {
         let entry = registry.find(provider.name(), provider.model_id());
         if let Some(entry) = &entry {
             self.agent.set_keyword_model(entry);
+            self.agent.stream_options_mut().max_tokens =
+                self.max_tokens_override.resolve(entry.model.max_tokens);
         } else {
             self.agent.keyword_chillax_thinking_level = None;
             self.agent.keyword_chillax_levels.clear();
@@ -19243,6 +19289,7 @@ impl AgentSession {
             state.compaction_models.active_provider_revision = None;
         }
         self.refresh_extension_compaction_models();
+        self.refresh_extension_completion_host_state();
     }
 
     pub fn set_auth_storage(&mut self, auth: AuthStorage) {
@@ -19252,6 +19299,11 @@ impl AgentSession {
             .set_media_auth_storage(&self.media_auth_owner, auth.clone());
         self.auth_storage = Some(auth);
         self.refresh_extension_compaction_models();
+    }
+
+    #[must_use]
+    pub(crate) const fn auth_storage(&self) -> Option<&AuthStorage> {
+        self.auth_storage.as_ref()
     }
 
     /// Keep a driver-supplied recovery key in normal credential admission.
@@ -19276,6 +19328,12 @@ impl AgentSession {
     /// CLI override, then stored credential, then the catalog entry's key.
     pub(crate) fn adopt_auth_storage(&mut self, mut auth: AuthStorage) {
         self.scope_auth_storage(&mut auth);
+        let previous = self.auth_storage.clone();
+        if let Some(registry_arc) = self.model_registry.clone() {
+            let mut updated = (*registry_arc).clone();
+            updated.refresh_stored_credentials(previous.as_ref(), &auth);
+            self.set_model_registry(updated);
+        }
         self.set_auth_storage(auth);
         let entry = self.current_model_entry();
         let key = entry.as_ref().map_or_else(
@@ -20888,9 +20946,9 @@ impl AgentSession {
         });
         let cli_api_key =
             self.recovery_api_key_override(&entry.model.provider, request.cli_api_key);
-        let explicit_key_recovers_unready = cli_api_key.is_some_and(|key| !key.trim().is_empty())
-            && !crate::models::model_entry_is_ready(&entry);
-        if registered && !admitted && !explicit_key_recovers_unready {
+        let cli_key_recovers_unready = !crate::models::model_entry_is_ready(&entry)
+            && cli_api_key.is_some_and(|key| !key.trim().is_empty());
+        if registered && !admitted && !cli_key_recovers_unready {
             // Availability and disabled-provider filtering happen after the
             // full catalog establishes identity. A ready alias's row cannot
             // admit a separately configured primary that was filtered out.
@@ -21100,10 +21158,9 @@ impl AgentSession {
             });
             let cli_api_key =
                 self.recovery_api_key_override(&entry.model.provider, attempt.cli_api_key);
-            let explicit_key_recovers_unready = cli_api_key
-                .is_some_and(|key| !key.trim().is_empty())
-                && !crate::models::model_entry_is_ready(&entry);
-            if registered && !admitted && !explicit_key_recovers_unready {
+            let cli_key_recovers_unready = !crate::models::model_entry_is_ready(&entry)
+                && cli_api_key.is_some_and(|key| !key.trim().is_empty());
+            if registered && !admitted && !cli_key_recovers_unready {
                 // Filtering cannot erase a declared provider's identity. Keep
                 // ready excluded routes out, while allowing an explicit key
                 // to make an otherwise unready configured route usable.
@@ -22374,15 +22431,14 @@ impl AgentSession {
                 "Automatic compaction source changed while awaiting installation; the result was not applied",
             ));
         }
-        if install_guard.is_some()
-            && !session.entries_for_current_path().iter().any(|entry| {
-                entry
-                    .base_id()
-                    .is_some_and(|entry_id| entry_id == first_kept_entry_id.as_str())
-            })
+        if require_reduction
+            && !compaction::overflow_compaction_preserves_current_turn(
+                &session.entries_for_current_path(),
+                &first_kept_entry_id,
+            )
         {
-            return Err(Error::session(
-                "Automatic compaction retained boundary is no longer on the selected path",
+            return Err(Error::api(
+                "Context overflow compaction would discard the current user request or completed tool work; the cut was not applied",
             ));
         }
         if handoff_source.is_some()
@@ -22396,14 +22452,15 @@ impl AgentSession {
                 "Handoff must preserve the current authored turn and have a nonempty summary",
             ));
         }
-        if require_reduction
-            && !compaction::overflow_compaction_preserves_current_turn(
-                &session.entries_for_current_path(),
-                &first_kept_entry_id,
-            )
+        if install_guard.is_some()
+            && !session.entries_for_current_path().iter().any(|entry| {
+                entry
+                    .base_id()
+                    .is_some_and(|entry_id| entry_id == first_kept_entry_id.as_str())
+            })
         {
-            return Err(Error::api(
-                "Context overflow compaction would discard the current user request or completed tool work; the cut was not applied",
+            return Err(Error::session(
+                "Automatic compaction retained boundary is no longer on the selected path",
             ));
         }
         let mut candidate = session.clone();
@@ -23336,25 +23393,51 @@ impl AgentSession {
             session.session_file().map(|p| p.display().to_string())
         };
 
-        if let Err(err) = manager
-            .dispatch_event(
-                ExtensionEventName::Startup,
-                Some(serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "sessionFile": session_path,
-                })),
-            )
-            .await
-        {
-            tracing::warn!("startup extension hook failed (fail-open): {err}");
-        }
+        manager.clear_startup_warnings();
+        let record_hook_outcome =
+            |hook: &str, outcome: Result<Option<serde_json::Value>>| match outcome {
+                Ok(Some(value)) => {
+                    if let Some(errors) = value
+                        .get("__pi_hook_errors")
+                        .and_then(serde_json::Value::as_array)
+                    {
+                        for item in errors.iter().filter_map(serde_json::Value::as_str) {
+                            tracing::warn!("{hook} extension hook failed (fail-open): {item}");
+                            manager.record_startup_warning(item.to_string());
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("{hook} extension hook failed (fail-open): {err}");
+                    manager.record_startup_warning(format!("{hook}: {err}"));
+                }
+            };
 
-        if let Err(err) = manager
-            .dispatch_event(ExtensionEventName::SessionStart, None)
-            .await
-        {
-            tracing::warn!("session_start extension hook failed (fail-open): {err}");
-        }
+        record_hook_outcome(
+            "startup",
+            manager
+                .dispatch_event_with_response(
+                    ExtensionEventName::Startup,
+                    Some(serde_json::json!({
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "sessionFile": session_path,
+                    })),
+                    extension_startup_timeout_ms,
+                )
+                .await,
+        );
+
+        record_hook_outcome(
+            "session_start",
+            manager
+                .dispatch_event_with_response(
+                    ExtensionEventName::SessionStart,
+                    None,
+                    extension_startup_timeout_ms,
+                )
+                .await,
+        );
 
         let ctx_payload = serde_json::json!({ "cwd": cwd.display().to_string() });
         let mut catalog = ExtensionToolCatalog::new(ctx_payload);
@@ -23433,7 +23516,7 @@ impl AgentSession {
             let persist_result = flush_turn_autosave(
                 &mut session,
                 &self.provider_admission,
-                AutosaveFlushTrigger::Periodic,
+                AutosaveFlushTrigger::Manual,
                 self.agent.cost_budget().map(|budget| (budget, cx.cx())),
             )
             .await;
@@ -23454,7 +23537,7 @@ impl AgentSession {
         let persist_result = flush_turn_autosave(
             &mut session,
             &self.provider_admission,
-            AutosaveFlushTrigger::Periodic,
+            AutosaveFlushTrigger::Manual,
             self.agent.cost_budget().map(|budget| (budget, cx.cx())),
         )
         .await;
@@ -25067,7 +25150,9 @@ impl AgentSession {
                             cost_budget.as_ref().map(|budget| (budget, cx.cx())),
                         )
                         .await;
-                        if let Err(err) = finish_turn_persistence(&admission, Ok(()), persist_result) {
+                        if let Err(err) =
+                            finish_turn_persistence(&admission, Ok(()), persist_result)
+                        {
                             // The rows stay queued and the cursor advances so
                             // the final save can retry without duplicating them.
                             // A failed durable account cannot admit more work.

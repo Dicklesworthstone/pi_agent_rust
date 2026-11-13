@@ -297,7 +297,7 @@ fn native_mediation_blocks_before_editor_allocation() {
         let result = tools
             .get("bash")
             .unwrap()
-            .execute("blocked", json!({"command":"rm -rf doomed"}), None)
+            .execute("blocked", json!({"command":"chmod -R 777 doomed"}), None)
             .await
             .unwrap();
         assert!(result.is_error);

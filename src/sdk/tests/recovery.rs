@@ -852,7 +852,11 @@ fn recovery_without_prewalk_keeps_the_original_time_cap_and_resets_the_next_prom
         }))
         .expect("the elapsed cap is a durably saved boundary");
         assert!(crate::agent::time_cap_marker(&result).is_some());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "no renewed primary request");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no renewed primary request"
+        );
         assert!(
             target.requests.lock().unwrap().is_empty(),
             "a committed fallback does not renew the original request's clock"
@@ -873,7 +877,10 @@ fn recovery_without_prewalk_keeps_the_original_time_cap_and_resets_the_next_prom
             },
         ] {
             assert_eq!(
-                observed.iter().filter(|event| event["type"] == kind).count(),
+                observed
+                    .iter()
+                    .filter(|event| event["type"] == kind)
+                    .count(),
                 1
             );
         }
@@ -892,7 +899,10 @@ fn recovery_without_prewalk_keeps_the_original_time_cap_and_resets_the_next_prom
         assert!(crate::agent::time_cap_marker(&fresh).is_none());
         assert_eq!(calls.load(Ordering::SeqCst), if fail_over { 1 } else { 2 });
         target.finish();
-        assert_eq!(target.requests.lock().unwrap().len(), usize::from(fail_over));
+        assert_eq!(
+            target.requests.lock().unwrap().len(),
+            usize::from(fail_over)
+        );
         let path = handle
             .session_store()
             .try_lock()
@@ -2558,7 +2568,7 @@ fn extension_generated_turns_deliver_typed_terminals_before_their_generic_messag
                 StopReason::Error,
             ];
             assert_eq!(terminals.len(), reasons.len() * 2);
-            for (pair, reason) in terminals.chunks_exact(2).zip(reasons) {
+            for (pair, reason) in terminals.as_chunks::<2>().0.iter().zip(reasons) {
                 assert_eq!((pair[0].0, pair[1].0), ("typed", "generic"));
                 assert_eq!(pair[0].1, reason);
                 assert_eq!(pair[0].1, pair[1].1);
@@ -3691,11 +3701,8 @@ fn recovery_without_prewalk_preserves_completed_tool_budget_and_next_prompt_star
             primary_responses.extend(continuation.clone());
         }
         let mut primary = RecoveryHttpFixture::new(primary_responses);
-        let mut fallback = RecoveryHttpFixture::new(if fail_over {
-            continuation
-        } else {
-            Vec::new()
-        });
+        let mut fallback =
+            RecoveryHttpFixture::new(if fail_over { continuation } else { Vec::new() });
         let mut handle = prewalk_http_handle(dir.path(), &primary.url, &fallback.url, false, 1)
             .with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: u32::from(!fail_over),
@@ -3738,7 +3745,10 @@ fn recovery_without_prewalk_preserves_completed_tool_budget_and_next_prompt_star
             primary.requests.lock().unwrap().len(),
             if fail_over { 2 } else { 3 }
         );
-        assert_eq!(fallback.requests.lock().unwrap().len(), usize::from(fail_over));
+        assert_eq!(
+            fallback.requests.lock().unwrap().len(),
+            usize::from(fail_over)
+        );
         let observed = events.lock().unwrap();
         let executed: Vec<_> = observed
             .iter()
@@ -5702,5 +5712,84 @@ fn explicit_model_selection_retires_child_role_but_automatic_changes_preserve_it
     assert_eq!(
         handle.model(),
         ("role-fallback".to_string(), "fallback".to_string())
+    );
+}
+
+#[test]
+fn live_login_and_logout_update_failover_eligibility_immediately() {
+    let dir = tempdir().unwrap();
+    let auth_path = dir.path().join("auth.json");
+    let primary = recovery_route_entry("login-primary", "primary");
+    let mut fallback = recovery_route_entry("login-fallback", "fallback");
+    // Unready at startup: requires a configured credential, and none exists yet.
+    fallback.api_key = None;
+    fallback.auth_header = true;
+    let entries = vec![primary.clone(), fallback];
+
+    let mut initial_auth = AuthStorage::empty_at(auth_path);
+    initial_auth.set(
+        "login-primary",
+        crate::auth::AuthCredential::ApiKey {
+            key: "primary-key".to_string(),
+        },
+    );
+
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["login-fallback/fallback".to_string()],
+            )]),
+            // Only startup-ready models were admitted at launch.
+            available_models: vec![primary],
+            auth: initial_auth,
+            cli_api_key: None,
+            cooldown_secs: 0,
+        }));
+
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider("login-primary", "503 service unavailable"));
+
+    // 1. Before /login: fallback has no credential, so failover declines cleanly.
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("login-primary".to_string(), "primary".to_string())
+    );
+
+    // 2. Simulate live /login via shared AuthStorage handle: fallback becomes eligible immediately!
+    handle.update_shared_auth_storage(|auth| {
+        auth.set(
+            "login-fallback",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fresh-login-fallback-key".to_string(),
+            },
+        );
+    });
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("login-fallback".to_string(), "fallback".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("fresh-login-fallback-key")
+    );
+
+    // Restore primary, then simulate /logout removing the fallback credential.
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("login-primary".to_string(), "primary".to_string())
+    );
+    handle.update_shared_auth_storage(|auth| {
+        assert!(auth.remove("login-fallback"));
+    });
+
+    // 3. Planted negative after /logout: logged-out fallback key must NOT remain cached!
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("login-primary".to_string(), "primary".to_string())
     );
 }

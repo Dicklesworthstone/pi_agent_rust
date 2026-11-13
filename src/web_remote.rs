@@ -29,7 +29,7 @@ pub const MAX_WEB_AUDIT_EVENTS: usize = 1024;
 const MAX_CLIENT_ID_BYTES: usize = 128;
 const MAX_REMOTE_ADDR_BYTES: usize = 256;
 const MAX_TOKEN_BYTES: usize = 128;
-const TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const TOKEN_LIFETIME: Duration = Duration::from_mins(10);
 
 /// Select one browser surface for the native session. A launch owns only the
 /// selected server, its credential namespace, and its local admission controls.
@@ -67,6 +67,7 @@ impl std::str::FromStr for BindMode {
 
 /// Web-remote configuration settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct WebRemoteSettings {
     pub port: u16,
     pub bind_mode: BindMode,
@@ -74,6 +75,12 @@ pub struct WebRemoteSettings {
     pub max_viewers: usize,
     pub require_auth_token: bool,
     pub enable_audit_log: bool,
+    #[serde(default)]
+    pub tls_cert: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub tls_key: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub allow_insecure_lan: bool,
 }
 
 impl Default for WebRemoteSettings {
@@ -85,6 +92,9 @@ impl Default for WebRemoteSettings {
             max_viewers: 4,
             require_auth_token: true,
             enable_audit_log: true,
+            tls_cert: None,
+            tls_key: None,
+            allow_insecure_lan: false,
         }
     }
 }
@@ -103,7 +113,26 @@ impl WebRemoteSettings {
         if !self.enable_audit_log {
             return Err("web remote access requires security audit logging".to_string());
         }
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err(
+                "web remote TLS requires both --tls-cert <PATH> and --tls-key <PATH>".to_string(),
+            );
+        }
+        if self.bind_mode != BindMode::Loopback
+            && self.tls_cert.is_none()
+            && !self.allow_insecure_lan
+        {
+            return Err(format!(
+                "refusing cleartext non-loopback web bind ({:?}): supply --tls-cert <PATH> and --tls-key <PATH> to enable HTTPS/WSS, or pass --allow-insecure-lan to explicitly permit unencrypted network traffic",
+                self.bind_mode
+            ));
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub const fn uses_tls(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
     }
 }
 
@@ -874,6 +903,14 @@ impl WebRemoteManager {
             .audit_events_dropped
     }
 
+    pub(super) fn record_audit_event(&self, event: WebAuditEvent) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record_audit(&mut state, event);
+    }
+
     fn record_audit(&self, state: &mut WebRemoteState, event: WebAuditEvent) {
         if self.settings.enable_audit_log {
             if state.audit_log.len() == MAX_WEB_AUDIT_EVENTS {
@@ -893,23 +930,613 @@ fn valid_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Legacy decorative pairing marker. This fixed pattern does not encode a QR
-/// payload and is not used by the live server's copyable-link pairing interface.
+/// Standards-compliant ISO/IEC 18004 QR Code Model 2 (ECC Level L, byte mode)
+/// encoder rendered with dense Unicode upper/lower half-block characters
+/// (`▀`, `▄`, `█`, ` `) and a 4-module quiet-zone margin.
 pub fn render_half_block_qr(data: &str) -> String {
     use std::fmt::Write as _;
+    let (_, modules) =
+        encode_qr_matrix(data.as_bytes()).expect("pairing payload fits ISO/IEC 18004 QR capacity");
+    let size = modules.len();
+    let quiet = 4usize;
+    let total = size + quiet * 2;
+    let is_dark = |r: usize, c: usize| -> bool {
+        if r < quiet || c < quiet || r >= quiet + size || c >= quiet + size {
+            false
+        } else {
+            modules[r - quiet][c - quiet]
+        }
+    };
+
     let mut out = String::new();
-    out.push_str("┌───────────────────────────┐\n");
-    out.push_str("│ █▀▀▀▀▀█ ▄▄█▄▄▄▄ █▀▀▀▀▀█ │\n");
-    out.push_str("│ █ ███ █ █ ▀▀▀█▀ █ ███ █ │\n");
-    out.push_str("│ █▀▀▀▀▀█ █ █ █ █ █▀▀▀▀▀█ │\n");
-    out.push_str("│ ▀▀▀▀▀▀▀ ▀ ▀ ▀ ▀ ▀▀▀▀▀▀▀ │\n");
-    out.push_str("│ ▀▄█▄▀█▀▄█▀▀█▄▀▄█▄▀█▀▄█▀ │\n");
-    out.push_str("│ █▀▀▀▀▀█ ▀█▀█▀██ ▄▀▄▀▄▀▄ │\n");
-    out.push_str("│ █ ███ █ █▀█▀▄▀█ █▀▀▀▀▀█ │\n");
-    out.push_str("│ █▀▀▀▀▀█ ▀▄▀▄▀▄█ █ ███ █ │\n");
-    out.push_str("└───────────────────────────┘\n");
+    let mut row = 0usize;
+    while row < total {
+        for col in 0..total {
+            let top = is_dark(row, col);
+            let bottom = if row + 1 < total {
+                is_dark(row + 1, col)
+            } else {
+                false
+            };
+            let ch = match (top, bottom) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            };
+            out.push(ch);
+        }
+        out.push('\n');
+        row += 2;
+    }
     let _ = writeln!(out, "Payload: {data}");
     out
+}
+
+/// Encode raw bytes into an ISO/IEC 18004 QR Code Model 2 boolean matrix (`true` = dark)
+/// at ECC Level L (versions 1..=13). Returns `(version, matrix)`.
+pub fn encode_qr_matrix(data: &[u8]) -> Result<(u8, Vec<Vec<bool>>), String> {
+    #[derive(Clone, Copy)]
+    struct QrVersionSpec {
+        version: u8,
+        total_data_cw: usize,
+        ec_cw_per_block: usize,
+        g1_blocks: usize,
+        g1_data_cw: usize,
+        g2_blocks: usize,
+        g2_data_cw: usize,
+    }
+
+    const SPECS: [QrVersionSpec; 13] = [
+        QrVersionSpec {
+            version: 1,
+            total_data_cw: 19,
+            ec_cw_per_block: 7,
+            g1_blocks: 1,
+            g1_data_cw: 19,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 2,
+            total_data_cw: 34,
+            ec_cw_per_block: 10,
+            g1_blocks: 1,
+            g1_data_cw: 34,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 3,
+            total_data_cw: 55,
+            ec_cw_per_block: 15,
+            g1_blocks: 1,
+            g1_data_cw: 55,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 4,
+            total_data_cw: 80,
+            ec_cw_per_block: 20,
+            g1_blocks: 1,
+            g1_data_cw: 80,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 5,
+            total_data_cw: 108,
+            ec_cw_per_block: 26,
+            g1_blocks: 1,
+            g1_data_cw: 108,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 6,
+            total_data_cw: 136,
+            ec_cw_per_block: 18,
+            g1_blocks: 2,
+            g1_data_cw: 68,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 7,
+            total_data_cw: 156,
+            ec_cw_per_block: 20,
+            g1_blocks: 2,
+            g1_data_cw: 78,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 8,
+            total_data_cw: 194,
+            ec_cw_per_block: 24,
+            g1_blocks: 2,
+            g1_data_cw: 97,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 9,
+            total_data_cw: 232,
+            ec_cw_per_block: 30,
+            g1_blocks: 2,
+            g1_data_cw: 116,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 10,
+            total_data_cw: 274,
+            ec_cw_per_block: 18,
+            g1_blocks: 2,
+            g1_data_cw: 68,
+            g2_blocks: 2,
+            g2_data_cw: 69,
+        },
+        QrVersionSpec {
+            version: 11,
+            total_data_cw: 324,
+            ec_cw_per_block: 20,
+            g1_blocks: 4,
+            g1_data_cw: 81,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+        QrVersionSpec {
+            version: 12,
+            total_data_cw: 370,
+            ec_cw_per_block: 24,
+            g1_blocks: 2,
+            g1_data_cw: 92,
+            g2_blocks: 2,
+            g2_data_cw: 93,
+        },
+        QrVersionSpec {
+            version: 13,
+            total_data_cw: 428,
+            ec_cw_per_block: 26,
+            g1_blocks: 4,
+            g1_data_cw: 107,
+            g2_blocks: 0,
+            g2_data_cw: 0,
+        },
+    ];
+
+    let spec = SPECS
+        .iter()
+        .copied()
+        .find(|candidate| {
+            let count_bits = if candidate.version <= 9 {
+                8usize
+            } else {
+                16usize
+            };
+            4 + count_bits + data.len().saturating_mul(8) <= candidate.total_data_cw * 8
+        })
+        .ok_or_else(|| {
+            format!(
+                "QR payload of {} bytes exceeds supported version-13 capacity",
+                data.len()
+            )
+        })?;
+
+    let count_bits = if spec.version <= 9 { 8usize } else { 16usize };
+    let total_data_bits = spec.total_data_cw * 8;
+    let mut bits = Vec::with_capacity(total_data_bits);
+    let push_bits = |out: &mut Vec<bool>, val: usize, width: usize| {
+        for shift in (0..width).rev() {
+            out.push(((val >> shift) & 1) != 0);
+        }
+    };
+    // Byte mode indicator = 0100.
+    push_bits(&mut bits, 0b0100, 4);
+    push_bits(&mut bits, data.len(), count_bits);
+    for &byte in data {
+        push_bits(&mut bits, usize::from(byte), 8);
+    }
+    let terminator = (total_data_bits - bits.len()).min(4);
+    bits.extend(std::iter::repeat_n(false, terminator));
+    while bits.len() % 8 != 0 {
+        bits.push(false);
+    }
+    let mut data_cw = Vec::with_capacity(spec.total_data_cw);
+    for &chunk in bits.as_chunks::<8>().0 {
+        let mut byte = 0u8;
+        for bit in chunk {
+            byte = (byte << 1) | u8::from(bit);
+        }
+        data_cw.push(byte);
+    }
+    let pad_bytes = [0xECu8, 0x11u8];
+    let mut pad_idx = 0usize;
+    while data_cw.len() < spec.total_data_cw {
+        data_cw.push(pad_bytes[pad_idx % 2]);
+        pad_idx += 1;
+    }
+
+    let generator = qr_rs_generator(spec.ec_cw_per_block);
+    let mut data_blocks: Vec<&[u8]> = Vec::with_capacity(spec.g1_blocks + spec.g2_blocks);
+    let mut ec_blocks: Vec<Vec<u8>> = Vec::with_capacity(spec.g1_blocks + spec.g2_blocks);
+    let mut offset = 0usize;
+    for _ in 0..spec.g1_blocks {
+        let slice = &data_cw[offset..offset + spec.g1_data_cw];
+        offset += spec.g1_data_cw;
+        ec_blocks.push(qr_rs_remainder(slice, &generator));
+        data_blocks.push(slice);
+    }
+    for _ in 0..spec.g2_blocks {
+        let slice = &data_cw[offset..offset + spec.g2_data_cw];
+        offset += spec.g2_data_cw;
+        ec_blocks.push(qr_rs_remainder(slice, &generator));
+        data_blocks.push(slice);
+    }
+
+    let max_block_len = spec.g1_data_cw.max(spec.g2_data_cw);
+    let mut interleaved = Vec::with_capacity(
+        spec.total_data_cw + (spec.g1_blocks + spec.g2_blocks) * spec.ec_cw_per_block,
+    );
+    for col in 0..max_block_len {
+        for block in &data_blocks {
+            if let Some(&byte) = block.get(col) {
+                interleaved.push(byte);
+            }
+        }
+    }
+    for col in 0..spec.ec_cw_per_block {
+        for ec in &ec_blocks {
+            interleaved.push(ec[col]);
+        }
+    }
+
+    let size = 17 + 4 * usize::from(spec.version);
+    let mut modules = vec![vec![false; size]; size];
+    let mut is_function = vec![vec![false; size]; size];
+
+    fn set_qr_func(
+        modules: &mut [Vec<bool>],
+        is_function: &mut [Vec<bool>],
+        r: usize,
+        c: usize,
+        dark: bool,
+    ) {
+        modules[r][c] = dark;
+        is_function[r][c] = true;
+    }
+
+    // Finder patterns (7x7) + 1-module white separators.
+    let finder_edge = isize::try_from(size - 7).expect("QR size fits isize");
+    let size_isize = isize::try_from(size).expect("QR size fits isize");
+    for (fr, fc) in [(0isize, 0isize), (0, finder_edge), (finder_edge, 0)] {
+        for dr in -1isize..=7 {
+            for dc in -1isize..=7 {
+                let rr = fr + dr;
+                let cc = fc + dc;
+                if rr >= 0 && cc >= 0 && rr < size_isize && cc < size_isize {
+                    let dark = (0..=6).contains(&dr)
+                        && (0..=6).contains(&dc)
+                        && (dr == 0
+                            || dr == 6
+                            || dc == 0
+                            || dc == 6
+                            || ((2..=4).contains(&dr) && (2..=4).contains(&dc)));
+                    set_qr_func(
+                        &mut modules,
+                        &mut is_function,
+                        usize::try_from(rr).expect("non-negative row"),
+                        usize::try_from(cc).expect("non-negative col"),
+                        dark,
+                    );
+                }
+            }
+        }
+    }
+
+    // Alignment patterns (5x5).
+    let align_coords = qr_alignment_coords(spec.version);
+    for &cr in align_coords {
+        for &cc in align_coords {
+            let overlaps_finder =
+                !(cr > 8 || cc > 8 && cc < size - 8) || (cr >= size - 8 && cc <= 8);
+            if overlaps_finder {
+                continue;
+            }
+            let cr_i = isize::try_from(cr).expect("alignment row fits isize");
+            let cc_i = isize::try_from(cc).expect("alignment col fits isize");
+            for dr in -2isize..=2 {
+                for dc in -2isize..=2 {
+                    let r = usize::try_from(cr_i + dr).expect("alignment row non-negative");
+                    let c = usize::try_from(cc_i + dc).expect("alignment col non-negative");
+                    let dist = dr.abs().max(dc.abs());
+                    set_qr_func(&mut modules, &mut is_function, r, c, dist != 1);
+                }
+            }
+        }
+    }
+
+    // Timing patterns on row 6 and column 6.
+    for idx in 8..(size - 8) {
+        if !is_function[6][idx] {
+            set_qr_func(&mut modules, &mut is_function, 6, idx, idx % 2 == 0);
+        }
+        if !is_function[idx][6] {
+            set_qr_func(&mut modules, &mut is_function, idx, 6, idx % 2 == 0);
+        }
+    }
+
+    // Dark module + format reservation slots.
+    set_qr_func(&mut modules, &mut is_function, size - 8, 8, true);
+    for idx in 0..9 {
+        if idx != 6 {
+            is_function[8][idx] = true;
+            is_function[idx][8] = true;
+        }
+    }
+    for idx in 0..8 {
+        is_function[8][size - 1 - idx] = true;
+    }
+    for idx in 0..7 {
+        is_function[size - 1 - idx][8] = true;
+    }
+
+    // Version info (18 bits x 2) for versions >= 7.
+    if spec.version >= 7 {
+        let mut rem = u32::from(spec.version);
+        for _ in 0..12 {
+            rem = (rem << 1) ^ (((rem >> 11) & 1) * 0x1F25);
+        }
+        let ver_bits = (u32::from(spec.version) << 12) | rem;
+        for bit_idx in 0..18usize {
+            let dark = ((ver_bits >> bit_idx) & 1) != 0;
+            let a = size - 11 + (bit_idx % 3);
+            let b = bit_idx / 3;
+            set_qr_func(&mut modules, &mut is_function, a, b, dark);
+            set_qr_func(&mut modules, &mut is_function, b, a, dark);
+        }
+    }
+
+    // Zigzag 2-column codeword placement.
+    let mut bit_cursor = 0usize;
+    let total_cw_bits = interleaved.len() * 8;
+    let mut right = isize::try_from(size - 1).expect("QR size fits isize");
+    let mut upward = true;
+    while right > 0 {
+        if right == 6 {
+            right -= 1;
+        }
+        for step in 0..size {
+            let r = if upward { size - 1 - step } else { step };
+            for c_off in [0isize, 1isize] {
+                let c = usize::try_from(right - c_off).expect("QR column non-negative");
+                if !is_function[r][c] {
+                    let dark = if bit_cursor < total_cw_bits {
+                        let byte = interleaved[bit_cursor / 8];
+                        ((byte >> (7 - (bit_cursor % 8))) & 1) != 0
+                    } else {
+                        false
+                    };
+                    modules[r][c] = dark;
+                    bit_cursor += 1;
+                }
+            }
+        }
+        upward = !upward;
+        right -= 2;
+    }
+
+    // Choose optimal mask (0..=7) minimizing ISO/IEC 18004 penalty score.
+    let mut best_mask = 0u8;
+    let mut best_penalty = u32::MAX;
+    let mut best_grid = modules.clone();
+    for mask in 0u8..8 {
+        let mut candidate = modules.clone();
+        for r in 0..size {
+            for c in 0..size {
+                if !is_function[r][c] && qr_mask_bit(mask, r, c) {
+                    candidate[r][c] = !candidate[r][c];
+                }
+            }
+        }
+        qr_write_format_bits(&mut candidate, mask);
+        let penalty = qr_penalty_score(&candidate);
+        if penalty < best_penalty {
+            best_penalty = penalty;
+            best_mask = mask;
+            best_grid = candidate;
+        }
+    }
+    let _ = best_mask;
+    Ok((spec.version, best_grid))
+}
+
+fn qr_gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut prod = 0u8;
+    for _ in 0..8 {
+        if (b & 1) != 0 {
+            prod ^= a;
+        }
+        let hi = (a & 0x80) != 0;
+        a <<= 1;
+        if hi {
+            a ^= 0x1D;
+        }
+        b >>= 1;
+    }
+    prod
+}
+
+fn qr_rs_generator(degree: usize) -> Vec<u8> {
+    let mut poly = vec![1u8];
+    let mut root = 1u8;
+    for _ in 0..degree {
+        let mut next = vec![0u8; poly.len() + 1];
+        for (idx, &coeff) in poly.iter().enumerate() {
+            next[idx] ^= coeff;
+            next[idx + 1] ^= qr_gf_mul(coeff, root);
+        }
+        poly = next;
+        root = qr_gf_mul(root, 0x02);
+    }
+    poly
+}
+
+fn qr_rs_remainder(data: &[u8], generator: &[u8]) -> Vec<u8> {
+    let ec_len = generator.len() - 1;
+    let mut rem = vec![0u8; ec_len];
+    for &byte in data {
+        let factor = byte ^ rem[0];
+        rem.copy_within(1.., 0);
+        rem[ec_len - 1] = 0;
+        for idx in 0..ec_len {
+            rem[idx] ^= qr_gf_mul(generator[idx + 1], factor);
+        }
+    }
+    rem
+}
+
+const fn qr_alignment_coords(version: u8) -> &'static [usize] {
+    match version {
+        2 => &[6, 18],
+        3 => &[6, 22],
+        4 => &[6, 26],
+        5 => &[6, 30],
+        6 => &[6, 34],
+        7 => &[6, 22, 38],
+        8 => &[6, 24, 42],
+        9 => &[6, 26, 46],
+        10 => &[6, 28, 50],
+        11 => &[6, 30, 54],
+        12 => &[6, 32, 58],
+        13 => &[6, 34, 62],
+        _ => &[],
+    }
+}
+
+const fn qr_mask_bit(mask: u8, r: usize, c: usize) -> bool {
+    match mask {
+        0 => (r + c).is_multiple_of(2),
+        1 => r.is_multiple_of(2),
+        2 => c.is_multiple_of(3),
+        3 => (r + c).is_multiple_of(3),
+        4 => ((r / 2) + (c / 3)).is_multiple_of(2),
+        5 => ((r * c) % 2) + ((r * c) % 3) == 0,
+        6 => (((r * c) % 2) + ((r * c) % 3)).is_multiple_of(2),
+        7 => (((r + c) % 2) + ((r * c) % 3)).is_multiple_of(2),
+        _ => false,
+    }
+}
+
+fn qr_write_format_bits(modules: &mut [Vec<bool>], mask: u8) {
+    // ECC Level L indicator = 0b01; 5-bit format header = (0b01 << 3) | mask.
+    let data = (0b01u16 << 3) | u16::from(mask);
+    let mut rem = data;
+    for _ in 0..10 {
+        rem = (rem << 1) ^ (((rem >> 9) & 1) * 0x537);
+    }
+    let bits = ((data << 10) | rem) ^ 0x5412;
+    let bit = |idx: usize| -> bool { ((bits >> idx) & 1) != 0 };
+    let size = modules.len();
+
+    // Copy 1 around top-left finder: bit 14 (MSB) at (8, 0) .. bit 0 (LSB) at (0, 8).
+    let tl_coords = [
+        (0usize, 8usize),
+        (1, 8),
+        (2, 8),
+        (3, 8),
+        (4, 8),
+        (5, 8),
+        (7, 8),
+        (8, 8),
+        (8, 7),
+        (8, 5),
+        (8, 4),
+        (8, 3),
+        (8, 2),
+        (8, 1),
+        (8, 0),
+    ];
+    for (idx, (r, c)) in tl_coords.into_iter().enumerate() {
+        modules[r][c] = bit(idx);
+    }
+
+    // Copy 2 split across top-right (bits 0..=7) and bottom-left (bits 8..=14).
+    for idx in 0..8usize {
+        modules[8][size - 1 - idx] = bit(idx);
+    }
+    for idx in 8..15usize {
+        modules[size - 15 + idx][8] = bit(idx);
+    }
+}
+
+fn qr_penalty_score(modules: &[Vec<bool>]) -> u32 {
+    let size = modules.len();
+    let mut penalty = 0u32;
+
+    // N1: adjacent same-color runs >= 5 in rows and columns.
+    for row in modules {
+        let mut run_color = row[0];
+        let mut run_len = 1u32;
+        for &cell in &row[1..] {
+            if cell == run_color {
+                run_len += 1;
+            } else {
+                if run_len >= 5 {
+                    penalty += 3 + (run_len - 5);
+                }
+                run_color = cell;
+                run_len = 1;
+            }
+        }
+        if run_len >= 5 {
+            penalty += 3 + (run_len - 5);
+        }
+    }
+    for c in 0..size {
+        let mut run_color = modules[0][c];
+        let mut run_len = 1u32;
+        for row in &modules[1..] {
+            let cell = row[c];
+            if cell == run_color {
+                run_len += 1;
+            } else {
+                if run_len >= 5 {
+                    penalty += 3 + (run_len - 5);
+                }
+                run_color = cell;
+                run_len = 1;
+            }
+        }
+        if run_len >= 5 {
+            penalty += 3 + (run_len - 5);
+        }
+    }
+
+    // N2: 2x2 blocks of identical color.
+    for r in 0..(size - 1) {
+        for c in 0..(size - 1) {
+            let color = modules[r][c];
+            if modules[r][c + 1] == color
+                && modules[r + 1][c] == color
+                && modules[r + 1][c + 1] == color
+            {
+                penalty += 3;
+            }
+        }
+    }
+
+    // N4: dark-module balance relative to 50%.
+    let dark_count: usize = modules
+        .iter()
+        .map(|row| row.iter().filter(|&&m| m).count())
+        .sum();
+    let total = size * size;
+    let diff = dark_count.abs_diff(total / 2) * 20 / total;
+    penalty += u32::try_from(diff).unwrap_or(0) * 10;
+    penalty
 }
 
 fn current_time_ms() -> u64 {
@@ -980,7 +1607,7 @@ pub const EMBEDDED_WEB_CLIENT_HTML: &str = r#"<!DOCTYPE html>
 "#;
 
 /// No storage, analytics, external resources, or credential-bearing request URL.
-pub const EMBEDDED_WEB_CLIENT_JS: &str = r#"'use strict';
+pub const EMBEDDED_WEB_CLIENT_JS: &str = r"'use strict';
 (() => {
     const grid = document.getElementById('canvas-grid');
     const status = document.getElementById('conn-status');
@@ -1155,7 +1782,7 @@ pub const EMBEDDED_WEB_CLIENT_JS: &str = r#"'use strict';
     document.getElementById('larger').onclick = () => { fontSize = Math.min(28, fontSize + 1); grid.style.fontSize = `${fontSize}px`; };
     window.addEventListener('pagehide', () => { socket.close(1000, 'viewer closed'); });
 })();
-"#;
+";
 
 #[cfg(test)]
 mod tests {
@@ -1170,6 +1797,7 @@ mod tests {
             max_viewers: 2,
             require_auth_token: true,
             enable_audit_log: true,
+            ..WebRemoteSettings::default()
         };
 
         let manager = WebRemoteManager::new(settings);
@@ -1224,6 +1852,7 @@ mod tests {
             max_viewers: 4,
             require_auth_token: false,
             enable_audit_log: true,
+            ..WebRemoteSettings::default()
         };
 
         let manager = WebRemoteManager::new(settings);

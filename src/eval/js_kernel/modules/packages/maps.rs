@@ -498,13 +498,13 @@ mod tests {
         write_package(
             dir.path(),
             "sealed",
-            r#"{"exports":{"./*":"./open.mjs","./private/*":null,"./exact":null,"./missing":["./absent.mjs","./open.mjs"],"./format":["./legacy.cjs","./open.mjs"]}}"#,
+            r#"{"exports":{"./*":"./open.mjs","./private/*":null,"./exact":null,"./missing":["./absent.mjs","./open.mjs"],"./format":["./legacy.wasm","./open.mjs"]}}"#,
             &[
                 (
                     "open.mjs",
                     "globalThis.executed = true; export const value = 42;",
                 ),
-                ("legacy.cjs", "globalThis.executed = true;"),
+                ("legacy.wasm", "globalThis.executed = true;"),
             ],
         );
         let tool = crate::eval::EvalTool::new(dir.path());

@@ -188,6 +188,16 @@ pub struct CopilotProvider {
     provider_name: String,
     /// Compatibility overrides passed to the underlying OpenAI provider.
     compat: Option<CompatConfig>,
+    /// Whether the target Copilot model supports reasoning effort controls.
+    reasoning: bool,
+    /// Declared input modalities (`text`, `image`, ...) for the target model.
+    input_types: Vec<crate::provider::InputType>,
+    /// Catalog pricing for the model when known.
+    model_cost: Option<crate::provider::ModelCost>,
+    /// Optional path to `auth.json` so rotated `/login github-copilot` tokens
+    /// are picked up dynamically during session-token refresh.
+    auth_path_override: Option<std::path::PathBuf>,
+    auth_command_working_directory: Option<std::path::PathBuf>,
     /// Cached session token (refreshed automatically).
     cached_token: Mutex<Option<CachedToken>>,
 }
@@ -203,6 +213,11 @@ impl CopilotProvider {
             chat_completions_override: None,
             provider_name: "github-copilot".to_string(),
             compat: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            model_cost: None,
+            auth_path_override: None,
+            auth_command_working_directory: None,
             cached_token: Mutex::new(None),
         }
     }
@@ -249,6 +264,61 @@ impl CopilotProvider {
         self
     }
 
+    /// Enable or disable OpenAI reasoning effort parameters on Chat Completions.
+    #[must_use]
+    pub const fn with_reasoning(mut self, reasoning: bool) -> Self {
+        self.reasoning = reasoning;
+        self
+    }
+
+    /// Declare supported input modalities (`text`, `image`, ...) for the model.
+    #[must_use]
+    pub fn with_input_types(mut self, input_types: &[crate::provider::InputType]) -> Self {
+        self.input_types = input_types.to_vec();
+        self
+    }
+
+    /// Attach catalog pricing for this Copilot model.
+    #[must_use]
+    pub const fn with_model_cost(mut self, cost: crate::provider::ModelCost) -> Self {
+        self.model_cost = Some(cost);
+        self
+    }
+
+    /// Bind `AuthStorage` metadata so rotated `/login github-copilot` tokens are
+    /// reloaded automatically whenever the short-lived Copilot session bearer refreshes.
+    pub fn with_auth_storage(mut self, auth: &crate::auth::AuthStorage) -> Result<Self> {
+        self.auth_path_override = Some(if auth.path().is_absolute() {
+            auth.path().to_path_buf()
+        } else {
+            std::env::current_dir()?.join(auth.path())
+        });
+        self.auth_command_working_directory = auth
+            .command_working_directory()
+            .map(std::path::Path::to_path_buf);
+        Ok(self)
+    }
+
+    fn effective_github_token(&self) -> String {
+        if let Some(path) = &self.auth_path_override
+            && let Ok(mut storage) = crate::auth::AuthStorage::load(path.clone())
+        {
+            if let Some(cwd) = &self.auth_command_working_directory {
+                let _ = storage.set_command_working_directory(cwd);
+            }
+            if let Some(live) = storage
+                .resolve_api_key(&self.provider_name, None)
+                .or_else(|| storage.resolve_api_key("github-copilot", None))
+            {
+                let trimmed = live.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        self.github_token.clone()
+    }
+
     /// Get a valid session token, refreshing if necessary.
     async fn ensure_session_token(&self) -> Result<CachedToken> {
         // Check cache first.
@@ -271,10 +341,11 @@ impl CopilotProvider {
             self.github_api_base.trim_end_matches('/')
         );
 
+        let github_token = self.effective_github_token();
         let request = self
             .client
             .get(&token_url)
-            .header("Authorization", format!("token {}", self.github_token))
+            .header("Authorization", format!("token {github_token}"))
             .header("Accept", "application/json")
             .header("Editor-Version", copilot_editor_version())
             .header("User-Agent", copilot_user_agent())
@@ -392,11 +463,18 @@ impl CopilotProvider {
         {
             headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
         }
-        let inner = OpenAIProvider::new(&self.model)
+        let mut inner = OpenAIProvider::new(&self.model)
             .with_provider_name(&self.provider_name)
             .with_base_url(&session.api_endpoint)
             .with_compat(compat)
+            .with_reasoning(self.reasoning)
             .with_client(self.client.clone());
+        if let Some(cost) = self.model_cost.clone() {
+            inner = inner.with_model_cost(cost);
+        }
+        if !self.input_types.is_empty() {
+            inner = inner.with_input_types(&self.input_types);
+        }
         inner
             .stream(context, &Self::session_options(session, options))
             .await
@@ -415,6 +493,21 @@ impl Provider for CopilotProvider {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        self.model_cost.clone()
+    }
+
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            vision: self.input_types.is_empty()
+                || self
+                    .input_types
+                    .iter()
+                    .any(|kind| matches!(kind, crate::provider::InputType::Image)),
+            ..crate::provider::ProviderCapabilities::default()
+        }
     }
 
     async fn stream(
@@ -1272,5 +1365,43 @@ mod tests {
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
             assert!(provider.cached_token.lock().expect("cache").is_none());
         });
+    }
+
+    #[test]
+    fn copilot_forwards_model_metadata_and_reloads_rotated_auth_storage_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"github-copilot":{"type":"api_key","key":"ghu_rotated_live_token"}}"#,
+        )
+        .expect("write auth.json");
+        let auth = crate::auth::AuthStorage::load(auth_path).expect("load auth");
+
+        let cost = crate::provider::ModelCost {
+            input: 2.5,
+            output: 10.0,
+            cache_read: 1.25,
+            cache_write: 0.0,
+            audio: None,
+        };
+        let provider = CopilotProvider::new("o3-mini", "ghu_stale_startup_token")
+            .with_reasoning(true)
+            .with_input_types(&[crate::provider::InputType::Text])
+            .with_model_cost(cost.clone())
+            .with_auth_storage(&auth)
+            .expect("bind auth storage");
+
+        assert!(provider.reasoning);
+        assert_eq!(provider.model_cost(), Some(cost));
+        assert!(
+            !provider.capabilities().vision,
+            "text-only input_types must report vision=false"
+        );
+        assert_eq!(
+            provider.effective_github_token(),
+            "ghu_rotated_live_token",
+            "live auth.json credential must override stale startup token on session refresh"
+        );
     }
 }

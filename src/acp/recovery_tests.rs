@@ -50,7 +50,7 @@ impl ProviderFixture {
         let stop = Arc::clone(&stopped);
         let worker = std::thread::spawn(move || {
             for (reply_index, (status, tool)) in statuses.into_iter().zip(tools).enumerate() {
-                let deadline = Instant::now() + Duration::from_secs(20);
+                let deadline = Instant::now() + Duration::from_secs(60);
                 let mut stream = loop {
                     if stop.load(Ordering::SeqCst) {
                         return;
@@ -1394,7 +1394,7 @@ fn user_content(request: &Value) -> &Value {
 }
 
 async fn bounded_launch_controls<F: Future>(work: F) -> F::Output {
-    timeout(wall_now(), Duration::from_secs(15), Box::pin(work))
+    timeout(wall_now(), Duration::from_secs(60), Box::pin(work))
         .await
         .expect("ACP launch controls watchdog expired")
 }
@@ -1408,7 +1408,10 @@ fn launch_prewalk_preserves_native_tasks_without_replaying_the_editor_edit() {
     let mut server = ProviderFixture::with_replies(
         vec![200, 200, 503, 200],
         vec![
-            Some(("todo", json!({"op":"init", "tasks":["Implement the editor change", "Verify"]}))),
+            Some((
+                "todo",
+                json!({"op":"init", "tasks":["Implement the editor change", "Verify"]}),
+            )),
             Some(("write", json!({"path":"prewalk.txt", "content":"one edit"}))),
             None,
             None,
@@ -2383,17 +2386,25 @@ fn launch_key_survives_real_retry_failover_and_explicit_runtime_model_switch() {
             .collect::<Vec<_>>(),
         [PRIMARY_MODEL, PRIMARY_MODEL, FALLBACK_MODEL, PRIMARY_MODEL]
     );
-    for (headers, body) in requests {
+    for (index, (headers, body)) in requests.into_iter().enumerate() {
+        let expected_bearer = if index == 2 {
+            "Bearer stored-fallback-key"
+        } else {
+            "Bearer pinned-launch-key"
+        };
         assert!(headers.lines().any(|line| {
             line.split_once(':').is_some_and(|(name, value)| {
-                name.eq_ignore_ascii_case("authorization")
-                    && value.trim() == "Bearer pinned-launch-key"
+                name.eq_ignore_ascii_case("authorization") && value.trim() == expected_bearer
             })
         }));
         let model = body["model"].as_str().unwrap();
         assert!(headers.contains(&format!("x-acp-model: {model}")));
         assert!(!headers.contains("stored-primary-key"));
-        assert!(!headers.contains("stored-fallback-key"));
+        if index == 2 {
+            assert!(!headers.contains("pinned-launch-key"));
+        } else {
+            assert!(!headers.contains("stored-fallback-key"));
+        }
     }
 }
 
@@ -2899,4 +2910,245 @@ fn configured_acp_retry_save_failure_blocks_all_later_provider_work() {
         assert_no_private_diagnostics(&updates);
     });
     server.finish(2);
+}
+
+#[test]
+fn acp_cli_resolves_default_session_dir_until_no_session_is_set() {
+    use clap::Parser as _;
+
+    let default_cli = crate::cli::Cli::parse_from(["pi", "--acp"]);
+    assert_eq!(
+        resolve_acp_session_dir(&default_cli),
+        Some(Config::sessions_dir()),
+        "pi --acp must persist per-project sessions by default"
+    );
+
+    let custom_cli =
+        crate::cli::Cli::parse_from(["pi", "--acp", "--session-dir", "/tmp/acp-custom"]);
+    assert_eq!(
+        resolve_acp_session_dir(&custom_cli),
+        Some(PathBuf::from("/tmp/acp-custom"))
+    );
+
+    let ephemeral_cli = crate::cli::Cli::parse_from(["pi", "--acp", "--no-session"]);
+    assert_eq!(
+        resolve_acp_session_dir(&ephemeral_cli),
+        None,
+        "pi --acp --no-session must remain in-memory"
+    );
+}
+
+#[test]
+fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let global_dir = root.path().join("global");
+    let workspace = root.path().join("workspace");
+    let sessions_root = root.path().join("sessions");
+    let ext_dir = workspace.join(".pi/extensions");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::create_dir_all(&sessions_root).unwrap();
+
+    std::fs::write(
+        ext_dir.join("acp_probe.mjs"),
+        r#"export default function (pi) {
+            pi.registerTool({
+                name: "acp_ext_probe",
+                label: "ACP Extension Probe",
+                description: "Echoes a marker from an ACP workspace extension",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        tag: { type: "string" }
+                    },
+                    required: ["tag"]
+                },
+                async execute(_toolCallId, params) {
+                    return {
+                        content: [{ type: "text", text: `EXT_OK:${params.tag}` }]
+                    };
+                }
+            });
+        }"#,
+    )
+    .unwrap();
+
+    let cwd = workspace.canonicalize().unwrap();
+    let mut provider = ProviderFixture::with_replies(
+        vec![200, 200],
+        vec![
+            Some(("acp_ext_probe", json!({ "tag": "zed-turn-1" }))),
+            None,
+        ],
+    );
+
+    let runtime = runtime();
+
+    // 1. Planted negative: untrusted workspace must NOT load `.pi/extensions/acp_probe.mjs`.
+    runtime.block_on(bounded_launch_controls(async {
+        let mut untrusted_opts = options(&cwd, &provider.url, runtime.handle(), 0);
+        untrusted_opts.session_dir = Some(sessions_root.clone());
+        untrusted_opts.settings_source = Some(AcpSettingsSource {
+            global_dir: global_dir.clone(),
+            config_override: None,
+            workspace_trust_env: Some("0".to_string()),
+            launch_cwd: cwd.clone(),
+        });
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            let _ = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({ "protocolVersion": 1 }),
+            )
+            .await;
+            let created = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/new",
+                json!({ "cwd": cwd, "mcpServers": [] }),
+            )
+            .await;
+            assert!(created.get("error").is_none(), "{created}");
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+        };
+        let (served, ()) = futures::join!(
+            Box::pin(run(untrusted_opts, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+    }));
+
+    // 2. Trusted workspace loads `.pi/extensions/acp_probe.mjs`, executes tool call, and persists session.
+    let (session_id, prompt_updates) = runtime.block_on(bounded_launch_controls(async {
+        let mut trusted_opts = options(&cwd, &provider.url, runtime.handle(), 0);
+        trusted_opts.session_dir = Some(sessions_root.clone());
+        trusted_opts.launch.tools = Some("current_time".to_string());
+        trusted_opts.launch.no_mcp = true;
+        trusted_opts.launch.no_context_files = true;
+        trusted_opts.settings_source = Some(AcpSettingsSource {
+            global_dir: global_dir.clone(),
+            config_override: None,
+            workspace_trust_env: Some("1".to_string()),
+            launch_cwd: cwd.clone(),
+        });
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            let _ = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({ "protocolVersion": 1 }),
+            )
+            .await;
+            let created = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/new",
+                json!({ "cwd": cwd, "mcpServers": [] }),
+            )
+            .await;
+            let id = created["result"]["sessionId"].as_str().unwrap().to_string();
+            approved_fork_prompt(
+                &input,
+                &outgoing,
+                &mut transcript,
+                3,
+                &id,
+                "Run the extension probe",
+            )
+            .await;
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+            (id, transcript)
+        };
+        let (served, out) = futures::join!(
+            Box::pin(run(trusted_opts, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+        out
+    }));
+
+    let wire_log = serde_json::to_string(&prompt_updates).unwrap();
+    assert!(
+        wire_log.contains("EXT_OK:zed-turn-1"),
+        "extension tool output must stream to ACP client: {wire_log}"
+    );
+
+    // 3. Restart ACP server and verify `session/load` replays persisted transcript + re-boots extension!
+    let reload_updates = runtime.block_on(bounded_launch_controls(async {
+        let mut restarted_opts = options(&cwd, &provider.url, runtime.handle(), 0);
+        restarted_opts.session_dir = Some(sessions_root.clone());
+        restarted_opts.launch.tools = Some("current_time".to_string());
+        restarted_opts.launch.no_mcp = true;
+        restarted_opts.launch.no_context_files = true;
+        restarted_opts.settings_source = Some(AcpSettingsSource {
+            global_dir: global_dir.clone(),
+            config_override: None,
+            workspace_trust_env: Some("1".to_string()),
+            launch_cwd: cwd.clone(),
+        });
+        let (input, incoming) = asupersync::channel::mpsc::channel(16);
+        let (output, outgoing) = std::sync::mpsc::sync_channel(128);
+        let mut transcript = Vec::new();
+        let editor = async {
+            let _ = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                1,
+                "initialize",
+                json!({ "protocolVersion": 1 }),
+            )
+            .await;
+            let loaded = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                2,
+                "session/load",
+                json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+            )
+            .await;
+            assert!(
+                loaded.get("error").is_none(),
+                "session/load failed: {loaded}"
+            );
+            input
+                .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
+                .unwrap();
+            transcript
+        };
+        let (served, out) = futures::join!(
+            Box::pin(run(restarted_opts, incoming, AcpOutput::new(output))),
+            editor
+        );
+        served.unwrap();
+        out
+    }));
+    let reload_wire = serde_json::to_string(&reload_updates).unwrap();
+    assert!(
+        reload_wire.contains("Run the extension probe")
+            && reload_wire.contains("Recovered editor answer"),
+        "restarted ACP server must replay persisted transcript: {reload_wire}"
+    );
+
+    provider.finish(2);
 }

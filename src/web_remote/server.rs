@@ -6,23 +6,27 @@
 
 use super::{
     BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, EMBEDDED_WEB_CLIENT_JS, TokenKind,
-    WebRemoteBridge, WebRemoteInput, WebRemoteSettings,
+    WebAuditEvent, WebRemoteBridge, WebRemoteInput, WebRemoteSettings,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use asupersync::Cx;
+use asupersync::bytes::BytesMut;
+use asupersync::codec::{Decoder as _, Encoder as _};
 use asupersync::http::h1::server::HostPolicy;
 use asupersync::http::h1::{
-    Http1Config, Http1Listener, Http1ListenerConfig, Http1Response, Http1Upgrade, Method, Request,
-    Response,
+    Http1Codec, Http1Config, Http1Listener, Http1ListenerConfig, Http1Response, Http1Upgrade,
+    Method, Request, Response,
 };
+use asupersync::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use asupersync::net::TcpListener;
 use asupersync::net::websocket::{
-    HttpRequest as UpgradeRequest, Message, ServerHandshake, ServerWebSocket, SlowConsumerPolicy,
-    WebSocketAcceptor,
+    AcceptResponse, HttpRequest as UpgradeRequest, Message, ServerHandshake, ServerWebSocket,
+    SlowConsumerPolicy, WebSocketAcceptor,
 };
-use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::RuntimeBuilder;
-use asupersync::server::shutdown::ShutdownSignal;
+use asupersync::server::shutdown::{ShutdownPhase, ShutdownSignal};
+use asupersync::tls::{TlsAcceptor, TlsAcceptorBuilder};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io;
@@ -66,7 +70,29 @@ impl WebRemoteServer {
     /// Bind before returning, so agent/session startup cannot race a failed port.
     pub fn start(settings: WebRemoteSettings) -> Result<Self> {
         settings.validate().map_err(Error::Config)?;
+        let tls_acceptor = match (&settings.tls_cert, &settings.tls_key) {
+            (Some(cert_path), Some(key_path)) => Some(
+                TlsAcceptorBuilder::from_pem_files(cert_path, key_path)
+                    .map_err(|err| Error::Config(format!("failed to load TLS credentials: {err}")))?
+                    .alpn_http()
+                    .handshake_timeout(HTTP_TIMEOUT)
+                    .build()
+                    .map_err(|err| Error::Config(format!("invalid TLS configuration: {err}")))?,
+            ),
+            _ => None,
+        };
+        let uses_tls = tls_acceptor.is_some();
         let bridge = WebRemoteBridge::new(settings.clone());
+        if settings.bind_mode != BindMode::Loopback && !uses_tls && settings.allow_insecure_lan {
+            eprintln!(
+                "SECURITY WARNING: web remote is binding to {:?} WITHOUT TLS (--allow-insecure-lan); pairing tokens and terminal frames are unencrypted.",
+                settings.bind_mode
+            );
+            bridge.manager().record_audit_event(
+                WebAuditEvent::new("insecure_lan_bind_permitted", None)
+                    .with_detail("bind_mode", format!("{:?}", settings.bind_mode)),
+            );
+        }
         let kind = if settings.view_only {
             TokenKind::View
         } else {
@@ -79,17 +105,19 @@ impl WebRemoteServer {
             .name("pi-web-remote".to_owned())
             .spawn(move || {
                 let _owner = ListenerGuard(thread_bridge.clone());
-                if let Err(error) = run_listener(settings, &thread_bridge, &ready_tx) {
+                if let Err(error) = run_listener(settings, tls_acceptor, &thread_bridge, &ready_tx)
+                {
                     // Before startup this reports the bind failure. Afterwards
                     // the receiver is gone; do not log requests or credentials.
                     let _ = ready_tx.try_send(Err(error));
                 }
             })?;
+        let scheme = if uses_tls { "https" } else { "http" };
         match ready_rx.recv() {
             Ok(Ok(ready)) => Ok(Self {
                 bridge,
                 local_addr: ready.local_addr,
-                pairing_url: format!("http://{}/#token={token}", ready.authority),
+                pairing_url: format!("{scheme}://{}/#token={token}", ready.authority),
                 shutdown: ready.shutdown,
                 thread: Some(thread),
             }),
@@ -148,6 +176,7 @@ struct ServerState {
     bridge: WebRemoteBridge,
     authorities: Vec<String>,
     content_security_policy: String,
+    uses_tls: bool,
 }
 
 struct ListenerGuard(WebRemoteBridge);
@@ -160,6 +189,7 @@ impl Drop for ListenerGuard {
 
 fn run_listener(
     settings: WebRemoteSettings,
+    tls_acceptor: Option<TlsAcceptor>,
     bridge: &WebRemoteBridge,
     ready: &mpsc::SyncSender<io::Result<Ready>>,
 ) -> io::Result<()> {
@@ -170,7 +200,39 @@ fn run_listener(
     runtime.block_on(async {
         let listener = bind_listener(&settings).await?;
         let local_addr = listener.local_addr()?;
-        let (authority, authorities) = bound_authorities(local_addr);
+        let uses_tls = tls_acceptor.is_some();
+        let (authority, authorities) = bound_authorities(local_addr, uses_tls);
+        let state = Arc::new(ServerState {
+            bridge: bridge.clone(),
+            content_security_policy: content_security_policy(&authorities, uses_tls),
+            authorities: authorities.clone(),
+            uses_tls,
+        });
+        if let Some(acceptor) = tls_acceptor {
+            let shutdown = ShutdownSignal::new();
+            ready
+                .send(Ok(Ready {
+                    local_addr,
+                    authority,
+                    shutdown: shutdown.clone(),
+                }))
+                .map_err(|_| io::Error::other("web listener owner disappeared"))?;
+            return run_tls_listener(listener, acceptor, state, shutdown, &handle).await;
+        }
+        let mut allowlist_hosts: Vec<String> = authorities
+            .iter()
+            .map(|auth| {
+                if auth.starts_with('[') {
+                    auth.split_once("]:")
+                        .map_or_else(|| auth.clone(), |(h, _)| format!("{h}]"))
+                } else {
+                    auth.rsplit_once(':')
+                        .map_or_else(|| auth.clone(), |(h, _)| h.to_owned())
+                }
+            })
+            .collect();
+        allowlist_hosts.sort();
+        allowlist_hosts.dedup();
         let http_config = Http1Config::default()
             .max_headers_size(8192)
             .max_body_size(0)
@@ -178,7 +240,7 @@ fn run_listener(
             .idle_timeout(Some(HTTP_TIMEOUT))
             .request_timeout(Some(HTTP_TIMEOUT))
             .request_drain_grace(Duration::from_millis(100))
-            .host_policy(HostPolicy::AllowList(authorities.clone()));
+            .host_policy(HostPolicy::AllowList(allowlist_hosts));
         let config = Http1ListenerConfig::default()
             .http_config(http_config)
             // Incomplete HTTP/authentication requests do not consume the much
@@ -186,11 +248,6 @@ fn run_listener(
             .max_connections(Some(MAX_HTTP_CONNECTIONS))
             .drain_timeout(Duration::from_millis(100))
             .hard_drain_timeout(Duration::from_secs(2));
-        let state = Arc::new(ServerState {
-            bridge: bridge.clone(),
-            content_security_policy: content_security_policy(&authorities),
-            authorities,
-        });
         let listener = Http1Listener::from_listener_upgradeable(
             listener,
             move |request| {
@@ -208,6 +265,171 @@ fn run_listener(
             .map_err(|_| io::Error::other("web listener owner disappeared"))?;
         listener.run(&handle).await.map(|_| ())
     })
+}
+
+async fn run_tls_listener(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    state: Arc<ServerState>,
+    shutdown: ShutdownSignal,
+    handle: &asupersync::runtime::RuntimeHandle,
+) -> io::Result<()> {
+    let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    while !shutdown.is_shutting_down() {
+        tasks.retain(|task: &asupersync::runtime::JoinHandle<()>| !task.is_finished());
+        let accepted = {
+            let mut accept_fut = core::pin::pin!(listener.accept());
+            let mut draining = core::pin::pin!(shutdown.wait_for_phase(ShutdownPhase::Draining));
+            let mut forcing = core::pin::pin!(shutdown.wait_for_phase(ShutdownPhase::ForceClosing));
+            std::future::poll_fn(|task_cx| {
+                if shutdown.is_shutting_down()
+                    || draining.as_mut().poll(task_cx).is_ready()
+                    || forcing.as_mut().poll(task_cx).is_ready()
+                {
+                    return std::task::Poll::Ready(None);
+                }
+                accept_fut.as_mut().poll(task_cx).map(Some)
+            })
+            .await
+        };
+        let Some(accepted) = accepted else {
+            break;
+        };
+        let Ok((stream, peer_addr)) = accepted else {
+            continue;
+        };
+        if active_conns.load(std::sync::atomic::Ordering::Acquire) >= MAX_HTTP_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
+        active_conns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let conn_counter = Arc::clone(&active_conns);
+        let conn_acceptor = acceptor.clone();
+        let conn_state = Arc::clone(&state);
+        let conn_shutdown = shutdown.clone();
+        tasks.push(handle.spawn(async move {
+            struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            }
+            let _active = ActiveGuard(conn_counter);
+            let mut force_close =
+                core::pin::pin!(conn_shutdown.wait_for_phase(ShutdownPhase::ForceClosing));
+            let mut session = core::pin::pin!(serve_tls_connection(
+                stream,
+                peer_addr,
+                conn_acceptor,
+                conn_state
+            ));
+            std::future::poll_fn(|task_cx| {
+                if conn_shutdown.phase() as u8 >= ShutdownPhase::ForceClosing as u8
+                    || force_close.as_mut().poll(task_cx).is_ready()
+                {
+                    return std::task::Poll::Ready(());
+                }
+                session.as_mut().poll(task_cx)
+            })
+            .await;
+        }));
+    }
+    for task in tasks {
+        let () = task.await;
+    }
+    Ok(())
+}
+
+async fn serve_tls_connection(
+    stream: asupersync::net::TcpStream,
+    peer_addr: SocketAddr,
+    acceptor: TlsAcceptor,
+    state: Arc<ServerState>,
+) {
+    let cx = Cx::current().unwrap_or_else(Cx::for_request);
+    let Ok(mut tls_stream) = acceptor.accept(stream).await else {
+        return;
+    };
+    if !matches!(tls_stream.alpn_protocol(), None | Some(b"http/1.1")) {
+        let _ = tls_stream.shutdown().await;
+        return;
+    }
+    let mut codec = Http1Codec::new().max_headers_size(8192).max_body_size(0);
+    let mut read_buf = BytesMut::with_capacity(8192);
+    let request = loop {
+        match codec.decode(&mut read_buf) {
+            Ok(Some(mut req)) => {
+                req.peer_addr = Some(peer_addr);
+                break req;
+            }
+            Ok(None) => {
+                if read_buf.len() >= 8192 {
+                    return;
+                }
+                let mut chunk = [0u8; 2048];
+                let read_res =
+                    asupersync::time::timeout(now(&cx), HTTP_TIMEOUT, tls_stream.read(&mut chunk))
+                        .await;
+                let Ok(Ok(n)) = read_res else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                read_buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => return,
+        }
+    };
+    let outcome = route_request_outcome(request, &state);
+    match outcome {
+        RouteOutcome::Plain(response) => {
+            let mut write_buf = BytesMut::with_capacity(4096);
+            if codec.encode(response, &mut write_buf).is_ok() {
+                let _ = asupersync::time::timeout(
+                    now(&cx),
+                    HTTP_TIMEOUT,
+                    tls_stream.write_all(&write_buf),
+                )
+                .await;
+                let _ = asupersync::time::timeout(now(&cx), HTTP_TIMEOUT, tls_stream.flush()).await;
+            }
+            let _ = tls_stream.shutdown().await;
+        }
+        RouteOutcome::WebSocket {
+            response,
+            accepted,
+            peer,
+        } => {
+            let mut write_buf = BytesMut::with_capacity(1024);
+            if codec.encode(response, &mut write_buf).is_err() {
+                return;
+            }
+            if !matches!(
+                asupersync::time::timeout(now(&cx), HTTP_TIMEOUT, tls_stream.write_all(&write_buf))
+                    .await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+            if !matches!(
+                asupersync::time::timeout(now(&cx), HTTP_TIMEOUT, tls_stream.flush()).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+            let ws_acceptor = WebSocketAcceptor::new()
+                .max_frame_size(MAX_INBOUND_BYTES)
+                .max_message_size(MAX_INBOUND_BYTES)
+                .max_pending_write_bytes(MAX_OUTBOUND_BYTES + 14)
+                .slow_consumer_policy(SlowConsumerPolicy::CloseWithTryAgainLater)
+                .ping_interval(None)
+                .close_timeout(Duration::from_millis(100));
+            let socket = ws_acceptor.finish_upgrade(tls_stream, accepted, &read_buf);
+            serve_websocket(&cx, socket, state.bridge.clone(), peer).await;
+        }
+    }
 }
 
 async fn bind_listener(settings: &WebRemoteSettings) -> io::Result<TcpListener> {
@@ -254,10 +476,13 @@ async fn tailscale_address() -> Option<Ipv4Addr> {
     (u32::from(address) & 0xffc0_0000 == 0x6440_0000).then_some(address)
 }
 
-fn bound_authorities(address: SocketAddr) -> (String, Vec<String>) {
+fn bound_authorities(address: SocketAddr, uses_tls: bool) -> (String, Vec<String>) {
     if !address.ip().is_unspecified() && !address.ip().is_loopback() {
         let authority = address.to_string();
-        return (authority.clone(), http_authorities(vec![authority]));
+        return (
+            authority.clone(),
+            http_authorities(vec![authority], uses_tls),
+        );
     }
     let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, address.port())).to_string();
     let mut authorities = vec![loopback.clone(), format!("localhost:{}", address.port())];
@@ -270,27 +495,29 @@ fn bound_authorities(address: SocketAddr) -> (String, Vec<String>) {
     } else {
         loopback
     };
-    (authority, http_authorities(authorities))
+    (authority, http_authorities(authorities, uses_tls))
 }
 
-fn http_authorities(mut authorities: Vec<String>) -> Vec<String> {
-    // Browsers omit HTTP's default port from Host and Origin even when the
+fn http_authorities(mut authorities: Vec<String>, uses_tls: bool) -> Vec<String> {
+    // Browsers omit the scheme's default port from Host and Origin even when the
     // pairing URL explicitly contains it. Both spellings identify this socket.
+    let default_suffix = if uses_tls { ":443" } else { ":80" };
     let default_port_aliases = authorities
         .iter()
-        .filter_map(|authority| authority.strip_suffix(":80").map(str::to_owned))
+        .filter_map(|authority| authority.strip_suffix(default_suffix).map(str::to_owned))
         .collect::<Vec<_>>();
     authorities.extend(default_port_aliases);
     authorities
 }
 
-fn content_security_policy(authorities: &[String]) -> String {
+fn content_security_policy(authorities: &[String], uses_tls: bool) -> String {
     let mut policy = CONTENT_SECURITY_POLICY.to_owned();
-    // Some browsers do not include ws:// in an HTTP page's 'self' source.
+    // Some browsers do not include ws:///wss:// in a page's 'self' source.
     // These literal authorities come from the bound socket/local route, never
     // from a request header, so granting them does not broaden the trust boundary.
+    let ws_scheme = if uses_tls { "wss" } else { "ws" };
     for authority in authorities {
-        let _ = write!(policy, " ws://{authority}");
+        let _ = write!(policy, " {ws_scheme}://{authority}");
     }
     policy
 }
@@ -310,62 +537,111 @@ fn primary_lan_address() -> Option<IpAddr> {
     Some(address)
 }
 
-fn route_request(request: Request, state: Arc<ServerState>) -> Http1Response {
+enum RouteOutcome {
+    Plain(Response),
+    WebSocket {
+        response: Response,
+        accepted: AcceptResponse,
+        peer: String,
+    },
+}
+
+fn route_request_outcome(request: Request, state: &ServerState) -> RouteOutcome {
+    let plain = |status: u16, reason: &str, body: &str| {
+        RouteOutcome::Plain(secure_response(
+            status,
+            reason,
+            "text/plain; charset=utf-8",
+            body,
+            CONTENT_SECURITY_POLICY,
+        ))
+    };
     if state.bridge.is_closed() {
-        return plain_response(503, "Service Unavailable", "Session closed.");
+        return plain(503, "Service Unavailable", "Session closed.");
     }
     let Some(host) = unique_header(&request, "host") else {
-        return plain_response(403, "Forbidden", "Invalid host.");
+        return plain(403, "Forbidden", "Invalid host.");
     };
     if !state
         .authorities
         .iter()
         .any(|authority| authority.eq_ignore_ascii_case(host))
     {
-        return plain_response(403, "Forbidden", "Invalid host.");
+        return plain(403, "Forbidden", "Invalid host.");
     }
     let origin_count = request
         .headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("origin"))
         .count();
+    let expected_origin_scheme = if state.uses_tls { "https" } else { "http" };
     if origin_count > 1
         || unique_header(&request, "origin")
-            .is_some_and(|origin| origin != format!("http://{host}"))
+            .is_some_and(|origin| origin != format!("{expected_origin_scheme}://{host}"))
     {
-        return plain_response(403, "Forbidden", "Invalid origin.");
+        return plain(403, "Forbidden", "Invalid origin.");
     }
     if request.method != Method::Get {
-        let mut response = plain_response(405, "Method Not Allowed", "Only GET is supported.");
+        let mut response = secure_response(
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            "Only GET is supported.",
+            CONTENT_SECURITY_POLICY,
+        );
         response
-            .response
             .headers
             .push(("Allow".to_owned(), "GET".to_owned()));
-        return response;
+        return RouteOutcome::Plain(response);
     }
     if !request.body.is_empty() || !request.trailers.is_empty() {
-        return plain_response(400, "Bad Request", "Request bodies are not supported.");
+        return plain(400, "Bad Request", "Request bodies are not supported.");
     }
     // Exact paths also reject credential-bearing queries and fragments before
     // routing. Authentication only happens inside the WebSocket hello message.
     match request.uri.as_str() {
-        "/" => Http1Response::new(secure_response(
+        "/" => RouteOutcome::Plain(secure_response(
             200,
             "OK",
             "text/html; charset=utf-8",
             EMBEDDED_WEB_CLIENT_HTML,
             &state.content_security_policy,
         )),
-        "/client.js" => Http1Response::new(secure_response(
+        "/client.js" => RouteOutcome::Plain(secure_response(
             200,
             "OK",
             "text/javascript; charset=utf-8",
             EMBEDDED_WEB_CLIENT_JS,
             &state.content_security_policy,
         )),
-        "/ws" if origin_count == 1 => upgrade_response(&request, state),
-        "/ws" => plain_response(403, "Forbidden", "An origin is required."),
-        _ => plain_response(404, "Not Found", "Not found."),
+        "/ws" if origin_count == 1 => prepare_upgrade_outcome(&request, state),
+        "/ws" => plain(403, "Forbidden", "An origin is required."),
+        _ => plain(404, "Not Found", "Not found."),
+    }
+}
+
+fn route_request(request: Request, state: Arc<ServerState>) -> Http1Response {
+    match route_request_outcome(request, &state) {
+        RouteOutcome::Plain(response) => Http1Response::new(response),
+        RouteOutcome::WebSocket {
+            response,
+            accepted,
+            peer,
+        } => {
+            let bridge = state.bridge.clone();
+            let upgrade = Http1Upgrade::new(move |cx, stream, read_ahead| async move {
+                let acceptor = WebSocketAcceptor::new()
+                    .max_frame_size(MAX_INBOUND_BYTES)
+                    .max_message_size(MAX_INBOUND_BYTES)
+                    .max_pending_write_bytes(MAX_OUTBOUND_BYTES + 14)
+                    .slow_consumer_policy(SlowConsumerPolicy::CloseWithTryAgainLater)
+                    .ping_interval(None)
+                    .close_timeout(Duration::from_millis(100));
+                let socket = acceptor.finish_upgrade(stream, accepted, &read_ahead);
+                serve_websocket(&cx, socket, bridge, peer).await;
+            });
+            Http1Response::new(response).with_upgrade(upgrade)
+        }
     }
 }
 
@@ -397,17 +673,7 @@ fn secure_response(
         .with_header("Cross-Origin-Opener-Policy", "same-origin")
 }
 
-fn plain_response(status: u16, reason: &str, body: &str) -> Http1Response {
-    Http1Response::new(secure_response(
-        status,
-        reason,
-        "text/plain; charset=utf-8",
-        body,
-        CONTENT_SECURITY_POLICY,
-    ))
-}
-
-fn upgrade_response(request: &Request, state: Arc<ServerState>) -> Http1Response {
+fn prepare_upgrade_outcome(request: &Request, state: &ServerState) -> RouteOutcome {
     let mut raw = format!("GET /ws {}\r\n", request.version.as_str());
     for (name, value) in &request.headers {
         let _ = write!(raw, "{name}: {value}\r\n");
@@ -416,7 +682,13 @@ fn upgrade_response(request: &Request, state: Arc<ServerState>) -> Http1Response
     let accepted = UpgradeRequest::parse(raw.as_bytes())
         .and_then(|request| ServerHandshake::new().accept(&request));
     let Ok(accepted) = accepted else {
-        return plain_response(400, "Bad Request", "Invalid WebSocket upgrade.");
+        return RouteOutcome::Plain(secure_response(
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            "Invalid WebSocket upgrade.",
+            CONTENT_SECURITY_POLICY,
+        ));
     };
     let response = secure_response(
         101,
@@ -431,18 +703,11 @@ fn upgrade_response(request: &Request, state: Arc<ServerState>) -> Http1Response
     let peer = request
         .peer_addr
         .map_or_else(|| "unknown".to_owned(), |peer| peer.to_string());
-    let upgrade = Http1Upgrade::new(move |cx, stream, read_ahead| async move {
-        let acceptor = WebSocketAcceptor::new()
-            .max_frame_size(MAX_INBOUND_BYTES)
-            .max_message_size(MAX_INBOUND_BYTES)
-            .max_pending_write_bytes(MAX_OUTBOUND_BYTES + 14)
-            .slow_consumer_policy(SlowConsumerPolicy::CloseWithTryAgainLater)
-            .ping_interval(None)
-            .close_timeout(Duration::from_millis(100));
-        let socket = acceptor.finish_upgrade(stream, accepted, &read_ahead);
-        serve_websocket(&cx, socket, state.bridge.clone(), peer).await;
-    });
-    Http1Response::new(response).with_upgrade(upgrade)
+    RouteOutcome::WebSocket {
+        response,
+        accepted,
+        peer,
+    }
 }
 
 #[derive(Deserialize)]
@@ -506,9 +771,9 @@ fn control_status(bridge: &WebRemoteBridge, client_id: &str) -> Option<ControlSt
     })
 }
 
-async fn serve_websocket(
+async fn serve_websocket<IO: AsyncRead + AsyncWrite + Unpin>(
     cx: &Cx,
-    mut socket: ServerWebSocket<TcpStream>,
+    mut socket: ServerWebSocket<IO>,
     bridge: WebRemoteBridge,
     peer: String,
 ) {
@@ -612,9 +877,9 @@ impl ClientProgress {
     }
 }
 
-async fn send_updates(
+async fn send_updates<IO: AsyncRead + AsyncWrite + Unpin>(
     cx: &Cx,
-    socket: &mut ServerWebSocket<TcpStream>,
+    socket: &mut ServerWebSocket<IO>,
     bridge: &WebRemoteBridge,
     client_id: &str,
     progress: &mut ClientProgress,
@@ -697,9 +962,9 @@ fn now(cx: &Cx) -> asupersync::types::Time {
         .map_or_else(asupersync::time::wall_now, |driver| driver.now())
 }
 
-async fn send_json<T: Serialize + ?Sized>(
+async fn send_json<IO: AsyncRead + AsyncWrite + Unpin, T: Serialize + ?Sized>(
     cx: &Cx,
-    socket: &mut ServerWebSocket<TcpStream>,
+    socket: &mut ServerWebSocket<IO>,
     value: &T,
 ) -> bool {
     let Ok(bytes) = serde_json::to_vec(value) else {
@@ -719,7 +984,11 @@ async fn send_json<T: Serialize + ?Sized>(
     )
 }
 
-async fn send_error(cx: &Cx, socket: &mut ServerWebSocket<TcpStream>, code: &str) -> bool {
+async fn send_error<IO: AsyncRead + AsyncWrite + Unpin>(
+    cx: &Cx,
+    socket: &mut ServerWebSocket<IO>,
+    code: &str,
+) -> bool {
     send_json(
         cx,
         socket,
@@ -793,7 +1062,7 @@ mod tests {
         if payload.len() < 126 {
             bytes.push(0x80 | u8::try_from(payload.len()).unwrap());
         } else {
-            bytes.push(0x80 | 126);
+            bytes.push(0x80 | 0x7e);
             bytes.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
         }
         let mask = [0x12, 0x34, 0x56, 0x78];

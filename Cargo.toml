@@ -386,7 +386,7 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader"] }
 # Sampling profiler (bd-cv653.7.12.1); opt-in via the `profiler` feature —
 # internal signal handling is wrapped by the crate, keeping this crate's
 # forbid(unsafe_code) intact.
-pprof = { version = "0.14", optional = true, features = ["flamegraph"] }
+pprof = { version = "0.14", optional = true }
 swc_common = "26.0.0"
 swc_ecma_codegen = "32.0.0"
 swc_ecma_ast = "29.0.0"
@@ -394,7 +394,7 @@ swc_ecma_parser = "45.0.0"
 swc_ecma_transforms_base = "49.0.0"
 swc_ecma_transforms_typescript = "55.0.0"
 swc_ecma_visit = "29.0.0"
-wasmtime = { version = "47.0.3", features = ["component-model"], optional = true }
+wasmtime = { version = "48.0.8", features = ["component-model"], optional = true }
 filetime = "0.2.27"
 
 # Image processing (optional). Formats limited to what the read tool
