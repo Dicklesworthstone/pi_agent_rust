@@ -162,6 +162,15 @@ impl Notebook {
         if document.get("nbformat").and_then(Value::as_u64) != Some(4) {
             return Err(invalid(display, "only nbformat 4 is supported"));
         }
+        if document
+            .get("nbformat_minor")
+            .is_some_and(|minor| minor.as_u64().is_none())
+        {
+            return Err(invalid(
+                display,
+                "nbformat_minor must be a nonnegative integer",
+            ));
+        }
         let cells = document
             .get("cells")
             .and_then(Value::as_array)
@@ -229,9 +238,17 @@ impl Notebook {
     /// unchanged source retains even its original string/array representation
     /// and CRLF bytes. Changed code deliberately retains saved outputs, which
     /// may be stale; file editing never claims to have executed a cell.
+    /// Converting attached markdown/raw cells to code requires an explicit raw edit.
     pub(crate) fn serialize_edited(&self, text: &str) -> Result<String> {
         let original = self.cells()?;
         let parsed = parse_editable(text, &self.display)?;
+        // Cell IDs entered the format in 4.5. Keep legacy documents at their
+        // existing version, including notebooks that omit the minor version.
+        let uses_cell_ids = self
+            .document
+            .get("nbformat_minor")
+            .and_then(Value::as_u64)
+            .is_some_and(|minor| minor >= 5);
         let mut used = HashSet::new();
         let mut cells = Vec::with_capacity(parsed.len());
         for parsed in parsed {
@@ -240,14 +257,29 @@ impl Notebook {
                 .filter(|index| *index < original.len() && used.insert(*index))
                 .and_then(|index| original.get(index))
                 .and_then(Value::as_object);
+            if parsed.kind == "code"
+                && reused.is_some_and(|cell| {
+                    matches!(
+                        cell.get("cell_type").and_then(Value::as_str),
+                        Some("markdown" | "raw")
+                    ) && cell.contains_key("attachments")
+                })
+            {
+                return Err(invalid(
+                    &self.display,
+                    "cells with attachments cannot be converted to code; use raw=true to relocate or remove attachments explicitly",
+                ));
+            }
             let mut cell = reused.cloned().unwrap_or_else(|| {
-                Map::from_iter([
-                    (
+                let mut cell =
+                    Map::from_iter([("metadata".to_string(), Value::Object(Map::new()))]);
+                if uses_cell_ids {
+                    cell.insert(
                         "id".to_string(),
                         Value::String(uuid::Uuid::new_v4().simple().to_string()),
-                    ),
-                    ("metadata".to_string(), Value::Object(Map::new())),
-                ])
+                    );
+                }
+                cell
             });
             let source = parsed.source;
             if reused.is_none() || normalize_source(&source_text(&cell, &self.display)?) != source {

@@ -151,7 +151,11 @@ fn reordering_and_source_edits_preserve_identity_metadata_and_saved_outputs() {
 
 #[test]
 fn changing_cell_type_changes_only_type_source_and_code_execution_fields() {
-    let original = notebook_fixture();
+    let mut original = notebook_fixture();
+    original["cells"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("attachments");
     let saved = save(
         &decode(&original),
         "# %% [markdown] cell:0\nExplain the result\n# %% [code] cell:1\nprint('new code')",
@@ -170,7 +174,7 @@ fn changing_cell_type_changes_only_type_source_and_code_execution_fields() {
     assert_eq!(code["id"], "original-markdown");
     assert_eq!(code["cell_type"], "code");
     assert_eq!(code["metadata"], original["cells"][1]["metadata"]);
-    assert_eq!(code["attachments"], original["cells"][1]["attachments"]);
+    assert!(code.get("attachments").is_none());
     assert_eq!(code["execution_count"], Value::Null);
     assert_eq!(code["outputs"], json!([]));
 }
@@ -211,6 +215,127 @@ fn repeated_missing_and_out_of_range_indices_create_distinct_fresh_cells() {
     assert_eq!(cells[1]["outputs"], json!([]));
     assert!(cells[2].get("outputs").is_none());
     assert!(cells[3].get("execution_count").is_none());
+}
+
+#[test]
+fn fresh_cells_preserve_legacy_minor_versions_without_adding_ids() {
+    for minor in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+        let mut original = json!({
+            "nbformat": 4,
+            "metadata": {"keep": "legacy"},
+            "cells": [{
+                "cell_type": "code",
+                "metadata": {"tags": ["retain"]},
+                "source": ["value = 1\n"],
+                "execution_count": 7,
+                "outputs": [{"output_type": "stream", "name": "stdout", "text": ["saved\n"]}]
+            }]
+        });
+        if let Some(minor) = minor {
+            original["nbformat_minor"] = json!(minor);
+        }
+        let saved = save(
+            &decode(&original),
+            concat!(
+                "# %% [code] cell:0\nvalue = 1\n\n",
+                "# %% [markdown]\nInserted prose\n",
+                "# %% [raw] cell:999\nInserted raw source\n",
+                "# %% [code] cell:0\nvalue = 2"
+            ),
+        );
+        assert_eq!(saved.get("nbformat_minor"), original.get("nbformat_minor"));
+        assert_eq!(saved["nbformat"], 4);
+        assert_eq!(saved["metadata"], original["metadata"]);
+        let cells = saved["cells"].as_array().unwrap();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[0], original["cells"][0]);
+        for cell in cells {
+            assert!(cell.get("id").is_none(), "minor {minor:?}: {cell}");
+        }
+        for cell in &cells[1..] {
+            assert_eq!(cell["metadata"], json!({}));
+        }
+        assert_eq!(cells[1]["cell_type"], "markdown");
+        assert_eq!(cells[2]["cell_type"], "raw");
+        assert_eq!(cells[3]["cell_type"], "code");
+        assert_eq!(cells[3]["execution_count"], Value::Null);
+        assert_eq!(cells[3]["outputs"], json!([]));
+    }
+}
+
+#[test]
+fn malformed_minor_versions_are_rejected_before_source_editing() {
+    for minor in [
+        Value::Null,
+        json!(-1),
+        json!(5.5),
+        json!("5"),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        let original = json!({
+            "nbformat": 4,
+            "nbformat_minor": minor,
+            "metadata": {},
+            "cells": []
+        });
+        let error = Notebook::parse(&original.to_string(), "invalid-version.ipynb")
+            .err()
+            .expect("a present minor version must be a nonnegative integer");
+        assert!(error.to_string().contains("nbformat_minor"), "{error}");
+    }
+}
+
+#[test]
+fn attached_cells_require_explicit_raw_edits_before_conversion_to_code() {
+    for kind in ["markdown", "raw"] {
+        for attachments in [json!({}), json!({"diagram.png": {"image/png": "AQID"}})] {
+            let original = json!({
+                "nbformat": 4,
+                "nbformat_minor": 5,
+                "metadata": {},
+                "cells": [{
+                    "id": "attached-cell",
+                    "cell_type": kind,
+                    "metadata": {"keep": true},
+                    "source": "Keep the attached resource.",
+                    "attachments": attachments
+                }]
+            });
+            let notebook = decode(&original);
+            let editable = notebook.editable_text().unwrap();
+            let marker = format!("# %% [{kind}] cell:0");
+            let error = notebook
+                .serialize_edited(&editable.replacen(&marker, "# %% [code] cell:0", 1))
+                .expect_err("code cells cannot represent attachments");
+            assert!(error.to_string().contains("attachments"), "{error}");
+            assert!(error.to_string().contains("raw=true"), "{error}");
+            assert_eq!(save(&notebook, &editable), original);
+
+            let other_kind = if kind == "markdown" { "raw" } else { "markdown" };
+            let converted = save(
+                &notebook,
+                &editable.replacen(&marker, &format!("# %% [{other_kind}] cell:0"), 1),
+            );
+            assert_eq!(converted["cells"][0]["cell_type"], other_kind);
+            assert_eq!(
+                converted["cells"][0]["attachments"],
+                original["cells"][0]["attachments"]
+            );
+
+            // A second use of the original index creates a fresh code cell;
+            // it does not convert the first cell or inherit its attachments.
+            let duplicated = save(
+                &notebook,
+                &format!("{editable}\n# %% [code] cell:0\nprint('new')"),
+            );
+            assert_eq!(duplicated["cells"][0], original["cells"][0]);
+            assert_eq!(duplicated["cells"][1]["cell_type"], "code");
+            assert!(duplicated["cells"][1].get("attachments").is_none());
+            assert_ne!(duplicated["cells"][1]["id"], original["cells"][0]["id"]);
+        }
+    }
 }
 
 #[test]

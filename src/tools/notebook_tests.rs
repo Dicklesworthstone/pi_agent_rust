@@ -276,6 +276,138 @@ fn raw_notebook_reads_and_both_edit_lanes_operate_on_json() {
 }
 
 #[test]
+fn legacy_notebook_cell_insertion_preserves_format_and_exact_undo() {
+    for hashline in [false, true] {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("legacy.ipynb");
+            let original = json!({
+                "nbformat": 4,
+                "nbformat_minor": 4,
+                "metadata": {"keep": "legacy"},
+                "cells": [{
+                    "cell_type": "code",
+                    "metadata": {"tags": ["retain"]},
+                    "source": ["value = 1\n"],
+                    "execution_count": 7,
+                    "outputs": [{"output_type": "stream", "name": "stdout", "text": ["saved\n"]}]
+                }]
+            });
+            let mut original_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            original_bytes.push(b'\n');
+            std::fs::write(&path, &original_bytes).unwrap();
+            let read = ReadTool::new(directory.path());
+            let view = read
+                .execute("read", json!({"path": path, "hashline": true}), None)
+                .await
+                .unwrap();
+            let tag = anchor(&text(&view), "value = 1");
+            let recorder = Arc::new(FileMutationRecorder::default());
+            let tool: Box<dyn Tool> = if hashline {
+                Box::new(
+                    HashlineEditTool::new(directory.path())
+                        .with_mutation_recorder(Some(Arc::clone(&recorder))),
+                )
+            } else {
+                Box::new(
+                    EditTool::new(directory.path())
+                        .with_mutation_recorder(Some(Arc::clone(&recorder))),
+                )
+            };
+            let replacement = "value = 1\n\n# %% [markdown]\nInserted cell";
+            let input = if hashline {
+                json!({
+                    "path": path,
+                    "edits": [{"op": "replace", "pos": tag, "lines": replacement}]
+                })
+            } else {
+                json!({"path": path, "oldText": "value = 1", "newText": replacement})
+            };
+            let output = tool.execute("insert-cell", input, None).await.unwrap();
+            assert!(!output.is_error);
+            let edited_bytes = std::fs::read(&path).unwrap();
+            let edited: Value = serde_json::from_slice(&edited_bytes).unwrap();
+            assert_eq!(edited["nbformat_minor"], 4);
+            assert_eq!(edited["metadata"], original["metadata"]);
+            assert_eq!(edited["cells"][0], original["cells"][0]);
+            assert_eq!(
+                edited["cells"][1],
+                json!({
+                    "cell_type": "markdown",
+                    "metadata": {},
+                    "source": ["Inserted cell\n"]
+                })
+            );
+            assert_eq!(edited["cells"].as_array().unwrap().len(), 2);
+            let inserted_view = read
+                .execute("read-inserted", json!({"path": path}), None)
+                .await
+                .unwrap();
+            assert!(text(&inserted_view).contains("# %% [markdown] cell:1"));
+            assert_eq!(recorder.stats().undo_depth, 1);
+            assert_eq!(recorder.undo(1, false).applied.len(), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+            assert_eq!(recorder.redo(1, false).applied.len(), 1);
+            assert_eq!(std::fs::read(&path).unwrap(), edited_bytes);
+        });
+    }
+}
+
+#[test]
+fn attached_notebook_cells_refuse_code_conversion_without_writing_or_undo() {
+    for kind in ["markdown", "raw"] {
+        for hashline in [false, true] {
+            asupersync::test_utils::run_test(|| async {
+                let directory = tempfile::tempdir().unwrap();
+                let (path, mut original, _) = fixture(directory.path());
+                original["cells"][1]["cell_type"] = json!(kind);
+                let mut original_bytes = serde_json::to_vec_pretty(&original).unwrap();
+                original_bytes.push(b'\n');
+                std::fs::write(&path, &original_bytes).unwrap();
+                let marker = format!("# %% [{kind}] cell:1");
+                let read = ReadTool::new(directory.path());
+                let view = read
+                    .execute("read", json!({"path": path, "hashline": true}), None)
+                    .await
+                    .unwrap();
+                let tag = anchor(&text(&view), &marker);
+                let recorder = Arc::new(FileMutationRecorder::default());
+                let tool: Box<dyn Tool> = if hashline {
+                    Box::new(
+                        HashlineEditTool::new(directory.path())
+                            .with_mutation_recorder(Some(Arc::clone(&recorder))),
+                    )
+                } else {
+                    Box::new(
+                        EditTool::new(directory.path())
+                            .with_mutation_recorder(Some(Arc::clone(&recorder))),
+                    )
+                };
+                let input = if hashline {
+                    json!({
+                        "path": path,
+                        "edits": [{"op": "replace", "pos": tag, "lines": "# %% [code] cell:1"}]
+                    })
+                } else {
+                    json!({"path": path, "oldText": marker, "newText": "# %% [code] cell:1"})
+                };
+                let error = tool
+                    .execute("convert-attached-cell", input, None)
+                    .await
+                    .unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains("NOTEBOOK_EDIT"), "{error}");
+                assert!(message.contains("attachments"), "{error}");
+                assert!(message.contains("raw=true"), "{error}");
+                assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+                assert_eq!(recorder.stats().undo_depth, 0);
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+            });
+        }
+    }
+}
+
+#[test]
 fn invalid_notebook_markers_refuse_both_edit_lanes_without_writing() {
     asupersync::test_utils::run_test(|| async {
         let directory = tempfile::tempdir().unwrap();
