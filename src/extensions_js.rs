@@ -11759,6 +11759,11 @@ function __spawnPersistent(cmd, argv, opts) {
   const decoders = new Map();
   for (const stream of streams) {
     if (!stream) continue;
+    stream.readable = true;
+    stream.readableEnded = false;
+    stream.destroyed = false;
+    stream.closed = false;
+    stream.errored = null;
     stream.setEncoding = (encoding) => {
       // Validate before replacing the decoder so a rejected encoding does not
       // discard a partially received character. Successful calls start fresh.
@@ -11772,6 +11777,7 @@ function __spawnPersistent(cmd, argv, opts) {
   let timer = null;
   let referenced = true;
   let spawned = false;
+  let closing = false;
   let nextWrite = 1;
   let bufferedBytes = 0;
   let needsDrain = false;
@@ -11806,7 +11812,9 @@ function __spawnPersistent(cmd, argv, opts) {
     }
   }
   function close(code, signal, error) {
-    if (child.__pi_done) return;
+    if (child.__pi_done || closing) return;
+    closing = true;
+    const failure = error ? pipeError(error) : null;
     if (timer !== null) clearTimeout(timer);
     timer = null;
     if (handle) {
@@ -11822,13 +11830,28 @@ function __spawnPersistent(cmd, argv, opts) {
       if (!stream) continue;
       const decoder = decoders.get(stream);
       decoders.delete(stream);
-      if (decoder) {
-        const tail = decoder.end();
-        if (tail.length > 0) stream.emit("data", tail);
+      if (failure) {
+        // Overflow, pipe failures and lifetime expiry are not EOF. In
+        // particular, readline must reject instead of accepting a truncated
+        // final JSON record or a decoder's replacement-character tail.
+        stream.errored = failure;
+        stream.destroyed = true;
+        stream.readable = false;
+        stream.emit("error", failure);
+      } else {
+        if (decoder) {
+          const tail = decoder.end();
+          if (tail.length > 0) stream.emit("data", tail);
+        }
+        stream.readable = false;
+        stream.readableEnded = true;
+        stream.emit("end");
+        stream.destroyed = true;
       }
-      stream.emit("end");
+      stream.closed = true;
+      stream.emit("close");
     }
-    if (error) child.emit("error", pipeError(error));
+    if (failure) child.emit("error", failure);
     if (spawned) {
       __emitCloseOnce(child, code, signal);
     } else {
@@ -11988,7 +12011,7 @@ function __spawnPersistent(cmd, argv, opts) {
     };
   }
   child.kill = (signal = "SIGTERM") => {
-    if (child.__pi_done) return false;
+    if (child.__pi_done || closing) return false;
     const requested = String(signal || "SIGTERM");
     if (requested !== "SIGTERM" && requested !== "SIGKILL") throw new Error("Unsupported process signal");
     if (!handle) {
@@ -14993,14 +15016,19 @@ export class Interface extends EventEmitter {
       } finally { this.close(); }
     };
     this._onError = (error) => this._fail(error);
-    this._onClose = () => this.close();
+    this._onClose = () => {
+      // A reader attached from an input error callback can miss that event
+      // and receive close before its deferred terminal-state check runs.
+      if (this.input.errored) this._fail(this.input.errored);
+      else this.close();
+    };
     this.input.on('data', this._onData);
     this.input.on('end', this._onEnd);
     this.input.on('error', this._onError);
     this.input.on('close', this._onClose);
     // A readable that already ended cannot produce another end notification.
     if (this.input.readableEnded || this.input.destroyed) {
-      Promise.resolve().then(() => this.close());
+      Promise.resolve().then(this._onClose);
     } else if (typeof this.input.resume === 'function') {
       this.input.resume();
     }
@@ -37957,6 +37985,201 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 assert_eq!(actual[name]["killedAfterClose"], false, "{name}");
             }
             assert_eq!(actual["closedSessions"], 11);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_child_process_readline_distinguishes_failed_transport_from_eof() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock_and_config(
+                DeterministicClock::new(0),
+                PiJsRuntimeConfig {
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                },
+            )
+            .await
+            .expect("create runtime");
+            {
+                let mut state = runtime.module_state.borrow_mut();
+                let source = state
+                    .static_virtual_modules
+                    .get("node:child_process")
+                    .expect("built-in child-process module")
+                    .clone();
+                // Only the native transport is controlled. The subprocess,
+                // readline, events and decoder modules retain their real code.
+                let fixture = r"
+                    let nextPoll = null;
+                    let nextBatch = { frames: [] };
+                    let rejectedSpawn = null;
+                    let closes = 0, kills = 0;
+                    export function feed(batch) {
+                      if (!nextPoll) throw new Error('No pending pipe poll');
+                      nextBatch = batch;
+                      const poll = nextPoll;
+                      nextPoll = null;
+                      poll();
+                    }
+                    export function rejectSpawn(message) { rejectedSpawn = message; }
+                    export function counts() { return { closes, kills }; }
+                    const setTimeout = callback => { nextPoll = callback; return 1; };
+                    const clearTimeout = () => { nextPoll = null; };
+                    const __pi_process_session_poll_native = () => {
+                      const batch = nextBatch;
+                      nextBatch = { frames: [] };
+                      if (batch.nativeError) throw new Error(batch.nativeError);
+                      return JSON.stringify(batch);
+                    };
+                    const __pi_process_session_close_native = () => { closes++; };
+                    const __pi_process_session_kill_native = () => { kills++; return true; };
+                    const globalThis = { pi: { exec: () => {
+                      if (rejectedSpawn) {
+                        const message = rejectedSpawn;
+                        rejectedSpawn = null;
+                        return Promise.reject(new Error(message));
+                      }
+                      return Promise.resolve({ session: 'readline-peer', pid: 1 });
+                    } } };
+";
+                state.dynamic_virtual_modules.insert(
+                    "pijs://readline-process-fixture".to_string(),
+                    format!("{fixture}\n{source}"),
+                );
+            }
+            runtime
+                .eval(
+                    r"
+                    globalThis.readlineResult = null;
+                    globalThis.__readline_process_result = () => globalThis.readlineResult;
+                    void (async () => {
+                      const { spawn, feed, rejectSpawn, counts } = await import('pijs://readline-process-fixture');
+                      const { createInterface } = await import('node:readline');
+                      const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+                      async function collect(mode) {
+                        const failure = mode === 'normal' ? null : mode + ' failed';
+                        if (mode === 'spawn') rejectSpawn(failure);
+                        const child = spawn('readline-peer');
+                        const result = { lines: [], terminal: 'pending', late: 'pending',
+                          duringError: 'unobserved', duringClose: 'pending',
+                          ends: 0, streamCloses: 0, childCloses: 0, childErrors: [], terminalKills: [], raw: '' };
+                        const readTerminal = key => {
+                          const reader = createInterface({ input: child.stdout });
+                          void reader[Symbol.asyncIterator]().next().then(
+                            value => { result[key] = value.done ? 'done' : value.value; },
+                            error => { result[key] = error.message; },
+                          );
+                        };
+                        child.on('error', error => result.childErrors.push(error.message));
+                        child.on('close', () => { result.childCloses++; });
+                        child.stdout.on('data', chunk => { result.raw += String(chunk); });
+                        child.stdout.on('end', () => { result.ends++; result.terminalKills.push(child.kill()); });
+                        child.stdout.on('error', () => {
+                          result.terminalKills.push(child.kill());
+                          readTerminal('duringError');
+                        });
+                        child.stdout.on('close', () => {
+                          result.streamCloses++;
+                          readTerminal('duringClose');
+                        });
+                        if (mode === 'decoder') child.stdout.setEncoding('utf8');
+                        const reader = createInterface({ input: child.stdout });
+                        void (async () => {
+                          try {
+                            for await (const line of reader) result.lines.push(line);
+                            result.terminal = 'success';
+                          } catch (error) { result.terminal = error.message; }
+                        })();
+                        await settle();
+                        if (mode !== 'spawn') {
+                          const bytes = Buffer.from('accepted\n42');
+                          const data = mode === 'decoder' ? Buffer.concat([bytes, Buffer.from([0xe2, 0x82])]) : bytes;
+                          feed({ frames: [{ stream: 'stdout', data: data.toString('base64') }] });
+                          await settle();
+                          feed(mode === 'poll' ? { nativeError: failure }
+                            : { terminal: { code: failure ? null : 0, error: failure } });
+                        }
+                        await settle();
+                        readTerminal('late');
+                        await settle();
+                        result.readerClosed = reader.closed;
+                        result.streamState = { readable: child.stdout.readable,
+                          readableEnded: child.stdout.readableEnded, destroyed: child.stdout.destroyed,
+                          closed: child.stdout.closed, error: child.stdout.errored?.message ?? null };
+                        child.stdout.emit('data', 'ignored\n');
+                        return result;
+                      }
+                      const result = {};
+                      for (const mode of ['normal', 'overflow', 'decoder', 'poll', 'spawn']) {
+                        result[mode] = await collect(mode);
+                      }
+                      result.counts = counts();
+                      globalThis.readlineResult = result;
+                    })().catch(error => { globalThis.readlineResult = { error: String(error.stack || error) }; });
+",
+                )
+                .await
+                .expect("run subprocess readline lifecycle fixture");
+
+            let result = call_global_fn_json(&runtime, "__readline_process_result").await;
+            assert!(result.get("error").is_none(), "{result}");
+            assert_eq!(
+                result["normal"]["lines"],
+                serde_json::json!(["accepted", "42"])
+            );
+            assert_eq!(result["normal"]["terminal"], "success");
+            assert_eq!(result["normal"]["late"], "done");
+            assert_eq!(result["normal"]["duringError"], "unobserved");
+            assert_eq!(result["normal"]["duringClose"], "done");
+            assert_eq!(
+                result["counts"],
+                serde_json::json!({ "closes": 4, "kills": 1 })
+            );
+            for mode in ["normal", "overflow", "decoder", "poll", "spawn"] {
+                let failure = (mode != "normal").then(|| format!("{mode} failed"));
+                let observed = &result[mode];
+                assert_eq!(observed["ends"], u64::from(failure.is_none()), "{mode}");
+                assert_eq!(observed["streamCloses"], 1, "{mode}");
+                assert_eq!(observed["childCloses"], 1, "{mode}");
+                assert_eq!(observed["readerClosed"], true, "{mode}");
+                assert_eq!(
+                    observed["terminalKills"],
+                    serde_json::json!([false]),
+                    "{mode}"
+                );
+                assert_eq!(
+                    observed["streamState"],
+                    serde_json::json!({
+                        "readable": false, "readableEnded": failure.is_none(),
+                        "destroyed": true, "closed": true, "error": failure,
+                    }),
+                    "{mode}"
+                );
+                if let Some(failure) = failure {
+                    assert_eq!(observed["terminal"], failure, "{mode}");
+                    assert_eq!(observed["late"], failure, "{mode}");
+                    assert_eq!(observed["duringError"], failure, "{mode}");
+                    assert_eq!(observed["duringClose"], failure, "{mode}");
+                    assert_eq!(
+                        observed["childErrors"],
+                        serde_json::json!([failure]),
+                        "{mode}"
+                    );
+                    let lines = if mode == "spawn" {
+                        vec![]
+                    } else {
+                        vec!["accepted"]
+                    };
+                    assert_eq!(observed["lines"], serde_json::json!(lines), "{mode}");
+                    assert!(
+                        !observed["raw"].as_str().unwrap().contains('\u{fffd}'),
+                        "{mode}"
+                    );
+                } else {
+                    assert_eq!(observed["childErrors"], serde_json::json!([]));
+                }
+            }
         });
     }
 
