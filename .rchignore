@@ -52,3 +52,6 @@ target/
 target/**
 .rch-target/
 .rch-target/**
+tests/ext_conformance/artifacts/doom-overlay/doom1.wad
+tests/ext_conformance/artifacts/doom-overlay/doom-debug.log
+tests/ext_conformance/artifacts/doom-overlay/tiny.wad

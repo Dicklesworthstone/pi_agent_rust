@@ -4581,7 +4581,18 @@ mod stream_delta_batcher_tests {
             ToolRegistry::new(&[], Path::new("."), None),
             AgentConfig::default(),
         );
-        let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+        static TEST_SESSIONS_ROOT: std::sync::OnceLock<tempfile::TempDir> =
+            std::sync::OnceLock::new();
+        let test_session_root = TEST_SESSIONS_ROOT
+            .get_or_init(|| tempfile::tempdir().expect("interactive test sessions root"));
+        let isolated_session_dir = test_session_root
+            .path()
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&isolated_session_dir)
+            .expect("create isolated interactive test session dir");
+        let mut in_memory_session = Session::in_memory();
+        in_memory_session.session_dir = Some(isolated_session_dir);
+        let session = Arc::new(asupersync::sync::Mutex::new(in_memory_session));
         let resources = ResourceLoader::empty(false);
         let resource_cli = ResourceCliOptions {
             no_skills: false,

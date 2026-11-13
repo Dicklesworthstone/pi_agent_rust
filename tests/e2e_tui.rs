@@ -2119,6 +2119,9 @@ fn e2e_tui_stream_scroll_and_finalize_vcr() {
         1,
         "Expected final marker to render exactly once"
     );
+    let _ = session
+        .tmux
+        .wait_for_pane_contains("Type a message...", COMMAND_TIMEOUT);
     let pane = session
         .tmux
         .wait_for_pane_contains("PgUp/PgDn", COMMAND_TIMEOUT);

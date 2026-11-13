@@ -37,9 +37,49 @@ fn relative_posix(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+fn repo_root_explicit_artifact_ignores(dir: &Path) -> std::collections::HashSet<PathBuf> {
+    let mut ignored = std::collections::HashSet::new();
+    let canonical_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    for ancestor in canonical_dir.ancestors() {
+        if !ancestor.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let gitignore = ancestor.join(".gitignore");
+        let Ok(contents) = fs::read_to_string(&gitignore) else {
+            break;
+        };
+        for raw_line in contents.lines() {
+            let line = raw_line.trim();
+            if line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with('!')
+                || line.contains('*')
+            {
+                continue;
+            }
+            if line.starts_with("tests/ext_conformance/artifacts/") {
+                let candidate = ancestor.join(line);
+                let canonical_candidate = fs::canonicalize(&candidate).unwrap_or(candidate);
+                if canonical_candidate.starts_with(&canonical_dir) {
+                    ignored.insert(canonical_candidate);
+                }
+            }
+        }
+        break;
+    }
+    ignored
+}
+
 fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
     let mut files = Vec::new();
     collect_files_recursive(dir, &mut files)?;
+    let explicit_ignores = repo_root_explicit_artifact_ignores(dir);
+    if !explicit_ignores.is_empty() {
+        files.retain(|path| {
+            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            !explicit_ignores.contains(&canonical)
+        });
+    }
     files.sort_by_key(|left| relative_posix(dir, left));
 
     let mut hasher = Sha256::new();

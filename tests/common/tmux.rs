@@ -137,6 +137,16 @@ impl TmuxInstance {
         self.run_checked(&["send-keys", "-t", &target, key], "send-keys");
     }
 
+    /// Send multiple special keys in a single tmux command so subprocess spawn
+    /// latency cannot split time-sensitive chords such as double Ctrl+C.
+    pub fn send_keys(&self, keys: &[&str]) {
+        let target = self.target_pane();
+        let mut args = Vec::with_capacity(3 + keys.len());
+        args.extend_from_slice(&["send-keys", "-t", &target]);
+        args.extend_from_slice(keys);
+        self.run_checked(&args, "send-keys");
+    }
+
     /// Best-effort send text during teardown.
     ///
     /// Returns false if the tmux server/session is already gone.

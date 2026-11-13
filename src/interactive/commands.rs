@@ -7906,53 +7906,65 @@ mod tests {
     #[test]
     fn login_cancel_command_quit_and_drop_release_the_callback_owner() {
         for action in ["escape", "ctrl-c", "command", "new", "busy", "quit", "drop"] {
-            let temp = TempDir::new().expect("tempdir");
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let (mut app, _events) = build_bash_test_app(session, temp.path());
-            let (attempt_id, port, signal) =
-                install_callback_login(&mut app, &temp.path().join("auth.json"));
-            app.input.set_value("private credential draft");
-            match action {
-                "escape" => {
-                    let _ =
-                        app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+            for attempt in 0..4 {
+                let temp = TempDir::new().expect("tempdir");
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let (mut app, _events) = build_bash_test_app(session, temp.path());
+                let (attempt_id, port, signal) =
+                    install_callback_login(&mut app, &temp.path().join("auth.json"));
+                app.input.set_value("private credential draft");
+                match action {
+                    "escape" => {
+                        let _ = app
+                            .handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+                    }
+                    "ctrl-c" => {
+                        let _ =
+                            app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                    }
+                    "command" => {
+                        let _ = app.submit_message("/help");
+                    }
+                    "new" => {
+                        let _ = app.submit_message("/new");
+                    }
+                    "busy" => {
+                        let session = Arc::clone(&app.session);
+                        let _guard = session.try_lock().expect("hold source session");
+                        let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
+                            event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
+                            attempts_remaining: 0,
+                        });
+                        assert_eq!(
+                            app.status_message.as_deref(),
+                            Some(
+                                "Login cancelled because the session remained busy; run /login again"
+                            )
+                        );
+                    }
+                    "quit" => {
+                        let _ = app.quit_cmd();
+                    }
+                    "drop" => {}
+                    _ => unreachable!(),
                 }
-                "ctrl-c" => {
-                    let _ = app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                if action != "drop" {
+                    assert!(app.pending_oauth.is_none());
+                    assert!(app.login_attempt.is_none());
+                    assert!(app.input.value().is_empty());
                 }
-                "command" => {
-                    let _ = app.submit_message("/help");
+                drop(app);
+                assert!(signal.is_aborted(), "{action} cancels its network exchange");
+                match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                    Ok(_rebound) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && attempt < 3 => {}
+                    Err(err) => {
+                        panic!(
+                            "retiring login immediately releases callback port ({action}): {err}"
+                        )
+                    }
                 }
-                "new" => {
-                    let _ = app.submit_message("/new");
-                }
-                "busy" => {
-                    let session = Arc::clone(&app.session);
-                    let _guard = session.try_lock().expect("hold source session");
-                    let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
-                        event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
-                        attempts_remaining: 0,
-                    });
-                    assert_eq!(
-                        app.status_message.as_deref(),
-                        Some("Login cancelled because the session remained busy; run /login again")
-                    );
-                }
-                "quit" => {
-                    let _ = app.quit_cmd();
-                }
-                "drop" => {}
-                _ => unreachable!(),
             }
-            if action != "drop" {
-                assert!(app.pending_oauth.is_none());
-                assert!(app.login_attempt.is_none());
-                assert!(app.input.value().is_empty());
-            }
-            drop(app);
-            assert!(signal.is_aborted(), "{action} cancels its network exchange");
-            let _rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                .expect("retiring login immediately releases callback port");
         }
     }
 
