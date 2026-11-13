@@ -233,7 +233,7 @@ function requestURL(config) {
     if (typeof serialized !== 'string') throw badOption(config, 'paramsSerializer must return a string');
     if (serialized) parsed.search += (parsed.search ? '&' : '?') + serialized.replace(/^\?/, '');
   }
-  return parsed.href;
+  return parsed.toString();
 }
 
 function transform(value, transforms, headers, config, status) {

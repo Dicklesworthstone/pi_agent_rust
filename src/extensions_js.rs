@@ -12233,11 +12233,11 @@ export function spawn(command, args = [], options = {}) {
   const argv = args.map((arg) => String(arg));
   const opts = __parseSpawnOptions(options);
 
-  if (!opts.detached && typeof __pi_process_session_poll_native === "function") {
-    return __spawnPersistent(cmd, argv, opts);
-  }
   if (opts.stdio[0] === "pipe" || opts.env !== undefined) {
-    throw new Error("node:child_process.spawn: persistent process host is unavailable");
+    if (typeof __pi_process_session_poll_native !== "function") {
+      throw new Error("node:child_process.spawn: persistent process host is unavailable");
+    }
+    return __spawnPersistent(cmd, argv, opts);
   }
 
   const child = __makeEmitter();
@@ -14276,7 +14276,7 @@ export function symlinkSync(target, path, _type) {
     __pi_vfs.files.has(normalized) ||
     __pi_vfs.dirs.has(normalized) ||
     __pi_vfs.symlinks.has(normalized) ||
-    __pi_vfs.readHostStat(normalized, false) !== null
+    __pi_vfs.readHostStat(normalized, false) != null
   ) {
     throw new Error(`EEXIST: file already exists, symlink '${String(path ?? "")}'`);
   }
@@ -22301,7 +22301,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         let policy_for_env = policy.clone();
-                        move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
+                        move |ctx: Ctx<'_>, key: String| -> rquickjs::Result<rquickjs::Value<'_>> {
                             // Compat fallback runs BEFORE deny_env so conformance
                             // scanning can inject deterministic dummy keys even when
                             // the policy denies env access (ext-conformance feature
@@ -22312,11 +22312,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     key = %key,
                                     "env compat fallback"
                                 );
-                                return Ok(Some(value));
+                                return rquickjs::IntoJs::into_js(value, &ctx);
                             }
                             if deny_env {
                                 tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
-                                return Ok(None);
+                                return Ok(rquickjs::Value::new_null(ctx));
                             }
                             // If a policy is present, use its SecretBroker (including
                             // disclosure_allowlist). Otherwise fall back to default
@@ -22332,10 +22332,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "env get"
                             );
                             if !allowed {
-                                return Ok(None);
+                                return Ok(rquickjs::Value::new_null(ctx));
                             }
-                            Ok(configured_environment_value(&env, &key, windows_environment)
-                                .map(str::to_string))
+                            match configured_environment_value(&env, &key, windows_environment) {
+                                Some(val) => rquickjs::IntoJs::into_js(val, &ctx),
+                                None => Ok(rquickjs::Value::new_null(ctx)),
+                            }
                         }
                     }),
                 )?;
@@ -27515,7 +27517,26 @@ if (typeof globalThis.URL === 'undefined') {
             this._hasAuthority = parts.hasAuthority;
             this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
             this.origin = parts.origin;
-            this.href = parts.href;
+        }
+        get href() {
+            return this.toString();
+        }
+        set href(value) {
+            const parsed = parseURL(String(value), null);
+            if (typeof parsed !== 'string') throw new TypeError('Invalid URL');
+            const parts = JSON.parse(parsed);
+            this.protocol = parts.protocol;
+            this.username = parts.username;
+            this._pw = parts.password;
+            this.host = parts.host;
+            this.hostname = parts.hostname;
+            this.port = parts.port;
+            this.pathname = parts.pathname;
+            this.search = parts.search;
+            this.hash = parts.hash;
+            this._hasAuthority = parts.hasAuthority;
+            this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
+            this.origin = parts.origin;
         }
         get password() {
             return this._pw;
@@ -30164,13 +30185,13 @@ mod tests {
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            267_834,
-            "f12bc8d59a13ca0afc0583ad79df4c9fcddf25dd29e0adb741565052fd00dad7",
+            268_637,
+            "f6d0335191ae2ff525bbc6a5486b9a503051f0e3cf4441330c28eb9c35353c06",
         ),
         (
             "node:fs",
-            64_850,
-            "8e1faf476c16684809d1f1bf2139106e207a69eab40efcea9c443836fc4b6004",
+            64_849,
+            "7899ca631ab76d2e60b302bfb20af984ed74cb77d123a9e4fbbcf260ba1b639b",
         ),
         (
             "@mariozechner/pi-ai",
@@ -30179,8 +30200,8 @@ mod tests {
         ),
         (
             "node:child_process",
-            33_727,
-            "b6b5fe45111ee3983a195bb724d0295606f5d64aa5961affc25721cba3cb54f7",
+            33_715,
+            "9c9d98f2f627ad734f2bf8279faa1a0de0418df939903292a26593d93759cf1e",
         ),
         // Completion observers and owned reader teardown add 9_516 bytes.
         // Only this deliberately changed module is re-pinned.
