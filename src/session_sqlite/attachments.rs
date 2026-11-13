@@ -17,6 +17,8 @@ use sha2::{Digest as _, Sha256};
 use std::io::Write;
 use std::sync::Arc;
 
+use crate::session::attachments::message_blocks;
+
 use super::{
     Error, MAX_SQLITE_JSON_BYTES, Result, SessionEntry, SqliteConnection, SqliteValue,
     malformed_json_error, map_sqlite_result, parse_sqlite_json, validate_sqlite_json_for_write,
@@ -100,13 +102,6 @@ fn digest(bytes: &[u8]) -> String {
         "sha256:{}",
         crate::package_manager::hex_encode(&Sha256::digest(bytes))
     )
-}
-
-fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
-    if value.get("type").and_then(Value::as_str) != Some("message") {
-        return None;
-    }
-    value.get_mut("message")?.get_mut("content")?.as_array_mut()
 }
 
 fn is_attachment(block: &Value) -> bool {
@@ -634,6 +629,92 @@ mod tests {
     }
 
     #[test]
+    fn public_bash_content_metadata_stays_opaque_without_blob_storage() {
+        let bytes = vec![0x46; INLINE_BYTES + 5];
+        for content in [
+            json!([
+                {"type":"image","mimeType":"image/png","data":STANDARD.encode(&bytes)},
+                {"type":"media","mimeType":"audio/wav","data":STANDARD_NO_PAD.encode(&bytes)}
+            ]),
+            json!([
+                {"type":"image","data":{
+                    "$piBlob":format!("sha256:{}", "0".repeat(64)),
+                    "sizeBytes":1,"encoding":"base64"
+                }},
+                {"type":"media","data":{"$piBlob":"../../opaque","sizeBytes":"unknown"}},
+                {"type":"image","data":null},
+                {"type":"media","data":["arbitrary",42]}
+            ]),
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("opaque-bash.sqlite");
+            let original = SessionEntry::Message(MessageEntry {
+                base: base("opaque-bash"),
+                message: serde_json::from_value(json!({
+                    "role":"bashExecution","command":"printf done","output":"done",
+                    "exitCode":0,"timestamp":1,"content":content
+                }))
+                .expect("bash execution accepts opaque metadata"),
+            });
+            let native = serde_json::to_value(&original).expect("native entry");
+            let stored = persisted_entry(&path, &original);
+            assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), native);
+            let (_, loaded) = futures::executor::block_on(load_session(&path))
+                .expect("load opaque metadata without interpreting attachment shapes");
+            assert_eq!(serde_json::to_value(&loaded[0]).unwrap(), native);
+            crate::session::attachments::validate_native_attachment_references(&stored)
+                .expect("opaque references need no native validation");
+            run_on_sqlite_thread(|| {
+                let conn = map_sqlite_result(SqliteConnection::open_read_only(&path))?;
+                let rows = map_sqlite_result(conn.query_sync(
+                    "SELECT name FROM sqlite_master WHERE name = 'pi_session_blobs'",
+                    &[],
+                ))?;
+                assert!(rows.is_empty(), "opaque metadata must not create blob storage");
+                map_sqlite_result(conn.close())
+            })
+            .expect("inspect opaque-only database");
+        }
+    }
+
+    #[test]
+    fn legacy_bash_content_metadata_loads_without_native_blob_resolution() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("legacy-opaque-bash.sqlite");
+        let original = SessionEntry::Message(MessageEntry {
+            base: base("legacy-opaque-bash"),
+            message: serde_json::from_value(json!({
+                "role":"bashExecution","command":"printf done","output":"done",
+                "exitCode":0,"timestamp":1
+            }))
+            .expect("bash execution"),
+        });
+        let _ = persisted_entry(&path, &original);
+        for data in [
+            json!({
+                "$piBlob":format!("sha256:{}", "0".repeat(64)),
+                "sizeBytes":1,"encoding":"base64"
+            }),
+            json!({"$piBlob":"../../opaque","sizeBytes":"unknown"}),
+            Value::Null,
+            json!(["arbitrary",42]),
+        ] {
+            let mut expected = serde_json::to_value(&original).unwrap();
+            expected["message"]["content"] = json!([{"type":"media","data":data}]);
+            let json = expected.to_string();
+            replace_stored_entry(&path, &json);
+            let (_, loaded) = futures::executor::block_on(load_session(&path))
+                .expect("opaque legacy metadata must not require a blob table");
+            assert_eq!(serde_json::to_value(&loaded[0]).unwrap(), expected);
+            let jsonl = crate::session::attachments::decode_entry(None, &json)
+                .expect("JSONL has the same opaque metadata contract");
+            assert_eq!(serde_json::to_value(jsonl).unwrap(), expected);
+            crate::session::attachments::validate_native_attachment_references(&json)
+                .expect("raw reference validation must ignore opaque metadata");
+        }
+    }
+
+    #[test]
     fn references_in_arbitrary_custom_json_do_not_trigger_storage_reads() {
         let custom = SessionEntry::Custom(CustomEntry {
             base: base("opaque"),
@@ -783,6 +864,20 @@ mod tests {
         ));
         for source in cases {
             assert_public_load_rejects(&path, &source, "duplicate");
+        }
+        for (first, second) in [("user", "bashExecution"), ("bashExecution", "user")] {
+            let source = format!(
+                r#"{entry_prefix}{{"role":"{first}","role":"{second}",
+                    "command":"true","output":"","exitCode":0,"content":[{healthy}]}}}}"#
+            );
+            let raw_error =
+                crate::session::attachments::validate_native_attachment_references(&source)
+                    .expect_err("duplicate roles cannot hide native references");
+            assert!(raw_error.to_string().contains("duplicate"));
+            replace_stored_entry(&path, &source);
+            let error = futures::executor::block_on(load_session(&path))
+                .expect_err("duplicate roles must be rejected by public loading");
+            assert!(error.to_string().contains("duplicate"));
         }
         // An unambiguous missing reference must still reach blob validation.
         assert_public_load_rejects(

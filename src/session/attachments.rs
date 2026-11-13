@@ -26,6 +26,7 @@ const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REFERENCES: usize = 4096;
 const BLOB_READ_BUFFER_BYTES: usize = 16 * 1024;
 const ERROR_PREFIX: &str = "PI_SESSION_ATTACHMENT_INVALID:";
+const NATIVE_CONTENT_ROLES: &[&str] = &["user", "assistant", "toolResult"];
 
 fn blob_error(reason: impl std::fmt::Display) -> Error {
     Error::session(format!("{ERROR_PREFIX} {reason}"))
@@ -127,11 +128,21 @@ fn digest(bytes: &[u8]) -> String {
     )
 }
 
-fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
+/// Only these message roles own native content blocks. In particular,
+/// Flattened Bash execution metadata may contain an opaque "content" field.
+pub(crate) fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
     if value.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
-    value.get_mut("message")?.get_mut("content")?.as_array_mut()
+    let message = value.get_mut("message")?;
+    if !message
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| NATIVE_CONTENT_ROLES.contains(&role))
+    {
+        return None;
+    }
+    message.get_mut("content")?.as_array_mut()
 }
 
 fn is_attachment(block: &Value) -> bool {
@@ -754,9 +765,9 @@ impl<'de> Deserialize<'de> for RawObject<'de> {
 }
 
 impl RawObject<'_> {
-    fn has_type(&self, allowed: &[&str]) -> bool {
+    fn has_string_field(&self, name: &str, allowed: &[&str]) -> bool {
         self.0.iter().any(|(key, value)| {
-            key == "type"
+            key == name
                 && serde_json::from_str::<String>(value.get())
                     .is_ok_and(|kind| allowed.contains(&kind.as_str()))
         })
@@ -781,7 +792,7 @@ fn native_attachment_data_spans(json: &str) -> Result<Vec<(usize, &RawValue)>> {
     let Ok(entry) = serde_json::from_str::<RawObject<'_>>(json) else {
         return Ok(Vec::new());
     };
-    if !entry.has_type(&["message"]) {
+    if !entry.has_string_field("type", &["message"]) {
         return Ok(Vec::new());
     }
     let mut references = Vec::new();
@@ -790,6 +801,11 @@ fn native_attachment_data_spans(json: &str) -> Result<Vec<(usize, &RawValue)>> {
         let Ok(message) = serde_json::from_str::<RawObject<'_>>(message.get()) else {
             continue;
         };
+        // Inspect every role occurrence so duplicate tags cannot conceal a
+        // native reference before the typed envelope rejects the duplicate.
+        if !message.has_string_field("role", NATIVE_CONTENT_ROLES) {
+            continue;
+        }
         for (_, content) in message.0.iter().filter(|(key, _)| key == "content") {
             let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(content.get()) else {
                 continue;
@@ -798,7 +814,7 @@ fn native_attachment_data_spans(json: &str) -> Result<Vec<(usize, &RawValue)>> {
                 let Ok(block) = serde_json::from_str::<RawObject<'_>>(block.get()) else {
                     continue;
                 };
-                if !block.has_type(&["image", "media"]) {
+                if !block.has_string_field("type", &["image", "media"]) {
                     continue;
                 }
                 for (_, data) in block.0.iter().filter(|(key, _)| key == "data") {
@@ -1500,6 +1516,71 @@ mod tests {
     }
 
     #[test]
+    fn bash_content_metadata_survives_save_append_rewrite_and_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("opaque-bash.jsonl");
+        let bytes = vec![0x46; INLINE_BYTES + 5];
+        let contents = [
+            json!([
+                {"type":"image","mimeType":"image/png","data":STANDARD.encode(&bytes)},
+                {"type":"media","mimeType":"audio/wav","data":STANDARD_NO_PAD.encode(&bytes)}
+            ]),
+            json!([
+                {"type":"image","data":{
+                    "$piBlob":format!("sha256:{}", "0".repeat(64)),
+                    "sizeBytes":1,"encoding":"base64"
+                }},
+                {"type":"media","data":{"$piBlob":"../../opaque","sizeBytes":"unknown"}},
+                {"type":"image","data":null},
+                {"type":"media","data":["arbitrary",42]}
+            ]),
+        ];
+        let mut session = session_at(&path);
+        for content in contents {
+            let bash: SessionMessage = serde_json::from_value(json!({
+                "role":"bashExecution","command":"printf done","output":"done",
+                "exitCode":0,"timestamp":1,"content":content
+            }))
+            .expect("bash execution accepts opaque metadata");
+            session.append_message(bash);
+            let original = serde_json::to_value(&session.entries).expect("native entries");
+            save(&mut session);
+            assert_eq!(Value::Array(wire_entries(&path)), original);
+            assert!(!sidecar_path(&path).exists());
+            assert_eq!(
+                serde_json::to_value(open(&path).expect("reopen opaque metadata").entries).unwrap(),
+                original
+            );
+            let entry = session.entries.last().expect("appended bash entry");
+            let json = serde_json::to_string(entry).expect("native JSON");
+            assert!(
+                native_reference_spans(&json)
+                    .expect("inspect native content")
+                    .is_empty()
+            );
+            let stored =
+                decode_stored_entry(None, &json).expect("opaque metadata needs no source path");
+            assert_eq!(
+                stored.payload().unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+        assert_eq!(session.appends_since_checkpoint, 1, "exercise append path");
+        let original = serde_json::to_value(&session.entries).unwrap();
+        let mut loaded = open(&path).expect("open before rewrite");
+        loaded.header.provider = Some("test-provider".to_string());
+        loaded.header_dirty = true;
+        save(&mut loaded);
+        assert_eq!(loaded.appends_since_checkpoint, 0, "exercise full rewrite");
+        assert_eq!(Value::Array(wire_entries(&path)), original);
+        assert!(!sidecar_path(&path).exists());
+        assert_eq!(
+            serde_json::to_value(open(&path).expect("reopen rewritten metadata").entries).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn malformed_digest_size_and_encoding_refs_are_hard_errors() {
         for mutation in [
             json!({"$piBlob":"sha256:../../outside", "sizeBytes":70000, "encoding":"base64"}),
@@ -1590,7 +1671,14 @@ mod tests {
                 "timestamp":"2026-01-01T00:00:00Z",
                 "message":{original_message},"customType":"opaque"}}"#
         );
-        for source in [duplicate_content, duplicate_message, duplicate_type] {
+        let mut duplicate_wrappers = vec![duplicate_content, duplicate_message, duplicate_type];
+        for (first, second) in [("user", "bashExecution"), ("bashExecution", "user")] {
+            duplicate_wrappers.push(format!(
+                r#"{entry_prefix}{{"role":"{first}","role":"{second}",
+                    "command":"true","output":"","exitCode":0,"content":{content}}}}}"#
+            ));
+        }
+        for source in duplicate_wrappers {
             assert_attachment_error(
                 decode_entry(Some(&path), &source).expect_err("duplicate wrapper cannot hide ref"),
                 "duplicate",
