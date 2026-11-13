@@ -1847,6 +1847,35 @@ pub mod configured_tests {
         }
     }
 
+    struct OAuthCallbackPortLockGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+    impl Drop for OAuthCallbackPortLockGuard {
+        fn drop(&mut self) {
+            OAUTH_CALLBACK_LOCK_DEPTH.with(|depth| {
+                depth.set(depth.get().saturating_sub(1));
+            });
+        }
+    }
+
+    thread_local! {
+        static OAUTH_CALLBACK_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn oauth_callback_port_lock() -> OAuthCallbackPortLockGuard {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        let current_depth = OAUTH_CALLBACK_LOCK_DEPTH.with(std::cell::Cell::get);
+        if current_depth > 0 {
+            OAUTH_CALLBACK_LOCK_DEPTH.with(|depth| depth.set(current_depth + 1));
+            return OAuthCallbackPortLockGuard(None);
+        }
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        OAUTH_CALLBACK_LOCK_DEPTH.with(|depth| depth.set(1));
+        OAuthCallbackPortLockGuard(Some(guard))
+    }
+
     pub struct OAuthFixture {
         pub(crate) origin: String,
         methods: Vec<String>,
@@ -1854,6 +1883,7 @@ pub mod configured_tests {
         failures: Arc<Mutex<Vec<String>>>,
         stopping: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        _callback_port_lock: OAuthCallbackPortLockGuard,
     }
 
     impl OAuthFixture {
@@ -1866,6 +1896,7 @@ pub mod configured_tests {
             methods: &[&str],
             respond: impl Fn(&str, &[String], &CapturedRequest) -> String + Send + 'static,
         ) -> Self {
+            let callback_port_lock = oauth_callback_port_lock();
             let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth fixture listener");
             listener.set_nonblocking(true).expect("nonblocking fixture");
             let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
@@ -1918,6 +1949,7 @@ pub mod configured_tests {
                 failures,
                 stopping,
                 thread: Some(thread),
+                _callback_port_lock: callback_port_lock,
             }
         }
 
