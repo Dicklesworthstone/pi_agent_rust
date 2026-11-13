@@ -15733,20 +15733,14 @@ fn resolve_extension_load_entry_paths(
     package_entries: &mut JsPackageEntryCache,
 ) -> Result<Vec<PathBuf>> {
     let explicit_primary = safe_canonicalize(&spec.entry_path);
-    let primary_provenance = js_extension_provenance(&explicit_primary, package_entries)?;
     let mut entry_paths =
         discover_related_extension_entries_with_cache(&spec.entry_path, package_entries)?;
-    entry_paths.retain(|entry_path| {
-        let canonical = safe_canonicalize(entry_path);
-        if canonical == explicit_primary {
-            return true;
-        }
-        if explicit_entry_paths.len() > 1 && explicit_entry_paths.contains(&canonical) {
-            return false;
-        }
-        js_extension_provenance(&canonical, package_entries)
-            .is_ok_and(|provenance| provenance == primary_provenance)
-    });
+    if explicit_entry_paths.len() > 1 {
+        entry_paths.retain(|entry_path| {
+            let canonical = safe_canonicalize(entry_path);
+            canonical == explicit_primary || !explicit_entry_paths.contains(&canonical)
+        });
+    }
     Ok(entry_paths)
 }
 
