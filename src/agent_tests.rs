@@ -4753,7 +4753,7 @@ mod tests {
 
     async fn observe_dispatched_context_usage(agent: &Agent, messages: &[Message]) -> Value {
         let observed = agent
-            .dispatch_context_event(messages)
+            .dispatch_context_event(messages, None)
             .await
             .expect("context hook observation");
         observed_context_usage(&observed)

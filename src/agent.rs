@@ -4984,7 +4984,14 @@ impl Agent {
         })
     }
 
-    async fn dispatch_context_event(&self, messages: &[Message]) -> Option<Vec<Message>> {
+    async fn dispatch_context_event(
+        &self,
+        messages: &[Message],
+        abort: Option<&AbortSignal>,
+    ) -> Option<Vec<Message>> {
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return None;
+        }
         let Some(extensions) = &self.extensions else {
             return None;
         };
@@ -5001,10 +5008,27 @@ impl Agent {
                 window,
             )
         });
-        let response = extensions
-            .dispatch_context_with_usage(payload, usage, EXTENSION_EVENT_TIMEOUT_MS)
-            .await
-            .ok()?;
+        let response =
+            extensions.dispatch_context_with_usage(payload, usage, EXTENSION_EVENT_TIMEOUT_MS);
+        // Context hooks run before provider admission, but can own pending
+        // hostcalls just like input and readiness hooks. Dropping the dispatch
+        // cancels that actor work; the caller then finalizes the aborted turn.
+        let response = if let Some(signal) = abort {
+            let cancelled = signal.wait();
+            futures::pin_mut!(response, cancelled);
+            match futures::future::select(cancelled, response).await {
+                futures::future::Either::Left(_) => return None,
+                futures::future::Either::Right((result, _)) => {
+                    if signal.is_aborted() {
+                        return None;
+                    }
+                    result
+                }
+            }
+        } else {
+            response.await
+        }
+        .ok()?;
 
         let value = response?;
 
@@ -5403,7 +5427,7 @@ impl Agent {
             )
         };
         let mut messages = self
-            .dispatch_context_event(&base_messages)
+            .dispatch_context_event(&base_messages, abort.as_ref())
             .await
             .unwrap_or(base_messages);
         // Context hooks can return new native image blocks. Enforce the active
@@ -17325,6 +17349,145 @@ mod abort_tests {
             StartupAbortPrompt::SdkContent,
         ] {
             cancelled_startup_never_reaches_provider(prompt, StartupAbortPhase::Input, true, true);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Exercise native and SDK cancellation through real hostcalls.
+    fn context_cancellation_releases_hostcalls_before_provider_admission() {
+        for via_sdk in [false, true] {
+            for return_after_abort in [false, true] {
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let directory = tempfile::tempdir().expect("extension directory");
+                    let entry = directory.path().join("context-abort.mjs");
+                    std::fs::write(
+                        &entry,
+                        r#"
+                        export default function init(pi) {
+                          pi.on("context", async (event) => {
+                            await pi.tool("read", {});
+                            return { messages: [...event.messages, {
+                              role: "user", content: "late context transformation", timestamp: 17
+                            }] };
+                          });
+                        }
+                        "#,
+                    )
+                    .expect("write context extension");
+                    let (abort_handle, abort_signal) = AbortHandle::new();
+                    let entered = Arc::new(AtomicUsize::new(0));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let tools = ToolRegistry::from_tools(vec![Box::new(StartupAbortTool {
+                        abort: abort_handle,
+                        return_after_abort,
+                        entered: Arc::clone(&entered),
+                        dropped: Arc::clone(&dropped),
+                    })]);
+                    let agent = Agent::new(
+                        Arc::new(CountingProvider {
+                            calls: Arc::clone(&calls),
+                        }),
+                        tools,
+                        AgentConfig::default(),
+                    );
+                    let store = Arc::new(Mutex::new(Session::in_memory()));
+                    let mut session = AgentSession::new(
+                        agent,
+                        Arc::clone(&store),
+                        false,
+                        ResolvedCompactionSettings::default(),
+                    );
+                    let mut policy = ExtensionPolicy::default();
+                    policy.default_caps.push("tool".to_string());
+                    session
+                        .enable_extensions_with_policy(
+                            &[],
+                            directory.path(),
+                            None,
+                            &[entry],
+                            Some(policy),
+                            Some(RepairPolicyMode::Off),
+                            None,
+                            ExtensionHostConfiguration::default(),
+                        )
+                        .await
+                        .expect("enable context extension");
+                    let manager = session.agent.extensions.clone().expect("extension manager");
+                    let mut sdk = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                        session,
+                        crate::sdk::EventListeners::default(),
+                    );
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let observed = Arc::clone(&events);
+                    let on_event = move |event| observed.lock().unwrap().push(event);
+                    let run = async {
+                        if via_sdk {
+                            sdk.prompt_with_abort("accepted input", abort_signal, on_event)
+                                .await
+                        } else {
+                            sdk.session_mut()
+                                .run_text_with_abort(
+                                    "accepted input".to_string(),
+                                    Some(abort_signal),
+                                    on_event,
+                                )
+                                .await
+                        }
+                    };
+                    // Shorter than the five-second hook timeout: the hostcall
+                    // itself signals cancellation, without a timer race.
+                    let message = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(2),
+                        run,
+                    )
+                    .await
+                    .expect("context cancellation must not wait for the hook timeout")
+                    .expect("cooperative abort must finalize the accepted turn");
+                    assert_eq!(message.stop_reason, StopReason::Aborted);
+                    assert_eq!(entered.load(Ordering::SeqCst), 1);
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    let history = store.try_lock().unwrap().to_messages_for_current_path();
+                    assert_eq!(
+                        history
+                            .iter()
+                            .filter(|message| matches!(message, Message::User(_)))
+                            .count(),
+                        1,
+                        "accepted input remains present exactly once"
+                    );
+                    assert!(matches!(history.first(), Some(Message::User(user))
+                        if matches!(&user.content, UserContent::Text(text) if text == "accepted input")));
+                    assert!(matches!(history.last(), Some(Message::Assistant(message))
+                        if message.stop_reason == StopReason::Aborted));
+                    sdk.session()
+                        .ensure_provider_reentry_allowed()
+                        .expect("cooperative context cancellation is not abandoned persistence");
+                    assert_eq!(
+                        events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                            .count(),
+                        1,
+                        "the accepted turn has one terminal lifecycle event"
+                    );
+                    let actor = manager.js_runtime().expect("native JS runtime");
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(5),
+                        actor.get_registered_tools(),
+                    )
+                    .await
+                    .expect("cancelled context must release the actor")
+                    .expect("actor barrier");
+                    assert!(dropped.load(Ordering::SeqCst), "context hostcall was released");
+                    assert!(manager.shutdown(Duration::from_secs(5)).await);
+                });
+            }
         }
     }
 
