@@ -381,6 +381,22 @@ pub(super) struct Origin {
     journal_name: String,
 }
 
+#[cfg(unix)]
+struct PendingJournal<'a> {
+    directory: &'a File,
+    name: &'a str,
+    published: bool,
+}
+
+#[cfg(unix)]
+impl Drop for PendingJournal<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = rustix::fs::unlinkat(self.directory, self.name, rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
 impl Origin {
     pub fn for_session(session: &Session) -> Result<Option<Arc<Self>>> {
         let Some(path) = &session.path else {
@@ -594,7 +610,46 @@ impl Origin {
         Ok(journal)
     }
 
-    fn write(&self, journal: &Journal, deadline: Instant) -> Result<()> {
+    fn validate_journal_lock(&self, lock: &File) -> Result<()> {
+        self.validate_directory()?;
+        let name = format!("{}.lock", self.journal_name);
+        let expected = FileIdentity::of_open_file(lock)?;
+        #[cfg(unix)]
+        let current = FileIdentity::of_directory_member_nofollow(&self.directory, OsStr::new(&name));
+        #[cfg(not(unix))]
+        let current = FileIdentity::of_path_nofollow(&self.parent.join(&name));
+        let current = current.map_err(|error| {
+            Error::session(format!("late model cost journal lock is unavailable: {error}"))
+        })?;
+        if current != expected {
+            return Err(Error::session("late model cost journal lock changed"));
+        }
+        self.validate_directory()?;
+        Ok(())
+    }
+
+    fn acquire_journal_lock(&self, lock: File, deadline: Instant) -> Result<File> {
+        loop {
+            remaining(deadline)?;
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    #[cfg(test)]
+                    tests::after_lock_contention();
+                    std::thread::sleep(LOCK_POLL.min(remaining(deadline)?));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        // A waiter can retain an unlinked or renamed lock while later writers
+        // acquire a replacement. Owning that stale file does not serialize the
+        // journal. Never read or merge counters under that obsolete authority.
+        self.validate_journal_lock(&lock)?;
+        remaining(deadline)?;
+        Ok(lock)
+    }
+
+    fn write(&self, journal: &Journal, lock: &File, deadline: Instant) -> Result<()> {
         remaining(deadline)?;
         let encoded = serde_json::to_vec(journal)?;
         if encoded.len() as u64 > MAX_JOURNAL_BYTES {
@@ -620,10 +675,18 @@ impl Origin {
             )
             .map_err(std::io::Error::from)?;
             let mut temporary = File::from(descriptor);
+            let mut pending = PendingJournal {
+                directory: &self.directory,
+                name: &temporary_name,
+                published: false,
+            };
             temporary.write_all(&encoded)?;
             temporary.sync_all()?;
             remaining(deadline)?;
-            self.validate_directory()?;
+            // Recheck after staging too: a lock replaced while this update was
+            // preparing its bytes must not authorize publication over a peer.
+            self.validate_journal_lock(lock)?;
+            remaining(deadline)?;
             rustix::fs::renameat(
                 &self.directory,
                 &temporary_name,
@@ -631,6 +694,7 @@ impl Origin {
                 &self.journal_name,
             )
             .map_err(std::io::Error::from)?;
+            pending.published = true;
             self.directory.sync_all()?;
         }
         #[cfg(not(unix))]
@@ -639,7 +703,8 @@ impl Origin {
             temporary.write_all(&encoded)?;
             temporary.as_file().sync_all()?;
             remaining(deadline)?;
-            self.validate_directory()?;
+            self.validate_journal_lock(lock)?;
+            remaining(deadline)?;
             temporary
                 .persist(self.parent.join(&self.journal_name))
                 .map_err(|error| Error::from(error.error))?;
@@ -658,17 +723,8 @@ impl Origin {
     ) -> Result<Writers> {
         remaining(deadline)?;
         let lock_name = format!("{}.lock", self.journal_name);
-        let lock = self.open_member(OsStr::new(&lock_name), true)?;
-        loop {
-            remaining(deadline)?;
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    std::thread::sleep(LOCK_POLL.min(remaining(deadline)?));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-            }
-        }
+        let lock =
+            self.acquire_journal_lock(self.open_member(OsStr::new(&lock_name), true)?, deadline)?;
         // Dropping this handle releases the dedicated journal lock. Transcript
         // locks are never acquired here, including during canceled cleanup.
         let required =
@@ -761,7 +817,7 @@ impl Origin {
             merge_writer(writer, &observed)?;
         }
         journal.version = 2;
-        self.write(&journal, deadline)?;
+        self.write(&journal, &lock, deadline)?;
         Ok(journal.writers)
     }
 }
@@ -905,5 +961,216 @@ fn open_directory(path: &Path) -> Result<File> {
             options.share_mode(0x0000_0003); // READ | WRITE; pin the directory against deletion.
         }
         Ok(options.open(path)?)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)] // Exact integer-dollar fixtures verify journal merge invariants.
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::mpsc;
+
+    thread_local! {
+        static LOCK_WAIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_lock_contention() {
+        let hook = LOCK_WAIT_HOOK.with_borrow_mut(Option::take);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, Arc<Origin>, String) {
+        let root = tempfile::tempdir().expect("journal directory");
+        let parent = std::fs::canonicalize(root.path()).expect("canonical journal directory");
+        let directory = open_directory(&parent).expect("pin journal directory");
+        let directory_identity = FileIdentity::of_open_file(&directory).expect("directory identity");
+        let journal_name = format!(".pi-cost-{}.json", "0".repeat(64));
+        let origin = Arc::new(Origin {
+            key: parent.join(&journal_name),
+            session_id: "journal-lock-test".to_string(),
+            source: None,
+            parent,
+            directory,
+            directory_identity,
+            journal_name,
+        });
+        let account = uuid::Uuid::new_v4().to_string();
+        update(&origin, &account, 1.0).expect("seed first writer");
+        (root, origin, account)
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    fn update(origin: &Origin, account: &str, total: f64) -> Result<Writers> {
+        origin.update(
+            account,
+            Writer {
+                baseline_own: 0.0,
+                own_total: total,
+                billing_unavailable: false,
+                closed: false,
+            },
+            &Writers::new(),
+            &Writers::new(),
+            &Coverage::new(),
+            deadline(),
+        )
+    }
+
+    fn lock_path(origin: &Origin) -> PathBuf {
+        origin.parent.join(format!("{}.lock", origin.journal_name))
+    }
+
+    fn open_lock(origin: &Origin) -> File {
+        origin
+            .open_member(OsStr::new(&format!("{}.lock", origin.journal_name)), true)
+            .expect("open journal lock")
+    }
+
+    fn displace_lock(origin: &Origin, replace: bool) -> Option<File> {
+        let path = lock_path(origin);
+        std::fs::rename(&path, path.with_extension("retired")).expect("retire old lock name");
+        replace.then(|| {
+            let replacement = open_lock(origin);
+            replacement.lock().expect("hold replacement journal lock");
+            replacement
+        })
+    }
+
+    #[test]
+    fn journal_lock_acquisition_rejects_missing_and_replaced_contended_entries() {
+        for replace in [false, true] {
+            let (_root, origin, _) = fixture();
+            let before = std::fs::read(&origin.key).expect("original journal");
+            let holder = open_lock(&origin);
+            holder.lock().expect("hold original journal lock");
+            let waiter = open_lock(&origin);
+            assert!(matches!(
+                waiter.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+
+            // A real waiter already owns the original file description before
+            // the name disappears or another writer locks its replacement.
+            let _replacement = displace_lock(&origin, replace);
+            drop(holder);
+            let error = origin
+                .acquire_journal_lock(waiter, deadline())
+                .expect_err("an acquired stale lock must not authorize journal reads or writes");
+            assert!(error.to_string().contains("journal lock"), "{error}");
+            assert_eq!(std::fs::read(&origin.key).expect("unchanged journal"), before);
+        }
+    }
+
+    #[test]
+    fn journal_publication_rejects_missing_and_replaced_locks() {
+        for replace in [false, true] {
+            let (_root, origin, account) = fixture();
+            let before = std::fs::read(&origin.key).expect("original journal");
+            let holder = origin
+                .acquire_journal_lock(open_lock(&origin), deadline())
+                .expect("acquire current lock");
+            let mut journal = origin.read().expect("read under current lock");
+            journal.writers.get_mut(&account).unwrap().own_total = 9.0;
+
+            // The lock was current when acquired. Publication must check it
+            // again, after staging, without overwriting the existing journal.
+            let _replacement = displace_lock(&origin, replace);
+            let error = origin
+                .write(&journal, &holder, deadline())
+                .expect_err("a stale locked handle must not authorize publication");
+            assert!(error.to_string().contains("journal lock"), "{error}");
+            assert_eq!(std::fs::read(&origin.key).expect("unchanged journal"), before);
+            assert!(std::fs::read_dir(&origin.parent).unwrap().all(|entry| {
+                entry.unwrap().path().extension() != Some(OsStr::new("pending"))
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_rejects_a_symlink_to_the_same_locked_file() {
+        for publication in [false, true] {
+            let (_root, origin, account) = fixture();
+            let before = std::fs::read(&origin.key).expect("original journal");
+            let holder = origin
+                .acquire_journal_lock(open_lock(&origin), deadline())
+                .expect("acquire current lock");
+            let waiter = open_lock(&origin);
+            assert!(matches!(
+                waiter.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            let mut journal = origin.read().expect("read journal");
+            journal.writers.get_mut(&account).unwrap().own_total = 9.0;
+            let path = lock_path(&origin);
+            let retired = path.with_extension("retired");
+            std::fs::rename(&path, &retired).expect("retire lock");
+            std::os::unix::fs::symlink(&retired, &path).expect("alias original lock");
+
+            let error = if publication {
+                origin
+                    .write(&journal, &holder, deadline())
+                    .expect_err("publication must inspect the entry without following its link")
+            } else {
+                drop(holder);
+                origin
+                    .acquire_journal_lock(waiter, deadline())
+                    .expect_err("acquisition must inspect the entry without following its link")
+            };
+            assert!(error.to_string().contains("journal lock changed"), "{error}");
+            assert_eq!(std::fs::read(&origin.key).expect("unchanged journal"), before);
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn journal_updates_merge_after_real_lock_contention() {
+        let (_root, origin, first_account) = fixture();
+        let holder = origin
+            .acquire_journal_lock(open_lock(&origin), deadline())
+            .expect("hold first writer's lock");
+        let second_account = uuid::Uuid::new_v4().to_string();
+        let worker_account = second_account.clone();
+        let worker_origin = Arc::clone(&origin);
+        let (contended, observed) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            LOCK_WAIT_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    contended.send(()).expect("report actual contention");
+                    resumed
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release contended update");
+                }));
+            });
+            update(&worker_origin, &worker_account, 2.0)
+        });
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second update must encounter the held file lock");
+        let mut journal = origin.read().expect("first writer's journal");
+        journal.writers.get_mut(&first_account).unwrap().own_total = 3.0;
+        origin
+            .write(&journal, &holder, deadline())
+            .expect("publish first writer's newer charge");
+        drop(holder);
+        resume.send(()).expect("resume second writer");
+        let merged = worker.join().expect("update worker").expect("merge update");
+        assert_eq!(merged[&first_account].own_total, 3.0);
+        assert_eq!(merged[&second_account].own_total, 2.0);
+        let saved = origin.read().expect("merged journal");
+        assert_eq!(saved.writers[&first_account].own_total, 3.0);
+        assert_eq!(saved.writers[&second_account].own_total, 2.0);
     }
 }
