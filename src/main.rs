@@ -789,6 +789,19 @@ fn handle_recover_blocking(
 
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
+    // Fast-path standalone `--version` / `-v` before constructing Clap's full
+    // Command metadata so startup/idle RSS stays minimal while preserving
+    // multi-argument conflict validation (such as `pi --fetch-models --version`).
+    {
+        let mut args = std::env::args_os();
+        if let (Some(_bin), Some(only_arg), None) = (args.next(), args.next(), args.next())
+            && (only_arg == "--version" || only_arg == "-v")
+        {
+            print_version()?;
+            return Ok(());
+        }
+    }
+
     // Parse CLI arguments
     let Some((mut cli, extension_flags, raw_args)) = parse_cli_from_env()? else {
         return Ok(());
@@ -3753,7 +3766,9 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
         )
     } else {
         if parsed_bind != pi::web_remote::BindMode::Loopback {
-            bail!("`pi web` supports only --bind loopback; other bindings require --terminal");
+            bail!(
+                "`pi web` supports only --bind loopback; other bindings require --terminal with --tls-cert <PATH> and --tls-key <PATH> (or --allow-insecure-lan)"
+            );
         }
         if tls_cert.is_some() {
             bail!("`pi web` TLS (--tls-cert/--tls-key) requires --terminal");
