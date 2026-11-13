@@ -3450,9 +3450,12 @@ pub fn wait(owner_session_id: &str, id: &str, timeout: Duration) -> Result<JobSn
 
 /// Async variant used by tool execution so a long wait continues yielding to
 /// abort/steering and unrelated sessions.
+/// Owner cancellation wakes an idle observer without cancelling its background
+/// work or consuming the eventual completion notice.
 ///
 /// # Errors
-/// Named `PI_JOBS_UNKNOWN_ID` for unknown or foreign-session job ids.
+/// Named `PI_JOBS_UNKNOWN_ID` for unknown or foreign-session job ids, or
+/// `PI_JOBS_WAIT_CANCELLED` when the waiting owner is cancelled.
 pub async fn wait_async(
     owner_session_id: &str,
     id: &str,
@@ -3461,9 +3464,6 @@ pub async fn wait_async(
     wait_async_with_slice(owner_session_id, id, timeout, MAX_ASYNC_WAIT_SLICE).await
 }
 
-// u64 nanoseconds cover centuries of timeout; the truncating cast cannot
-// overflow for any accepted job timeout.
-#[allow(clippy::cast_possible_truncation)]
 async fn wait_async_with_slice(
     owner_session_id: &str,
     id: &str,
@@ -3474,7 +3474,6 @@ async fn wait_async_with_slice(
     wait_async_with_handle(&handle, timeout, max_wait_slice).await
 }
 
-#[allow(clippy::cast_possible_truncation)]
 async fn wait_async_with_handle(
     handle: &JobWaitHandle,
     timeout: Duration,
@@ -3504,7 +3503,26 @@ async fn wait_async_with_handle(
         .cx()
         .timer_driver()
         .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    let deadline = now.saturating_add_nanos(timeout.as_nanos() as u64);
+    // Public callers can supply any Duration. An unrepresentable deadline
+    // remains an effectively unbounded wait, just as in the synchronous API;
+    // wrapping nanoseconds must never turn a centuries-long wait into a poll.
+    let deadline = u64::try_from(timeout.as_nanos())
+        .ok()
+        .and_then(|nanos| now.as_nanos().checked_add(nanos))
+        .map(Time::from_nanos);
+    // Notify and Sleep do not register with this owner's cancellation lane.
+    // Retain a local sender that never publishes: the cancel-aware receive
+    // wakes even a quiet shell wait without a timer tick or job completion.
+    // Dropping this wait retires the registration with no detached task.
+    let cancellation_owner = cx.clone();
+    let cancelled = async move {
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let _ = receiver.recv(cancellation_owner.cx()).await;
+        drop(sender);
+    }
+    .fuse();
+    futures::pin_mut!(cancelled);
+    let clock = cx.time();
     loop {
         if let Some(snapshot) = settled_snapshot(handle) {
             return Ok(snapshot);
@@ -3519,8 +3537,8 @@ async fn wait_async_with_handle(
             .cx()
             .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        let Some(sleep_for) = remaining_wait_slice_at(now, Some(deadline))
-            .map(|sleep_for| sleep_for.min(max_wait_slice))
+        let Some(sleep_for) =
+            remaining_wait_slice_at(now, deadline).map(|sleep_for| sleep_for.min(max_wait_slice))
         else {
             return snapshot_now_best_effort(handle);
         };
@@ -3528,15 +3546,22 @@ async fn wait_async_with_handle(
             .settled_notify
             .wait_until(|| settled_snapshot(handle).is_some())
             .fuse();
-        let deadline_sleep = asupersync::time::sleep(now, sleep_for).fuse();
+        let deadline_sleep = clock.sleep(sleep_for).fuse();
         futures::pin_mut!(notified, deadline_sleep);
-        match futures::future::select(notified, deadline_sleep).await {
-            futures::future::Either::Left(((), _)) => {}
-            futures::future::Either::Right(((), _)) => {
-                if let Some(snapshot) = settled_snapshot(handle) {
-                    return Ok(snapshot);
-                }
-            }
+        let progress = futures::future::select(notified, deadline_sleep);
+        futures::pin_mut!(progress);
+        if let futures::future::Either::Right(((), _)) =
+            futures::future::select(progress, cancelled.as_mut()).await
+        {
+            // Preserve an already-published terminal result when settlement
+            // races observer cancellation. Cancelling a wait does not cancel
+            // its background work or consume the owner's completion notice.
+            return settled_snapshot(handle).ok_or_else(|| {
+                Error::tool(
+                    "jobs",
+                    "PI_JOBS_WAIT_CANCELLED: job wait owner is cancelled",
+                )
+            });
         }
     }
 }
@@ -7010,6 +7035,212 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .jobs
             .remove(&id);
+    }
+
+    #[derive(Default)]
+    struct WaitWakeCounter(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for WaitWakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn wait_test_clock() -> (
+        crate::agent_cx::AgentCx,
+        Arc<asupersync::time::VirtualClock>,
+        asupersync::time::TimerDriverHandle,
+    ) {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        let clock = Arc::new(VirtualClock::starting_at(Time::from_secs(42)));
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let cx = asupersync::Cx::new_with_drivers(
+            asupersync::types::RegionId::new_for_test(7, 0),
+            asupersync::types::TaskId::new_for_test(9, 0),
+            asupersync::Budget::INFINITE,
+            None,
+            None,
+            None,
+            Some(timer.clone()),
+            None,
+        );
+        (crate::agent_cx::AgentCx::from_cx(cx), clock, timer)
+    }
+
+    #[test]
+    fn async_wait_cancellation_wakes_without_job_or_clock_progress() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-cancel-wait-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let completion = Arc::clone(&entry.settled_snapshot);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let (owner, _clock, timer) = wait_test_clock();
+        let wakes = Arc::new(WaitWakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut waiting = Box::pin(wait_async(TEST_SESSION_ID, &id, Duration::from_hours(3)));
+        {
+            let _current = owner.cx().clone().set_current_restricted();
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+        }
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            0,
+            "waiting must not busy-poll"
+        );
+        let unrelated = crate::agent_cx::AgentCx::for_request();
+        let _current = unrelated.cx().clone().set_current_restricted();
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel quiet wait"),
+        );
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > 0,
+            "owner cancellation must wake a wait without job output or a timer tick"
+        );
+        assert_eq!(timer.now(), Time::from_secs(42));
+        let Poll::Ready(Err(error)) = waiting.as_mut().poll(&mut task) else {
+            panic!("a pending wait must observe its owner's cancellation immediately");
+        };
+        assert!(error.to_string().contains("PI_JOBS_WAIT_CANCELLED"));
+        assert!(!unrelated.is_cancel_requested());
+        assert!(completion.lock().expect("completion state").is_none());
+        let entry = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id)
+            .expect("cancelled observer retains its job");
+        assert_eq!(entry.status, JobStatus::Running);
+        assert!(
+            !entry.cancel_requested,
+            "cancelling an observer must not cancel the job"
+        );
+    }
+
+    #[test]
+    fn dropped_async_wait_unregisters_its_cancellation_waker() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let id = format!("job-dropped-wait-{}", uuid::Uuid::new_v4().simple());
+        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .insert(id.clone(), entry);
+
+        let (owner, _clock, _timer) = wait_test_clock();
+        let wakes = Arc::new(WaitWakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut waiting = Box::pin(wait_async(TEST_SESSION_ID, &id, Duration::from_hours(3)));
+        {
+            let _current = owner.cx().clone().set_current_restricted();
+            assert!(waiting.as_mut().poll(&mut task).is_pending());
+        }
+        drop(waiting);
+        let before = wakes.0.load(Ordering::SeqCst);
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("after wait was dropped"),
+        );
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            before,
+            "a retired wait must not retain an owner-cancellation registration"
+        );
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .jobs
+            .remove(&id);
+    }
+
+    #[test]
+    fn overflowing_async_waits_keep_their_owner_clock_and_accept_real_settlement() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let _guard = process_test_guard();
+        let root = temp_root();
+        for timeout in [
+            // Exactly 2^64 nanoseconds formerly wrapped to a zero timeout.
+            Duration::from_nanos(u64::MAX) + Duration::from_nanos(1),
+            Duration::from_nanos(u64::MAX),
+            Duration::MAX,
+        ] {
+            let id = format!("job-overflow-wait-{}", uuid::Uuid::new_v4().simple());
+            let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .jobs
+                .insert(id.clone(), entry);
+
+            let (owner, clock, timer) = wait_test_clock();
+            let wakes = Arc::new(WaitWakeCounter::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task = Context::from_waker(&waker);
+            let mut waiting = Box::pin(wait_async(TEST_SESSION_ID, &id, timeout));
+            {
+                let _current = owner.cx().clone().set_current_restricted();
+                assert!(waiting.as_mut().poll(&mut task).is_pending());
+            }
+
+            // Poll migration must not rearm a later timer on the new poller's
+            // unrelated clock. Advance only the original owner between polls.
+            let (unrelated, _unrelated_clock, _unrelated_timer) = wait_test_clock();
+            let _current = unrelated.cx().clone().set_current_restricted();
+            for hour in 1..=2 {
+                let before = wakes.0.load(Ordering::SeqCst);
+                clock.advance_to(Time::from_secs(42 + hour * 3600));
+                let _ = timer.process_timers();
+                assert!(
+                    wakes.0.load(Ordering::SeqCst) > before,
+                    "the captured owner's clock must wake every intermediate slice"
+                );
+                assert!(
+                    waiting.as_mut().poll(&mut task).is_pending(),
+                    "overflow and intermediate slices must not expire a huge wait"
+                );
+            }
+
+            settle_job_without_notice(&id, JobStatus::Exited, Some(0), true);
+            // A committed result remains authoritative if observer cancellation
+            // arrives in the same interval before its next poll.
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("after settlement"),
+            );
+            let Poll::Ready(Ok(snapshot)) = waiting.as_mut().poll(&mut task) else {
+                panic!("real settlement must complete a huge wait despite late cancellation");
+            };
+            assert_eq!(snapshot.status, "exited");
+            assert_eq!(snapshot.exit_code, Some(0));
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .jobs
+                .remove(&id);
+        }
     }
 
     #[test]
