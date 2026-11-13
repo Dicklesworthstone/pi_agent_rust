@@ -666,6 +666,521 @@ impl AdmittedSql {
     }
 }
 
+fn collect_from_table_names<'a>(from: &'a fsqlite_ast::FromClause, out: &mut Vec<&'a str>) {
+    collect_source_table_names(&from.source, out);
+    for join in &from.joins {
+        collect_source_table_names(&join.table, out);
+    }
+}
+
+fn collect_source_table_names<'a>(
+    source: &'a fsqlite_ast::TableOrSubquery,
+    out: &mut Vec<&'a str>,
+) {
+    match source {
+        fsqlite_ast::TableOrSubquery::Table {
+            name: qualified,
+            alias,
+            ..
+        } => {
+            if qualified.schema.is_none() {
+                out.push(&qualified.name);
+            }
+            if let Some(alias) = alias.as_deref() {
+                out.push(alias);
+            }
+        }
+        fsqlite_ast::TableOrSubquery::ParenJoin(inner) => collect_from_table_names(inner, out),
+        fsqlite_ast::TableOrSubquery::Subquery { .. }
+        | fsqlite_ast::TableOrSubquery::TableFunction { .. } => {}
+    }
+}
+
+fn expr_contains_fts5_aux_call(expr: &fsqlite_ast::Expr, table_names: &[&str]) -> bool {
+    match expr {
+        fsqlite_ast::Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let is_fts5_aux = (name.eq_ignore_ascii_case("bm25")
+                || name.eq_ignore_ascii_case("highlight")
+                || name.eq_ignore_ascii_case("snippet"))
+                && matches!(
+                    args,
+                    fsqlite_ast::FunctionArgs::List(list)
+                        if matches!(
+                            list.first(),
+                            Some(fsqlite_ast::Expr::Column(col_ref, _))
+                                if col_ref.schema.is_none()
+                                    && col_ref.table.is_none()
+                                    && table_names.iter().any(|t| col_ref.column.eq_ignore_ascii_case(t))
+                        )
+                );
+            if is_fts5_aux {
+                return true;
+            }
+            let in_args = match args {
+                fsqlite_ast::FunctionArgs::Star => false,
+                fsqlite_ast::FunctionArgs::List(list) => list
+                    .iter()
+                    .any(|arg| expr_contains_fts5_aux_call(arg, table_names)),
+            };
+            in_args
+                || order_by
+                    .iter()
+                    .any(|term| expr_contains_fts5_aux_call(&term.expr, table_names))
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| expr_contains_fts5_aux_call(f, table_names))
+                || over.as_ref().is_some_and(|spec| {
+                    spec.partition_by
+                        .iter()
+                        .any(|e| expr_contains_fts5_aux_call(e, table_names))
+                        || spec
+                            .order_by
+                            .iter()
+                            .any(|t| expr_contains_fts5_aux_call(&t.expr, table_names))
+                })
+        }
+        fsqlite_ast::Expr::BinaryOp { left, right, .. }
+        | fsqlite_ast::Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            expr_contains_fts5_aux_call(left, table_names)
+                || expr_contains_fts5_aux_call(right, table_names)
+        }
+        fsqlite_ast::Expr::UnaryOp { expr: inner, .. }
+        | fsqlite_ast::Expr::Cast { expr: inner, .. }
+        | fsqlite_ast::Expr::Collate { expr: inner, .. }
+        | fsqlite_ast::Expr::IsNull { expr: inner, .. } => {
+            expr_contains_fts5_aux_call(inner, table_names)
+        }
+        fsqlite_ast::Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            expr_contains_fts5_aux_call(target, table_names)
+                || expr_contains_fts5_aux_call(low, table_names)
+                || expr_contains_fts5_aux_call(high, table_names)
+        }
+        fsqlite_ast::Expr::In {
+            expr: target, set, ..
+        } => {
+            expr_contains_fts5_aux_call(target, table_names)
+                || matches!(
+                    set,
+                    fsqlite_ast::InSet::List(list)
+                        if list.iter().any(|e| expr_contains_fts5_aux_call(e, table_names))
+                )
+        }
+        fsqlite_ast::Expr::Like {
+            expr: target,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_fts5_aux_call(target, table_names)
+                || expr_contains_fts5_aux_call(pattern, table_names)
+                || escape
+                    .as_deref()
+                    .is_some_and(|e| expr_contains_fts5_aux_call(e, table_names))
+        }
+        fsqlite_ast::Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|e| expr_contains_fts5_aux_call(e, table_names))
+                || whens.iter().any(|(w, t)| {
+                    expr_contains_fts5_aux_call(w, table_names)
+                        || expr_contains_fts5_aux_call(t, table_names)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|e| expr_contains_fts5_aux_call(e, table_names))
+        }
+        fsqlite_ast::Expr::RowValue(items, _) => items
+            .iter()
+            .any(|e| expr_contains_fts5_aux_call(e, table_names)),
+        fsqlite_ast::Expr::Literal(_, _)
+        | fsqlite_ast::Expr::BoundOuterValue { .. }
+        | fsqlite_ast::Expr::Column(_, _)
+        | fsqlite_ast::Expr::Exists { .. }
+        | fsqlite_ast::Expr::Subquery(_, _)
+        | fsqlite_ast::Expr::Raise { .. }
+        | fsqlite_ast::Expr::Placeholder(_, _) => false,
+    }
+}
+
+fn visit_window_spec_placeholders_mut(
+    spec: &mut fsqlite_ast::WindowSpec,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    for expr in &mut spec.partition_by {
+        visit_expr_placeholders_mut(expr, visit);
+    }
+    for term in &mut spec.order_by {
+        visit_expr_placeholders_mut(&mut term.expr, visit);
+    }
+    if let Some(frame) = &mut spec.frame {
+        if let fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) =
+            &mut frame.start
+        {
+            visit_expr_placeholders_mut(expr, visit);
+        }
+        if let Some(
+            fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr),
+        ) = &mut frame.end
+        {
+            visit_expr_placeholders_mut(expr, visit);
+        }
+    }
+}
+
+fn visit_expr_placeholders_mut(
+    expr: &mut fsqlite_ast::Expr,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    match expr {
+        fsqlite_ast::Expr::Placeholder(kind, span) => visit(kind, *span),
+        fsqlite_ast::Expr::BinaryOp { left, right, .. }
+        | fsqlite_ast::Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            visit_expr_placeholders_mut(left, visit);
+            visit_expr_placeholders_mut(right, visit);
+        }
+        fsqlite_ast::Expr::UnaryOp { expr: inner, .. }
+        | fsqlite_ast::Expr::Cast { expr: inner, .. }
+        | fsqlite_ast::Expr::Collate { expr: inner, .. }
+        | fsqlite_ast::Expr::IsNull { expr: inner, .. } => {
+            visit_expr_placeholders_mut(inner, visit);
+        }
+        fsqlite_ast::Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            visit_expr_placeholders_mut(target, visit);
+            visit_expr_placeholders_mut(low, visit);
+            visit_expr_placeholders_mut(high, visit);
+        }
+        fsqlite_ast::Expr::In {
+            expr: target, set, ..
+        } => {
+            visit_expr_placeholders_mut(target, visit);
+            match set {
+                fsqlite_ast::InSet::List(list) => {
+                    for item in list {
+                        visit_expr_placeholders_mut(item, visit);
+                    }
+                }
+                fsqlite_ast::InSet::Subquery(subquery) => {
+                    visit_select_placeholders_mut(subquery, visit);
+                }
+                fsqlite_ast::InSet::Table(_) => {}
+            }
+        }
+        fsqlite_ast::Expr::Like {
+            expr: target,
+            pattern,
+            escape,
+            ..
+        } => {
+            visit_expr_placeholders_mut(target, visit);
+            visit_expr_placeholders_mut(pattern, visit);
+            if let Some(esc) = escape {
+                visit_expr_placeholders_mut(esc, visit);
+            }
+        }
+        fsqlite_ast::Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand {
+                visit_expr_placeholders_mut(op, visit);
+            }
+            for (when_expr, then_expr) in whens {
+                visit_expr_placeholders_mut(when_expr, visit);
+                visit_expr_placeholders_mut(then_expr, visit);
+            }
+            if let Some(el) = else_expr {
+                visit_expr_placeholders_mut(el, visit);
+            }
+        }
+        fsqlite_ast::Expr::Exists { subquery, .. } | fsqlite_ast::Expr::Subquery(subquery, _) => {
+            visit_select_placeholders_mut(subquery, visit);
+        }
+        fsqlite_ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let fsqlite_ast::FunctionArgs::List(list) = args {
+                for arg in list {
+                    visit_expr_placeholders_mut(arg, visit);
+                }
+            }
+            for term in order_by {
+                visit_expr_placeholders_mut(&mut term.expr, visit);
+            }
+            if let Some(f) = filter {
+                visit_expr_placeholders_mut(f, visit);
+            }
+            if let Some(spec) = over {
+                visit_window_spec_placeholders_mut(spec, visit);
+            }
+        }
+        fsqlite_ast::Expr::RowValue(items, _) => {
+            for item in items {
+                visit_expr_placeholders_mut(item, visit);
+            }
+        }
+        fsqlite_ast::Expr::Literal(_, _)
+        | fsqlite_ast::Expr::BoundOuterValue { .. }
+        | fsqlite_ast::Expr::Column(_, _)
+        | fsqlite_ast::Expr::Raise { .. } => {}
+    }
+}
+
+fn visit_from_placeholders_mut(
+    from: &mut fsqlite_ast::FromClause,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    visit_table_source_placeholders_mut(&mut from.source, visit);
+    for join in &mut from.joins {
+        visit_table_source_placeholders_mut(&mut join.table, visit);
+        if let Some(fsqlite_ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            visit_expr_placeholders_mut(expr, visit);
+        }
+    }
+}
+
+fn visit_table_source_placeholders_mut(
+    source: &mut fsqlite_ast::TableOrSubquery,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    match source {
+        fsqlite_ast::TableOrSubquery::Table { .. } => {}
+        fsqlite_ast::TableOrSubquery::Subquery { query, .. } => {
+            visit_select_placeholders_mut(query, visit);
+        }
+        fsqlite_ast::TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                visit_expr_placeholders_mut(arg, visit);
+            }
+        }
+        fsqlite_ast::TableOrSubquery::ParenJoin(inner) => {
+            visit_from_placeholders_mut(inner, visit);
+        }
+    }
+}
+
+fn visit_select_core_placeholders_mut(
+    core: &mut fsqlite_ast::SelectCore,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    match core {
+        fsqlite_ast::SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for col in columns {
+                if let fsqlite_ast::ResultColumn::Expr { expr, .. } = col {
+                    visit_expr_placeholders_mut(expr, visit);
+                }
+            }
+            if let Some(from_clause) = from {
+                visit_from_placeholders_mut(from_clause, visit);
+            }
+            if let Some(where_expr) = where_clause {
+                visit_expr_placeholders_mut(where_expr, visit);
+            }
+            for expr in group_by {
+                visit_expr_placeholders_mut(expr, visit);
+            }
+            if let Some(having_expr) = having {
+                visit_expr_placeholders_mut(having_expr, visit);
+            }
+            for win in windows {
+                visit_window_spec_placeholders_mut(&mut win.spec, visit);
+            }
+        }
+        fsqlite_ast::SelectCore::Values(values) => {
+            for row in values.iter_mut() {
+                for expr in row {
+                    visit_expr_placeholders_mut(expr, visit);
+                }
+            }
+        }
+    }
+}
+
+fn visit_select_placeholders_mut(
+    select: &mut fsqlite_ast::SelectStatement,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            visit_select_placeholders_mut(&mut cte.query, visit);
+        }
+    }
+    visit_select_core_placeholders_mut(&mut select.body.select, visit);
+    for (_, core) in &mut select.body.compounds {
+        visit_select_core_placeholders_mut(core, visit);
+    }
+    for term in &mut select.order_by {
+        visit_expr_placeholders_mut(&mut term.expr, visit);
+    }
+    if let Some(limit) = &mut select.limit {
+        visit_expr_placeholders_mut(&mut limit.limit, visit);
+        if let Some(offset) = &mut limit.offset {
+            visit_expr_placeholders_mut(offset, visit);
+        }
+    }
+}
+
+/// Work around `fsqlite-core 0.4.10` rejecting unprojected FTS5 auxiliary
+/// functions (`bm25`, `highlight`, `snippet`) in `ORDER BY` by projecting them
+/// as hidden trailing `SELECT` columns and truncating them from query output.
+fn rewrite_unprojected_fts5_order_by_select(
+    stmt: Option<&SqlStatement>,
+) -> (Option<String>, usize) {
+    let Some(SqlStatement::Select(select)) = stmt else {
+        return (None, 0);
+    };
+    if !select.body.compounds.is_empty() || select.order_by.is_empty() {
+        return (None, 0);
+    }
+    let fsqlite_ast::SelectCore::Select {
+        distinct: fsqlite_ast::Distinctness::All,
+        columns: select_cols,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return (None, 0);
+    };
+
+    let mut table_names = Vec::new();
+    collect_from_table_names(from, &mut table_names);
+    if table_names.is_empty() {
+        return (None, 0);
+    }
+
+    let mut needs_hidden = false;
+    for term in &select.order_by {
+        let already_projected = select_cols.iter().any(|col| {
+            matches!(
+                col,
+                fsqlite_ast::ResultColumn::Expr { expr, .. } if expr == &term.expr
+            )
+        });
+        if !already_projected && expr_contains_fts5_aux_call(&term.expr, &table_names) {
+            needs_hidden = true;
+            break;
+        }
+    }
+    if !needs_hidden {
+        return (None, 0);
+    }
+
+    let mut rewritten = select.clone();
+    let mut slots = Vec::new();
+    visit_select_placeholders_mut(&mut rewritten, &mut |kind, span| {
+        slots.push((span.start, kind.clone()));
+    });
+    if slots
+        .iter()
+        .any(|(_, kind)| matches!(kind, fsqlite_ast::PlaceholderType::Anonymous))
+    {
+        slots.sort_by_key(|(start, _)| *start);
+        let mut max_ordinal = 0_u32;
+        let mut named = HashMap::<(char, String), u32>::new();
+        let mut anon_ordinals = HashMap::<u32, u32>::new();
+        for (start, kind) in slots {
+            let ordinal = match kind {
+                fsqlite_ast::PlaceholderType::Anonymous => {
+                    let next = max_ordinal.saturating_add(1);
+                    anon_ordinals.insert(start, next);
+                    next
+                }
+                fsqlite_ast::PlaceholderType::Numbered(n) => n,
+                fsqlite_ast::PlaceholderType::ColonNamed(ident) => *named
+                    .entry((':', ident))
+                    .or_insert_with(|| max_ordinal.saturating_add(1)),
+                fsqlite_ast::PlaceholderType::AtNamed(ident) => *named
+                    .entry(('@', ident))
+                    .or_insert_with(|| max_ordinal.saturating_add(1)),
+                fsqlite_ast::PlaceholderType::DollarNamed(ident) => *named
+                    .entry(('$', ident))
+                    .or_insert_with(|| max_ordinal.saturating_add(1)),
+            };
+            max_ordinal = max_ordinal.max(ordinal);
+        }
+        visit_select_placeholders_mut(&mut rewritten, &mut |kind, span| {
+            if matches!(kind, fsqlite_ast::PlaceholderType::Anonymous)
+                && let Some(&ordinal) = anon_ordinals.get(&span.start)
+            {
+                *kind = fsqlite_ast::PlaceholderType::Numbered(ordinal);
+            }
+        });
+    }
+
+    let order_terms = rewritten.order_by.clone();
+    let fsqlite_ast::SelectCore::Select {
+        columns: rewritten_cols,
+        ..
+    } = &mut rewritten.body.select
+    else {
+        return (None, 0);
+    };
+    let mut hidden_col_count = 0_usize;
+    for term in order_terms {
+        let already_projected = rewritten_cols.iter().any(|col| {
+            matches!(
+                col,
+                fsqlite_ast::ResultColumn::Expr { expr, .. } if expr == &term.expr
+            )
+        });
+        if !already_projected && expr_contains_fts5_aux_call(&term.expr, &table_names) {
+            rewritten_cols.push(fsqlite_ast::ResultColumn::Expr {
+                expr: term.expr,
+                alias: None,
+            });
+            hidden_col_count += 1;
+        }
+    }
+    if hidden_col_count == 0 {
+        (None, 0)
+    } else {
+        (Some(rewritten.to_string()), hidden_col_count)
+    }
+}
+
 fn split_sql_statement_slices(sql: &str) -> Vec<&str> {
     let mut slices = Vec::new();
     let bytes = sql.as_bytes();
@@ -1819,7 +2334,15 @@ async fn execute_request(
             ..
         } => {
             let admitted = admit_sql(&sql, true)?;
-            let exec_sql = admitted.normalized_sql(&sql);
+            let (rewritten_fts_sql, hidden_col_count) = if matches!(mode, QueryMode::Run) {
+                (None, 0)
+            } else {
+                rewrite_unprojected_fts5_order_by_select(admitted.parsed.first())
+            };
+            let exec_sql = match rewritten_fts_sql {
+                Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+                None => admitted.normalized_sql(&sql),
+            };
             budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
             if !admitted.uses_native_prepare() {
@@ -1863,6 +2386,13 @@ async fn execute_request(
                 columns =
                     dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
             }
+            let visible_col_count = if hidden_col_count > 0 {
+                let count = columns.len().saturating_sub(hidden_col_count);
+                columns.truncate(count);
+                Some(count)
+            } else {
+                None
+            };
             let mut bytes = serde_json::to_vec(&columns)
                 .map_err(|error| error.to_string())?
                 .len()
@@ -1895,8 +2425,10 @@ async fn execute_request(
                     return Ok(());
                 }
                 bytes += 3; // enclosing row brackets and its separator
-                match row
-                    .values()
+                let values = row.values();
+                let visible_values =
+                    visible_col_count.map_or(values, |count| &values[..values.len().min(count)]);
+                match visible_values
                     .iter()
                     .map(|value| encode_value(value, database.safe_integers, &mut bytes))
                     .collect::<Result<Vec<_>>>()

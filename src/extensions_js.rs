@@ -19942,6 +19942,17 @@ impl PiJsRuntime<WallClock> {
     }
 }
 
+struct NullableJsString(Option<String>);
+
+impl<'js> rquickjs::IntoJs<'js> for NullableJsString {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Some(value) => value.into_js(ctx),
+            None => Ok(Value::new_null(ctx.clone())),
+        }
+    }
+}
+
 #[allow(clippy::future_not_send)]
 impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Create a new PiJS runtime with a custom clock.
@@ -22301,7 +22312,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         let policy_for_env = policy.clone();
-                        move |ctx: Ctx<'_>, key: String| -> rquickjs::Result<rquickjs::Value<'_>> {
+                        move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<NullableJsString> {
                             // Compat fallback runs BEFORE deny_env so conformance
                             // scanning can inject deterministic dummy keys even when
                             // the policy denies env access (ext-conformance feature
@@ -22312,11 +22323,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     key = %key,
                                     "env compat fallback"
                                 );
-                                return rquickjs::IntoJs::into_js(value, &ctx);
+                                return Ok(NullableJsString(Some(value)));
                             }
                             if deny_env {
                                 tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
-                                return Ok(rquickjs::Value::new_null(ctx));
+                                return Ok(NullableJsString(None));
                             }
                             // If a policy is present, use its SecretBroker (including
                             // disclosure_allowlist). Otherwise fall back to default
@@ -22332,12 +22343,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "env get"
                             );
                             if !allowed {
-                                return Ok(rquickjs::Value::new_null(ctx));
+                                return Ok(NullableJsString(None));
                             }
-                            match configured_environment_value(&env, &key, windows_environment) {
-                                Some(val) => rquickjs::IntoJs::into_js(val, &ctx),
-                                None => Ok(rquickjs::Value::new_null(ctx)),
-                            }
+                            Ok(NullableJsString(
+                                configured_environment_value(&env, &key, windows_environment)
+                                    .map(str::to_string),
+                            ))
                         }
                     }),
                 )?;

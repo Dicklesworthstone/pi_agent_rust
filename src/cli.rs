@@ -65,15 +65,24 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "gallery",
 ];
 
-fn known_long_option(name: &str) -> Option<LongOptionSpec> {
-    static KNOWN_LONG_OPTIONS: OnceLock<HashMap<String, LongOptionSpec>> = OnceLock::new();
-    let specs = KNOWN_LONG_OPTIONS.get_or_init(|| {
-        let mut map = HashMap::new();
+struct CliPreprocessCatalog {
+    long_options: HashMap<Box<str>, LongOptionSpec>,
+    subcommands: HashSet<Box<str>>,
+}
+
+fn cli_preprocess_catalog() -> &'static CliPreprocessCatalog {
+    static CATALOG: OnceLock<CliPreprocessCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let always_bool_spec = LongOptionSpec {
+            takes_value: false,
+            optional_value: false,
+        };
+        let cmd = <Cli as CommandFactory>::command();
         // ftui migration flags (bd-cv653.9.1) + help: listed unconditionally so
         // on non-ftui builds clap still rejects `--ftui` / `--inline` with a
         // proper error instead of silently diverting them to extension flags,
         // and `--my-ext-flag --help` preserves `--help` for Clap.
-        for always_known_bool in [
+        let long_options = [
             "help",
             "ftui",
             "classic",
@@ -81,18 +90,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
             "charmed",
             "bubbletea",
             "inline",
-        ] {
-            map.insert(
-                always_known_bool.to_string(),
-                LongOptionSpec {
-                    takes_value: false,
-                    optional_value: false,
-                },
-            );
-        }
-
-        let cmd = <Cli as CommandFactory>::command();
-        for arg in cmd.get_arguments() {
+        ]
+        .into_iter()
+        .map(|name| (Box::<str>::from(name), always_bool_spec))
+        .chain(cmd.get_arguments().flat_map(|arg| {
             let takes_value = arg.get_action().takes_values();
             let optional_value = takes_value
                 && arg
@@ -102,18 +103,30 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
                 takes_value,
                 optional_value,
             };
-            if let Some(long) = arg.get_long() {
-                map.insert(long.to_string(), spec);
-            }
-            if let Some(aliases) = arg.get_all_aliases() {
-                for alias in aliases {
-                    map.insert(alias.to_string(), spec);
-                }
-            }
+            arg.get_long()
+                .into_iter()
+                .chain(arg.get_all_aliases().into_iter().flatten())
+                .map(move |name| (Box::<str>::from(name), spec))
+        }))
+        .collect();
+
+        let subcommands = cmd
+            .get_subcommands()
+            .flat_map(|subcommand| {
+                std::iter::once(subcommand.get_name()).chain(subcommand.get_all_aliases())
+            })
+            .map(Box::<str>::from)
+            .collect();
+
+        CliPreprocessCatalog {
+            long_options,
+            subcommands,
         }
-        map
-    });
-    specs.get(name).copied()
+    })
+}
+
+fn known_long_option(name: &str) -> Option<LongOptionSpec> {
+    cli_preprocess_catalog().long_options.get(name).copied()
 }
 
 fn is_known_short_flag(token: &str) -> bool {
@@ -256,22 +269,7 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
 }
 
 fn is_root_subcommand_or_alias(token: &str) -> bool {
-    use clap::CommandFactory as _;
-    use std::collections::HashSet;
-    use std::sync::OnceLock;
-
-    static SUBCOMMANDS: OnceLock<HashSet<String>> = OnceLock::new();
-    let names = SUBCOMMANDS.get_or_init(|| {
-        let mut set = HashSet::new();
-        for subcommand in Cli::command().get_subcommands() {
-            set.insert(subcommand.get_name().to_string());
-            for alias in subcommand.get_all_aliases() {
-                set.insert(alias.to_string());
-            }
-        }
-        set
-    });
-    names.contains(token)
+    cli_preprocess_catalog().subcommands.contains(token)
 }
 
 pub fn parse_with_extension_flags(raw_args: Vec<String>) -> Result<ParsedCli, clap::Error> {
@@ -283,12 +281,12 @@ pub fn parse_with_extension_flags(raw_args: Vec<String>) -> Result<ParsedCli, cl
         });
     }
 
-    match Cli::try_parse_from(raw_args.clone()) {
-        Ok(_) => {
-            // We do NOT return early here because `Cli` has trailing varargs for `message`.
-            // If the user provided `pi hello --unknown flag`, clap might happily parse
-            // `--unknown flag` into `message`. We must preprocess extension flags first!
-        }
+    // We do NOT return early on `Ok` here because `Cli` has trailing varargs for `message`.
+    // If the user provided `pi hello --unknown flag`, clap might happily parse
+    // `--unknown flag` into `message`. We preprocess extension flags first and
+    // reuse `first_parse` whenever no extension flags were extracted.
+    let first_parse = match Cli::try_parse_from(&raw_args) {
+        Ok(cli) => Some(cli),
         Err(err) => {
             if matches!(
                 err.kind(),
@@ -296,12 +294,16 @@ pub fn parse_with_extension_flags(raw_args: Vec<String>) -> Result<ParsedCli, cl
             ) {
                 return Err(err);
             }
+            None
         }
-    }
+    };
 
     let (filtered_args, extension_flags) = preprocess_extension_flags(&raw_args);
     if extension_flags.is_empty() {
-        let cli = Cli::try_parse_from(raw_args)?;
+        let cli = match first_parse {
+            Some(cli) => cli,
+            None => Cli::try_parse_from(raw_args)?,
+        };
         return Ok(ParsedCli {
             cli,
             extension_flags: Vec::new(),
