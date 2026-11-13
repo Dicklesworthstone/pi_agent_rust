@@ -5036,7 +5036,15 @@ impl Session {
                 if allow_sidecar_repair {
                     is_v2_sidecar_stale(path, v2_root)?
                 } else {
-                    is_v2_sidecar_stale_read_only(path, v2_root)?
+                    match is_v2_sidecar_stale_read_only(path, v2_root) {
+                        Ok(stale) => stale,
+                        Err(Error::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            true
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             Some(_) => true,

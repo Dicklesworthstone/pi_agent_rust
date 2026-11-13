@@ -2194,6 +2194,88 @@ mod tests {
     }
 
     #[test]
+    fn partial_exports_use_jsonl_when_the_v2_cache_disappears() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("missing-export-cache.jsonl");
+        let mut source = session_at(&path);
+        let root = source.append_message(text_message("root"));
+        let image_data = STANDARD.encode(vec![0x65; INLINE_BYTES + 2]);
+        let media_data = STANDARD_NO_PAD.encode(vec![0x66; INLINE_BYTES + 3]);
+        let hidden = source.append_message(message(vec![
+            image(image_data.clone()),
+            media(media_data.clone(), "audio/wav"),
+        ]));
+        assert!(source.navigate_to(&root));
+        source.append_message(text_message("active branch"));
+        save(&mut source);
+        let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+        let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+            &store,
+            source.header.clone(),
+            V2OpenMode::ActivePath,
+            Some(&path),
+        )
+        .unwrap();
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert!(partial.has_partial_v2_hydration());
+        assert!(partial.get_entry(&hidden).is_none());
+        partial.path = Some(path.clone());
+        let v2_root = session_store_v2::v2_sidecar_path(&path);
+        partial.v2_sidecar_root = Some(v2_root.clone());
+        let pending = partial.append_message(text_message("unsaved operator work"));
+        fs::rename(&v2_root, directory.path().join("parked-v2-cache")).unwrap();
+        let before_disk = fs::read(&path).unwrap();
+        let before_blobs = blobs(&path)
+            .into_iter()
+            .map(|blob| {
+                let bytes = fs::read(&blob).unwrap();
+                (blob, bytes)
+            })
+            .collect::<Vec<_>>();
+        let before_entries = serde_json::to_value(&partial.entries).unwrap();
+        let before_header = serde_json::to_value(&partial.header).unwrap();
+        let before_persisted = partial
+            .persisted_entry_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let snapshot = partial.export_snapshot().expect("read authoritative JSONL");
+        assert_eq!(snapshot.entries.len(), source.entries.len() + 1);
+        assert_eq!(
+            serde_json::to_value(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.base_id() == Some(&hidden))
+                    .expect("hidden media branch is exported"),
+            )
+            .unwrap(),
+            serde_json::to_value(source.get_entry(&hidden).unwrap()).unwrap()
+        );
+        assert_eq!(snapshot.entries.last().unwrap().base_id(), Some(&pending));
+        let html = snapshot.to_html();
+        assert_eq!(partial.to_html().expect("direct JSONL export"), html);
+        assert!(html.contains(&image_data));
+        assert!(html.contains(&media_data));
+        assert!(html.contains("unsaved operator work"));
+        assert!(!v2_root.exists(), "export must not recreate the V2 cache");
+        assert_eq!(fs::read(&path).unwrap(), before_disk);
+        assert_eq!(blobs(&path).len(), before_blobs.len());
+        for (blob, bytes) in before_blobs {
+            assert_eq!(fs::read(blob).unwrap(), bytes);
+        }
+        assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
+        assert_eq!(serde_json::to_value(&partial.header).unwrap(), before_header);
+        assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+        assert_eq!(
+            partial
+                .persisted_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before_persisted
+        );
+        assert!(partial.has_partial_v2_hydration());
+    }
+
+    #[test]
     fn partial_exports_do_not_repair_corrupt_v2_sidecars() {
         fn snapshot_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
             let mut snapshot = std::collections::BTreeMap::new();
