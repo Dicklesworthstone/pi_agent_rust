@@ -20609,12 +20609,14 @@ impl AgentSession {
                 "retry restoration invariant failed: the completed error response had no incomplete assistant tail",
             ));
         }
-        if !reverted {
+        let save_enabled = self.save_enabled();
+        let needs_persist_check =
+            save_enabled && (candidate.path.is_some() || !candidate.entries.is_empty());
+        if !reverted && !needs_persist_check {
             return Ok(());
         }
 
-        let restored_messages = candidate.to_messages_for_current_path();
-        let save_enabled = self.save_enabled();
+        let restored_messages = reverted.then(|| candidate.to_messages_for_current_path());
         let _provider_transition = ProviderSwapAdmission::Held(&authority)
             .begin_transition(
                 "retry restoration persistence was interrupted before live installation completed"
@@ -20638,9 +20640,13 @@ impl AgentSession {
         // here; print mode did not, so a compaction prepared before the revert
         // could be applied after it. Discarding prepared work is the safe
         // direction — the worker recomputes — so the shared path does it.
-        self.invalidate_background_compaction();
-        *inner = candidate;
-        self.agent.replace_messages(restored_messages);
+        if let Some(restored_messages) = restored_messages {
+            self.invalidate_background_compaction();
+            *inner = candidate;
+            self.agent.replace_messages(restored_messages);
+        } else {
+            *inner = candidate;
+        }
         admission.clear();
         Ok(())
     }
@@ -23367,10 +23373,13 @@ impl AgentSession {
         // A startup hook may select a provider registered by the extension
         // that just loaded. Validate a private registration snapshot for those
         // hooks; the caller still owns final credential refresh and selection.
-        let bindings = crate::models::extension_provider_bindings(&manager.extension_providers())?;
+        let catalog = manager
+            .extension_provider_catalog(None)?
+            .expect("initial extension provider catalog snapshot must exist");
         let mut hook_registry = self.model_registry.as_deref().cloned().unwrap_or_default();
-        hook_registry.merge_extension_registry(&bindings, manager.extension_model_entries())?;
-        manager.set_extension_models(pi_ai_model_registry_values(&hook_registry));
+        hook_registry.merge_extension_registry(&catalog.bindings, catalog.entries)?;
+        let hook_models = pi_ai_model_registry_values(&hook_registry);
+        manager.set_extension_models(hook_models.clone());
         {
             let mut state = self
                 .extension_ai_completion
@@ -23378,7 +23387,9 @@ impl AgentSession {
                 .map_err(|_| Error::extension("Failed to publish the startup model catalog"))?;
             state.compaction_models.registry = Some(Arc::new(hook_registry));
             state.compaction_models.provider_manager = manager.handle();
-            state.compaction_models.provider_revision = None;
+            state.compaction_models.provider_revision = Some(catalog.revision);
+            state.compaction_models.js_provider_ids = catalog.stream_provider_ids;
+            state.models = hook_models;
         }
 
         // Fire the `startup` lifecycle hook once extensions are loaded.
