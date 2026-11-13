@@ -9737,7 +9737,7 @@ async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<P
     }
 
     let session = Session::open(input_path).await?;
-    let html = pi::app::render_session_html(&session);
+    let html = pi::app::render_session_html(&session)?;
     let output_path = output_path.map_or_else(|| default_export_path(input), PathBuf::from);
 
     if let Some(parent) = output_path.parent()

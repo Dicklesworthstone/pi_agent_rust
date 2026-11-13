@@ -2242,7 +2242,7 @@ impl PiApp {
                     return None;
                 }
 
-                let (output_path, html) = {
+                let (output_path, snapshot) = {
                     let Ok(session_guard) = self.session.try_lock() else {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
@@ -2252,9 +2252,15 @@ impl PiApp {
                     } else {
                         self.resolve_output_path(args)
                     };
-                    let html = session_guard.to_html();
-                    (output_path, html)
+                    match session_guard.export_snapshot() {
+                        Ok(snapshot) => (output_path, snapshot),
+                        Err(error) => {
+                            self.status_message = Some(format!("Failed to export session: {error}"));
+                            return None;
+                        }
+                    }
                 };
+                let html = snapshot.to_html();
 
                 if let Some(parent) = output_path.parent()
                     && !parent.as_os_str().is_empty()

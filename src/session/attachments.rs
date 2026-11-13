@@ -1430,7 +1430,7 @@ mod tests {
         let fork_target = parent.append_message(text_message("try another path"));
         save(&mut parent);
         let parent = open(&path).expect("hydrate parent");
-        let snapshot = parent.export_snapshot();
+        let snapshot = parent.export_snapshot().expect("complete export snapshot");
 
         let copied_path = directory.path().join("copy.jsonl");
         let mut copied = parent.clone();
@@ -2054,6 +2054,215 @@ mod tests {
         let dry_run =
             crate::session::migrate_dry_run(&path).expect("portable dry-run source context");
         assert!(dry_run.entry_count_match && dry_run.hash_chain_match && dry_run.index_consistent);
+    }
+
+    #[test]
+    fn partial_exports_include_hidden_media_and_pending_entries_without_mutating_the_source() {
+        for mode in [V2OpenMode::ActivePath, V2OpenMode::Tail(1)] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("export-branches.jsonl");
+            let mut source = session_at(&path);
+            let root = source.append_message(text_message("export-root-sentinel"));
+            let image_data = STANDARD.encode(vec![0x61; INLINE_BYTES + 2]);
+            let media_data = STANDARD_NO_PAD.encode(vec![0x62; INLINE_BYTES + 3]);
+            let hidden = source.append_message(message(vec![
+                ContentBlock::Text(crate::model::TextContent::new("hidden-media-sentinel")),
+                image(image_data.clone()),
+                media(media_data.clone(), "audio/wav"),
+            ]));
+            assert!(source.navigate_to(&root));
+            source.append_message(text_message("export-active-sentinel"));
+            save(&mut source);
+            let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+            let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+                &store,
+                source.header.clone(),
+                mode,
+                Some(&path),
+            )
+            .expect("open partial export source");
+            assert!(diagnostics.skipped_entries.is_empty());
+            assert!(diagnostics.orphaned_parent_links.is_empty());
+            assert!(partial.has_partial_v2_hydration());
+            assert!(partial.get_entry(&hidden).is_none());
+            partial.path = Some(path.clone());
+            partial.v2_sidecar_root = Some(session_store_v2::v2_sidecar_path(&path));
+            let pending = partial.append_message(text_message("export-pending-sentinel"));
+            let before_entries = serde_json::to_value(&partial.entries).unwrap();
+            let before_header = serde_json::to_value(&partial.header).unwrap();
+            let before_persisted = partial
+                .persisted_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let before_disk = fs::read(&path).unwrap();
+
+            let snapshot = partial.export_snapshot().expect("complete partial snapshot");
+            assert_eq!(snapshot.entries.len(), source.entries.len() + 1);
+            assert_eq!(
+                serde_json::to_value(
+                    snapshot
+                        .entries
+                        .iter()
+                        .find(|entry| entry.base_id() == Some(&hidden))
+                        .expect("hidden branch is exported"),
+                )
+                .unwrap(),
+                serde_json::to_value(source.get_entry(&hidden).unwrap()).unwrap()
+            );
+            assert_eq!(snapshot.entries.last().unwrap().base_id(), Some(&pending));
+            let html = snapshot.to_html();
+            assert_eq!(partial.to_html().expect("complete direct export"), html);
+            assert!(html.contains("media-src data:"));
+            for text in [
+                "export-root-sentinel",
+                "hidden-media-sentinel",
+                "export-active-sentinel",
+                "export-pending-sentinel",
+                image_data.as_str(),
+                media_data.as_str(),
+            ] {
+                assert!(html.contains(text), "missing exported content under {mode:?}");
+            }
+            assert!(!html.contains("$piBlob"));
+            assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
+            assert_eq!(serde_json::to_value(&partial.header).unwrap(), before_header);
+            assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+            assert_eq!(
+                partial
+                    .persisted_entry_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                before_persisted
+            );
+            assert!(partial.has_partial_v2_hydration());
+            assert_eq!(fs::read(&path).unwrap(), before_disk);
+        }
+    }
+
+    #[test]
+    fn partial_exports_fail_closed_on_missing_or_corrupt_hidden_media() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("broken-export.jsonl");
+            let mut source = session_at(&path);
+            let root = source.append_message(text_message("root"));
+            let hidden = source.append_message(message(vec![image(
+                STANDARD.encode(vec![0x63; INLINE_BYTES + 2]),
+            )]));
+            assert!(source.navigate_to(&root));
+            source.append_message(text_message("active"));
+            save(&mut source);
+            let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+            let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+                &store,
+                source.header.clone(),
+                V2OpenMode::ActivePath,
+                Some(&path),
+            )
+            .unwrap();
+            assert!(diagnostics.skipped_entries.is_empty());
+            assert!(partial.get_entry(&hidden).is_none());
+            partial.path = Some(path.clone());
+            partial.v2_sidecar_root = Some(session_store_v2::v2_sidecar_path(&path));
+            let pending = partial.append_message(text_message("unsaved operator work"));
+            let before_entries = serde_json::to_value(&partial.entries).unwrap();
+            let before_disk = fs::read(&path).unwrap();
+            let blob = blobs(&path).pop().unwrap();
+            let detail = if corrupt {
+                fs::write(&blob, vec![0x64; INLINE_BYTES + 2]).unwrap();
+                "digest"
+            } else {
+                fs::rename(&blob, directory.path().join("unavailable-attachment")).unwrap();
+                "missing"
+            };
+
+            assert_attachment_error(
+                partial
+                    .export_snapshot()
+                    .expect_err("do not export a partial snapshot"),
+                detail,
+            );
+            assert_attachment_error(
+                partial
+                    .to_html()
+                    .expect_err("do not render a truncated export"),
+                detail,
+            );
+            assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
+            assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+            assert!(partial.has_partial_v2_hydration());
+            assert_eq!(fs::read(&path).unwrap(), before_disk);
+        }
+    }
+
+    #[test]
+    fn partial_exports_do_not_repair_corrupt_v2_sidecars() {
+        fn snapshot_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut snapshot = std::collections::BTreeMap::new();
+            let mut directories = vec![root.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    if entry.file_type().unwrap().is_dir() {
+                        snapshot.insert(relative, None);
+                        directories.push(path);
+                    } else {
+                        snapshot.insert(relative, Some(fs::read(path).unwrap()));
+                    }
+                }
+            }
+            snapshot
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("corrupt-export-cache.jsonl");
+        let mut source = session_at(&path);
+        let root = source.append_message(text_message("root"));
+        let hidden = source.append_message(text_message("hidden branch"));
+        assert!(source.navigate_to(&root));
+        source.append_message(text_message("active branch"));
+        save(&mut source);
+        let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+        let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+            &store,
+            source.header.clone(),
+            V2OpenMode::ActivePath,
+            Some(&path),
+        )
+        .unwrap();
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert!(partial.has_partial_v2_hydration());
+        assert!(partial.get_entry(&hidden).is_none());
+        partial.path = Some(path.clone());
+        let v2_root = session_store_v2::v2_sidecar_path(&path);
+        partial.v2_sidecar_root = Some(v2_root.clone());
+        let pending = partial.append_message(text_message("unsaved operator work"));
+        fs::write(v2_root.join("manifest.json"), b"{ invalid manifest\n").unwrap();
+        let before_files = snapshot_files(directory.path());
+        let before_entries = serde_json::to_value(&partial.entries).unwrap();
+        let before_header = serde_json::to_value(&partial.header).unwrap();
+        let before_persisted = partial
+            .persisted_entry_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        partial
+            .export_snapshot()
+            .expect_err("export must not silently repair a corrupt V2 manifest");
+        partial
+            .to_html()
+            .expect_err("direct export must not silently repair a corrupt V2 manifest");
+
+        assert_eq!(snapshot_files(directory.path()), before_files);
+        assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
+        assert_eq!(serde_json::to_value(&partial.header).unwrap(), before_header);
+        assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+        assert_eq!(
+            partial
+                .persisted_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before_persisted
+        );
+        assert!(partial.has_partial_v2_hydration());
     }
 
     #[test]

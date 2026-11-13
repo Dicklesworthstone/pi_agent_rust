@@ -2379,7 +2379,7 @@ pub fn output_final_text(message: &AssistantMessage) {
     }
 }
 
-pub fn render_session_html(session: &Session) -> String {
+pub fn render_session_html(session: &Session) -> crate::Result<String> {
     session.to_html()
 }
 

@@ -5029,9 +5029,17 @@ impl Session {
     fn load_full_v2_rehydration(
         &self,
         v2_root: &Path,
+        allow_sidecar_repair: bool,
     ) -> Result<(Self, SessionOpenDiagnostics, &'static str)> {
         let use_jsonl = match self.path.as_ref() {
-            Some(path) => self.v2_sidecar_stale || is_v2_sidecar_stale(path, v2_root)?,
+            Some(path) if !self.v2_sidecar_stale => {
+                if allow_sidecar_repair {
+                    is_v2_sidecar_stale(path, v2_root)?
+                } else {
+                    is_v2_sidecar_stale_read_only(path, v2_root)?
+                }
+            }
+            Some(_) => true,
             None => false,
         };
         if use_jsonl {
@@ -5075,7 +5083,10 @@ impl Session {
                     "missing JSONL path while rehydrating a partial V2 session",
                 )
             }
-            Err(error) => self.recover_full_v2_rehydration(v2_root, &error),
+            Err(error) if allow_sidecar_repair => {
+                self.recover_full_v2_rehydration(v2_root, &error)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -5102,13 +5113,18 @@ impl Session {
     /// resume. Before any save path that could trigger a full JSONL rewrite, we
     /// must rehydrate all V2 entries to preserve non-active branches.
     pub(crate) fn ensure_full_v2_hydration_before_save(&mut self) -> Result<()> {
+        self.ensure_full_v2_hydration(true)
+    }
+
+    /// Exports may read all entries but must not repair or upgrade source files.
+    fn ensure_full_v2_hydration(&mut self, allow_sidecar_repair: bool) -> Result<()> {
         if !self.v2_partial_hydration {
             return Ok(());
         }
 
         let Some(v2_root) = self.v2_sidecar_root.clone() else {
             return Err(Error::session(
-                "cannot persist a partially hydrated V2 session because its sidecar root is unavailable",
+                "cannot fully hydrate a V2 session because its sidecar root is unavailable",
             ));
         };
 
@@ -5121,14 +5137,14 @@ impl Session {
             && self.header.current_leaf.as_deref() == Some(ROOT_LEAF_OVERRIDE_SENTINEL);
         let previous_mode = self.v2_resume_mode;
         let (fully_hydrated, diagnostics, rehydration_source) =
-            self.load_full_v2_rehydration(&v2_root)?;
+            self.load_full_v2_rehydration(&v2_root, allow_sidecar_repair)?;
         if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty()
         {
             tracing::error!(
                 skipped_entries = diagnostics.skipped_entries.len(),
                 orphaned_parent_links = diagnostics.orphaned_parent_links.len(),
                 rehydration_source,
-                "full V2 rehydration before save failed integrity check; aborting save to prevent data loss"
+                "full V2 rehydration failed integrity check; refusing incomplete session data"
             );
             return Err(Error::session(format!(
                 "V2 rehydration failed with {} skipped entries and {} orphaned links",
@@ -5180,7 +5196,7 @@ impl Session {
             rehydration_source,
             persisted_entry_count,
             pending_entries = self.entries.len().saturating_sub(persisted_entry_count),
-            "fully rehydrated V2 session before save"
+            "fully rehydrated V2 session"
         );
 
         Ok(())
@@ -6043,11 +6059,16 @@ impl Session {
 
     /// Render the session as a standalone HTML document.
     ///
-    /// Delegates to `render_session_html()` for the actual rendering. For
-    /// non-blocking export, prefer `export_snapshot().to_html()` which avoids
-    /// cloning internal caches.
-    pub fn to_html(&self) -> String {
-        render_session_html(&self.header, &self.entries)
+    /// Includes every branch, even when fast resume loaded only a tail or the
+    /// active path. Missing or corrupt source entries and attachments fail the
+    /// export instead of producing an apparently complete, truncated document.
+    /// For rendering outside the session lock, use `export_snapshot()?.to_html()`.
+    pub fn to_html(&self) -> Result<String> {
+        self.ensure_export_integrity()?;
+        if self.v2_partial_hydration {
+            return self.export_snapshot().map(|snapshot| snapshot.to_html());
+        }
+        Ok(render_session_html(&self.header, &self.entries))
     }
 
     /// Render the selected conversation branch for secret-gist link sharing.
@@ -6175,15 +6196,35 @@ impl Session {
 
     /// Create a lightweight snapshot for non-blocking HTML export.
     ///
-    /// Captures only the fields needed by `to_html()` (header, entries, path),
-    /// avoiding a full `Session::clone()` which includes caches, autosave queues,
-    /// persistence state, and other internal bookkeeping.
-    pub fn export_snapshot(&self) -> ExportSnapshot {
-        ExportSnapshot {
+    /// Captures all branches and pending local entries without changing the
+    /// live session's navigation or persistence state. A partial V2 view is
+    /// hydrated on a private clone first; an already complete view copies only
+    /// the header, entries, and path needed by the renderer.
+    pub fn export_snapshot(&self) -> Result<ExportSnapshot> {
+        self.ensure_export_integrity()?;
+        if self.v2_partial_hydration {
+            let mut complete = self.clone();
+            complete.ensure_full_v2_hydration(false)?;
+            return Ok(ExportSnapshot {
+                header: complete.header,
+                entries: complete.entries,
+                path: complete.path,
+            });
+        }
+        Ok(ExportSnapshot {
             header: self.header.clone(),
             entries: self.entries.clone(),
             path: self.path.clone(),
+        })
+    }
+
+    fn ensure_export_integrity(&self) -> Result<()> {
+        if self.source_integrity_failed {
+            return Err(Error::session(
+                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to export a session opened with skipped rows or missing parents",
+            ));
         }
+        Ok(())
     }
 
     /// Plan a `/fork` from a user message entry ID.
@@ -8062,7 +8103,7 @@ fn render_session_html_entries<'a>(
     let mut html = String::new();
     html.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
     html.push_str(
-        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">",
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; media-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">",
     );
     html.push_str("<title>Pi Session</title>");
     html.push_str("<style>");
@@ -13006,7 +13047,7 @@ mod tests {
             matches!(entry, SessionEntry::BranchSummary(summary) if summary.summary.eq("branch summary"))
         }));
 
-        let html = loaded.to_html();
+        let html = loaded.to_html().expect("complete HTML export");
         assert!(html.contains("compacted"));
         assert!(html.contains("branch summary"));
     }
@@ -14790,7 +14831,7 @@ mod tests {
         session.append_model_change("anthropic".to_string(), "claude-test".to_string());
         session.set_name("test-session-html");
 
-        let html = session.to_html();
+        let html = session.to_html().expect("complete HTML export");
         assert!(html.contains("<!doctype html>"));
         assert!(html.contains("user question"));
         assert!(html.contains("assistant answer"));
@@ -14821,10 +14862,10 @@ mod tests {
         assert!(html.contains("[REDACTED_GITHUB_PAT]"));
         assert!(!html.contains("cwd:"));
         assert!(html.contains(
-            "Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+            "Content-Security-Policy\" content=\"default-src 'none'; img-src data:; media-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
         ));
 
-        let local_html = session.to_html();
+        let local_html = session.to_html().expect("complete local HTML export");
         assert!(local_html.contains("abandoned-branch-sentinel"));
         assert!(local_html.contains("/private/workspaces/customer-secret"));
         assert!(local_html.contains("cwd:"));
@@ -19223,7 +19264,24 @@ mod tests {
         assert_eq!(diagnostics.orphaned_parent_links.len(), 1);
         assert_eq!(recovered.entries.len(), 2);
 
-        recovered.append_message(make_test_message("must not overwrite missing B"));
+        let pending = recovered.append_message(make_test_message("must not overwrite missing B"));
+        let before_entries = serde_json::to_value(&recovered.entries).unwrap();
+        for error in [
+            recovered
+                .export_snapshot()
+                .expect_err("recovered rows are not a complete export snapshot"),
+            recovered
+                .to_html()
+                .expect_err("recovered rows must not render as a complete export"),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
+            );
+        }
+        assert_eq!(serde_json::to_value(&recovered.entries).unwrap(), before_entries);
+        assert_eq!(recovered.leaf_id(), Some(pending.as_str()));
         let error = run_async(async { recovered.save().await })
             .expect_err("valid-invalid-valid source must remain byte-preserved");
         assert!(
@@ -20431,7 +20489,7 @@ mod tests {
         session.append_message(make_test_message("hello world"));
         session.append_message(make_test_message("second message"));
 
-        let snapshot = session.export_snapshot();
+        let snapshot = session.export_snapshot().expect("complete export snapshot");
         assert_eq!(snapshot.header.id, session.header.id);
         assert_eq!(snapshot.header.timestamp, session.header.timestamp);
         assert_eq!(snapshot.header.cwd, session.header.cwd);
@@ -20447,7 +20505,7 @@ mod tests {
         }
         // The snapshot should be lighter than a full Session clone because
         // it skips autosave_queue, entry_index, entry_ids, and other caches.
-        let snapshot = session.export_snapshot();
+        let snapshot = session.export_snapshot().expect("complete export snapshot");
         assert_eq!(snapshot.entries.len(), 10);
         // Verify the snapshot is a distinct copy (not sharing references).
         assert_eq!(snapshot.header.id, session.header.id);
@@ -20459,15 +20517,18 @@ mod tests {
         session.append_message(make_test_message("hello"));
         session.append_message(make_test_message("world"));
 
-        let session_html = session.to_html();
-        let snapshot_html = session.export_snapshot().to_html();
+        let session_html = session.to_html().expect("complete HTML export");
+        let snapshot_html = session
+            .export_snapshot()
+            .expect("complete export snapshot")
+            .to_html();
         assert_eq!(session_html, snapshot_html);
     }
 
     #[test]
     fn export_snapshot_empty_session() {
         let session = Session::create();
-        let snapshot = session.export_snapshot();
+        let snapshot = session.export_snapshot().expect("complete export snapshot");
         assert!(snapshot.entries.is_empty());
         let html = snapshot.to_html();
         assert!(html.contains("Pi Session"));
@@ -20516,7 +20577,7 @@ mod tests {
         session.path = Some(PathBuf::from("/tmp/my-session.jsonl"));
         session.append_message(make_test_message("msg"));
 
-        let snapshot = session.export_snapshot();
+        let snapshot = session.export_snapshot().expect("complete export snapshot");
         assert_eq!(
             snapshot.path.as_deref(),
             Some(Path::new("/tmp/my-session.jsonl"))

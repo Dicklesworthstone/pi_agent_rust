@@ -4580,10 +4580,9 @@ pub async fn run(
                     .get("outputPath")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                // Capture a lightweight snapshot under lock, then release immediately.
-                // This avoids cloning the full Session (caches, autosave queue, etc.)
-                // and allows the HTML rendering + file I/O to proceed without holding
-                // any session lock.
+                // Capture every branch, hydrating a private clone if fast resume
+                // loaded only part of the source. Rendering and file I/O happen
+                // outside the lock, and a failed capture never writes an export.
                 let snapshot = {
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
@@ -4593,7 +4592,11 @@ pub async fn run(
                     })?;
                     inner.export_snapshot()
                 };
-                match export_html_snapshot(&snapshot, output_path.as_deref()).await {
+                let result = match snapshot {
+                    Ok(snapshot) => export_html_snapshot(&snapshot, output_path.as_deref()).await,
+                    Err(error) => Err(error),
+                };
+                match result {
                     Ok(path) => {
                         let _ = out_tx.send(response_ok(
                             id,

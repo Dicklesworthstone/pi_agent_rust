@@ -12520,7 +12520,7 @@ async fn run_export_command(
     agent_tx: &Sender<PiMsg>,
 ) {
     let cx = crate::agent_cx::AgentCx::for_request();
-    let (output_path, html) = {
+    let (output_path, snapshot) = {
         let store = handle.session_store();
         let Ok(session) = store.lock(cx.cx()).await else {
             let _ = agent_tx.send(PiMsg::AgentError(String::from(
@@ -12533,8 +12533,15 @@ async fn run_export_command(
         } else {
             crate::interactive::resolve_output_path(cwd, raw_path)
         };
-        (output_path, session.to_html())
+        match session.export_snapshot() {
+            Ok(snapshot) => (output_path, snapshot),
+            Err(error) => {
+                let _ = agent_tx.send(PiMsg::AgentError(format!("export: {error}")));
+                return;
+            }
+        }
     };
+    let html = snapshot.to_html();
 
     if let Some(parent) = output_path.parent()
         && !parent.as_os_str().is_empty()
