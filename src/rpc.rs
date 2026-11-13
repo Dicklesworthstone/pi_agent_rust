@@ -18235,6 +18235,59 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct EmptyReplyProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for EmptyReplyProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
     struct CompactionSummaryProvider;
 
     #[async_trait]
@@ -19588,7 +19641,7 @@ mod tests {
                     Arc::new(CompactionSummaryProvider)
                 } else {
                     // Empty terminal content must fail strict native synthesis.
-                    Arc::new(NoopProvider)
+                    Arc::new(EmptyReplyProvider)
                 };
                 let agent_session = handoff_agent_session(stored, persistence_failure, provider);
                 let inner = Arc::clone(&agent_session.session);
@@ -28286,7 +28339,7 @@ export default function init(pi) {
             model.model.provider = "test-provider".to_string();
 
             let agent = Agent::new(
-                Arc::new(NoopProvider),
+                Arc::new(EmptyReplyProvider),
                 ToolRegistry::new(&[], Path::new("."), None),
                 AgentConfig::default(),
             );
