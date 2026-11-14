@@ -1181,6 +1181,108 @@ fn rewrite_unprojected_fts5_order_by_select(
     }
 }
 
+fn canonicalize_sql_parameter_tokens(sql: &str) -> Result<String> {
+    let mut chars = sql.chars().peekable();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut max_ordinal = 0_usize;
+    let mut named = HashMap::<String, usize>::new();
+    while let Some(ch) = chars.next() {
+        if ch == '-' && chars.peek() == Some(&'-') {
+            out.push(ch);
+            if let Some(second) = chars.next() {
+                out.push(second);
+            }
+            for comment_ch in chars.by_ref() {
+                out.push(comment_ch);
+                if comment_ch == '\n' || comment_ch == '\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            out.push(ch);
+            if let Some(second) = chars.next() {
+                out.push(second);
+            }
+            while let Some(comment_ch) = chars.next() {
+                out.push(comment_ch);
+                if comment_ch == '*' && chars.peek() == Some(&'/') {
+                    if let Some(end_slash) = chars.next() {
+                        out.push(end_slash);
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`' | '[') {
+            let close = if ch == '[' { ']' } else { ch };
+            out.push(ch);
+            while let Some(next) = chars.next() {
+                out.push(next);
+                if next == close {
+                    if close != ']' && chars.peek() == Some(&close) {
+                        if let Some(escaped) = chars.next() {
+                            out.push(escaped);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if matches!(ch, '?' | ':' | '@' | '$') {
+            let mut name = ch.to_string();
+            while let Some(&next) = chars.peek() {
+                if (ch == '?' && next.is_ascii_digit())
+                    || (ch != '?' && (next.is_alphanumeric() || next == '_'))
+                {
+                    name.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let ordinal = if name == "?" {
+                max_ordinal + 1
+            } else if let Some(index) = name.strip_prefix('?') {
+                index
+                    .parse::<usize>()
+                    .map_err(|_| "Invalid numbered SQL parameter")?
+            } else if let Some(&index) = named.get(&name) {
+                index
+            } else {
+                let index = max_ordinal + 1;
+                named.insert(name, index);
+                index
+            };
+            if ordinal == 0 || ordinal > MAX_PARAMETERS {
+                return Err("SQL parameter limit exceeded (1 through 999)".into());
+            }
+            max_ordinal = max_ordinal.max(ordinal);
+            out.push('?');
+            out.push_str(&ordinal.to_string());
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            out.push(ch);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' || next == '$' {
+                    out.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    Ok(out)
+}
+
 fn split_sql_statement_slices(sql: &str) -> Vec<&str> {
     let mut slices = Vec::new();
     let bytes = sql.as_bytes();
@@ -2734,12 +2836,17 @@ async fn execute_request(
                         {
                             // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred skips
                             // placeholder canonicalization on live virtual tables (such
-                            // as FTS5); Connection::execute_with_params canonicalizes AST
-                            // placeholders before virtual-table dispatch while preserving
-                            // change tracking.
+                            // as FTS5), and Connection::execute_with_params re-enters the
+                            // same prepared fast lane for simple VALUES inserts. Rewrite
+                            // parameter tokens to canonical ?N ordinals and re-prepare.
+                            let canonical_sql =
+                                canonicalize_sql_parameter_tokens(exec_sql.as_ref())?;
                             database
                                 .conn
-                                .execute_with_params(exec_sql.as_ref(), &params)
+                                .prepare(&canonical_sql)
+                                .await
+                                .map_err(SqliteFailure::from)?
+                                .execute_with_params(&params)
                                 .await
                                 .map_err(SqliteFailure::from)?;
                         }
@@ -3433,5 +3540,67 @@ mod tests {
         // This is a real engine acknowledgment check, not merely a host
         // recv_timeout assertion. The worker must also release its connection.
         wait_for_worker_exit(&worker);
+    }
+
+    #[test]
+    fn canonicalize_sql_parameter_tokens_preserves_literals_and_numbers_slots() {
+        let sql = "/* ? :skip */ INSERT INTO foo$bar(\"col$1\", [?raw], `tick?`) VALUES (?, :same, '? :lit', :same, ?4, ?) -- ?\n";
+        let canonical = canonicalize_sql_parameter_tokens(sql).expect("canonicalize SQL");
+        assert_eq!(
+            canonical,
+            "/* ? :skip */ INSERT INTO foo$bar(\"col$1\", [?raw], `tick?`) VALUES (?1, ?2, '? :lit', ?2, ?4, ?5) -- ?\n"
+        );
+    }
+
+    #[test]
+    fn fts5_parameterized_insert_and_bm25_query_use_canonical_placeholders() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("real memory database");
+        exec(
+            &mut worker,
+            1,
+            "CREATE VIRTUAL TABLE chunks USING fts5(title, content, tokenize='porter unicode61')",
+        );
+        for (title, content) in [
+            (
+                "SQLite",
+                "Transactions keep persistent session records consistent",
+            ),
+            ("Unrelated", "A completely different document"),
+        ] {
+            let run_result = worker
+                .call(Command::Request(Request::Query {
+                    id: 1,
+                    sql: "INSERT INTO chunks(title, content) VALUES (?, ?)".into(),
+                    bindings: Bindings::Positional(vec![json!(title), json!(content)]),
+                    mode: QueryMode::Run,
+                }))
+                .expect("FTS5 parameterized insert");
+            assert_eq!(run_result["changes"], json!(1));
+        }
+        let search = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT title FROM chunks WHERE chunks MATCH ? ORDER BY bm25(chunks)".into(),
+                bindings: Bindings::Positional(vec![json!("transaction")]),
+                mode: QueryMode::All,
+            }))
+            .expect("FTS5 parameterized bm25 query");
+        assert_eq!(
+            search,
+            json!({ "columns": ["title"], "rows": [["SQLite"]] })
+        );
+        worker
+            .call(Command::Request(Request::Close { id: 1 }))
+            .expect("close");
     }
 }
