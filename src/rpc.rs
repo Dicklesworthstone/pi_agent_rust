@@ -474,6 +474,54 @@ fn command_payload_can_advance_rpc_session(
 /// fork.
 type ForkCompletion = Option<(String, Option<String>, String, String)>;
 
+/// `run` consumes a live registry. Dropping the RPC loop must close service
+/// admission and request process cleanup even when no asynchronous shutdown
+/// can be polled. Normal EOF additionally awaits the same monitor controls.
+struct RpcServiceRegistryGuard(Option<crate::hub::ServiceOwner>);
+
+impl RpcServiceRegistryGuard {
+    fn retire(&mut self) -> Result<crate::hub::ServiceShutdown> {
+        let owner = self
+            .0
+            .take()
+            .ok_or_else(|| Error::session("RPC service registry is already retired"))?;
+        crate::hub::begin_registry_shutdown(&owner)
+    }
+}
+
+impl Drop for RpcServiceRegistryGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take()
+            && let Err(error) = crate::hub::begin_registry_shutdown(&owner)
+        {
+            tracing::warn!(event = "rpc.session.service_retirement_failed", %error);
+        }
+    }
+}
+
+/// A committed session change stays successful even if service settlement is
+/// incomplete. Admission was already fenced synchronously at installation;
+/// wait only after releasing session authority, and report the cleanup result
+/// without suggesting that the old session is still current.
+async fn finish_session_service_cleanup(
+    shutdown: Option<Result<crate::hub::ServiceShutdown>>,
+    mut data: Value,
+) -> Value {
+    let result = match shutdown {
+        Some(Ok(shutdown)) => shutdown.finish().await.map(|_| ()),
+        Some(Err(error)) => Err(error),
+        None => return data,
+    };
+    if let Err(error) = result {
+        let warning = format!(
+            "Session changed, but previous-session services did not stop cleanly: {error}"
+        );
+        tracing::warn!(event = "rpc.session.service_cleanup_failed", "{warning}");
+        data["serviceCleanupWarning"] = json!(warning);
+    }
+    data
+}
+
 fn select_rpc_user_turn_for_retry<'a>(
     session: &'a Session,
 ) -> Result<Option<(&'a str, &'a UserContent)>> {
@@ -2825,6 +2873,7 @@ pub async fn run(
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
+    let mut service_registry = RpcServiceRegistryGuard(Some(session.agent.service_owner("")));
     // The available list can omit unready declared providers. Retain the full
     // catalog and admit option-only entries without replacing registry routes.
     let mut model_registry = session.model_registry().cloned();
@@ -5561,6 +5610,7 @@ pub async fn run(
                     .get("parentSession")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let mut service_shutdown = None;
                 let result: Result<(String, Option<String>)> = async {
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
@@ -5613,6 +5663,8 @@ pub async fn run(
                             .map_err(|err| {
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
+                        let service_owner =
+                            guard.agent.service_owner(inner_session.header.id.as_str());
                         if let Some(budget) = guard.agent.cost_budget() {
                             let prepared = prepare_rpc_cost_handoff(
                                 budget,
@@ -5630,6 +5682,7 @@ pub async fn run(
                         *inner_session = new_session;
                         session_transition_permit.commit_session_change();
                         state.output.clear_session();
+                        service_shutdown = Some(crate::hub::begin_session_shutdown(&service_owner));
                     }
                     guard.agent.set_cost_budget(cost_budget);
                     guard.agent.clear_messages();
@@ -5654,6 +5707,11 @@ pub async fn run(
                 drop(session_transition_permit);
                 match result {
                     Ok((session_id, previous_session_file)) => {
+                        let response_data = finish_session_service_cleanup(
+                            service_shutdown,
+                            json!({ "cancelled": false }),
+                        )
+                        .await;
                         rpc_dispatch_session_switch_event(
                             rpc_extension_manager.clone(),
                             json!({
@@ -5666,7 +5724,7 @@ pub async fn run(
                         let _ = out_tx.send(response_ok(
                             id,
                             "new_session",
-                            Some(json!({ "cancelled": false })),
+                            Some(response_data),
                         ));
                     }
                     Err(err) => {
@@ -5786,6 +5844,7 @@ pub async fn run(
                             || resolved_path.display().to_string(),
                             |p| p.display().to_string(),
                         );
+                        let mut service_shutdown = None;
                         let result: Result<(Option<String>, String)> = async {
                             // Acquire every fallible transition authority and
                             // prepare the target provider before replacing the
@@ -5853,6 +5912,10 @@ pub async fn run(
                                 })?;
                             let previous_session_file =
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
+                            let service_owner = (inner_session.header.id != new_session.header.id)
+                                .then(|| {
+                                    guard.agent.service_owner(inner_session.header.id.as_str())
+                                });
                             let preserve_cost = inner_session.header.id == new_session.header.id;
                             let retiring_session =
                                 !crate::cost::same_session_target(&inner_session, &new_session);
@@ -5918,6 +5981,8 @@ pub async fn run(
                             *inner_session = new_session;
                             session_transition_permit.commit_session_change();
                             state.output.clear_session();
+                            service_shutdown =
+                                service_owner.as_ref().map(crate::hub::begin_session_shutdown);
                             drop(inner_session);
                             guard.agent.set_cost_budget(cost_budget);
                             guard.agent.replace_messages(messages);
@@ -5961,6 +6026,11 @@ pub async fn run(
 
                         match result {
                             Ok((previous_session_file, session_id)) => {
+                                let response_data = finish_session_service_cleanup(
+                                    service_shutdown,
+                                    json!({ "cancelled": false }),
+                                )
+                                .await;
                                 rpc_dispatch_session_switch_event(
                                     rpc_extension_manager.clone(),
                                     json!({
@@ -5975,7 +6045,7 @@ pub async fn run(
                                 let _ = out_tx.send(response_ok(
                                     id,
                                     "switch_session",
-                                    Some(json!({ "cancelled": false })),
+                                    Some(response_data),
                                 ));
                             }
                             Err(err) => {
@@ -6028,6 +6098,7 @@ pub async fn run(
                     }
                 };
 
+                let mut service_shutdown = None;
                 let result: Result<ForkCompletion> = async {
                     // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
                     let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
@@ -6207,6 +6278,7 @@ pub async fn run(
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        let service_owner = guard.agent.service_owner(inner.header.id.as_str());
                         if save_enabled && let Some(budget) = &cost_budget {
                             budget.retire_session(&inner, cx.cx())?;
                         }
@@ -6218,6 +6290,7 @@ pub async fn run(
                         *inner = new_session;
                         session_transition_permit.commit_session_change();
                         state.output.clear_session();
+                        service_shutdown = Some(crate::hub::begin_session_shutdown(&service_owner));
                         drop(inner);
                         guard.agent.set_cost_budget(cost_budget);
                         guard.agent.replace_messages(messages);
@@ -6276,6 +6349,11 @@ pub async fn run(
                         source_session_id,
                         new_session_id,
                     ))) => {
+                        let response_data = finish_session_service_cleanup(
+                            service_shutdown,
+                            json!({ "text": selected_text, "cancelled": false }),
+                        )
+                        .await;
                         rpc_dispatch_session_fork_event(
                             rpc_extension_manager.clone(),
                             json!({
@@ -6290,7 +6368,7 @@ pub async fn run(
                         let _ = out_tx.send(response_ok(
                             id,
                             "fork",
-                            Some(json!({ "text": selected_text, "cancelled": false })),
+                            Some(response_data),
                         ));
                     }
                     Err(err) => {
@@ -6511,6 +6589,11 @@ pub async fn run(
         cx.time().sleep(Duration::from_millis(25)).await;
     }
 
+    // Permanently fence the consumed registry before extension shutdown can
+    // yield. Unlike navigation, EOF must never reopen service admission for
+    // retained tool clones, even if final persistence later fails.
+    let service_shutdown = service_registry.retire();
+
     // Explicitly shut down extension runtimes before the session drops.
     // Move the region out under lock, then await shutdown after releasing
     // the lock so we don't hold the session mutex across an async wait.
@@ -6521,6 +6604,11 @@ pub async fn run(
     if let Some(ext) = extension_region {
         cx.with_current(ext.shutdown()).await;
     }
+
+    let service_result = match service_shutdown {
+        Ok(shutdown) => shutdown.finish().await.map(|_| ()),
+        Err(error) => Err(error),
+    };
 
     let preservation_cx = AgentCx::for_request();
     preserve_terminal_rpc_input(&session, &shared_state, &preservation_cx)
@@ -6540,7 +6628,9 @@ pub async fn run(
 
     flush_rpc_session_on_shutdown(&session, &preservation_cx).await?;
 
-    Ok(())
+    service_result.map_err(|error| {
+        Error::session(format!("RPC hub service cleanup was incomplete: {error}"))
+    })
 }
 
 // =============================================================================
@@ -20372,6 +20462,245 @@ mod tests {
             runtime_handle: handle.clone(),
             ask_tool: None,
         }
+    }
+
+    #[cfg(unix)]
+    struct RpcServiceCleanup(Vec<(crate::hub::ServiceOwner, String)>);
+
+    #[cfg(unix)]
+    impl Drop for RpcServiceCleanup {
+        fn drop(&mut self) {
+            for (owner, name) in &self.0 {
+                let _ = crate::hub::stop(owner, name);
+                // Accepted detached services survive a retired RPC registry
+                // and remain explicitly manageable by the same saved session.
+                let scope = crate::jobs::JobSessionScope::fixed(owner.session_id());
+                let resumed_owner = scope.service_owner(owner.session_id());
+                let _ = crate::hub::stop(&resumed_owner, name);
+                let _ = crate::hub::begin_registry_shutdown(owner);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn rpc_service_spec(workspace: &Path, name: &str, detached: bool) -> crate::hub::LaunchSpec {
+        crate::hub::LaunchSpec {
+            name: name.to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'ready\\n'; exec sleep 60".to_string(),
+            ],
+            cwd: workspace.to_path_buf(),
+            env: Vec::new(),
+            ready: Some(crate::hub::ReadySpec {
+                log: Some("ready".to_string()),
+                port: None,
+                timeout_secs: Some(5),
+            }),
+            detached,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rpc_navigation_and_eof_settle_only_the_retiring_registry_services() {
+        let _services_lock = crate::hub::test_lock();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for navigation in ["new_session", "switch_session", "fork", "reload", "rejected"] {
+                let temp = tempfile::tempdir().expect("workspace");
+                let workspace = temp.path().canonicalize().expect("canonical workspace");
+                let mut source = Session::create_with_dir(Some(workspace.join("sessions")));
+                source.header.cwd = workspace.display().to_string();
+                source.header.provider = Some("anthropic".to_string());
+                source.header.model_id = Some("test-model".to_string());
+                source.header.thinking_level = Some("off".to_string());
+                let entry_id = source.append_message(SessionMessage::User {
+                    content: UserContent::Text("retain this source prompt".to_string()),
+                    timestamp: Some(0),
+                });
+                source.save().await.expect("save source");
+                let source_id = source.header.id.clone();
+                let source_path = source.path.clone().expect("source path");
+                let request = match navigation {
+                    "new_session" => json!({"id":"navigate", "type":"new_session"}),
+                    "fork" => json!({"id":"navigate", "type":"fork", "entryId":entry_id}),
+                    _ => {
+                        let path = match navigation {
+                            "reload" => source_path,
+                            "rejected" => workspace.join("missing-session.jsonl"),
+                            _ => {
+                                let mut target =
+                                    Session::create_with_dir(Some(workspace.join("sessions")));
+                                target.header.cwd = workspace.display().to_string();
+                                target.header.provider = Some("anthropic".to_string());
+                                target.header.model_id = Some("test-model".to_string());
+                                target.header.thinking_level = Some("off".to_string());
+                                target.save().await.expect("save target");
+                                target.path.expect("target path")
+                            }
+                        };
+                        json!({"id":"navigate", "type":"switch_session", "sessionPath":path})
+                    }
+                };
+                let registry = ToolRegistry::new(&[], &workspace, None);
+                let scope = registry.job_session_scope();
+                let agent = Agent::new(Arc::new(NoopProvider), registry, AgentConfig::default());
+                let owner = agent.service_owner(source_id.as_str());
+                // A second live host of the same saved session is a distinct
+                // owner, even when both services have the same display name.
+                let other_scope = crate::jobs::JobSessionScope::fixed(source_id.as_str());
+                let other_owner = other_scope.service_owner(source_id.as_str());
+                let mut cleanup = RpcServiceCleanup(vec![
+                    (owner.clone(), "active".to_string()),
+                    (owner.clone(), "detached".to_string()),
+                    (other_owner.clone(), "active".to_string()),
+                ]);
+                for (service_owner, name, detached) in [
+                    (&owner, "active", false),
+                    (&owner, "detached", true),
+                    (&other_owner, "active", false),
+                ] {
+                    let started = crate::hub::start(
+                        service_owner,
+                        &rpc_service_spec(&workspace, name, detached),
+                    )
+                    .expect("start service");
+                    assert_eq!(started.status, "running");
+                }
+                let store = Arc::new(asupersync::sync::Mutex::new(source));
+                let session = AgentSession::new(
+                    agent,
+                    Arc::clone(&store),
+                    false,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                let mut options = build_test_rpc_options(&handle, workspace.join("auth.json"));
+                options.working_directory = Some(workspace.clone());
+                let mut entry = dummy_entry("test-model", false);
+                entry.api_key = Some("fixture-key".to_string());
+                options.available_models.push(entry);
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(session, options, in_rx, out_tx)).await
+                });
+                let response = send_recv(&in_tx, &out_rx, &request.to_string(), navigation).await;
+                if navigation == "rejected" {
+                    assert_err(&response, "switch_session");
+                } else {
+                    assert_ok(&response, request["type"].as_str().expect("command type"));
+                    assert_eq!(response["data"]["cancelled"], false);
+                    assert!(
+                        response["data"].get("serviceCleanupWarning").is_none(),
+                        "{response}"
+                    );
+                }
+                let changed = !matches!(navigation, "reload" | "rejected");
+                let previous = crate::hub::describe(&owner, "active").expect("source service");
+                assert_eq!(previous.pid.is_none(), changed, "{navigation}: {previous:?}");
+                assert_eq!(
+                    crate::hub::describe(&owner, "detached")
+                        .expect("detached service")
+                        .status,
+                    "running"
+                );
+                assert_eq!(
+                    crate::hub::describe(&other_owner, "active")
+                        .expect("other live host")
+                        .status,
+                    "running"
+                );
+                let current_id = store
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("current session")
+                    .header
+                    .id
+                    .clone();
+                assert_eq!(current_id != source_id, changed);
+                let current_owner = scope.service_owner(current_id);
+                crate::hub::start(
+                    &current_owner,
+                    &rpc_service_spec(&workspace, "after-navigation", false),
+                )
+                .expect("replacement owner admits a service");
+                cleanup
+                    .0
+                    .push((current_owner.clone(), "after-navigation".to_string()));
+                drop(in_tx);
+                server.await.expect("RPC EOF cleanup");
+                assert!(
+                    crate::hub::describe(&current_owner, "after-navigation")
+                        .unwrap()
+                        .pid
+                        .is_none()
+                );
+                assert!(
+                    crate::hub::start(
+                        &current_owner,
+                        &rpc_service_spec(&workspace, "late", false)
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    crate::hub::describe(&other_owner, "active").unwrap().status,
+                    "running"
+                );
+            }
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_rpc_loop_retires_its_service_registry_without_awaiting_shutdown() {
+        let _services_lock = crate::hub::test_lock();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("workspace");
+            let source = Session::in_memory();
+            let registry = ToolRegistry::new(&[], temp.path(), None);
+            let agent = Agent::new(Arc::new(NoopProvider), registry, AgentConfig::default());
+            let owner = agent.service_owner(source.header.id.as_str());
+            let _cleanup = RpcServiceCleanup(vec![(owner.clone(), "owned".to_string())]);
+            crate::hub::start(&owner, &rpc_service_spec(temp.path(), "owned", false))
+                .expect("start service");
+            let session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(source)),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let mut options = build_test_rpc_options(&runtime.handle(), temp.path().join("auth.json"));
+            options.working_directory = Some(temp.path().to_path_buf());
+            let (_in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
+            let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            let mut rpc = Box::pin(run(session, options, in_rx, out_tx));
+            assert!(futures::poll!(rpc.as_mut()).is_pending());
+            drop(rpc);
+            assert!(
+                crate::hub::start(&owner, &rpc_service_spec(temp.path(), "late", false)).is_err()
+            );
+            // Observe the original drop's stop request; another shutdown here
+            // would conceal a guard which fenced admission but leaked its child.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while crate::hub::describe(&owner, "owned").unwrap().pid.is_some() {
+                assert!(Instant::now() < deadline, "dropped RPC loop leaked its service");
+                asupersync::time::sleep(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(10),
+                )
+                .await;
+            }
+        });
     }
 
     #[cfg(unix)]

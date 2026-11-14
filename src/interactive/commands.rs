@@ -2521,6 +2521,8 @@ impl PiApp {
                         return None;
                     };
                     let reset_thinking = self.new_session_thinking_level();
+                    let departing_services =
+                        agent_guard.service_owner(session_guard.header.id.clone());
                     let session_dir = session_guard.session_dir.clone();
                     *session_guard = Session::create_with_dir(session_dir);
                     session_guard.header.cwd = self.cwd.display().to_string();
@@ -2531,9 +2533,10 @@ impl PiApp {
                     agent_guard.replace_messages(Vec::new());
                     agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
                     agent_guard.session_was_replaced(crate::plan::PlanMode::Off);
+                    self.session_action_admission.advance_generation();
+                    let shutdown = crate::hub::begin_session_shutdown(&departing_services);
                     drop(session_guard);
                     drop(agent_guard);
-                    self.session_action_admission.advance_generation();
 
                     self.messages.clear();
                     self.message_render_cache.clear();
@@ -2552,7 +2555,7 @@ impl PiApp {
                     self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
-                    self.displayed_session_id = Some(new_session_id);
+                    self.displayed_session_id = Some(new_session_id.clone());
                     self.session_picker = None;
                     self.tree_ui = None;
                     self.drain_capability_prompts_for_session_reset();
@@ -2565,6 +2568,33 @@ impl PiApp {
                     ));
                     self.scroll_to_bottom();
                     self.input.focus();
+                    let event_tx = self.event_tx.clone();
+                    if let Err(error) =
+                        self.runtime_handle.try_spawn_with_cx(move |cx| async move {
+                            if let Some(message) = Self::finish_departing_services(shutdown).await {
+                                let _ = crate::interactive::enqueue_pi_event(
+                                    &event_tx,
+                                    &cx,
+                                    PiMsg::SessionSystemNote {
+                                        owner_session_id: new_session_id,
+                                        message,
+                                    },
+                                )
+                                .await;
+                            }
+                        })
+                    {
+                        tracing::warn!(%error, "could not await previous session service cleanup");
+                        self.messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: format!(
+                                "Session changed, but completion of previous session service cleanup could not be awaited: {error}"
+                            ),
+                            thinking: None,
+                            collapsed: false,
+                        });
+                        self.scroll_to_bottom();
+                    }
                     return None;
                 }
 
@@ -2623,7 +2653,7 @@ impl PiApp {
                     new_session.header.model_id = Some(model_id);
                     new_session.header.thinking_level = Some(reset_thinking.to_string());
                     let new_session_id = new_session.header.id.clone();
-                    if let Err(err) = Self::try_install_session(
+                    let service_warning = match Self::try_install_session(
                         &session,
                         &agent,
                         &admission,
@@ -2634,14 +2664,17 @@ impl PiApp {
                     )
                     .await
                     {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
+                        Ok(warning) => warning,
+                        Err(err) => {
+                            let _ = crate::interactive::enqueue_pi_event(
+                                &event_tx,
+                                &task_cx,
+                                PiMsg::AgentError(err.to_string()),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
 
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
@@ -2656,6 +2689,18 @@ impl PiApp {
                         },
                     )
                     .await;
+
+                    if let Some(message) = service_warning {
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &task_cx,
+                            PiMsg::SessionSystemNote {
+                                owner_session_id: new_session_id.clone(),
+                                message,
+                            },
+                        )
+                        .await;
+                    }
 
                     if let Some(extensions) = extensions {
                         let _ = extensions
@@ -5840,6 +5885,253 @@ mod tests {
             .clone()
     }
 
+    #[cfg(unix)]
+    struct ClassicServiceFixture {
+        owner: crate::hub::ServiceOwner,
+        name: String,
+        pid: u32,
+    }
+
+    #[cfg(unix)]
+    impl ClassicServiceFixture {
+        fn start(
+            owner: crate::hub::ServiceOwner,
+            cwd: &Path,
+            name: &str,
+            detached: bool,
+        ) -> Self {
+            let snapshot = crate::hub::start(
+                &owner,
+                &crate::hub::LaunchSpec {
+                    name: name.to_string(),
+                    program: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "printf 'ready\\n'; exec sleep 60".to_string(),
+                    ],
+                    cwd: cwd.to_path_buf(),
+                    env: Vec::new(),
+                    ready: Some(crate::hub::ReadySpec {
+                        log: Some("ready".to_string()),
+                        timeout_secs: Some(10),
+                        ..crate::hub::ReadySpec::default()
+                    }),
+                    detached,
+                },
+            )
+            .expect("start classic transition service");
+            assert_eq!(snapshot.status, "running");
+            Self {
+                owner,
+                name: name.to_string(),
+                pid: snapshot.pid.expect("running service PID"),
+            }
+        }
+
+        fn assert_live(&self) {
+            let snapshot = crate::hub::describe(&self.owner, &self.name).unwrap();
+            assert_eq!(snapshot.status, "running");
+            assert_eq!(snapshot.pid, Some(self.pid));
+        }
+
+        fn assert_stopped(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+            loop {
+                let snapshot = crate::hub::describe(&self.owner, &self.name).unwrap();
+                if snapshot.pid.is_none() {
+                    assert!(matches!(snapshot.status.as_str(), "killed" | "exited"));
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "committed transition must reap its departing service"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let pid = rustix::process::Pid::from_raw(i32::try_from(self.pid).unwrap()).unwrap();
+            assert!(rustix::process::test_kill_process(pid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ClassicServiceFixture {
+        fn drop(&mut self) {
+            let _ = crate::hub::send_signal(&self.owner, &self.name, sysinfo::Signal::Kill);
+            let _ = crate::hub::stop(&self.owner, &self.name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_new_fork_and_resume_stop_only_departing_owned_services() {
+        let _hub_guard = crate::hub::test_lock();
+        for operation in ["new-sync", "new-async", "fork", "resume"] {
+            let temp = TempDir::new().unwrap();
+            let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+            initial.header.cwd = temp.path().display().to_string();
+            initial.append_model_message(ModelMessage::User(UserMessage {
+                content: UserContent::Text("forkable source prompt".to_string()),
+                timestamp: 0,
+            }));
+            runtime().block_on(initial.save()).unwrap();
+            let session = Arc::new(Mutex::new(initial));
+            let (mut app, mut events) = build_bash_test_app(session, temp.path());
+            let original_id = current_session_id(&app);
+            let owner = app
+                .agent
+                .try_lock()
+                .unwrap()
+                .service_owner(original_id.clone());
+            let owned = ClassicServiceFixture::start(
+                owner.clone(),
+                temp.path(),
+                "classic-owned",
+                false,
+            );
+            let detached =
+                ClassicServiceFixture::start(owner, temp.path(), "classic-detached", true);
+            let foreign_scope = crate::jobs::JobSessionScope::fixed(original_id.clone());
+            let foreign = ClassicServiceFixture::start(
+                foreign_scope.service_owner(original_id.clone()),
+                temp.path(),
+                "classic-owned",
+                false,
+            );
+            if operation == "new-async" {
+                app.extensions = Some(crate::extensions::ExtensionManager::default());
+            }
+            match operation {
+                "new-sync" | "new-async" => {
+                    let _ = app.handle_slash_command(SlashCommand::New, "");
+                }
+                "fork" => {
+                    let _ = app.handle_slash_fork("1");
+                }
+                "resume" => {
+                    let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+                    target.header.cwd = temp.path().display().to_string();
+                    runtime().block_on(target.save()).unwrap();
+                    let _ =
+                        app.load_session_from_path(target.path.as_ref().unwrap().to_str().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            if operation == "new-sync" {
+                assert!(matches!(app.agent_state, AgentState::Idle));
+                assert!(
+                    matches!(
+                        crate::hub::describe(&owned.owner, &owned.name)
+                            .unwrap()
+                            .status
+                            .as_str(),
+                        "stopping" | "killed" | "exited"
+                    ),
+                    "the synchronous transition must request stop before returning"
+                );
+            } else {
+                let terminal = runtime().block_on(async {
+                    let cx = Cx::for_testing();
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(20),
+                        events.recv(&cx),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                });
+                assert!(
+                    matches!(terminal, PiMsg::ConversationReset { .. }),
+                    "{operation}: {terminal:?}"
+                );
+                let _ = app.handle_pi_message(terminal);
+            }
+            assert_ne!(current_session_id(&app), original_id, "{operation}");
+            owned.assert_stopped();
+            detached.assert_live();
+            foreign.assert_live();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_rejected_candidate_and_same_id_reload_retain_services() {
+        let _hub_guard = crate::hub::test_lock();
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        let session = Arc::new(Mutex::new(initial));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original_id = current_session_id(&app);
+        let owner = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .service_owner(original_id.clone());
+        let service =
+            ClassicServiceFixture::start(owner.clone(), temp.path(), "classic-retained", false);
+        app.agent.try_lock().unwrap().set_cost_budget(Some(
+            crate::cost::CostBudget::new(None, Some(2.0), 0.25).unwrap(),
+        ));
+        let blocked = temp.path().join("not-a-session-directory");
+        std::fs::write(&blocked, "candidate must fail before service shutdown").unwrap();
+        let result = runtime().block_on(PiApp::try_install_session(
+            &session,
+            &app.agent,
+            &app.session_action_admission,
+            Session::create_with_dir(Some(blocked)),
+            Vec::new(),
+            None,
+            false,
+        ));
+        assert!(result.is_err());
+        assert_eq!(current_session_id(&app), original_id);
+        service.assert_live();
+        let still_admitted =
+            ClassicServiceFixture::start(owner, temp.path(), "classic-still-admitted", false);
+
+        let same_session = session.try_lock().unwrap().clone();
+        let warning = runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                same_session,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(warning.is_none());
+        assert_eq!(current_session_id(&app), original_id);
+        service.assert_live();
+        still_admitted.assert_live();
+    }
+
+    #[test]
+    fn classic_service_cleanup_warning_keeps_the_new_foreground_turn_owned() {
+        let temp = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        let owner_session_id = current_session_id(&app);
+        let message = runtime()
+            .block_on(PiApp::finish_departing_services(Err(
+                crate::error::Error::tool("hub", "fixture cleanup failure"),
+            )))
+            .unwrap();
+        assert!(message.contains("Session changed"));
+        app.agent_state = AgentState::Processing;
+        let (abort, _) = crate::agent::AbortHandle::new();
+        app.abort_handle = Some(abort);
+        let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message: message.clone(),
+        });
+        assert!(matches!(app.agent_state, AgentState::Processing));
+        assert!(app.abort_handle.is_some());
+        assert!(app.messages.iter().any(|entry| entry.content == message));
+    }
+
     #[test]
     fn completed_tan_event_keeps_card_and_follow_up_bound_to_the_origin_session() {
         let temp = TempDir::new().expect("tempdir");
@@ -6169,7 +6461,7 @@ mod tests {
             .unwrap()
             .set_cost_budget(Some(original.clone()));
 
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6180,6 +6472,7 @@ mod tests {
                 true,
             ))
             .unwrap();
+        assert!(warning.is_none());
         assert!(
             app.agent
                 .try_lock()
@@ -6194,7 +6487,7 @@ mod tests {
         );
 
         let same_session = session.try_lock().unwrap().clone();
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6205,6 +6498,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        assert!(warning.is_none());
         assert!(
             app.agent
                 .try_lock()
@@ -6219,7 +6513,7 @@ mod tests {
             .unwrap()
             .checkpoint(&mut resumed)
             .unwrap();
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6230,6 +6524,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        assert!(warning.is_none());
         let resumed_budget = app
             .agent
             .try_lock()
@@ -6251,7 +6546,7 @@ mod tests {
                 .same_tree(&resumed_budget)
         );
 
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6262,6 +6557,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        assert!(warning.is_none());
         let fresh = app
             .agent
             .try_lock()
@@ -6293,7 +6589,7 @@ mod tests {
             .set_cost_budget(Some(budget.clone()));
         let mut fork = Session::create_with_dir(Some(temp.path().join("sessions")));
         fork.header.cwd = temp.path().display().to_string();
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6304,6 +6600,7 @@ mod tests {
                 true,
             ))
             .unwrap();
+        assert!(warning.is_none());
         let fork_path = session.try_lock().unwrap().path.clone().unwrap();
         let bytes = std::fs::read(&fork_path).unwrap();
         drop(app);

@@ -702,9 +702,9 @@ impl PiApp {
         messages_for_agent: Vec<ModelMessage>,
         thinking_level: Option<ThinkingLevel>,
         preserve_cost: bool,
-    ) -> std::result::Result<(), &'static str> {
+    ) -> std::result::Result<Option<String>, &'static str> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let _permit = admission
+        let permit = admission
             .acquire(cx.cx())
             .await
             .map_err(|_| "Session busy; session change was not applied")?;
@@ -716,6 +716,8 @@ impl PiApp {
             return Err("Session busy; session change was not applied");
         };
 
+        let departing_services = (session_guard.header.id != new_session.header.id)
+            .then(|| agent_guard.service_owner(session_guard.header.id.clone()));
         let retiring_session = !crate::cost::same_session_target(&session_guard, &new_session);
         let save_enabled = agent_guard.handle.session().save_enabled();
         let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
@@ -818,7 +820,34 @@ impl PiApp {
         }
         agent_guard.session_was_replaced(crate::plan::replayed_plan_mode(&session_guard));
         admission.advance_generation();
-        Ok(())
+        // Commit both views before fencing the departing service owner. A
+        // failed candidate must retain its live services; cleanup after this
+        // point cannot turn the installed replacement into a reported failure.
+        let shutdown = departing_services
+            .as_ref()
+            .map(crate::hub::begin_session_shutdown);
+        drop(session_guard);
+        drop(agent_guard);
+        drop(permit);
+        Ok(match shutdown {
+            Some(shutdown) => Self::finish_departing_services(shutdown).await,
+            None => None,
+        })
+    }
+
+    async fn finish_departing_services(
+        shutdown: crate::error::Result<crate::hub::ServiceShutdown>,
+    ) -> Option<String> {
+        let result = match shutdown {
+            Ok(shutdown) => shutdown.finish().await,
+            Err(error) => Err(error),
+        };
+        result.err().map(|error| {
+            tracing::warn!(%error, "previous session service cleanup incomplete after replacement");
+            format!(
+                "Session changed, but services from the previous session could not be fully stopped: {error}"
+            )
+        })
     }
 
     fn toggle_queue_mode_setting(&mut self, entry: SettingsUiEntry) {
@@ -1826,7 +1855,7 @@ impl PiApp {
 
             let messages_for_agent = loaded_session.to_messages_for_current_path();
             let (messages, usage) = conversation_from_session(&loaded_session);
-            if let Err(err) = Self::try_install_session(
+            let service_warning = match Self::try_install_session(
                 &session,
                 &agent,
                 &admission,
@@ -1837,14 +1866,17 @@ impl PiApp {
             )
             .await
             {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &task_cx,
-                    PiMsg::AgentError(err.to_string()),
-                )
-                .await;
-                return;
-            }
+                Ok(warning) => warning,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &task_cx,
+                        PiMsg::AgentError(err.to_string()),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
@@ -1857,6 +1889,18 @@ impl PiApp {
                 },
             )
             .await;
+
+            if let Some(message) = service_warning {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &task_cx,
+                    PiMsg::SessionSystemNote {
+                        owner_session_id: new_session_id.clone(),
+                        message,
+                    },
+                )
+                .await;
+            }
 
             if let Some(manager) = extensions {
                 let _ = manager

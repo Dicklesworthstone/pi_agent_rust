@@ -577,7 +577,7 @@ impl PiApp {
 
             let messages_for_agent = new_session.to_messages_for_current_path();
             let (messages, usage) = conversation_from_session(&new_session);
-            if let Err(err) = Self::try_install_session(
+            let service_warning = match Self::try_install_session(
                 &session,
                 &agent,
                 &admission,
@@ -588,14 +588,17 @@ impl PiApp {
             )
             .await
             {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &cx,
-                    PiMsg::AgentError(err.to_string()),
-                )
-                .await;
-                return;
-            }
+                Ok(warning) => warning,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(err.to_string()),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
@@ -608,6 +611,18 @@ impl PiApp {
                 },
             )
             .await;
+
+            if let Some(message) = service_warning {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::SessionSystemNote {
+                        owner_session_id: new_session_id.clone(),
+                        message,
+                    },
+                )
+                .await;
+            }
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
