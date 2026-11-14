@@ -1096,10 +1096,12 @@ mod tests {
     }
 
     #[test]
-    fn owner_shutdown_fences_progress_before_jobs_are_marked_cancelled() {
+    #[allow(clippy::significant_drop_tightening)]
+    fn owner_shutdown_timeout_still_cancels_native_work_and_fences_progress() {
         let _guard = super::super::process_test_guard();
-        let root = tempfile::tempdir().expect("artifact root"); // ubs:ignore shutdown progress fixture requires isolated artifacts
+        let root = tempfile::tempdir().expect("artifact root");
         let owner = owner_id();
+        let dropped = Arc::new(AtomicBool::new(false));
         let started = spawn_owned_task(
             &owner,
             "shutdown progress task",
@@ -1107,21 +1109,75 @@ mod tests {
             Duration::from_secs(30),
             Some(root.path()),
             privacy(),
-            futures::future::pending(),
+            PendingDrop {
+                dropped: Arc::clone(&dropped),
+                restricted_drop: None,
+            },
         )
-        .expect("start task"); // ubs:ignore a live task is required before installing the owner shutdown fence
-        let shutdown = super::super::SessionShutdownAttempt::begin(&owner).expect("shutdown fence"); // ubs:ignore reproduce the closing fence that precedes lifecycle-lock acquisition
+        .expect("start task");
+        // An unrelated stalled spawn can own this lane. The existing task's
+        // monitor must receive cancellation even when shutdown cannot enter it.
+        let lifecycle = super::super::lifecycle_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shutdown_error =
+            super::super::request_session_shutdown_with_timeout(&owner, Duration::ZERO).err();
         let mut called = false;
-        let error = with_owned_task_progress(&owner, &started.id, || {
+        let progress = with_owned_task_progress(&owner, &started.id, || {
             called = true;
             Ok(((), Some("late shutdown progress".to_string())))
-        })
-        .expect_err("closing owner"); // ubs:ignore closing alone must refuse progress even before cancellation reaches each task
-        assert!(!called); // ubs:ignore shutdown must prevent the private-state commit
-        assert!(error.to_string().contains("PI_JOBS_TASK_STOPPED")); // ubs:ignore shutdown uses the same stopped-task error
-        assert!(super::super::take_completion_notices(&owner).is_empty()); // ubs:ignore rejected progress must not publish a late notice
-        super::super::cancel(&owner, &started.id).expect("retire fixture task"); // ubs:ignore cleanup retires the still-pending task through normal cancellation
-        shutdown.finish_success().expect("finish shutdown"); // ubs:ignore release the fixture's owner fence only after settlement
+        });
+        let observed = super::super::wait(&owner, &started.id, Duration::from_secs(10))
+            .expect("observe task while lifecycle remains held");
+        let retired_before_release = dropped.load(Ordering::Acquire);
+        let admission_fenced = super::super::ensure_session_accepting_jobs(&owner).is_err();
+        drop(lifecycle);
+        // Keep this regression isolated even when the cancellation mutation
+        // leaves work running until the observation deadline.
+        if observed.status == "running" {
+            super::super::cancel(&owner, &started.id).expect("retire unfinished fixture");
+        }
+        super::super::ensure_session_accepting_jobs(&owner)
+            .expect("reconcile failed shutdown after settlement");
+        let notices = super::super::take_completion_notices(&owner);
+
+        let error = shutdown_error.expect("held lifecycle must reject the shutdown snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_JOBS_SESSION_SHUTDOWN_LOCK_TIMEOUT")
+        );
+        assert!(!called, "shutdown must fence progress side effects");
+        assert!(
+            progress
+                .expect_err("closing owner")
+                .to_string()
+                .contains("PI_JOBS_TASK_STOPPED")
+        );
+        assert!(
+            admission_fenced,
+            "blocked shutdown must keep admission closed"
+        );
+        assert_eq!(observed.status, "killed");
+        assert!(
+            retired_before_release,
+            "the task must retire without acquiring lifecycle"
+        );
+        assert!(observed.result.expect("terminal cancellation result").is_error);
+        assert!(
+            super::super::take_completion_notices(&owner).is_empty(),
+            "terminal notices are delivered once"
+        );
+        assert_eq!(
+            notices.len(),
+            1,
+            "cancelled work publishes one terminal notice"
+        );
+        assert!(
+            !serde_json::to_string(&notices)
+                .expect("notices")
+                .contains("late shutdown progress")
+        );
     }
 
     #[test]

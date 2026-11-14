@@ -3828,6 +3828,16 @@ impl SessionShutdownAttempt {
         let mut reg = registry()
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+        // Fence existing work at the same boundary as new admission. The
+        // global lifecycle lane may be held by an unrelated, stalled spawn;
+        // cancellation must still reach this owner's monitors if acquiring
+        // that lane later times out. Preserve already-completed publication
+        // and every other session's work.
+        for job in reg.jobs.values_mut().filter(|job| {
+            job.owner_session_id == owner_session_id && !job.status.settled() && job.process_live
+        }) {
+            job.cancel_requested = true;
+        }
         let current_generation = reg
             .owner_shutdown_generations
             .get(owner_session_id)
@@ -6423,6 +6433,77 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .closing_owners
                 .contains_key(&owner)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn session_shutdown_timeout_still_reaps_owned_shell_and_preserves_peer() {
+        let _guard = process_test_guard();
+        let root = temp_root();
+        let owner = format!("shutdown-running-{}", uuid::Uuid::new_v4().simple());
+        let peer_owner = format!("shutdown-peer-{}", uuid::Uuid::new_v4().simple());
+        let owned = spawn_background(
+            &owner,
+            &root,
+            None,
+            None,
+            "sleep 300",
+            Some(300),
+            Some(&root),
+        )
+        .expect("start owned shell");
+        let peer = spawn_background(
+            &peer_owner,
+            &root,
+            None,
+            None,
+            "sleep 300",
+            Some(300),
+            Some(&root),
+        )
+        .expect("start peer shell");
+        let owned_pid = owned.pid.expect("owned child pid");
+        let lifecycle = lifecycle_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shutdown_error = request_session_shutdown_with_timeout(&owner, Duration::ZERO).err();
+        let observed = wait(&owner, &owned.id, Duration::from_secs(10))
+            .expect("observe owner while lifecycle remains held");
+        let reaped_before_release = !std::process::Command::new("/bin/kill")
+            .args(["-0", &owned_pid.to_string()])
+            .status()
+            .expect("execute process existence probe")
+            .success();
+        let peer_observed =
+            wait(&peer_owner, &peer.id, Duration::ZERO).expect("observe unrelated session");
+        let admission_fenced = ensure_session_accepting_jobs(&owner).is_err();
+        drop(lifecycle);
+        if observed.status == "running" {
+            cancel(&owner, &owned.id).expect("retire unfinished owner fixture");
+        }
+        if peer_observed.status == "running" {
+            cancel(&peer_owner, &peer.id).expect("retire peer fixture");
+        }
+        ensure_session_accepting_jobs(&owner)
+            .expect("reconcile failed shutdown after settlement");
+
+        let error = shutdown_error.expect("held lifecycle must reject the shutdown snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_JOBS_SESSION_SHUTDOWN_LOCK_TIMEOUT")
+        );
+        assert_eq!(observed.status, "killed");
+        assert!(
+            reaped_before_release,
+            "the owned child must be reaped without acquiring lifecycle"
+        );
+        assert_eq!(peer_observed.status, "running");
+        assert!(
+            admission_fenced,
+            "failed shutdown cannot reopen its owner while lifecycle is held"
         );
     }
 
