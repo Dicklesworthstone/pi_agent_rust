@@ -5890,16 +5890,12 @@ mod tests {
         owner: crate::hub::ServiceOwner,
         name: String,
         pid: u32,
+        detached: bool,
     }
 
     #[cfg(unix)]
     impl ClassicServiceFixture {
-        fn start(
-            owner: crate::hub::ServiceOwner,
-            cwd: &Path,
-            name: &str,
-            detached: bool,
-        ) -> Self {
+        fn start(owner: crate::hub::ServiceOwner, cwd: &Path, name: &str, detached: bool) -> Self {
             let snapshot = crate::hub::start(
                 &owner,
                 &crate::hub::LaunchSpec {
@@ -5925,6 +5921,7 @@ mod tests {
                 owner,
                 name: name.to_string(),
                 pid: snapshot.pid.expect("running service PID"),
+                detached,
             }
         }
 
@@ -5938,8 +5935,8 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
             loop {
                 let snapshot = crate::hub::describe(&self.owner, &self.name).unwrap();
-                if snapshot.pid.is_none() {
-                    assert!(matches!(snapshot.status.as_str(), "killed" | "exited"));
+                if matches!(snapshot.status.as_str(), "killed" | "exited") {
+                    assert!(snapshot.pid.is_none());
                     break;
                 }
                 assert!(
@@ -5958,7 +5955,149 @@ mod tests {
         fn drop(&mut self) {
             let _ = crate::hub::send_signal(&self.owner, &self.name, sysinfo::Signal::Kill);
             let _ = crate::hub::stop(&self.owner, &self.name);
+            if self.detached {
+                // A retired driver cannot manage even its accepted detached
+                // services. Resume only that durable session's detached
+                // fixture through a fresh live registry for final cleanup.
+                let scope = crate::jobs::JobSessionScope::fixed(self.owner.session_id());
+                let resumed_owner = scope.service_owner(self.owner.session_id());
+                let _ = crate::hub::send_signal(&resumed_owner, &self.name, sysinfo::Signal::Kill);
+                let _ = crate::hub::stop(&resumed_owner, &self.name);
+            }
         }
+    }
+
+    #[cfg(unix)]
+    fn assert_classic_service_registry_retired(owner: &crate::hub::ServiceOwner, cwd: &Path) {
+        let error = crate::hub::start(
+            owner,
+            &crate::hub::LaunchSpec {
+                name: "late-driver-service".to_string(),
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                cwd: cwd.to_path_buf(),
+                env: Vec::new(),
+                ready: None,
+                detached: false,
+            },
+        )
+        .expect_err("a consumed classic driver must permanently close service admission");
+        assert!(error.to_string().contains("PI_HUB_SESSION_RETIRED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_driver_drop_during_initial_session_lock_reaps_owned_services() {
+        let _hub_guard = crate::hub::test_lock();
+        let temp = TempDir::new().unwrap();
+        runtime().block_on(async {
+            let source = Session::in_memory();
+            let session_id = source.header.id.clone();
+            let agent = Agent::new(
+                Arc::new(DummyProvider),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let owner = agent.service_owner(session_id.clone());
+            let owned =
+                ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-owned", false);
+            let detached =
+                ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-detached", true);
+            let foreign_scope = crate::jobs::JobSessionScope::fixed(session_id);
+            let foreign = ClassicServiceFixture::start(
+                foreign_scope.service_owner(owner.session_id()),
+                temp.path(),
+                "driver-owned",
+                false,
+            );
+            let store = Arc::new(Mutex::new(source));
+            let agent_session = crate::agent::AgentSession::new(
+                agent,
+                Arc::clone(&store),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let cx = Cx::for_request();
+            let held_session = store.lock(&cx).await.unwrap();
+            let model = test_model_entry("dummy", "dummy-model");
+            let mut driver = Box::pin(crate::interactive::run_interactive(
+                agent_session,
+                Config::default(),
+                model.clone(),
+                Vec::new(),
+                vec![model],
+                None,
+                Vec::new(),
+                false,
+                ResourceLoader::empty(false),
+                ResourceCliOptions {
+                    no_skills: true,
+                    no_prompt_templates: true,
+                    no_extensions: true,
+                    no_themes: true,
+                    skill_paths: Vec::new(),
+                    prompt_paths: Vec::new(),
+                    extension_paths: Vec::new(),
+                    theme_paths: Vec::new(),
+                },
+                PackageManager::new(temp.path().to_path_buf()),
+                None,
+                temp.path().to_path_buf(),
+                runtime().handle(),
+                crate::workspace::WorkspaceHandle::single(temp.path()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+            assert!(futures::poll!(driver.as_mut()).is_pending());
+            drop(driver);
+            assert_classic_service_registry_retired(&owner, temp.path());
+            // Observe the original Drop request while the store remains
+            // locked; a rescue shutdown would hide a missing driver guard.
+            owned.assert_stopped();
+            detached.assert_live();
+            foreign.assert_live();
+            drop(held_session);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_driver_explicit_retirement_settles_every_session_in_its_registry() {
+        let _hub_guard = crate::hub::test_lock();
+        let temp = TempDir::new().unwrap();
+        let scope = crate::jobs::JobSessionScope::fixed("classic-exit");
+        let owner = scope.service_owner("classic-exit");
+        let next_owner = scope.service_owner("classic-next");
+        let owned = ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-owned", false);
+        let next =
+            ClassicServiceFixture::start(next_owner.clone(), temp.path(), "driver-next", false);
+        let detached =
+            ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-detached", true);
+        let foreign_scope = crate::jobs::JobSessionScope::fixed("classic-exit");
+        let foreign = ClassicServiceFixture::start(
+            foreign_scope.service_owner("classic-exit"),
+            temp.path(),
+            "driver-owned",
+            false,
+        );
+        let mut guard =
+            crate::interactive::ClassicServiceRegistryGuard(Some(scope.service_owner("")));
+        let shutdown = guard.retire();
+        assert_classic_service_registry_retired(&owner, temp.path());
+        assert_classic_service_registry_retired(&next_owner, temp.path());
+        runtime()
+            .block_on(crate::interactive::finish_classic_service_cleanup(shutdown))
+            .unwrap();
+        drop(guard);
+        owned.assert_stopped();
+        next.assert_stopped();
+        detached.assert_live();
+        foreign.assert_live();
+        assert_classic_service_registry_retired(&owner, temp.path());
+        assert_classic_service_registry_retired(&next_owner, temp.path());
     }
 
     #[cfg(unix)]
@@ -5982,12 +6121,8 @@ mod tests {
                 .try_lock()
                 .unwrap()
                 .service_owner(original_id.clone());
-            let owned = ClassicServiceFixture::start(
-                owner.clone(),
-                temp.path(),
-                "classic-owned",
-                false,
-            );
+            let owned =
+                ClassicServiceFixture::start(owner.clone(), temp.path(), "classic-owned", false);
             let detached =
                 ClassicServiceFixture::start(owner, temp.path(), "classic-detached", true);
             let foreign_scope = crate::jobs::JobSessionScope::fixed(original_id.clone());

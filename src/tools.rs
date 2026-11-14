@@ -11801,11 +11801,11 @@ impl HubTool {
                     ready,
                     detached: input.detached.unwrap_or(false),
                 };
-                let snapshot = crate::hub::run_service_request(
-                    &self.job_session_scope,
-                    move |request| crate::hub::start_for_request(&spec, request),
-                )
-                .await?;
+                let snapshot =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::start_for_request(&spec, request)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!(
                     "Service '{name}' is running (pid {}, log: {}).",
@@ -11818,10 +11818,11 @@ impl HubTool {
                 (text, details)
             }
             "ps" => {
-                let services = crate::hub::run_service_request(&self.job_session_scope, |request| {
-                    crate::hub::ps(request.service_owner())
-                })
-                .await?;
+                let services =
+                    crate::hub::run_service_request(&self.job_session_scope, |request| {
+                        crate::hub::ps(request.service_owner())
+                    })
+                    .await?;
                 let details = serde_json::json!({
                     "schema": crate::hub::SERVICE_SCHEMA,
                     "services": services,
@@ -11855,9 +11856,8 @@ impl HubTool {
                 let tail = input.tail;
                 let grep = input.grep.clone();
                 let wait_ms = input.wait_ms.unwrap_or(0);
-                let page = crate::hub::run_service_request(
-                    &self.job_session_scope,
-                    move |request| {
+                let page =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
                         crate::hub::logs_for_request(
                             &name,
                             cursor,
@@ -11866,9 +11866,8 @@ impl HubTool {
                             wait_ms,
                             request,
                         )
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 let details = serde_json::to_value(&page)?;
                 let mut text = page.lines.join("\n");
                 if text.is_empty() {
@@ -11887,11 +11886,11 @@ impl HubTool {
             "stop" => {
                 let name = name_required("stop")?;
                 let stop_name = name.clone();
-                let snapshot = crate::hub::run_service_request(
-                    &self.job_session_scope,
-                    move |request| crate::hub::stop_for_request(&stop_name, request),
-                )
-                .await?;
+                let snapshot =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::stop_for_request(&stop_name, request)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!("Service '{name}' stopped (status: {}).", snapshot.status);
                 Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
@@ -11900,11 +11899,11 @@ impl HubTool {
             "restart" => {
                 let name = name_required("restart")?;
                 let restart_name = name.clone();
-                let snapshot = crate::hub::run_service_request(
-                    &self.job_session_scope,
-                    move |request| crate::hub::restart_for_request(&restart_name, request),
-                )
-                .await?;
+                let snapshot =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::restart_for_request(&restart_name, request)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!("Service '{name}' restarted (status: {}).", snapshot.status);
                 Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
@@ -11912,11 +11911,11 @@ impl HubTool {
             }
             "describe" => {
                 let name = name_required("describe")?;
-                let snapshot = crate::hub::run_service_request(
-                    &self.job_session_scope,
-                    move |request| crate::hub::describe(request.service_owner(), &name),
-                )
-                .await?;
+                let snapshot =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::describe(request.service_owner(), &name)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     serde_json::to_string_pretty(&snapshot).unwrap_or_default(),

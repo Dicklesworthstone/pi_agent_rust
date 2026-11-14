@@ -858,9 +858,7 @@ impl ServiceRegistry {
         // A restart retains the previous settled descriptor. That history
         // must not conceal the uniquely live detached incarnation on resume.
         let has_live = detached.clone().any(|entry| entry.status.live());
-        if !has_live
-            && let Some(entry) = exact
-        {
+        if !has_live && let Some(entry) = exact {
             return Ok(entry);
         }
         let mut detached = detached.filter(|entry| !has_live || entry.status.live());
@@ -870,7 +868,9 @@ impl ServiceRegistry {
         if detached.next().is_some() {
             return Err(Error::tool(
                 "hub",
-                format!("PI_HUB_AMBIGUOUS_SERVICE: more than one detached service is named '{name}'"),
+                format!(
+                    "PI_HUB_AMBIGUOUS_SERVICE: more than one detached service is named '{name}'"
+                ),
             ));
         }
         Ok(entry)
@@ -1909,7 +1909,14 @@ pub fn logs(
     grep: Option<&str>,
     wait_ms: u64,
 ) -> Result<LogPage> {
-    logs_inner(name, since, tail, grep, wait_ms, &ServiceRequest::new(owner)?)
+    logs_inner(
+        name,
+        since,
+        tail,
+        grep,
+        wait_ms,
+        &ServiceRequest::new(owner)?,
+    )
 }
 
 pub(crate) fn logs_for_request(
@@ -2409,16 +2416,16 @@ fn begin_shutdown(owner: &ServiceOwner, retire_registry: bool) -> Result<Service
     let instance_generation = reg
         .instance_generation(owner.instance_id())
         .checked_add(1)
-        .ok_or_else(|| {
-            Error::tool("hub", "PI_HUB_SESSION_LIMIT: registry generation exhausted")
-        })?;
+        .ok_or_else(|| Error::tool("hub", "PI_HUB_SESSION_LIMIT: registry generation exhausted"))?;
     let state = reg.owners.entry(owner.clone()).or_default();
-    let generation = state.generation.checked_add(1).ok_or_else(|| {
-        Error::tool("hub", "PI_HUB_SESSION_LIMIT: service generation exhausted")
-    })?;
-    let active_shutdowns = state.active_shutdowns.checked_add(1).ok_or_else(|| {
-        Error::tool("hub", "PI_HUB_SESSION_LIMIT: too many shutdown attempts")
-    })?;
+    let generation = state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| Error::tool("hub", "PI_HUB_SESSION_LIMIT: service generation exhausted"))?;
+    let active_shutdowns = state
+        .active_shutdowns
+        .checked_add(1)
+        .ok_or_else(|| Error::tool("hub", "PI_HUB_SESSION_LIMIT: too many shutdown attempts"))?;
     state.generation = generation;
     state.active_shutdowns = active_shutdowns;
     state.incomplete_shutdown = true;
@@ -2434,8 +2441,7 @@ fn begin_shutdown(owner: &ServiceOwner, retire_registry: bool) -> Result<Service
             (entry.owner == *owner
                 || (retire_registry && entry.owner.instance_id == owner.instance_id))
                 && entry.status.live()
-                && (!entry.spec.detached
-                    || !entry.control.startup_accepted.load(Ordering::Acquire))
+                && (!entry.spec.detached || !entry.control.startup_accepted.load(Ordering::Acquire))
         })
         .map(|entry| {
             entry.status = ServiceStatus::Stopping;
@@ -2941,8 +2947,13 @@ mod tests {
         let ring = Arc::new(Mutex::new(Ring::new(8)));
         let mut reg = ServiceRegistry::default();
         let launch = spec("hub-output-settlement", "unused", &[], None);
-        reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("settlement.log"))
-            .expect("reserve");
+        reg.reserve(
+            &test_owner(),
+            &launch,
+            &ring,
+            &PathBuf::from("settlement.log"),
+        )
+        .expect("reserve");
         let dir = tempfile::tempdir().expect("temp dir");
         let log_path = dir.path().join("output.log");
         let artifact = create_service_log(&log_path).expect("artifact");
@@ -2965,7 +2976,10 @@ mod tests {
             ServiceSnapshot::from_entry(reg.current(&launch.name, &ring).expect("entry"));
         assert_eq!(snapshot.status, "stopping");
         assert_eq!(snapshot.log_capture.drain_state, LogDrainState::Streaming);
-        assert!(reg.reserve(&test_owner(), &launch, &ring, &log_path).is_err());
+        assert!(
+            reg.reserve(&test_owner(), &launch, &ring, &log_path)
+                .is_err()
+        );
         let control = Arc::clone(&reg.current(&launch.name, &ring).expect("entry").control);
         assert!(control.completion.lock().expect("completion").is_none());
         // A stop arriving during output cleanup must not rewrite an already
@@ -3086,8 +3100,9 @@ mod tests {
         let launch = spec(name, "unused", &[], None);
         let ring = Arc::new(Mutex::new(Ring::new(8)));
         let request = ServiceRequest::new(&test_owner()).expect("input owner");
-        let pending = PendingService::reserve(&launch, &ring, &PathBuf::from("input.log"), &request)
-            .expect("input reservation");
+        let pending =
+            PendingService::reserve(&launch, &ring, &PathBuf::from("input.log"), &request)
+                .expect("input reservation");
         registry()
             .lock()
             .expect("registry")
@@ -3110,8 +3125,12 @@ mod tests {
             }),
         );
         send_text(&test_owner(), &pending.name, "prêt 界🙂", true).expect("partial text writes");
-        send_keys(&test_owner(), &pending.name, &["UP".to_string(), "ENTER".to_string()])
-            .expect("partial key writes");
+        send_keys(
+            &test_owner(),
+            &pending.name,
+            &["UP".to_string(), "ENTER".to_string()],
+        )
+        .expect("partial key writes");
         assert_eq!(
             &*bytes.lock().expect("input bytes"),
             "prêt 界🙂\r\x1b[A\r".as_bytes()
@@ -3176,7 +3195,9 @@ mod tests {
         assert_eq!(&*bytes.lock().expect("input bytes"), b"bl");
         assert!(!pending.control.stop_requested.load(Ordering::Acquire));
         assert_eq!(
-            describe(&test_owner(), &pending.name).expect("live service").status,
+            describe(&test_owner(), &pending.name)
+                .expect("live service")
+                .status,
             "starting"
         );
     }
@@ -3190,7 +3211,12 @@ mod tests {
         reg.reserve(&test_owner(), &launch, &first, &PathBuf::from("first.log"))
             .expect("reserve");
         let error = reg
-            .reserve(&test_owner(), &launch, &second, &PathBuf::from("second.log"))
+            .reserve(
+                &test_owner(),
+                &launch,
+                &second,
+                &PathBuf::from("second.log"),
+            )
             .expect_err("pending launch owns the name");
         assert!(error.to_string().contains("PI_HUB_NAME_TAKEN"));
         assert!(
@@ -3284,8 +3310,13 @@ mod tests {
             let mut reg = ServiceRegistry::default();
             let launch = spec("hub-terminal", "unused", &[], None);
             let ring = Arc::new(Mutex::new(Ring::new(8)));
-            reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("terminal.log"))
-                .expect("reserve");
+            reg.reserve(
+                &test_owner(),
+                &launch,
+                &ring,
+                &PathBuf::from("terminal.log"),
+            )
+            .expect("reserve");
             reg.current_mut(&launch.name, &ring).expect("entry").status = terminal;
             assert!(reg.mark_ready(&launch.name, &ring).is_err());
             assert_eq!(
@@ -3322,8 +3353,13 @@ mod tests {
         let mut reg = ServiceRegistry::default();
         let mut launch = spec("hub-shutdown-reservation", "unused", &[], None);
         let ring = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("previous.log"))
-            .expect("initial reservation");
+        reg.reserve(
+            &test_owner(),
+            &launch,
+            &ring,
+            &PathBuf::from("previous.log"),
+        )
+        .expect("initial reservation");
         assert!(reg.settle(&launch.name, &ring, 0));
         reg.shutting_down = true;
 
@@ -3335,13 +3371,20 @@ mod tests {
             launch.name = name.to_string();
             launch.detached = detached;
             let error = reg
-                .reserve(&test_owner(), &launch, &ring, &PathBuf::from("never-created.log"))
+                .reserve(
+                    &test_owner(),
+                    &launch,
+                    &ring,
+                    &PathBuf::from("never-created.log"),
+                )
                 .expect_err("process shutdown permanently closes admission");
             assert!(error.to_string().contains("PI_HUB_SHUTTING_DOWN"));
         }
         assert_eq!(reg.services.len(), 1);
         assert_eq!(
-            reg.lookup(&test_owner(), "hub-shutdown-reservation").expect("service").status,
+            reg.lookup(&test_owner(), "hub-shutdown-reservation")
+                .expect("service")
+                .status,
             ServiceStatus::Exited
         );
     }
@@ -3421,7 +3464,11 @@ mod tests {
             let error = operation.await.expect_err("late lookup must be stale");
             assert!(error.to_string().contains("PI_HUB_STALE_SESSION"));
         });
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no stale worker side effects");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no stale worker side effects"
+        );
         scope.bind(Arc::new(|| {
             Box::pin(async { Some("hub-lookup-owner".to_string()) })
         }));
@@ -3481,7 +3528,10 @@ mod tests {
                     {
                         break Some(pid);
                     }
-                    assert!(Instant::now() < deadline, "spawned child must publish its PID");
+                    assert!(
+                        Instant::now() < deadline,
+                        "spawned child must publish its PID"
+                    );
                     std::thread::sleep(Duration::from_millis(5));
                 }
             } else {
@@ -3644,7 +3694,9 @@ mod tests {
         *startup_test_hook().lock().expect("startup hook") = Some((launch.name.clone(), hook));
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let startup = std::thread::spawn(move || {
-            started_tx.send(start(&test_owner(), &launch)).expect("startup result");
+            started_tx
+                .send(start(&test_owner(), &launch))
+                .expect("startup result");
         });
         reached_rx
             .recv_timeout(Duration::from_secs(10))
@@ -3701,7 +3753,8 @@ mod tests {
         startup.join().expect("startup thread");
         shutdown.join().expect("shutdown thread");
         assert!(
-            ps(&test_owner()).expect("services")
+            ps(&test_owner())
+                .expect("services")
                 .iter()
                 .all(|entry| entry.pid.is_none())
         );
@@ -3735,8 +3788,9 @@ mod tests {
         let old = Arc::new(Mutex::new(Ring::new(8)));
         let new = Arc::new(Mutex::new(Ring::new(8)));
         let request = ServiceRequest::new(&test_owner()).expect("request owner");
-        let pending_old = PendingService::reserve(&launch, &old, &PathBuf::from("old.log"), &request)
-            .expect("old reservation");
+        let pending_old =
+            PendingService::reserve(&launch, &old, &PathBuf::from("old.log"), &request)
+                .expect("old reservation");
         registry()
             .lock()
             .expect("registry")
@@ -3745,10 +3799,16 @@ mod tests {
             .lock()
             .expect("registry")
             .settle(&launch.name, &old, -1);
-        let pending_new = PendingService::reserve(&launch, &new, &PathBuf::from("new.log"), &request)
-            .expect("new reservation");
+        let pending_new =
+            PendingService::reserve(&launch, &new, &PathBuf::from("new.log"), &request)
+                .expect("new reservation");
         drop(pending_old);
-        assert_eq!(describe(&test_owner(), &launch.name).expect("current").status, "starting");
+        assert_eq!(
+            describe(&test_owner(), &launch.name)
+                .expect("current")
+                .status,
+            "starting"
+        );
         drop(pending_new);
         let failed = describe(&test_owner(), &launch.name).expect("failed setup");
         assert_eq!(failed.status, "failed");
@@ -3797,15 +3857,18 @@ mod tests {
     #[test]
     fn overflowing_readiness_timeout_is_rejected_before_spawn() {
         let _lock = test_lock();
-        let error = start(&test_owner(), &spec(
-            "hub-timeout-overflow",
-            "pi-hub-program-that-does-not-exist",
-            &[],
-            Some(ReadySpec {
-                timeout_secs: Some(u64::MAX),
-                ..ReadySpec::default()
-            }),
-        ))
+        let error = start(
+            &test_owner(),
+            &spec(
+                "hub-timeout-overflow",
+                "pi-hub-program-that-does-not-exist",
+                &[],
+                Some(ReadySpec {
+                    timeout_secs: Some(u64::MAX),
+                    ..ReadySpec::default()
+                }),
+            ),
+        )
         .expect_err("timeout must be validated before program resolution");
         assert!(error.to_string().contains("PI_HUB_INVALID_READY_TIMEOUT"));
         assert!(describe(&test_owner(), "hub-timeout-overflow").is_err());
@@ -3959,12 +4022,15 @@ mod tests {
     #[test]
     fn invalid_name_is_rejected_before_program_resolution() {
         let _guard = crate::hub::test_lock();
-        let err = start(&test_owner(), &spec(
-            "../../outside-hub",
-            "pi-hub-program-that-does-not-exist",
-            &[],
-            None,
-        ))
+        let err = start(
+            &test_owner(),
+            &spec(
+                "../../outside-hub",
+                "pi-hub-program-that-does-not-exist",
+                &[],
+                None,
+            ),
+        )
         .expect_err("path-like service name must fail before spawn");
         assert!(
             err.to_string().contains("PI_HUB_INVALID_NAME"),
@@ -3975,16 +4041,19 @@ mod tests {
     #[test]
     fn invalid_ready_regex_is_rejected_before_program_resolution() {
         let _guard = crate::hub::test_lock();
-        let err = start(&test_owner(), &spec(
-            "hub-test-invalid-ready-regex",
-            "pi-hub-program-that-does-not-exist",
-            &[],
-            Some(ReadySpec {
-                log: Some("[".to_string()),
-                port: None,
-                timeout_secs: Some(1),
-            }),
-        ))
+        let err = start(
+            &test_owner(),
+            &spec(
+                "hub-test-invalid-ready-regex",
+                "pi-hub-program-that-does-not-exist",
+                &[],
+                Some(ReadySpec {
+                    log: Some("[".to_string()),
+                    port: None,
+                    timeout_secs: Some(1),
+                }),
+            ),
+        )
         .expect_err("invalid regex must fail before spawn");
         assert!(
             err.to_string().contains("Invalid ready.log regex"),
@@ -3997,16 +4066,19 @@ mod tests {
     fn readiness_requires_observed_port() {
         let _guard = crate::hub::test_lock();
         // No listener on the port → readiness must time out and kill.
-        let result = start(&test_owner(), &spec(
-            "hub-test-dead",
-            "sleep",
-            &["30"],
-            Some(ReadySpec {
-                log: None,
-                port: Some(39_991),
-                timeout_secs: Some(1),
-            }),
-        ));
+        let result = start(
+            &test_owner(),
+            &spec(
+                "hub-test-dead",
+                "sleep",
+                &["30"],
+                Some(ReadySpec {
+                    log: None,
+                    port: Some(39_991),
+                    timeout_secs: Some(1),
+                }),
+            ),
+        );
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("PI_HUB_NOT_READY"),
@@ -4070,7 +4142,8 @@ mod tests {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-restart";
         // A service that exits on its own, then restarts from the retained spec.
-        let first = start(&test_owner(), &spec(name, "echo", &["first-run"], None)).expect("first run");
+        let first =
+            start(&test_owner(), &spec(name, "echo", &["first-run"], None)).expect("first run");
         assert_eq!(first.status, "running");
         std::thread::sleep(Duration::from_millis(400));
         let settled = describe(&test_owner(), name).expect("describe");
@@ -4085,7 +4158,15 @@ mod tests {
             "each run must own its artifact"
         );
         std::thread::sleep(Duration::from_millis(400));
-        let page = logs(&test_owner(), name, None, Some(50), Some("first-run"), 5_000).expect("logs");
+        let page = logs(
+            &test_owner(),
+            name,
+            None,
+            Some(50),
+            Some("first-run"),
+            5_000,
+        )
+        .expect("logs");
         assert!(
             page.lines.iter().any(|line| line.contains("first-run")),
             "restarted service must run the retained spec: {:?}",
@@ -4099,16 +4180,19 @@ mod tests {
     fn status_stays_running_for_live_repl() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-stable";
-        let snapshot = start(&test_owner(), &spec(
-            name,
-            "python3",
-            &["-i", "-q"],
-            Some(ReadySpec {
-                log: Some(">>>".to_string()),
-                port: None,
-                timeout_secs: Some(10),
-            }),
-        ))
+        let snapshot = start(
+            &test_owner(),
+            &spec(
+                name,
+                "python3",
+                &["-i", "-q"],
+                Some(ReadySpec {
+                    log: Some(">>>".to_string()),
+                    port: None,
+                    timeout_secs: Some(10),
+                }),
+            ),
+        )
         .expect("repl start");
         assert_eq!(snapshot.status, "running");
         for wait_ms in [100u64, 300, 600] {
@@ -4151,22 +4235,33 @@ mod tests {
     fn logs_cursor_advances_incrementally() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-cursor";
-        let _ = start(&test_owner(), &spec(
-            name,
-            "sh",
-            &["-c", "echo first; sleep 300"],
-            Some(ReadySpec {
-                log: Some("first".to_string()),
-                port: None,
-                timeout_secs: Some(10),
-            }),
-        ))
+        let _ = start(
+            &test_owner(),
+            &spec(
+                name,
+                "sh",
+                &["-c", "echo first; sleep 300"],
+                Some(ReadySpec {
+                    log: Some("first".to_string()),
+                    port: None,
+                    timeout_secs: Some(10),
+                }),
+            ),
+        )
         .expect("start");
         let first_page = logs(&test_owner(), name, None, None, None, 0).expect("first page");
         assert!(first_page.lines.iter().any(|line| line.contains("first")));
         let cursor = first_page.cursor;
         send_text(&test_owner(), name, "echo second", true).expect("send");
-        let second_page = logs(&test_owner(), name, Some(cursor), None, Some("second"), 5_000).expect("page 2");
+        let second_page = logs(
+            &test_owner(),
+            name,
+            Some(cursor),
+            None,
+            Some("second"),
+            5_000,
+        )
+        .expect("page 2");
         assert!(
             second_page.lines.iter().any(|line| line.contains("second")),
             "incremental page must contain the new line: {:?}",

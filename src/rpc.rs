@@ -513,9 +513,8 @@ async fn finish_session_service_cleanup(
         None => return data,
     };
     if let Err(error) = result {
-        let warning = format!(
-            "Session changed, but previous-session services did not stop cleanly: {error}"
-        );
+        let warning =
+            format!("Session changed, but previous-session services did not stop cleanly: {error}");
         tracing::warn!(event = "rpc.session.service_cleanup_failed", "{warning}");
         data["serviceCleanupWarning"] = json!(warning);
     }
@@ -5721,11 +5720,7 @@ pub async fn run(
                             }),
                         )
                         .await;
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "new_session",
-                            Some(response_data),
-                        ));
+                        let _ = out_tx.send(response_ok(id, "new_session", Some(response_data)));
                     }
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(id, "new_session", &err));
@@ -6365,11 +6360,7 @@ pub async fn run(
                             }),
                         )
                         .await;
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "fork",
-                            Some(response_data),
-                        ));
+                        let _ = out_tx.send(response_ok(id, "fork", Some(response_data)));
                     }
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(id, "fork", &err));
@@ -6628,9 +6619,8 @@ pub async fn run(
 
     flush_rpc_session_on_shutdown(&session, &preservation_cx).await?;
 
-    service_result.map_err(|error| {
-        Error::session(format!("RPC hub service cleanup was incomplete: {error}"))
-    })
+    service_result
+        .map_err(|error| Error::session(format!("RPC hub service cleanup was incomplete: {error}")))
 }
 
 // =============================================================================
@@ -20512,7 +20502,13 @@ mod tests {
             .expect("runtime");
         let handle = runtime.handle();
         runtime.block_on(Box::pin(async move {
-            for navigation in ["new_session", "switch_session", "fork", "reload", "rejected"] {
+            for navigation in [
+                "new_session",
+                "switch_session",
+                "fork",
+                "reload",
+                "rejected",
+            ] {
                 let temp = tempfile::tempdir().expect("workspace");
                 let workspace = temp.path().canonicalize().expect("canonical workspace");
                 let mut source = Session::create_with_dir(Some(workspace.join("sessions")));
@@ -20588,9 +20584,8 @@ mod tests {
                 let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
                 let out_rx = Arc::new(Mutex::new(out_rx));
-                let server = handle.spawn(async move {
-                    Box::pin(run(session, options, in_rx, out_tx)).await
-                });
+                let server = handle
+                    .spawn(async move { Box::pin(run(session, options, in_rx, out_tx)).await });
                 let response = send_recv(&in_tx, &out_rx, &request.to_string(), navigation).await;
                 if navigation == "rejected" {
                     assert_err(&response, "switch_session");
@@ -20604,7 +20599,11 @@ mod tests {
                 }
                 let changed = !matches!(navigation, "reload" | "rejected");
                 let previous = crate::hub::describe(&owner, "active").expect("source service");
-                assert_eq!(previous.pid.is_none(), changed, "{navigation}: {previous:?}");
+                assert_eq!(
+                    previous.pid.is_none(),
+                    changed,
+                    "{navigation}: {previous:?}"
+                );
                 assert_eq!(
                     crate::hub::describe(&owner, "detached")
                         .expect("detached service")
@@ -20643,11 +20642,8 @@ mod tests {
                         .is_none()
                 );
                 assert!(
-                    crate::hub::start(
-                        &current_owner,
-                        &rpc_service_spec(&workspace, "late", false)
-                    )
-                    .is_err()
+                    crate::hub::start(&current_owner, &rpc_service_spec(&workspace, "late", false))
+                        .is_err()
                 );
                 assert_eq!(
                     crate::hub::describe(&other_owner, "active").unwrap().status,
@@ -20671,15 +20667,17 @@ mod tests {
             let agent = Agent::new(Arc::new(NoopProvider), registry, AgentConfig::default());
             let owner = agent.service_owner(source.header.id.as_str());
             let _cleanup = RpcServiceCleanup(vec![(owner.clone(), "owned".to_string())]);
-            crate::hub::start(&owner, &rpc_service_spec(temp.path(), "owned", false))
-                .expect("start service");
+            let spec = rpc_service_spec(temp.path(), "owned", false);
+            let started = crate::hub::start(&owner, &spec).expect("start service");
+            let pid = started.pid.expect("running service PID");
             let session = AgentSession::new(
                 agent,
                 Arc::new(asupersync::sync::Mutex::new(source)),
                 false,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
-            let mut options = build_test_rpc_options(&runtime.handle(), temp.path().join("auth.json"));
+            let mut options =
+                build_test_rpc_options(&runtime.handle(), temp.path().join("auth.json"));
             options.working_directory = Some(temp.path().to_path_buf());
             let (_in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(4);
             let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(32);
@@ -20692,14 +20690,25 @@ mod tests {
             // Observe the original drop's stop request; another shutdown here
             // would conceal a guard which fenced admission but leaked its child.
             let deadline = Instant::now() + Duration::from_secs(10);
-            while crate::hub::describe(&owner, "owned").unwrap().pid.is_some() {
-                assert!(Instant::now() < deadline, "dropped RPC loop leaked its service");
-                asupersync::time::sleep(
-                    asupersync::time::wall_now(),
-                    Duration::from_millis(10),
-                )
-                .await;
+            loop {
+                let snapshot = crate::hub::describe(&owner, "owned").unwrap();
+                if matches!(snapshot.status.as_str(), "killed" | "exited") {
+                    assert!(snapshot.pid.is_none());
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "dropped RPC loop leaked its service: {snapshot:?}"
+                );
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10))
+                    .await;
             }
+            let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32"))
+                .expect("positive child pid");
+            assert!(
+                rustix::process::test_kill_process(pid).is_err(),
+                "dropped RPC loop must reap its original child"
+            );
         });
     }
 

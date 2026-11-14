@@ -1925,6 +1925,42 @@ const fn bool_label(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+/// Own service admission from the first poll, including startup failures and
+/// cancellation before the terminal or its asynchronous cleanup can run.
+struct ClassicServiceRegistryGuard(Option<crate::hub::ServiceOwner>);
+
+impl ClassicServiceRegistryGuard {
+    fn retire(&mut self) -> crate::error::Result<crate::hub::ServiceShutdown> {
+        let owner = self.0.take().ok_or_else(|| {
+            crate::error::Error::session("Classic service registry is already retired")
+        })?;
+        crate::hub::begin_registry_shutdown(&owner)
+    }
+}
+
+impl Drop for ClassicServiceRegistryGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take()
+            && let Err(error) = crate::hub::begin_registry_shutdown(&owner)
+        {
+            tracing::warn!(event = "classic.session.service_retirement_failed", %error);
+        }
+    }
+}
+
+async fn finish_classic_service_cleanup(
+    shutdown: crate::error::Result<crate::hub::ServiceShutdown>,
+) -> anyhow::Result<()> {
+    let result = match shutdown {
+        Ok(shutdown) => shutdown.finish().await.map(|_| ()),
+        Err(error) => Err(error),
+    };
+    result.map_err(|error| {
+        tracing::warn!(event = "classic.session.service_cleanup_failed", %error);
+        anyhow::anyhow!("Classic hub service cleanup was incomplete: {error}")
+    })
+}
+
 /// Run the interactive mode.
 #[allow(
     clippy::future_not_send,
@@ -1953,6 +1989,8 @@ pub async fn run_interactive(
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
     failover: Option<crate::sdk::FailoverOptions>,
 ) -> anyhow::Result<()> {
+    let mut service_registry =
+        ClassicServiceRegistryGuard(Some(agent_session.agent.service_owner("")));
     let session = Arc::clone(&agent_session.session);
     let extensions = agent_session
         .extensions
@@ -1966,9 +2004,11 @@ pub async fn run_interactive(
         let guard = match session.lock(&cx).await {
             Ok(guard) => guard,
             Err(error) => {
+                let service_shutdown = service_registry.retire();
                 if let Some(region) = &agent_session.extensions {
                     region.shutdown().await;
                 }
+                let _ = finish_classic_service_cleanup(service_shutdown).await;
                 return Err(anyhow::anyhow!("Failed to lock session: {error}"));
             }
         };
@@ -2124,6 +2164,10 @@ pub async fn run_interactive(
         program.run()
     };
 
+    // Fence the entire consumed registry before asynchronous cleanup yields.
+    // Retained tool clones cannot start services after the terminal is gone.
+    let service_shutdown = service_registry.retire();
+
     // Terminally close both request/reply surfaces before bridge teardown.
     // This runs on normal exit and on `Program::run` errors, so outstanding
     // tool/extension futures cannot wait for a UI that no longer exists.
@@ -2142,6 +2186,7 @@ pub async fn run_interactive(
             tracing::warn!("classic extension shutdown exceeded its cleanup budget");
         }
     }
+    let service_result = finish_classic_service_cleanup(service_shutdown).await;
     drop(shutdown_owner);
 
     // Tell the async bridge to exit promptly even if some background task still
@@ -2153,6 +2198,7 @@ pub async fn run_interactive(
 
     let _ = crossterm::execute!(std::io::stdout(), cursor::Show);
     program_result?;
+    service_result?;
     println!("Goodbye!");
     Ok(())
 }

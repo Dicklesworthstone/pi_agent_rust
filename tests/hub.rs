@@ -296,7 +296,11 @@ time.sleep(60)
         let old_pid = wait_for_service_pid(name).await;
         std::fs::write(root.join("release-ready"), "ready").expect("release readiness");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while pi::hub::describe(&hub_owner(), name).expect("first service").status != "running" {
+        while pi::hub::describe(&hub_owner(), name)
+            .expect("first service")
+            .status
+            != "running"
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker must complete readiness before the name is reused"

@@ -1652,8 +1652,8 @@ mod tests {
         let scope = crate::cost::CostScope::default();
         scope.set(Some(budget.clone()));
         tool.bind_cost_scope(scope);
-        let catalog = crate::models::ModelRegistry::from_entries_for_tests(vec![
-            crate::models::ModelEntry {
+        let catalog =
+            crate::models::ModelRegistry::from_entries_for_tests(vec![crate::models::ModelEntry {
                 model: crate::provider::Model {
                     id: "fixture-vision".to_string(),
                     name: "Fixture vision".to_string(),
@@ -1678,8 +1678,7 @@ mod tests {
                 auth_header: true,
                 compat: None,
                 oauth_config: None,
-            },
-        ]);
+            }]);
         let auth = crate::media_tools::MediaAuthScope::default();
         auth.set_models(&Arc::new(()), Some(&catalog));
         tool.bind_media_auth_scope(auth);
@@ -1738,8 +1737,16 @@ mod tests {
         assert_eq!(budget.spent(), 3.0);
         assert_eq!(budget.snapshot().pending, 0.0);
         assert_eq!(std::fs::read(&image_path).unwrap(), image);
-        let one = server.endpoint.metadata_url("files/one").unwrap().to_string();
-        let two = server.endpoint.metadata_url("files/two").unwrap().to_string();
+        let one = server
+            .endpoint
+            .metadata_url("files/one")
+            .unwrap()
+            .to_string();
+        let two = server
+            .endpoint
+            .metadata_url("files/two")
+            .unwrap()
+            .to_string();
         let requests = server.finish();
         assert_eq!(
             requests.len(),
@@ -1756,7 +1763,10 @@ mod tests {
         assert_eq!(requests[5].method, "GET");
         for (index, uri) in [(2, one.as_str()), (4, one.as_str()), (8, two.as_str())] {
             let request = &requests[index];
-            assert_eq!(request.path, "/v1beta/models/fixture-vision:generateContent");
+            assert_eq!(
+                request.path,
+                "/v1beta/models/fixture-vision:generateContent"
+            );
             assert_eq!(request.headers["x-goog-api-key"], "native-vision-key");
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let part = &body["contents"][0]["parts"][0];

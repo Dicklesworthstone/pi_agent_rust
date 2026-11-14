@@ -2920,9 +2920,8 @@ impl AgentSessionHandle {
     pub(crate) async fn discard_uncommitted_resources(self) -> SessionResourceShutdown {
         // Stop this live registry before awaiting even the session lock. A
         // cancelled discard must not leave its services or late admissions live.
-        let service_shutdown = crate::hub::begin_registry_shutdown(
-            &self.session.agent.service_owner(""),
-        );
+        let service_shutdown =
+            crate::hub::begin_registry_shutdown(&self.session.agent.service_owner(""));
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut report = SessionResourceShutdown::default();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
@@ -2950,9 +2949,8 @@ impl AgentSessionHandle {
     pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
         // Registry ownership needs no durable-ID lookup. Publish its fence
         // before the first lock/save await so cancellation cannot skip cleanup.
-        let service_shutdown = crate::hub::begin_registry_shutdown(
-            &self.session.agent.service_owner(""),
-        );
+        let service_shutdown =
+            crate::hub::begin_registry_shutdown(&self.session.agent.service_owner(""));
         let mut report = SessionResourceShutdown::default();
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
@@ -11629,9 +11627,10 @@ printf sdk-owned-command-key
 
             run_async(async {
                 let cx = crate::agent_cx::AgentCx::for_testing_with_io();
-                let held_store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
-                    .await
-                    .expect("hold session store");
+                let held_store =
+                    asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                        .await
+                        .expect("hold session store");
                 let mut closing: std::pin::Pin<
                     Box<dyn std::future::Future<Output = SessionResourceShutdown>>,
                 > = if discard {
@@ -11650,7 +11649,9 @@ printf sdk-owned-command-key
 
                 let error = crate::hub::run_service_request(&scope, |_| Ok(()))
                     .await
-                    .expect_err("retained registry scope must stay retired after shutdown is dropped");
+                    .expect_err(
+                        "retained registry scope must stay retired after shutdown is dropped",
+                    );
                 assert!(error.to_string().contains("PI_HUB_SESSION_RETIRED"));
                 // Observe cleanup without issuing another stop, which would
                 // conceal a missing retirement in the abandoned future.

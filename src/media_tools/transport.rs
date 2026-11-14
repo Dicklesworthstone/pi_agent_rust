@@ -461,7 +461,9 @@ impl Api<'_> {
                         payload.to_mut(),
                     ))
                     .await
-                    .map_err(|error| Error::tool(self.tool, self.scrub(&error.to_string(), 2048)))?;
+                    .map_err(|error| {
+                        Error::tool(self.tool, self.scrub(&error.to_string(), 2048))
+                    })?;
                 check_owner(self.tool, &self.owner)?;
             }
             let client = self.owner.http().bind(&self.transport.client);
