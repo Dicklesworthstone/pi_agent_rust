@@ -1,6 +1,4 @@
-use super::commands::{
-    create_runtime_provider, model_entry_matches, resolve_model_key_from_default_auth,
-};
+use super::commands::model_entry_matches;
 use super::*;
 use crate::models::model_requires_configured_credential;
 
@@ -55,7 +53,7 @@ impl PiApp {
 
     /// Open the model selector overlay.
     pub fn open_model_selector(&mut self) {
-        if self.agent_state != AgentState::Idle {
+        if self.agent_state != AgentState::Idle || self.model_selection.is_some() {
             self.status_message = Some("Cannot switch models while processing".to_string());
             return;
         }
@@ -75,7 +73,7 @@ impl PiApp {
     }
 
     pub(super) fn open_model_selector_configured_only(&mut self) {
-        if self.agent_state != AgentState::Idle {
+        if self.agent_state != AgentState::Idle || self.model_selection.is_some() {
             self.status_message = Some("Cannot switch models while processing".to_string());
             return;
         }
@@ -158,39 +156,9 @@ impl PiApp {
             return;
         };
 
-        if model_entry_matches(&next, &self.model_entry) {
-            self.status_message = Some(format!("Already using {}", selected.full_id()));
-            return;
-        }
-
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
-        if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
-            self.status_message = Some(format!(
-                "Missing credentials for provider {}. Run /login {}.",
-                next.model.provider, next.model.provider
-            ));
-            return;
-        }
-
-        let provider_impl =
-            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
-                Ok(p) => p,
-                Err(err) => {
-                    self.status_message = Some(err.to_string());
-                    return;
-                }
-            };
-
-        if let Err(message) = self.switch_active_model(
-            &next,
-            provider_impl,
-            resolved_key_opt.as_deref(),
-            "selector",
-        ) {
+        if let Err(message) = self.request_manual_model_selection(&next, "selector") {
             self.status_message = Some(message);
-            return;
         }
-        self.status_message = Some(format!("Switched model: {}", next.model.display_label()));
     }
 
     /// Render the model selector overlay.
@@ -391,7 +359,7 @@ mod tests {
         }
     }
 
-    fn runtime_handle() -> asupersync::runtime::RuntimeHandle {
+    fn runtime() -> &'static asupersync::runtime::Runtime {
         static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
             RuntimeBuilder::multi_thread()
@@ -399,7 +367,10 @@ mod tests {
                 .build()
                 .expect("build runtime")
         })
-        .handle()
+    }
+
+    fn runtime_handle() -> asupersync::runtime::RuntimeHandle {
+        runtime().handle()
     }
 
     fn model_entry(provider: &str, id: &str, api_key: Option<&str>) -> ModelEntry {
@@ -431,7 +402,10 @@ mod tests {
         }
     }
 
-    fn build_test_app(current: ModelEntry, available: Vec<ModelEntry>) -> PiApp {
+    fn build_test_app_with_event_rx(
+        current: ModelEntry,
+        available: Vec<ModelEntry>,
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
         let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
         let agent = Agent::new(
             provider,
@@ -450,33 +424,40 @@ mod tests {
             extension_paths: Vec::new(),
             theme_paths: Vec::new(),
         };
-        let (event_tx, _event_rx) = mpsc::channel(64);
+        let (event_tx, event_rx) = mpsc::channel(64);
         let config = Config {
             last_changelog_version: Some(crate::platform::VERSION.to_string()),
             ..Config::default()
         };
-        PiApp::new(
-            agent,
-            session,
-            config,
-            resources,
-            resource_cli,
-            Path::new(".").to_path_buf(),
-            current,
-            Vec::new(),
-            available,
-            None,
-            Vec::new(),
-            event_tx,
-            runtime_handle(),
-            false,
-            false,
-            None,
-            Some(KeyBindings::new()),
-            Vec::new(),
-            Usage::default(),
-            None,
+        (
+            PiApp::new(
+                agent,
+                session,
+                config,
+                resources,
+                resource_cli,
+                Path::new(".").to_path_buf(),
+                current,
+                Vec::new(),
+                available,
+                None,
+                Vec::new(),
+                event_tx,
+                runtime_handle(),
+                false,
+                false,
+                None,
+                Some(KeyBindings::new()),
+                Vec::new(),
+                Usage::default(),
+                None,
+            ),
+            event_rx,
         )
+    }
+
+    fn build_test_app(current: ModelEntry, available: Vec<ModelEntry>) -> PiApp {
+        build_test_app_with_event_rx(current, available).0
     }
 
     #[test]
@@ -486,7 +467,8 @@ mod tests {
         next.headers
             .insert("x-provider-header".to_string(), "next".to_string());
 
-        let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, next.clone()]);
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
@@ -501,6 +483,11 @@ mod tests {
             provider: next.model.provider.clone(),
             id: next.model.id,
         });
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         let mut guard = app.agent.try_lock().expect("agent lock");
         assert_eq!(
@@ -526,7 +513,8 @@ mod tests {
         let current = model_entry("openai", "gpt-4o-mini", Some("old-key"));
         let mut next = model_entry("ollama", "llama3.2", None);
         next.auth_header = false;
-        let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, next.clone()]);
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
@@ -537,6 +525,11 @@ mod tests {
             provider: next.model.provider.clone(),
             id: next.model.id,
         });
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         let mut guard = app.agent.try_lock().expect("agent lock");
         assert!(
@@ -551,7 +544,8 @@ mod tests {
         let mut next = model_entry("ollama", "llama3.2", None);
         next.auth_header = false;
         next.model.reasoning = false;
-        let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, next.clone()]);
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
@@ -566,6 +560,11 @@ mod tests {
             provider: next.model.provider.clone(),
             id: next.model.id,
         });
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         let mut agent_guard = app.agent.try_lock().expect("agent lock");
         assert_eq!(

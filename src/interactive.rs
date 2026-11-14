@@ -654,6 +654,9 @@ impl PiApp {
     }
 
     fn session_transition_blocker(&self) -> Option<&'static str> {
+        if self.model_selection.is_some() {
+            return Some("Model selection is still saving; try again when it finishes");
+        }
         if self.agent_state != AgentState::Idle {
             return Some("Cannot change sessions while processing");
         }
@@ -2304,6 +2307,12 @@ pub enum PiMsg {
         owner_session_id: String,
         message: String,
     },
+    /// A manual model transaction finished; only its retained UI request may
+    /// refresh the displayed selection. It never owns an agent turn's state.
+    ModelSelectionFinished {
+        request_id: String,
+        error: Option<String>,
+    },
     /// Classic terminal review completion, scoped to its session and request.
     ReviewFinished {
         owner_session_id: String,
@@ -3009,6 +3018,17 @@ fn apply_editor_keybinding_overrides(keybindings: &KeyBindings, input: &mut Text
     }
 }
 
+#[derive(Clone)]
+struct ManualModelSelection {
+    id: String,
+    owner_session_id: String,
+    origin: crate::extensions::SessionActionOrigin,
+    previous: ModelEntry,
+    selected: ModelEntry,
+    source: String,
+    status_prefix: Option<String>,
+}
+
 /// The classic UI's live agent and its durable Session have one owner.
 ///
 /// Idle editor operations access the Agent through this owner; complete user
@@ -3059,6 +3079,7 @@ pub struct PiApp {
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
     pending_inputs_paused_by_time_cap: bool,
+    pending_inputs_paused_by_model_selection: bool,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
     injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
@@ -3147,6 +3168,7 @@ pub struct PiApp {
     abort_handle: Option<AbortHandle>,
     goal_invocation: Option<GoalInvocation>,
     review_request_id: Option<String>,
+    model_selection: Option<ManualModelSelection>,
     handoff_request_id: Option<String>,
     mcp_auth_request_id: Option<String>,
     bash_running: bool,
@@ -3624,6 +3646,7 @@ impl PiApp {
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
             pending_inputs_paused_by_time_cap: false,
+            pending_inputs_paused_by_model_selection: false,
             message_queue,
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
@@ -3688,6 +3711,7 @@ impl PiApp {
             abort_handle: None,
             goal_invocation: None,
             review_request_id: None,
+            model_selection: None,
             handoff_request_id: None,
             mcp_auth_request_id: None,
             bash_running: false,

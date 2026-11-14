@@ -1433,7 +1433,11 @@ impl PiApp {
                 // from this turn BEFORE idle input or RunPending runs.
                 self.invalidate_input_cards_for_turn_end();
 
-                if !self.pending_inputs_paused_by_time_cap && !self.pending_inputs.is_empty() {
+                if !self.pending_inputs_paused_by_time_cap
+                    && !self.pending_inputs_paused_by_model_selection
+                    && self.model_selection.is_none()
+                    && !self.pending_inputs.is_empty()
+                {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
@@ -1572,6 +1576,151 @@ impl PiApp {
                     PiMsg::System(message),
                     attempts_remaining,
                 );
+            }
+            PiMsg::ModelSelectionFinished { request_id, error } => {
+                let Some(request) = self
+                    .model_selection
+                    .as_ref()
+                    .filter(|request| request.id == request_id)
+                    .cloned()
+                else {
+                    return None;
+                };
+                if !self
+                    .session_action_admission
+                    .origin_source()
+                    .accepts(&request.origin)
+                {
+                    self.model_selection = None;
+                    return None;
+                }
+                let selection: std::result::Result<_, ()> = (|| {
+                    let agent = self.agent.try_lock().map_err(|_| ())?;
+                    let session = self.session.try_lock().map_err(|_| ())?;
+                    if session.header.id != request.owner_session_id
+                        || !self
+                            .session_action_admission
+                            .origin_source()
+                            .accepts(&request.origin)
+                    {
+                        return Ok(None);
+                    }
+                    let native_model = agent.handle.model();
+                    let registry = agent
+                        .handle
+                        .session()
+                        .model_registry_snapshot()
+                        .ok()
+                        .flatten();
+                    let catalog = registry
+                        .as_deref()
+                        .map_or(&[][..], crate::models::ModelRegistry::models);
+                    let durable_matches_native = session
+                        .effective_model_for_current_path()
+                        .is_none_or(|(provider, model)| {
+                            crate::models::model_identities_match(
+                                catalog,
+                                &native_model.0,
+                                &native_model.1,
+                                &provider,
+                                &model,
+                            )
+                        });
+                    Ok(Some((
+                        native_model,
+                        agent.handle.session().current_model_entry(),
+                        durable_matches_native,
+                    )))
+                })();
+                let ((provider, model), entry, durable_matches_native) = match selection {
+                    Ok(Some(selection)) => selection,
+                    Ok(None) => {
+                        self.model_selection = None;
+                        return None;
+                    }
+                    Err(()) if attempts_remaining == 0 => {
+                        self.model_selection = None;
+                        self.pending_inputs_paused_by_model_selection = true;
+                        self.status_message = Some(
+                            "Model selection finished; the busy session prevented a display refresh"
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                    Err(()) => {
+                        return self.retry_busy_session_event(
+                            PiMsg::ModelSelectionFinished { request_id, error },
+                            attempts_remaining,
+                        );
+                    }
+                };
+                self.model_selection = None;
+                if !durable_matches_native {
+                    // An extension may persist a newer selection without
+                    // refreshing the native provider or sending a UI event.
+                    // Do not announce this superseded result or claim queued work.
+                    self.pending_inputs_paused_by_model_selection = true;
+                    self.status_message = Some(
+                        "Model selection was superseded by a newer session selection; queued input is paused"
+                            .to_string(),
+                    );
+                    return None;
+                }
+                // Failed selection must not send retained work to the old model.
+                // A successful selection does not renew an exhausted turn budget.
+                self.pending_inputs_paused_by_model_selection = error.is_some();
+                self.model = format!("{provider}/{model}");
+                let requested_is_current = provider
+                    .eq_ignore_ascii_case(&request.selected.model.provider)
+                    && model.eq_ignore_ascii_case(&request.selected.model.id);
+                if let Some(entry) = entry {
+                    self.model_entry = entry.clone();
+                    if let Ok(mut shared) = self.model_entry_shared.lock() {
+                        *shared = entry.clone();
+                    }
+                    if error.is_none() && requested_is_current {
+                        if !self
+                            .available_models
+                            .iter()
+                            .any(|existing| super::commands::model_entry_matches(existing, &entry))
+                        {
+                            self.available_models.push(entry.clone());
+                        }
+                        self.dispatch_model_select_event(
+                            &entry,
+                            Some(&request.previous),
+                            &request.source,
+                        );
+                    }
+                }
+                let message = error.map_or_else(
+                    || {
+                        if requested_is_current {
+                            let selected = format!(
+                                "Switched model: {}",
+                                self.model_entry.model.display_label()
+                            );
+                            if let Some(prefix) = request.status_prefix.as_deref() {
+                                format!("{prefix} {selected}")
+                            } else {
+                                selected
+                            }
+                        } else {
+                            format!("Model selection finished; current model: {}", self.model)
+                        }
+                    },
+                    |error| format!("Model switch failed: {error}"),
+                );
+                self.status_message = Some(message.clone());
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
+                if !self.pending_inputs_paused_by_time_cap
+                    && !self.pending_inputs_paused_by_model_selection
+                    && !self.pending_inputs.is_empty()
+                {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
             }
             PiMsg::SessionModelChanged {
                 owner_session_id,
@@ -1783,7 +1932,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                     return None;
                 }
                 let retry_input = PendingInput::GeneratedText(text);
-                if self.pending_inputs_paused_by_time_cap {
+                if self.pending_inputs_paused_by_time_cap
+                    || self.pending_inputs_paused_by_model_selection
+                {
                     // A committed /retry owns the next foreground budget;
                     // earlier unclaimed work stays queued behind that target.
                     self.pending_inputs.push_front(retry_input);
@@ -1791,6 +1942,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                     self.pending_inputs.push_back(retry_input);
                 }
                 self.pending_inputs_paused_by_time_cap = false;
+                self.pending_inputs_paused_by_model_selection = false;
                 return self.run_next_pending();
             }
             PiMsg::ConversationReset {
@@ -1859,8 +2011,10 @@ After approving access in the browser, press Enter in Pi to complete login."
                 if is_replacement {
                     self.handoff_request_id = None;
                     self.mcp_auth_request_id = None;
+                    self.model_selection = None;
                     self.title_cancellation = None;
                     self.pending_inputs_paused_by_time_cap = false;
+                    self.pending_inputs_paused_by_model_selection = false;
                     self.title_requested = !self.messages.is_empty();
                     self.todo_summary = None;
                     self.retire_login();
@@ -3458,7 +3612,11 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     fn run_next_pending(&mut self) -> Option<Cmd> {
         loop {
-            if self.agent_state != AgentState::Idle || self.pending_inputs_paused_by_time_cap {
+            if self.agent_state != AgentState::Idle
+                || self.model_selection.is_some()
+                || self.pending_inputs_paused_by_time_cap
+                || self.pending_inputs_paused_by_model_selection
+            {
                 return None;
             }
             let next = self.pending_inputs.pop_front()?;
@@ -3493,6 +3651,12 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     pub(super) fn queue_input(&mut self, kind: QueuedMessageKind) {
+        if self.model_selection.is_some() {
+            self.status_message = Some(
+                "Model selection is still saving; your draft has been retained".to_string(),
+            );
+            return;
+        }
         if self.goal_invocation.is_some() {
             self.status_message = Some(
                 "Goal work is active; Escape pauses it. Your draft has been retained".to_string(),
@@ -3793,6 +3957,10 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     fn submit_continue(&mut self) -> Option<Cmd> {
+        if self.model_selection.is_some() {
+            self.status_message = Some("Model selection is still saving; try again".to_string());
+            return None;
+        }
         if let Err(message) = self.sync_runtime_selection_from_session_header() {
             self.status_message = Some(message);
             return None;
@@ -3829,9 +3997,11 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Only a new foreground submission/continue can renew the run budget.
         // Automatic queue processing cannot reach this point while paused.
         self.pending_inputs_paused_by_time_cap = false;
+        self.pending_inputs_paused_by_model_selection = false;
         let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.review_request_id = None;
+        self.model_selection = None;
         self.abort_handle = Some(abort_handle);
         self.agent_state = AgentState::Processing;
         // Extensions may send steering while the first request is in backoff
@@ -3980,6 +4150,18 @@ After approving access in the browser, press Enter in Pi to complete login."
         if content.is_empty() {
             return None;
         }
+        if self.model_selection.is_some() {
+            let pending = match keyword_scan_source {
+                Some(keyword_scan_source) => PendingInput::ContentWithKeywordSource {
+                    content,
+                    keyword_scan_source,
+                },
+                None => PendingInput::Content(content),
+            };
+            self.pending_inputs.push_back(pending);
+            self.status_message = Some("Input queued until model selection finishes".to_string());
+            return None;
+        }
 
         if let Err(message) = self.sync_runtime_selection_from_session_header() {
             self.status_message = Some(message);
@@ -4053,6 +4235,14 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
 
+        if self.model_selection.is_some()
+            && !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _)))
+        {
+            self.status_message = Some(
+                "Model selection is still saving; your draft has been retained".to_string(),
+            );
+            return None;
+        }
         if self.goal_invocation.is_some()
             && !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _)))
         {

@@ -1492,6 +1492,105 @@ impl PiApp {
         ));
     }
 
+    /// Admit one explicit selection without replacing live state before its
+    /// save commits. Keep the editor draft and other foreground owners intact.
+    pub(super) fn request_manual_model_selection(
+        &mut self,
+        next: &ModelEntry,
+        source: &str,
+    ) -> Result<(), String> {
+        if self.agent_state != AgentState::Idle || self.model_selection.is_some() {
+            return Err("Cannot switch models while another request is active".to_string());
+        }
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        if cx.is_cancel_requested() {
+            return Err("Cancelled: no model selection was started".to_string());
+        }
+        let mut agent = OwnedMutexGuard::try_lock(Arc::clone(&self.agent))
+            .map_err(|_| "Agent busy; try again".to_string())?;
+        agent
+            .handle
+            .session()
+            .ensure_provider_reentry_allowed()
+            .map_err(|error| error.to_string())?;
+        let owner_session_id = self
+            .session
+            .try_lock()
+            .map_err(|_| "Session busy; try again".to_string())?
+            .header
+            .id
+            .clone();
+        if self.displayed_session_id.as_deref() != Some(owner_session_id.as_str()) {
+            return Err("Session display is catching up; try again".to_string());
+        }
+        let request = ManualModelSelection {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner_session_id,
+            origin: self.session_action_admission.capture_origin(),
+            previous: agent
+                .handle
+                .session()
+                .current_model_entry()
+                .unwrap_or_else(|| self.model_entry.clone()),
+            selected: next.clone(),
+            source: source.to_string(),
+            status_prefix: None,
+        };
+        let request_id = request.id.clone();
+        let origin = request.origin.clone();
+        let provider = next.model.provider.clone();
+        let model = next.model.id.clone();
+        let event_tx = self.event_tx.clone();
+        self.model_selection = Some(request);
+        if let Err(error) = self.runtime_handle.try_spawn_with_cx(move |_task_cx| async move {
+            let error = agent
+                .handle
+                .set_model_from_origin(&provider, &model, &origin)
+                .await
+                .err()
+                .map(|error| error.to_string());
+            if error.is_none() {
+                // An explicit choice also retires plan-mode restoration.
+                agent.plan_state().take_previous_model();
+            }
+            drop(agent);
+            enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::ModelSelectionFinished { request_id, error },
+            )
+            .await;
+        }) {
+            self.model_selection = None;
+            return Err(format!("Could not start model selection: {error}"));
+        }
+        self.status_message = Some(format!("Switching model to {}...", next.model.display_label()));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn settle_model_selection_for_test(
+        &mut self,
+        events: &mut mpsc::Receiver<PiMsg>,
+    ) -> Option<String> {
+        let cx = Cx::for_testing();
+        let event = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(10),
+            events.recv(&cx),
+        )
+        .await
+        .expect("model selection completes")
+        .expect("model selection event channel stays open");
+        let PiMsg::ModelSelectionFinished { error, .. } = &event else {
+            panic!("unexpected event while selecting a model: {event:?}");
+        };
+        let error = error.clone();
+        assert!(self.handle_pi_message(event).is_none());
+        assert!(self.model_selection.is_none());
+        error
+    }
+
     pub(super) fn switch_active_model(
         &mut self,
         next: &ModelEntry,
@@ -1572,7 +1671,7 @@ impl PiApp {
         Ok(())
     }
 
-    fn dispatch_model_select_event(
+    pub(super) fn dispatch_model_select_event(
         &self,
         next: &ModelEntry,
         previous: Option<&ModelEntry>,
@@ -2448,6 +2547,8 @@ impl PiApp {
                     self.pending_tool_output = None;
                     self.abort_handle = None;
                     self.retire_login();
+                    self.model_selection = None;
+                    self.pending_inputs_paused_by_model_selection = false;
                     self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
@@ -3359,48 +3460,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let next = matches.pop().expect("matches is exactly length 1 here");
 
-        let resolved_key_opt = resolve_model_key_from_default_auth(&next, &self.cwd);
-        if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
-            self.status_message = Some(format!(
-                "Missing credentials for provider {}. Run /login {}.",
-                next.model.provider, next.model.provider
-            ));
-            return None;
-        }
-
-        if model_entry_matches(&next, &self.model_entry) {
-            self.status_message = Some(format!(
-                "Current model: {}",
-                session_model_line(&self.model_entry)
-            ));
-            return None;
-        }
-
-        let provider_impl =
-            match create_runtime_provider(&next, self.extensions.as_ref(), &self.cwd) {
-                Ok(provider_impl) => provider_impl,
-                Err(err) => {
-                    self.status_message = Some(err.to_string());
-                    return None;
-                }
-            };
-
-        if let Err(message) =
-            self.switch_active_model(&next, provider_impl, resolved_key_opt.as_deref(), "command")
-        {
+        if let Err(message) = self.request_manual_model_selection(&next, "command") {
             self.status_message = Some(message);
-            return None;
         }
-
-        if !self
-            .available_models
-            .iter()
-            .any(|entry| model_entry_matches(entry, &next))
-        {
-            self.available_models.push(next.clone());
-        }
-
-        self.status_message = Some(format!("Switched model: {}", next.model.display_label()));
         None
     }
 
@@ -6843,6 +6905,393 @@ mod tests {
         }
     }
 
+    fn manual_selection_fixture() -> (
+        TempDir,
+        PiApp,
+        asupersync::channel::mpsc::Receiver<PiMsg>,
+        ModelEntry,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            directory.path().to_path_buf(),
+        ))));
+        session.try_lock().unwrap().set_model_header(
+            Some("dummy".to_string()),
+            Some("dummy-model".to_string()),
+            Some("off".to_string()),
+        );
+        let (mut app, events) = build_bash_test_app(session, directory.path());
+        let target = test_model_entry("openai", "manual-selection-target");
+        let catalog = vec![app.model_entry.clone(), target.clone()];
+        app.available_models = catalog.clone();
+        runtime().block_on(async {
+            let mut agent = app.agent.try_lock().unwrap();
+            agent.handle.session_mut().set_model_registry(
+                crate::models::ModelRegistry::from_entries_for_tests(catalog),
+            );
+            agent.handle.session_mut().persist_session().await.unwrap();
+        });
+        (directory, app, events, target)
+    }
+
+    fn manual_selection_completion(
+        events: &mut asupersync::channel::mpsc::Receiver<PiMsg>,
+    ) -> PiMsg {
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let event = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                events.recv(&cx),
+            )
+            .await
+            .expect("model selection must finish")
+            .expect("model selection completion");
+            assert!(matches!(event, PiMsg::ModelSelectionFinished { .. }));
+            event
+        })
+    }
+
+    #[test]
+    fn classic_manual_selection_failure_preserves_live_and_durable_state() {
+        let (directory, mut app, mut events, target) = manual_selection_fixture();
+        let provider = app.agent.try_lock().unwrap().provider();
+        let before = {
+            let session = app.session.try_lock().unwrap();
+            (
+                session.path.clone().unwrap(),
+                serde_json::to_value(&session.header).unwrap(),
+                serde_json::to_value(&session.entries).unwrap(),
+            )
+        };
+        let original_bytes = std::fs::read(&before.0).unwrap();
+        let blocked = directory.path().join("blocked-model-selection.jsonl");
+        std::fs::create_dir(&blocked).unwrap();
+        app.session.try_lock().unwrap().path = Some(blocked);
+        app.pending_inputs
+            .push_back(PendingInput::Text("queued work".to_string()));
+        app.request_manual_model_selection(&target, "command")
+            .unwrap();
+        let event = manual_selection_completion(&mut events);
+        assert!(matches!(
+            &event,
+            PiMsg::ModelSelectionFinished { error: Some(_), .. }
+        ));
+        assert!(app.handle_pi_message(event).is_none());
+        assert!(app.model_selection.is_none());
+        assert_eq!(app.model, "dummy/dummy-model");
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.pending_inputs_paused_by_model_selection);
+        assert!(!app.pending_inputs_paused_by_time_cap);
+        assert!(app.handle_pi_message(PiMsg::RunPending).is_none());
+        assert_eq!(app.pending_inputs.len(), 1);
+        let agent = app.agent.try_lock().unwrap();
+        assert!(Arc::ptr_eq(&provider, &agent.provider()));
+        assert!(
+            agent
+                .handle
+                .session()
+                .ensure_provider_reentry_allowed()
+                .as_ref()
+                .is_err_and(crate::error::Error::is_session_persistence)
+        );
+        let session = app.session.try_lock().unwrap();
+        assert_eq!(serde_json::to_value(&session.header).unwrap(), before.1);
+        assert_eq!(serde_json::to_value(&session.entries).unwrap(), before.2);
+        assert_eq!(std::fs::read(&before.0).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn classic_same_model_command_retires_fallback_provenance_durably() {
+        let (_directory, mut app, mut events, _target) = manual_selection_fixture();
+        {
+            let mut session = app.session.try_lock().unwrap();
+            session.append_model_change_with_role_and_failover(
+                "dummy".to_string(),
+                "dummy-model".to_string(),
+                Some("failover".to_string()),
+                Some(crate::session::ModelChangeFailover {
+                    primary_provider: "openai".to_string(),
+                    primary_model_id: "manual-selection-target".to_string(),
+                    primary_thinking_level: Some("off".to_string()),
+                    fallback_provider: "dummy".to_string(),
+                    fallback_model_id: "dummy-model".to_string(),
+                    chain_position: Some(1),
+                    cooldown_deadline: Some(chrono::Utc::now().to_rfc3339()),
+                    cooldown_secs: Some(0),
+                    lifecycle_id: Some("classic-manual-choice".to_string()),
+                }),
+            );
+        }
+        runtime().block_on(async {
+            app.agent
+                .try_lock()
+                .unwrap()
+                .handle
+                .session_mut()
+                .persist_session()
+                .await
+                .unwrap();
+        });
+        let provider = app.agent.try_lock().unwrap().provider();
+        let path = app.session.try_lock().unwrap().path.clone().unwrap();
+        for _ in 0..2 {
+            let _ = app.handle_slash_model("dummy/dummy-model");
+            assert!(
+                app.model_selection.is_some(),
+                "same-model choices must reach durable admission"
+            );
+            assert!(
+                runtime()
+                    .block_on(app.settle_model_selection_for_test(&mut events))
+                    .is_none()
+            );
+            let reopened =
+                runtime().block_on(Session::open(&path.display().to_string())).unwrap();
+            assert!(
+                reopened
+                    .active_failover_provenance_for_current_path()
+                    .is_none()
+            );
+            assert_eq!(
+                reopened
+                    .entries_for_current_path()
+                    .into_iter()
+                    .filter(|entry| matches!(entry, SessionEntry::ModelChange(_)))
+                    .count(),
+                2
+            );
+            assert!(Arc::ptr_eq(
+                &provider,
+                &app.agent.try_lock().unwrap().provider()
+            ));
+        }
+    }
+
+    #[test]
+    fn classic_model_selection_retains_every_pending_input_until_save_finishes() {
+        for keep_time_cap_pause in [false, true] {
+            let (_directory, mut app, mut events, target) = manual_selection_fixture();
+            let native = vec![
+                crate::model::ContentBlock::Text(crate::model::TextContent::new("native input")),
+                crate::model::ContentBlock::Image(crate::model::ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+            ];
+            app.pending_inputs.extend([
+                PendingInput::Text("typed input".to_string()),
+                PendingInput::GeneratedText("generated input".to_string()),
+                PendingInput::Content(native.clone()),
+                PendingInput::Continue,
+            ]);
+            let gate = app.session_action_admission.clone();
+            let cx = Cx::for_testing();
+            let held = runtime().block_on(gate.acquire(&cx)).unwrap();
+            app.request_manual_model_selection(&target, "command")
+                .unwrap();
+            let queued = format!("{:?}", app.pending_inputs);
+            assert!(app.handle_pi_message(PiMsg::RunPending).is_none());
+            assert_eq!(format!("{:?}", app.pending_inputs), queued);
+            assert_eq!(app.model, "dummy/dummy-model");
+            app.input.set_value("draft retained");
+            assert!(app.submit_message("draft retained").is_none());
+            app.queue_input(crate::interactive::QueuedMessageKind::FollowUp);
+            assert_eq!(app.input.value(), "draft retained");
+            assert_eq!(format!("{:?}", app.pending_inputs), queued);
+            assert!(
+                app.submit_content_with_display_and_keyword_source(
+                    native.clone(),
+                    "native input",
+                    Some("captured source".to_string()),
+                )
+                .is_none()
+            );
+            assert!(matches!(
+                app.pending_inputs.back(),
+                Some(PendingInput::ContentWithKeywordSource {
+                    content,
+                    keyword_scan_source,
+                }) if serde_json::to_value(content).unwrap()
+                    == serde_json::to_value(&native).unwrap()
+                    && keyword_scan_source == "captured source"
+            ));
+            assert_eq!(app.pending_inputs.len(), 5);
+            assert!(app.handle_pi_message(PiMsg::RunPending).is_none());
+            assert_eq!(app.pending_inputs.len(), 5);
+            assert_eq!(app.agent_state, AgentState::Idle);
+            app.pending_inputs_paused_by_time_cap = keep_time_cap_pause;
+            app.pending_inputs_paused_by_model_selection = true;
+            drop(held);
+            let event = manual_selection_completion(&mut events);
+            assert!(matches!(
+                &event,
+                PiMsg::ModelSelectionFinished { error: None, .. }
+            ));
+            let next = app.handle_pi_message(event);
+            assert_eq!(next.is_some(), !keep_time_cap_pause);
+            assert!(!app.pending_inputs_paused_by_model_selection);
+            assert_eq!(app.pending_inputs_paused_by_time_cap, keep_time_cap_pause);
+            assert_eq!(app.pending_inputs.len(), 5);
+            assert_eq!(app.model, "openai/manual-selection-target");
+        }
+    }
+
+    #[test]
+    fn classic_model_selection_completion_preserves_a_newer_foreground_owner() {
+        let (_directory, mut app, mut events, target) = manual_selection_fixture();
+        app.request_manual_model_selection(&target, "selector")
+            .unwrap();
+        let request_id = app.model_selection.as_ref().unwrap().id.clone();
+        assert!(
+            app.handle_pi_message(PiMsg::ModelSelectionFinished {
+                request_id: "another-request".to_string(),
+                error: Some("stale failure".to_string()),
+            })
+            .is_none()
+        );
+        assert_eq!(app.model_selection.as_ref().unwrap().id, request_id);
+        let event = manual_selection_completion(&mut events);
+        runtime().block_on(async {
+            app.agent
+                .try_lock()
+                .unwrap()
+                .handle
+                .set_model("dummy", "dummy-model")
+                .await
+                .unwrap();
+        });
+        let (abort, signal) = crate::agent::AbortHandle::new();
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        app.extension_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(app.handle_pi_message(event).is_none());
+        assert_eq!(app.model, "dummy/dummy-model");
+        assert_eq!(app.model_entry.model.id, "dummy-model");
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.abort_handle.is_some());
+        assert!(!signal.is_aborted());
+        assert!(
+            app.extension_streaming
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn classic_model_selection_completion_cannot_override_newer_extension_intent() {
+        let (_directory, mut app, mut events, target) = manual_selection_fixture();
+        app.request_manual_model_selection(&target, "selector")
+            .unwrap();
+        let event = manual_selection_completion(&mut events);
+        let (model_catalog, provider_admission) = {
+            let agent = app.agent.try_lock().unwrap();
+            (
+                agent.handle.session().extension_model_catalog(),
+                agent.handle.session().provider_admission_gate(),
+            )
+        };
+        let extension = crate::interactive::ext_session::InteractiveExtensionSession {
+            session: Arc::clone(&app.session),
+            model_entry: Arc::clone(&app.model_entry_shared),
+            model_catalog,
+            is_streaming: Arc::clone(&app.extension_streaming),
+            is_compacting: Arc::clone(&app.extension_compacting),
+            config: app.config.clone(),
+            save_enabled: true,
+            provider_admission,
+            session_action_admission: app.session_action_admission.clone(),
+        };
+        runtime()
+            .block_on(crate::extensions::ExtensionSession::set_model(
+                &extension,
+                "dummy".to_string(),
+                "dummy-model".to_string(),
+                Some(app.session_action_admission.capture_origin()),
+            ))
+            .unwrap();
+        // The real extension adapter commits intent without replacing the
+        // native provider; that refresh belongs to the next foreground run.
+        assert_eq!(
+            app.agent.try_lock().unwrap().handle.model(),
+            (target.model.provider.clone(), target.model.id.clone())
+        );
+        let path = app.session.try_lock().unwrap().path.clone().unwrap();
+        let reopened = runtime().block_on(Session::open(&path.display().to_string())).unwrap();
+        assert_eq!(
+            reopened.effective_model_for_current_path(),
+            Some(("dummy".to_string(), "dummy-model".to_string()))
+        );
+        app.pending_inputs
+            .push_back(PendingInput::Text("queued input".to_string()));
+        let displayed = app.model.clone();
+        let messages = app.messages.len();
+        let (abort, signal) = crate::agent::AbortHandle::new();
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        app.extension_streaming
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(app.handle_pi_message(event).is_none());
+        assert!(app.model_selection.is_none());
+        assert_eq!(app.model, displayed);
+        assert_eq!(app.messages.len(), messages);
+        assert_eq!(app.pending_inputs.len(), 1);
+        assert!(app.pending_inputs_paused_by_model_selection);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("superseded")
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.abort_handle.is_some());
+        assert!(!signal.is_aborted());
+        assert!(
+            app.extension_streaming
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn classic_model_selection_waiting_across_session_generation_cannot_commit() {
+        let (_directory, mut app, mut events, target) = manual_selection_fixture();
+        let gate = app.session_action_admission.clone();
+        let cx = Cx::for_testing();
+        let held = runtime().block_on(gate.acquire(&cx)).unwrap();
+        let path = app.session.try_lock().unwrap().path.clone().unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        app.request_manual_model_selection(&target, "cycle")
+            .unwrap();
+        gate.advance_generation();
+        app.model = "replacement/retained".to_string();
+        app.status_message = Some("new session owns the display".to_string());
+        app.pending_inputs_paused_by_model_selection = true;
+        drop(held);
+        let event = manual_selection_completion(&mut events);
+        assert!(matches!(
+            &event,
+            PiMsg::ModelSelectionFinished { error: Some(_), .. }
+        ));
+        // A newer owner may hold the agent when this obsolete event arrives.
+        // Origin rejection must happen before the handler retries those locks.
+        let agent_owner = Arc::clone(&app.agent);
+        let newer_owner = agent_owner.try_lock().unwrap();
+        assert!(app.handle_pi_message(event).is_none());
+        drop(newer_owner);
+        assert!(app.model_selection.is_none());
+        assert_eq!(app.model, "replacement/retained");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("new session owns the display")
+        );
+        assert!(app.pending_inputs_paused_by_model_selection);
+        assert_eq!(
+            app.agent.try_lock().unwrap().handle.model(),
+            ("dummy".to_string(), "dummy-model".to_string())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+    }
+
     #[test]
     fn classic_fast_uses_current_catalog_and_preserves_selection_across_models() {
         let temp = TempDir::new().expect("tempdir");
@@ -7172,8 +7621,10 @@ mod tests {
     fn classic_model_commands_switch_declared_aliases_without_losing_the_route() {
         for reverse in [false, true] {
             let temp = TempDir::new().expect("tempdir");
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().to_path_buf(),
+            ))));
+            let (mut app, mut events) = build_bash_test_app(Arc::clone(&session), temp.path());
             app.save_enabled = false;
             let mut native = test_model_entry("openrouter", "vendor/shared");
             native.model.api = "openai-completions".to_string();
@@ -7202,6 +7653,11 @@ mod tests {
             for target in [&native, &custom, &native] {
                 let spec = format!("{}/{}", target.model.provider, target.model.id);
                 let _ = app.handle_slash_model(&spec);
+                assert!(
+                    runtime()
+                        .block_on(app.settle_model_selection_for_test(&mut events))
+                        .is_none()
+                );
                 assert_eq!(app.model_entry.model.provider, target.model.provider);
                 assert_eq!(app.model_entry.model.base_url, target.model.base_url);
                 assert_eq!(app.model_entry.headers, target.headers);
@@ -7214,6 +7670,11 @@ mod tests {
                 };
                 let before = session.try_lock().expect("session").entries.len();
                 let _ = app.handle_slash_model(&spec);
+                assert!(
+                    runtime()
+                        .block_on(app.settle_model_selection_for_test(&mut events))
+                        .is_none()
+                );
                 assert_eq!(session.try_lock().expect("session").entries.len(), before);
                 assert!(Arc::ptr_eq(
                     &running,
@@ -7311,8 +7772,10 @@ mod tests {
     #[test]
     fn classic_undeclared_native_alias_is_an_idempotent_command() {
         let temp = TempDir::new().expect("tempdir");
-        let session = Arc::new(Mutex::new(Session::in_memory()));
-        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().to_path_buf(),
+        ))));
+        let (mut app, mut events) = build_bash_test_app(Arc::clone(&session), temp.path());
         app.save_enabled = false;
         let mut native = test_model_entry("openrouter", "vendor/shared");
         native.model.api = "openai-completions".to_string();
@@ -7328,9 +7791,19 @@ mod tests {
                 native,
             ]));
         let _ = app.handle_slash_model("openrouter/vendor/shared");
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
         let before = session.try_lock().expect("session").entries.len();
         let running = app.agent.try_lock().expect("agent").provider();
         let _ = app.handle_slash_model("open-router/vendor/shared");
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
         assert_eq!(app.model_entry.model.provider, "openrouter");
         assert_eq!(session.try_lock().expect("session").entries.len(), before);
         assert!(Arc::ptr_eq(

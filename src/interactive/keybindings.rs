@@ -356,7 +356,7 @@ impl PiApp {
 
     #[allow(clippy::too_many_lines)]
     pub fn cycle_model(&mut self, delta: i32) {
-        if self.agent_state != AgentState::Idle {
+        if self.agent_state != AgentState::Idle || self.model_selection.is_some() {
             self.status_message = Some("Cannot switch models while processing".to_string());
             return;
         }
@@ -445,42 +445,18 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match super::commands::create_runtime_provider(
-            &next,
-            self.extensions.as_ref(),
-            &self.cwd,
-        ) {
-            Ok(provider_impl) => provider_impl,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                return;
-            }
-        };
-        let resolved_key_opt =
-            super::commands::resolve_model_key_from_default_auth(&next, &self.cwd);
-        if crate::models::model_requires_configured_credential(&next) && resolved_key_opt.is_none()
-        {
-            self.status_message = Some(format!(
-                "Missing credentials for provider {}. Run /login {}.",
-                next.model.provider, next.model.provider
-            ));
-            return;
-        }
-
-        if let Err(message) =
-            self.switch_active_model(&next, provider_impl, resolved_key_opt.as_deref(), "cycle")
-        {
+        if let Err(message) = self.request_manual_model_selection(&next, "cycle") {
             self.status_message = Some(message);
-            return;
+        } else if fell_back_to_available {
+            let prefix = "No scoped models matched; cycling all available models.";
+            if let Some(request) = self.model_selection.as_mut() {
+                request.status_prefix = Some(prefix.to_string());
+            }
+            self.status_message = Some(format!(
+                "{prefix} Switching model to {}...",
+                next.model.display_label()
+            ));
         }
-        let label = next.model.display_label();
-        self.status_message = Some(if fell_back_to_available {
-            format!(
-                "No scoped models matched; cycling all available models. Switched model: {label}"
-            )
-        } else {
-            format!("Switched model: {label}")
-        });
     }
 
     pub(super) fn cycle_thinking_level(&mut self) {
@@ -1316,7 +1292,8 @@ mod tests {
             next_headers,
         );
 
-        let mut app = build_test_app(current.clone(), vec![current, next]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, next]);
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
             guard.stream_options_mut().api_key = Some("stale-key".to_string());
@@ -1327,6 +1304,11 @@ mod tests {
         }
 
         app.cycle_model(1);
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         let mut guard = app.agent.try_lock().expect("agent lock");
         assert_eq!(
@@ -1352,7 +1334,8 @@ mod tests {
         let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
         let mut next = model_entry("ollama", "llama3.2", None, HashMap::new());
         next.auth_header = false;
-        let mut app = build_test_app(current.clone(), vec![current, next]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, next]);
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
             guard.stream_options_mut().api_key = Some("stale-key".to_string());
@@ -1363,6 +1346,11 @@ mod tests {
         }
 
         app.cycle_model(1);
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         let mut guard = app.agent.try_lock().expect("agent lock");
         assert!(
@@ -1381,7 +1369,8 @@ mod tests {
         let mut next = model_entry("ollama", "llama3.2", None, HashMap::new());
         next.auth_header = false;
         next.model.reasoning = false;
-        let mut app = build_test_app(current.clone(), vec![current, next]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, next]);
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
@@ -1393,6 +1382,11 @@ mod tests {
         }
 
         app.cycle_model(1);
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         let mut agent_guard = app.agent.try_lock().expect("agent lock");
         assert_eq!(

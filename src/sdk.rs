@@ -3193,6 +3193,21 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// A terminal's explicit selection also permits its existing native
+    /// ad-hoc model syntax, without broadening the public SDK contract.
+    pub(crate) async fn set_model_from_origin(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        origin: &crate::extensions::SessionActionOrigin,
+    ) -> Result<()> {
+        self.session
+            .set_provider_model_from_origin(provider, model_id, origin, true)
+            .await?;
+        self.failover_state.clear();
+        Ok(())
+    }
+
     /// The terminal's plan role is an automatic temporary selection. Preserve
     /// prewalk, but retire an older fallback cycle only after durable install:
     /// its cooldown must not silently replace the newly selected planner.

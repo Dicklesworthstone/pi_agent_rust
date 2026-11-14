@@ -19818,10 +19818,20 @@ impl AgentSession {
         model_id: &str,
         requested_thinking: crate::model::ThinkingLevel,
     ) -> Result<PreparedModelSelection> {
+        self.prepare_model_selection_resolving(provider_id, model_id, requested_thinking, false)
+    }
+
+    fn prepare_model_selection_resolving(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        requested_thinking: crate::model::ThinkingLevel,
+        allow_unlisted_native_model: bool,
+    ) -> Result<PreparedModelSelection> {
         let active_provider = self.agent.provider();
         let requested_matches_active =
             active_provider.name().eq(provider_id) && active_provider.model_id().eq(model_id);
-        let (registry, extension_revision, active_extension_model, active_provider_revision) =
+        let (mut registry, extension_revision, active_extension_model, active_provider_revision) =
             if self.extensions.is_some() {
                 let catalog = self.extension_model_catalog().snapshot()?;
                 (
@@ -19833,9 +19843,13 @@ impl AgentSession {
             } else {
                 (self.model_registry.clone(), None, false, None)
             };
-        let entry = registry
-            .as_ref()
-            .and_then(|registry| registry.find(provider_id, model_id));
+        let entry = registry.as_ref().and_then(|registry| {
+            if allow_unlisted_native_model {
+                registry.resolve(provider_id, model_id)
+            } else {
+                registry.find(provider_id, model_id)
+            }
+        });
 
         let Some(entry) = entry else {
             if !requested_matches_active
@@ -19873,6 +19887,14 @@ impl AgentSession {
             });
         };
 
+        // A terminal command may explicitly select an unlisted native model.
+        // Retain the resolved entry only in this prepared registry; a failed
+        // save must not publish it or revive a retired extension namespace.
+        if let Some(registry) = registry.as_mut()
+            && registry.find(&entry.model.provider, &entry.model.id).is_none()
+        {
+            Arc::make_mut(registry).merge_missing_entries(vec![entry.clone()]);
+        }
         let canonical_provider_id = entry.model.provider.clone();
         let canonical_model_id = entry.model.id.clone();
         let already_active = active_provider.name().eq(&canonical_provider_id)
@@ -19939,10 +19961,35 @@ impl AgentSession {
             provider_id,
             model_id,
             thinking_level,
-            registry,
+            mut registry,
             extension_revision,
             extension_model,
         } = prepared;
+        // Native ad-hoc selection adds a host row only after its Session save
+        // commits. Extension-enabled readers use this shared catalog rather
+        // than self.model_registry. Merge into its newest snapshot instead of
+        // replacing registrations that may have changed during persistence.
+        if !extension_model
+            && let Some(entry) = entry.as_ref()
+            && let Some(region) = &self.extensions
+            && let Ok(mut state) = self.extension_ai_completion.lock()
+            && let Some(live_registry) = state.compaction_models.registry.as_mut()
+        {
+            let admit = !live_registry
+                .extension_provider_was_registered(&entry.model.provider)
+                && live_registry
+                    .find(&entry.model.provider, &entry.model.id)
+                    .is_none();
+            if admit {
+                Arc::make_mut(live_registry).merge_missing_entries(vec![entry.clone()]);
+            }
+            registry = Some(Arc::clone(live_registry));
+            if admit {
+                let models = pi_ai_model_registry_values(live_registry);
+                state.models = models.clone();
+                region.manager().set_extension_models(models);
+            }
+        }
         if let Some(provider) = provider {
             tracing::info!("Updating agent provider to {provider_id}/{model_id}");
             self.agent.set_provider(provider);
@@ -20006,6 +20053,43 @@ impl AgentSession {
             current_thinking,
             ProviderSwapAdmission::Gate(&admission),
             false,
+            false,
+        )
+        .await?;
+        self.agent.disarm_prewalk();
+        if let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
+        Ok(())
+    }
+
+    /// Keep an admitted terminal selection bound to its original Session even
+    /// when provider completion or session-action admission makes it wait.
+    pub(crate) async fn set_provider_model_from_origin(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        origin: &SessionActionOrigin,
+        allow_unlisted_native_model: bool,
+    ) -> Result<()> {
+        self.ensure_provider_reentry_allowed()?;
+        let current_thinking = self
+            .agent
+            .stream_options()
+            .thinking_level
+            .unwrap_or_default();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire_origin(origin).await?;
+        self.set_provider_model_selection(
+            provider_id,
+            model_id,
+            current_thinking,
+            ProviderSwapAdmission::Held(&authority),
+            false,
+            allow_unlisted_native_model,
         )
         .await?;
         self.agent.disarm_prewalk();
@@ -20109,6 +20193,7 @@ impl AgentSession {
             thinking,
             ProviderSwapAdmission::Held(&authority),
             true,
+            false,
         )
         .await
     }
@@ -20123,6 +20208,7 @@ impl AgentSession {
         thinking: crate::model::ThinkingLevel,
         admission: ProviderSwapAdmission<'_>,
         automatic: bool,
+        allow_unlisted_native_model: bool,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -20182,7 +20268,12 @@ impl AgentSession {
         }
         // Respect a newer explicit selection before refreshing credentials for
         // an automatic destination that will no longer be used.
-        let prepared = self.prepare_model_selection(provider_id, model_id, thinking)?;
+        let prepared = self.prepare_model_selection_resolving(
+            provider_id,
+            model_id,
+            thinking,
+            allow_unlisted_native_model,
+        )?;
         let target_provider_id = prepared.provider_id.clone();
         let target_model_id = prepared.model_id.clone();
         let next_thinking = prepared.thinking_level;
@@ -20369,6 +20460,7 @@ impl AgentSession {
             &source.model_id,
             source.thinking_level,
             ProviderSwapAdmission::Held(&authority),
+            false,
             false,
         )
         .await?;

@@ -4250,6 +4250,7 @@ impl PiFtuiModel {
         }
         match msg {
             PiMsg::HandoffFinished { .. }
+            | PiMsg::ModelSelectionFinished { .. }
             | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
             | PiMsg::GoalFinished { .. }

@@ -19,7 +19,7 @@ use futures::stream;
 use pi::agent::{Agent, AgentConfig};
 use pi::config::Config;
 use pi::interactive::{
-    PiApp, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
+    PiApp, PiMsg, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,
 };
 use pi::keybindings::KeyBindings;
@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock};
 
 // ── Test infrastructure ─────────────────────────────────────────────
 
-fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
+fn test_runtime() -> &'static asupersync::runtime::Runtime {
     static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         asupersync::runtime::RuntimeBuilder::multi_thread()
@@ -43,7 +43,10 @@ fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
             .build()
             .expect("build asupersync runtime")
     })
-    .handle()
+}
+
+fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
+    test_runtime().handle()
 }
 
 struct DummyProvider;
@@ -120,12 +123,39 @@ fn build_app_with_models_and_config(
     available: Vec<ModelEntry>,
     config: Config,
 ) -> PiApp {
+    build_app_with_models_and_config_and_events(harness, current, scope, available, config).0
+}
+
+fn build_app_with_models_and_events(
+    harness: &TestHarness,
+    current: ModelEntry,
+    scope: Vec<ModelEntry>,
+    available: Vec<ModelEntry>,
+) -> (PiApp, mpsc::Receiver<PiMsg>) {
+    build_app_with_models_and_config_and_events(
+        harness,
+        current,
+        scope,
+        available,
+        Config::default(),
+    )
+}
+
+fn build_app_with_models_and_config_and_events(
+    harness: &TestHarness,
+    current: ModelEntry,
+    scope: Vec<ModelEntry>,
+    available: Vec<ModelEntry>,
+    config: Config,
+) -> (PiApp, mpsc::Receiver<PiMsg>) {
     let config = common::hermetic_interactive_config(config);
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
-    let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+    let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(Some(
+        harness.temp_dir().join("sessions"),
+    ))));
     let resources = ResourceLoader::empty(config.enable_skill_commands());
     let resource_cli = ResourceCliOptions {
         no_skills: false,
@@ -137,7 +167,7 @@ fn build_app_with_models_and_config(
         extension_paths: Vec::new(),
         theme_paths: Vec::new(),
     };
-    let (event_tx, _event_rx) = mpsc::channel(1024);
+    let (event_tx, event_rx) = mpsc::channel(1024);
 
     let mut app = PiApp::new(
         agent,
@@ -162,7 +192,26 @@ fn build_app_with_models_and_config(
         None,
     );
     app.set_terminal_size(80, 24);
-    app
+    (app, event_rx)
+}
+
+fn settle_model_selection(app: &mut PiApp, events: &mut mpsc::Receiver<PiMsg>) {
+    let event = test_runtime().block_on(async {
+        let cx = asupersync::Cx::for_testing();
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(10),
+            events.recv(&cx),
+        )
+        .await
+        .expect("model selection must finish")
+        .expect("model selection completion")
+    });
+    assert!(
+        matches!(&event, PiMsg::ModelSelectionFinished { error: None, .. }),
+        "unexpected model selection result: {event:?}"
+    );
+    let _ = BubbleteaModel::update(app, bubbletea::Message::new(event));
 }
 
 fn get_status(app: &PiApp) -> Option<&str> {
@@ -608,20 +657,20 @@ fn model_selector_enter_with_no_match_shows_status() {
 fn model_selector_enter_selecting_current_model() {
     let harness = TestHarness::new("model_selector_same");
     let current = make_model_entry("anthropic", "claude-sonnet-4");
+    let expected = format!("Switched model: {}", current.model.display_label());
     let available = vec![
         make_model_entry("anthropic", "claude-sonnet-4"),
         make_model_entry("openai", "gpt-4o"),
     ];
-    let mut app = build_app_with_models(&harness, current, vec![], available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, vec![], available);
 
     app.open_model_selector();
     // First item (sorted) is anthropic/claude-sonnet-4, which is current
     app.handle_model_selector_key(&KeyMsg::from_type(KeyType::Enter));
+    settle_model_selection(&mut app, &mut events);
     assert!(app.model_selector().is_none());
-    assert_eq!(
-        get_status(&app),
-        Some("Already using anthropic/claude-sonnet-4")
-    );
+    assert_eq!(get_status(&app), Some(expected.as_str()));
 }
 
 #[test]
@@ -661,10 +710,12 @@ fn cycle_model_forward_wraps_around() {
         make_model_entry("openai", "gpt-4o"),
         make_model_entry("google", "gemini-pro"),
     ];
-    let mut app = build_app_with_models(&harness, current, vec![], available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, vec![], available);
 
     // cycle_model(1) = forward
     app.cycle_model(1);
+    settle_model_selection(&mut app, &mut events);
 
     // After cycling forward from anthropic/claude-sonnet-4 (sorted first),
     // next should be google/gemini-pro (sorted second)
@@ -684,10 +735,12 @@ fn cycle_model_backward_wraps_to_end() {
         make_model_entry("openai", "gpt-4o"),
         make_model_entry("google", "gemini-pro"),
     ];
-    let mut app = build_app_with_models(&harness, current, vec![], available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, vec![], available);
 
     // cycle_model(-1) = backward
     app.cycle_model(-1);
+    settle_model_selection(&mut app, &mut events);
 
     // Cycling backward from first (anthropic/claude-sonnet-4) wraps to last (openai/gpt-4o)
     let status = get_status(&app).unwrap_or("");
@@ -707,9 +760,11 @@ fn cycle_model_status_names_a_models_json_display_name() {
     let mut named = make_model_entry("openai", "deepseek-v4-pro");
     named.model.name = "DeepSeek V4 Pro".to_string();
     let available = vec![make_model_entry("anthropic", "claude-sonnet-4"), named];
-    let mut app = build_app_with_models(&harness, current, vec![], available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, vec![], available);
 
     app.cycle_model(1);
+    settle_model_selection(&mut app, &mut events);
 
     let status = get_status(&app).unwrap_or("");
     assert_eq!(
@@ -756,9 +811,11 @@ fn cycle_model_uses_scope_when_set() {
         make_model_entry("openai", "gpt-4o"),
         make_model_entry("google", "gemini-pro"),
     ];
-    let mut app = build_app_with_models(&harness, current, scope, available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, scope, available);
 
     app.cycle_model(1);
+    settle_model_selection(&mut app, &mut events);
 
     // With scope, should cycle within scope only (2 models)
     let status = get_status(&app).unwrap_or("");
@@ -799,9 +856,11 @@ fn cycle_model_empty_scope_with_config_falls_back_to_available_models() {
         ..Config::default()
     };
 
-    let mut app = build_app_with_models_and_config(&harness, current, vec![], available, config);
+    let (mut app, mut events) =
+        build_app_with_models_and_config_and_events(&harness, current, vec![], available, config);
 
     app.cycle_model(1);
+    settle_model_selection(&mut app, &mut events);
 
     let status = get_status(&app).unwrap_or("");
     assert!(
@@ -826,7 +885,8 @@ fn cycle_model_deterministic_ordering() {
         make_model_entry("google", "gemini-pro"),
         make_model_entry("anthropic", "claude-sonnet-4"),
     ];
-    let mut app = build_app_with_models(&harness, current, vec![], available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, vec![], available);
 
     // Sorted order:
     // anthropic/claude-opus-4 (0)
@@ -837,6 +897,7 @@ fn cycle_model_deterministic_ordering() {
 
     // Forward from openai/gpt-4o (index 3) → openai/gpt-4o-mini (index 4)
     app.cycle_model(1);
+    settle_model_selection(&mut app, &mut events);
     let status = get_status(&app).unwrap_or("");
     assert!(
         status.contains("openai/gpt-4o-mini"),
@@ -844,9 +905,7 @@ fn cycle_model_deterministic_ordering() {
     );
 }
 
-// Note: back-to-back cycle_model calls are not tested because spawn_save_session()
-// holds the session lock asynchronously, causing the second call to get "Session busy".
-// Individual forward and backward tests cover both directions independently.
+// Each committed selection above is consumed through the public UI event path.
 
 // ═══════════════════════════════════════════════════════════════════
 // 4. Resolve + cycling integration
@@ -861,9 +920,11 @@ fn resolve_then_cycle_respects_scope() {
 
     let harness = TestHarness::new("resolve_cycle");
     let current = scope[0].clone(); // claude-opus-4 (first alphabetically)
-    let mut app = build_app_with_models(&harness, current, scope, available);
+    let (mut app, mut events) =
+        build_app_with_models_and_events(&harness, current, scope, available);
 
     app.cycle_model(1);
+    settle_model_selection(&mut app, &mut events);
     let status = get_status(&app).unwrap_or("");
     assert!(
         status.contains("claude-sonnet-4"),

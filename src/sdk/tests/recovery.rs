@@ -1733,6 +1733,171 @@ fn saving_fallback_selection_handle(dir: &Path) -> AgentSessionHandle {
 }
 
 #[test]
+fn terminal_model_selection_refuses_an_origin_replaced_while_waiting() {
+    let directory = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(directory.path());
+    let original = handle.model();
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let gate = handle.session.session_action_admission_gate();
+    let origin = gate.capture_origin();
+    run_async(async {
+        let cx = asupersync::Cx::for_testing();
+        let held = gate.acquire(&cx).await.unwrap();
+        let mut selection =
+            Box::pin(handle.set_model_from_origin(&original.0, &original.1, &origin));
+        assert!(futures::poll!(selection.as_mut()).is_pending());
+        gate.advance_generation();
+        drop(held);
+        selection
+            .await
+            .expect_err("replaced origin must be refused");
+    });
+    assert_eq!(handle.model(), original);
+    assert_eq!(
+        handle.failover_state.lifecycle_id(),
+        Some("selection-fixture")
+    );
+    assert_eq!(handle.failover_state.chain_position(), 2);
+    assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn terminal_native_selection_publishes_extension_catalog_only_after_durable_save() {
+    for fail_save in [false, true] {
+        let directory = tempdir().unwrap();
+        let extension = directory.path().join("manual-selection-catalog.mjs");
+        std::fs::write(
+            &extension,
+            r#"export default function init(pi) {
+  pi.registerCommand("inspect-manual-selection", {
+    description: "Inspect the live native model catalog",
+    handler: (_args, ctx) =>
+      ctx.modelRegistry.find("ollama", "manual-selection-unlisted") ?? null
+  });
+}
+"#,
+        )
+        .unwrap();
+        let mut handle = saving_handle(directory.path());
+        handle
+            .session
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                Vec::new(),
+            ));
+        run_async(async {
+            handle
+                .session
+                .enable_extensions(&[], directory.path(), None, &[extension])
+                .await
+                .unwrap();
+            handle.session.persist_session().await.unwrap();
+            let manager = handle
+                .session
+                .extensions
+                .as_ref()
+                .unwrap()
+                .manager()
+                .clone();
+            let catalog = handle.session.extension_model_catalog();
+            let original = handle.model();
+            let path = handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .path
+                .clone()
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                catalog
+                    .snapshot()
+                    .unwrap()
+                    .find("ollama", "manual-selection-unlisted")
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .execute_command("inspect-manual-selection", "", 5_000)
+                    .await
+                    .unwrap()
+                    .is_null()
+            );
+            handle
+                .set_model("ollama", "manual-selection-unlisted")
+                .await
+                .expect_err("public SDK selection remains registered-only");
+            if fail_save {
+                let blocked = directory.path().join("blocked-native-selection.jsonl");
+                std::fs::create_dir(&blocked).unwrap();
+                handle.session_store().try_lock().unwrap().path = Some(blocked);
+            }
+            let origin = handle
+                .session
+                .session_action_admission_gate()
+                .capture_origin();
+            let result = handle
+                .set_model_from_origin("ollama", "manual-selection-unlisted", &origin)
+                .await;
+            let shared = catalog
+                .snapshot()
+                .unwrap()
+                .find("ollama", "manual-selection-unlisted");
+            let context_model = manager
+                .execute_command("inspect-manual-selection", "", 5_000)
+                .await
+                .unwrap();
+            if fail_save {
+                assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+                assert_eq!(handle.model(), original);
+                assert!(shared.is_none());
+                assert!(context_model.is_null());
+                assert!(
+                    handle
+                        .session
+                        .model_registry_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .find("ollama", "manual-selection-unlisted")
+                        .is_none()
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            } else {
+                result.unwrap();
+                let selected = handle
+                    .session
+                    .current_model_entry()
+                    .expect("selected native metadata");
+                assert_eq!(selected.model.provider, "ollama");
+                assert_eq!(selected.model.id, "manual-selection-unlisted");
+                let shared = shared.expect("native entry published to shared catalog");
+                assert_eq!(shared.model.base_url, selected.model.base_url);
+                assert_eq!(shared.model.context_window, selected.model.context_window);
+                assert_eq!(context_model["provider"], "ollama");
+                assert_eq!(context_model["id"], "manual-selection-unlisted");
+                assert_eq!(context_model["contextWindow"], selected.model.context_window);
+                let reopened = Session::open(&path.display().to_string()).await.unwrap();
+                assert_eq!(
+                    reopened.effective_model_for_current_path(),
+                    Some((
+                        "ollama".to_string(),
+                        "manual-selection-unlisted".to_string()
+                    ))
+                );
+            }
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+}
+
+#[test]
 fn explicitly_selecting_the_fallback_cancels_restoration_durably() {
     let dir = tempdir().unwrap();
     let mut handle = saving_fallback_selection_handle(dir.path());

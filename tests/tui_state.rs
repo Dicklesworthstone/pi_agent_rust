@@ -317,6 +317,16 @@ fn build_app_with_extension_and_mcp(
     (app, event_rx, manager)
 }
 
+fn model_selection_runtime() -> &'static asupersync::runtime::Runtime {
+    static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("build model selection runtime")
+    })
+}
+
 fn build_app_with_models(
     harness: &TestHarness,
     session: Session,
@@ -326,6 +336,27 @@ fn build_app_with_models(
     available_models: Vec<ModelEntry>,
     keybindings: KeyBindings,
 ) -> PiApp {
+    build_app_with_models_and_events(
+        harness,
+        session,
+        config,
+        model_entry,
+        model_scope,
+        available_models,
+        keybindings,
+    )
+    .0
+}
+
+fn build_app_with_models_and_events(
+    harness: &TestHarness,
+    session: Session,
+    config: Config,
+    model_entry: ModelEntry,
+    model_scope: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
+    keybindings: KeyBindings,
+) -> (PiApp, mpsc::Receiver<PiMsg>) {
     let config = common::hermetic_interactive_config(config);
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
@@ -342,7 +373,7 @@ fn build_app_with_models(
         extension_paths: Vec::new(),
         theme_paths: Vec::new(),
     };
-    let (event_tx, _event_rx) = mpsc::channel(1024);
+    let (event_tx, event_rx) = mpsc::channel(1024);
     let (messages, usage) = conversation_from_session(&session);
     let session = Arc::new(Mutex::new(session));
 
@@ -359,7 +390,7 @@ fn build_app_with_models(
         None,
         Vec::new(),
         event_tx,
-        test_runtime_handle(),
+        model_selection_runtime().handle(),
         false,
         false,
         None,
@@ -369,7 +400,7 @@ fn build_app_with_models(
         None,
     );
     app.set_terminal_size(80, 24);
-    app
+    (app, event_rx)
 }
 
 fn read_project_settings_json(harness: &TestHarness) -> serde_json::Value {
@@ -892,6 +923,29 @@ fn apply_msg(harness: &TestHarness, app: &mut PiApp, label: &str, msg: Message) 
 
 fn apply_pi(harness: &TestHarness, app: &mut PiApp, label: &str, msg: PiMsg) -> StepOutcome {
     apply_msg(harness, app, label, Message::new(msg))
+}
+
+fn finish_model_selection(
+    harness: &TestHarness,
+    app: &mut PiApp,
+    events: &mut mpsc::Receiver<PiMsg>,
+) -> StepOutcome {
+    let event = model_selection_runtime().block_on(async {
+        let cx = asupersync::Cx::for_testing();
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(10),
+            events.recv(&cx),
+        )
+        .await
+        .expect("model selection must finish")
+        .expect("model selection completion")
+    });
+    assert!(
+        matches!(&event, PiMsg::ModelSelectionFinished { error: None, .. }),
+        "unexpected model selection result: {event:?}"
+    );
+    apply_pi(harness, app, "model-selection-finished", event)
 }
 
 fn apply_conversation_reset(
@@ -3064,7 +3118,7 @@ fn tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp() {
     let model_scope = Vec::new();
     let available_models = vec![anthropic.clone(), openai, google];
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -3087,7 +3141,8 @@ fn tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp() {
         Some(vec!["openai/*"])
     );
 
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
 }
 
@@ -3111,7 +3166,7 @@ fn tui_state_slash_scoped_models_no_matches_warns_and_ctrlp_falls_back() {
     let model_scope = Vec::new();
     let available_models = vec![anthropic.clone(), openai, google];
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -3138,7 +3193,8 @@ fn tui_state_slash_scoped_models_no_matches_warns_and_ctrlp_falls_back() {
         Some(vec!["does-not-match/*"])
     );
 
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(
         &harness,
         &step,
@@ -3166,7 +3222,7 @@ fn tui_state_slash_scoped_models_clear_persists_and_restores_all_models() {
     let model_scope = Vec::new();
     let available_models = vec![anthropic.clone(), openai, google];
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -3192,7 +3248,8 @@ fn tui_state_slash_scoped_models_clear_persists_and_restores_all_models() {
         Some(0)
     );
 
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: google/gemini-a");
 }
 
@@ -3217,7 +3274,7 @@ fn tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header() {
     let model_scope = vec![openai.clone(), anthropic.clone()];
     let available_models = vec![google, openai, anthropic.clone()];
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -3227,7 +3284,8 @@ fn tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header() {
         KeyBindings::new(),
     );
 
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
 
     let session_handle = app.session_handle();
@@ -3237,6 +3295,7 @@ fn tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header() {
     drop(session_guard);
 
     press_ctrlp(&harness, &mut app);
+    finish_model_selection(&harness, &mut app, &mut events);
     let session_guard = session_handle.try_lock().expect("session lock");
     assert_eq!(session_guard.header.provider.as_deref(), Some("anthropic"));
     assert_eq!(session_guard.header.model_id.as_deref(), Some("claude-a"));
@@ -3262,7 +3321,7 @@ fn tui_state_ctrlp_cycles_models_without_scope_uses_available_models() {
     let available_models = vec![openai, google, anthropic.clone()];
     let model_scope = Vec::new();
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -3273,6 +3332,7 @@ fn tui_state_ctrlp_cycles_models_without_scope_uses_available_models() {
     );
 
     press_ctrlp(&harness, &mut app);
+    finish_model_selection(&harness, &mut app, &mut events);
     let session_handle = app.session_handle();
     let session_guard = session_handle.try_lock().expect("session lock");
     assert_eq!(session_guard.header.provider.as_deref(), Some("google"));
@@ -3305,7 +3365,7 @@ fn tui_state_cycle_model_backward_can_be_bound_and_updates_session_header() {
     let model_scope = vec![openai.clone(), anthropic.clone()];
     let available_models = vec![anthropic, openai];
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -3316,6 +3376,7 @@ fn tui_state_cycle_model_backward_can_be_bound_and_updates_session_header() {
     );
 
     press_ctrlo(&harness, &mut app);
+    finish_model_selection(&harness, &mut app, &mut events);
     let session_handle = app.session_handle();
     let session_guard = session_handle.try_lock().expect("session lock");
     assert_eq!(session_guard.header.provider.as_deref(), Some("anthropic"));
@@ -6824,7 +6885,7 @@ fn tui_state_model_selector_select_switches_model() {
     let available_models = vec![anthropic.clone(), openai];
     let model_scope = Vec::new();
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -6838,7 +6899,8 @@ fn tui_state_model_selector_select_switches_model() {
     // Navigate to second model (openai/gpt-a)
     press_down(&harness, &mut app);
     // Select it
-    let step = press_enter(&harness, &mut app);
+    press_enter(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     // Overlay should close and model should switch
     assert_after_not_contains(&harness, &step, "Select a model");
     assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
@@ -6851,8 +6913,9 @@ fn tui_state_model_selector_select_switches_model() {
 }
 
 #[test]
-fn tui_state_model_selector_select_current_shows_already_using() {
-    let harness = TestHarness::new("tui_state_model_selector_select_current_shows_already_using");
+fn tui_state_model_selector_select_current_commits_explicit_choice() {
+    let harness =
+        TestHarness::new("tui_state_model_selector_select_current_commits_explicit_choice");
 
     let anthropic = make_model_entry(
         "anthropic",
@@ -6864,7 +6927,7 @@ fn tui_state_model_selector_select_current_shows_already_using() {
     let available_models = vec![anthropic.clone(), openai];
     let model_scope = Vec::new();
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -6876,8 +6939,9 @@ fn tui_state_model_selector_select_current_shows_already_using() {
 
     press_ctrll(&harness, &mut app);
     // Select first model (same as current)
-    let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Already using");
+    press_enter(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
+    assert_after_contains(&harness, &step, "Switched model: anthropic/claude-a");
 }
 
 #[test]
@@ -6978,7 +7042,7 @@ fn tui_state_ctrlp_cycling_wraps_forward_through_all_models() {
     let available_models = vec![openai, google, anthropic.clone()];
     let model_scope = Vec::new();
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -6990,15 +7054,18 @@ fn tui_state_ctrlp_cycling_wraps_forward_through_all_models() {
 
     // Sorted order: anthropic/claude-a, google/gemini-a, openai/gpt-a
     // Current: anthropic/claude-a → next: google/gemini-a
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: google/gemini-a");
 
     // google/gemini-a → openai/gpt-a
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
 
     // openai/gpt-a → wraps to anthropic/claude-a
-    let step = press_ctrlp(&harness, &mut app);
+    press_ctrlp(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: anthropic/claude-a");
 }
 
@@ -7457,7 +7524,7 @@ fn tui_state_model_selector_jk_navigation() {
     let available_models = vec![anthropic.clone(), openai, google];
     let model_scope = Vec::new();
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -7473,7 +7540,8 @@ fn tui_state_model_selector_jk_navigation() {
     type_text(&harness, &mut app, "j");
     type_text(&harness, &mut app, "j");
     // Select it with Enter
-    let step = press_enter(&harness, &mut app);
+    press_enter(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     // Third model in sorted order: anthropic/claude-a, google/gemini-a, openai/gpt-a
     // Start at idx 0 → j → idx 1 → j → idx 2 → Enter selects openai/gpt-a
     assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
@@ -7498,7 +7566,7 @@ fn tui_state_model_selector_filter_then_select() {
     let available_models = vec![anthropic.clone(), openai, google];
     let model_scope = Vec::new();
 
-    let mut app = build_app_with_models(
+    let (mut app, mut events) = build_app_with_models_and_events(
         &harness,
         Session::in_memory(),
         Config::default(),
@@ -7513,7 +7581,8 @@ fn tui_state_model_selector_filter_then_select() {
     // Type filter text that matches only gemini
     type_text(&harness, &mut app, "gemini");
     // First filtered result should be auto-selected, press Enter to confirm
-    let step = press_enter(&harness, &mut app);
+    press_enter(&harness, &mut app);
+    let step = finish_model_selection(&harness, &mut app, &mut events);
     assert_after_contains(&harness, &step, "Switched model: google/gemini-a");
     assert_after_not_contains(&harness, &step, "Select a model");
 }
