@@ -288,6 +288,7 @@ struct Candidate {
 /// Request-owned recovery data, never persisted or kept in the shared cache.
 /// The original encoded bytes are moved out of each staged part, once per
 /// distinct blob, rather than cloning the complete pre-upload request body.
+/// Retaining a prepared request does not pin idle metadata cache entries.
 pub(super) struct PreparedFiles {
     endpoint: Endpoint,
     owner: AgentCx,
@@ -298,7 +299,6 @@ pub(super) struct PreparedFiles {
 }
 
 struct PreparedFile {
-    slot: FileSlot,
     remote: RemoteFile,
     mime: String,
     encoded: String,
@@ -308,7 +308,6 @@ struct PreparedFile {
 }
 
 struct StagedFile {
-    slot: FileSlot,
     remote: RemoteFile,
     replacement_used: bool,
 }
@@ -488,7 +487,6 @@ impl FileCache {
                 prepared.insert(
                     key,
                     PreparedFile {
-                        slot: staged.slot,
                         remote: staged.remote,
                         mime: mime.clone(),
                         encoded,
@@ -607,7 +605,6 @@ impl FileCache {
         )
         .await?;
         Ok(StagedFile {
-            slot,
             remote,
             replacement_used,
         })
@@ -702,7 +699,7 @@ async fn recover_files(
     body: &mut Value,
 ) -> Result<bool> {
     let mut changed = false;
-    for file in files.values_mut() {
+    for (key, file) in files.iter_mut() {
         checkpoint(context.owner)?;
         for pointer in &file.pointers {
             let part = body.pointer(pointer).and_then(|part| part.get("fileData"));
@@ -714,9 +711,14 @@ async fn recover_files(
                 return Err(files_error("staged media changed before recovery"));
             }
         }
-        // Pin the same slot used at preparation. An older generation must not
-        // evict or overwrite a newer request's replacement for this content.
-        let mut cached = OwnedMutexGuard::lock(Arc::clone(&file.slot), context.owner.cx())
+        // Completed uploads are evictable even while their generation is in
+        // flight: pinning every prepared file would make one request larger
+        // than the metadata cache permanently fail on its 65th upload. Recover
+        // through the current content slot, which may have been recreated, so
+        // an older generation observes a newer request's replacement instead
+        // of writing into an obsolete slot. Only active I/O pins the slot.
+        let slot = cache.slot(*key)?;
+        let mut cached = OwnedMutexGuard::lock(slot, context.owner.cx())
             .await
             .map_err(|_| {
                 files_error("media recovery cancelled while waiting for its content lock")
@@ -736,6 +738,14 @@ async fn recover_files(
         if !stale {
             // A still-live input does not turn a model/prompt failure into a
             // media retry. In particular, FAILED is not a replacement signal.
+            // Refill an evicted slot from this authenticated observation, but
+            // never replace a newer request's different remote resource.
+            if cached
+                .as_ref()
+                .is_none_or(|current| current.uri == file.remote.uri)
+            {
+                *cached = observed;
+            }
             continue;
         }
         if file.replacement_used {
@@ -2722,6 +2732,123 @@ mod tests {
         drop(state);
     }
 
+    /// Admit unrelated idle entries through the ordinary bounded LRU rather
+    /// than removing the slot by hand. No upload is in flight while evicting.
+    fn evict_file_slot(cache: &FileCache, key: ContentKey) {
+        for index in 0..MAX_CACHE_ENTRIES {
+            let mut unrelated = key;
+            unrelated[0] ^= 1;
+            unrelated[1] = u8::try_from(index).unwrap();
+            drop(cache.slot(unrelated).unwrap());
+        }
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), MAX_CACHE_ENTRIES);
+        assert!(!state.entries.contains_key(&key));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn provider_stages_more_files_than_cache_capacity_and_reuses_recent_content() {
+        let count = MAX_CACHE_ENTRIES + 1;
+        let payloads: Vec<_> = (0..count)
+            .map(|index| vec![u8::try_from(index).unwrap(), 42, 255])
+            .collect();
+        let server = Server::start(|endpoint| {
+            let mut replies = Vec::new();
+            for index in 0..count {
+                replies.extend([
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(
+                        endpoint, &format!("item-{index}"), "ACTIVE", 3
+                    )})),
+                ]);
+            }
+            replies.extend([
+                Reply::sse("all recordings accepted"),
+                Reply::json(&file_metadata(
+                    endpoint,
+                    &format!("item-{}", count - 1),
+                    "ACTIVE",
+                    3,
+                )),
+                Reply::sse("recent recording reused"),
+            ]);
+            replies
+        });
+        let provider = fixture_provider(&server);
+        let options = fixture_options();
+        let context = Context::owned(
+            None,
+            vec![Message::User(UserMessage {
+                content: UserContent::Blocks(
+                    payloads
+                        .iter()
+                        .map(|bytes| ContentBlock::Media(MediaContent {
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                            mime_type: "audio/wav".to_string(),
+                            name: None,
+                        }))
+                        .collect(),
+                ),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        run_async(async {
+            let events = fixture_events(&provider, &context, &options).await.unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { delta, .. } if delta == "all recordings accepted"
+            )));
+            assert_eq!(
+                provider.files.state.lock().unwrap().entries.len(),
+                MAX_CACHE_ENTRIES
+            );
+            let recent = Context::owned(
+                None,
+                vec![Message::User(UserMessage {
+                    content: UserContent::Blocks(vec![ContentBlock::Media(MediaContent {
+                        data: base64::engine::general_purpose::STANDARD
+                            .encode(payloads.last().unwrap()),
+                        mime_type: "audio/wav".to_string(),
+                        name: None,
+                    })]),
+                    timestamp: 1,
+                })],
+                Vec::new(),
+            );
+            let events = fixture_events(&provider, &recent, &options).await.unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { delta, .. } if delta == "recent recording reused"
+            )));
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), count * 2 + 3);
+        for (index, bytes) in payloads.iter().enumerate() {
+            assert_eq!(requests[index * 2].path, "/upload/v1beta/files");
+            assert_request_credentials(&requests[index * 2]);
+            assert_eq!(&requests[index * 2 + 1].body, bytes);
+        }
+        let generation: Value = serde_json::from_slice(&requests[count * 2].body).unwrap();
+        let parts = generation["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), count);
+        for (index, part) in parts.iter().enumerate() {
+            assert!(part.get("inlineData").is_none());
+            assert!(
+                part["fileData"]["fileUri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/item-{index}"))
+            );
+        }
+        assert_eq!(requests[count * 2 + 1].method, "GET");
+        assert_eq!(
+            requests[count * 2 + 1].path,
+            format!("/v1beta/files/item-{}", count - 1)
+        );
+    }
+
     #[test]
     fn upload_reuses_padded_and_unpadded_content_across_parts_and_turns() {
         let server = Server::start(|endpoint| {
@@ -3204,6 +3331,9 @@ mod tests {
             assert_eq!(file.encoded, "YWJj");
             assert_eq!(file.pointers.len(), 2);
             assert!(!body.to_string().contains("YWJj"));
+            let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+            evict_file_slot(&cache, key);
+            let slot = cache.slot(key).unwrap();
             let concurrent = RemoteFile::parse(
                 &file_metadata(&server.endpoint, "concurrent", "ACTIVE", 3),
                 &server.endpoint,
@@ -3211,7 +3341,7 @@ mod tests {
                 3,
             )
             .unwrap();
-            *file.slot.lock(prepared.owner.cx()).await.unwrap() = Some(concurrent.clone());
+            *slot.lock(prepared.owner.cx()).await.unwrap() = Some(concurrent.clone());
             assert!(
                 recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
                     .await
@@ -3221,8 +3351,7 @@ mod tests {
             assert!(file.replacement_used);
             assert_eq!(file.remote.uri, concurrent.uri);
             assert_eq!(
-                file.slot
-                    .lock(prepared.owner.cx())
+                slot.lock(prepared.owner.cx())
                     .await
                     .unwrap()
                     .as_ref()
@@ -3256,6 +3385,136 @@ mod tests {
                     .map(String::as_str),
                 Some("a")
             );
+        }
+    }
+
+    #[test]
+    fn concurrent_generation_recovery_recreates_one_slot_and_replaces_only_once() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::json(&file_metadata(endpoint, "old", "ACTIVE", 3)),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "replacement", "ACTIVE", 3)})),
+                Reply::status(404),
+                Reply::json(&file_metadata(endpoint, "replacement", "ACTIVE", 3)),
+                Reply::status(404),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+        let mut left = media_body(b"abc");
+        let mut right = left.clone();
+        run_async(async {
+            let (a, b) = futures::join!(
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut left),
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut right),
+            );
+            let mut a = a.unwrap();
+            let mut b = b.unwrap();
+            assert_eq!(left, right);
+            evict_file_slot(&cache, key);
+
+            let (a_recovered, b_recovered) = futures::join!(
+                recover_fixture(&mut a, &cache, &client, &auth, &mut left),
+                recover_fixture(&mut b, &cache, &client, &auth, &mut right),
+            );
+            assert!(a_recovered.unwrap());
+            assert!(b_recovered.unwrap());
+            assert_eq!(left, right);
+            for prepared in [&a, &b] {
+                let file = prepared.files.get(&key).unwrap();
+                assert!(file.replacement_used);
+                assert!(file.remote.uri.ends_with("/replacement"));
+            }
+            let current = cache.slot(key).unwrap();
+            assert!(
+                current
+                    .lock(a.owner.cx())
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .uri
+                    .ends_with("/replacement")
+            );
+            drop(current);
+
+            // Cache eviction cannot reset this request's one-replacement bit.
+            // Exercise the shared recovery core after a second disappearance;
+            // the provider's outer lifecycle separately prohibits a third try.
+            evict_file_slot(&cache, key);
+            let before = left.clone();
+            let error = recover_fixture(&mut a, &cache, &client, &auth, &mut left)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("after one replacement"));
+            assert_eq!(left, before);
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            4,
+            "one cold upload and one shared replacement"
+        );
+        assert_eq!(requests[1].body, b"abc");
+        assert_eq!(requests[5].body, b"abc");
+        assert_eq!(requests[3].path, "/v1beta/files/old");
+        assert_eq!(requests[6].path, "/v1beta/files/old");
+        assert_eq!(requests[7].path, "/v1beta/files/replacement");
+        assert_eq!(requests[8].path, "/v1beta/files/replacement");
+    }
+
+    #[test]
+    fn recovery_repopulates_evicted_live_metadata_without_retrying_or_reuploading() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "live", "ACTIVE", 3)})),
+                Reply::json(&file_metadata(endpoint, "live", "ACTIVE", 3)),
+                Reply::json(&file_metadata(endpoint, "live", "ACTIVE", 3)),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+        let mut body = media_body(b"abc");
+        run_async(async {
+            let mut prepared =
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut body)
+                    .await
+                    .unwrap();
+            let original = body.clone();
+            evict_file_slot(&cache, key);
+            assert!(
+                !recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(body, original);
+            assert!(!prepared.files[&key].replacement_used);
+
+            let mut next_turn = media_body(b"abc");
+            stage(&cache, &client, &server.endpoint, &auth, &mut next_turn)
+                .await
+                .unwrap();
+            assert_eq!(next_turn, original);
+            assert_eq!(cache.state.lock().unwrap().entries.len(), MAX_CACHE_ENTRIES);
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 4, "an observed live file is still reusable");
+        for request in &requests[2..] {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/v1beta/files/live");
         }
     }
 
