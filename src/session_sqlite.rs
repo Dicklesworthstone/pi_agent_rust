@@ -213,10 +213,23 @@ fn opened_sidecar_is_read_only(path: &Path) -> Result<bool> {
 /// (`opened_sidecar_is_read_only`). fsqlite rebuilds the WAL index and its
 /// namespace sidecars beside the copy, which a read-only connection cannot do
 /// ("recovery in progress"), so the copy is opened read-write; callers only
-/// read through it and it is discarded with the connection. The WAL family is
-/// copied first, so a checkpoint between the copies only moves committed pages
-/// into the database copy and never drops them.
+/// read through it and it is discarded with the connection. Retain the
+/// rollback journal too: omitting it could expose pages whose transaction
+/// still requires recovery. Copying these files does not establish a coherent
+/// snapshot of a concurrently modified source.
 fn open_read_only_snapshot(path: &Path) -> Result<SqliteConnection> {
+    // Check even the companions that the private connection reconstructs.
+    // An early read-only WAL/SHM match must not bypass the source family's
+    // regular-file and read-access checks. Metadata-only validation avoids
+    // opening and closing a second SHM descriptor, which could release a
+    // native connection's process-scoped locks on that file.
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let source = append_sidecar_suffix(path, suffix);
+        if ensure_regular_sqlite_artifact_if_present(&source)? {
+            crate::session::ensure_session_file_readable(&source)
+                .map_err(|err| Error::Io(Box::new(err)))?;
+        }
+    }
     let snapshot = tempfile::Builder::new()
         .prefix("pi-session-snapshot-")
         .tempdir()
@@ -228,7 +241,7 @@ fn open_read_only_snapshot(path: &Path) -> Result<SqliteConnection> {
         ))
     })?;
     let copy = snapshot.path().join(name);
-    for suffix in ["-wal-cert-head", "-wal-cert", "-wal", ""] {
+    for suffix in ["-wal-cert-head", "-wal-cert", "-wal", "-journal", ""] {
         let source = append_sidecar_suffix(path, suffix);
         if !suffix.is_empty() && !ensure_regular_sqlite_artifact_if_present(&source)? {
             continue;
@@ -2094,6 +2107,181 @@ mod tests {
             2,
             "refused read must not create runtime companions or a persistence lock"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_snapshot_retains_rollback_journal_validation_without_source_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for malformed in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("source.sqlite");
+            let header = SessionHeader {
+                id: "sqlite-readonly-snapshot-journal".to_string(),
+                ..SessionHeader::default()
+            };
+            futures::executor::block_on(save_session(&source, &header, &[message_entry()], true))
+                .expect("seed SQLite session");
+            with_write_connection(&source, |conn| {
+                map_sqlite_result(conn.execute_raw("PRAGMA journal_mode = DELETE;"))
+            })
+            .expect("checkpoint fixture in rollback-journal mode");
+
+            let archive_dir = dir.path().join("archive");
+            std::fs::create_dir(&archive_dir).expect("create archive directory");
+            let archive = archive_dir.join("session.sqlite");
+            std::fs::copy(&source, &archive).expect("copy archived database");
+            assert!(!sqlite_database_uses_wal(&archive).unwrap());
+            // A retained read-only WAL companion selects the private-copy
+            // path even when the database itself is in rollback mode.
+            let wal = append_sidecar_suffix(&archive, "-wal");
+            std::fs::write(&wal, []).expect("retained empty WAL");
+            let journal = append_sidecar_suffix(&archive, "-journal");
+            let journal_bytes = if malformed {
+                vec![0xd9, 0xd5, 0x05]
+            } else {
+                vec![0; 28]
+            };
+            std::fs::write(&journal, &journal_bytes).expect("rollback journal");
+            let _database_mode = UnixModeGuard::apply(&archive, 0o400);
+            let _wal_mode = UnixModeGuard::apply(&wal, 0o400);
+            let _journal_mode = UnixModeGuard::apply(&journal, 0o400);
+            let _directory_mode = UnixModeGuard::apply(&archive_dir, 0o500);
+            assert!(opened_sidecar_is_read_only(&archive).unwrap());
+            let original_files = [&archive, &wal, &journal].map(|path| {
+                (
+                    path.to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                    std::fs::metadata(path).unwrap().permissions().mode(),
+                )
+            });
+
+            let header_result = load_session_header(&archive);
+            let session_result = futures::executor::block_on(load_session(&archive));
+            let meta_result = futures::executor::block_on(load_session_meta(&archive));
+            if malformed {
+                for result in [
+                    header_result.map(|_| ()),
+                    session_result.map(|_| ()),
+                    meta_result.map(|_| ()),
+                ] {
+                    let error = result.expect_err("private copy must retain recovery requirements");
+                    assert!(
+                        error.to_string().contains("rollback journal"),
+                        "expected native journal validation, got {error}"
+                    );
+                }
+            } else {
+                assert_eq!(header_result.expect("cold journal header").id, header.id);
+                let (loaded_header, entries) = session_result.expect("cold journal session");
+                assert_eq!(loaded_header.id, header.id);
+                assert_eq!(entries.len(), 1);
+                let meta = meta_result.expect("cold journal metadata");
+                assert_eq!(meta.header.id, header.id);
+                assert_eq!(meta.message_count, 1);
+            }
+            for (path, bytes, mode) in original_files {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(std::fs::metadata(path).unwrap().permissions().mode(), mode);
+            }
+            assert_eq!(
+                std::fs::metadata(&archive_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+            assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 3);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_snapshot_rejects_unreadable_and_nonregular_companions() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite");
+        futures::executor::block_on(save_session(
+            &source,
+            &SessionHeader::default(),
+            &[message_entry()],
+            true,
+        ))
+        .expect("seed SQLite session");
+        let database_bytes = std::fs::read(&source).unwrap();
+        let external = dir.path().join("external-companion");
+        std::fs::write(&external, b"must not follow or change this target").unwrap();
+
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            if suffix == "-wal" {
+                continue;
+            }
+            for kind in ["unreadable", "symlink", "directory"] {
+                let archive_dir = dir.path().join(format!("archive{suffix}-{kind}"));
+                std::fs::create_dir(&archive_dir).unwrap();
+                let archive = archive_dir.join("session.sqlite");
+                std::fs::copy(&source, &archive).unwrap();
+                let wal = append_sidecar_suffix(&archive, "-wal");
+                std::fs::write(&wal, []).unwrap();
+                let _wal_mode = UnixModeGuard::apply(&wal, 0o400);
+                let companion = append_sidecar_suffix(&archive, suffix);
+                let unreadable_mode = match kind {
+                    "unreadable" => {
+                        std::fs::write(&companion, b"unreadable companion").unwrap();
+                        Some(UnixModeGuard::apply(&companion, 0o000))
+                    }
+                    "symlink" => {
+                        symlink(&external, &companion).unwrap();
+                        None
+                    }
+                    "directory" => {
+                        std::fs::create_dir(&companion).unwrap();
+                        None
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(opened_sidecar_is_read_only(&archive).unwrap());
+                let results = [
+                    load_session_header(&archive).map(|_| ()),
+                    futures::executor::block_on(load_session(&archive)).map(|_| ()),
+                    futures::executor::block_on(load_session_meta(&archive)).map(|_| ()),
+                ];
+                for result in results {
+                    let error = result.expect_err("snapshot must validate every source companion");
+                    let expected_kind = if kind == "unreadable" {
+                        std::io::ErrorKind::PermissionDenied
+                    } else {
+                        std::io::ErrorKind::InvalidData
+                    };
+                    assert!(
+                        matches!(&error, Error::Io(error) if error.kind() == expected_kind),
+                        "expected {expected_kind:?} for {suffix}/{kind}, got {error}"
+                    );
+                    assert!(error.to_string().contains(suffix));
+                }
+                assert_eq!(std::fs::read(&archive).unwrap(), database_bytes);
+                assert!(std::fs::read(&wal).unwrap().is_empty());
+                assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 3);
+                let metadata = std::fs::symlink_metadata(&companion).unwrap();
+                match kind {
+                    "unreadable" => {
+                        assert_eq!(metadata.permissions().mode() & 0o777, 0);
+                        drop(unreadable_mode);
+                        assert_eq!(std::fs::read(&companion).unwrap(), b"unreadable companion");
+                    }
+                    "symlink" => assert!(metadata.file_type().is_symlink()),
+                    "directory" => assert!(metadata.is_dir()),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    std::fs::read(&external).unwrap(),
+                    b"must not follow or change this target"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
