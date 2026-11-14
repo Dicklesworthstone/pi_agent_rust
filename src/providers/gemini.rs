@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 
 mod files;
+pub(crate) use files::FileCache as GeminiFileCache;
 pub(super) mod reasoning;
 mod wire;
 

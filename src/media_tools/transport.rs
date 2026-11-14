@@ -7,6 +7,7 @@ use crate::http::client::Client;
 use futures::future::{Either, select};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ pub(super) struct Transport {
     base_url: Option<String>,
     auth: super::MediaAuthScope,
     cost_scope: crate::cost::CostScope,
+    gemini_files: crate::providers::gemini::GeminiFileCache,
 }
 
 impl Transport {
@@ -36,6 +38,15 @@ impl Transport {
 
     pub(super) fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = Some(base_url);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_gemini_files(
+        mut self,
+        files: crate::providers::gemini::GeminiFileCache,
+    ) -> Self {
+        self.gemini_files = files;
         self
     }
 
@@ -299,7 +310,8 @@ impl Api<'_> {
     }
 
     pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
-        self.post_inner(path, payload, limit, None).await
+        self.post_inner(path, Cow::Borrowed(payload), limit, None)
+            .await
     }
 
     /// Vision responses use the same token rates as ordinary model requests.
@@ -309,12 +321,17 @@ impl Api<'_> {
         &self,
         model: &str,
         path: &str,
-        payload: &Value,
+        payload: Value,
         limit: usize,
     ) -> Result<Value> {
-        self.post_inner(path, payload, limit, Some(Billing::Vision(model)))
-            .await?
-            .json(self.tool)
+        self.post_inner(
+            path,
+            Cow::Owned(payload),
+            limit,
+            Some(Billing::Vision(model)),
+        )
+        .await?
+        .json(self.tool)
     }
 
     /// Retain the invocation's account through image generation and editing.
@@ -326,9 +343,14 @@ impl Api<'_> {
         payload: &Value,
         limit: usize,
     ) -> Result<Value> {
-        self.post_inner(path, payload, limit, Some(Billing::Image(model)))
-            .await?
-            .json(self.tool)
+        self.post_inner(
+            path,
+            Cow::Borrowed(payload),
+            limit,
+            Some(Billing::Image(model)),
+        )
+        .await?
+        .json(self.tool)
     }
 
     /// Speech SSE carries billing in its terminal audio event. Capture that
@@ -340,8 +362,13 @@ impl Api<'_> {
         payload: &Value,
         limit: usize,
     ) -> Result<Response> {
-        self.post_inner(path, payload, limit, Some(Billing::Speech(model)))
-            .await
+        self.post_inner(
+            path,
+            Cow::Borrowed(payload),
+            limit,
+            Some(Billing::Speech(model)),
+        )
+        .await
     }
 
     fn vision_cost(&self, model: &str, response: &Value) -> Result<Option<f64>> {
@@ -399,7 +426,7 @@ impl Api<'_> {
     async fn post_inner(
         &self,
         path: &str,
-        payload: &Value,
+        mut payload: Cow<'_, Value>,
         limit: usize,
         billing: Option<Billing<'_>>,
     ) -> Result<Response> {
@@ -418,11 +445,30 @@ impl Api<'_> {
         }
         let operation = async {
             check_owner(self.tool, &self.owner)?;
+            if self.provider == "gemini" && matches!(billing, Some(Billing::Vision(_))) {
+                // A large native inspection needs the same Files transport as
+                // an ordinary chat attachment. Uploads stay inside this
+                // invocation's original watchdog and captured authority; they
+                // never acquire a billable generation attempt of their own.
+                if let Some(budget) = &self.cost_budget {
+                    budget.admit()?;
+                }
+                self.owner
+                    .with_current(self.transport.gemini_files.prepare_native_inline(
+                        &self.transport.client,
+                        self.base.as_str(),
+                        &self.key,
+                        payload.to_mut(),
+                    ))
+                    .await
+                    .map_err(|error| Error::tool(self.tool, self.scrub(&error.to_string(), 2048)))?;
+                check_owner(self.tool, &self.owner)?;
+            }
             let client = self.owner.http().bind(&self.transport.client);
             let request = client
                 .post(url.as_str())
                 .timeout(remaining_timeout(self.tool, self.started, self.timeout)?)
-                .json(payload)?;
+                .json(payload.as_ref())?;
             let request = match self.provider {
                 "gemini" => request.try_header("x-goog-api-key", &self.key),
                 "anthropic" => request
@@ -988,6 +1034,7 @@ pub(super) mod tests {
             let name = match billing {
                 Billing::Image(_) => "generate_image",
                 Billing::Vision(_) => "inspect_image",
+                Billing::Speech(_) => unreachable!("speech billing uses the SSE fixture"),
             };
             let api = transport
                 .api(
@@ -1003,9 +1050,10 @@ pub(super) mod tests {
                         .await
                 }
                 Billing::Vision(model) => {
-                    api.post_vision(model, "chat/completions", &serde_json::json!({}), 4096)
+                    api.post_vision(model, "chat/completions", serde_json::json!({}), 4096)
                         .await
                 }
+                Billing::Speech(_) => unreachable!("speech billing uses the SSE fixture"),
             }
         });
         worker.join().unwrap();

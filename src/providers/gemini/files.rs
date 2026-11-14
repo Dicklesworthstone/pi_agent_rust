@@ -265,7 +265,7 @@ struct CacheState {
 /// Per-provider, bounded metadata-only cache. A per-content async lock prevents
 /// concurrent foreground/background requests from uploading the same blob twice.
 #[derive(Default)]
-pub(super) struct FileCache {
+pub(crate) struct FileCache {
     state: Mutex<CacheState>,
     policy: StagingPolicy,
     #[cfg(test)]
@@ -320,6 +320,27 @@ struct UploadInput<'a> {
 }
 
 impl FileCache {
+    /// Native vision uses the same credential-scoped staging as chat, while
+    /// retaining its own generation billing and no-replay policy. The caller
+    /// owns the enclosing cancellation/deadline race and installs its captured
+    /// request context before polling this future.
+    pub(crate) async fn prepare_native_inline(
+        &self,
+        client: &Client,
+        base: &str,
+        api_key: &str,
+        body: &mut Value,
+    ) -> Result<()> {
+        let auth = UploadAuth {
+            headers: vec![("x-goog-api-key".to_string(), api_key.to_string())],
+        };
+        // Native tools never replay a potentially billable generation. Drop
+        // the request-only recovery payload after preflight; the bounded
+        // cache still retains the validated remote resource for later calls.
+        self.prepare(client, base, &auth, body).await?;
+        Ok(())
+    }
+
     pub(super) async fn prepare(
         &self,
         client: &Client,
@@ -1164,6 +1185,7 @@ mod tests {
         ContentBlock, MediaContent, Message, StreamEvent, TextContent, UserContent, UserMessage,
     };
     use crate::provider::{BeforeProviderRequestHook, Context, Provider};
+    use crate::tools::Tool as _;
     use asupersync::runtime::RuntimeBuilder;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -1589,6 +1611,233 @@ mod tests {
             ..cache()
         };
         provider
+    }
+
+    fn native_vision_image() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==",
+            )
+            .unwrap()
+    }
+
+    fn native_vision_metadata(endpoint: &Endpoint, id: &str) -> Value {
+        let mut metadata = file_metadata(endpoint, id, "ACTIVE", native_vision_image().len());
+        metadata["mimeType"] = json!("image/png");
+        metadata
+    }
+
+    fn native_vision_response() -> Value {
+        json!({
+            "candidates": [{"finishReason":"STOP", "content":{"parts":[{"text":"A staged diagram."}]}}],
+            "usageMetadata": {"promptTokenCount":1_000_000, "candidatesTokenCount":0}
+        })
+    }
+
+    fn native_vision_tool(
+        directory: &std::path::Path,
+        server: &Server,
+        files: FileCache,
+        budget: &crate::cost::CostBudget,
+    ) -> crate::media_tools::InspectImageTool {
+        let mut tool = crate::media_tools::InspectImageTool::with_defaults(
+            directory,
+            Some("gemini".to_string()),
+            Some("fixture-vision".to_string()),
+        )
+        .with_mock(false)
+        .with_api_key(Some("native-vision-key".to_string()))
+        .with_base_url(server.endpoint.base.as_str())
+        .with_gemini_files(files);
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(budget.clone()));
+        tool.bind_cost_scope(scope);
+        let catalog = crate::models::ModelRegistry::from_entries_for_tests(vec![
+            crate::models::ModelEntry {
+                model: crate::provider::Model {
+                    id: "fixture-vision".to_string(),
+                    name: "Fixture vision".to_string(),
+                    provider: "gemini".to_string(),
+                    api: "google-generative-ai".to_string(),
+                    base_url: server.endpoint.base.to_string(),
+                    reasoning: false,
+                    input: vec![
+                        crate::provider::InputType::Text,
+                        crate::provider::InputType::Image,
+                    ],
+                    cost: crate::provider::ModelCost {
+                        input: 1.0,
+                        ..crate::provider::ModelCost::default()
+                    },
+                    context_window: 128_000,
+                    max_tokens: 4096,
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            },
+        ]);
+        let auth = crate::media_tools::MediaAuthScope::default();
+        auth.set_models(&Arc::new(()), Some(&catalog));
+        tool.bind_media_auth_scope(auth);
+        tool
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Each generation has an exact one-dollar fixture bill.
+    fn native_vision_stages_reuses_and_replaces_files_without_duplicate_charges() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = native_vision_image();
+        let image_path = directory.path().join("input.png");
+        std::fs::write(&image_path, &image).unwrap();
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": native_vision_metadata(endpoint, "one")})),
+                Reply::json(&native_vision_response()),
+                Reply::json(&native_vision_metadata(endpoint, "one")),
+                Reply::json(&native_vision_response()),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": native_vision_metadata(endpoint, "two")})),
+                Reply::json(&native_vision_response()),
+            ]
+        });
+        let files = FileCache {
+            test_endpoint: Some(server.endpoint.clone()),
+            // Scale only the threshold: Tool::execute, credentials, uploads,
+            // metadata validation, generation and billing all run normally.
+            ..cache()
+        };
+        let budget = crate::cost::CostBudget::new(None, Some(3.0), 0.0).unwrap();
+        let tool = native_vision_tool(directory.path(), &server, files, &budget);
+        run_async(async {
+            for id in ["upload", "reuse", "replace-missing"] {
+                let output = tool
+                    .execute(
+                        id,
+                        json!({"path":"input.png", "prompt":"Read the diagram"}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&output.content[0], ContentBlock::Text(text) if text.text == "A staged diagram.")
+                );
+                assert!(!output.is_error);
+            }
+            assert!(matches!(
+                tool.execute("capped", json!({"path":"input.png"}), None)
+                    .await,
+                Err(Error::CostCap { .. })
+            ));
+        });
+        assert_eq!(budget.spent(), 3.0);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert_eq!(std::fs::read(&image_path).unwrap(), image);
+        let one = server.endpoint.metadata_url("files/one").unwrap().to_string();
+        let two = server.endpoint.metadata_url("files/two").unwrap().to_string();
+        let requests = server.finish();
+        assert_eq!(
+            requests.len(),
+            9,
+            "cap refuses before a metadata check or upload"
+        );
+        assert_eq!(requests[0].path, "/upload/v1beta/files");
+        assert_eq!(requests[6].path, "/upload/v1beta/files");
+        for index in [1, 7] {
+            assert_eq!(requests[index].body, image);
+            assert!(!requests[index].headers.contains_key("x-goog-api-key"));
+        }
+        assert_eq!(requests[3].method, "GET");
+        assert_eq!(requests[5].method, "GET");
+        for (index, uri) in [(2, one.as_str()), (4, one.as_str()), (8, two.as_str())] {
+            let request = &requests[index];
+            assert_eq!(request.path, "/v1beta/models/fixture-vision:generateContent");
+            assert_eq!(request.headers["x-goog-api-key"], "native-vision-key");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let part = &body["contents"][0]["parts"][0];
+            assert!(part.get("inlineData").is_none());
+            assert_eq!(
+                part["fileData"],
+                json!({"mimeType":"image/png", "fileUri":uri})
+            );
+            assert_eq!(body["contents"][0]["parts"][1]["text"], "Read the diagram");
+            assert_eq!(body["generationConfig"]["maxOutputTokens"], 4096);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Upload refusal is free; the rejected generation reports one dollar.
+    fn native_vision_staging_refusal_and_generation_error_never_replay_generation() {
+        for refuse_upload in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("input.png"), native_vision_image()).unwrap();
+            let server = Server::start(|endpoint| {
+                let failure = Reply {
+                    status: if refuse_upload { 401 } else { 503 },
+                    ..Reply::json(&json!({
+                        "error":{"code":503, "status":"UNAVAILABLE", "message":"private-upload-body"},
+                        "usageMetadata":{"promptTokenCount":1_000_000, "candidatesTokenCount":0}
+                    }))
+                };
+                let mut replies = if refuse_upload {
+                    vec![failure]
+                } else {
+                    vec![
+                        Reply::start(endpoint),
+                        Reply::json(&json!({"file":native_vision_metadata(endpoint, "one")})),
+                        failure,
+                    ]
+                };
+                // A replay would receive success and make expect_err fail.
+                replies.push(Reply::json(&native_vision_response()));
+                replies
+            });
+            let files = FileCache {
+                test_endpoint: Some(server.endpoint.clone()),
+                ..cache()
+            };
+            let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            let tool = native_vision_tool(directory.path(), &server, files, &budget);
+            let error = run_async(tool.execute("refused", json!({"path":"input.png"}), None))
+                .expect_err("native vision must not replay a failed request");
+            if refuse_upload {
+                assert!(!error.to_string().contains("private-upload-body"));
+            } else {
+                assert!(error.to_string().contains("HTTP 503"));
+            }
+            assert_eq!(budget.spent(), if refuse_upload { 0.0 } else { 1.0 });
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert_eq!(server.finish().len(), if refuse_upload { 1 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn native_vision_custom_gateway_keeps_inline_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = native_vision_image();
+        std::fs::write(directory.path().join("input.png"), &image).unwrap();
+        let server = Server::start(|_| vec![Reply::json(&native_vision_response())]);
+        let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        // Deliberately omit the fixture origin override. A configured gateway
+        // must not acquire Google's Files API routes or send credentials there.
+        let tool = native_vision_tool(directory.path(), &server, cache(), &budget);
+        run_async(tool.execute("gateway", json!({"path":"input.png"}), None)).unwrap();
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let inline = &body["contents"][0]["parts"][0]["inlineData"];
+        assert_eq!(inline["mimeType"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(inline["data"].as_str().unwrap())
+                .unwrap(),
+            image
+        );
     }
 
     fn fixture_options() -> StreamOptions {

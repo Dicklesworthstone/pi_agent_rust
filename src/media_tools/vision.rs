@@ -75,6 +75,15 @@ impl InspectImageTool {
         self.transport = self.transport.with_client(client);
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_gemini_files(
+        mut self,
+        files: crate::providers::gemini::GeminiFileCache,
+    ) -> Self {
+        self.transport = self.transport.with_gemini_files(files);
+        self
+    }
 }
 
 #[async_trait]
@@ -268,7 +277,7 @@ impl Tool for InspectImageTool {
             ),
         };
         let response = api
-            .post_vision(model, &endpoint, &payload, 1024 * 1024)
+            .post_vision(model, &endpoint, payload, 1024 * 1024)
             .await?;
         let analysis = parse_analysis(provider, &response)?;
         let analysis = api.scrub(&analysis, MAX_ANALYSIS_BYTES);
@@ -852,7 +861,7 @@ mod tests {
             api.post_vision(
                 "fixture-vision",
                 "chat/completions",
-                &json!({"model":"fixture-vision"}),
+                json!({"model":"fixture-vision"}),
                 4096,
             )
             .await
