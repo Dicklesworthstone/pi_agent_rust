@@ -35,13 +35,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fsqlite::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
 use fsqlite_ast::Statement as SqlStatement;
-use fsqlite_parser::Parser;
+use fsqlite_parser::{Lexer, Parser, TokenKind};
 use rquickjs::Ctx;
 use rquickjs::function::Func;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1281,6 +1281,159 @@ fn canonicalize_sql_parameter_tokens(sql: &str) -> Result<String> {
         out.push(ch);
     }
     Ok(out)
+}
+
+fn dqs_double_quoted_identifier_tokens(sql: &str) -> Vec<(u32, u32, String)> {
+    Lexer::tokenize(sql)
+        .into_iter()
+        .filter_map(|tok| match tok.kind {
+            TokenKind::QuotedId(name, true) => {
+                Some((tok.span.start, tok.span.end, name.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn dqs_missing_column_name(err: &FrankenError) -> Option<String> {
+    let msg = match err {
+        FrankenError::Internal(m)
+        | FrankenError::NotImplemented(m)
+        | FrankenError::FunctionError(m) => m.as_str(),
+        _ => return None,
+    };
+    if let Some((_, rest)) = msg.split_once("no such column: ") {
+        let name = rest
+            .split_once(" in table ")
+            .map_or(rest, |(head, _)| head)
+            .trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(name) = msg
+        .strip_prefix("column not found: ")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    if let Some((_, rest)) = msg.split_once("column: \"")
+        && let Some((name, _)) = rest.split_once('"')
+        && !name.is_empty()
+    {
+        return Some(name.to_string());
+    }
+    None
+}
+
+fn dqs_rewrite_once(
+    sql: &str,
+    err: &FrankenError,
+    rewritten: &mut HashSet<String>,
+) -> Option<String> {
+    let name = dqs_missing_column_name(err)?;
+    if !rewritten.insert(name.clone()) {
+        return None;
+    }
+    let mut ranges: Vec<(u32, u32)> = dqs_double_quoted_identifier_tokens(sql)
+        .into_iter()
+        .filter(|(_, _, candidate)| candidate == &name)
+        .map(|(start, end, _)| (start, end))
+        .collect();
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|&(start, _)| std::cmp::Reverse(start));
+    let literal = format!("'{}'", name.replace('\'', "''"));
+    let mut out = sql.to_string();
+    for (start, end) in ranges {
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return None;
+        };
+        out.replace_range(start..end, &literal);
+    }
+    Some(out)
+}
+
+fn dqs_insert_values_rewrite(sql: &str) -> Option<String> {
+    let (stmts, errors) = Parser::from_sql(sql).parse_all();
+    if !errors.is_empty() || stmts.len() != 1 {
+        return None;
+    }
+    let SqlStatement::Insert(insert) = &stmts[0] else {
+        return None;
+    };
+    let fsqlite_ast::InsertSource::Values(rows) = &insert.source else {
+        return None;
+    };
+    let dq_tokens = dqs_double_quoted_identifier_tokens(sql);
+    if dq_tokens.is_empty() {
+        return None;
+    }
+    let mut ranges: Vec<(u32, u32, String)> = Vec::new();
+    for row in rows {
+        for expr in row {
+            if let fsqlite_ast::Expr::Column(col_ref, span) = expr
+                && col_ref.table.is_none()
+                && dq_tokens.iter().any(|(start, end, name)| {
+                    *start == span.start
+                        && *end == span.end
+                        && name.as_str() == col_ref.column.as_ref()
+                })
+            {
+                ranges.push((span.start, span.end, col_ref.column.to_string()));
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut out = sql.to_string();
+    for (start, end, name) in ranges {
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return None;
+        };
+        let literal = format!("'{}'", name.replace('\'', "''"));
+        out.replace_range(start..end, &literal);
+    }
+    Some(out)
+}
+
+async fn prepare_with_dqs<'conn, 'sql>(
+    conn: &'conn Connection,
+    sql: &'sql str,
+) -> NativeResult<(
+    fsqlite::PreparedStatement<'conn>,
+    std::borrow::Cow<'sql, str>,
+)> {
+    if !sql.contains('"') {
+        let stmt = conn.prepare(sql).await.map_err(SqliteFailure::from)?;
+        return Ok((stmt, std::borrow::Cow::Borrowed(sql)));
+    }
+    let candidate = dqs_insert_values_rewrite(sql)
+        .map_or(std::borrow::Cow::Borrowed(sql), std::borrow::Cow::Owned);
+    match conn.prepare(candidate.as_ref()).await {
+        Ok(stmt) => Ok((stmt, candidate)),
+        Err(first) => {
+            let mut rewritten = HashSet::new();
+            let Some(mut cur) = dqs_rewrite_once(candidate.as_ref(), &first, &mut rewritten) else {
+                return Err(SqliteFailure::from(first));
+            };
+            loop {
+                match conn.prepare(&cur).await {
+                    Ok(stmt) => return Ok((stmt, std::borrow::Cow::Owned(cur))),
+                    Err(err) => {
+                        let Some(next) = dqs_rewrite_once(&cur, &err, &mut rewritten) else {
+                            return Err(SqliteFailure::from(err));
+                        };
+                        cur = next;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn split_sql_statement_slices(sql: &str) -> Vec<&str> {
@@ -2751,12 +2904,8 @@ async fn execute_request(
             let exec_sql = admitted.normalized_sql(&sql);
             let columns = if admitted.uses_native_prepare() {
                 budget.reserve_database(database, true)?;
-                let mut cols = database
-                    .conn
-                    .prepare(exec_sql.as_ref())
-                    .await
-                    .map_err(SqliteFailure::from)?
-                    .column_names();
+                let (statement, _) = prepare_with_dqs(&database.conn, exec_sql.as_ref()).await?;
+                let mut cols = statement.column_names();
                 if cols.is_empty() && admitted.is_dml() {
                     cols =
                         dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
@@ -2819,11 +2968,8 @@ async fn execute_request(
                     };
                 }
                 budget.reserve_database(database, true)?;
-                let statement = database
-                    .conn
-                    .prepare(exec_sql.as_ref())
-                    .await
-                    .map_err(SqliteFailure::from)?;
+                let (statement, prepared_sql) =
+                    prepare_with_dqs(&database.conn, exec_sql.as_ref()).await?;
                 if matches!(mode, QueryMode::Run) {
                     match statement.execute_with_params(&params).await {
                         Ok(_) => {}
@@ -2840,7 +2986,7 @@ async fn execute_request(
                             // same prepared fast lane for simple VALUES inserts. Rewrite
                             // parameter tokens to canonical ?N ordinals and re-prepare.
                             let canonical_sql =
-                                canonicalize_sql_parameter_tokens(exec_sql.as_ref())?;
+                                canonicalize_sql_parameter_tokens(prepared_sql.as_ref())?;
                             database
                                 .conn
                                 .prepare(&canonical_sql)
@@ -3598,6 +3744,90 @@ mod tests {
         assert_eq!(
             search,
             json!({ "columns": ["title"], "rows": [["SQLite"]] })
+        );
+        worker
+            .call(Command::Request(Request::Close { id: 1 }))
+            .expect("close");
+    }
+
+    #[test]
+    fn prepared_dml_and_select_preserve_dqs_literals_and_reject_missing_tables() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("open memory database");
+        exec(
+            &mut worker,
+            1,
+            "CREATE TABLE conflicts(id INTEGER PRIMARY KEY, value TEXT)",
+        );
+        let dml_sql = "INSERT INTO conflicts VALUES (9, \"DQS literal\") RETURNING id, value";
+        let prepared = worker
+            .call(Command::Request(Request::Prepare {
+                id: 1,
+                sql: dml_sql.into(),
+            }))
+            .expect("prepare DQS DML with RETURNING");
+        assert_eq!(prepared["columns"], json!(["id", "value"]));
+        let got = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: dml_sql.into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Get,
+            }))
+            .expect("execute DQS DML with RETURNING");
+        assert_eq!(
+            got,
+            json!({ "columns": ["id", "value"], "rows": [[9, "DQS literal"]] })
+        );
+        let run_sql = "INSERT INTO conflicts VALUES (10, \"DQS run literal\")";
+        worker
+            .call(Command::Request(Request::Prepare {
+                id: 1,
+                sql: run_sql.into(),
+            }))
+            .expect("prepare DQS DML without RETURNING");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: run_sql.into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Run,
+            }))
+            .expect("run DQS DML without RETURNING");
+        let rows = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id, value, \"DQS select\" AS tag FROM conflicts ORDER BY id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::All,
+            }))
+            .expect("select DQS literal");
+        assert_eq!(
+            rows["rows"],
+            json!([
+                [9, "DQS literal", "DQS select"],
+                [10, "DQS run literal", "DQS select"]
+            ])
+        );
+        let missing_table = worker
+            .call(Command::Request(Request::Prepare {
+                id: 1,
+                sql: "SELECT * FROM \"database is locked\"".into(),
+            }))
+            .expect_err("missing quoted table must still fail at prepare");
+        assert!(
+            missing_table.message.contains("no such table"),
+            "unexpected prepare failure: {}",
+            missing_table.message
         );
         worker
             .call(Command::Request(Request::Close { id: 1 }))

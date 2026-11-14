@@ -196,6 +196,11 @@ fn parse_report(raw: &Value, revision: Revision, previous: Option<&Report>) -> R
 }
 
 #[allow(clippy::significant_drop_tightening)]
+enum PullRefreshOutcome {
+    Published,
+    RetryAfterInvalidation(&'static str),
+}
+
 impl LspClient {
     pub(super) fn has_pull_diagnostics(&self) -> bool {
         Self::lock(&self.capabilities)
@@ -232,30 +237,43 @@ impl LspClient {
         };
         let pulling = self.has_pull_diagnostics() && !wait.is_zero();
         let received = if pulling {
+            self.poll_notifications();
             loop {
                 // The request layer owns typed retry decisions. A returned
                 // error is final, even when an earlier report is cached. Do
                 // not reinterpret error text or restart an exhausted budget.
-                self.refresh_document_diagnostics_with_budget(&uri, &budget)
-                    .await?;
-                self.poll_notifications();
-                let diags = Self::lock(&self.diagnostics)
-                    .get(&uri)
-                    .cloned()
-                    .unwrap_or_default();
-                let settled = !diags.is_empty()
-                    || self.quiescent.load(Ordering::SeqCst)
-                    || self.connected_at.elapsed() >= WARMUP_EMPTY_RESULT_WINDOW;
-                if settled {
-                    break;
-                }
-                // Read once: expiry between an is_err check and a second
-                // remaining().unwrap() used to panic at the deadline edge.
-                let remaining = budget.remaining().map_err(Error::from)?;
-                if remaining < WAIT_TICK * 2 {
-                    break;
+                match self
+                    .refresh_document_diagnostics_with_budget(&uri, &budget)
+                    .await?
+                {
+                    PullRefreshOutcome::Published => {
+                        self.poll_notifications();
+                        let diags = Self::lock(&self.diagnostics)
+                            .get(&uri)
+                            .cloned()
+                            .unwrap_or_default();
+                        let settled = !diags.is_empty()
+                            || self.quiescent.load(Ordering::SeqCst)
+                            || self.connected_at.elapsed() >= WARMUP_EMPTY_RESULT_WINDOW;
+                        if settled {
+                            break;
+                        }
+                        // Read once: expiry between an is_err check and a second
+                        // remaining().unwrap() used to panic at the deadline edge.
+                        let remaining = budget.remaining().map_err(Error::from)?;
+                        if remaining < WAIT_TICK * 2 {
+                            break;
+                        }
+                    }
+                    PullRefreshOutcome::RetryAfterInvalidation(message) => {
+                        let remaining = budget.remaining().map_err(Error::from)?;
+                        if remaining < WAIT_TICK * 2 {
+                            return Err(Error::tool("lsp", message));
+                        }
+                    }
                 }
                 budget.pause(WAIT_TICK).await.map_err(Error::from)?;
+                self.poll_notifications();
             }
             true
         } else {
@@ -310,15 +328,20 @@ impl LspClient {
     /// A dropped request uses the client request layer's cancellation discipline.
     pub async fn refresh_document_diagnostics(&self, uri: &str, timeout: Duration) -> Result<()> {
         let budget = RequestBudget::new(timeout);
-        self.refresh_document_diagnostics_with_budget(uri, &budget)
-            .await
+        match self
+            .refresh_document_diagnostics_with_budget(uri, &budget)
+            .await?
+        {
+            PullRefreshOutcome::Published => Ok(()),
+            PullRefreshOutcome::RetryAfterInvalidation(message) => Err(Error::tool("lsp", message)),
+        }
     }
 
     async fn refresh_document_diagnostics_with_budget(
         &self,
         uri: &str,
         budget: &RequestBudget,
-    ) -> Result<()> {
+    ) -> Result<PullRefreshOutcome> {
         budget.remaining().map_err(Error::from)?;
         let uri = file_uri::normalize_uri(uri)
             .filter(|uri| uri.len() <= MAX_RESULT_ID_BYTES)
@@ -380,8 +403,7 @@ impl LspClient {
         let mut generation = Self::lock(&self.notification_generation);
         self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
         if *generation != dropped_before {
-            return Err(Error::tool(
-                "lsp",
+            return Ok(PullRefreshOutcome::RetryAfterInvalidation(
                 "[LSP_DIAGNOSTICS_PENDING] notifications were lost; retry for a fresh report",
             ));
         }
@@ -403,15 +425,25 @@ impl LspClient {
             ));
         }
         let mut diagnostics = Self::lock(&self.diagnostics);
-        if docs.get(&uri).is_none_or(|doc| {
-            doc.push_generation != push_generation || doc.push_generation == u64::MAX
-        }) {
+        if docs
+            .get(&uri)
+            .is_none_or(|doc| doc.push_generation == u64::MAX)
+        {
+            diagnostics.remove(&uri);
+            return Err(Error::tool(
+                "lsp",
+                "[LSP_DIAGNOSTICS_PENDING] a push arrived during the diagnostic request; retry",
+            ));
+        }
+        if docs
+            .get(&uri)
+            .is_some_and(|doc| doc.push_generation != push_generation)
+        {
             // The response and accepted push have no comparable server-side
             // revision. Keep neither as a clean result, and leave the prior
             // pull resultId available for a new request to revalidate.
             diagnostics.remove(&uri);
-            return Err(Error::tool(
-                "lsp",
+            return Ok(PullRefreshOutcome::RetryAfterInvalidation(
                 "[LSP_DIAGNOSTICS_PENDING] a push arrived during the diagnostic request; retry",
             ));
         }
@@ -420,7 +452,7 @@ impl LspClient {
         for evicted in cache.insert(uri, report) {
             diagnostics.remove(&evicted);
         }
-        Ok(())
+        Ok(PullRefreshOutcome::Published)
     }
 }
 
