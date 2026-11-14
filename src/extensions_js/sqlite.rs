@@ -2493,7 +2493,7 @@ fn plan_wal_lease(was_in_txn: bool, had_writes: bool, parsed: &[SqlStatement]) -
                 in_txn = false;
                 writes_in_txn = false;
             }
-            SqlStatement::Rollback(rollback) if rollback.name.is_none() => {
+            SqlStatement::Rollback(rollback) if rollback.to_savepoint.is_none() => {
                 release_before_exec = true;
                 in_txn = false;
                 writes_in_txn = false;
@@ -2577,7 +2577,7 @@ async fn ensure_wal_write_lease(
                 if now >= deadline {
                     return Err(SqliteFailure::from(FrankenError::Busy));
                 }
-                if operation_cx.is_cancelled() || budget.expire_at(now) {
+                if operation_cx.is_cancel_requested() || budget.expire_at(now) {
                     return Err(SqliteFailure::from(FrankenError::Interrupt));
                 }
                 let sleep_for = deadline

@@ -6276,7 +6276,7 @@ pub async fn run(
                 let cx_for_fork = cx.clone();
 
                 in_flight_fork = Some(options.runtime_handle.spawn(async move {
-                    let result: Result<ForkCompletion> = async {
+                    let result: Result<ForkCompletion> = Box::pin(async {
                         // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
                         let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
                             let guard = OwnedMutexGuard::lock(
@@ -6310,9 +6310,8 @@ pub async fn run(
                         // Phase 2: Build new session on the blocking pool without holding any
                         // lock or occupying a single-threaded async executor during large forks.
                         let selected_text = fork_plan.selected_text.clone();
-                        let previous_session_file = parent_path.clone();
+                        let previous_session_file = parent_path;
                         let origin_session_id = header_snapshot.id.clone();
-                        let runtime_cwd_for_build = runtime_cwd_for_fork.clone();
                         let (mut new_session, target_plan_mode, messages) =
                             asupersync::runtime::spawn_blocking(move || -> Result<_> {
                                 let mut new_session = if save_enabled {
@@ -6335,7 +6334,7 @@ pub async fn run(
                                 new_session.init_from_fork_plan(fork_plan);
                                 crate::session_workdir::check_session_workdir(
                                     &new_session,
-                                    &runtime_cwd_for_build,
+                                    &runtime_cwd_for_fork,
                                 )?;
                                 let target_plan_mode = replayed_plan_mode(&new_session);
                                 let messages = new_session.to_messages_for_current_path();
@@ -6522,7 +6521,7 @@ pub async fn run(
                             origin_session_id,
                             session_id,
                         )))
-                    }
+                    })
                     .await;
 
                     match result {
