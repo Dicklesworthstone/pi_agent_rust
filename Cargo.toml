@@ -337,6 +337,7 @@ fsqlite = { version = "0.4.10", default-features = false, features = ["native", 
 # structural sandbox admission; both crates are already engine dependencies.
 fsqlite-ast = "=0.4.10"
 fsqlite-parser = "=0.4.10"
+fsqlite-types = "=0.4.10"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

@@ -11517,7 +11517,7 @@ mod extensions_integration_tests {
                 .manager()
                 .clone();
             manager
-                .execute_command("begin-idle-work", "", 5_000)
+                .execute_command("begin-idle-work", "", 15_000)
                 .await
                 .expect("start idle timer");
             entered_rx

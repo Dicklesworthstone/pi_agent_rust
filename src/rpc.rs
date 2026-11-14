@@ -3420,6 +3420,9 @@ pub async fn run(
         None
     };
 
+    let mut pending_bg_commands = Vec::new();
+    let mut in_flight_fork = None;
+
     while let Ok(line) = in_rx.recv(&cx).await {
         if line.trim().is_empty() {
             continue;
@@ -3442,6 +3445,21 @@ pub async fn run(
         let command_type = normalize_command_type(command_type_raw);
 
         let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
+
+        if !matches!(
+            command_type,
+            "get_state"
+                | "get_session_stats"
+                | "get_messages"
+                | "get_fork_messages"
+                | "get_commands"
+                | "get_available_models"
+                | "get_last_assistant_text"
+                | "extension_ui_response"
+        ) && let Some(prev_fork) = in_flight_fork.take()
+        {
+            prev_fork.await;
+        }
 
         // Validate once before recovery, model restoration, or queue mutation.
         // A rejected attachment must never advance the durable session, and an
@@ -4871,7 +4889,7 @@ pub async fn run(
                 // Capture a lightweight snapshot under lock, then release immediately.
                 // This avoids cloning the full Session (caches, autosave queue, etc.)
                 // and allows the HTML rendering + file I/O to proceed without holding
-                // any session lock.
+                // any session lock or stalling subsequent read-only RPC commands.
                 let snapshot = {
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
@@ -4881,18 +4899,25 @@ pub async fn run(
                     })?;
                     inner.export_snapshot()
                 };
-                match export_html_snapshot(&snapshot, output_path.as_deref()).await {
-                    Ok(path) => {
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "export_html",
-                            Some(json!({ "path": path })),
-                        ));
+                let out_tx_export = out_tx.clone();
+                pending_bg_commands.push(options.runtime_handle.spawn(async move {
+                    match export_html_snapshot(snapshot, output_path.as_deref()).await {
+                        Ok(path) => {
+                            let _ = out_tx_export.send(response_ok(
+                                id,
+                                "export_html",
+                                Some(json!({ "path": path })),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = out_tx_export.send(response_error_with_hints(
+                                id,
+                                "export_html",
+                                &err,
+                            ));
+                        }
                     }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "export_html", &err));
-                    }
-                }
+                }));
             }
 
             "bash" => {
@@ -6237,275 +6262,309 @@ pub async fn run(
                     }
                 };
 
-                let result: Result<ForkCompletion> = async {
-                    // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
-                    let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
-                        let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                let entry_id_owned = entry_id.to_string();
+                let session_for_fork = Arc::clone(&session);
+                let shared_state_for_fork = Arc::clone(&shared_state);
+                let bash_state_for_fork = Arc::clone(&bash_state);
+                let is_streaming_for_fork = Arc::clone(&is_streaming);
+                let is_compacting_for_fork = Arc::clone(&is_compacting);
+                let turn_phase_linearizer_for_fork = Arc::clone(&turn_phase_linearizer);
+                let rpc_extension_manager_for_fork = rpc_extension_manager.clone();
+                let runtime_cwd_for_fork = runtime_cwd.clone();
+                let options_for_fork = options.clone();
+                let out_tx_for_fork = out_tx.clone();
+                let cx_for_fork = cx.clone();
+
+                in_flight_fork = Some(options.runtime_handle.spawn(async move {
+                    let result: Result<ForkCompletion> = async {
+                        // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
+                        let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
+                            let guard = OwnedMutexGuard::lock(
+                                Arc::clone(&session_for_fork),
+                                &cx_for_fork,
+                            )
                             .await
                             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                        let inner = guard.session.lock(&cx).await.map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
-                        })?;
-                        let plan = inner.plan_fork_from_user_message(entry_id)?;
-                        let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
-                        let session_dir = inner.session_dir.clone();
-                        let header = inner.header.clone();
-                        (plan, parent_path, session_dir, guard.save_enabled(), header)
-                        // Both locks released here.
-                    };
-
-                    if rpc_dispatch_session_before_fork(
-                        rpc_extension_manager.clone(),
-                        entry_id,
-                        &fork_plan.selected_text,
-                        &header_snapshot.id,
-                    )
-                    .await
-                    {
-                        return Ok(None);
-                    }
-
-                    // Phase 2: Build new session without holding any lock.
-                    let selected_text = fork_plan.selected_text.clone();
-                    let previous_session_file = parent_path.clone();
-
-                    let mut new_session = if save_enabled {
-                        crate::session::Session::create_with_dir(session_dir)
-                    } else {
-                        crate::session::Session::in_memory()
-                    };
-                    new_session
-                        .header
-                        .provider
-                        .clone_from(&header_snapshot.provider);
-                    new_session
-                        .header
-                        .model_id
-                        .clone_from(&header_snapshot.model_id);
-                    new_session
-                        .header
-                        .thinking_level
-                        .clone_from(&header_snapshot.thinking_level);
-                    new_session.init_from_fork_plan(fork_plan);
-                    crate::session_workdir::check_session_workdir(&new_session, &runtime_cwd)?;
-                    let origin_session_id = header_snapshot.id;
-
-                    // Phase 3: prepare and persist the complete target runtime,
-                    // then atomically install Session + agent model state.
-                    let session_id = {
-                        let session_transition = acquire_rpc_session_transition(
-                            &transition_baseline,
-                            &is_streaming,
-                            &is_compacting,
-                            &turn_phase_linearizer,
-                            &session,
-                            &shared_state,
-                            &bash_state,
-                            &cx,
-                        )
-                        .await?;
-                        let RpcSessionTransitionAuthority {
-                            session: mut guard,
-                            permits: session_transition_permit,
-                        } = session_transition;
-                        let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        state.bind_provider_admission(guard.provider_admission_gate());
-                        state.ensure_session_advancement_allowed()?;
-
-                        let requested_model = new_session
-                            .effective_model_for_current_path()
-                            .unwrap_or_else(|| {
-                                let provider = guard.agent.provider();
-                                (
-                                    provider.name().to_string(),
-                                    provider.model_id().to_string(),
-                                )
-                            });
-                        let entry = rpc_model_catalog(&guard, &options)?.resolve(
-                            &requested_model.0,
-                            &requested_model.1,
-                        )
-                        .ok_or_else(|| {
-                            Error::validation(format!(
-                                "Unable to install forked Session runtime {}/{}. Use get_available_models to inspect registered provider/model pairs.",
-                                requested_model.0, requested_model.1
-                            ))
-                        })?;
-                        let key = resolve_model_key(
-                            options.cli_api_key.as_deref(),
-                            &options.auth,
-                            &entry,
-                        )?;
-                        if model_requires_configured_credential(&entry) && key.is_none() {
-                            return Err(Error::auth(format!(
-                                "Missing credentials for forked Session model {}/{}",
-                                requested_model.0, requested_model.1
-                            )));
-                        }
-                        let provider_impl = providers::create_provider_with_auth(
-                            &entry,
-                            guard
-                                .extensions
-                                .as_ref()
-                                .map(crate::extensions::ExtensionRegion::manager),
-                            Some(&options.auth),
-                        )?;
-                        let (thinking, _) =
-                            normalize_resumed_session_model(&mut new_session, &entry);
-
-                        // Resolve and validate the live commit target before
-                        // publishing the fork file. After save succeeds the
-                        // assignment and runtime-state install are infallible.
-                        let session_store = Arc::clone(&guard.session);
-                        let mut inner = OwnedMutexGuard::lock(session_store, &cx)
-                            .await
-                            .map_err(|err| {
+                            let inner = guard.session.lock(&cx_for_fork).await.map_err(|err| {
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
-                        if inner.header.id != origin_session_id {
-                            return Err(Error::session(
-                                "active Session changed while the fork target was being prepared",
-                            ));
+                            let plan = inner.plan_fork_from_user_message(&entry_id_owned)?;
+                            let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
+                            let session_dir = inner.session_dir.clone();
+                            let header = inner.header.clone();
+                            (plan, parent_path, session_dir, guard.save_enabled(), header)
+                            // Both locks released here.
+                        };
+
+                        if rpc_dispatch_session_before_fork(
+                            rpc_extension_manager_for_fork.clone(),
+                            &entry_id_owned,
+                            &fork_plan.selected_text,
+                            &header_snapshot.id,
+                        )
+                        .await
+                        {
+                            return Ok(None);
                         }
-                        guard.invalidate_background_compaction();
-                        state.provider_admission.ensure_allowed()?;
-                        let cost_budget = if let Some(budget) = guard.agent.cost_budget() {
-                            let prepared = prepare_rpc_cost_handoff(
-                                budget,
-                                &mut inner,
-                                save_enabled,
-                                &guard.provider_admission_gate(),
-                                AutosaveFlushTrigger::Manual,
-                                cx.cx(),
+
+                        // Phase 2: Build new session on the blocking pool without holding any
+                        // lock or occupying a single-threaded async executor during large forks.
+                        let selected_text = fork_plan.selected_text.clone();
+                        let previous_session_file = parent_path.clone();
+                        let origin_session_id = header_snapshot.id.clone();
+                        let runtime_cwd_for_build = runtime_cwd_for_fork.clone();
+                        let (mut new_session, target_plan_mode, messages) =
+                            asupersync::runtime::spawn_blocking(move || -> Result<_> {
+                                let mut new_session = if save_enabled {
+                                    crate::session::Session::create_with_dir(session_dir)
+                                } else {
+                                    crate::session::Session::in_memory()
+                                };
+                                new_session
+                                    .header
+                                    .provider
+                                    .clone_from(&header_snapshot.provider);
+                                new_session
+                                    .header
+                                    .model_id
+                                    .clone_from(&header_snapshot.model_id);
+                                new_session
+                                    .header
+                                    .thinking_level
+                                    .clone_from(&header_snapshot.thinking_level);
+                                new_session.init_from_fork_plan(fork_plan);
+                                crate::session_workdir::check_session_workdir(
+                                    &new_session,
+                                    &runtime_cwd_for_build,
+                                )?;
+                                let target_plan_mode = replayed_plan_mode(&new_session);
+                                let messages = new_session.to_messages_for_current_path();
+                                Ok((new_session, target_plan_mode, messages))
+                            })
+                            .await?;
+
+                        // Phase 3: prepare and persist the complete target runtime,
+                        // then atomically install Session + agent model state.
+                        let session_id = {
+                            let session_transition = acquire_rpc_session_transition(
+                                &transition_baseline,
+                                &is_streaming_for_fork,
+                                &is_compacting_for_fork,
+                                &turn_phase_linearizer_for_fork,
+                                &session_for_fork,
+                                &shared_state_for_fork,
+                                &bash_state_for_fork,
+                                &cx_for_fork,
                             )
                             .await?;
-                            prepared.checkpoint(&mut new_session)?;
-                            Some(prepared)
-                        } else {
-                            None
-                        };
-                        if save_enabled
-                            && let Err(first_err) = new_session.save().await
+                            let RpcSessionTransitionAuthority {
+                                session: mut guard,
+                                permits: session_transition_permit,
+                            } = session_transition;
+                            let mut state = OwnedMutexGuard::lock(
+                                Arc::clone(&shared_state_for_fork),
+                                &cx_for_fork,
+                            )
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                            state.bind_provider_admission(guard.provider_admission_gate());
+                            state.ensure_session_advancement_allowed()?;
+
+                            let requested_model = new_session
+                                .effective_model_for_current_path()
+                                .unwrap_or_else(|| {
+                                    let provider = guard.agent.provider();
+                                    (
+                                        provider.name().to_string(),
+                                        provider.model_id().to_string(),
+                                    )
+                                });
+                            let entry = rpc_model_catalog(&guard, &options_for_fork)?
+                                .resolve(&requested_model.0, &requested_model.1)
+                                .ok_or_else(|| {
+                                    Error::validation(format!(
+                                        "Unable to install forked Session runtime {}/{}. Use get_available_models to inspect registered provider/model pairs.",
+                                        requested_model.0, requested_model.1
+                                    ))
+                                })?;
+                            let key = resolve_model_key(
+                                options_for_fork.cli_api_key.as_deref(),
+                                &options_for_fork.auth,
+                                &entry,
+                            )?;
+                            if model_requires_configured_credential(&entry) && key.is_none() {
+                                return Err(Error::auth(format!(
+                                    "Missing credentials for forked Session model {}/{}",
+                                    requested_model.0, requested_model.1
+                                )));
+                            }
+                            let provider_impl = providers::create_provider_with_auth(
+                                &entry,
+                                guard
+                                    .extensions
+                                    .as_ref()
+                                    .map(crate::extensions::ExtensionRegion::manager),
+                                Some(&options_for_fork.auth),
+                            )?;
+                            let (thinking, _) =
+                                normalize_resumed_session_model(&mut new_session, &entry);
+
+                            // Resolve and validate the live commit target before
+                            // publishing the fork file. After save succeeds the
+                            // assignment and runtime-state install are infallible.
+                            let session_store = Arc::clone(&guard.session);
+                            let mut inner = OwnedMutexGuard::lock(session_store, &cx_for_fork)
+                                .await
+                                .map_err(|err| {
+                                    Error::session(format!("inner session lock failed: {err}"))
+                                })?;
+                            if inner.header.id != origin_session_id {
+                                return Err(Error::session(
+                                    "active Session changed while the fork target was being prepared",
+                                ));
+                            }
+                            guard.invalidate_background_compaction();
+                            state.provider_admission.ensure_allowed()?;
+                            let cost_budget = if let Some(budget) = guard.agent.cost_budget() {
+                                let prepared = prepare_rpc_cost_handoff(
+                                    budget,
+                                    &mut inner,
+                                    save_enabled,
+                                    &guard.provider_admission_gate(),
+                                    AutosaveFlushTrigger::Manual,
+                                    cx_for_fork.cx(),
+                                )
+                                .await?;
+                                prepared.checkpoint(&mut new_session)?;
+                                Some(prepared)
+                            } else {
+                                None
+                            };
+                            if save_enabled
+                                && let Err(first_err) = new_session.save().await
                                 && let Err(retry_err) = new_session.save().await
                             {
                                 return Err(Error::session_persistence(format!(
                                     "forked Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
                                 )));
                             }
-                        let cost_budget = cost_budget
-                            .map(|budget| budget.for_replacement(&new_session, true))
-                            .transpose()?;
-                        if let Some(budget) = &cost_budget {
-                            // Binding the saved target also captures the old
-                            // source's last observed writers, including one
-                            // that settled and closed during the first save.
-                            // Publish that frontier before activating retirement.
-                            budget.checkpoint(&mut new_session)?;
-                            if save_enabled
-                                && let Err(first_err) = new_session.save().await
+                            let cost_budget = cost_budget
+                                .map(|budget| budget.for_replacement(&new_session, true))
+                                .transpose()?;
+                            if let Some(budget) = &cost_budget {
+                                // Binding the saved target also captures the old
+                                // source's last observed writers, including one
+                                // that settled and closed during the first save.
+                                // Publish that frontier before activating retirement.
+                                budget.checkpoint(&mut new_session)?;
+                                if save_enabled
+                                    && let Err(first_err) = new_session.save().await
                                     && let Err(retry_err) = new_session.save().await
-                            {
-                                return Err(Error::session_persistence(format!(
-                                    "forked Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                                )));
+                                {
+                                    return Err(Error::session_persistence(format!(
+                                        "forked Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+                                    )));
+                                }
                             }
-                        }
 
-                        let target_plan_mode = replayed_plan_mode(&new_session);
-                        let messages = new_session.to_messages_for_current_path();
-                        let session_id = new_session.header.id.clone();
-                        if save_enabled && let Some(budget) = &cost_budget {
-                            budget.retire_session(&inner, cx.cx())?;
-                        }
-                        state.reconstruct_failover_from_session(
-                            &new_session,
-                            options.config.failover_cooldown_secs(),
-                            chrono::Utc::now(),
-                        );
-                        *inner = new_session;
-                        session_transition_permit.commit_session_change();
-                        state.output.clear_session();
-                        drop(inner);
-                        guard.agent.set_cost_budget(cost_budget);
-                        guard.agent.replace_messages(messages);
-                        crate::app::rebind_stream_options_session(
-                            guard.agent.stream_options_mut(),
-                            &session_id,
-                        );
-                        guard.agent.reset_session_scoped_state(target_plan_mode);
-                        guard.agent.set_provider(provider_impl);
-                        guard.agent.set_keyword_model(&entry);
-                        guard
-                            .agent
-                            .set_tool_call_dialect(entry.tool_call_dialect());
-                        guard
-                            .agent
-                            .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-                        {
-                            let stream_options = guard.agent.stream_options_mut();
-                            stream_options.api_key.clone_from(&key);
-                            stream_options.headers.clone_from(&entry.headers);
-                            stream_options.max_tokens = Some(entry.model.max_tokens);
-                            stream_options.thinking_level = Some(thinking);
-                        }
-                        guard.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-                        guard.refresh_extension_completion_host_state();
-                        if let Some(region) = &guard.extensions {
-                            region.manager().set_current_model(
-                                Some(entry.model.provider.clone()),
-                                Some(entry.model.id.clone()),
+                            let session_id = new_session.header.id.clone();
+                            if save_enabled && let Some(budget) = &cost_budget {
+                                budget.retire_session(&inner, cx_for_fork.cx())?;
+                            }
+                            state.reconstruct_failover_from_session(
+                                &new_session,
+                                options_for_fork.config.failover_cooldown_secs(),
+                                chrono::Utc::now(),
                             );
+                            *inner = new_session;
+                            session_transition_permit.commit_session_change();
+                            state.output.clear_session();
+                            drop(inner);
+                            guard.agent.set_cost_budget(cost_budget);
+                            guard.agent.replace_messages(messages);
+                            crate::app::rebind_stream_options_session(
+                                guard.agent.stream_options_mut(),
+                                &session_id,
+                            );
+                            guard.agent.reset_session_scoped_state(target_plan_mode);
+                            guard.agent.set_provider(provider_impl);
+                            guard.agent.set_keyword_model(&entry);
+                            guard
+                                .agent
+                                .set_tool_call_dialect(entry.tool_call_dialect());
+                            guard.agent.set_model_accepts_images(
+                                entry.model.input.contains(&InputType::Image),
+                            );
+                            {
+                                let stream_options = guard.agent.stream_options_mut();
+                                stream_options.api_key.clone_from(&key);
+                                stream_options.headers.clone_from(&entry.headers);
+                                stream_options.max_tokens = Some(entry.model.max_tokens);
+                                stream_options.thinking_level = Some(thinking);
+                            }
+                            guard.set_compaction_context_window(
+                                context_window_tokens_for_entry(&entry),
+                            );
+                            guard.refresh_extension_completion_host_state();
+                            if let Some(region) = &guard.extensions {
+                                region.manager().set_current_model(
+                                    Some(entry.model.provider.clone()),
+                                    Some(entry.model.id.clone()),
+                                );
+                            }
+                            state.clear_all_pending();
+                            session_id
+                        };
+
+                        Ok(Some((
+                            selected_text,
+                            previous_session_file,
+                            origin_session_id,
+                            session_id,
+                        )))
+                    }
+                    .await;
+
+                    match result {
+                        Ok(None) => {
+                            let _ = out_tx_for_fork.send(response_ok(
+                                id,
+                                "fork",
+                                Some(json!({ "cancelled": true })),
+                            ));
                         }
-                        state.clear_all_pending();
-                        session_id
-                    };
-
-                    Ok(Some((
-                        selected_text,
-                        previous_session_file,
-                        origin_session_id,
-                        session_id,
-                    )))
-                }
-                .await;
-
-                match result {
-                    Ok(None) => {
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "fork",
-                            Some(json!({ "cancelled": true })),
-                        ));
+                        Ok(Some((
+                            selected_text,
+                            previous_session_file,
+                            source_session_id,
+                            new_session_id,
+                        ))) => {
+                            rpc_dispatch_session_fork_event(
+                                rpc_extension_manager_for_fork,
+                                json!({
+                                    "entryId": entry_id_owned,
+                                    "summary": selected_text.clone(),
+                                    "sessionId": source_session_id,
+                                    "newSessionId": new_session_id,
+                                    "previousSessionFile": previous_session_file,
+                                }),
+                            )
+                            .await;
+                            let _ = out_tx_for_fork.send(response_ok(
+                                id,
+                                "fork",
+                                Some(json!({ "text": selected_text, "cancelled": false })),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = out_tx_for_fork.send(response_error_with_hints(
+                                id,
+                                "fork",
+                                &err,
+                            ));
+                        }
                     }
-                    Ok(Some((
-                        selected_text,
-                        previous_session_file,
-                        source_session_id,
-                        new_session_id,
-                    ))) => {
-                        rpc_dispatch_session_fork_event(
-                            rpc_extension_manager.clone(),
-                            json!({
-                                "entryId": entry_id,
-                                "summary": selected_text.clone(),
-                                "sessionId": source_session_id,
-                                "newSessionId": new_session_id,
-                                "previousSessionFile": previous_session_file,
-                            }),
-                        )
-                        .await;
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "fork",
-                            Some(json!({ "text": selected_text, "cancelled": false })),
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "fork", &err));
-                    }
-                }
+                }));
             }
 
             "get_fork_messages" => {
@@ -6695,6 +6754,13 @@ pub async fn run(
     }
     if let Some(forwarder) = extension_ui_forwarder {
         forwarder.await;
+    }
+
+    if let Some(prev_fork) = in_flight_fork.take() {
+        prev_fork.await;
+    }
+    for bg_cmd in pending_bg_commands {
+        bg_cmd.await;
     }
 
     // Drain any in-flight work (streaming turn, extension
@@ -17090,14 +17156,16 @@ fn last_assistant_text(session: &crate::session::Session) -> Option<String> {
 /// The snapshot is captured under a brief lock, so the HTML rendering and
 /// file I/O happen entirely outside any session lock.
 async fn export_html_snapshot(
-    snapshot: &crate::session::ExportSnapshot,
+    snapshot: crate::session::ExportSnapshot,
     output_path: Option<&str>,
 ) -> Result<String> {
-    let html = snapshot.to_html();
+    let snapshot_path = snapshot.path.clone();
+    let html =
+        asupersync::runtime::spawn_blocking(move || Ok::<_, Error>(snapshot.to_html())).await?;
 
     let path = output_path.map_or_else(
         || {
-            snapshot.path.as_ref().map_or_else(
+            snapshot_path.as_ref().map_or_else(
                 || {
                     let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
                     PathBuf::from(format!("pi-session-{ts}.html"))

@@ -2014,18 +2014,156 @@ impl Drop for Worker {
     }
 }
 
+#[cfg(unix)]
+struct ExternalWalWriteLease {
+    file: fsqlite::fsqlite_vfs::UnixFile,
+}
+
+#[cfg(unix)]
+impl ExternalWalWriteLease {
+    fn try_acquire(
+        path: &Path,
+        cx: &fsqlite_types::cx::Cx,
+    ) -> std::result::Result<Self, FrankenError> {
+        use fsqlite::fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
+        use fsqlite_types::flags::VfsOpenFlags;
+
+        let vfs = UnixVfs::new();
+        let (mut file, _) = vfs.open(
+            cx,
+            Some(path),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+        )?;
+        if let Err(err) = file.compat_writer_hold_wal_write_lock(cx) {
+            let uncancelled = fsqlite_types::cx::Cx::new();
+            let _ = file.close(&uncancelled);
+            return Err(err);
+        }
+        Ok(Self { file })
+    }
+
+    fn release(mut self) -> std::result::Result<(), FrankenError> {
+        use fsqlite::fsqlite_vfs::VfsFile as _;
+
+        let uncancelled = fsqlite_types::cx::Cx::new();
+        let release_err = self
+            .file
+            .compat_writer_release_wal_write_lock(&uncancelled)
+            .err();
+        let close_err = self.file.close(&uncancelled).err();
+        release_err.or(close_err).map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(windows)]
+struct ExternalWalWriteLease {
+    file: fsqlite::fsqlite_vfs::WindowsFile,
+}
+
+#[cfg(windows)]
+impl ExternalWalWriteLease {
+    fn try_acquire(
+        path: &Path,
+        cx: &fsqlite_types::cx::Cx,
+    ) -> std::result::Result<Self, FrankenError> {
+        use fsqlite::fsqlite_vfs::shm::{SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, WAL_WRITE_LOCK};
+        use fsqlite::fsqlite_vfs::{Vfs as _, VfsFile as _, WindowsVfs};
+        use fsqlite_types::LockLevel;
+        use fsqlite_types::flags::VfsOpenFlags;
+
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(
+            cx,
+            Some(path),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+        )?;
+        if let Err(err) = file.lock(cx, LockLevel::Shared) {
+            let uncancelled = fsqlite_types::cx::Cx::new();
+            let _ = file.close(&uncancelled);
+            return Err(err);
+        }
+        if let Err(err) = file.shm_lock(
+            cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        ) {
+            let uncancelled = fsqlite_types::cx::Cx::new();
+            let _ = file.unlock(&uncancelled, LockLevel::None);
+            let _ = file.close(&uncancelled);
+            return Err(err);
+        }
+        Ok(Self { file })
+    }
+
+    fn release(mut self) -> std::result::Result<(), FrankenError> {
+        use fsqlite::fsqlite_vfs::VfsFile as _;
+        use fsqlite::fsqlite_vfs::shm::{SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_UNLOCK, WAL_WRITE_LOCK};
+        use fsqlite_types::LockLevel;
+
+        let uncancelled = fsqlite_types::cx::Cx::new();
+        let shm_err = self
+            .file
+            .shm_lock(
+                &uncancelled,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .err();
+        let unlock_err = self.file.unlock(&uncancelled, LockLevel::None).err();
+        let close_err = self.file.close(&uncancelled).err();
+        shm_err.or(unlock_err).or(close_err).map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ExternalWalWriteLease;
+
+#[cfg(not(any(unix, windows)))]
+impl ExternalWalWriteLease {
+    fn try_acquire(
+        _path: &Path,
+        _cx: &fsqlite_types::cx::Cx,
+    ) -> std::result::Result<Self, FrankenError> {
+        Ok(Self)
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn release(self) -> std::result::Result<(), FrankenError> {
+        Ok(())
+    }
+}
+
 struct EngineDatabase {
+    // Drop/release the external WAL write lease before closing the engine, and
+    // drop/close the engine before releasing its directory guards.
+    wal_write_lease: RefCell<Option<ExternalWalWriteLease>>,
     conn: Connection,
-    // Drop/close the engine before releasing its directory guards.
     parent: Option<storage::StorageParent>,
+    readonly: bool,
     strict: bool,
     safe_integers: bool,
+    txn_has_writes: Cell<bool>,
     schema_version: Cell<Option<i64>>,
     namespace_valid: Cell<bool>,
     poisoned: Cell<bool>,
 }
 
 impl EngineDatabase {
+    fn writable_db_path(&self) -> Option<&Path> {
+        (!self.readonly)
+            .then(|| self.parent.as_ref().map(storage::StorageParent::path))
+            .flatten()
+    }
+
+    fn release_wal_write_lease(&self) -> NativeResult<()> {
+        if let Some(lease) = self.wal_write_lease.borrow_mut().take() {
+            lease.release().map_err(SqliteFailure::from)?;
+        }
+        Ok(())
+    }
+
     fn verify_paths(&self) -> Result<()> {
         if self.poisoned.get() {
             return Err(
@@ -2158,10 +2296,13 @@ fn execute_work(
             })
             .map_err(SqliteFailure::from)?;
             let database = EngineDatabase {
+                wal_write_lease: RefCell::new(None),
                 conn,
                 parent,
+                readonly,
                 strict,
                 safe_integers,
+                txn_has_writes: Cell::new(false),
                 schema_version: Cell::new(None),
                 namespace_valid: Cell::new(true),
                 poisoned: Cell::new(false),
@@ -2175,6 +2316,8 @@ fn execute_work(
             let database = databases.get_mut(&id).ok_or("SQLite database is closed")?;
             database.verify_paths()?;
             budget.reserve_database(database, false)?;
+            database.txn_has_writes.set(false);
+            database.release_wal_write_lease()?;
             // Close cannot borrow a binding guard and &mut Connection at once;
             // cancelling this terminal operation cancels the connection root.
             let cx = database.conn.root_cx().clone();
@@ -2197,7 +2340,7 @@ fn execute_work(
             let binding = database.conn.bind_operation_cx(&operation_cx);
             let result = futures::executor::block_on(async {
                 validate_schema(database, budget).await?;
-                execute_request(database, request, budget).await
+                execute_request(database, request, budget, &operation_cx).await
             });
             drop(binding);
             if database.poisoned.get() {
@@ -2226,6 +2369,10 @@ fn execute_work(
                 if let Err(error) = budget.reserve_database(&database, false) {
                     first_error.get_or_insert(error);
                     continue;
+                }
+                database.txn_has_writes.set(false);
+                if let Err(error) = database.release_wal_write_lease() {
+                    first_error.get_or_insert(error);
                 }
                 let cx = database.conn.root_cx().clone();
                 set_cancel(cancel, stopped, Arc::new(move || cx.cancel()));
@@ -2296,11 +2443,207 @@ async fn validate_schema(database: &EngineDatabase, budget: &OperationBudget) ->
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreExecWalAction {
+    None,
+    Release,
+    Acquire,
+}
+
+#[derive(Clone, Copy)]
+struct WalLeasePlan {
+    had_writes: bool,
+    pre_exec: PreExecWalAction,
+    expected_writes_if_open: bool,
+}
+
+fn statement_writes(statement: &SqlStatement) -> bool {
+    match statement {
+        SqlStatement::Begin(begin) => matches!(
+            begin.mode,
+            Some(fsqlite_ast::TransactionMode::Immediate | fsqlite_ast::TransactionMode::Exclusive)
+        ),
+        SqlStatement::Insert(_)
+        | SqlStatement::Update(_)
+        | SqlStatement::Delete(_)
+        | SqlStatement::CreateTable(_)
+        | SqlStatement::CreateIndex(_)
+        | SqlStatement::CreateView(_)
+        | SqlStatement::CreateVirtualTable(_)
+        | SqlStatement::Drop(_)
+        | SqlStatement::AlterTable(_) => true,
+        _ => false,
+    }
+}
+
+fn plan_wal_lease(was_in_txn: bool, had_writes: bool, parsed: &[SqlStatement]) -> WalLeasePlan {
+    let mut in_txn = was_in_txn;
+    let mut writes_in_txn = was_in_txn && had_writes;
+    let mut release_before_exec = false;
+    for statement in parsed {
+        match statement {
+            SqlStatement::Begin(_) => {
+                in_txn = true;
+                if statement_writes(statement) {
+                    writes_in_txn = true;
+                }
+            }
+            SqlStatement::Commit => {
+                release_before_exec = true;
+                in_txn = false;
+                writes_in_txn = false;
+            }
+            SqlStatement::Rollback(rollback) if rollback.name.is_none() => {
+                release_before_exec = true;
+                in_txn = false;
+                writes_in_txn = false;
+            }
+            SqlStatement::Pragma(_) => {
+                release_before_exec = true;
+            }
+            other if statement_writes(other) => {
+                if in_txn {
+                    writes_in_txn = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let pre_exec = if release_before_exec {
+        PreExecWalAction::Release
+    } else if in_txn && writes_in_txn {
+        PreExecWalAction::Acquire
+    } else {
+        PreExecWalAction::None
+    };
+    WalLeasePlan {
+        had_writes,
+        pre_exec,
+        expected_writes_if_open: writes_in_txn,
+    }
+}
+
+async fn is_wal_journal_mode(conn: &Connection) -> NativeResult<bool> {
+    let rows = conn
+        .query("PRAGMA journal_mode")
+        .await
+        .map_err(SqliteFailure::from)?;
+    Ok(matches!(
+        rows.first().and_then(|row| row.get(0)),
+        Some(SqliteValue::Text(mode)) if mode.as_ref().eq_ignore_ascii_case("wal")
+    ))
+}
+
+async fn current_busy_timeout_ms(conn: &Connection) -> NativeResult<u64> {
+    let rows = conn
+        .query("PRAGMA busy_timeout")
+        .await
+        .map_err(SqliteFailure::from)?;
+    let raw = rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(|value| match value {
+            SqliteValue::Integer(ms) => Some(u64::try_from(*ms).unwrap_or(0)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Ok(raw.min(MAX_BUSY_TIMEOUT_MS))
+}
+
+async fn ensure_wal_write_lease(
+    database: &EngineDatabase,
+    operation_cx: &fsqlite_types::cx::Cx,
+    budget: &OperationBudget,
+) -> NativeResult<()> {
+    if database.wal_write_lease.borrow().is_some() {
+        return Ok(());
+    }
+    let Some(path) = database.writable_db_path() else {
+        return Ok(());
+    };
+    if !is_wal_journal_mode(&database.conn).await? {
+        return Ok(());
+    }
+    let timeout_ms = current_busy_timeout_ms(&database.conn).await?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match ExternalWalWriteLease::try_acquire(path, operation_cx) {
+            Ok(lease) => {
+                *database.wal_write_lease.borrow_mut() = Some(lease);
+                return Ok(());
+            }
+            Err(FrankenError::Busy) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(SqliteFailure::from(FrankenError::Busy));
+                }
+                if operation_cx.is_cancelled() || budget.expire_at(now) {
+                    return Err(SqliteFailure::from(FrankenError::Interrupt));
+                }
+                let sleep_for = deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(2));
+                std::thread::sleep(sleep_for);
+            }
+            Err(err) => return Err(SqliteFailure::from(err)),
+        }
+    }
+}
+
+async fn prepare_wal_lease_before_exec(
+    database: &EngineDatabase,
+    plan: WalLeasePlan,
+    operation_cx: &fsqlite_types::cx::Cx,
+    budget: &OperationBudget,
+) -> NativeResult<()> {
+    match plan.pre_exec {
+        PreExecWalAction::Release => database.release_wal_write_lease()?,
+        PreExecWalAction::Acquire => ensure_wal_write_lease(database, operation_cx, budget).await?,
+        PreExecWalAction::None => {}
+    }
+    Ok(())
+}
+
+async fn reconcile_wal_lease_after_exec<T>(
+    database: &EngineDatabase,
+    plan: WalLeasePlan,
+    outcome: NativeResult<T>,
+    operation_cx: &fsqlite_types::cx::Cx,
+    budget: &OperationBudget,
+) -> NativeResult<T> {
+    if !database.conn.in_transaction() {
+        database.txn_has_writes.set(false);
+        database.release_wal_write_lease()?;
+        return outcome;
+    }
+    match outcome {
+        Ok(value) => {
+            database.txn_has_writes.set(plan.expected_writes_if_open);
+            if plan.expected_writes_if_open {
+                ensure_wal_write_lease(database, operation_cx, budget).await?;
+            } else {
+                database.release_wal_write_lease()?;
+            }
+            Ok(value)
+        }
+        Err(err) => {
+            database.txn_has_writes.set(plan.had_writes);
+            if plan.had_writes {
+                let _ = ensure_wal_write_lease(database, operation_cx, budget).await;
+            } else {
+                let _ = database.release_wal_write_lease();
+            }
+            Err(err)
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn execute_request(
     database: &EngineDatabase,
     request: Request,
     budget: &OperationBudget,
+    operation_cx: &fsqlite_types::cx::Cx,
 ) -> NativeResult<Json> {
     match request {
         Request::Prepare { sql, .. } => {
@@ -2345,161 +2688,173 @@ async fn execute_request(
             };
             budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
-            if !admitted.uses_native_prepare() {
-                if params.is_empty() {
-                    // execute() retains the original DDL source for default
-                    // expressions and CHECK constraints. The parameterized
-                    // dispatcher does not publish that source in 0.4.10.
-                    database
-                        .conn
-                        .execute(exec_sql.as_ref())
-                        .await
-                        .map_err(SqliteFailure::from)?;
-                } else {
-                    database
-                        .conn
-                        .execute_with_params(exec_sql.as_ref(), &params)
-                        .await
-                        .map_err(SqliteFailure::from)?;
-                }
-                return if matches!(mode, QueryMode::Run) {
-                    change_result(database, budget).await
-                } else {
-                    Ok(json!({ "columns": [], "rows": [] }))
-                };
-            }
-            budget.reserve_database(database, true)?;
-            let statement = database
-                .conn
-                .prepare(exec_sql.as_ref())
-                .await
-                .map_err(SqliteFailure::from)?;
-            if matches!(mode, QueryMode::Run) {
-                match statement.execute_with_params(&params).await {
-                    Ok(_) => {}
-                    Err(FrankenError::NotImplemented(message))
-                        if admitted.is_dml()
-                            && !params.is_empty()
-                            && message.contains("Placeholder(") =>
-                    {
-                        // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred leaves AST
-                        // placeholders unbound on live virtual tables (such as FTS5);
-                        // Connection::query_with_params binds AST placeholders before
-                        // virtual-table dispatch while preserving change tracking.
+            let wal_plan = plan_wal_lease(
+                database.conn.in_transaction(),
+                database.txn_has_writes.get(),
+                &admitted.parsed,
+            );
+            prepare_wal_lease_before_exec(database, wal_plan, operation_cx, budget).await?;
+            let query_outcome: NativeResult<Json> = async {
+                if !admitted.uses_native_prepare() {
+                    if params.is_empty() {
+                        // execute() retains the original DDL source for default
+                        // expressions and CHECK constraints. The parameterized
+                        // dispatcher does not publish that source in 0.4.10.
                         database
                             .conn
-                            .query_with_params(exec_sql.as_ref(), &params)
+                            .execute(exec_sql.as_ref())
+                            .await
+                            .map_err(SqliteFailure::from)?;
+                    } else {
+                        database
+                            .conn
+                            .execute_with_params(exec_sql.as_ref(), &params)
                             .await
                             .map_err(SqliteFailure::from)?;
                     }
-                    Err(error) => return Err(SqliteFailure::from(error)),
+                    return if matches!(mode, QueryMode::Run) {
+                        change_result(database, budget).await
+                    } else {
+                        Ok(json!({ "columns": [], "rows": [] }))
+                    };
                 }
-                return change_result(database, budget).await;
-            }
-            let mut columns = statement.column_names();
-            if columns.is_empty() && admitted.is_dml() {
-                columns =
-                    dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
-            }
-            let visible_col_count = if hidden_col_count > 0 {
-                let count = columns.len().saturating_sub(hidden_col_count);
-                columns.truncate(count);
-                Some(count)
-            } else {
-                None
-            };
-            let mut bytes = serde_json::to_vec(&columns)
-                .map_err(|error| error.to_string())?
-                .len()
-                + 64;
-            if columns.len() > 256 || bytes > MAX_RESULT_BYTES {
-                return Err("SQLite result has too many columns".into());
-            }
-            let is_dml = admitted.is_dml();
-            if is_dml {
-                // The pinned engine materializes RETURNING before invoking
-                // row callbacks. Keep its writes uncommitted until every
-                // result has passed the bridge's row/encoding limits.
-                database
+                budget.reserve_database(database, true)?;
+                let statement = database
                     .conn
-                    .execute("SAVEPOINT __pijs_row_result")
+                    .prepare(exec_sql.as_ref())
                     .await
                     .map_err(SqliteFailure::from)?;
-            }
-            let mut rows = Vec::new();
-            let mut seen = 0_usize;
-            let mut limit_error = None;
-            let mut stopped_after_first = false;
-            let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
-                seen += 1;
-                if seen > MAX_RESULT_ROWS || budget.expire_at(Instant::now()) {
-                    limit_error = Some("SQLite result exceeds the row or time limit".to_string());
-                    return Err(FrankenError::Abort);
-                }
-                if matches!(mode, QueryMode::Get) && !rows.is_empty() {
-                    return Ok(());
-                }
-                bytes += 3; // enclosing row brackets and its separator
-                let values = row.values();
-                let visible_values =
-                    visible_col_count.map_or(values, |count| &values[..values.len().min(count)]);
-                match visible_values
-                    .iter()
-                    .map(|value| encode_value(value, database.safe_integers, &mut bytes))
-                    .collect::<Result<Vec<_>>>()
-                {
-                    Ok(row) => {
-                        rows.push(row);
-                        if matches!(mode, QueryMode::Get) && !is_dml {
-                            // A read-only get() needs one row. The engine's
-                            // callback-abort path closes only its read cursor
-                            // and preserves an enclosing transaction.
-                            stopped_after_first = true;
-                            return Err(FrankenError::Abort);
+                if matches!(mode, QueryMode::Run) {
+                    match statement.execute_with_params(&params).await {
+                        Ok(_) => {}
+                        Err(FrankenError::NotImplemented(message))
+                            if admitted.is_dml()
+                                && !params.is_empty()
+                                && message.contains("Placeholder(") =>
+                        {
+                            // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred leaves AST
+                            // placeholders unbound on live virtual tables (such as FTS5);
+                            // Connection::query_with_params binds AST placeholders before
+                            // virtual-table dispatch while preserving change tracking.
+                            database
+                                .conn
+                                .query_with_params(exec_sql.as_ref(), &params)
+                                .await
+                                .map_err(SqliteFailure::from)?;
                         }
-                        Ok(())
+                        Err(error) => return Err(SqliteFailure::from(error)),
                     }
-                    Err(error) => {
-                        limit_error = Some(error);
-                        Err(FrankenError::Abort)
-                    }
+                    return change_result(database, budget).await;
                 }
-            };
-            // PreparedStatement's query API rejects DML, including RETURNING.
-            // The connection query dispatcher is its actual DML row interface.
-            // Consume all DML rows even for get(), retaining only the first.
-            let mut preserve_native_constraint = false;
-            let outcome = if is_dml {
-                // This API also applies the engine's DQS rewrites and error
-                // offsets. Its for_each variant omits those wrappers, while
-                // materializing DML rows in exactly the same way.
-                match database
-                    .conn
-                    .query_with_params(exec_sql.as_ref(), &params)
-                    .await
-                {
-                    Ok(native_rows) => native_rows.iter().try_for_each(&mut accept),
-                    Err(error) => {
-                        preserve_native_constraint = is_native_constraint_error(&error);
-                        Err(error)
-                    }
+                let mut columns = statement.column_names();
+                if columns.is_empty() && admitted.is_dml() {
+                    columns =
+                        dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
                 }
-            } else {
-                statement
-                    .query_with_params_for_each(&params, &mut accept)
-                    .await
-            };
-            let outcome = match (outcome, limit_error) {
-                (_, Some(error)) => Err(error.into()),
-                (Err(FrankenError::Abort), None) if stopped_after_first => Ok(()),
-                (result, None) => result.map_err(SqliteFailure::from),
-            };
-            if is_dml {
-                finish_row_savepoint(database, outcome, preserve_native_constraint).await?;
-            } else {
-                outcome?;
+                let visible_col_count = if hidden_col_count > 0 {
+                    let count = columns.len().saturating_sub(hidden_col_count);
+                    columns.truncate(count);
+                    Some(count)
+                } else {
+                    None
+                };
+                let mut bytes = serde_json::to_vec(&columns)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    + 64;
+                if columns.len() > 256 || bytes > MAX_RESULT_BYTES {
+                    return Err("SQLite result has too many columns".into());
+                }
+                let is_dml = admitted.is_dml();
+                if is_dml {
+                    // The pinned engine materializes RETURNING before invoking
+                    // row callbacks. Keep its writes uncommitted until every
+                    // result has passed the bridge's row/encoding limits.
+                    database
+                        .conn
+                        .execute("SAVEPOINT __pijs_row_result")
+                        .await
+                        .map_err(SqliteFailure::from)?;
+                }
+                let mut rows = Vec::new();
+                let mut seen = 0_usize;
+                let mut limit_error = None;
+                let mut stopped_after_first = false;
+                let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
+                    seen += 1;
+                    if seen > MAX_RESULT_ROWS || budget.expire_at(Instant::now()) {
+                        limit_error =
+                            Some("SQLite result exceeds the row or time limit".to_string());
+                        return Err(FrankenError::Abort);
+                    }
+                    if matches!(mode, QueryMode::Get) && !rows.is_empty() {
+                        return Ok(());
+                    }
+                    bytes += 3; // enclosing row brackets and its separator
+                    let values = row.values();
+                    let visible_values = visible_col_count
+                        .map_or(values, |count| &values[..values.len().min(count)]);
+                    match visible_values
+                        .iter()
+                        .map(|value| encode_value(value, database.safe_integers, &mut bytes))
+                        .collect::<Result<Vec<_>>>()
+                    {
+                        Ok(row) => {
+                            rows.push(row);
+                            if matches!(mode, QueryMode::Get) && !is_dml {
+                                // A read-only get() needs one row. The engine's
+                                // callback-abort path closes only its read cursor
+                                // and preserves an enclosing transaction.
+                                stopped_after_first = true;
+                                return Err(FrankenError::Abort);
+                            }
+                            Ok(())
+                        }
+                        Err(error) => {
+                            limit_error = Some(error);
+                            Err(FrankenError::Abort)
+                        }
+                    }
+                };
+                // PreparedStatement's query API rejects DML, including RETURNING.
+                // The connection query dispatcher is its actual DML row interface.
+                // Consume all DML rows even for get(), retaining only the first.
+                let mut preserve_native_constraint = false;
+                let outcome = if is_dml {
+                    // This API also applies the engine's DQS rewrites and error
+                    // offsets. Its for_each variant omits those wrappers, while
+                    // materializing DML rows in exactly the same way.
+                    match database
+                        .conn
+                        .query_with_params(exec_sql.as_ref(), &params)
+                        .await
+                    {
+                        Ok(native_rows) => native_rows.iter().try_for_each(&mut accept),
+                        Err(error) => {
+                            preserve_native_constraint = is_native_constraint_error(&error);
+                            Err(error)
+                        }
+                    }
+                } else {
+                    statement
+                        .query_with_params_for_each(&params, &mut accept)
+                        .await
+                };
+                let outcome = match (outcome, limit_error) {
+                    (_, Some(error)) => Err(error.into()),
+                    (Err(FrankenError::Abort), None) if stopped_after_first => Ok(()),
+                    (result, None) => result.map_err(SqliteFailure::from),
+                };
+                if is_dml {
+                    finish_row_savepoint(database, outcome, preserve_native_constraint).await?;
+                } else {
+                    outcome?;
+                }
+                Ok(json!({ "columns": columns, "rows": rows }))
             }
-            Ok(json!({ "columns": columns, "rows": rows }))
+            .await;
+            reconcile_wal_lease_after_exec(database, wal_plan, query_outcome, operation_cx, budget)
+                .await
         }
         Request::Exec { sql, .. } => {
             let admitted = admit_sql(&sql, false)?;
@@ -2519,15 +2874,26 @@ async fn execute_request(
                 )
             });
             budget.reserve_database(database, may_prepare)?;
-            if !admitted.statements.is_empty() {
-                let exec_sql = admitted.normalized_sql(&sql);
-                database
-                    .conn
-                    .execute_batch(exec_sql.as_ref())
-                    .await
-                    .map_err(SqliteFailure::from)?;
+            let wal_plan = plan_wal_lease(
+                database.conn.in_transaction(),
+                database.txn_has_writes.get(),
+                &admitted.parsed,
+            );
+            prepare_wal_lease_before_exec(database, wal_plan, operation_cx, budget).await?;
+            let exec_outcome: NativeResult<Json> = async {
+                if !admitted.statements.is_empty() {
+                    let exec_sql = admitted.normalized_sql(&sql);
+                    database
+                        .conn
+                        .execute_batch(exec_sql.as_ref())
+                        .await
+                        .map_err(SqliteFailure::from)?;
+                }
+                change_result(database, budget).await
             }
-            change_result(database, budget).await
+            .await;
+            reconcile_wal_lease_after_exec(database, wal_plan, exec_outcome, operation_cx, budget)
+                .await
         }
         Request::InTransaction { .. } => Ok(json!(database.conn.in_transaction())),
         Request::Open { .. } | Request::Close { .. } => Err("Invalid SQLite operation".into()),

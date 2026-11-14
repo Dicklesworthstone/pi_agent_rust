@@ -5215,7 +5215,10 @@ impl Session {
     /// pending work exists.
     pub async fn flush_autosave(&mut self, trigger: AutosaveFlushTrigger) -> Result<()> {
         let Some(ticket) = self.autosave_queue.begin_flush(trigger) else {
-            if self.persisted_path.is_some() && self.should_full_rewrite() {
+            if self.autosave_queue.metrics().pending_mutations == 0
+                && self.persisted_path.is_some()
+                && self.needs_unqueued_structural_rewrite()
+            {
                 return self.save_inner().await;
             }
             return Ok(());
@@ -5223,6 +5226,21 @@ impl Session {
         let result = self.save_inner().await;
         self.autosave_queue.finish_flush(ticket, result.is_ok());
         result
+    }
+
+    fn needs_unqueued_structural_rewrite(&self) -> bool {
+        if self.persisted_path.as_deref() != self.path.as_deref() {
+            return true;
+        }
+        if self
+            .path
+            .as_ref()
+            .is_some_and(|path| !matches!(std::fs::metadata(path), Ok(meta) if meta.is_file()))
+        {
+            return true;
+        }
+        let persisted_count = self.persisted_entry_count.load(Ordering::SeqCst);
+        !self.v2_partial_hydration && persisted_count > self.entries.len()
     }
 
     /// Final shutdown flush respecting the configured durability mode.

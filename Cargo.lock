@@ -5775,6 +5775,7 @@ dependencies = [
  "fsqlite",
  "fsqlite-ast",
  "fsqlite-parser",
+ "fsqlite-types",
  "ftui",
  "ftui-extras",
  "futures",

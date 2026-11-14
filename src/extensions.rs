@@ -14439,6 +14439,7 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
 struct JsPackageEntrySnapshot {
     entries: Option<Vec<PathBuf>>,
     establishes_boundary: bool,
+    has_explicit_name: bool,
 }
 
 type JsPackageEntryCache = HashMap<PathBuf, JsPackageEntrySnapshot>;
@@ -14469,9 +14470,14 @@ fn cached_package_extension_entries(
                 Some("module" | "commonjs")
             )
     });
+    let has_explicit_name = json
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.trim().is_empty());
     let snapshot = JsPackageEntrySnapshot {
         entries,
         establishes_boundary: !type_only_scope,
+        has_explicit_name,
     };
     cache.insert(manifest, snapshot.clone());
     Ok(snapshot)
@@ -14498,7 +14504,7 @@ fn discover_related_extension_entries_with_cache(
         if resolved.len() > selected_resolved.len() {
             selected_resolved = resolved;
         }
-        if snapshot.establishes_boundary {
+        if snapshot.has_explicit_name {
             break;
         }
     }

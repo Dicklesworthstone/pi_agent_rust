@@ -318,18 +318,18 @@ impl JobSnapshot {
     }
 
     fn from_source_best_effort(source: &JobSnapshotSource) -> Self {
-        let (output_tail, output_bytes, output_lines, tail_truncated) =
-            source.tail.try_lock().map_or_else(
-                |_| (String::new(), 0, 0, true),
-                |tail| {
-                    (
-                        tail.text(),
-                        tail.total_bytes,
-                        tail.line_count(),
-                        tail.total_bytes > tail.buf.len(),
-                    )
-                },
-            );
+        let (output_tail, output_bytes, output_lines, tail_truncated) = {
+            let tail = source
+                .tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                tail.text(),
+                tail.total_bytes,
+                tail.line_count(),
+                tail.total_bytes > tail.buf.len(),
+            )
+        };
         let (artifact_truncated, artifact_error) = source.artifact.try_lock().map_or_else(
             |_| {
                 (

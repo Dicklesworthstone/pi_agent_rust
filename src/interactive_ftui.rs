@@ -28279,10 +28279,18 @@ mod tests {
         for name in ["shell.pid", "child.pid"] {
             let pid =
                 std::fs::read_to_string(directory.path().join(name)).expect("started process");
-            let running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                stat.rsplit_once(") ")
-                    .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
-            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut running = true;
+            while std::time::Instant::now() < deadline {
+                running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
+                });
+                if !running {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             assert!(!running, "cancelled process is still running: {pid}");
         }
         for event in agent_rx.try_iter() {

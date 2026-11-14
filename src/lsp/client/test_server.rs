@@ -41,9 +41,12 @@ while True:
         key, value = line.decode('ascii').split(':', 1)
         headers[key.lower()] = value.strip()
     body = sys.stdin.buffer.read(int(headers['content-length']))
-    message = json.loads(body)
     # Keep pressure traffic observable without echoing megabytes back through
-    # test/frames. All actual protocol payloads remain recorded verbatim.
+    # test/frames or spending seconds in json.loads under parallel test load.
+    if b'test/outboundPressure' in body[:128]:
+        frames.append({'method':'test/outboundPressure','payloadBytes':len(body)})
+        continue
+    message = json.loads(body)
     if message.get('method') == 'test/outboundPressure':
         frames.append({'method':'test/outboundPressure','payloadBytes':len(body)})
     else:
