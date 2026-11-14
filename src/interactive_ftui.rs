@@ -7390,10 +7390,11 @@ impl PiFtuiModel {
                     return Cmd::none();
                 }
                 if ctrl_c
+                    && !double_tap
                     && self.busy.is_some()
                     && (self.abort_handoff() || self.abort_driver_operation())
                 {
-                    self.last_ctrl_c = None;
+                    self.last_ctrl_c = Some(std::time::Instant::now());
                     return Cmd::none();
                 }
                 if ctrl_c

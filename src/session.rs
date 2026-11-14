@@ -5491,8 +5491,10 @@ impl Session {
         if self.appends_since_checkpoint >= compaction_checkpoint_interval() {
             return true;
         }
-        // Defensive: if persisted count somehow exceeds entries, force full rewrite.
-        if persisted_count > self.entries.len() {
+        // Defensive: if persisted count somehow exceeds entries (outside lazy V2
+        // partial hydration, where entries intentionally hold only the tail
+        // window until an explicit full-rewrite mutation occurs), force rewrite.
+        if !self.v2_partial_hydration && persisted_count > self.entries.len() {
             return true;
         }
         false

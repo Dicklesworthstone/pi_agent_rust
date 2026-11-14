@@ -3782,11 +3782,6 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
     if !(1..=viewer_limit).contains(max_viewers) {
         bail!("`pi web --max-viewers` must be between 1 and {viewer_limit}");
     }
-    if !has_local_terminal {
-        bail!(
-            "`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported"
-        );
-    }
     if *terminal
         && parsed_bind != pi::web_remote::BindMode::Loopback
         && tls_cert.is_none()
@@ -3794,6 +3789,11 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
     {
         bail!(
             "`pi web` refuses cleartext non-loopback binding (--bind {bind}) without TLS: pass --tls-cert <PATH> and --tls-key <PATH> (with --terminal), or pass --allow-insecure-lan to explicitly permit unencrypted network traffic"
+        );
+    }
+    if !has_local_terminal {
+        bail!(
+            "`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported"
         );
     }
     if bind_mode != pi::web_remote::BindMode::Loopback && tls_cert.is_none() && *allow_insecure_lan

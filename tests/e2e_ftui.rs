@@ -140,15 +140,17 @@ fn e2e_ftui_launch_help_bash_quit() {
         "help text incomplete; got:\n{pane}"
     );
 
-    // Driver round-trip: display-only bash.
+    // Driver round-trip: `!` bash. Construct the marker at runtime in sh so
+    // `send_text_and_wait` waits for actual driver output rather than matching
+    // the user's echoed `!` command line while bash is still running.
     let pane = session.send_text_and_wait(
         "bash",
-        "!echo pi-ftui-e2e-marker",
+        "!printf 'pi-ftui-e2e-%s\\n' marker",
         "pi-ftui-e2e-marker",
         COMMAND_TIMEOUT,
     );
     assert!(
-        pane.contains("$ echo pi-ftui-e2e-marker") || pane.contains("pi-ftui-e2e-marker"),
+        pane.contains("pi-ftui-e2e-marker"),
         "bash output missing; got:\n{pane}"
     );
 

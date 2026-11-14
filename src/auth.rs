@@ -7346,10 +7346,7 @@ mod tests {
 
     #[test]
     fn oauth_callback_drop_releases_idle_fixed_and_random_ports() {
-        let (server, uri) =
-            start_oauth_callback_server_random_port().expect("random callback server");
-        let port = server.port;
-        let check_drop = |server: OAuthCallbackServer| {
+        let check_drop = |server: OAuthCallbackServer, port: u16| {
             let io = Arc::clone(&server.io);
             drop(server);
             // Rebinding is immediate, even if the worker has not run yet.
@@ -7358,12 +7355,25 @@ mod tests {
             assert_oauth_callback_worker_retired(&io);
             drop(rebound);
         };
-        check_drop(server);
+        let (random_server, _) =
+            start_oauth_callback_server_random_port().expect("random callback server");
+        let random_port = random_server.port;
+        check_drop(random_server, random_port);
+
+        // Choose a localhost port strictly below the OS ephemeral range
+        // (32768..65535) so concurrent `:0` listeners and loopback connects in
+        // parallel test threads cannot steal the port between drop and rebind.
+        let fixed_port = (21_000..29_000)
+            .find(|&candidate| {
+                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, candidate)).is_ok()
+            })
+            .expect("available non-ephemeral localhost port");
+        let fixed_uri = format!("http://localhost:{fixed_port}/auth/callback");
         for _ in 0..3 {
             let server =
-                start_oauth_callback_server(&uri).expect("replacement fixed-port callback");
-            assert_eq!(server.port, port);
-            check_drop(server);
+                start_oauth_callback_server(&fixed_uri).expect("replacement fixed-port callback");
+            assert_eq!(server.port, fixed_port);
+            check_drop(server, fixed_port);
         }
     }
 

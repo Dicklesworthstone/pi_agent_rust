@@ -14488,7 +14488,8 @@ fn discover_related_extension_entries_with_cache(
 
     let mut selected_resolved: Vec<PathBuf> = Vec::new();
     for package_json in find_package_json_ancestors(canonical_primary.parent()) {
-        let Some(resolved) = cached_package_extension_entries(&package_json, cache)?.entries else {
+        let snapshot = cached_package_extension_entries(&package_json, cache)?;
+        let Some(resolved) = snapshot.entries else {
             continue;
         };
         if !resolved.contains(&canonical_primary) {
@@ -14496,6 +14497,9 @@ fn discover_related_extension_entries_with_cache(
         }
         if resolved.len() > selected_resolved.len() {
             selected_resolved = resolved;
+        }
+        if snapshot.establishes_boundary {
+            break;
         }
     }
 

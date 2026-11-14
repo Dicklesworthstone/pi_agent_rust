@@ -2375,10 +2375,25 @@ async fn execute_request(
                 .await
                 .map_err(SqliteFailure::from)?;
             if matches!(mode, QueryMode::Run) {
-                statement
-                    .execute_with_params(&params)
-                    .await
-                    .map_err(SqliteFailure::from)?;
+                match statement.execute_with_params(&params).await {
+                    Ok(_) => {}
+                    Err(FrankenError::NotImplemented(message))
+                        if admitted.is_dml()
+                            && !params.is_empty()
+                            && message.contains("Placeholder(") =>
+                    {
+                        // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred leaves AST
+                        // placeholders unbound on live virtual tables (such as FTS5);
+                        // Connection::query_with_params binds AST placeholders before
+                        // virtual-table dispatch while preserving change tracking.
+                        database
+                            .conn
+                            .query_with_params(exec_sql.as_ref(), &params)
+                            .await
+                            .map_err(SqliteFailure::from)?;
+                    }
+                    Err(error) => return Err(SqliteFailure::from(error)),
+                }
                 return change_result(database, budget).await;
             }
             let mut columns = statement.column_names();
