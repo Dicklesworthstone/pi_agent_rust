@@ -273,6 +273,26 @@ accounting until cleanup finishes.
 Per-runtime process slots also remain reserved until the child and its I/O
 workers actually finish, including after a handle is closed or startup fails.
 
+For `spawn(command, args, { signal })`, an `AbortSignal` cancels the managed
+child through its existing owner-checked process handle. Signal-bearing spawns
+use this lifecycle even when stdin or all three stdio endpoints are ignored.
+Detached processes and custom `killSignal` options remain unsupported; abort
+requests use `SIGTERM` and the native monitor's existing escalation and reap.
+
+A signal that is already aborted admits no host execution. Its returned child
+emits an asynchronous `error` with `name: "AbortError"`, `code: "ABORT_ERR"`,
+and the signal reason as `cause`, followed by `close` without `spawn` or
+`exit`. Cancelling a pending admission retains that request: if a handle
+arrives later, the child emits `spawn`, requests termination, and emits one
+`AbortError`. A refused admission retains its actual error. An admitted live
+child emits the abort error once and keeps its native cleanup ownership until
+the terminal result supplies `exit` and `close`; cancellation is not a
+fabricated successful EOF for protocol readers. Queued stdin is settled with
+the cancellation error instead of being sent after abort. Synthetic abort
+events do not cancel a live signal, and listeners are removed on abort or
+normal close. Cancelling one child does not cancel a sibling using a different
+signal.
+
 The runtime services timers and subprocess callbacks while its command channel
 is idle. Healthy extension realms receive turns in stable round-robin order;
 each turn advances a scheduler step and at most one queued hostcall. A slow

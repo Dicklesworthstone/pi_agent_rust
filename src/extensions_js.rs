@@ -11620,7 +11620,7 @@ function __emitCloseOnce(child, code, signal = null) {
 
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
-  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "env"]);
+  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "env", "signal"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) {
       throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
@@ -11668,12 +11668,25 @@ function __parseSpawnOptions(raw) {
     timeoutMs = Math.floor(options.timeout);
   }
 
+  const signal = options.signal;
+  if (signal !== undefined && (
+    signal === null || typeof signal !== "object" ||
+    typeof signal.aborted !== "boolean" ||
+    typeof signal.addEventListener !== "function" ||
+    typeof signal.removeEventListener !== "function"
+  )) {
+    const error = new TypeError("node:child_process.spawn: signal must be an AbortSignal");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+
   return {
     cwd,
     detached: Boolean(options.detached),
     stdio,
     timeoutMs,
     env: options.env,
+    signal,
   };
 }
 
@@ -11782,6 +11795,11 @@ function __spawnPersistent(cmd, argv, opts) {
   let bufferedBytes = 0;
   let needsDrain = false;
   let pendingKill = null;
+  let admissionStarted = false;
+  let abortFailure = null;
+  let abortEmitted = false;
+  let signalListening = false;
+  const signal = opts.signal;
   const pending = [];
   const writes = new Map();
   let endWrite = null;
@@ -11794,6 +11812,39 @@ function __spawnPersistent(cmd, argv, opts) {
     if (!error.code && message && typeof message === "object" && message.code) error.code = String(message.code);
     if (!error.code) error.code = "EPIPE";
     return error;
+  }
+  function removeAbortListener() {
+    if (!signalListening) return;
+    signalListening = false;
+    try { signal.removeEventListener("abort", onAbort); } catch (_) {}
+  }
+  function emitAbort() {
+    if (!abortFailure || abortEmitted) return;
+    abortEmitted = true;
+    child.emit("error", abortFailure);
+  }
+  function onAbort() {
+    // Synthetic events must not retire a live child or consume its listener.
+    if (!signal.aborted || child.__pi_done || closing || abortFailure) return;
+    try {
+      // A pending admission still owns its promise. Record the kill intent
+      // until its opaque handle arrives instead of abandoning a live child.
+      if (admissionStarted && !child.kill("SIGTERM")) {
+        removeAbortListener();
+        return;
+      }
+    } catch (error) {
+      removeAbortListener();
+      child.emit("error", pipeError(error));
+      return;
+    }
+    abortFailure = new Error("The operation was aborted");
+    abortFailure.name = "AbortError";
+    abortFailure.code = "ABORT_ERR";
+    try { abortFailure.cause = signal.reason; } catch (_) {}
+    removeAbortListener();
+    // If admission is still pending, spawn (or admission failure) comes first.
+    if (spawned) emitAbort();
   }
   function settleWrite(id, error) {
     const write = writes.get(id);
@@ -11814,13 +11865,14 @@ function __spawnPersistent(cmd, argv, opts) {
   function close(code, signal, error) {
     if (child.__pi_done || closing) return;
     closing = true;
-    const failure = error ? pipeError(error) : null;
+    removeAbortListener();
+    const failure = error ? pipeError(error) : abortFailure;
     if (timer !== null) clearTimeout(timer);
     timer = null;
     if (handle) {
       try { __pi_process_session_close_native(handle); } catch (_) {}
     }
-    for (const id of [...writes.keys()]) settleWrite(id, pipeError(error || "Process stdin closed"));
+    for (const id of [...writes.keys()]) settleWrite(id, failure || pipeError("Process stdin closed"));
     pending.length = 0;
     if (child.stdin) {
       child.stdin.destroyed = true;
@@ -11851,7 +11903,10 @@ function __spawnPersistent(cmd, argv, opts) {
       stream.closed = true;
       stream.emit("close");
     }
-    if (failure) child.emit("error", failure);
+    if (failure && (!abortEmitted || failure !== abortFailure)) {
+      if (failure === abortFailure) emitAbort();
+      else child.emit("error", failure);
+    }
     if (spawned) {
       __emitCloseOnce(child, code, signal);
     } else {
@@ -11863,7 +11918,7 @@ function __spawnPersistent(cmd, argv, opts) {
     }
   }
   function flushInput() {
-    if (!handle || child.__pi_done) return;
+    if (!handle || child.__pi_done || abortFailure) return;
     while (pending.length) {
       const next = pending[0];
       const accepted = next.end
@@ -11927,7 +11982,7 @@ function __spawnPersistent(cmd, argv, opts) {
     child.stdin.closed = false;
     child.stdin.write = (chunk, encoding, callback) => {
       if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
-      if (child.stdin.writableEnded || child.stdin.destroyed || child.__pi_done) {
+      if (child.stdin.writableEnded || child.stdin.destroyed || child.__pi_done || abortFailure) {
         const error = pipeError("write after process stdin closed");
         if (typeof callback === "function") Promise.resolve().then(() => callback(error));
         else Promise.resolve().then(() => child.stdin.emit("error", error));
@@ -11991,13 +12046,13 @@ function __spawnPersistent(cmd, argv, opts) {
           ? rejectEnd("ERR_STREAM_ALREADY_FINISHED", "process stdin already finished")
           : rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
       }
-      if (child.stdin.destroyed || child.__pi_done) {
+      if (child.stdin.destroyed || child.__pi_done || abortFailure) {
         return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
       }
       if (hasChunk) child.stdin.write(chunk, encoding);
       // A synchronous native-write failure may have closed the child while
       // accepting the final chunk. Never enqueue EOF after its close drain.
-      if (child.stdin.destroyed || child.__pi_done) {
+      if (child.stdin.destroyed || child.__pi_done || abortFailure) {
         return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
       }
       child.stdin.writableEnded = true;
@@ -12027,16 +12082,47 @@ function __spawnPersistent(cmd, argv, opts) {
   child.unref = () => { referenced = false; if (timer && typeof timer.unref === "function") timer.unref(); return child; };
   child.stdio = [child.stdin, child.stdout, child.stderr];
   __pi_child_process_state.children.set(child.pid, child);
-  const execOptions = { persistent: true, stdio: opts.stdio, shell: false };
-  if (opts.cwd !== undefined) execOptions.cwd = opts.cwd;
-  if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
-  if (opts.env !== undefined) {
-    execOptions.env = Object.create(null);
-    for (const [name, value] of Object.entries(opts.env)) {
-      if (value !== undefined) execOptions.env[name] = value === null ? null : String(value);
+  if (signal !== undefined) {
+    try {
+      if (!signal.aborted) {
+        signalListening = true;
+        signal.addEventListener("abort", onAbort);
+      }
+      if (signal.aborted) onAbort();
+    } catch (error) {
+      Promise.resolve().then(() => close(null, null, error));
+      return child;
+    }
+    if (abortFailure) {
+      // Let the caller install error/close listeners, but admit no host work.
+      Promise.resolve().then(() => close(null, null, abortFailure));
+      return child;
     }
   }
-  globalThis.pi.exec(cmd, argv, execOptions).then((result) => {
+  const execOptions = { persistent: true, stdio: opts.stdio, shell: false };
+  let admission;
+  try {
+    if (opts.cwd !== undefined) execOptions.cwd = opts.cwd;
+    if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
+    if (opts.env !== undefined) {
+      execOptions.env = Object.create(null);
+      for (const [name, value] of Object.entries(opts.env)) {
+        if (value !== undefined) execOptions.env[name] = value === null ? null : String(value);
+      }
+    }
+    // Environment getters can abort while the request is being captured.
+    if (signal !== undefined && signal.aborted) onAbort();
+    if (abortFailure) {
+      Promise.resolve().then(() => close(null, null, abortFailure));
+      return child;
+    }
+    admissionStarted = true;
+    admission = globalThis.pi.exec(cmd, argv, execOptions);
+  } catch (error) {
+    Promise.resolve().then(() => close(null, null, error));
+    return child;
+  }
+  Promise.resolve(admission).then((result) => {
     if (!result || typeof result.session !== "string") throw new Error("Persistent process session was not created");
     handle = result.session;
     if (child.__pi_done) { __pi_process_session_close_native(handle); return; }
@@ -12045,7 +12131,11 @@ function __spawnPersistent(cmd, argv, opts) {
     __pi_child_process_state.children.set(child.pid, child);
     spawned = true;
     child.emit("spawn");
-    if (pendingKill) __pi_process_session_kill_native(handle, pendingKill);
+    if (pendingKill) {
+      __pi_process_session_kill_native(handle, pendingKill);
+      pendingKill = null;
+    }
+    if (abortFailure) emitAbort();
     if (!child.stdin) pending.push({ id: 0, end: true });
     flushInput();
     poll();
@@ -12065,7 +12155,9 @@ export function spawn(command, args = [], options = {}) {
   const argv = args.map((arg) => String(arg));
   const opts = __parseSpawnOptions(options);
 
-  if (opts.stdio[0] === "pipe" || opts.env !== undefined) {
+  // Signal-driven cancellation uses the owned process handle and real
+  // terminal acknowledgement even when every stdio endpoint is ignored.
+  if (opts.stdio[0] === "pipe" || opts.env !== undefined || opts.signal !== undefined) {
     if (typeof __pi_process_session_poll_native !== "function") {
       throw new Error("node:child_process.spawn: persistent process host is unavailable");
     }
@@ -37762,6 +37854,332 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["readText"], serde_json::json!("value"));
             assert_eq!(r["names"], serde_json::json!(["value.txt"]));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_child_process_abort_signal_owns_cancellation_through_terminal_close() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock_and_config(
+                DeterministicClock::new(0),
+                PiJsRuntimeConfig {
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                },
+            )
+            .await
+            .expect("create runtime");
+            {
+                let mut state = runtime.module_state.borrow_mut();
+                let source = state
+                    .static_virtual_modules
+                    .get("node:child_process")
+                    .expect("built-in child-process module")
+                    .clone();
+                // Exercise the real module and AbortSignal implementation with
+                // explicit admission and terminal acknowledgements. Keeping
+                // two children alive detects cancellation of the wrong handle.
+                let fixture = r"
+let nextTimer = 0;
+let pollingHandle = null;
+const scheduled = new Map();
+const batches = new Map();
+const admissions = [];
+const kills = [];
+const closes = [];
+const inputEnds = [];
+export function counts() {
+  return { admissions: admissions.length, kills: kills.slice(), closes: closes.slice(),
+    inputEnds: inputEnds.slice(), timers: scheduled.size };
+}
+export function admit(index) {
+  admissions[index].resolve({ session: 'abort-peer-' + index, pid: index + 1 });
+}
+export function refuse(index) {
+  admissions[index].reject(Object.assign(new Error('Permission denied'), { code: 'EACCES' }));
+}
+export function feed(index, batch) {
+  const handle = 'abort-peer-' + index;
+  const entry = Array.from(scheduled.entries()).find(([, timer]) => timer.handle === handle);
+  if (!entry) throw new Error('No pending poll for ' + handle);
+  batches.set(handle, batch);
+  scheduled.delete(entry[0]);
+  entry[1].callback();
+}
+const setTimeout = (callback) => {
+  const id = ++nextTimer;
+  scheduled.set(id, { handle: pollingHandle, callback });
+  return id;
+};
+const clearTimeout = (id) => scheduled.delete(id);
+const __pi_process_session_poll_native = (handle) => {
+  pollingHandle = handle;
+  const batch = batches.get(handle) || { frames: [] };
+  batches.delete(handle);
+  return JSON.stringify(batch);
+};
+const __pi_process_session_write_native = () => { throw new Error('Unexpected write'); };
+const __pi_process_session_end_native = (handle) => { inputEnds.push(handle); return true; };
+const __pi_process_session_close_native = (handle) => { closes.push(handle); };
+const __pi_process_session_kill_native = (handle, signal) => { kills.push([handle, signal]); return true; };
+const globalThis = {
+  pi: { exec: () => new Promise((resolve, reject) => admissions.push({ resolve, reject })) },
+};
+";
+                state.dynamic_virtual_modules.insert(
+                    "pijs://spawn-abort-fixture".to_string(),
+                    format!("{fixture}\n{source}"),
+                );
+            }
+            runtime
+                .eval(
+                    r"
+                    globalThis.__spawn_abort_result = null;
+                    globalThis.__spawn_abort_results = () => globalThis.__spawn_abort_result;
+                    import('pijs://spawn-abort-fixture').then(async ({ spawn, counts, admit, refuse, feed }) => {
+const result = {};
+function watchedSignal() {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const listeners = new Set();
+  const add = signal.addEventListener.bind(signal);
+  const remove = signal.removeEventListener.bind(signal);
+  signal.addEventListener = (type, listener, options) => {
+    if (type === 'abort') listeners.add(listener);
+    add(type, listener, options);
+  };
+  signal.removeEventListener = (type, listener, options) => {
+    if (type === 'abort') listeners.delete(listener);
+    remove(type, listener, options);
+  };
+  return { controller, signal, listeners };
+}
+function watch(child) {
+  const trace = { child, events: [], streamErrors: [], streamEnds: 0 };
+  child.on('spawn', () => trace.events.push(['spawn']));
+  child.on('error', error => trace.events.push(['error', error.name, error.code, error.cause]));
+  child.on('exit', (code, signal) => trace.events.push(['exit', code, signal]));
+  child.on('close', (code, signal) => trace.events.push(['close', code, signal]));
+  for (const stream of [child.stdout, child.stderr]) {
+    stream?.on('error', error => trace.streamErrors.push(error.code));
+    stream?.on('end', () => { trace.streamEnds++; });
+  }
+  return trace;
+}
+const earlier = watchedSignal();
+earlier.controller.abort('already stopped');
+const pre = watch(spawn('peer', [], { signal: earlier.signal }));
+result.preSyncEvents = pre.events.length;
+await Promise.resolve();
+result.pre = { events: pre.events, admissions: counts().admissions,
+  listeners: earlier.listeners.size, killed: pre.child.killed, killAfterClose: pre.child.kill() };
+
+const waiting = watchedSignal();
+const pending = watch(spawn('peer', [], { signal: waiting.signal }));
+pending.child.stdin.end(error => { result.pendingEndError = error?.code; });
+waiting.controller.abort('admission cancelled');
+result.pendingBeforeAdmission = { events: pending.events.slice(), kills: counts().kills.slice(),
+  listeners: waiting.listeners.size };
+admit(0);
+await Promise.resolve();
+result.pendingAfterAdmission = { events: pending.events.slice(), kills: counts().kills.slice(),
+  closes: counts().closes.slice(), inputEnds: counts().inputEnds.slice() };
+feed(0, { frames: [], terminal: { code: null, signal: 'SIGTERM' } });
+await Promise.resolve();
+result.pending = { events: pending.events, streamErrors: pending.streamErrors,
+  streamEnds: pending.streamEnds, listeners: waiting.listeners.size };
+
+const liveSignal = watchedSignal();
+const siblingSignal = watchedSignal();
+const live = watch(spawn('peer', [], { signal: liveSignal.signal, stdio: ['ignore', 'pipe', 'pipe'] }));
+const sibling = watch(spawn('peer', [], { signal: siblingSignal.signal }));
+admit(1);
+admit(2);
+await Promise.resolve();
+const killsBeforeSynthetic = counts().kills.length;
+liveSignal.signal.dispatchEvent(new Event('abort'));
+result.synthetic = { newKills: counts().kills.length - killsBeforeSynthetic,
+  listeners: liveSignal.listeners.size, events: live.events.slice() };
+live.child.on('error', () => { throw new Error('guest error callback'); });
+liveSignal.controller.abort('live cancelled');
+liveSignal.controller.abort('second reason');
+result.liveBeforeTerminal = { events: live.events.slice(), kills: counts().kills.slice(),
+  closes: counts().closes.slice(), siblingEvents: sibling.events.slice() };
+feed(1, { frames: [], terminal: { code: null, signal: 'SIGTERM' } });
+result.live = { events: live.events, listeners: liveSignal.listeners.size,
+  killAfterClose: live.child.kill() };
+feed(2, { frames: [], terminal: { code: 0 } });
+const settledKills = counts().kills.length;
+siblingSignal.controller.abort('too late');
+result.completed = { events: sibling.events, listeners: siblingSignal.listeners.size,
+  newKills: counts().kills.length - settledKills, streamEnds: sibling.streamEnds };
+
+const deniedSignal = watchedSignal();
+const denied = watch(spawn('peer', [], { signal: deniedSignal.signal }));
+deniedSignal.controller.abort('denied while waiting');
+refuse(3);
+await Promise.resolve();
+await Promise.resolve();
+result.denied = { events: denied.events, listeners: deniedSignal.listeners.size };
+
+const getterSignal = watchedSignal();
+const admissionsBeforeGetter = counts().admissions;
+const captured = watch(spawn('peer', [], { signal: getterSignal.signal,
+  env: { get PATH() { getterSignal.controller.abort('capturing environment'); return '/bin'; } } }));
+await Promise.resolve();
+result.capture = { events: captured.events, newAdmissions: counts().admissions - admissionsBeforeGetter,
+  listeners: getterSignal.listeners.size };
+
+result.invalid = [];
+for (const signal of [null, true, {}, { aborted: false, addEventListener() {} }]) {
+  try { spawn('peer', [], { signal }); result.invalid.push('accepted'); }
+  catch (error) { result.invalid.push([error.name, error.code]); }
+}
+try { spawn('peer', [], { signal: new AbortController().signal, detached: true }); }
+catch (error) { result.detached = String(error.message); }
+try { spawn('peer', [], { signal: new AbortController().signal, killSignal: 'SIGINT' }); }
+catch (error) { result.killSignal = String(error.message); }
+result.final = counts();
+globalThis.__spawn_abort_result = result;
+                    }).catch(error => {
+                      globalThis.__spawn_abort_result = { error: String(error.stack || error) };
+                    });
+",
+                )
+                .await
+                .expect("run child-process abort fixture");
+            let actual = call_global_fn_json(&runtime, "__spawn_abort_results").await;
+            assert!(actual.get("error").is_none(), "{actual}");
+            assert_eq!(actual["preSyncEvents"], 0);
+            assert_eq!(
+                actual["pre"],
+                serde_json::json!({
+                    "events": [
+                        ["error", "AbortError", "ABORT_ERR", "already stopped"],
+                        ["close", null, null]
+                    ],
+                    "admissions": 0,
+                    "listeners": 0,
+                    "killed": false,
+                    "killAfterClose": false
+                })
+            );
+            assert_eq!(
+                actual["pendingBeforeAdmission"],
+                serde_json::json!({"events": [], "kills": [], "listeners": 0})
+            );
+            assert_eq!(
+                actual["pendingAfterAdmission"],
+                serde_json::json!({
+                    "events": [
+                        ["spawn"],
+                        ["error", "AbortError", "ABORT_ERR", "admission cancelled"]
+                    ],
+                    "kills": [["abort-peer-0", "SIGTERM"]],
+                    "closes": [],
+                    "inputEnds": []
+                })
+            );
+            assert_eq!(actual["pendingEndError"], "ABORT_ERR");
+            assert_eq!(
+                actual["pending"]["events"],
+                serde_json::json!([
+                    ["spawn"],
+                    ["error", "AbortError", "ABORT_ERR", "admission cancelled"],
+                    ["exit", null, "SIGTERM"],
+                    ["close", null, "SIGTERM"]
+                ])
+            );
+            assert_eq!(
+                actual["pending"]["streamErrors"],
+                serde_json::json!(["ABORT_ERR", "ABORT_ERR"])
+            );
+            assert_eq!(actual["pending"]["streamEnds"], 0);
+            assert_eq!(actual["pending"]["listeners"], 0);
+            assert_eq!(
+                actual["synthetic"],
+                serde_json::json!({"newKills": 0, "listeners": 1, "events": [["spawn"]]})
+            );
+            assert_eq!(
+                actual["liveBeforeTerminal"],
+                serde_json::json!({
+                    "events": [
+                        ["spawn"],
+                        ["error", "AbortError", "ABORT_ERR", "live cancelled"]
+                    ],
+                    "kills": [["abort-peer-0", "SIGTERM"], ["abort-peer-1", "SIGTERM"]],
+                    "closes": ["abort-peer-0"],
+                    "siblingEvents": [["spawn"]]
+                })
+            );
+            assert_eq!(
+                actual["live"]["events"],
+                serde_json::json!([
+                    ["spawn"],
+                    ["error", "AbortError", "ABORT_ERR", "live cancelled"],
+                    ["exit", null, "SIGTERM"],
+                    ["close", null, "SIGTERM"]
+                ])
+            );
+            assert_eq!(actual["live"]["listeners"], 0);
+            assert_eq!(actual["live"]["killAfterClose"], false);
+            assert_eq!(
+                actual["completed"],
+                serde_json::json!({
+                    "events": [["spawn"], ["exit", 0, null], ["close", 0, null]],
+                    "listeners": 0,
+                    "newKills": 0,
+                    "streamEnds": 2
+                })
+            );
+            assert_eq!(
+                actual["denied"],
+                serde_json::json!({
+                    "events": [["error", "Error", "EACCES", null], ["close", null, null]],
+                    "listeners": 0
+                })
+            );
+            assert_eq!(
+                actual["capture"],
+                serde_json::json!({
+                    "events": [
+                        ["error", "AbortError", "ABORT_ERR", "capturing environment"],
+                        ["close", null, null]
+                    ],
+                    "newAdmissions": 0,
+                    "listeners": 0
+                })
+            );
+            assert_eq!(
+                actual["invalid"],
+                serde_json::json!([
+                    ["TypeError", "ERR_INVALID_ARG_TYPE"],
+                    ["TypeError", "ERR_INVALID_ARG_TYPE"],
+                    ["TypeError", "ERR_INVALID_ARG_TYPE"],
+                    ["TypeError", "ERR_INVALID_ARG_TYPE"]
+                ])
+            );
+            assert!(
+                actual["detached"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("cannot be detached"))
+            );
+            assert!(
+                actual["killSignal"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("unsupported option 'killSignal'"))
+            );
+            assert_eq!(
+                actual["final"],
+                serde_json::json!({
+                    "admissions": 4,
+                    "kills": [["abort-peer-0", "SIGTERM"], ["abort-peer-1", "SIGTERM"]],
+                    "closes": ["abort-peer-0", "abort-peer-1", "abort-peer-2"],
+                    "inputEnds": ["abort-peer-1"],
+                    "timers": 0
+                })
+            );
         });
     }
 
