@@ -891,6 +891,31 @@ impl AgentSessionHandle {
         }
     }
 
+    /// Same-provider retries and overflow recovery share this admission path.
+    /// Waiting for another owner's callback or Session lock is cancellable;
+    /// after the rewind starts saving, let its durable result settle.
+    pub(super) async fn restore_recovery_tail(
+        &mut self,
+        require_incomplete_tail: bool,
+        abort_signal: &AbortSignal,
+    ) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let authority = await_session_preparation(
+            Some(abort_signal),
+            admission.acquire_transition_authority(cx.cx()),
+        )
+        .await?
+        .with_abort(Some(abort_signal));
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action =
+            await_session_preparation(Some(abort_signal), session_actions.acquire(cx.cx())).await?;
+        self.session
+            .restore_retry_tail_with_authority(&cx, require_incomplete_tail, &authority)
+            .await
+    }
+
     async fn prepare_context_overflow_recovery(
         &mut self,
         current: &Result<AssistantMessage>,
@@ -899,14 +924,11 @@ impl AgentSessionHandle {
         turn: &LogicalTurn,
     ) -> Result<bool> {
         ensure_not_aborted(abort_signal)?;
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let admission = self.session.provider_admission_gate();
-        admission.ensure_allowed()?;
         // Rewind only the incomplete assistant response. Accepted user/media
         // input and every completed tool result stay in the durable transcript.
-        self.session
-            .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
+        self.restore_recovery_tail(current.is_ok(), abort_signal)
             .await?;
+        let admission = self.session.provider_admission_gate();
         admission.ensure_allowed()?;
         turn.restored_tail();
         ensure_not_aborted(abort_signal)?;
@@ -961,12 +983,10 @@ impl AgentSessionHandle {
             if !Self::await_retry_backoff(delay_ms, abort_signal).await {
                 return Err(Error::Aborted);
             }
+            self.restore_recovery_tail(current.is_ok(), abort_signal)
+                .await?;
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
             let admission = self.session.provider_admission_gate();
-            admission.ensure_allowed()?;
-            self.session
-                .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
-                .await?;
             admission.ensure_allowed()?;
             turn.restored_tail();
             // Do not race cancellation against a durability operation: let it
@@ -976,7 +996,11 @@ impl AgentSessionHandle {
                 // A successful rewind is the prerequisite for credential
                 // rotation, just as it is for another provider request. Keep
                 // a delayed retry from changing a newer provider selection.
-                let authority = admission.acquire_transition_authority(cx.cx()).await?;
+                let authority = await_session_preparation(
+                    Some(abort_signal),
+                    admission.acquire_transition_authority(cx.cx()),
+                )
+                .await?;
                 ensure_not_aborted(abort_signal)?;
                 let legacy_pin = self
                     .failover

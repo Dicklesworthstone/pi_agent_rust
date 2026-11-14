@@ -20723,12 +20723,29 @@ impl AgentSession {
         let authority = admission.acquire_transition_authority(cx.cx()).await?;
         let session_actions = self.session_action_admission.clone();
         let _session_action = session_actions.acquire(cx.cx()).await?;
-        let session_store = Arc::clone(&self.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        self.restore_retry_tail_with_authority(cx, require_incomplete_tail, &authority)
             .await
-            .map_err(|err| {
-                Error::session(format!("retry restoration session lock failed: {err}"))
-            })?;
+    }
+
+    /// Restore a failed tail under authority already held by a recovery driver.
+    /// Its optional abort signal can cancel the store wait or preparation,
+    /// never the ensuing durable save and installation.
+    pub(crate) async fn restore_retry_tail_with_authority(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<()> {
+        let admission = &authority.gate;
+        let session_store = Arc::clone(&self.session);
+        let mut inner = await_session_preparation(authority.abort.as_ref(), async {
+            OwnedMutexGuard::lock(session_store, cx)
+                .await
+                .map_err(|err| {
+                    Error::session(format!("retry restoration session lock failed: {err}"))
+                })
+        })
+        .await?;
         let mut candidate = inner.clone();
         let reverted = candidate.revert_incomplete_response();
         if require_incomplete_tail && !reverted {
@@ -20742,7 +20759,7 @@ impl AgentSession {
 
         let restored_messages = candidate.to_messages_for_current_path();
         let save_enabled = self.save_enabled();
-        let _provider_transition = ProviderSwapAdmission::Held(&authority)
+        let _provider_transition = ProviderSwapAdmission::Held(authority)
             .begin_transition(
                 "retry restoration persistence was interrupted before live installation completed"
                     .to_string(),

@@ -5710,12 +5710,19 @@ fn explicit_model_selection_retires_child_role_but_automatic_changes_preserve_it
 fn recovery_cancellation_releases_admission_without_changing_history() {
     use crate::extensions::ExtensionSession as _;
 
-    for restore in [false, true] {
+    for mode in ["restore", "fallback", "retry"] {
         for blocked_on in ["provider", "action", "session"] {
             let dir = tempdir().unwrap();
-            let mut handle = saving_fallback_selection_handle(dir.path());
+            let mut handle = if mode == "retry" {
+                let (mut handle, _) = saving_recovery_handle(dir.path());
+                let failed = run_async(handle.prompt("saved input", |_| {})).unwrap();
+                assert_eq!(failed.stop_reason, StopReason::Error);
+                handle
+            } else {
+                saving_fallback_selection_handle(dir.path())
+            };
             let store = handle.session_store();
-            if !restore {
+            if mode == "fallback" {
                 let selected = handle.model();
                 let extension = crate::session::SessionHandle(Arc::clone(&store));
                 run_async(extension.set_model(selected.0, selected.1, None)).unwrap();
@@ -5759,7 +5766,7 @@ fn recovery_cancellation_releases_admission_without_changing_history() {
                 let failure = Err(Error::provider("test-provider", "503 service unavailable"));
                 {
                     let recovery = async {
-                        if restore {
+                        if mode == "restore" {
                             // Exercise the public preflight, not only the
                             // internal helper's optional cancellation argument.
                             handle
@@ -5770,7 +5777,7 @@ fn recovery_cancellation_releases_admission_without_changing_history() {
                                 )
                                 .await
                                 .map(|_| ())
-                        } else {
+                        } else if mode == "fallback" {
                             handle
                                 .try_chain_failover(
                                     &failure,
@@ -5782,12 +5789,14 @@ fn recovery_cancellation_releases_admission_without_changing_history() {
                                 )
                                 .await
                                 .map(|_| ())
+                        } else {
+                            handle.restore_recovery_tail(true, &signal).await
                         }
                     };
                     futures::pin_mut!(recovery);
                     assert!(
                         futures::poll!(recovery.as_mut()).is_pending(),
-                        "{restore}/{blocked_on}: the operation must reach the held resource"
+                        "{mode}/{blocked_on}: the operation must reach the held resource"
                     );
                     abort.abort();
                     let outcome = asupersync::time::timeout(
@@ -5931,4 +5940,177 @@ fn admitted_recovery_can_abort_the_actual_transaction_store_wait() {
         assert!(Arc::ptr_eq(&handle.session.agent.provider(), &provider_before));
         provider_gate.ensure_allowed().unwrap();
     }
+}
+
+#[test]
+fn aborting_retry_admission_closes_the_logical_turn_without_quarantine() {
+    use futures::FutureExt as _;
+
+    let dir = tempdir().unwrap();
+    let (handle, calls) = saving_recovery_handle(dir.path());
+    let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+    let store = handle.session_store();
+    let gate = handle.session.provider_admission_gate();
+    let callback_gate = gate.clone();
+    let held = Arc::new(Mutex::new(None));
+    let callback_held = Arc::clone(&held);
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_started = Arc::clone(&started);
+    let (abort, signal) = AbortHandle::new();
+    let (events, callback) = event_log();
+    let on_event = move |event| {
+        if matches!(&event, AgentEvent::AutoRetryStart { .. }) {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let permit = callback_gate
+                .acquire(cx.cx())
+                .now_or_never()
+                .expect("the completed attempt released provider admission")
+                .unwrap();
+            *callback_held.lock().unwrap() = Some(permit);
+            callback_started.store(true, Ordering::SeqCst);
+        }
+        callback(event);
+    };
+    let (result, path, disk_before) = run_async(async {
+        let turn = handle.prompt_with_abort("persist once", signal, on_event);
+        futures::pin_mut!(turn);
+        futures::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+            if started.load(Ordering::SeqCst) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        let path = store.try_lock().unwrap().path.clone().unwrap();
+        let disk_before = std::fs::read(&path).unwrap();
+        abort.abort();
+        let result = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(5),
+            turn,
+        )
+        .await
+        .expect("abort must close recovery while the unrelated provider owner remains held");
+        assert!(held.lock().unwrap().is_some());
+        (result, path, disk_before)
+    });
+    assert!(matches!(result, Err(Error::Aborted)));
+    gate.ensure_allowed().unwrap();
+    drop(held.lock().unwrap().take());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    assert_eq!(
+        lifecycle_names(&events.lock().unwrap()),
+        [
+            "agent_start",
+            "retry_start:1",
+            "retry_end:1:false",
+            "agent_end",
+        ]
+    );
+    let messages = run_async(handle.messages()).unwrap();
+    assert!(matches!(messages.first(), Some(Message::User(_))));
+    assert!(matches!(
+        messages.last(),
+        Some(Message::Assistant(message)) if message.stop_reason == StopReason::Error
+    ));
+}
+
+#[test]
+fn retry_rewind_cancels_at_its_shared_session_store_wait() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls) = saving_recovery_handle(dir.path());
+    let failed = run_async(handle.prompt("keep this input", |_| {})).unwrap();
+    assert_eq!(failed.stop_reason, StopReason::Error);
+    let messages_before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+    let store = handle.session_store();
+    let path = store.try_lock().unwrap().path.clone().unwrap();
+    let disk_before = std::fs::read(&path).unwrap();
+    let gate = handle.session.provider_admission_gate();
+    let actions = handle.session.session_action_admission_gate();
+    let (abort, signal) = AbortHandle::new();
+    run_async(async {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let authority = gate
+            .acquire_transition_authority(cx.cx())
+            .await
+            .unwrap()
+            .with_abort(Some(&signal));
+        let _action = actions.acquire(cx.cx()).await.unwrap();
+        let _store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+            .await
+            .unwrap();
+        let rewind = handle
+            .session
+            .restore_retry_tail_with_authority(&cx, true, &authority);
+        futures::pin_mut!(rewind);
+        assert!(futures::poll!(rewind.as_mut()).is_pending());
+        abort.abort();
+        let result = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(5),
+            rewind,
+        )
+        .await
+        .expect("the shared rewind must observe cancellation before persistence");
+        assert!(matches!(result, Err(Error::Aborted)));
+        gate.ensure_allowed().unwrap();
+    });
+    assert_eq!(
+        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+        messages_before
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn retry_abort_after_save_begins_finishes_the_durable_rewind() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls) = saving_recovery_handle(dir.path());
+    let failed = run_async(handle.prompt("retain the accepted input", |_| {})).unwrap();
+    assert_eq!(failed.stop_reason, StopReason::Error);
+    let store = handle.session_store();
+    let path = store.try_lock().unwrap().path.clone().unwrap();
+    let disk_before = std::fs::read(&path).unwrap();
+    let gate = handle.session.provider_admission_gate();
+    let (abort, signal) = AbortHandle::new();
+    run_async_with_blocking_pool(async {
+        let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+        let rewind = handle.restore_recovery_tail(true, &signal);
+        futures::pin_mut!(rewind);
+        assert!(futures::poll!(rewind.as_mut()).is_pending());
+        assert!(
+            gate.ensure_allowed().unwrap_err().is_session_persistence(),
+            "the transition has crossed its persistence boundary"
+        );
+        abort.abort();
+        assert!(
+            futures::poll!(rewind.as_mut()).is_pending(),
+            "an abort must not abandon an already-started save"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        drop(disk_lock);
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(10),
+            rewind,
+        )
+        .await
+        .expect("the admitted save must settle")
+        .expect("a settled rewind keeps the handle reusable");
+    });
+    gate.ensure_allowed().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let messages = run_async(handle.messages()).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(&messages[0], Message::User(_)));
+    let saved = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        serde_json::to_value(saved.to_messages_for_current_path()).unwrap(),
+        serde_json::to_value(messages).unwrap()
+    );
+    assert_ne!(std::fs::read(&path).unwrap(), disk_before);
 }
