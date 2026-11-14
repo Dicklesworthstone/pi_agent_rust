@@ -2501,10 +2501,8 @@ fn plan_wal_lease(was_in_txn: bool, had_writes: bool, parsed: &[SqlStatement]) -
             SqlStatement::Pragma(_) => {
                 release_before_exec = true;
             }
-            other if statement_writes(other) => {
-                if in_txn {
-                    writes_in_txn = true;
-                }
+            other if in_txn && statement_writes(other) => {
+                writes_in_txn = true;
             }
             _ => {}
         }
