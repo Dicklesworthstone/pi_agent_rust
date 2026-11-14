@@ -178,11 +178,12 @@ fn open_sqlite_connection_read_only(path: &Path) -> Result<SqliteConnection> {
     let all_sidecars_exist = ensure_preexisting_sqlite_sidecar_access(path, false)?;
     // Validates the database header bytes even though fsqlite reads through
     // both WAL and rollback-journal databases.
-    let _uses_wal = sqlite_database_uses_wal(path)?;
-    if !all_sidecars_exist {
-        // fsqlite creates any missing namespace/WAL sidecars even for a
-        // read-only open, which requires a writable parent directory.
-        // Existing sidecars only need to be openable in place.
+    let uses_wal = sqlite_database_uses_wal(path)?;
+    if uses_wal && !all_sidecars_exist {
+        // WAL sessions retain the directory-write preflight for missing
+        // runtime companions. A rollback-mode read uses the engine's native
+        // reader locks and admits missing namespace records without creating
+        // them, so a database-only archive needs no directory write access.
         crate::session::ensure_session_parent_writable(path)
             .map_err(|err| Error::Io(Box::new(err)))?;
     }
@@ -1954,6 +1955,145 @@ mod tests {
             result.expect("rollback-journal read-only open must not create WAL sidecars");
         assert_eq!(loaded_header.id, header.id);
         assert_eq!(loaded_entries.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_rollback_archive_loads_without_sidecars_or_directory_writes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite");
+        let header = SessionHeader {
+            id: "sqlite-readonly-archive".to_string(),
+            ..SessionHeader::default()
+        };
+        let entries = vec![
+            session_info_entry(Some("Read-only archive".to_string())),
+            message_entry(),
+        ];
+        futures::executor::block_on(save_session(&source, &header, &entries, true))
+            .expect("seed SQLite session");
+        with_write_connection(&source, |conn| {
+            map_sqlite_result(conn.execute_raw("PRAGMA journal_mode = DELETE;"))
+        })
+        .expect("checkpoint fixture in rollback-journal mode");
+
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir(&archive_dir).expect("create archive directory");
+        let archive = archive_dir.join("session.sqlite");
+        std::fs::copy(&source, &archive).expect("copy only the database into the archive");
+        assert!(!sqlite_database_uses_wal(&archive).expect("archive journal mode"));
+        let original_bytes = std::fs::read(&archive).expect("archive database bytes");
+        let _file_mode = UnixModeGuard::apply(&archive, 0o400);
+        let _directory_mode = UnixModeGuard::apply(&archive_dir, 0o500);
+        assert_eq!(
+            crate::session::ensure_session_parent_writable(&archive)
+                .expect_err("archive directory must deny writes even under UID 0")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let loaded_header = load_session_header(&archive).expect("read archive header");
+        let (session_header, loaded_entries) =
+            futures::executor::block_on(load_session(&archive)).expect("read archive session");
+        let meta = futures::executor::block_on(load_session_meta(&archive))
+            .expect("read archive discovery metadata");
+        assert_eq!(loaded_header.id, header.id);
+        assert_eq!(session_header.id, header.id);
+        assert_eq!(
+            serde_json::to_value(&loaded_entries).expect("loaded entries"),
+            serde_json::to_value(&entries).expect("source entries")
+        );
+        assert_eq!(meta.header.id, header.id);
+        assert_eq!(meta.message_count, 1);
+        assert_eq!(meta.name.as_deref(), Some("Read-only archive"));
+
+        run_on_sqlite_thread(|| {
+            let conn = open_sqlite_connection_read_only(&archive)?;
+            assert!(matches!(
+                conn.execute_raw("DELETE FROM pi_session_entries;"),
+                Err(SqliteError::ReadOnly)
+            ));
+            Ok(())
+        })
+        .expect("archive connection must remain read-only");
+        assert_eq!(
+            std::fs::read(&archive).expect("preserved archive"),
+            original_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(&archive)
+                .expect("archive mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::metadata(&archive_dir)
+                .expect("archive directory mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        let files = std::fs::read_dir(&archive_dir)
+            .expect("archive directory")
+            .map(|entry| entry.expect("archive entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec![std::ffi::OsString::from("session.sqlite")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_rollback_archive_refuses_malformed_recovery_journal_without_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.sqlite");
+        let header = SessionHeader {
+            id: "sqlite-readonly-archive-journal".to_string(),
+            ..SessionHeader::default()
+        };
+        futures::executor::block_on(save_session(&source, &header, &[message_entry()], true))
+            .expect("seed SQLite session");
+        with_write_connection(&source, |conn| {
+            map_sqlite_result(conn.execute_raw("PRAGMA journal_mode = DELETE;"))
+        })
+        .expect("checkpoint fixture in rollback-journal mode");
+
+        let archive_dir = dir.path().join("archive");
+        std::fs::create_dir(&archive_dir).expect("create archive directory");
+        let archive = archive_dir.join("session.sqlite");
+        std::fs::copy(&source, &archive).expect("copy archived database");
+        let original_bytes = std::fs::read(&archive).expect("archive database bytes");
+        let journal = append_sidecar_suffix(&archive, "-journal");
+        let journal_bytes = [0xd9, 0xd5, 0x05];
+        std::fs::write(&journal, journal_bytes).expect("write interrupted journal magic");
+        let _file_mode = UnixModeGuard::apply(&archive, 0o400);
+        let _journal_mode = UnixModeGuard::apply(&journal, 0o400);
+        let _directory_mode = UnixModeGuard::apply(&archive_dir, 0o500);
+
+        let error = futures::executor::block_on(load_session(&archive))
+            .expect_err("a read-only archive must not ignore a malformed recovery journal");
+        assert!(
+            error.to_string().contains("rollback journal"),
+            "expected the native journal validation error, got {error}"
+        );
+        assert_eq!(
+            std::fs::read(&archive).expect("preserved archive"),
+            original_bytes
+        );
+        assert_eq!(
+            std::fs::read(&journal).expect("preserved journal"),
+            journal_bytes
+        );
+        assert_eq!(
+            std::fs::read_dir(&archive_dir)
+                .expect("archive directory")
+                .count(),
+            2,
+            "refused read must not create runtime companions or a persistence lock"
+        );
     }
 
     #[cfg(unix)]
