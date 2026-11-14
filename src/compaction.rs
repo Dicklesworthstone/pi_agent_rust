@@ -2016,11 +2016,9 @@ pub fn estimate_model_context_tokens_for_model(
             .map(|message| estimate_model_message_with_table(message, table))
             .fold(0u64, u64::saturating_add)
     };
-    if accepts_images
-        && !messages
-            .iter()
-            .any(crate::compaction_snap::is_archive_message)
-    {
+    if !messages.iter().any(|message| {
+        crate::compaction_snap::message_needs_model_projection(message, accepts_images)
+    }) {
         return estimate(messages);
     }
     let mut projected = messages.to_vec();

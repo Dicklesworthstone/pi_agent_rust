@@ -4352,21 +4352,23 @@ pub async fn run(
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                     RpcStateSnapshot::from(&*state)
                 };
-                let mut data = {
+                let inputs = {
                     let inner_session = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx)
                         .await
                         .map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
-                    session_state(
+                    SessionStateInputs::capture(
                         &inner_session,
                         catalog.header_model(&inner_session),
-                        &snapshot,
                         &options.config,
-                        is_streaming.load(Ordering::SeqCst),
-                        is_compacting.load(Ordering::SeqCst),
                     )
                 };
+                let mut data = inputs.into_value(
+                    &snapshot,
+                    is_streaming.load(Ordering::SeqCst),
+                    is_compacting.load(Ordering::SeqCst),
+                );
                 data["outputMode"] = Value::String(output.mode().to_string());
                 let _ = out_tx.send(response_ok(id, "get_state", Some(data)));
             }
@@ -16840,6 +16842,143 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
     })
 }
 
+struct SessionStateInputs {
+    model: Option<Value>,
+    accepts_images: bool,
+    text_budget: u32,
+    messages: Vec<crate::model::Message>,
+    provider: String,
+    model_id: String,
+    message_count: usize,
+    session_name: Option<String>,
+    thinking_level: String,
+    session_file: Value,
+    session_id: String,
+    context_window: Value,
+    durability_mode: &'static str,
+}
+
+impl SessionStateInputs {
+    fn capture(
+        session: &crate::session::Session,
+        model_entry: Option<&ModelEntry>,
+        config: &Config,
+    ) -> Self {
+        let model = model_entry.map(rpc_model_from_entry);
+        let accepts_images = !config.image_block_images()
+            && model_entry.is_some_and(|entry| {
+                entry
+                    .model
+                    .input
+                    .iter()
+                    .any(|input| input.as_str() == "image")
+            });
+        let text_budget = model_entry.map_or(
+            crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
+            |entry| {
+                context_window_tokens_for_entry(entry)
+                    .saturating_sub(config.compaction_reserve_tokens())
+                    / 2
+            },
+        );
+        let path_entries = session.entries_for_current_path();
+        let message_count = path_entries
+            .iter()
+            .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
+            .count();
+        let session_name = path_entries.iter().rev().find_map(|entry| {
+            let crate::session::SessionEntry::SessionInfo(info) = entry else {
+                return None;
+            };
+            info.name.clone()
+        });
+        Self {
+            model,
+            accepts_images,
+            text_budget,
+            messages: session.to_messages_for_current_path(),
+            provider: session.header.provider.clone().unwrap_or_default(),
+            model_id: session.header.model_id.clone().unwrap_or_default(),
+            message_count,
+            session_name,
+            thinking_level: session
+                .header
+                .thinking_level
+                .clone()
+                .unwrap_or_else(|| "off".to_string()),
+            session_file: session
+                .path
+                .as_ref()
+                .map_or(Value::Null, |p| Value::String(p.display().to_string())),
+            session_id: session.header.id.clone(),
+            context_window: model_entry
+                .filter(|entry| entry.model.context_window > 0)
+                .map_or(Value::Null, |entry| Value::from(entry.model.context_window)),
+            durability_mode: session.autosave_durability_mode().as_str(),
+        }
+    }
+
+    fn into_value(
+        self,
+        snapshot: &RpcStateSnapshot,
+        is_streaming: bool,
+        is_compacting: bool,
+    ) -> Value {
+        let context_tokens = crate::compaction::estimate_model_context_tokens_for_model(
+            &self.messages,
+            self.accepts_images,
+            Some(self.text_budget),
+            &self.provider,
+            &self.model_id,
+        );
+        let mut state = serde_json::Map::new();
+        state.insert("model".to_string(), self.model.unwrap_or(Value::Null));
+        state.insert(
+            "thinkingLevel".to_string(),
+            Value::String(self.thinking_level),
+        );
+        state.insert("isStreaming".to_string(), Value::Bool(is_streaming));
+        state.insert("isCompacting".to_string(), Value::Bool(is_compacting));
+        state.insert(
+            "steeringMode".to_string(),
+            Value::String(snapshot.steering_mode.as_str().to_string()),
+        );
+        state.insert(
+            "followUpMode".to_string(),
+            Value::String(snapshot.follow_up_mode.as_str().to_string()),
+        );
+        state.insert("sessionFile".to_string(), self.session_file);
+        state.insert("sessionId".to_string(), Value::String(self.session_id));
+        state.insert(
+            "sessionName".to_string(),
+            self.session_name.map_or(Value::Null, Value::String),
+        );
+        state.insert(
+            "autoCompactionEnabled".to_string(),
+            Value::Bool(snapshot.auto_compaction_enabled),
+        );
+        state.insert(
+            "autoRetryEnabled".to_string(),
+            Value::Bool(snapshot.auto_retry_enabled),
+        );
+        state.insert(
+            "messageCount".to_string(),
+            Value::Number(self.message_count.into()),
+        );
+        state.insert("contextTokens".to_string(), Value::from(context_tokens));
+        state.insert("contextWindow".to_string(), self.context_window);
+        state.insert(
+            "pendingMessageCount".to_string(),
+            Value::Number(snapshot.pending_count().into()),
+        );
+        state.insert(
+            "durabilityMode".to_string(),
+            Value::String(self.durability_mode.to_string()),
+        );
+        Value::Object(state)
+    }
+}
+
 fn session_state(
     session: &crate::session::Session,
     model_entry: Option<&ModelEntry>,
@@ -16848,113 +16987,11 @@ fn session_state(
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
-    let model = model_entry.map(rpc_model_from_entry);
-    let accepts_images = !config.image_block_images()
-        && model_entry.is_some_and(|entry| {
-            entry
-                .model
-                .input
-                .iter()
-                .any(|input| input.as_str() == "image")
-        });
-    let text_budget = model_entry.map_or(
-        crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
-        |entry| {
-            context_window_tokens_for_entry(entry)
-                .saturating_sub(config.compaction_reserve_tokens())
-                / 2
-        },
-    );
-    let context_tokens = crate::compaction::estimate_model_context_tokens_for_model(
-        &session.to_messages_for_current_path(),
-        accepts_images,
-        Some(text_budget),
-        session.header.provider.as_deref().unwrap_or_default(),
-        session.header.model_id.as_deref().unwrap_or_default(),
-    );
-
-    let message_count = session
-        .entries_for_current_path()
-        .iter()
-        .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
-        .count();
-
-    let session_name = session
-        .entries_for_current_path()
-        .iter()
-        .rev()
-        .find_map(|entry| {
-            let crate::session::SessionEntry::SessionInfo(info) = entry else {
-                return None;
-            };
-            info.name.clone()
-        });
-
-    let mut state = serde_json::Map::new();
-    state.insert("model".to_string(), model.unwrap_or(Value::Null));
-    state.insert(
-        "thinkingLevel".to_string(),
-        Value::String(
-            session
-                .header
-                .thinking_level
-                .clone()
-                .unwrap_or_else(|| "off".to_string()),
-        ),
-    );
-    state.insert("isStreaming".to_string(), Value::Bool(is_streaming));
-    state.insert("isCompacting".to_string(), Value::Bool(is_compacting));
-    state.insert(
-        "steeringMode".to_string(),
-        Value::String(snapshot.steering_mode.as_str().to_string()),
-    );
-    state.insert(
-        "followUpMode".to_string(),
-        Value::String(snapshot.follow_up_mode.as_str().to_string()),
-    );
-    state.insert(
-        "sessionFile".to_string(),
-        session
-            .path
-            .as_ref()
-            .map_or(Value::Null, |p| Value::String(p.display().to_string())),
-    );
-    state.insert(
-        "sessionId".to_string(),
-        Value::String(session.header.id.clone()),
-    );
-    state.insert(
-        "sessionName".to_string(),
-        session_name.map_or(Value::Null, Value::String),
-    );
-    state.insert(
-        "autoCompactionEnabled".to_string(),
-        Value::Bool(snapshot.auto_compaction_enabled),
-    );
-    state.insert(
-        "autoRetryEnabled".to_string(),
-        Value::Bool(snapshot.auto_retry_enabled),
-    );
-    state.insert(
-        "messageCount".to_string(),
-        Value::Number(message_count.into()),
-    );
-    state.insert("contextTokens".to_string(), Value::from(context_tokens));
-    state.insert(
-        "contextWindow".to_string(),
-        model_entry
-            .filter(|entry| entry.model.context_window > 0)
-            .map_or(Value::Null, |entry| Value::from(entry.model.context_window)),
-    );
-    state.insert(
-        "pendingMessageCount".to_string(),
-        Value::Number(snapshot.pending_count().into()),
-    );
-    state.insert(
-        "durabilityMode".to_string(),
-        Value::String(session.autosave_durability_mode().as_str().to_string()),
-    );
-    Value::Object(state)
+    SessionStateInputs::capture(session, model_entry, config).into_value(
+        snapshot,
+        is_streaming,
+        is_compacting,
+    )
 }
 
 fn session_stats(session: &crate::session::Session, save_enabled: bool) -> Value {

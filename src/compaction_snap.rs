@@ -447,6 +447,28 @@ pub(crate) fn is_archive_message(message: &Message) -> bool {
     matches!(message, Message::Custom(custom) if custom.custom_type == SNAPCOMPACT_MESSAGE_TYPE)
 }
 
+/// Whether [`project_for_model`] can transform `message` for `accepts_images`.
+#[must_use]
+pub(crate) fn message_needs_model_projection(message: &Message, accepts_images: bool) -> bool {
+    if is_archive_message(message) {
+        return true;
+    }
+    if accepts_images {
+        return false;
+    }
+    let Message::User(user) = message else {
+        return false;
+    };
+    let UserContent::Blocks(blocks) = &user.content else {
+        return false;
+    };
+    blocks.first().is_some_and(|block| {
+        matches!(block, ContentBlock::Text(text) if text.text.starts_with(COMPACTION_SUMMARY_PREFIX))
+    }) && blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)))
+}
+
 /// Retained source for a text-only consumer. The source has its own bounded
 /// shape check; a reader that sends no images need not decompress any PNG.
 /// The caller must apply its usual outbound privacy and text-budget policy.

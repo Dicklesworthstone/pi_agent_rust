@@ -619,6 +619,12 @@ opt-level = 3
 [profile.dev.package.bstr]
 opt-level = 3
 
+[profile.dev.package.base64]
+opt-level = 3
+
+[profile.dev.package.rustc-hash]
+opt-level = 3
+
 [profile.test]
 # Full-suite RCH workers have limited artifact storage; keep test binaries
 # debuggable enough for line traces without emitting full debug sections.

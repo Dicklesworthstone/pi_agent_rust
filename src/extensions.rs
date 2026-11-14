@@ -17135,12 +17135,15 @@ async fn await_js_cancellable_task(
             return JsCancellableTaskOutcome::Stopped { settled: false };
         }
         let shard = &mut shards.shards[shard_index];
-        if let Err(err) = pump_active_runtime_shard(shard, host, hostcall_deadline).await {
+        if let Err(err) = pump_active_runtime_hostcalls(shard, host, hostcall_deadline).await {
             return JsCancellableTaskOutcome::Fault(err);
         }
         if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
             return JsCancellableTaskOutcome::Stopped { settled: false };
         }
+        // Check task settlement before running a timer tick so a command/event
+        // handler that already resolved cannot sweep newly due background
+        // `setTimeout` callbacks into its interaction settlement snapshot.
         let state = match take_js_task_state(&shard.runtime, task_id).await {
             Ok(state) => state,
             Err(err) => return JsCancellableTaskOutcome::Fault(err),
@@ -17156,7 +17159,15 @@ async fn await_js_cancellable_task(
         match finish_js_task_take(state) {
             Ok(Some(value)) => return JsCancellableTaskOutcome::Finished(Ok(value)),
             Err(err) => return JsCancellableTaskOutcome::Finished(Err(err)),
-            Ok(None) => extension_wait_cooperate(deadline).await,
+            Ok(None) => {
+                let tick = match shard.runtime.tick().await {
+                    Ok(tick) => tick,
+                    Err(err) => return JsCancellableTaskOutcome::Fault(err),
+                };
+                if !tick.ran_macrotask && tick.jobs_drained == 0 {
+                    extension_wait_cooperate(deadline).await;
+                }
+            }
         }
     }
 }
@@ -18149,11 +18160,11 @@ const MAX_RETAINED_ACTIVE_HOSTCALLS: usize = 16;
 /// while a native dispatch is pending. Native synchronous calls retain their
 /// own timeout: polling cannot interrupt Rust code that does not yield.
 #[allow(clippy::future_not_send)]
-async fn pump_active_runtime_shard(
+async fn pump_active_runtime_hostcalls(
     shard: &mut JsRuntimeShard,
     host: &JsRuntimeHost,
     root_deadline: Option<Instant>,
-) -> Result<IdleRuntimeProgress> {
+) -> Result<usize> {
     let jobs_drained = shard.runtime.drain_microtasks().await?;
     // Preserve the shared conservative scheduling veto. Existing dispatches
     // keep their guards and continue polling; a transition to the smaller
@@ -18186,6 +18197,16 @@ async fn pump_active_runtime_shard(
             shard.pending_tool_dispatches.push_back(pending);
         }
     }
+    Ok(jobs_drained)
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_active_runtime_shard(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+    root_deadline: Option<Instant>,
+) -> Result<IdleRuntimeProgress> {
+    let jobs_drained = pump_active_runtime_hostcalls(shard, host, root_deadline).await?;
     let tick = shard.runtime.tick().await?;
     Ok(IdleRuntimeProgress {
         has_pending: shard.pending_idle_dispatch.is_some()

@@ -7346,6 +7346,8 @@ mod tests {
 
     #[test]
     fn oauth_callback_drop_releases_idle_fixed_and_random_ports() {
+        static NEXT_AUTH_DROP_TEST_PORT: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(19_100);
         let check_drop = |server: OAuthCallbackServer, port: u16| {
             let io = Arc::clone(&server.io);
             drop(server);
@@ -7355,15 +7357,48 @@ mod tests {
             assert_oauth_callback_worker_retired(&io);
             drop(rebound);
         };
-        let (random_server, _) =
-            start_oauth_callback_server_random_port().expect("random callback server");
-        let random_port = random_server.port;
-        check_drop(random_server, random_port);
+        // `:0` picks from the OS ephemeral range (32768..60999), where one of
+        // the thousands of parallel `--lib` loopback clients can grab the port
+        // between `drop` and `bind`. Always verify immediate listener release
+        // and worker retirement on drop; retry only an external `AddrInUse`.
+        let mut rebound_random = false;
+        for attempt in 0..4 {
+            let (random_server, _) =
+                start_oauth_callback_server_random_port().expect("random callback server");
+            let random_port = random_server.port;
+            let io = Arc::clone(&random_server.io);
+            drop(random_server);
+            assert!(
+                io.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .listener
+                    .is_none(),
+                "drop must synchronously clear the callback listener"
+            );
+            match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, random_port)) {
+                Ok(rebound) => {
+                    assert_oauth_callback_worker_retired(&io);
+                    drop(rebound);
+                    rebound_random = true;
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && attempt < 3 => {
+                    assert_oauth_callback_worker_retired(&io);
+                }
+                Err(err) => panic!("dropped callback listener releases its port: {err}"),
+            }
+        }
+        assert!(rebound_random, "rebound dropped random callback port");
 
-        // Choose a localhost port strictly below the OS ephemeral range
-        // (32768..65535) so concurrent `:0` listeners and loopback connects in
-        // parallel test threads cannot steal the port between drop and rebind.
-        let fixed_port = (21_000..29_000)
+        // Choose a localhost port strictly below both `interactive::commands`'s
+        // 20000..30000 callback test range and the OS ephemeral range
+        // (32768..65535) so concurrent test threads cannot collide on it.
+        let fixed_port = (0..800_u16)
+            .map(|_| {
+                let raw =
+                    NEXT_AUTH_DROP_TEST_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                19_100 + (raw % 800)
+            })
             .find(|&candidate| {
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, candidate)).is_ok()
             })

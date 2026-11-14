@@ -2390,6 +2390,11 @@ impl ExternalWalWriteLease {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SchemaFailProfile {
+    auto_ipk_col_lower: Option<String>,
+}
+
 struct EngineDatabase {
     // Drop/release the external WAL write lease before closing the engine, and
     // drop/close the engine before releasing its directory guards.
@@ -2401,6 +2406,8 @@ struct EngineDatabase {
     safe_integers: bool,
     txn_has_writes: Cell<bool>,
     schema_version: Cell<Option<i64>>,
+    schema_fail_tables: RefCell<HashMap<String, SchemaFailProfile>>,
+    has_temp_schema: Cell<bool>,
     namespace_valid: Cell<bool>,
     poisoned: Cell<bool>,
 }
@@ -2559,6 +2566,8 @@ fn execute_work(
                 safe_integers,
                 txn_has_writes: Cell::new(false),
                 schema_version: Cell::new(None),
+                schema_fail_tables: RefCell::new(HashMap::new()),
+                has_temp_schema: Cell::new(false),
                 namespace_valid: Cell::new(true),
                 poisoned: Cell::new(false),
             };
@@ -2677,25 +2686,254 @@ async fn validate_schema(database: &EngineDatabase, budget: &OperationBudget) ->
         return Ok(());
     }
     budget.reserve_database(database, true)?;
-    let rows = database
+    let mut rows = database
         .conn
-        .query("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
+        .query("SELECT type, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
         .await
         .map_err(SqliteFailure::from)?;
     if rows.len() > 1024 {
         return Err("SQLite schema exceeds 1024 objects".into());
     }
+    if database.has_temp_schema.get()
+        && let Ok(temp_rows) = database
+            .conn
+            .query(
+                "SELECT type, tbl_name, sql FROM sqlite_temp_master WHERE sql IS NOT NULL LIMIT 1025",
+            )
+            .await
+    {
+        rows.extend(temp_rows);
+    }
+    let mut fail_tables = HashMap::new();
+    let mut tables_with_aux_ddl = HashSet::new();
     for row in rows {
-        if matches!(row.get(0), Some(SqliteValue::Text(kind)) if kind.as_ref() == "trigger") {
+        let Some(SqliteValue::Text(kind)) = row.get(0) else {
+            return Err("Invalid SQLite schema object type".into());
+        };
+        if kind.as_ref() == "trigger" {
             return Err("Existing SQLite triggers are not permitted in extension databases".into());
         }
-        let Some(SqliteValue::Text(sql)) = row.get(1) else {
+        let Some(SqliteValue::Text(sql)) = row.get(2) else {
             return Err("Invalid SQLite schema text".into());
         };
-        admit_sql(sql.as_ref(), true)?;
+        let admitted = admit_sql(sql.as_ref(), true)?;
+        if let Some(SqliteValue::Text(tbl_name)) = row.get(1) {
+            let key = tbl_name.as_ref().to_ascii_lowercase();
+            if kind.as_ref() == "table" {
+                if let Some(SqlStatement::CreateTable(create)) = admitted.parsed.first()
+                    && let Some(profile) = schema_fail_profile(create)
+                {
+                    fail_tables.insert(key, profile);
+                } else {
+                    fail_tables.remove(&key);
+                }
+            } else {
+                tables_with_aux_ddl.insert(key);
+            }
+        }
     }
+    for tbl in tables_with_aux_ddl {
+        fail_tables.remove(&tbl);
+    }
+    *database.schema_fail_tables.borrow_mut() = fail_tables;
     database.schema_version.set(Some(version));
     Ok(())
+}
+
+fn schema_fail_profile(create: &fsqlite_ast::CreateTableStatement) -> Option<SchemaFailProfile> {
+    let fsqlite_ast::CreateTableBody::Columns {
+        columns,
+        constraints,
+    } = &create.body
+    else {
+        return None;
+    };
+    let mut has_fail = false;
+    let mut has_non_fail = false;
+    let mut saw_pk = false;
+    let mut auto_ipk_col_lower = None;
+    for col in columns {
+        let is_integer = col
+            .type_name
+            .as_ref()
+            .is_some_and(|ty| ty.name.eq_ignore_ascii_case("integer"));
+        for constraint in &col.constraints {
+            match &constraint.kind {
+                fsqlite_ast::ColumnConstraintKind::PrimaryKey { conflict, .. } => {
+                    if saw_pk {
+                        has_non_fail = true;
+                    } else {
+                        saw_pk = true;
+                        match conflict {
+                            Some(fsqlite_ast::ConflictAction::Fail) => has_fail = true,
+                            None if !create.without_rowid && is_integer => {
+                                auto_ipk_col_lower = Some(col.name.to_ascii_lowercase());
+                            }
+                            _ => has_non_fail = true,
+                        }
+                    }
+                }
+                fsqlite_ast::ColumnConstraintKind::Unique { conflict }
+                | fsqlite_ast::ColumnConstraintKind::NotNull { conflict } => {
+                    if *conflict == Some(fsqlite_ast::ConflictAction::Fail) {
+                        has_fail = true;
+                    } else {
+                        has_non_fail = true;
+                    }
+                }
+                fsqlite_ast::ColumnConstraintKind::Check(_)
+                | fsqlite_ast::ColumnConstraintKind::ForeignKey(_) => {
+                    has_non_fail = true;
+                }
+                fsqlite_ast::ColumnConstraintKind::Null
+                | fsqlite_ast::ColumnConstraintKind::Default(_)
+                | fsqlite_ast::ColumnConstraintKind::Collate(_)
+                | fsqlite_ast::ColumnConstraintKind::Generated { .. } => {}
+            }
+        }
+    }
+    for constraint in constraints {
+        match &constraint.kind {
+            fsqlite_ast::TableConstraintKind::PrimaryKey { conflict, .. } => {
+                if saw_pk {
+                    has_non_fail = true;
+                } else {
+                    saw_pk = true;
+                    auto_ipk_col_lower = None;
+                    if *conflict == Some(fsqlite_ast::ConflictAction::Fail) {
+                        has_fail = true;
+                    } else {
+                        has_non_fail = true;
+                    }
+                }
+            }
+            fsqlite_ast::TableConstraintKind::Unique { conflict, .. } => {
+                if *conflict == Some(fsqlite_ast::ConflictAction::Fail) {
+                    has_fail = true;
+                } else {
+                    has_non_fail = true;
+                }
+            }
+            fsqlite_ast::TableConstraintKind::Check(_)
+            | fsqlite_ast::TableConstraintKind::ForeignKey { .. } => {
+                has_non_fail = true;
+            }
+        }
+    }
+    if create.strict {
+        has_non_fail = true;
+    }
+    (has_fail && !has_non_fail).then_some(SchemaFailProfile { auto_ipk_col_lower })
+}
+
+fn note_schema_mutation(database: &EngineDatabase, parsed: &[SqlStatement]) {
+    let mut invalidate = false;
+    for stmt in parsed {
+        match stmt {
+            SqlStatement::CreateTable(create) => {
+                invalidate = true;
+                if create.temporary {
+                    database.has_temp_schema.set(true);
+                }
+            }
+            SqlStatement::CreateIndex(_)
+            | SqlStatement::CreateView(_)
+            | SqlStatement::CreateVirtualTable(_)
+            | SqlStatement::Drop(_)
+            | SqlStatement::AlterTable(_)
+            | SqlStatement::Rollback(_) => {
+                invalidate = true;
+            }
+            _ => {}
+        }
+    }
+    if invalidate {
+        database.schema_version.set(None);
+    }
+}
+
+/// `fsqlite-core 0.4.10` preserves prior row changes on a mid-statement
+/// constraint halt only when the DML statement AST carries `OR FAIL`, rolling
+/// back its internal statement savepoint when `ON CONFLICT FAIL` is declared
+/// solely in the table schema. Promote `INSERT`/`UPDATE` without an explicit
+/// `OR` or `UPSERT` clause to `OR FAIL` when every constraint on the target
+/// table resolves conflicts via `FAIL`.
+fn rewrite_schema_fail_dml<'a>(
+    database: &EngineDatabase,
+    stmt: Option<&SqlStatement>,
+    sql: std::borrow::Cow<'a, str>,
+) -> std::borrow::Cow<'a, str> {
+    let fail_tables = database.schema_fail_tables.borrow();
+    if fail_tables.is_empty() {
+        return sql;
+    }
+    let is_insert = match stmt {
+        Some(SqlStatement::Insert(ins)) if ins.or_conflict.is_none() && ins.upsert.is_empty() => {
+            if ins.table.schema.as_deref().is_some_and(|schema| {
+                !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+            }) {
+                return sql;
+            }
+            let Some(profile) = fail_tables.get(&ins.table.name.to_ascii_lowercase()) else {
+                return sql;
+            };
+            if let Some(ipk) = &profile.auto_ipk_col_lower
+                && (ins.columns.is_empty()
+                    || ins.columns.iter().any(|col| col.eq_ignore_ascii_case(ipk)))
+            {
+                return sql;
+            }
+            true
+        }
+        Some(SqlStatement::Update(upd)) if upd.or_conflict.is_none() => {
+            if upd.table.name.schema.as_deref().is_some_and(|schema| {
+                !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+            }) {
+                return sql;
+            }
+            let Some(profile) = fail_tables.get(&upd.table.name.name.to_ascii_lowercase()) else {
+                return sql;
+            };
+            if let Some(ipk) = &profile.auto_ipk_col_lower
+                && upd.assignments.iter().any(|assign| match &assign.target {
+                    fsqlite_ast::AssignmentTarget::Column(col) => col.eq_ignore_ascii_case(ipk),
+                    fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
+                        cols.iter().any(|col| col.eq_ignore_ascii_case(ipk))
+                    }
+                })
+            {
+                return sql;
+            }
+            false
+        }
+        _ => return sql,
+    };
+    let mut paren_depth = 0_usize;
+    for tok in Lexer::tokenize(sql.as_ref()) {
+        match tok.kind {
+            TokenKind::LeftParen => paren_depth += 1,
+            TokenKind::RightParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::KwInsert | TokenKind::KwUpdate
+                if paren_depth == 0
+                    && matches!(
+                        (&tok.kind, is_insert),
+                        (TokenKind::KwInsert, true) | (TokenKind::KwUpdate, false)
+                    ) =>
+            {
+                let end = usize::try_from(tok.span.end).unwrap_or(usize::MAX);
+                if let Some((head, tail)) = sql.as_ref().split_at_checked(end) {
+                    let mut out = String::with_capacity(sql.len() + 8);
+                    out.push_str(head);
+                    out.push_str(" OR FAIL");
+                    out.push_str(tail);
+                    return std::borrow::Cow::Owned(out);
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    sql
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2935,6 +3173,7 @@ async fn execute_request(
                 Some(rewritten) => std::borrow::Cow::Owned(rewritten),
                 None => admitted.normalized_sql(&sql),
             };
+            let exec_sql = rewrite_schema_fail_dml(database, admitted.parsed.first(), exec_sql);
             budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
             let wal_plan = plan_wal_lease(
@@ -3107,6 +3346,7 @@ async fn execute_request(
                 Ok(json!({ "columns": columns, "rows": rows }))
             }
             .await;
+            note_schema_mutation(database, &admitted.parsed);
             reconcile_wal_lease_after_exec(database, wal_plan, query_outcome, operation_cx, budget)
                 .await
         }
@@ -3146,6 +3386,7 @@ async fn execute_request(
                 change_result(database, budget).await
             }
             .await;
+            note_schema_mutation(database, &admitted.parsed);
             reconcile_wal_lease_after_exec(database, wal_plan, exec_outcome, operation_cx, budget)
                 .await
         }
@@ -3829,6 +4070,80 @@ mod tests {
             "unexpected prepare failure: {}",
             missing_table.message
         );
+        worker
+            .call(Command::Request(Request::Close { id: 1 }))
+            .expect("close");
+    }
+
+    #[test]
+    fn worker_preserves_schema_level_on_conflict_fail_with_returning_and_run() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("open memory database");
+        exec(
+            &mut worker,
+            1,
+            "CREATE TABLE schema_fail(id INTEGER UNIQUE ON CONFLICT FAIL); \
+             CREATE TABLE schema_abort(id INTEGER UNIQUE);",
+        );
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_fail VALUES (9)".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Run,
+            }))
+            .expect("seed schema_fail");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_abort VALUES (9)".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Run,
+            }))
+            .expect("seed schema_abort");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_fail VALUES (1), (9), (2) RETURNING id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::All,
+            }))
+            .expect_err("duplicate row must still reject statement");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_abort VALUES (1), (9), (2) RETURNING id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::All,
+            }))
+            .expect_err("duplicate row in abort table must reject statement");
+        let fail_rows = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id FROM schema_fail ORDER BY id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Values,
+            }))
+            .expect("select schema_fail");
+        assert_eq!(fail_rows["rows"], json!([[1], [9]]));
+        let abort_rows = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id FROM schema_abort ORDER BY id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Values,
+            }))
+            .expect("select schema_abort");
+        assert_eq!(abort_rows["rows"], json!([[9]]));
         worker
             .call(Command::Request(Request::Close { id: 1 }))
             .expect("close");
