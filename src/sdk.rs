@@ -7638,7 +7638,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         assert_eq!(captured.model_id, "claude-3-5-haiku-latest");
 
         let (seen, shared) = restore_recorder();
-        run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+        run_async(handle.maybe_restore_primary(&shared, None)).expect("restore primary");
 
         assert_eq!(
             handle.session.agent.provider().model_id(),
@@ -7670,7 +7670,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         let mut handle = handle_after_one_failover(300);
 
         let (seen, shared) = restore_recorder();
-        run_async(handle.maybe_restore_primary(&shared)).expect("cooldown check");
+        run_async(handle.maybe_restore_primary(&shared, None)).expect("cooldown check");
 
         assert_eq!(
             handle.session.agent.provider().model_id(),
@@ -12159,7 +12159,7 @@ export default function init(pi) {
             );
 
             let (_seen, shared) = restore_recorder();
-            run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+            run_async(handle.maybe_restore_primary(&shared, None)).expect("restore primary");
             assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
             assert_eq!(
                 handle.max_tokens(),

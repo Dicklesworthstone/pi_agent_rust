@@ -1795,7 +1795,7 @@ impl Drop for ManualCompactionProgress {
 /// Cancel only admission/read waits, never an admitted persistence transaction.
 /// If completion and cancellation race, refuse the newly acquired resource
 /// before publishing it to the caller.
-async fn await_compaction_admission<T>(
+pub(crate) async fn await_session_preparation<T>(
     abort: Option<&AbortSignal>,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
@@ -8202,6 +8202,7 @@ impl ProviderAdmissionGate {
         Ok(ProviderTransitionAuthority {
             gate: self.clone(),
             _permit: permit,
+            abort: None,
         })
     }
 
@@ -8223,6 +8224,17 @@ impl ProviderAdmissionGate {
 pub(crate) struct ProviderTransitionAuthority {
     gate: ProviderAdmissionGate,
     _permit: OwnedMutexGuard<()>,
+    abort: Option<AbortSignal>,
+}
+
+impl ProviderTransitionAuthority {
+    /// Cancellation controls preparation only. Once the transition starts,
+    /// persistence and live installation must settle together.
+    #[must_use]
+    pub(crate) fn with_abort(mut self, abort: Option<&AbortSignal>) -> Self {
+        self.abort = abort.cloned();
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -8239,6 +8251,13 @@ impl<'a> ProviderSwapAdmission<'a> {
         }
     }
 
+    fn abort(self) -> Option<&'a AbortSignal> {
+        match self {
+            Self::Gate(_) => None,
+            Self::Held(authority) => authority.abort.as_ref(),
+        }
+    }
+
     async fn begin_transition(
         self,
         reason: String,
@@ -8248,6 +8267,9 @@ impl<'a> ProviderSwapAdmission<'a> {
             Self::Gate(gate) => gate.begin_transition(reason, cx).await.map(Some),
             Self::Held(authority) => {
                 authority.gate.ensure_allowed()?;
+                if authority.abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                    return Err(Error::Aborted);
+                }
                 authority.gate.block(reason);
                 Ok(None)
             }
@@ -20893,9 +20915,15 @@ impl AgentSession {
         }
 
         let session_store = Arc::clone(&self.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
-            .await
-            .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
+        let mut inner = await_session_preparation(
+            admission.and_then(ProviderSwapAdmission::abort),
+            async {
+                OwnedMutexGuard::lock(session_store, cx)
+                    .await
+                    .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))
+            },
+        )
+        .await?;
         let session_matches_active = inner.effective_model_for_current_path().is_some_and(
             |(session_provider, session_model)| {
                 crate::models::model_identities_match(
@@ -20942,9 +20970,6 @@ impl AgentSession {
             Self::prepare_restore_candidate(&inner, &entry, request.primary);
 
         let save_enabled = self.save_enabled();
-        if request.invalidate_background_compaction {
-            self.invalidate_background_compaction();
-        }
         let _provider_transition = match admission {
             Some(admission) => {
                 admission
@@ -20957,6 +20982,12 @@ impl AgentSession {
             }
             None => None,
         };
+        // Preparation can still be cancelled without changing live work.
+        // After the transition starts, the save and installation settle even
+        // if the user requests an abort while filesystem work is pending.
+        if request.invalidate_background_compaction {
+            self.invalidate_background_compaction();
+        }
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -21466,9 +21497,15 @@ impl AgentSession {
     )> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let session_store = Arc::clone(&self.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
-            .await
-            .map_err(|err| Error::session(format!("failover session lock failed: {err}")))?;
+        let mut inner = await_session_preparation(
+            admission.and_then(ProviderSwapAdmission::abort),
+            async {
+                OwnedMutexGuard::lock(session_store, cx)
+                    .await
+                    .map_err(|err| Error::session(format!("failover session lock failed: {err}")))
+            },
+        )
+        .await?;
         let (mut candidate, restored_messages, target_thinking) =
             Self::prepare_failover_candidate(&inner, request)?;
         let entry = request.entry;
@@ -21476,7 +21513,6 @@ impl AgentSession {
         let to_model = entry.model.id.clone();
 
         let save_enabled = self.save_enabled();
-        self.invalidate_background_compaction();
         let _provider_transition = match admission {
             Some(admission) => {
                 admission
@@ -21489,6 +21525,7 @@ impl AgentSession {
             }
             None => None,
         };
+        self.invalidate_background_compaction();
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -22497,13 +22534,13 @@ impl AgentSession {
         let abort = source.map(|(_, abort)| abort);
         let session_action_permit = if source.is_some() || install_guard.is_some() {
             Some(
-                await_compaction_admission(abort, self.session_action_admission.acquire(cx.cx()))
+                await_session_preparation(abort, self.session_action_admission.acquire(cx.cx()))
                     .await?,
             )
         } else {
             None
         };
-        let mut session = await_compaction_admission(abort, async {
+        let mut session = await_session_preparation(abort, async {
             OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))
@@ -22806,7 +22843,7 @@ impl AgentSession {
 
         let (entries, preparation, source_snapshot, install_guard) = {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = await_compaction_admission(abort, async {
+            let mut session = await_session_preparation(abort, async {
                 self.session
                     .lock(cx.cx())
                     .await
@@ -22930,7 +22967,7 @@ impl AgentSession {
                     return Err(error);
                 }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                let provider_admission = match await_compaction_admission(
+                let provider_admission = match await_session_preparation(
                     abort,
                     self.provider_admission.acquire(cx.cx()),
                 )
@@ -23000,7 +23037,7 @@ impl AgentSession {
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
             let provider_admission =
-                match await_compaction_admission(abort, self.provider_admission.acquire(cx.cx()))
+                match await_session_preparation(abort, self.provider_admission.acquire(cx.cx()))
                     .await
                 {
                     Ok(provider_admission) => provider_admission,

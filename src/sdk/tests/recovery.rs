@@ -1957,7 +1957,7 @@ fn failover_save_failure_preserves_source_state_and_quarantines_reentry() {
             .unwrap()
             .push(serde_json::to_value(event).unwrap());
     });
-    let result = run_async(handle.try_chain_failover(&Ok(first), true, None, 1, &callback));
+    let result = run_async(handle.try_chain_failover(&Ok(first), true, None, 1, &callback, None));
     assert!(result.as_ref().is_err_and(Error::is_session_persistence));
     assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
     assert!(handle.failover_state.primary().is_none());
@@ -4715,7 +4715,7 @@ fn extension_selection_of_the_current_fallback_cancels_restoration() {
     );
 
     let (events, callback) = event_log();
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(handle.model(), selected);
     assert!(handle.failover_state.primary().is_none());
     assert!(events.lock().unwrap().is_empty());
@@ -4752,7 +4752,7 @@ fn extension_selection_starts_the_next_failover_from_its_own_primary_and_cursor(
     let (events, callback) = event_log();
     let failure = Err(Error::provider(&selected.0, "503 service unavailable"));
     assert!(
-        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap(),
         "the retired cycle's cursor cannot skip the new primary's first fallback"
     );
     let primary = handle.failover_state.primary().unwrap();
@@ -4795,8 +4795,8 @@ fn an_old_provider_error_cannot_fail_over_an_extension_model_selection() {
     let entries_before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
     let (events, callback) = event_log();
     let failure = Err(Error::provider(&old_runtime.0, "503 service unavailable"));
-    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         old_runtime,
@@ -4869,7 +4869,7 @@ fn sdk_failover_policies_use_full_catalog_ownership_and_destination_metadata() {
             let (events, callback) = event_log();
             let failure = Err(Error::provider(current, "503 service unavailable"));
             assert!(
-                !run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+                !run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap(),
                 "{current} cannot use {other}'s policy (reverse={reverse})"
             );
             assert_eq!(
@@ -4888,7 +4888,7 @@ fn sdk_failover_policies_use_full_catalog_ownership_and_destination_metadata() {
             );
             handle = handle.with_failover(Some(options));
             assert!(
-                run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap()
+                run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap()
             );
             assert_eq!(
                 handle.model(),
@@ -5011,14 +5011,14 @@ fn sdk_recovery_preserves_pending_declared_alias_selection_and_native_aliases() 
                     let (events, callback) = event_log();
                     let failure = Err(Error::provider(current, "503 service unavailable"));
                     let swapped =
-                        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback))
+                        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None))
                             .unwrap();
                     assert_eq!(
                         swapped, !separately_declared,
                         "current={current}, selected={selected}, full registry={with_registry}, reverse={reverse}"
                     );
                     if separately_declared {
-                        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+                        run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
                         assert!(Arc::ptr_eq(
                             &original_runtime,
                             &handle.session.agent.provider()
@@ -5103,7 +5103,7 @@ fn unchanged_failover_provenance_keeps_its_running_monotonic_cooldown() {
     let started = handle.failover_state.cooldown().unwrap().failed_at();
     let (events, callback) = event_log();
     for _ in 0..2 {
-        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+        run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
         assert_eq!(
             handle.failover_state.cooldown().unwrap().failed_at(),
             started
@@ -5140,7 +5140,7 @@ fn changed_branch_provenance_refreshes_only_the_affected_failover_cycle() {
         }
         install_reconciliation_provenance(&mut handle, provenance.clone());
         let (events, callback) = event_log();
-        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+        run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
         let primary = handle.failover_state.primary().expect(changed);
         assert_eq!(primary.provider, provenance.primary_provider, "{changed}");
         assert_eq!(primary.model_id, provenance.primary_model_id, "{changed}");
@@ -5189,10 +5189,10 @@ fn recovery_waits_for_provider_callbacks_before_claiming_session_actions() {
             let failure = Err(Error::provider("test-provider", "503 service unavailable"));
             let recovery = async {
                 if restore {
-                    handle.maybe_restore_primary(&callback).await.map(|()| true)
+                    handle.maybe_restore_primary(&callback, None).await.map(|()| true)
                 } else {
                     handle
-                        .try_chain_failover(&failure, false, None, 1, &callback)
+                        .try_chain_failover(&failure, false, None, 1, &callback, None)
                         .await
                 }
             };
@@ -5268,7 +5268,7 @@ fn another_branch_deadline_cannot_reuse_an_expired_cooldown() {
     install_reconciliation_provenance(&mut handle, provenance);
     let selected = handle.model();
     let (events, callback) = event_log();
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(handle.model(), selected);
     assert!(
         !handle
@@ -5301,13 +5301,13 @@ fn distinct_legacy_failover_entries_have_independent_cooldowns() {
     let old_started = handle.failover_state.cooldown().unwrap().failed_at();
     install_reconciliation_provenance(&mut handle, provenance);
     let (events, callback) = event_log();
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     let new_started = handle.failover_state.cooldown().unwrap().failed_at();
     assert_ne!(
         old_started, new_started,
         "the other entry starts its own interval"
     );
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.failover_state.cooldown().unwrap().failed_at(),
         new_started
@@ -5421,7 +5421,7 @@ fn bound_cli_key_cannot_admit_an_unready_foreign_fallback_and_survives_restorati
     );
     let (_, callback) = event_log();
     let failure = Err(Error::provider("bound-primary", "503 service unavailable"));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("ready-other".to_string(), "fallback".to_string())
@@ -5434,7 +5434,7 @@ fn bound_cli_key_cannot_admit_an_unready_foreign_fallback_and_survives_restorati
     // A temporary planning role may remove the SDK's active-provider pin.
     // The native execution binding still admits its otherwise unready primary.
     Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key = None;
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("bound-primary".to_string(), "execution".to_string())
@@ -5469,7 +5469,7 @@ fn planner_fallback_recovers_original_pin_without_reusing_it_for_planner_restore
         "separate-planner",
         "503 service unavailable",
     ));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("bound-executor".to_string(), "execution".to_string())
@@ -5481,7 +5481,7 @@ fn planner_fallback_recovers_original_pin_without_reusing_it_for_planner_restore
 
     Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key =
         Some("bound-execution-pin".to_string());
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("separate-planner".to_string(), "planning".to_string())
@@ -5516,7 +5516,7 @@ fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() 
         "embedder-primary",
         "503 service unavailable",
     ));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("embedder-fallback".to_string(), "fallback".to_string())
@@ -5525,7 +5525,7 @@ fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() 
         handle.session.agent.stream_options().api_key.as_deref(),
         Some("explicit-embedder-pin")
     );
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("embedder-primary".to_string(), "primary".to_string())
@@ -5597,7 +5597,7 @@ fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() 
         )));
     let (_, callback) = event_log();
     let failure = Err(Error::provider("child-primary", "503 service unavailable"));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("child-first".to_string(), "first".to_string())
@@ -5606,7 +5606,7 @@ fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() 
         handle.session.agent.stream_options().thinking_level,
         Some(ThinkingLevel::Low)
     );
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 2, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 2, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("child-second".to_string(), "second".to_string())
@@ -5623,7 +5623,7 @@ fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() 
             .requested_thinking_level,
         ThinkingLevel::High
     );
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("child-primary".to_string(), "primary".to_string())
@@ -5695,12 +5695,240 @@ fn explicit_model_selection_retires_child_role_but_automatic_changes_preserve_it
     run_async(handle.session.sync_runtime_selection_from_session_header()).unwrap();
     let (events, callback) = event_log();
     let failure = Err(Error::provider("role-automatic", "503 service unavailable"));
-    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert!(events.lock().unwrap().is_empty());
     run_async(handle.set_model("role-automatic", "automatic")).unwrap();
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("role-fallback".to_string(), "fallback".to_string())
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn recovery_cancellation_releases_admission_without_changing_history() {
+    use crate::extensions::ExtensionSession as _;
+
+    for restore in [false, true] {
+        for blocked_on in ["provider", "action", "session"] {
+            let dir = tempdir().unwrap();
+            let mut handle = saving_fallback_selection_handle(dir.path());
+            let store = handle.session_store();
+            if !restore {
+                let selected = handle.model();
+                let extension = crate::session::SessionHandle(Arc::clone(&store));
+                run_async(extension.set_model(selected.0, selected.1, None)).unwrap();
+            }
+            let model_before = handle.model();
+            let provider_before = handle.session.agent.provider();
+            let recovery_before = format!("{:?}", handle.failover_state);
+            let (path, entries_before) = {
+                let session = store.try_lock().unwrap();
+                (
+                    session.path.clone().unwrap(),
+                    serde_json::to_value(&session.entries).unwrap(),
+                )
+            };
+            let disk_before = std::fs::read(&path).unwrap();
+            let provider_gate = handle.session.provider_admission_gate();
+            let action_gate = handle.session.session_action_admission_gate();
+            let (abort, signal) = AbortHandle::new();
+            let (events, callback) = event_log();
+            run_async(async {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let provider_held = if blocked_on == "provider" {
+                    Some(provider_gate.acquire(cx.cx()).await.unwrap())
+                } else {
+                    None
+                };
+                let action_held = if blocked_on == "action" {
+                    Some(action_gate.acquire(cx.cx()).await.unwrap())
+                } else {
+                    None
+                };
+                let session_held = if blocked_on == "session" {
+                    Some(
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let failure = Err(Error::provider("test-provider", "503 service unavailable"));
+                {
+                    let recovery = async {
+                        if restore {
+                            // Exercise the public preflight, not only the
+                            // internal helper's optional cancellation argument.
+                            handle
+                                .prompt_with_abort(
+                                    "must not be appended",
+                                    signal,
+                                    move |event| callback(event),
+                                )
+                                .await
+                                .map(|_| ())
+                        } else {
+                            handle
+                                .try_chain_failover(
+                                    &failure,
+                                    false,
+                                    None,
+                                    1,
+                                    &callback,
+                                    Some(&signal),
+                                )
+                                .await
+                                .map(|_| ())
+                        }
+                    };
+                    futures::pin_mut!(recovery);
+                    assert!(
+                        futures::poll!(recovery.as_mut()).is_pending(),
+                        "{restore}/{blocked_on}: the operation must reach the held resource"
+                    );
+                    abort.abort();
+                    let outcome = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(5),
+                        recovery,
+                    )
+                    .await
+                    .expect("abort must settle without releasing the unrelated owner");
+                    assert!(matches!(outcome, Err(Error::Aborted)));
+                }
+                provider_gate.ensure_allowed().unwrap();
+                drop(session_held);
+                drop(action_held);
+                drop(provider_held);
+                let released = async {
+                    let _provider = provider_gate.acquire(cx.cx()).await.unwrap();
+                    let _action = action_gate.acquire(cx.cx()).await.unwrap();
+                    let _session =
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                            .await
+                            .unwrap();
+                };
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    released,
+                )
+                .await
+                .expect("aborted preparation must release every acquired permit");
+            });
+            assert_eq!(handle.model(), model_before);
+            assert!(Arc::ptr_eq(&handle.session.agent.provider(), &provider_before));
+            assert_eq!(format!("{:?}", handle.failover_state), recovery_before);
+            assert_eq!(
+                serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                entries_before
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+            assert!(events.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn admitted_recovery_can_abort_the_actual_transaction_store_wait() {
+    for restore in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut handle = saving_fallback_selection_handle(dir.path());
+        let store = handle.session_store();
+        let model_before = handle.model();
+        let provider_before = handle.session.agent.provider();
+        let options = Arc::clone(handle.failover.as_ref().unwrap());
+        let primary = handle.failover_state.primary().cloned().unwrap();
+        let chain = crate::failover::FailoverChain {
+            entries: vec!["openai/gpt-4o-mini".to_string()],
+        };
+        let (path, entries_before) = {
+            let session = store.try_lock().unwrap();
+            (
+                session.path.clone().unwrap(),
+                serde_json::to_value(&session.entries).unwrap(),
+            )
+        };
+        let disk_before = std::fs::read(&path).unwrap();
+        let provider_gate = handle.session.provider_admission_gate();
+        let action_gate = handle.session.session_action_admission_gate();
+        let (abort, signal) = AbortHandle::new();
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let authority = provider_gate
+                .acquire_transition_authority(cx.cx())
+                .await
+                .unwrap()
+                .with_abort(Some(&signal));
+            let _action = action_gate.acquire(cx.cx()).await.unwrap();
+            let held_store =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                    .await
+                    .unwrap();
+            {
+                let transition = async {
+                    if restore {
+                        let request = crate::agent::PrimaryRestoreRequest {
+                            primary: &primary,
+                            active: &model_before,
+                            cooldown_elapsed: true,
+                            available_models: &options.available_models,
+                            auth: &options.auth,
+                            cli_api_key: options.cli_api_key.as_deref(),
+                            strict_invariants: false,
+                            invalidate_background_compaction: true,
+                        };
+                        handle
+                            .session
+                            .restore_primary_with_authority(&cx, &request, &authority)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        let attempt = crate::agent::FailoverSwapAttempt {
+                            chain: &chain,
+                            start_position: 0,
+                            available_models: &options.available_models,
+                            auth: &options.auth,
+                            cli_api_key: options.cli_api_key.as_deref(),
+                            class: crate::failover::FailoverClass::Transient,
+                            thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+                            require_incomplete_tail: false,
+                            primary: Some(&primary),
+                            cooldown_secs: Some(0),
+                            lifecycle_id: Some("cancelled-transaction"),
+                        };
+                        handle
+                            .session
+                            .try_failover_with_authority(&cx, &attempt, &authority)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                futures::pin_mut!(transition);
+                assert!(futures::poll!(transition.as_mut()).is_pending());
+                abort.abort();
+                let outcome = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    transition,
+                )
+                .await
+                .expect("the inner pre-save lock must observe cancellation");
+                assert!(matches!(outcome, Err(Error::Aborted)));
+            }
+            provider_gate.ensure_allowed().unwrap();
+            assert_eq!(
+                serde_json::to_value(&held_store.entries).unwrap(),
+                entries_before
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        });
+        assert_eq!(handle.model(), model_before);
+        assert!(Arc::ptr_eq(&handle.session.agent.provider(), &provider_before));
+        provider_gate.ensure_allowed().unwrap();
+    }
 }
