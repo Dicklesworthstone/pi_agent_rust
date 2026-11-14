@@ -7,8 +7,10 @@
 //! `ready.log` regex and/or a `ready.port` TCP accept must both pass within
 //! the timeout before `start` returns.
 //!
-//! Lifecycle: session-scoped by default (killed at the main shutdown
-//! chokepoint, same as background jobs); `detached: true` skips that cleanup.
+//! Lifecycle: scoped to the durable session and its live tool registry.
+//! Session replacement or shutdown retires that owner's services; final host
+//! shutdown also stops remaining services. `detached: true` skips cleanup
+//! once startup is accepted and remains addressable by the same session.
 //! Detached PTYs still belong to this host process; the persisted roster does
 //! not provide cross-process reattachment or guarantee host-exit survival.
 //!
@@ -16,7 +18,7 @@
 //! (bd-cv653.3.10); the `messaging` action group lands with the agent-hub
 //! registry (bd-cv653.5.3).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +59,43 @@ const INPUT_BUDGET: Duration = Duration::from_secs(8);
 /// Keep service identifiers portable and bounded before deriving artifact
 /// names from them.
 const MAX_SERVICE_NAME_BYTES: usize = 128;
+
+/// A durable session and the particular live registry hosting it. A prepared
+/// replacement may load the same session without acquiring its predecessor's
+/// processes or authority to shut them down.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServiceOwner {
+    session_id: String,
+    instance_id: String,
+}
+
+impl ServiceOwner {
+    pub(crate) const fn new(session_id: String, instance_id: String) -> Self {
+        Self {
+            session_id,
+            instance_id,
+        }
+    }
+
+    /// Durable identity used for explicitly detached service resumption.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Identity of the live tool registry that admitted the service.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
+#[derive(Default)]
+struct ServiceOwnerState {
+    generation: u64,
+    active_shutdowns: usize,
+    incomplete_shutdown: bool,
+}
 
 /// Readiness gates for `start`. Both supplied gates MUST pass.
 #[derive(Debug, Clone, Default)]
@@ -120,10 +159,12 @@ impl ServiceStatus {
 /// through escalation and reap; completion belongs to this exact incarnation,
 /// even when another caller has already restarted the retained service name.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent startup, input and monitor atomics.
 struct ServiceControl {
     stop_requested: AtomicBool,
     force_requested: AtomicBool,
     input_closed: AtomicBool,
+    startup_accepted: AtomicBool,
     completion: Mutex<Option<ServiceSnapshot>>,
     completed: Condvar,
 }
@@ -184,6 +225,8 @@ impl ServiceControl {
 #[derive(Clone)]
 pub(crate) struct ServiceRequest {
     owner: crate::agent_cx::AgentCx,
+    service_owner: ServiceOwner,
+    generation: u64,
     cancelled: Arc<AtomicBool>,
     startup: Arc<Mutex<Option<OwnedStartup>>>,
 }
@@ -196,12 +239,47 @@ struct OwnedStartup {
 }
 
 impl ServiceRequest {
-    fn new() -> Self {
-        Self {
+    fn new(service_owner: &ServiceOwner) -> Result<Self> {
+        Self::after_resolution(service_owner, None)
+    }
+
+    fn after_resolution(
+        service_owner: &ServiceOwner,
+        instance_generation: Option<u64>,
+    ) -> Result<Self> {
+        if service_owner.session_id.trim().is_empty() {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_UNAVAILABLE: service owner is empty",
+            ));
+        }
+        let generation = {
+            let mut reg = registry().lock().map_err(|_| registry_err())?;
+            if instance_generation.is_some_and(|generation| {
+                generation != reg.instance_generation(service_owner.instance_id())
+            }) {
+                return Err(Error::tool(
+                    "hub",
+                    "PI_HUB_STALE_SESSION: session changed during service owner lookup",
+                ));
+            }
+            reg.ensure_owner_open(service_owner)?;
+            reg.owners
+                .entry(service_owner.clone())
+                .or_default()
+                .generation
+        };
+        Ok(Self {
             owner: crate::agent_cx::AgentCx::for_current_or_request(),
+            service_owner: service_owner.clone(),
+            generation,
             cancelled: Arc::new(AtomicBool::new(false)),
             startup: Arc::new(Mutex::new(None)),
-        }
+        })
+    }
+
+    pub(crate) fn service_owner(&self) -> &ServiceOwner {
+        &self.service_owner
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -210,6 +288,28 @@ impl ServiceRequest {
                 "hub",
                 "PI_HUB_CANCELLED: service operation cancelled",
             ));
+        }
+        registry()
+            .lock()
+            .map_err(|_| registry_err())?
+            .check_request(self)
+    }
+
+    fn accept(&self) -> Result<()> {
+        self.check()?;
+        let startup = self
+            .startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let reg = registry().lock().map_err(|_| registry_err())?;
+        reg.check_request(self)?;
+        if let Some(startup) = startup {
+            reg.ensure_accepting_starts()?;
+            startup
+                .control
+                .startup_accepted
+                .store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -319,12 +419,46 @@ where
 /// Offload one service operation while retaining cancellation and ownership
 /// through result delivery. An abandoned future only requests cleanup; the
 /// service monitor remains the process owner and publishes its actual reap.
-pub(crate) async fn run_service_request<T, F>(operation: F) -> Result<T>
+pub(crate) async fn run_service_request<T, F>(
+    scope: &crate::jobs::JobSessionScope,
+    operation: F,
+) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&ServiceRequest) -> Result<T> + Send + 'static,
 {
-    let request = ServiceRequest::new();
+    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    let instance_generation = registry()
+        .lock()
+        .map_err(|_| registry_err())?
+        .instance_generation(scope.instance_id());
+    let deadline = Instant::now() + INPUT_BUDGET;
+    let mut resolving = Box::pin(owner.with_current(scope.session_id()));
+    let session_id = loop {
+        if owner.checkpoint().is_err() {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_CANCELLED: session lookup cancelled",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_TIMEOUT: session lookup timed out",
+            ));
+        }
+        let time = owner.time();
+        let pause = Box::pin(time.sleep(remaining.min(IO_POLL_INTERVAL)));
+        match futures::future::select(resolving, pause).await {
+            futures::future::Either::Left((result, _)) => break result?,
+            futures::future::Either::Right(((), pending)) => resolving = pending,
+        }
+    };
+    let request = ServiceRequest::after_resolution(
+        &scope.service_owner(session_id),
+        Some(instance_generation),
+    )?;
     request.check()?;
     let mut guard = ServiceRequestGuard {
         request: request.clone(),
@@ -346,7 +480,7 @@ where
         Ok(Err(error)) => return Err(error),
         Err(error) => Err(error),
     };
-    match result.and_then(|value| request.check().map(|()| value)) {
+    match result.and_then(|value| request.accept().map(|()| value)) {
         Ok(value) => {
             guard.accepted = true;
             Ok(value)
@@ -544,6 +678,7 @@ impl Ring {
 type ServiceWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
 struct ServiceEntry {
+    owner: ServiceOwner,
     spec: LaunchSpec,
     status: ServiceStatus,
     pid: Option<u32>,
@@ -593,6 +728,8 @@ fn release_service_input(writer: Option<ServiceWriter>) {
 #[serde(rename_all = "camelCase")]
 pub struct ServiceSnapshot {
     pub schema: String,
+    pub owner_session_id: String,
+    pub owner_instance_id: String,
     pub name: String,
     pub command: String,
     pub cwd: String,
@@ -611,6 +748,8 @@ impl ServiceSnapshot {
         let status = entry.current_status();
         Self {
             schema: SERVICE_SCHEMA.to_string(),
+            owner_session_id: entry.owner.session_id.clone(),
+            owner_instance_id: entry.owner.instance_id.clone(),
             name: entry.spec.name.clone(),
             command: format!("{} {}", entry.spec.program, entry.spec.args.join(" ")),
             cwd: entry.spec.cwd.display().to_string(),
@@ -651,11 +790,100 @@ pub struct LogPage {
 
 #[derive(Default)]
 struct ServiceRegistry {
-    services: HashMap<String, ServiceEntry>,
+    services: HashMap<(ServiceOwner, String), ServiceEntry>,
+    owners: HashMap<ServiceOwner, ServiceOwnerState>,
+    instance_generations: HashMap<String, u64>,
+    retired_instances: HashSet<String>,
     shutting_down: bool,
 }
 
 impl ServiceRegistry {
+    fn instance_generation(&self, instance_id: &str) -> u64 {
+        self.instance_generations
+            .get(instance_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn ensure_owner_open(&self, owner: &ServiceOwner) -> Result<()> {
+        if self.retired_instances.contains(&owner.instance_id) {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_RETIRED: this live service registry has shut down",
+            ));
+        }
+        if self
+            .owners
+            .get(owner)
+            .is_some_and(|state| state.active_shutdowns != 0 || state.incomplete_shutdown)
+        {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_CLOSING: this live session's services are closing",
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_request(&self, request: &ServiceRequest) -> Result<()> {
+        self.ensure_owner_open(&request.service_owner)?;
+        let generation = self
+            .owners
+            .get(&request.service_owner)
+            .map_or(0, |state| state.generation);
+        if generation != request.generation {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_STALE_SESSION: service request belongs to a retired session generation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, owner: &ServiceOwner, name: &str) -> Result<&ServiceEntry> {
+        let exact = self.services.get(&(owner.clone(), name.to_string()));
+        if let Some(entry) = exact
+            && entry.status.live()
+        {
+            return Ok(entry);
+        }
+        // Explicit detachment survives replacement, but never grants access
+        // across persistent sessions. Ambiguous detached names fail closed.
+        let detached = self.services.values().filter(|entry| {
+            entry.owner.session_id == owner.session_id
+                && entry.spec.name == name
+                && entry.spec.detached
+                && entry.control.startup_accepted.load(Ordering::Acquire)
+        });
+        // A restart retains the previous settled descriptor. That history
+        // must not conceal the uniquely live detached incarnation on resume.
+        let has_live = detached.clone().any(|entry| entry.status.live());
+        if !has_live
+            && let Some(entry) = exact
+        {
+            return Ok(entry);
+        }
+        let mut detached = detached.filter(|entry| !has_live || entry.status.live());
+        let Some(entry) = detached.next() else {
+            return Err(unknown_service(name));
+        };
+        if detached.next().is_some() {
+            return Err(Error::tool(
+                "hub",
+                format!("PI_HUB_AMBIGUOUS_SERVICE: more than one detached service is named '{name}'"),
+            ));
+        }
+        Ok(entry)
+    }
+
+    fn lookup_mut(&mut self, owner: &ServiceOwner, name: &str) -> Result<&mut ServiceEntry> {
+        let entry = self.lookup(owner, name)?;
+        let key = (entry.owner.clone(), entry.spec.name.clone());
+        self.services
+            .get_mut(&key)
+            .ok_or_else(|| unknown_service(name))
+    }
+
     fn ensure_accepting_starts(&self) -> Result<()> {
         if self.shutting_down {
             return Err(Error::tool(
@@ -671,12 +899,15 @@ impl ServiceRegistry {
     /// without letting an old monitor or readiness waiter mutate the new run.
     fn reserve(
         &mut self,
+        owner: &ServiceOwner,
         spec: &LaunchSpec,
         ring: &Arc<Mutex<Ring>>,
         log_path: &std::path::Path,
     ) -> Result<()> {
         self.ensure_accepting_starts()?;
-        if let Some(existing) = self.services.get(&spec.name)
+        self.ensure_owner_open(owner)?;
+        let key = (owner.clone(), spec.name.clone());
+        if let Some(existing) = self.services.get(&key)
             && existing.status.live()
         {
             return Err(Error::tool(
@@ -687,9 +918,26 @@ impl ServiceRegistry {
                 ),
             ));
         }
+        if spec.detached
+            && self.services.values().any(|entry| {
+                entry.owner.session_id == owner.session_id
+                    && entry.spec.name == spec.name
+                    && entry.spec.detached
+                    && entry.status.live()
+            })
+        {
+            return Err(Error::tool(
+                "hub",
+                format!(
+                    "PI_HUB_NAME_TAKEN: a live detached service named '{}' already belongs to this session",
+                    spec.name
+                ),
+            ));
+        }
         self.services.insert(
-            spec.name.clone(),
+            key,
             ServiceEntry {
+                owner: owner.clone(),
                 spec: spec.clone(),
                 status: ServiceStatus::Starting,
                 pid: None,
@@ -707,14 +955,14 @@ impl ServiceRegistry {
 
     fn current(&self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<&ServiceEntry> {
         self.services
-            .get(name)
-            .filter(|entry| Arc::ptr_eq(&entry.ring, ring))
+            .values()
+            .find(|entry| entry.spec.name == name && Arc::ptr_eq(&entry.ring, ring))
     }
 
     fn current_mut(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Option<&mut ServiceEntry> {
         self.services
-            .get_mut(name)
-            .filter(|entry| Arc::ptr_eq(&entry.ring, ring))
+            .values_mut()
+            .find(|entry| entry.spec.name == name && Arc::ptr_eq(&entry.ring, ring))
     }
 
     fn mark_ready(&mut self, name: &str, ring: &Arc<Mutex<Ring>>) -> Result<ServiceSnapshot> {
@@ -802,6 +1050,13 @@ fn stale_service(name: &str) -> Error {
     )
 }
 
+fn unknown_service(name: &str) -> Error {
+    Error::tool(
+        "hub",
+        format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}' in this session"),
+    )
+}
+
 /// A failed setup settles only its own reservation. This guard is created
 /// before the child guard, so child cleanup runs before the reservation settles.
 struct PendingService {
@@ -817,9 +1072,11 @@ impl PendingService {
         spec: &LaunchSpec,
         ring: &Arc<Mutex<Ring>>,
         log_path: &std::path::Path,
+        request: &ServiceRequest,
     ) -> Result<Self> {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
-        reg.reserve(spec, ring, log_path)?;
+        reg.check_request(request)?;
+        reg.reserve(&request.service_owner, spec, ring, log_path)?;
         let control = Arc::clone(
             &reg.current(&spec.name, ring)
                 .ok_or_else(|| stale_service(&spec.name))?
@@ -1169,6 +1426,8 @@ fn validated_service_name(name: &str) -> Result<&str> {
 fn persist_detached_state(reg: &ServiceRegistry) {
     #[derive(Serialize)]
     struct DetachedRecord {
+        owner_session_id: String,
+        owner_instance_id: String,
         name: String,
         pid: Option<u32>,
         log_path: String,
@@ -1181,6 +1440,8 @@ fn persist_detached_state(reg: &ServiceRegistry) {
         .values()
         .filter(|entry| entry.spec.detached && entry.status.live())
         .map(|entry| DetachedRecord {
+            owner_session_id: entry.owner.session_id.clone(),
+            owner_instance_id: entry.owner.instance_id.clone(),
             name: entry.spec.name.clone(),
             pid: entry.pid,
             log_path: entry.log_path.display().to_string(),
@@ -1207,26 +1468,34 @@ fn persist_detached_state(reg: &ServiceRegistry) {
 /// `PI_HUB_NAME_TAKEN` for a duplicate live name; `PI_HUB_NOT_READY` when
 /// the gates do not pass in time (the process is killed — no half-started
 /// surprise daemons); tool errors for spawn failures.
-pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
-    start_inner(spec, None)
+pub fn start(owner: &ServiceOwner, spec: &LaunchSpec) -> Result<ServiceSnapshot> {
+    let request = ServiceRequest::new(owner)?;
+    let mut guard = ServiceRequestGuard {
+        request: request.clone(),
+        accepted: false,
+    };
+    let result = start_inner(spec, &request)
+        .and_then(|snapshot| request.accept().map(|()| snapshot))
+        .map_err(|error| request.cancel_and_wait(error));
+    guard.accepted = result.is_ok();
+    result
 }
 
 pub(crate) fn start_for_request(
     spec: &LaunchSpec,
     request: &ServiceRequest,
 ) -> Result<ServiceSnapshot> {
-    start_inner(spec, Some(request))
+    start_inner(spec, request)
 }
 
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<ServiceSnapshot> {
-    registry()
-        .lock()
-        .map_err(|_| registry_err())?
-        .ensure_accepting_starts()?;
-    if let Some(request) = request {
-        request.check_spawn()?;
+fn start_inner(spec: &LaunchSpec, request: &ServiceRequest) -> Result<ServiceSnapshot> {
+    {
+        let reg = registry().lock().map_err(|_| registry_err())?;
+        reg.ensure_accepting_starts()?;
+        reg.check_request(request)?;
     }
+    request.check_spawn()?;
     let name = validated_service_name(&spec.name)?.to_string();
     let ready = spec.ready.clone().unwrap_or_default();
     let has_gates = ready.log.is_some() || ready.port.is_some();
@@ -1258,10 +1527,8 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
     let ring = Arc::new(Mutex::new(output));
     let log_dir = hub_artifact_dir();
     let log_path = log_dir.join(format!("{name}-{}.log", uuid::Uuid::new_v4()));
-    let pending = PendingService::reserve(spec, &ring, &log_path)?;
-    if let Some(request) = request {
-        request.own_startup(&name, &pending.control)?;
-    }
+    let pending = PendingService::reserve(spec, &ring, &log_path, request)?;
+    request.own_startup(&name, &pending.control)?;
     std::fs::create_dir_all(&log_dir)
         .map_err(|e| Error::tool("hub", format!("Failed to create hub artifact dir: {e}")))?;
     // All fallible artifact/PTY handle setup precedes child creation.
@@ -1277,6 +1544,7 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
     let initial_snapshot = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
         reg.ensure_accepting_starts()?;
+        reg.check_request(request)?;
         let entry = reg
             .current_mut(&name, &ring)
             .ok_or_else(|| stale_service(&name))?;
@@ -1325,9 +1593,7 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
     }
 
     loop {
-        if let Some(request) = request {
-            request.check()?;
-        }
+        request.check()?;
         let status = {
             let reg = registry().lock().map_err(|_| registry_err())?;
             reg.current(&name, &ring)
@@ -1360,16 +1626,15 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
         });
         if log_passed && port_passed && Instant::now() <= deadline {
             let mut reg = registry().lock().map_err(|_| registry_err())?;
+            reg.check_request(request)?;
             let snapshot = reg.mark_ready(&name, &ring)?;
             persist_detached_state(&reg);
             return Ok(snapshot);
         }
         if Instant::now() >= deadline {
-            if let Some(request) = request {
-                // The caller's request shares this first cleanup deadline;
-                // reporting a timeout must not trigger a second full wait.
-                request.cancel();
-            }
+            // The caller's request shares this first cleanup deadline;
+            // reporting a timeout must not trigger a second full wait.
+            request.cancel();
             let control = {
                 let mut reg = registry().lock().map_err(|_| registry_err())?;
                 let control = reg.time_out(&name, &ring);
@@ -1401,7 +1666,7 @@ fn start_inner(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Se
     }
 }
 
-fn spawn_pty(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<SpawnedService> {
+fn spawn_pty(spec: &LaunchSpec, request: &ServiceRequest) -> Result<SpawnedService> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     let pty_system = native_pty_system();
@@ -1435,15 +1700,14 @@ fn spawn_pty(spec: &LaunchSpec, request: Option<&ServiceRequest>) -> Result<Spaw
         .master
         .take_writer()
         .map_err(|e| Error::tool("hub", format!("Failed to open PTY writer: {e}")))?;
-    if let Some(request) = request {
-        request.check_spawn()?;
-    }
+    request.check_spawn()?;
     #[cfg(test)]
     run_startup_test_hook(&spec.name, StartupTestStage::BeforeSpawn);
-    registry()
-        .lock()
-        .map_err(|_| registry_err())?
-        .ensure_accepting_starts()?;
+    {
+        let reg = registry().lock().map_err(|_| registry_err())?;
+        reg.ensure_accepting_starts()?;
+        reg.check_request(request)?;
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1605,16 +1869,22 @@ fn ring_tail(ring: &Mutex<Ring>, count: usize) -> String {
     )
 }
 
-/// List every service supervised by this host process, including services
-/// excluded from session-exit cleanup. Persisted PIDs are never adopted.
+/// List this live owner's services and explicitly detached services retained
+/// for the same durable session. Persisted PIDs are never adopted.
 ///
 /// # Errors
 /// Registry lock failure.
-pub fn ps() -> Result<Vec<ServiceSnapshot>> {
+pub fn ps(owner: &ServiceOwner) -> Result<Vec<ServiceSnapshot>> {
     let reg = registry().lock().map_err(|_| registry_err())?;
     Ok(reg
         .services
         .values()
+        .filter(|entry| {
+            entry.owner == *owner
+                || (entry.spec.detached
+                    && entry.owner.session_id == owner.session_id
+                    && entry.control.startup_accepted.load(Ordering::Acquire))
+        })
         .map(ServiceSnapshot::from_entry)
         .collect())
 }
@@ -1632,13 +1902,14 @@ pub fn ps() -> Result<Vec<ServiceSnapshot>> {
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names.
 pub fn logs(
+    owner: &ServiceOwner,
     name: &str,
     since: Option<u64>,
     tail: Option<usize>,
     grep: Option<&str>,
     wait_ms: u64,
 ) -> Result<LogPage> {
-    logs_inner(name, since, tail, grep, wait_ms, None)
+    logs_inner(name, since, tail, grep, wait_ms, &ServiceRequest::new(owner)?)
 }
 
 pub(crate) fn logs_for_request(
@@ -1649,7 +1920,7 @@ pub(crate) fn logs_for_request(
     wait_ms: u64,
     request: &ServiceRequest,
 ) -> Result<LogPage> {
-    logs_inner(name, since, tail, grep, wait_ms, Some(request))
+    logs_inner(name, since, tail, grep, wait_ms, request)
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1659,21 +1930,15 @@ fn logs_inner(
     tail: Option<usize>,
     grep: Option<&str>,
     wait_ms: u64,
-    request: Option<&ServiceRequest>,
+    request: &ServiceRequest,
 ) -> Result<LogPage> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms.min(60_000));
     loop {
-        if let Some(request) = request {
-            request.check()?;
-        }
+        request.check()?;
         {
             let reg = registry().lock().map_err(|_| registry_err())?;
-            let Some(entry) = reg.services.get(name) else {
-                return Err(Error::tool(
-                    "hub",
-                    format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
-                ));
-            };
+            reg.check_request(request)?;
+            let entry = reg.lookup(&request.service_owner, name)?;
             let ring = entry.ring.lock().map_err(|_| registry_err())?;
             let (mut lines, cursor) = ring.since(since.unwrap_or(0));
             let oldest_cursor = ring.next_index.saturating_sub(ring.lines.len() as u64);
@@ -1720,8 +1985,8 @@ fn logs_inner(
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` / `PI_HUB_NOT_RUNNING` for invalid targets.
 /// Cancellation or `PI_HUB_INPUT_TIMEOUT` can follow partial input delivery.
-pub fn send_text(name: &str, text: &str, enter: bool) -> Result<()> {
-    send_text_for_request(name, text, enter, &ServiceRequest::new())
+pub fn send_text(owner: &ServiceOwner, name: &str, text: &str, enter: bool) -> Result<()> {
+    send_text_for_request(name, text, enter, &ServiceRequest::new(owner)?)
 }
 
 pub(crate) fn send_text_for_request(
@@ -1742,8 +2007,8 @@ pub(crate) fn send_text_for_request(
 ///
 /// # Errors
 /// Named validation error for unknown key names.
-pub fn send_keys(name: &str, keys: &[String]) -> Result<()> {
-    send_keys_for_request(name, keys, &ServiceRequest::new())
+pub fn send_keys(owner: &ServiceOwner, name: &str, keys: &[String]) -> Result<()> {
+    send_keys_for_request(name, keys, &ServiceRequest::new(owner)?)
 }
 
 pub(crate) fn send_keys_for_request(
@@ -1787,12 +2052,8 @@ fn write_to_master(name: &str, chunks: &[&[u8]], request: &ServiceRequest) -> Re
     request.check()?;
     let (writer, control) = {
         let reg = registry().lock().map_err(|_| registry_err())?;
-        let Some(entry) = reg.services.get(name) else {
-            return Err(Error::tool(
-                "hub",
-                format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
-            ));
-        };
+        reg.check_request(request)?;
+        let entry = reg.lookup(&request.service_owner, name)?;
         if !entry.current_status().accepts_input() {
             return Err(Error::tool(
                 "hub",
@@ -1893,15 +2154,20 @@ fn input_checkpoint(
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` / `PI_HUB_NOT_RUNNING`.
 #[allow(clippy::significant_drop_tightening)]
-pub fn send_signal(name: &str, signal: sysinfo::Signal) -> Result<()> {
+pub fn send_signal(owner: &ServiceOwner, name: &str, signal: sysinfo::Signal) -> Result<()> {
+    send_signal_for_request(name, signal, &ServiceRequest::new(owner)?)
+}
+
+pub(crate) fn send_signal_for_request(
+    name: &str,
+    signal: sysinfo::Signal,
+    request: &ServiceRequest,
+) -> Result<()> {
+    request.check()?;
     let pid = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
-        let Some(entry) = reg.services.get_mut(name) else {
-            return Err(Error::tool(
-                "hub",
-                format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
-            ));
-        };
+        reg.check_request(request)?;
+        let entry = reg.lookup_mut(&request.service_owner, name)?;
         if !entry.status.live() {
             return Err(Error::tool(
                 "hub",
@@ -1962,15 +2228,16 @@ fn signal_pid_tree(pid: u32, signal: sysinfo::Signal) {
 /// if cleanup is still pending after the bounded wait. Such services remain
 /// `stopping`, retain their name, and may be awaited by another `stop` call.
 #[allow(clippy::significant_drop_tightening)]
-pub fn stop(name: &str) -> Result<ServiceSnapshot> {
+pub fn stop(owner: &ServiceOwner, name: &str) -> Result<ServiceSnapshot> {
+    stop_for_request(name, &ServiceRequest::new(owner)?)
+}
+
+pub(crate) fn stop_for_request(name: &str, request: &ServiceRequest) -> Result<ServiceSnapshot> {
+    request.check()?;
     let control = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
-        let Some(entry) = reg.services.get_mut(name) else {
-            return Err(Error::tool(
-                "hub",
-                format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
-            ));
-        };
+        reg.check_request(request)?;
+        let entry = reg.lookup_mut(&request.service_owner, name)?;
         if !entry.status.live() {
             return Err(Error::tool(
                 "hub",
@@ -1989,31 +2256,36 @@ pub fn stop(name: &str) -> Result<ServiceSnapshot> {
 
 /// Restart reuses the retained launch spec. Running services are stopped
 /// first; completed names re-spawn directly.
+/// A detached service resumed from an older live registry is stopped under
+/// its original control, then the replacement belongs to the requesting owner.
 ///
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names; start errors otherwise.
-pub fn restart(name: &str) -> Result<ServiceSnapshot> {
-    restart_inner(name, None)
+pub fn restart(owner: &ServiceOwner, name: &str) -> Result<ServiceSnapshot> {
+    let request = ServiceRequest::new(owner)?;
+    let mut guard = ServiceRequestGuard {
+        request: request.clone(),
+        accepted: false,
+    };
+    let result = restart_inner(name, &request)
+        .and_then(|snapshot| request.accept().map(|()| snapshot))
+        .map_err(|error| request.cancel_and_wait(error));
+    guard.accepted = result.is_ok();
+    result
 }
 
 pub(crate) fn restart_for_request(name: &str, request: &ServiceRequest) -> Result<ServiceSnapshot> {
-    restart_inner(name, Some(request))
+    restart_inner(name, request)
 }
 
 #[allow(clippy::significant_drop_tightening)]
-fn restart_inner(name: &str, request: Option<&ServiceRequest>) -> Result<ServiceSnapshot> {
-    if let Some(request) = request {
-        request.check_spawn()?;
-    }
+fn restart_inner(name: &str, request: &ServiceRequest) -> Result<ServiceSnapshot> {
+    request.check_spawn()?;
     let (spec, control) = {
         let mut reg = registry().lock().map_err(|_| registry_err())?;
         reg.ensure_accepting_starts()?;
-        let Some(entry) = reg.services.get_mut(name) else {
-            return Err(Error::tool(
-                "hub",
-                format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
-            ));
-        };
+        reg.check_request(request)?;
+        let entry = reg.lookup_mut(&request.service_owner, name)?;
         let control = if entry.status.live() {
             entry.status = ServiceStatus::Stopping;
             entry.control.request_stop(false);
@@ -2034,15 +2306,150 @@ fn restart_inner(name: &str, request: Option<&ServiceRequest>) -> Result<Service
 /// # Errors
 /// `PI_HUB_UNKNOWN_SERVICE` for unknown names.
 #[allow(clippy::significant_drop_tightening)]
-pub fn describe(name: &str) -> Result<ServiceSnapshot> {
+pub fn describe(owner: &ServiceOwner, name: &str) -> Result<ServiceSnapshot> {
     let reg = registry().lock().map_err(|_| registry_err())?;
-    let Some(entry) = reg.services.get(name) else {
-        return Err(Error::tool(
-            "hub",
-            format!("PI_HUB_UNKNOWN_SERVICE: no service named '{name}'"), // ubs:ignore cold error path
-        ));
-    };
+    let entry = reg.lookup(owner, name)?;
     Ok(ServiceSnapshot::from_entry(entry))
+}
+
+/// An already-published shutdown fence and its exact service incarnations.
+/// Dropping this token keeps admission fenced and stop requests effective;
+/// cleanup must be retried before this owner may admit new services.
+pub struct ServiceShutdown {
+    owner: ServiceOwner,
+    generation: u64,
+    controls: Vec<(String, Arc<ServiceControl>)>,
+    deadline: Instant,
+    finished: bool,
+}
+
+impl ServiceShutdown {
+    /// Await process reap and output cleanup without blocking the executor.
+    /// All services share the deadline established when the fence was begun.
+    /// A clean finish permits fresh requests for this owner; older requests
+    /// remain invalid because their captured generation cannot advance.
+    /// Permanently retired registries stay closed after cleanup succeeds.
+    ///
+    /// # Errors
+    /// Returns an error if the cleanup worker cannot start or any service
+    /// does not settle within the original shared shutdown budget.
+    pub async fn finish(self) -> Result<usize> {
+        service_worker(move || {
+            let mut shutdown = self;
+            let mut failures = Vec::new();
+            for (name, control) in &shutdown.controls {
+                if let Err(error) = control.wait_until(name, shutdown.deadline) {
+                    failures.push(error.to_string());
+                }
+            }
+            let count = shutdown.controls.len();
+            shutdown.complete(failures.is_empty());
+            if failures.is_empty() {
+                Ok(count)
+            } else {
+                Err(Error::tool(
+                    "hub",
+                    format!("PI_HUB_SESSION_STOP_INCOMPLETE: {}", failures.join("; ")),
+                ))
+            }
+        })
+        .await?
+    }
+
+    fn complete(&mut self, clean: bool) {
+        if self.finished {
+            return;
+        }
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = reg.owners.get_mut(&self.owner) {
+            state.active_shutdowns = state.active_shutdowns.saturating_sub(1);
+            if clean && state.generation == self.generation {
+                state.incomplete_shutdown = false;
+            }
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for ServiceShutdown {
+    fn drop(&mut self) {
+        self.complete(false);
+    }
+}
+
+/// Fence this live owner synchronously and request every owned stop before
+/// returning. Call after a session transition commits, then finish outside
+/// session locks. Other registries, even those loading the same persistent
+/// session ID, retain their services and startup authority.
+///
+/// # Errors
+/// Returns a registry-lock or exhausted-generation error before publishing
+/// a partial shutdown fence.
+pub fn begin_session_shutdown(owner: &ServiceOwner) -> Result<ServiceShutdown> {
+    begin_shutdown(owner, false)
+}
+
+/// Permanently retire a consumed SDK handle's live registry, including any
+/// owner lookup that has not resolved yet. Fresh handles loading the same
+/// persisted session have a different registry identity and remain usable.
+/// The durable ID may be empty when its store cannot be read: this operation
+/// uses the live registry identity and retires every session it hosted.
+///
+/// # Errors
+/// Returns a registry-lock or exhausted-generation error before publishing
+/// a partial shutdown fence.
+pub fn begin_registry_shutdown(owner: &ServiceOwner) -> Result<ServiceShutdown> {
+    begin_shutdown(owner, true)
+}
+
+fn begin_shutdown(owner: &ServiceOwner, retire_registry: bool) -> Result<ServiceShutdown> {
+    let mut reg = registry().lock().map_err(|_| registry_err())?;
+    let instance_generation = reg
+        .instance_generation(owner.instance_id())
+        .checked_add(1)
+        .ok_or_else(|| {
+            Error::tool("hub", "PI_HUB_SESSION_LIMIT: registry generation exhausted")
+        })?;
+    let state = reg.owners.entry(owner.clone()).or_default();
+    let generation = state.generation.checked_add(1).ok_or_else(|| {
+        Error::tool("hub", "PI_HUB_SESSION_LIMIT: service generation exhausted")
+    })?;
+    let active_shutdowns = state.active_shutdowns.checked_add(1).ok_or_else(|| {
+        Error::tool("hub", "PI_HUB_SESSION_LIMIT: too many shutdown attempts")
+    })?;
+    state.generation = generation;
+    state.active_shutdowns = active_shutdowns;
+    state.incomplete_shutdown = true;
+    reg.instance_generations
+        .insert(owner.instance_id.clone(), instance_generation);
+    if retire_registry {
+        reg.retired_instances.insert(owner.instance_id.clone());
+    }
+    let controls = reg
+        .services
+        .values_mut()
+        .filter(|entry| {
+            (entry.owner == *owner
+                || (retire_registry && entry.owner.instance_id == owner.instance_id))
+                && entry.status.live()
+                && (!entry.spec.detached
+                    || !entry.control.startup_accepted.load(Ordering::Acquire))
+        })
+        .map(|entry| {
+            entry.status = ServiceStatus::Stopping;
+            entry.control.request_stop(true);
+            (entry.spec.name.clone(), Arc::clone(&entry.control))
+        })
+        .collect();
+    Ok(ServiceShutdown {
+        owner: owner.clone(),
+        generation,
+        controls,
+        deadline: Instant::now() + SETTLEMENT_BUDGET,
+        finished: false,
+    })
 }
 
 /// Kill the current non-detached services, leaving admission open for later
@@ -2061,7 +2468,11 @@ pub fn kill_session_services() {
         let victims: Vec<_> = reg
             .services
             .values_mut()
-            .filter(|entry| entry.status.live() && !entry.spec.detached)
+            .filter(|entry| {
+                entry.status.live()
+                    && (!entry.spec.detached
+                        || !entry.control.startup_accepted.load(Ordering::Acquire))
+            })
             .map(|entry| {
                 entry.status = ServiceStatus::Stopping;
                 entry.control.request_stop(true);
@@ -2137,6 +2548,21 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_owner() -> ServiceOwner {
+        ServiceOwner::new(
+            "hub-unit-session".to_string(),
+            "hub-unit-instance".to_string(),
+        )
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("hub test runtime")
+            .block_on(future)
+    }
 
     fn temp_root() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pi-hub-test-{}", std::process::id()));
@@ -2515,7 +2941,7 @@ mod tests {
         let ring = Arc::new(Mutex::new(Ring::new(8)));
         let mut reg = ServiceRegistry::default();
         let launch = spec("hub-output-settlement", "unused", &[], None);
-        reg.reserve(&launch, &ring, &PathBuf::from("settlement.log"))
+        reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("settlement.log"))
             .expect("reserve");
         let dir = tempfile::tempdir().expect("temp dir");
         let log_path = dir.path().join("output.log");
@@ -2539,7 +2965,7 @@ mod tests {
             ServiceSnapshot::from_entry(reg.current(&launch.name, &ring).expect("entry"));
         assert_eq!(snapshot.status, "stopping");
         assert_eq!(snapshot.log_capture.drain_state, LogDrainState::Streaming);
-        assert!(reg.reserve(&launch, &ring, &log_path).is_err());
+        assert!(reg.reserve(&test_owner(), &launch, &ring, &log_path).is_err());
         let control = Arc::clone(&reg.current(&launch.name, &ring).expect("entry").control);
         assert!(control.completion.lock().expect("completion").is_none());
         // A stop arriving during output cleanup must not rewrite an already
@@ -2659,7 +3085,8 @@ mod tests {
     fn reserve_input_fixture(name: &str, writer: Box<dyn Write + Send>) -> PendingService {
         let launch = spec(name, "unused", &[], None);
         let ring = Arc::new(Mutex::new(Ring::new(8)));
-        let pending = PendingService::reserve(&launch, &ring, &PathBuf::from("input.log"))
+        let request = ServiceRequest::new(&test_owner()).expect("input owner");
+        let pending = PendingService::reserve(&launch, &ring, &PathBuf::from("input.log"), &request)
             .expect("input reservation");
         registry()
             .lock()
@@ -2682,8 +3109,8 @@ mod tests {
                 flush_blocked: true,
             }),
         );
-        send_text(&pending.name, "prêt 界🙂", true).expect("partial text writes");
-        send_keys(&pending.name, &["UP".to_string(), "ENTER".to_string()])
+        send_text(&test_owner(), &pending.name, "prêt 界🙂", true).expect("partial text writes");
+        send_keys(&test_owner(), &pending.name, &["UP".to_string(), "ENTER".to_string()])
             .expect("partial key writes");
         assert_eq!(
             &*bytes.lock().expect("input bytes"),
@@ -2728,7 +3155,7 @@ mod tests {
                 blocked: Some(blocked_tx),
             }),
         );
-        let request = ServiceRequest::new();
+        let request = ServiceRequest::new(&test_owner()).expect("request owner");
         let worker_request = request.clone();
         let name = pending.name.clone();
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
@@ -2749,7 +3176,7 @@ mod tests {
         assert_eq!(&*bytes.lock().expect("input bytes"), b"bl");
         assert!(!pending.control.stop_requested.load(Ordering::Acquire));
         assert_eq!(
-            describe(&pending.name).expect("live service").status,
+            describe(&test_owner(), &pending.name).expect("live service").status,
             "starting"
         );
     }
@@ -2760,10 +3187,10 @@ mod tests {
         let launch = spec("hub-reserved", "unused", &[], None);
         let first = Arc::new(Mutex::new(Ring::new(8)));
         let second = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &first, &PathBuf::from("first.log"))
+        reg.reserve(&test_owner(), &launch, &first, &PathBuf::from("first.log"))
             .expect("reserve");
         let error = reg
-            .reserve(&launch, &second, &PathBuf::from("second.log"))
+            .reserve(&test_owner(), &launch, &second, &PathBuf::from("second.log"))
             .expect_err("pending launch owns the name");
         assert!(error.to_string().contains("PI_HUB_NAME_TAKEN"));
         assert!(
@@ -2781,7 +3208,7 @@ mod tests {
         let launch = spec("hub-cleanup-pending", "unused", &[], None);
         let old = Arc::new(Mutex::new(Ring::new(8)));
         let new = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &old, &PathBuf::from("old.log"))
+        reg.reserve(&test_owner(), &launch, &old, &PathBuf::from("old.log"))
             .expect("old reservation");
         reg.current_mut(&launch.name, &old).expect("entry").pid = Some(42);
         let control = reg.time_out(&launch.name, &old).expect("stop request");
@@ -2795,14 +3222,14 @@ mod tests {
         assert_eq!(pending.exit_code, None);
         assert!(reg.mark_ready(&launch.name, &old).is_err());
         assert!(
-            reg.reserve(&launch, &new, &PathBuf::from("new.log"))
+            reg.reserve(&test_owner(), &launch, &new, &PathBuf::from("new.log"))
                 .unwrap_err()
                 .to_string()
                 .contains("PI_HUB_NAME_TAKEN")
         );
 
         assert!(reg.settle(&launch.name, &old, 137));
-        reg.reserve(&launch, &new, &PathBuf::from("new.log"))
+        reg.reserve(&test_owner(), &launch, &new, &PathBuf::from("new.log"))
             .expect("reaped service releases its name");
         let completed = control
             .wait_until(&launch.name, Instant::now())
@@ -2823,11 +3250,11 @@ mod tests {
         let launch = spec("hub-generation", "unused", &[], None);
         let old = Arc::new(Mutex::new(Ring::new(8)));
         let new = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &old, &PathBuf::from("old.log"))
+        reg.reserve(&test_owner(), &launch, &old, &PathBuf::from("old.log"))
             .expect("old");
         reg.time_out(&launch.name, &old);
         assert!(reg.settle(&launch.name, &old, 137));
-        reg.reserve(&launch, &new, &PathBuf::from("new.log"))
+        reg.reserve(&test_owner(), &launch, &new, &PathBuf::from("new.log"))
             .expect("new");
         reg.current_mut(&launch.name, &new).expect("new entry").pid = Some(42);
         reg.mark_ready(&launch.name, &new).expect("ready");
@@ -2857,7 +3284,7 @@ mod tests {
             let mut reg = ServiceRegistry::default();
             let launch = spec("hub-terminal", "unused", &[], None);
             let ring = Arc::new(Mutex::new(Ring::new(8)));
-            reg.reserve(&launch, &ring, &PathBuf::from("terminal.log"))
+            reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("terminal.log"))
                 .expect("reserve");
             reg.current_mut(&launch.name, &ring).expect("entry").status = terminal;
             assert!(reg.mark_ready(&launch.name, &ring).is_err());
@@ -2873,7 +3300,7 @@ mod tests {
         let mut reg = ServiceRegistry::default();
         let launch = spec("hub-killed", "unused", &[], None);
         let ring = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &ring, &PathBuf::from("killed.log"))
+        reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("killed.log"))
             .expect("reserve");
         reg.current_mut(&launch.name, &ring).expect("entry").pid = Some(42);
         let control = reg.time_out(&launch.name, &ring).expect("stop requested");
@@ -2895,7 +3322,7 @@ mod tests {
         let mut reg = ServiceRegistry::default();
         let mut launch = spec("hub-shutdown-reservation", "unused", &[], None);
         let ring = Arc::new(Mutex::new(Ring::new(8)));
-        reg.reserve(&launch, &ring, &PathBuf::from("previous.log"))
+        reg.reserve(&test_owner(), &launch, &ring, &PathBuf::from("previous.log"))
             .expect("initial reservation");
         assert!(reg.settle(&launch.name, &ring, 0));
         reg.shutting_down = true;
@@ -2908,15 +3335,196 @@ mod tests {
             launch.name = name.to_string();
             launch.detached = detached;
             let error = reg
-                .reserve(&launch, &ring, &PathBuf::from("never-created.log"))
+                .reserve(&test_owner(), &launch, &ring, &PathBuf::from("never-created.log"))
                 .expect_err("process shutdown permanently closes admission");
             assert!(error.to_string().contains("PI_HUB_SHUTTING_DOWN"));
         }
         assert_eq!(reg.services.len(), 1);
         assert_eq!(
-            reg.services["hub-shutdown-reservation"].status,
+            reg.lookup(&test_owner(), "hub-shutdown-reservation").expect("service").status,
             ServiceStatus::Exited
         );
+    }
+
+    #[test]
+    fn abandoned_owner_shutdown_fences_unaccepted_detached_startup_until_retry() {
+        let _guard = test_lock();
+        let scope = crate::jobs::JobSessionScope::fixed("hub-abandoned-owner");
+        let owner = scope.service_owner("hub-abandoned-owner");
+        let request = ServiceRequest::new(&owner).expect("admitted owner");
+        let mut launch = spec("unaccepted-detached", "unused", &[], None);
+        launch.detached = true;
+        let ring = Arc::new(Mutex::new(Ring::new(8)));
+        let pending =
+            PendingService::reserve(&launch, &ring, &PathBuf::from("unused.log"), &request)
+                .expect("reserve before shutdown");
+        let replacement = crate::jobs::JobSessionScope::fixed("hub-abandoned-owner")
+            .service_owner("hub-abandoned-owner");
+        assert!(
+            describe(&replacement, &launch.name).is_err(),
+            "unaccepted detachment is private to its startup"
+        );
+        assert!(ps(&replacement).expect("replacement services").is_empty());
+        let shutdown = begin_session_shutdown(&owner).expect("publish owner fence");
+        assert!(pending.control.stop_requested.load(Ordering::Acquire));
+        drop(shutdown);
+        drop(pending);
+        assert!(
+            ServiceRequest::new(&owner).is_err(),
+            "abandoned cleanup remains fenced"
+        );
+        let retry = begin_session_shutdown(&owner).expect("retry incomplete cleanup");
+        block_on(retry.finish()).expect("prove all old services settled");
+        assert!(
+            request.check().is_err(),
+            "the old request never gains a new generation"
+        );
+        ServiceRequest::new(&owner).expect("clean return to the same owner admits fresh work");
+    }
+
+    #[test]
+    fn owner_lookup_started_before_navigation_cannot_reenter_after_clean_shutdown() {
+        let _guard = test_lock();
+        let scope = crate::jobs::JobSessionScope::fixed("hub-lookup-owner");
+        let owner = scope.service_owner("hub-lookup-owner");
+        let (release, pending) = futures::channel::oneshot::channel::<()>();
+        let pending = Arc::new(Mutex::new(Some(pending)));
+        scope.bind(Arc::new(move || {
+            let pending = pending
+                .lock()
+                .expect("resolver gate")
+                .take()
+                .expect("one lookup");
+            Box::pin(async move {
+                pending.await.ok()?;
+                Some("hub-lookup-owner".to_string())
+            })
+        }));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        block_on(async {
+            let mut operation = Box::pin(run_service_request(&scope, move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(operation.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            begin_session_shutdown(&owner)
+                .expect("navigation fence")
+                .finish()
+                .await
+                .expect("clean old generation");
+            release.send(()).expect("release old identity lookup");
+            let error = operation.await.expect_err("late lookup must be stale");
+            assert!(error.to_string().contains("PI_HUB_STALE_SESSION"));
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no stale worker side effects");
+        scope.bind(Arc::new(|| {
+            Box::pin(async { Some("hub-lookup-owner".to_string()) })
+        }));
+        block_on(run_service_request(&scope, |_| Ok(())))
+            .expect("fresh operation may return to the same durable session");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_shutdown_fences_reservation_spawn_and_publication_without_retiring_the_host() {
+        let _guard = test_lock();
+        for (label, target) in [
+            ("reservation", StartupTestStage::BeforeReservation),
+            ("spawn", StartupTestStage::BeforeSpawn),
+            ("publication", StartupTestStage::BeforePublication),
+        ] {
+            let root = tempfile::tempdir().expect("startup race directory");
+            let owner = crate::jobs::JobSessionScope::fixed(label).service_owner(label);
+            let launch = LaunchSpec {
+                name: format!("hub-owner-{label}"),
+                program: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf '%s' \"$$\" > child.pid; exec sleep 300".to_string(),
+                ],
+                cwd: root.path().to_path_buf(),
+                env: Vec::new(),
+                ready: None,
+                detached: false,
+            };
+            let (reached, entered) = std::sync::mpsc::sync_channel(1);
+            let (release, resume) = std::sync::mpsc::sync_channel(1);
+            let resume = Mutex::new(resume);
+            *startup_test_hook().lock().expect("startup hook") = Some((
+                launch.name.clone(),
+                Arc::new(move |stage| {
+                    if stage == target {
+                        reached.send(()).expect("startup reached gate");
+                        resume
+                            .lock()
+                            .expect("resume gate")
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("release fenced startup");
+                    }
+                }),
+            ));
+            let starting_owner = owner.clone();
+            let startup = std::thread::spawn(move || start(&starting_owner, &launch));
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("startup paused");
+            let pid = if target == StartupTestStage::BeforePublication {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(root.path().join("child.pid"))
+                        && let Ok(pid) = text.parse::<i32>()
+                    {
+                        break Some(pid);
+                    }
+                    assert!(Instant::now() < deadline, "spawned child must publish its PID");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            } else {
+                None
+            };
+            let shutdown = begin_session_shutdown(&owner)
+                .expect("owner shutdown does not wait for startup lock");
+            if target == StartupTestStage::BeforeReservation {
+                block_on(shutdown.finish()).expect("nothing reserved yet");
+                release.send(()).expect("release stale unreserved launch");
+            } else {
+                release.send(()).expect("release owned launch for reap");
+                block_on(shutdown.finish()).expect("reserved startup cleaned up");
+            }
+            let result = startup.join().expect("startup thread");
+            *startup_test_hook().lock().expect("startup hook") = None;
+            assert!(
+                result.is_err(),
+                "old startup must not survive its owner's transition"
+            );
+            assert!(
+                ps(&owner)
+                    .expect("owner services")
+                    .iter()
+                    .all(|entry| entry.pid.is_none())
+            );
+            if let Some(pid) = pid {
+                assert!(
+                    rustix::process::test_kill_process(
+                        rustix::process::Pid::from_raw(pid).expect("PID")
+                    )
+                    .is_err(),
+                    "a spawned but unpublished child must be reaped"
+                );
+            } else {
+                assert!(
+                    !root.path().join("child.pid").exists(),
+                    "fence wins before process creation"
+                );
+            }
+            ServiceRequest::new(&owner)
+                .expect("same owner can admit fresh work after clean shutdown");
+        }
     }
 
     #[cfg(unix)]
@@ -2966,13 +3574,13 @@ mod tests {
                 ready: None,
                 detached: true,
             };
-            let initial = start(&launch).expect("start detached service");
+            let initial = start(&test_owner(), &launch).expect("start detached service");
             shutdown_session_services();
-            let restarted = restart(&launch.name);
-            let retained = describe(&launch.name);
+            let restarted = restart(&test_owner(), &launch.name);
+            let retained = describe(&test_owner(), &launch.name);
             // Clean up before assertions so a regression cannot orphan the
             // explicit detached fixture when its child test fails.
-            let stopped = stop(&launch.name);
+            let stopped = stop(&test_owner(), &launch.name);
             let error = restarted.expect_err("shutdown must refuse detached restarts");
             assert!(error.to_string().contains("PI_HUB_SHUTTING_DOWN"));
             let retained = retained.expect("retained detached service");
@@ -3036,7 +3644,7 @@ mod tests {
         *startup_test_hook().lock().expect("startup hook") = Some((launch.name.clone(), hook));
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let startup = std::thread::spawn(move || {
-            started_tx.send(start(&launch)).expect("startup result");
+            started_tx.send(start(&test_owner(), &launch)).expect("startup result");
         });
         reached_rx
             .recv_timeout(Duration::from_secs(10))
@@ -3093,7 +3701,7 @@ mod tests {
         startup.join().expect("startup thread");
         shutdown.join().expect("shutdown thread");
         assert!(
-            ps().expect("services")
+            ps(&test_owner()).expect("services")
                 .iter()
                 .all(|entry| entry.pid.is_none())
         );
@@ -3126,7 +3734,8 @@ mod tests {
         let launch = spec("hub-pending-guard", "unused", &[], None);
         let old = Arc::new(Mutex::new(Ring::new(8)));
         let new = Arc::new(Mutex::new(Ring::new(8)));
-        let pending_old = PendingService::reserve(&launch, &old, &PathBuf::from("old.log"))
+        let request = ServiceRequest::new(&test_owner()).expect("request owner");
+        let pending_old = PendingService::reserve(&launch, &old, &PathBuf::from("old.log"), &request)
             .expect("old reservation");
         registry()
             .lock()
@@ -3136,12 +3745,12 @@ mod tests {
             .lock()
             .expect("registry")
             .settle(&launch.name, &old, -1);
-        let pending_new = PendingService::reserve(&launch, &new, &PathBuf::from("new.log"))
+        let pending_new = PendingService::reserve(&launch, &new, &PathBuf::from("new.log"), &request)
             .expect("new reservation");
         drop(pending_old);
-        assert_eq!(describe(&launch.name).expect("current").status, "starting");
+        assert_eq!(describe(&test_owner(), &launch.name).expect("current").status, "starting");
         drop(pending_new);
-        let failed = describe(&launch.name).expect("failed setup");
+        let failed = describe(&test_owner(), &launch.name).expect("failed setup");
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.pid, None);
         assert_eq!(failed.exit_code, Some(-1));
@@ -3188,7 +3797,7 @@ mod tests {
     #[test]
     fn overflowing_readiness_timeout_is_rejected_before_spawn() {
         let _lock = test_lock();
-        let error = start(&spec(
+        let error = start(&test_owner(), &spec(
             "hub-timeout-overflow",
             "pi-hub-program-that-does-not-exist",
             &[],
@@ -3199,7 +3808,7 @@ mod tests {
         ))
         .expect_err("timeout must be validated before program resolution");
         assert!(error.to_string().contains("PI_HUB_INVALID_READY_TIMEOUT"));
-        assert!(describe("hub-timeout-overflow").is_err());
+        assert!(describe(&test_owner(), "hub-timeout-overflow").is_err());
         let now = Instant::now();
         assert_eq!(
             readiness_deadline(now, Duration::ZERO).expect("zero budget"),
@@ -3350,7 +3959,7 @@ mod tests {
     #[test]
     fn invalid_name_is_rejected_before_program_resolution() {
         let _guard = crate::hub::test_lock();
-        let err = start(&spec(
+        let err = start(&test_owner(), &spec(
             "../../outside-hub",
             "pi-hub-program-that-does-not-exist",
             &[],
@@ -3366,7 +3975,7 @@ mod tests {
     #[test]
     fn invalid_ready_regex_is_rejected_before_program_resolution() {
         let _guard = crate::hub::test_lock();
-        let err = start(&spec(
+        let err = start(&test_owner(), &spec(
             "hub-test-invalid-ready-regex",
             "pi-hub-program-that-does-not-exist",
             &[],
@@ -3388,7 +3997,7 @@ mod tests {
     fn readiness_requires_observed_port() {
         let _guard = crate::hub::test_lock();
         // No listener on the port → readiness must time out and kill.
-        let result = start(&spec(
+        let result = start(&test_owner(), &spec(
             "hub-test-dead",
             "sleep",
             &["30"],
@@ -3403,7 +4012,7 @@ mod tests {
             err.to_string().contains("PI_HUB_NOT_READY"),
             "expected not-ready error, got: {err}"
         );
-        let settled = describe("hub-test-dead").expect("readiness cleanup settled");
+        let settled = describe(&test_owner(), "hub-test-dead").expect("readiness cleanup settled");
         assert_eq!(settled.status, "killed");
         assert_eq!(settled.pid, None);
         assert!(settled.exit_code.is_some());
@@ -3414,15 +4023,15 @@ mod tests {
     fn duplicate_live_name_rejected() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-dupe";
-        let first = start(&spec(name, "sleep", &["30"], None)).expect("first start");
+        let first = start(&test_owner(), &spec(name, "sleep", &["30"], None)).expect("first start");
         assert_eq!(first.status, "running");
-        let second = start(&spec(name, "sleep", &["30"], None));
+        let second = start(&test_owner(), &spec(name, "sleep", &["30"], None));
         let err = second.unwrap_err();
         assert!(
             err.to_string().contains("PI_HUB_NAME_TAKEN"),
             "expected name-taken error, got: {err}"
         );
-        let _ = stop(name);
+        let _ = stop(&test_owner(), name);
     }
 
     #[cfg(unix)]
@@ -3443,16 +4052,16 @@ mod tests {
         launch
             .env
             .push(("PYTHONUNBUFFERED".to_string(), "1".to_string()));
-        let snapshot = start(&launch).expect("repl start");
+        let snapshot = start(&test_owner(), &launch).expect("repl start");
         assert_eq!(snapshot.status, "running");
-        send_text(name, "print(40 + 2)", true).expect("send");
-        let page = logs(name, None, Some(50), Some("42"), 5_000).expect("logs");
+        send_text(&test_owner(), name, "print(40 + 2)", true).expect("send");
+        let page = logs(&test_owner(), name, None, Some(50), Some("42"), 5_000).expect("logs");
         assert!(
             page.lines.iter().any(|line| line.contains("42")),
             "repl output must contain 42: {:?}",
             page.lines
         );
-        let _ = stop(name);
+        let _ = stop(&test_owner(), name);
     }
 
     #[cfg(unix)]
@@ -3461,28 +4070,28 @@ mod tests {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-restart";
         // A service that exits on its own, then restarts from the retained spec.
-        let first = start(&spec(name, "echo", &["first-run"], None)).expect("first run");
+        let first = start(&test_owner(), &spec(name, "echo", &["first-run"], None)).expect("first run");
         assert_eq!(first.status, "running");
         std::thread::sleep(Duration::from_millis(400));
-        let settled = describe(name).expect("describe");
+        let settled = describe(&test_owner(), name).expect("describe");
         assert!(
             settled.status == "exited",
             "echo should have exited: {settled:?}"
         );
-        let restarted = restart(name).expect("restart");
+        let restarted = restart(&test_owner(), name).expect("restart");
         assert_eq!(restarted.status, "running");
         assert_ne!(
             first.log_path, restarted.log_path,
             "each run must own its artifact"
         );
         std::thread::sleep(Duration::from_millis(400));
-        let page = logs(name, None, Some(50), Some("first-run"), 5_000).expect("logs");
+        let page = logs(&test_owner(), name, None, Some(50), Some("first-run"), 5_000).expect("logs");
         assert!(
             page.lines.iter().any(|line| line.contains("first-run")),
             "restarted service must run the retained spec: {:?}",
             page.lines
         );
-        let _ = stop(name).ok();
+        let _ = stop(&test_owner(), name).ok();
     }
 
     #[cfg(unix)]
@@ -3490,7 +4099,7 @@ mod tests {
     fn status_stays_running_for_live_repl() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-stable";
-        let snapshot = start(&spec(
+        let snapshot = start(&test_owner(), &spec(
             name,
             "python3",
             &["-i", "-q"],
@@ -3504,18 +4113,18 @@ mod tests {
         assert_eq!(snapshot.status, "running");
         for wait_ms in [100u64, 300, 600] {
             std::thread::sleep(Duration::from_millis(wait_ms));
-            let current = describe(name).expect("describe");
+            let current = describe(&test_owner(), name).expect("describe");
             assert_eq!(
                 current.status, "running",
                 "status flipped to {} after {}ms with python alive (exit_code {:?})",
                 current.status, wait_ms, current.exit_code
             );
         }
-        send_keys(name, &["CTRL_C".to_string()]).expect("keys");
+        send_keys(&test_owner(), name, &["CTRL_C".to_string()]).expect("keys");
         std::thread::sleep(Duration::from_millis(200));
-        let after = describe(name).expect("describe after keys");
+        let after = describe(&test_owner(), name).expect("describe after keys");
         assert_eq!(after.status, "running", "status after CTRL_C: {after:?}");
-        let _ = stop(name);
+        let _ = stop(&test_owner(), name);
     }
 
     #[cfg(unix)]
@@ -3523,9 +4132,9 @@ mod tests {
     fn stop_leaves_no_survivors() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-stop";
-        let snapshot = start(&spec(name, "sleep", &["300"], None)).expect("start");
+        let snapshot = start(&test_owner(), &spec(name, "sleep", &["300"], None)).expect("start");
         let pid = snapshot.pid.expect("pid");
-        let stopped = stop(name).expect("stop");
+        let stopped = stop(&test_owner(), name).expect("stop");
         assert_eq!(stopped.status, "killed");
         assert_eq!(stopped.pid, None);
         assert!(stopped.exit_code.is_some());
@@ -3542,7 +4151,7 @@ mod tests {
     fn logs_cursor_advances_incrementally() {
         let _guard = crate::hub::test_lock();
         let name = "hub-test-cursor";
-        let _ = start(&spec(
+        let _ = start(&test_owner(), &spec(
             name,
             "sh",
             &["-c", "echo first; sleep 300"],
@@ -3553,17 +4162,17 @@ mod tests {
             }),
         ))
         .expect("start");
-        let first_page = logs(name, None, None, None, 0).expect("first page");
+        let first_page = logs(&test_owner(), name, None, None, None, 0).expect("first page");
         assert!(first_page.lines.iter().any(|line| line.contains("first")));
         let cursor = first_page.cursor;
-        send_text(name, "echo second", true).expect("send");
-        let second_page = logs(name, Some(cursor), None, Some("second"), 5_000).expect("page 2");
+        send_text(&test_owner(), name, "echo second", true).expect("send");
+        let second_page = logs(&test_owner(), name, Some(cursor), None, Some("second"), 5_000).expect("page 2");
         assert!(
             second_page.lines.iter().any(|line| line.contains("second")),
             "incremental page must contain the new line: {:?}",
             second_page.lines
         );
         assert!(second_page.cursor > cursor);
-        let _ = stop(name);
+        let _ = stop(&test_owner(), name);
     }
 }

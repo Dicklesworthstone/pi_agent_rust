@@ -58,6 +58,9 @@ pub type JobSessionIdResolver = Arc<dyn Fn() -> JobSessionIdFuture + Send + Sync
 #[derive(Clone)]
 pub struct JobSessionScope {
     resolver: Arc<Mutex<JobSessionIdResolver>>,
+    /// Replacement candidates may load the same persisted session before its
+    /// old registry retires. Clones retain this separate live identity.
+    instance_id: String,
 }
 
 impl JobSessionScope {
@@ -72,7 +75,19 @@ impl JobSessionScope {
         });
         Self {
             resolver: Arc::new(Mutex::new(resolver)),
+            instance_id: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    /// Bind services to this live registry and its selected durable session.
+    /// Background-job ownership retains its existing session-ID semantics.
+    #[must_use]
+    pub fn service_owner(&self, session_id: impl Into<String>) -> crate::hub::ServiceOwner {
+        crate::hub::ServiceOwner::new(session_id.into(), self.instance_id.clone())
+    }
+
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// Rebind this shared scope to a live session resolver.

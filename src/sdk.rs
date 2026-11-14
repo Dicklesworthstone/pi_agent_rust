@@ -2828,6 +2828,7 @@ impl AgentSessionHandle {
     async fn shutdown_runtime_resources(
         self,
         owner_session_id: Option<&str>,
+        service_shutdown: Result<crate::hub::ServiceShutdown>,
         mut report: SessionResourceShutdown,
     ) -> SessionResourceShutdown {
         if let Some(owner_session_id) = owner_session_id
@@ -2835,6 +2836,16 @@ impl AgentSessionHandle {
         {
             let warning = format!("failed to stop session-owned background jobs: {err}");
             tracing::warn!(event = "sdk.session.shutdown.jobs_failed", "{warning}");
+            report.fail(warning);
+        }
+
+        let service_result = match service_shutdown {
+            Ok(shutdown) => shutdown.finish().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = service_result {
+            let warning = format!("failed to stop session-owned hub services: {error}");
+            tracing::warn!(event = "sdk.session.shutdown.services_failed", "{warning}");
             report.fail(warning);
         }
 
@@ -2892,8 +2903,12 @@ impl AgentSessionHandle {
         session_actions.advance_generation();
         drop(session);
         drop(session_action_permit);
+        let service_shutdown = crate::hub::begin_registry_shutdown(
+            &self.session.agent.service_owner(&owner_session_id),
+        );
         self.shutdown_runtime_resources(
             Some(owner_session_id.as_str()),
+            service_shutdown,
             SessionResourceShutdown::default(),
         )
         .await
@@ -2903,6 +2918,11 @@ impl AgentSessionHandle {
     /// Its session state is intentionally not autosaved, but every owner-scoped
     /// runtime family is still attempted without process-wide job cleanup.
     pub(crate) async fn discard_uncommitted_resources(self) -> SessionResourceShutdown {
+        // Stop this live registry before awaiting even the session lock. A
+        // cancelled discard must not leave its services or late admissions live.
+        let service_shutdown = crate::hub::begin_registry_shutdown(
+            &self.session.agent.service_owner(""),
+        );
         let cx = crate::agent_cx::AgentCx::for_request();
         let mut report = SessionResourceShutdown::default();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
@@ -2919,7 +2939,7 @@ impl AgentSessionHandle {
                 None
             }
         };
-        self.shutdown_runtime_resources(owner_session_id.as_deref(), report)
+        self.shutdown_runtime_resources(owner_session_id.as_deref(), service_shutdown, report)
             .await
     }
 
@@ -2928,6 +2948,11 @@ impl AgentSessionHandle {
     /// Final driver exit uses this exhaustive seam: persistence or ownership
     /// failures are reported, but they never skip later independent cleanup.
     pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
+        // Registry ownership needs no durable-ID lookup. Publish its fence
+        // before the first lock/save await so cancellation cannot skip cleanup.
+        let service_shutdown = crate::hub::begin_registry_shutdown(
+            &self.session.agent.service_owner(""),
+        );
         let mut report = SessionResourceShutdown::default();
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
@@ -3015,7 +3040,7 @@ impl AgentSessionHandle {
                 None
             }
         };
-        self.shutdown_runtime_resources(owner_session_id.as_deref(), report)
+        self.shutdown_runtime_resources(owner_session_id.as_deref(), service_shutdown, report)
             .await
     }
 
@@ -11532,6 +11557,167 @@ printf sdk-owned-command-key
                 snapshot.id == job.id && snapshot.status == crate::jobs::JobStatus::Killed.as_str()
             }));
             let _ = crate::jobs::take_completion_notices(&owner);
+        });
+    }
+
+    #[cfg(unix)]
+    struct SdkHubOwnerCleanup(crate::hub::ServiceOwner);
+
+    #[cfg(unix)]
+    impl Drop for SdkHubOwnerCleanup {
+        fn drop(&mut self) {
+            // A failed assertion must still request cleanup of the fixture.
+            let _ = crate::hub::begin_registry_shutdown(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn sdk_service_spec(directory: &Path, name: &str) -> crate::hub::LaunchSpec {
+        crate::hub::LaunchSpec {
+            name: name.to_string(),
+            program: "sleep".to_string(),
+            args: vec!["300".to_string()],
+            cwd: directory.to_path_buf(),
+            env: Vec::new(),
+            ready: None,
+            detached: false,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_sdk_service_reap(owner: &crate::hub::ServiceOwner, name: &str, pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = crate::hub::describe(owner, name).expect("retained service descriptor");
+            if snapshot.status == "killed" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retired service did not finish cleanup: {snapshot:?}"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+        let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits i32"))
+            .expect("positive child pid");
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "service settlement must include actual child reap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_sdk_shutdown_fences_services_before_waiting_for_session_lock() {
+        let _lock = crate::hub::test_lock();
+        for discard in [false, true] {
+            let directory = tempdir().expect("tempdir");
+            let handle = saving_handle(directory.path());
+            let store = handle.session_store();
+            let session_id = store.try_lock().unwrap().header.id.clone();
+            let scope = handle
+                .session
+                .agent
+                .shared_tools()
+                .snapshot()
+                .job_session_scope();
+            let owner = scope.service_owner(session_id);
+            let _cleanup = SdkHubOwnerCleanup(owner.clone());
+            let launch = sdk_service_spec(directory.path(), "sdk-dropped-shutdown");
+            let started = crate::hub::start(&owner, &launch).expect("start owned service");
+            let pid = started.pid.expect("running child pid");
+
+            run_async(async {
+                let cx = crate::agent_cx::AgentCx::for_testing_with_io();
+                let held_store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                    .await
+                    .expect("hold session store");
+                let mut closing: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = SessionResourceShutdown>>,
+                > = if discard {
+                    Box::pin(handle.discard_uncommitted_resources())
+                } else {
+                    Box::pin(handle.shutdown_owned_resources())
+                };
+                assert!(futures::poll!(closing.as_mut()).is_pending());
+                drop(closing);
+                let stopped = crate::hub::describe(&owner, &launch.name).unwrap();
+                assert!(
+                    matches!(stopped.status.as_str(), "stopping" | "killed"),
+                    "first poll must request stop before waiting for the store: {stopped:?}"
+                );
+                drop(held_store);
+
+                let error = crate::hub::run_service_request(&scope, |_| Ok(()))
+                    .await
+                    .expect_err("retained registry scope must stay retired after shutdown is dropped");
+                assert!(error.to_string().contains("PI_HUB_SESSION_RETIRED"));
+                // Observe cleanup without issuing another stop, which would
+                // conceal a missing retirement in the abandoned future.
+                wait_for_sdk_service_reap(&owner, &launch.name, pid).await;
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discarding_same_id_candidate_preserves_active_registry_services() {
+        let _lock = crate::hub::test_lock();
+        let directory = tempdir().expect("tempdir");
+        let active = saving_handle(directory.path());
+        let candidate = saving_handle(directory.path());
+        run_async(async {
+            let active_store = active.session_store();
+            let path = {
+                let mut session = active_store.try_lock().unwrap();
+                session.save().await.expect("save original session");
+                session.path.clone().expect("saved session path")
+            };
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            let session_id = reopened.header.id.clone();
+            *candidate.session_store().try_lock().unwrap() = reopened;
+            let scope = active
+                .session
+                .agent
+                .shared_tools()
+                .snapshot()
+                .job_session_scope();
+            let active_owner = scope.service_owner(session_id.clone());
+            let candidate_owner = candidate.session.agent.service_owner(session_id);
+            assert_ne!(active_owner.instance_id(), candidate_owner.instance_id());
+            let _active_cleanup = SdkHubOwnerCleanup(active_owner.clone());
+            let _candidate_cleanup = SdkHubOwnerCleanup(candidate_owner.clone());
+            let launch = sdk_service_spec(directory.path(), "sdk-same-session-service");
+            let original = crate::hub::start(&active_owner, &launch).expect("active service");
+            let prepared = crate::hub::start(&candidate_owner, &launch).expect("candidate service");
+
+            assert!(
+                candidate
+                    .discard_uncommitted_resources()
+                    .await
+                    .completed_cleanly()
+            );
+            wait_for_sdk_service_reap(
+                &candidate_owner,
+                &launch.name,
+                prepared.pid.expect("candidate child pid"),
+            )
+            .await;
+            let retained = crate::hub::run_service_request(&scope, |request| {
+                crate::hub::describe(request.service_owner(), "sdk-same-session-service")
+            })
+            .await
+            .expect("original registry retains admission after same-ID candidate discard");
+            assert_eq!(retained.pid, original.pid);
+            assert_eq!(retained.status, "running");
+
+            assert!(active.shutdown_owned_resources().await.completed_cleanly());
+            wait_for_sdk_service_reap(
+                &active_owner,
+                &launch.name,
+                original.pid.expect("original child pid"),
+            )
+            .await;
         });
     }
 

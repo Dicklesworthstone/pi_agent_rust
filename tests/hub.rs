@@ -6,7 +6,7 @@
 //!    stop leaves no processes.
 //! 2. PTY send drives a `python3 -i` REPL fixture through the tool surface.
 //! 3. Duplicate live name → `PI_HUB_NAME_TAKEN`; restart after completion.
-//! 4. `kill_session_services` (session exit) leaves zero survivors.
+//! 4. Owner-scoped session shutdown leaves zero owned survivors.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
@@ -68,9 +68,31 @@ fn hub_exec(cwd: &std::path::Path, input: Value) -> ToolOutput {
     hub_exec_for_session(cwd, "hub-integration-session", input)
 }
 
+fn hub_scope(session_id: &str) -> pi::jobs::JobSessionScope {
+    type Scopes = std::sync::Mutex<std::collections::HashMap<String, pi::jobs::JobSessionScope>>;
+    static SCOPES: std::sync::LazyLock<Scopes> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    SCOPES
+        .lock()
+        .expect("test scopes")
+        .entry(session_id.to_string())
+        .or_insert_with(|| pi::jobs::JobSessionScope::fixed(session_id))
+        .clone()
+}
+
+fn hub_owner() -> pi::hub::ServiceOwner {
+    hub_scope("hub-integration-session").service_owner("hub-integration-session")
+}
+
+fn hub_tool(cwd: &std::path::Path) -> pi::tools::HubTool {
+    let mut tool = pi::tools::HubTool::new(cwd);
+    tool.bind_job_session_scope(hub_scope("hub-integration-session"));
+    tool
+}
+
 fn hub_exec_for_session(cwd: &std::path::Path, session_id: &str, input: Value) -> ToolOutput {
     let mut tool = pi::tools::HubTool::new(cwd);
-    tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(session_id));
+    tool.bind_job_session_scope(hub_scope(session_id));
     block_on_local(tool.execute("call-1", input, None)).expect("hub execute")
 }
 
@@ -102,8 +124,8 @@ struct ServiceCleanup(&'static str);
 #[cfg(unix)]
 impl Drop for ServiceCleanup {
     fn drop(&mut self) {
-        let _ = pi::hub::send_signal(self.0, sysinfo::Signal::Kill);
-        let _ = pi::hub::stop(self.0);
+        let _ = pi::hub::send_signal(&hub_owner(), self.0, sysinfo::Signal::Kill);
+        let _ = pi::hub::stop(&hub_owner(), self.0);
     }
 }
 
@@ -124,7 +146,7 @@ async fn with_hub_owner<F: std::future::Future>(
 async fn wait_for_service_pid(name: &str) -> u32 {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(snapshot) = pi::hub::describe(name)
+        if let Ok(snapshot) = pi::hub::describe(&hub_owner(), name)
             && let Some(pid) = snapshot.pid
         {
             return pid;
@@ -146,7 +168,7 @@ fn cancelling_readiness_yields_the_executor_and_reaps_before_returning() {
     let root = harness.temp_path(".");
     let name = "hub-cancel-readiness";
     let _cleanup = ServiceCleanup(name);
-    let tool = pi::tools::HubTool::new(&root);
+    let tool = hub_tool(&root);
     let owner = pi::agent_cx::AgentCx::for_request();
     let (output, pid) = block_on_local(async {
         let mut call = Box::pin(with_hub_owner(
@@ -182,7 +204,7 @@ fn cancelling_readiness_yields_the_executor_and_reaps_before_returning() {
     let output = output.expect("hub cancellation is a domain result");
     assert!(output.is_error);
     assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
-    let settled = pi::hub::describe(name).expect("settled startup");
+    let settled = pi::hub::describe(&hub_owner(), name).expect("settled startup");
     assert_eq!(settled.status, "killed");
     assert!(settled.pid.is_none());
     assert_reaped(pid);
@@ -198,7 +220,7 @@ fn dropping_a_readiness_future_stops_its_unaccepted_service() {
     let root = harness.temp_path(".");
     let name = "hub-dropped-readiness";
     let _cleanup = ServiceCleanup(name);
-    let tool = pi::tools::HubTool::new(&root);
+    let tool = hub_tool(&root);
     let pid = block_on_local(async {
         let mut call = Box::pin(tool.execute(
             "drop-readiness",
@@ -220,7 +242,8 @@ fn dropping_a_readiness_future_stops_its_unaccepted_service() {
         drop(call);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let snapshot = pi::hub::describe(name).expect("abandoned service stays observable");
+            let snapshot =
+                pi::hub::describe(&hub_owner(), name).expect("abandoned service stays observable");
             if snapshot.pid.is_none() && snapshot.status == "killed" {
                 break;
             }
@@ -245,7 +268,7 @@ fn abandoning_a_completed_start_never_stops_a_replacement_incarnation() {
     let root = harness.temp_path(".");
     let name = "hub-unaccepted-result";
     let _cleanup = ServiceCleanup(name);
-    let tool = pi::tools::HubTool::new(&root);
+    let tool = hub_tool(&root);
     let script = r"import pathlib, time
 while not pathlib.Path('release-ready').exists():
     time.sleep(0.01)
@@ -273,7 +296,7 @@ time.sleep(60)
         let old_pid = wait_for_service_pid(name).await;
         std::fs::write(root.join("release-ready"), "ready").expect("release readiness");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while pi::hub::describe(name).expect("first service").status != "running" {
+        while pi::hub::describe(&hub_owner(), name).expect("first service").status != "running" {
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker must complete readiness before the name is reused"
@@ -301,11 +324,12 @@ time.sleep(60)
             .await
             .expect("start replacement");
         assert!(!replacement.is_error, "{}", first_text(&replacement));
-        let before = pi::hub::describe(name).expect("replacement is running");
+        let before = pi::hub::describe(&hub_owner(), name).expect("replacement is running");
         assert_eq!(before.status, "running");
         assert!(before.pid.is_some());
         drop(first);
-        let after = pi::hub::describe(name).expect("replacement survives old result abandonment");
+        let after = pi::hub::describe(&hub_owner(), name)
+            .expect("replacement survives old result abandonment");
         assert_eq!(after.status, "running");
         assert_eq!(after.pid, before.pid);
     });
@@ -330,8 +354,8 @@ fn cancelling_a_log_wait_preserves_the_running_service() {
         }),
     );
     assert!(!started.is_error, "{}", first_text(&started));
-    let before = pi::hub::describe(name).expect("running service");
-    let tool = pi::tools::HubTool::new(&root);
+    let before = pi::hub::describe(&hub_owner(), name).expect("running service");
+    let tool = hub_tool(&root);
     let owner = pi::agent_cx::AgentCx::for_request();
     let output = block_on_local(async {
         let mut call = Box::pin(with_hub_owner(
@@ -359,7 +383,8 @@ fn cancelling_a_log_wait_preserves_the_running_service() {
     .expect("hub cancellation is a domain result");
     assert!(output.is_error);
     assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
-    let after = pi::hub::describe(name).expect("service is not owned by the log request");
+    let after =
+        pi::hub::describe(&hub_owner(), name).expect("service is not owned by the log request");
     assert_eq!(after.status, "running");
     assert_eq!(after.pid, before.pid);
     finish_case(&harness, case);
@@ -390,8 +415,8 @@ time.sleep(30)
         }),
     );
     assert!(!started.is_error, "{}", first_text(&started));
-    let before = pi::hub::describe(name).expect("running service");
-    let tool = pi::tools::HubTool::new(&root);
+    let before = pi::hub::describe(&hub_owner(), name).expect("running service");
+    let tool = hub_tool(&root);
     let owner = pi::agent_cx::AgentCx::for_request();
     let output = block_on_local(async {
         let mut call = Box::pin(with_hub_owner(
@@ -405,7 +430,8 @@ time.sleep(30)
         let queued = async {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let page = pi::hub::logs(name, None, None, None, 0).expect("service logs");
+                let page =
+                    pi::hub::logs(&hub_owner(), name, None, None, None, 0).expect("service logs");
                 if page.lines.iter().any(|line| line == "input-is-queued") {
                     break;
                 }
@@ -434,7 +460,7 @@ time.sleep(30)
     .expect("hub cancellation is a domain result");
     assert!(output.is_error);
     assert!(first_text(&output).contains("PI_HUB_CANCELLED"));
-    let after = pi::hub::describe(name).expect("service survives input cancellation");
+    let after = pi::hub::describe(&hub_owner(), name).expect("service survives input cancellation");
     assert_eq!(after.status, "running");
     assert_eq!(after.pid, before.pid);
     finish_case(&harness, case);
@@ -538,7 +564,7 @@ print('hub-ack:' + line, flush=True)
     assert!(first_text(&acknowledged).contains("hub-ack:input-after-cap"));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let finished = loop {
-        let snapshot = pi::hub::describe(name).expect("finished service");
+        let snapshot = pi::hub::describe(&hub_owner(), name).expect("finished service");
         if snapshot.status == "exited"
             && snapshot.log_capture.drain_state == pi::hub::LogDrainState::Complete
         {
@@ -584,7 +610,7 @@ fn short_service_output_is_complete_and_unchanged() {
     assert!(!started.is_error, "{}", first_text(&started));
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let snapshot = pi::hub::describe(name).expect("service");
+        let snapshot = pi::hub::describe(&hub_owner(), name).expect("service");
         if snapshot.status == "exited"
             && snapshot.log_capture.drain_state == pi::hub::LogDrainState::Complete
         {
@@ -647,7 +673,7 @@ os.write(1, b'final output before exit')
         }),
     );
     assert!(!started.is_error, "{}", first_text(&started));
-    let pid = pi::hub::describe(name)
+    let pid = pi::hub::describe(&hub_owner(), name)
         .expect("running service")
         .pid
         .expect("pid");
@@ -664,7 +690,7 @@ os.write(1, b'final output before exit')
     std::fs::write(root.join("exit-now"), b"exit").expect("release child exit");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let settled = loop {
-        let snapshot = pi::hub::describe(name).expect("service");
+        let snapshot = pi::hub::describe(&hub_owner(), name).expect("service");
         if matches!(snapshot.status.as_str(), "exited" | "failed" | "killed") {
             break snapshot;
         }
@@ -695,7 +721,7 @@ os.write(1, b'final output before exit')
             .is_err(),
         "terminal publication must release every master handle, including the output reader"
     );
-    let page = pi::hub::logs(name, None, None, None, 0).expect("settled logs");
+    let page = pi::hub::logs(&hub_owner(), name, None, None, None, 0).expect("settled logs");
     assert_eq!(
         page.lines,
         vec!["retained-pty-ready", "final output before exit"]
@@ -741,8 +767,8 @@ while True:
         }),
     );
     assert!(!started.is_error, "{}", first_text(&started));
-    let before = pi::hub::describe(name).expect("initial service");
-    let tool = pi::tools::HubTool::new(&root);
+    let before = pi::hub::describe(&hub_owner(), name).expect("initial service");
+    let tool = hub_tool(&root);
     let owner = pi::agent_cx::AgentCx::for_request();
     let output = block_on_local(async {
         let call = with_hub_owner(
@@ -779,7 +805,7 @@ while True:
         std::fs::read_to_string(root.join("launch-count")).unwrap(),
         "1"
     );
-    let settled = pi::hub::describe(name).expect("old service settles");
+    let settled = pi::hub::describe(&hub_owner(), name).expect("old service settles");
     assert_eq!(settled.status, "killed");
     assert_eq!(settled.exit_code, Some(0));
     assert!(settled.pid.is_none());
@@ -1136,10 +1162,11 @@ fn session_exit_kills_non_detached_services() {
         .log()
         .info("verify", format!("service pids: {pid_a}, {pid_b}"));
 
-    pi::hub::kill_session_services();
+    let shutdown = pi::hub::begin_session_shutdown(&hub_owner()).expect("fence session services");
+    assert!(block_on_local(shutdown.finish()).expect("session services reaped") >= 2);
 
     for name in ["svc-a", "svc-b"] {
-        let settled = pi::hub::describe(name).expect("settled service");
+        let settled = pi::hub::describe(&hub_owner(), name).expect("settled service");
         assert_eq!(settled.status, "killed"); // ubs:ignore[rust.panic.assert-macros] -- Session cleanup must settle every service.
         assert!(settled.pid.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Cleanup returns only after reap.
         assert!(settled.exit_code.is_some()); // ubs:ignore[rust.panic.assert-macros] -- Terminal exit metadata is already available.
@@ -1158,6 +1185,166 @@ fn session_exit_kills_non_detached_services() {
             "service pid {pid} survived session exit (state {state:?})"
         );
     }
+    finish_case(&harness, case);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // One native scenario retains all live owners through replacement.
+fn services_isolate_live_owners_and_preserve_explicit_detachment_on_replacement() {
+    let _guard = hub_test_guard();
+    let case = "services_isolate_live_owners_and_preserve_explicit_detachment_on_replacement";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let old_scope = pi::jobs::JobSessionScope::fixed("persisted-service-owner");
+    let next_scope = pi::jobs::JobSessionScope::fixed("persisted-service-owner");
+    let foreign_scope = pi::jobs::JobSessionScope::fixed("other-service-owner");
+    let old_owner = old_scope.service_owner("persisted-service-owner");
+    let next_owner = next_scope.service_owner("persisted-service-owner");
+    let foreign_owner = foreign_scope.service_owner("other-service-owner");
+    let mut old = pi::tools::HubTool::new(&root);
+    old.bind_job_session_scope(old_scope.clone());
+    let mut next = pi::tools::HubTool::new(&root);
+    next.bind_job_session_scope(next_scope);
+    let mut foreign = pi::tools::HubTool::new(&root);
+    foreign.bind_job_session_scope(foreign_scope);
+    struct Cleanup(Vec<(pi::hub::ServiceOwner, &'static str)>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for (owner, name) in &self.0 {
+                let _ = pi::hub::send_signal(owner, name, sysinfo::Signal::Kill);
+                let _ = pi::hub::stop(owner, name);
+            }
+        }
+    }
+    let _cleanup = Cleanup(vec![
+        (old_owner.clone(), "shared-name"),
+        (next_owner.clone(), "shared-name"),
+        (foreign_owner.clone(), "shared-name"),
+        (next_owner.clone(), "detached-private"),
+    ]);
+    let call = |tool: &pi::tools::HubTool, input: Value| {
+        block_on_local(tool.execute("owner-test", input, None)).expect("hub domain result")
+    };
+    let launch = |tool: &pi::tools::HubTool, name: &str, marker: &str, detached: bool| {
+        let output = call(
+            tool,
+            json!({
+                "op":"start", "name":name, "application":"/bin/sh",
+                "args":["-c", format!("printf '%s\\n' '{marker}'; exec sleep 300")],
+                "ready":{"log":marker,"timeoutSecs":10}, "detached":detached,
+            }),
+        );
+        assert!(!output.is_error, "{}", first_text(&output));
+        u32::try_from(
+            output.details.as_ref().expect("service receipt")["pid"]
+                .as_u64()
+                .expect("PID"),
+        )
+        .expect("PID fits")
+    };
+    let old_pid = launch(&old, "shared-name", "old-owner-output", false);
+    let next_pid = launch(&next, "shared-name", "new-owner-output", false);
+    let foreign_pid = launch(&foreign, "shared-name", "foreign-owner-output", false);
+    let detached_pid = launch(&old, "detached-private", "detached-owner-output", true);
+    let duplicate_detached = call(
+        &next,
+        json!({
+            "op":"start", "name":"detached-private", "application":"/bin/sh",
+            "args":["-c","touch forbidden-detached-start"], "detached":true,
+        }),
+    );
+    assert!(
+        duplicate_detached.is_error
+            && first_text(&duplicate_detached).contains("PI_HUB_NAME_TAKEN")
+    );
+    assert!(!root.join("forbidden-detached-start").exists());
+    assert_ne!(
+        old_pid, next_pid,
+        "same durable ID still has distinct live service ownership"
+    );
+    let foreign_list = call(&foreign, json!({"op":"ps"}));
+    let listed = foreign_list.details.as_ref().expect("roster")["services"]
+        .as_array()
+        .expect("services");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["pid"].as_u64(), Some(u64::from(foreign_pid)));
+    for request in [
+        json!({"op":"describe","name":"detached-private"}),
+        json!({"op":"logs","name":"detached-private"}),
+        json!({"op":"send","name":"detached-private","text":"unwanted input"}),
+        json!({"op":"send","name":"detached-private","signal":"SIGKILL"}),
+        json!({"op":"stop","name":"detached-private"}),
+        json!({"op":"restart","name":"detached-private"}),
+    ] {
+        let denied = call(&foreign, request);
+        assert!(denied.is_error && first_text(&denied).contains("PI_HUB_UNKNOWN_SERVICE"));
+        assert!(!first_text(&denied).contains("detached-owner-output"));
+    }
+    let old_logs = call(&old, json!({"op":"logs","name":"shared-name"}));
+    let next_logs = call(&next, json!({"op":"logs","name":"shared-name"}));
+    assert!(first_text(&old_logs).contains("old-owner-output"));
+    assert!(!first_text(&old_logs).contains("new-owner-output"));
+    assert!(first_text(&next_logs).contains("new-owner-output"));
+    let shutdown = pi::hub::begin_registry_shutdown(&old_owner).expect("retire old handle");
+    assert_eq!(
+        block_on_local(shutdown.finish()).expect("old process reaped"),
+        1
+    );
+    assert_reaped(old_pid);
+    assert_eq!(
+        pi::hub::describe(&next_owner, "shared-name")
+            .expect("new owner survives")
+            .pid,
+        Some(next_pid)
+    );
+    assert_eq!(
+        pi::hub::describe(&foreign_owner, "shared-name")
+            .expect("foreign owner survives")
+            .pid,
+        Some(foreign_pid)
+    );
+    assert_eq!(
+        pi::hub::describe(&next_owner, "detached-private")
+            .expect("detached service retained")
+            .pid,
+        Some(detached_pid)
+    );
+    let detached_logs = call(&next, json!({"op":"logs","name":"detached-private"}));
+    assert!(
+        !detached_logs.is_error && first_text(&detached_logs).contains("detached-owner-output")
+    );
+    let restarted = call(&next, json!({"op":"restart","name":"detached-private"}));
+    assert!(!restarted.is_error, "{}", first_text(&restarted));
+    assert_reaped(detached_pid);
+    let restarted_pid = restarted.details.as_ref().expect("restart receipt")["pid"]
+        .as_u64()
+        .expect("restart PID");
+    let resumed_owner = pi::jobs::JobSessionScope::fixed("persisted-service-owner")
+        .service_owner("persisted-service-owner");
+    let resumed = pi::hub::describe(&resumed_owner, "detached-private")
+        .expect("settled history must not conceal the live detached replacement");
+    assert_eq!(resumed.pid.map(u64::from), Some(restarted_pid));
+    assert_eq!(resumed.owner_instance_id, next_owner.instance_id());
+    assert_eq!(
+        pi::hub::describe(&old_owner, "detached-private")
+            .expect("live detached transfer wins over old settled entry")
+            .pid,
+        resumed.pid
+    );
+    pi::hub::stop(&resumed_owner, "detached-private")
+        .expect("third registry controls the resumed detached service");
+    assert_reaped(u32::try_from(restarted_pid).expect("restart PID fits"));
+    let retired = call(&old, json!({"op":"ps"}));
+    assert!(retired.is_error && first_text(&retired).contains("PI_HUB_SESSION_RETIRED"));
+    old_scope.bind(std::sync::Arc::new(|| {
+        Box::pin(async { Some("different-durable-id".to_string()) })
+    }));
+    let retired_after_rebind = call(&old, json!({"op":"ps"}));
+    assert!(
+        retired_after_rebind.is_error
+            && first_text(&retired_after_rebind).contains("PI_HUB_SESSION_RETIRED")
+    );
     finish_case(&harness, case);
 }
 

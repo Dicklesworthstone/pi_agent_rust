@@ -2343,6 +2343,14 @@ impl Agent {
         self.tools.clone()
     }
 
+    /// Resource owner for this live registry and a selected durable session.
+    /// Separately constructed handles retain distinct identities even when
+    /// both load the same persisted session ID.
+    #[must_use]
+    pub fn service_owner(&self, session_id: impl Into<String>) -> crate::hub::ServiceOwner {
+        self.job_session_scope.service_owner(session_id)
+    }
+
     /// Create a new agent over an already-shared tool registry.
     pub fn with_shared_tools(
         provider: Arc<dyn Provider>,
