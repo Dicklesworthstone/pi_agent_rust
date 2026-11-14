@@ -12,6 +12,11 @@ use super::LspClient;
 
 pub(in crate::lsp) const SERVER: &str = r"
 import json, os, sys, time
+try:
+    import fcntl
+    fcntl.fcntl(sys.stdin.fileno(), 1031, 1048576)
+except Exception:
+    pass
 capabilities = json.loads(sys.argv[1])
 hold_initialize = capabilities.pop('_fixtureHoldInitialize', False)
 frames, replies, held = [], {}, []

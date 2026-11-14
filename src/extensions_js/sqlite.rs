@@ -2725,18 +2725,21 @@ async fn execute_request(
                 if matches!(mode, QueryMode::Run) {
                     match statement.execute_with_params(&params).await {
                         Ok(_) => {}
-                        Err(FrankenError::NotImplemented(message))
-                            if admitted.is_dml()
-                                && !params.is_empty()
-                                && message.contains("Placeholder(") =>
+                        Err(
+                            FrankenError::NotImplemented(message) | FrankenError::Internal(message),
+                        ) if admitted.is_dml()
+                            && !params.is_empty()
+                            && (message.contains("Placeholder(")
+                                || message.contains("canonicalized numbered placeholder")) =>
                         {
-                            // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred leaves AST
-                            // placeholders unbound on live virtual tables (such as FTS5);
-                            // Connection::query_with_params binds AST placeholders before
-                            // virtual-table dispatch while preserving change tracking.
+                            // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred skips
+                            // placeholder canonicalization on live virtual tables (such
+                            // as FTS5); Connection::execute_with_params canonicalizes AST
+                            // placeholders before virtual-table dispatch while preserving
+                            // change tracking.
                             database
                                 .conn
-                                .query_with_params(exec_sql.as_ref(), &params)
+                                .execute_with_params(exec_sql.as_ref(), &params)
                                 .await
                                 .map_err(SqliteFailure::from)?;
                         }

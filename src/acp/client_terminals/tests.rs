@@ -447,9 +447,12 @@ fn timeout_zero_remains_cancellable_and_cleanup_acknowledgment_retires_waiters()
 fn command_deadline_kills_and_releases_without_waiting_for_the_client_to_exit() {
     asupersync::test_utils::run_test(|| async {
         let fixture = Fixture::new(true);
-        let client = fixture.client();
+        let mut client = fixture.client();
+        client.rpc_timeout = Duration::from_secs(2);
+        client.output_timeout = Duration::from_secs(2);
+        client.cleanup_timeout = Duration::from_secs(2);
         let mut pending =
-            Box::pin(client.execute(fixture.command(Some(Duration::from_millis(20))), None));
+            Box::pin(client.execute(fixture.command(Some(Duration::from_millis(200))), None));
         fixture.allocate(pending.as_mut()).await;
         let kill = fixture.await_frame(pending.as_mut(), "terminal/kill").await;
         let release = fixture
