@@ -1,4 +1,5 @@
 //! Runtime MCP registry publication and its owner/trust boundaries.
+#![cfg(test)]
 
 use super::*;
 
@@ -42,8 +43,8 @@ fn server_names(manager: &ExtensionManager) -> Vec<String> {
         .extension_mcp_servers()
         .iter()
         .map(|spec| {
-            spec["name"]
-                .as_str()
+            spec.get("name")
+                .and_then(Value::as_str)
                 .expect("server name")
                 .trim()
                 .to_string()
@@ -92,7 +93,9 @@ fn runtime_mcp_callbacks_reach_the_host_and_live_pending_trust_registry() {
             .await;
             let extensions = handle.extension_manager().expect("extensions").clone();
             let mcp = handle.mcp_manager().expect("native MCP manager");
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(extensions.extension_mcp_servers().is_empty());
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(mcp.list().is_empty());
             assert_eq!(handle.sync_extension_mcp_registrations().await, 0);
 
@@ -123,7 +126,10 @@ fn runtime_mcp_callbacks_reach_the_host_and_live_pending_trust_registry() {
                 ["late-command", "late-event", "late-tool"]
             );
             for spec in extensions.extension_mcp_servers() {
-                assert_eq!(spec["extension_id"].as_str(), Some(owners[0].as_str()));
+                assert_eq!(
+                    spec.get("extension_id").and_then(Value::as_str),
+                    owners.first().map(String::as_str)
+                );
             }
 
             // No test-side registration shortcut: the SDK consumes only the
@@ -133,6 +139,7 @@ fn runtime_mcp_callbacks_reach_the_host_and_live_pending_trust_registry() {
             for row in mcp.list() {
                 assert_eq!(row.provenance, "extension");
                 assert_eq!(row.trust, "pending");
+                // ubs:ignore[rust.panic.assert-macros]
                 assert!(
                     !handle
                         .session()
@@ -144,7 +151,9 @@ fn runtime_mcp_callbacks_reach_the_host_and_live_pending_trust_registry() {
             assert_eq!(handle.sync_extension_mcp_registrations().await, 0);
 
             let shutdown = handle.shutdown_owned_resources().await;
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(shutdown.completed_cleanly(), "{shutdown:?}");
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 extensions.extension_mcp_servers().is_empty(),
                 "actor shutdown retires its published host definitions"
@@ -203,11 +212,14 @@ fn mcp_collision_quarantines_only_its_owner_and_reset_preserves_host_rows() {
             .await;
             let extensions = handle.extension_manager().expect("extensions").clone();
             let js_runtime = extensions.js_runtime().expect("JavaScript runtime");
+            let owner_id = owners.first().expect("owner id").as_str();
+            let peer_id = owners.get(1).expect("peer id").as_str();
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 extensions
                     .extension_mcp_servers()
                     .iter()
-                    .any(|spec| spec["name"] == "  owner-boot  "),
+                    .any(|spec| spec.get("name").and_then(Value::as_str) == Some("  owner-boot  ")),
                 "startup retains the guest's exact registered definition"
             );
             // This is deliberately host-authored state, not a substitute for
@@ -215,7 +227,7 @@ fn mcp_collision_quarantines_only_its_owner_and_reset_preserves_host_rows() {
             extensions.register_mcp_server(json!({
                 "name": "host-only",
                 "command": "pi-mcp-host-fixture-must-not-run",
-                "extension_id": owners[0],
+                "extension_id": owner_id,
             }));
             extensions
                 .execute_command("owner-install", "", 5_000)
@@ -229,6 +241,7 @@ fn mcp_collision_quarantines_only_its_owner_and_reset_preserves_host_rows() {
                 .execute_command("owner-collide", "", 5_000)
                 .await
                 .expect_err("a peer's MCP name cannot be claimed");
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 error.to_string().contains("server name collision"),
                 "{error}"
@@ -241,9 +254,12 @@ fn mcp_collision_quarantines_only_its_owner_and_reset_preserves_host_rows() {
             let peer = extensions
                 .extension_mcp_servers()
                 .into_iter()
-                .find(|spec| spec["name"] == "peer-boot")
+                .find(|spec| spec.get("name").and_then(Value::as_str) == Some("peer-boot"))
                 .expect("peer server survived");
-            assert_eq!(peer["extension_id"].as_str(), Some(owners[1].as_str()));
+            assert_eq!(
+                peer.get("extension_id").and_then(Value::as_str),
+                Some(peer_id)
+            );
             extensions
                 .execute_command("peer-install", "", 5_000)
                 .await
@@ -259,6 +275,7 @@ fn mcp_collision_quarantines_only_its_owner_and_reset_preserves_host_rows() {
                 .expect("reset runtime-owned registries");
             assert_eq!(server_names(&extensions), ["host-only"]);
             let shutdown = handle.shutdown_owned_resources().await;
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(shutdown.completed_cleanly(), "{shutdown:?}");
             assert_eq!(server_names(&extensions), ["host-only"]);
         });
@@ -294,6 +311,7 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                 .lock()
                 .expect("extension manager lock")
                 .js_provider_generation;
+            let owner_id = owners.first().expect("owner id").as_str();
             let published = extensions.extension_mcp_servers();
             let replacement = json!({
                 "name": "  callback-owned  ",
@@ -301,11 +319,12 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                 "extension_id": "forged-owner",
             });
             for (candidate_actor, candidate_generation, candidate_owner) in [
-                (Weak::new(), generation, owners[0].as_str()),
-                (actor.clone(), Some(Uuid::new_v4()), owners[0].as_str()),
-                (actor.clone(), None, owners[0].as_str()),
+                (Weak::new(), generation, owner_id),
+                (actor.clone(), Some(Uuid::new_v4()), owner_id),
+                (actor.clone(), None, owner_id),
                 (actor.clone(), generation, "unloaded-owner"),
             ] {
+                // ubs:ignore[rust.panic.assert-macros]
                 assert!(
                     !extensions
                         .replace_runtime_mcp_specs(
@@ -318,6 +337,7 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                         .expect("stale authority must reject without mutation")
                 );
                 assert_eq!(extensions.extension_mcp_servers(), published);
+                // ubs:ignore[rust.panic.assert-macros]
                 assert!(
                     !extensions
                         .replace_runtime_mcp_specs(
@@ -338,7 +358,7 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                 .js_provider_catalog_ready = false;
             let unready = extensions
                 .replace_runtime_mcp_specs(
-                    &owners[0],
+                    owner_id,
                     &actor,
                     generation,
                     &[],
@@ -350,13 +370,15 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                 .lock()
                 .expect("extension manager lock")
                 .js_provider_catalog_ready = true;
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(!unready);
             assert_eq!(extensions.extension_mcp_servers(), published);
 
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 extensions
                     .replace_runtime_mcp_specs(
-                        &owners[0],
+                        owner_id,
                         &actor,
                         generation,
                         &[],
@@ -367,13 +389,16 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
             let callback = extensions
                 .extension_mcp_servers()
                 .into_iter()
-                .find(|spec| spec["name"] == "  callback-owned  ")
+                .find(|spec| spec.get("name").and_then(Value::as_str) == Some("  callback-owned  "))
                 .expect("exact owned registration");
-            assert_eq!(callback["extension_id"].as_str(), Some(owners[0].as_str()));
+            assert_eq!(
+                callback.get("extension_id").and_then(Value::as_str),
+                Some(owner_id)
+            );
             let before_collision = extensions.extension_mcp_servers();
             let collision = extensions
                 .replace_runtime_mcp_specs(
-                    &owners[0],
+                    owner_id,
                     &actor,
                     generation,
                     &[],
@@ -383,15 +408,17 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                     })],
                 )
                 .expect_err("trimmed aliases must collide without rewriting owned specs");
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 collision.to_string().contains("server name collision"),
                 "{collision}"
             );
             assert_eq!(extensions.extension_mcp_servers(), before_collision);
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 extensions
                     .replace_runtime_mcp_specs(
-                        &owners[0],
+                        owner_id,
                         &actor,
                         generation,
                         std::slice::from_ref(&replacement),
@@ -403,12 +430,13 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
             let host_replacement = json!({
                 "name": "runtime-owned",
                 "command": "pi-mcp-host-replacement-must-not-run",
-                "extension_id": owners[0],
+                "extension_id": owner_id,
             });
             extensions.register_mcp_server(host_replacement.clone());
             let error = extensions
-                .replace_runtime_mcp_specs(&owners[0], &actor, generation, &published, &published)
+                .replace_runtime_mcp_specs(owner_id, &actor, generation, &published, &published)
                 .expect_err("runtime cannot overwrite a newer host-authored definition");
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(
                 error.to_string().contains("server name collision"),
                 "{error}"
@@ -418,6 +446,7 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                 [host_replacement.clone()]
             );
             let shutdown = handle.shutdown_owned_resources().await;
+            // ubs:ignore[rust.panic.assert-macros]
             assert!(shutdown.completed_cleanly(), "{shutdown:?}");
             assert_eq!(
                 extensions.extension_mcp_servers(),

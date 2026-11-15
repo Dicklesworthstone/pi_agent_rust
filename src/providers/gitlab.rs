@@ -72,7 +72,26 @@ struct GitLabContextItem {
     content: String,
 }
 
-/// GitLab Chat response wrapper used by some self-hosted versions.
+#[derive(Debug, Deserialize, Default)]
+struct GitLabReportedUsage {
+    #[serde(default, alias = "prompt_tokens")]
+    input_tokens: u64,
+    #[serde(default, alias = "completion_tokens")]
+    output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitLabReportedToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+/// GitLab Chat response wrapper used by some self-hosted / AI Gateway versions.
 #[derive(Debug, Deserialize)]
 struct GitLabChatResponse {
     /// The generated response text.
@@ -81,17 +100,42 @@ struct GitLabChatResponse {
     /// Alternative: some GitLab versions return content directly.
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    tool_calls: Vec<GitLabReportedToolCall>,
+    #[serde(default)]
+    usage: Option<GitLabReportedUsage>,
 }
 
-fn parse_gitlab_response(text: &str) -> Result<String> {
+struct ParsedGitLabPayload {
+    text: String,
+    reported_tool_calls: Vec<crate::model::ToolCall>,
+    reported_usage: Option<Usage>,
+}
+
+fn parse_gitlab_payload(
+    text: &str,
+    allowed_tools: &std::collections::HashSet<String>,
+) -> Result<ParsedGitLabPayload> {
     let value = serde_json::from_str::<serde_json::Value>(text).map_err(|err| {
         Error::provider(
             "gitlab",
             format!("Invalid GitLab Chat JSON success response: {err}"),
         )
     })?;
-    let response = match value {
-        serde_json::Value::String(response) => response,
+    match value {
+        serde_json::Value::String(response) => {
+            if response.trim().is_empty() {
+                return Err(Error::provider(
+                    "gitlab",
+                    "GitLab Chat returned an empty success response",
+                ));
+            }
+            Ok(ParsedGitLabPayload {
+                text: response,
+                reported_tool_calls: Vec::new(),
+                reported_usage: None,
+            })
+        }
         value @ serde_json::Value::Object(_) => {
             let parsed: GitLabChatResponse = serde_json::from_value(value).map_err(|err| {
                 Error::provider(
@@ -99,26 +143,72 @@ fn parse_gitlab_response(text: &str) -> Result<String> {
                     format!("Unsupported GitLab Chat response object: {err}"),
                 )
             })?;
-            if parsed.response.trim().is_empty() {
+            let response_text = if parsed.response.trim().is_empty() {
                 parsed.content
             } else {
                 parsed.response
+            };
+            let mut reported_tool_calls = Vec::new();
+            for (idx, tc) in parsed.tool_calls.into_iter().enumerate() {
+                let trimmed_name = tc.name.trim();
+                if trimmed_name.is_empty()
+                    || (!allowed_tools.is_empty() && !allowed_tools.contains(trimmed_name))
+                {
+                    continue;
+                }
+                let args = match tc.arguments {
+                    val @ serde_json::Value::Object(_) => val,
+                    serde_json::Value::String(raw) => serde_json::from_str(&raw)
+                        .ok()
+                        .filter(serde_json::Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    _ => serde_json::json!({}),
+                };
+                reported_tool_calls.push(crate::model::ToolCall {
+                    id: tc
+                        .id
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or_else(|| format!("gitlab_call_{}", idx + 1)),
+                    name: trimmed_name.to_string(),
+                    arguments: args,
+                    thought_signature: None,
+                });
             }
+            if response_text.trim().is_empty() && reported_tool_calls.is_empty() {
+                return Err(Error::provider(
+                    "gitlab",
+                    "GitLab Chat returned an empty success response",
+                ));
+            }
+            let reported_usage = parsed.usage.map(|u| {
+                let total = if u.total_tokens > 0 {
+                    u.total_tokens
+                } else {
+                    u.input_tokens.saturating_add(u.output_tokens)
+                };
+                Usage {
+                    input: u.input_tokens,
+                    output: u.output_tokens,
+                    total_tokens: total,
+                    ..Usage::default()
+                }
+            });
+            Ok(ParsedGitLabPayload {
+                text: response_text,
+                reported_tool_calls,
+                reported_usage,
+            })
         }
-        _ => {
-            return Err(Error::provider(
-                "gitlab",
-                "Unsupported GitLab Chat success response shape",
-            ));
-        }
-    };
-    if response.trim().is_empty() {
-        return Err(Error::provider(
+        _ => Err(Error::provider(
             "gitlab",
-            "GitLab Chat returned an empty success response",
-        ));
+            "Unsupported GitLab Chat success response shape",
+        )),
     }
-    Ok(response)
+}
+
+#[cfg(test)]
+fn parse_gitlab_response(text: &str) -> Result<String> {
+    parse_gitlab_payload(text, &std::collections::HashSet::new()).map(|p| p.text)
 }
 
 fn validate_request_rewrite(
@@ -355,32 +445,53 @@ fn push_context_item(
     Ok(())
 }
 
-fn batch_response_events(
-    message: AssistantMessage,
-    response_text: String,
-) -> Vec<Result<StreamEvent>> {
+fn batch_response_events(message: AssistantMessage) -> Vec<Result<StreamEvent>> {
     // `Start.partial` represents the state before deltas are applied. Including
-    // the final text here would make consumers that accumulate deltas render
+    // the final content here would make consumers that accumulate deltas render
     // every GitLab response twice.
     let mut partial = message.clone();
     partial.content.clear();
+    let stop_reason = message.stop_reason;
 
-    vec![
-        Ok(StreamEvent::Start { partial }),
-        Ok(StreamEvent::TextStart { content_index: 0 }),
-        Ok(StreamEvent::TextDelta {
-            content_index: 0,
-            delta: response_text.clone(),
-        }),
-        Ok(StreamEvent::TextEnd {
-            content_index: 0,
-            content: response_text,
-        }),
-        Ok(StreamEvent::Done {
-            reason: StopReason::Stop,
-            message,
-        }),
-    ]
+    let mut events = vec![Ok(StreamEvent::Start { partial })];
+    for (content_index, block) in message.content.iter().enumerate() {
+        match block {
+            ContentBlock::Text(text) => {
+                events.push(Ok(StreamEvent::TextStart { content_index }));
+                events.push(Ok(StreamEvent::TextDelta {
+                    content_index,
+                    delta: text.text.clone(),
+                }));
+                events.push(Ok(StreamEvent::TextEnd {
+                    content_index,
+                    content: text.text.clone(),
+                }));
+            }
+            ContentBlock::ToolCall(tool_call) => {
+                let args_json = serde_json::to_string(&tool_call.arguments)
+                    .unwrap_or_else(|_| "{}".to_string());
+                events.push(Ok(StreamEvent::ToolCallStart {
+                    content_index,
+                    id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                }));
+                events.push(Ok(StreamEvent::ToolCallDelta {
+                    content_index,
+                    delta: args_json,
+                }));
+                events.push(Ok(StreamEvent::ToolCallEnd {
+                    content_index,
+                    tool_call: tool_call.clone(),
+                }));
+            }
+            _ => {}
+        }
+    }
+    events.push(Ok(StreamEvent::Done {
+        reason: stop_reason,
+        message,
+    }));
+    events
 }
 
 // ── Provider ─────────────────────────────────────────────────────
@@ -481,8 +592,11 @@ impl GitLabProvider {
             &mut request_text_bytes,
             user_content_text_bytes(&primary_user.content),
         )?;
-        let content = user_content_text(&primary_user.content);
-        if content.trim().is_empty() {
+        let has_trailing_tool_turns = context.messages[primary_index + 1..]
+            .iter()
+            .any(|msg| matches!(msg, Message::Assistant(_) | Message::ToolResult(_)));
+        let user_text = user_content_text(&primary_user.content);
+        if user_text.trim().is_empty() {
             return Err(Error::provider(
                 "gitlab",
                 "GitLab Chat requires non-empty text in the latest user message",
@@ -491,9 +605,6 @@ impl GitLabProvider {
 
         let mut additional_context = Vec::new();
 
-        // Keep the system prompt first and only attach history that precedes
-        // the primary user turn. Messages after that turn are not context for
-        // the request being built.
         if let Some(system) = &context.system_prompt {
             charge_request_text(
                 &mut request_text_bytes,
@@ -509,61 +620,117 @@ impl GitLabProvider {
             )?;
         }
 
-        for (i, msg) in context.messages[..primary_index].iter().enumerate() {
+        if !context.tools.is_empty() {
+            let tool_instructions =
+                crate::provider::format_prompt_tool_instructions(&context.tools);
+            charge_request_text(&mut request_text_bytes, tool_instructions.len())?;
+            push_context_item(
+                &mut additional_context,
+                GitLabContextItem {
+                    category: "file".to_string(),
+                    id: "pi-tool-definitions".to_string(),
+                    content: tool_instructions,
+                },
+            )?;
+        }
+
+        let history_end = if has_trailing_tool_turns {
+            context.messages.len()
+        } else {
+            primary_index
+        };
+
+        for (i, msg) in context.messages[..history_end].iter().enumerate() {
             match msg {
                 Message::User(user_msg) => {
-                    charge_request_text(
-                        &mut request_text_bytes,
-                        "[User]: "
-                            .len()
-                            .saturating_add(user_content_text_bytes(&user_msg.content)),
-                    )?;
                     let text = user_content_text(&user_msg.content);
                     if !text.trim().is_empty() {
+                        let rendered = format!("[User]: {text}");
+                        if i != primary_index {
+                            charge_request_text(&mut request_text_bytes, rendered.len())?;
+                        }
                         push_context_item(
                             &mut additional_context,
                             GitLabContextItem {
                                 category: "file".to_string(),
                                 id: format!("message-{i}"),
-                                content: format!("[User]: {text}"),
+                                content: rendered,
                             },
                         )?;
                     }
                 }
                 Message::Assistant(asst_msg) => {
-                    // Include prior assistant responses as context.
-                    charge_request_text(
-                        &mut request_text_bytes,
-                        "[Assistant]: "
-                            .len()
-                            .saturating_add(text_block_bytes(asst_msg.content.iter())),
-                    )?;
-                    let text: String = asst_msg
-                        .content
-                        .iter()
-                        .filter_map(|c| {
-                            if let ContentBlock::Text(t) = c {
-                                Some(t.text.as_str())
-                            } else {
-                                None
+                    let mut parts = Vec::new();
+                    for block in &asst_msg.content {
+                        match block {
+                            ContentBlock::Text(t) if !t.text.trim().is_empty() => {
+                                parts.push(t.text.clone());
                             }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                            ContentBlock::ToolCall(tc) => {
+                                let args = serde_json::to_string(&tc.arguments)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                parts.push(format!(
+                                    "{}{{\"id\":{},\"name\":{},\"arguments\":{args}}}{}",
+                                    crate::provider::PI_TOOL_CALL_OPEN,
+                                    serde_json::to_string(&tc.id)
+                                        .unwrap_or_else(|_| "\"call\"".to_string()),
+                                    serde_json::to_string(&tc.name)
+                                        .unwrap_or_else(|_| "\"tool\"".to_string()),
+                                    crate::provider::PI_TOOL_CALL_CLOSE,
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    let text = parts.join("\n");
                     if !text.trim().is_empty() {
+                        let rendered = format!("[Assistant]: {text}");
+                        charge_request_text(&mut request_text_bytes, rendered.len())?;
                         push_context_item(
                             &mut additional_context,
                             GitLabContextItem {
                                 category: "file".to_string(),
                                 id: format!("message-{i}"),
-                                content: format!("[Assistant]: {text}"),
+                                content: rendered,
                             },
                         )?;
                     }
                 }
-                _ => {}
+                Message::ToolResult(tool_result) => {
+                    let body = tool_result
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let rendered = format!(
+                        "[ToolResult id={} name={} is_error={}]: {}",
+                        tool_result.tool_call_id, tool_result.tool_name, tool_result.is_error, body
+                    );
+                    charge_request_text(&mut request_text_bytes, rendered.len())?;
+                    push_context_item(
+                        &mut additional_context,
+                        GitLabContextItem {
+                            category: "file".to_string(),
+                            id: format!("message-{i}"),
+                            content: rendered,
+                        },
+                    )?;
+                }
+                Message::Custom(_) => {}
             }
         }
+
+        let content = if has_trailing_tool_turns {
+            let continuation = "Continue solving the user's request using the tool execution results in additional_context. Emit <pi_tool_call> if another tool step is required, or provide the final answer.".to_string();
+            charge_request_text(&mut request_text_bytes, continuation.len())?;
+            continuation
+        } else {
+            user_text
+        };
 
         Ok(GitLabChatRequest {
             content,
@@ -588,6 +755,7 @@ impl GitLabProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let request_body = Self::build_request(context)?;
         let original_body_bytes = serialize_request_bounded(&request_body)?;
+        let original_body_len = original_body_bytes.len();
         let url = self.chat_url();
 
         let api_key = options.api_key.as_deref().ok_or_else(|| {
@@ -649,27 +817,76 @@ impl GitLabProvider {
         }
 
         // GitLab documents a JSON string response. Wrapper tolerance remains
-        // for known self-hosted variants, but malformed/non-JSON bodies fail.
-        let response_text = parse_gitlab_response(&text)?;
+        // for known self-hosted variants, and structured `<pi_tool_call>` blocks
+        // bridge local tool calls when `context.tools` is populated.
+        let allowed_tools: std::collections::HashSet<String> =
+            context.tools.iter().map(|t| t.name.clone()).collect();
+        let parsed = parse_gitlab_payload(&text, &allowed_tools)?;
+        let (cleaned_text, prompt_tool_calls) =
+            crate::provider::extract_prompt_tool_calls(&parsed.text, &allowed_tools);
+
+        let mut tool_calls = parsed.reported_tool_calls;
+        tool_calls.extend(prompt_tool_calls);
+
+        let mut content_blocks = Vec::new();
+        if tool_calls.is_empty() {
+            content_blocks.push(ContentBlock::Text(TextContent {
+                text: parsed.text.clone(),
+                text_signature: None,
+            }));
+        } else {
+            let trimmed_prose = cleaned_text.trim();
+            if !trimmed_prose.is_empty() {
+                content_blocks.push(ContentBlock::Text(TextContent {
+                    text: trimmed_prose.to_string(),
+                    text_signature: None,
+                }));
+            }
+            for call in tool_calls {
+                content_blocks.push(ContentBlock::ToolCall(call));
+            }
+        }
+
+        let has_tool_calls = content_blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolCall(_)));
+        let estimated_input = u64::try_from(original_body_len)
+            .unwrap_or(u64::MAX)
+            .div_ceil(4)
+            .max(1);
+        let estimated_output = u64::try_from(parsed.text.len())
+            .unwrap_or(u64::MAX)
+            .div_ceil(4)
+            .max(1);
+        let mut usage = parsed.reported_usage.unwrap_or_else(|| Usage {
+            input: estimated_input,
+            output: estimated_output,
+            total_tokens: estimated_input.saturating_add(estimated_output),
+            ..Usage::default()
+        });
+        if let Some(observer) = &options.usage_observer {
+            observer.observe_authoritative(&mut usage)?;
+        }
 
         // Build the final assistant message.
         let message = AssistantMessage {
-            content: vec![ContentBlock::Text(TextContent {
-                text: response_text.clone(),
-                text_signature: None,
-            })],
+            content: content_blocks,
             api: "gitlab-chat".to_string(),
             provider: self.provider_name.clone(),
             model: self.model.clone(),
-            usage: Usage::default(),
-            stop_reason: StopReason::Stop,
+            usage,
+            stop_reason: if has_tool_calls {
+                StopReason::ToolUse
+            } else {
+                StopReason::Stop
+            },
             stop_details: None,
             error_message: None,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
 
         // GitLab Chat API is non-streaming, so we emit the full event sequence.
-        let events = batch_response_events(message, response_text);
+        let events = batch_response_events(message);
 
         Ok(Box::pin(stream::iter(events)))
     }
@@ -687,6 +904,17 @@ impl Provider for GitLabProvider {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        crate::provider::ProviderCapabilities {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: false,
+            streaming: false,
+            vision: false,
+            authoritative_usage: false,
+        }
     }
 
     async fn stream(
@@ -1058,7 +1286,7 @@ mod tests {
             error_message: None,
             timestamp: 0,
         };
-        let events = batch_response_events(message, "answer".to_string())
+        let events = batch_response_events(message)
             .into_iter()
             .collect::<Result<Vec<_>>>()
             .expect("event sequence");
@@ -1430,5 +1658,179 @@ mod tests {
             p.chat_url(),
             "https://gitlab.example.com/api/v4/chat/completions"
         );
+    }
+
+    #[test]
+    fn test_gitlab_multi_turn_tool_call_and_tool_result_round_trip() {
+        use futures::StreamExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock GitLab");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            for turn in 0..2 {
+                let (mut socket, _) = listener.accept().expect("accept");
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .expect("read timeout");
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match socket.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for GitLab HTTP request"
+                            );
+                            continue;
+                        }
+                        Err(e) => panic!("read: {e}"),
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let hdrs = String::from_utf8_lossy(&raw[..hdr_end]);
+                        let content_len = hdrs
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= hdr_end + 4 + content_len {
+                            let body_slice = &raw[hdr_end + 4..hdr_end + 4 + content_len];
+                            let req_json: serde_json::Value =
+                                serde_json::from_slice(body_slice).expect("valid GitLab JSON");
+                            let ctx_items = req_json["additional_context"]
+                                .as_array()
+                                .expect("additional_context array");
+                            if turn == 0 {
+                                assert!(
+                                    ctx_items
+                                        .iter()
+                                        .any(|item| item["id"] == "pi-tool-definitions"),
+                                    "turn 0 must attach tool definitions in additional_context"
+                                );
+                                let resp_body = serde_json::to_string(
+                                    r#"Let me check.<pi_tool_call>{"id":"call_gl_1","name":"echo","arguments":{"text":"hello-gitlab"}}</pi_tool_call>"#,
+                                )
+                                .expect("json string");
+                                write!(
+                                    socket,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    resp_body.len(),
+                                    resp_body
+                                )
+                                .expect("write turn 0");
+                            } else {
+                                assert!(
+                                    ctx_items.iter().any(|item| {
+                                        item["content"]
+                                            .as_str()
+                                            .is_some_and(|c| c.contains("tool-output-42"))
+                                    }),
+                                    "turn 1 must forward ToolResult in additional_context"
+                                );
+                                let resp_body = r#"{"response":"Echo returned tool-output-42.","usage":{"input_tokens":50,"output_tokens":12}}"#;
+                                write!(
+                                    socket,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    resp_body.len(),
+                                    resp_body
+                                )
+                                .expect("write turn 1");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let provider =
+            GitLabProvider::new("gitlab-duo-chat").with_base_url(format!("http://{addr}"));
+        let caps = provider.capabilities();
+        assert!(caps.multi_turn && caps.tool_use && !caps.native_tool_wire && !caps.streaming);
+
+        let tools = vec![ToolDef {
+            name: "echo".to_string(),
+            description: "Echo text".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}}),
+        }];
+        let options = StreamOptions {
+            api_key: Some("glpat-test".to_string()),
+            ..StreamOptions::default()
+        };
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let user_msg = Message::User(UserMessage {
+                content: UserContent::Text("Echo hello-gitlab".to_string()),
+                timestamp: 1,
+            });
+            let ctx1 = Context::owned(None, vec![user_msg.clone()], tools.clone());
+            let events1: Vec<StreamEvent> = provider
+                .stream(&ctx1, &options)
+                .await
+                .expect("turn 0 stream")
+                .map(|e| e.expect("event"))
+                .collect()
+                .await;
+            assert!(events1.iter().any(|e| matches!(e, StreamEvent::ToolCallEnd { tool_call, .. } if tool_call.name == "echo" && tool_call.id == "call_gl_1")));
+            let Some(StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                message: asst1,
+            }) = events1.last().cloned()
+            else {
+                panic!("expected ToolUse Done on turn 0, got {events1:?}");
+            };
+            assert!(asst1.usage.total_tokens > 0);
+
+            let tool_res = Message::ToolResult(std::sync::Arc::new(crate::model::ToolResultMessage {
+                tool_call_id: "call_gl_1".to_string(),
+                tool_name: "echo".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("tool-output-42"))],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+            }));
+            let ctx2 = Context::owned(
+                None,
+                vec![user_msg, Message::assistant(asst1), tool_res],
+                tools,
+            );
+            let events2: Vec<StreamEvent> = provider
+                .stream(&ctx2, &options)
+                .await
+                .expect("turn 1 stream")
+                .map(|e| e.expect("event"))
+                .collect()
+                .await;
+            let Some(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message: asst2,
+            }) = events2.last()
+            else {
+                panic!("expected Stop Done on turn 1, got {events2:?}");
+            };
+            assert_eq!(asst2.usage.input, 50);
+            assert_eq!(asst2.usage.output, 12);
+            assert_eq!(asst2.usage.total_tokens, 62);
+        });
+        server.join().expect("join server");
     }
 }

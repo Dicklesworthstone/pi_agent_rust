@@ -1080,8 +1080,12 @@ mod tests {
 
             // Use the session's serialized Message shape before replaying the
             // completed tool call. No credentials or external API are involved.
-            let saved = serde_json::to_vec(&Message::assistant(message.clone())).unwrap();
-            let restored: Message = serde_json::from_slice(&saved).unwrap();
+            let Ok(saved) = serde_json::to_vec(&Message::assistant(message.clone())) else {
+                panic!("serialize assistant message");
+            };
+            let Ok(restored) = serde_json::from_slice::<Message>(&saved) else {
+                panic!("deserialize assistant message");
+            };
             let context = Context {
                 messages: vec![
                     Message::User(UserMessage {
@@ -1109,27 +1113,45 @@ mod tests {
             } else {
                 provider.build_request(&context, &options)
             };
-            let mut body = serde_json::to_value(request).unwrap();
+            let Ok(mut body) = serde_json::to_value(request) else {
+                panic!("serialize request");
+            };
             if api == "google-vertex" {
-                body = vertex_request(body).unwrap();
+                let Ok(vertex_body) = vertex_request(body) else {
+                    panic!("build vertex request");
+                };
+                body = vertex_body;
             }
-            assert_eq!(body["messages"].as_array().unwrap().len(), 3);
             assert_eq!(
-                body["messages"][1],
-                json!({"role": "assistant", "content": [
+                body.get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+                3
+            );
+            assert_eq!(
+                body.get("messages").and_then(|msgs| msgs.get(1)),
+                Some(&json!({"role": "assistant", "content": [
                     {"type": "thinking", "thinking": "", "signature": "c2lnLWVtcHR5"},
                     {"type": "redacted_thinking", "data": "b3BhcXVlCg=="},
                     {"type": "thinking", "thinking": "Read the file.", "signature": "c2lnLXZpc2libGU="},
                     {"type": "tool_use", "id": "call_read", "name": "read", "input": {"path": "src/lib.rs"}}
-                ]}),
+                ]})),
                 "{provider_name}/{api}"
             );
             assert_eq!(
-                body["messages"][2],
-                json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_read",
+                body.get("messages").and_then(|msgs| msgs.get(2)),
+                Some(
+                    &json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_read",
                     "content": [{"type": "text", "text": "file contents"}]}]})
+                )
             );
-            assert_eq!(serde_json::to_vec(&context.messages[1]).unwrap(), saved);
+            let Some(replayed_assistant) = context.messages.get(1) else {
+                panic!("expected assistant message at index 1");
+            };
+            let Ok(replayed_bytes) = serde_json::to_vec(replayed_assistant) else {
+                panic!("serialize replayed assistant");
+            };
+            assert_eq!(replayed_bytes, saved);
         }
     }
 
@@ -2501,7 +2523,12 @@ mod tests {
                 let (events, yields) = drain_with_poll_budget(&mut output);
                 assert!(yields > 0);
                 assert_eq!(events.len(), 2 + MAX_READY_EVENTS_PER_YIELD * 3);
-                for (index, group) in events[1..events.len() - 1].chunks_exact(3).enumerate() {
+                for (index, group) in events[1..events.len() - 1]
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
                     assert!(matches!(
                         &group[0], Ok(StreamEvent::ToolCallStart { content_index, id, .. })
                             if *content_index == index && id == &format!("call-{index}")

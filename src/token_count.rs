@@ -62,6 +62,26 @@ pub fn table_for_model(provider: &str, model_id: &str) -> TokenTable {
     }
 }
 
+/// Prewarm the active model's BPE table before serving latency-sensitive
+/// session requests on an already-populated transcript.
+pub fn prewarm_for_model(provider: &str, model_id: &str) {
+    #[cfg(feature = "bpe-tokens")]
+    {
+        match table_for_model(provider, model_id) {
+            TokenTable::O200k => {
+                let _ = tiktoken_rs::o200k_base_singleton();
+            }
+            TokenTable::Cl100k => {
+                let _ = tiktoken_rs::cl100k_base_singleton();
+            }
+        }
+    }
+    #[cfg(not(feature = "bpe-tokens"))]
+    {
+        let _ = (provider, model_id);
+    }
+}
+
 /// Count text using the destination model's tokenizer approximation.
 #[must_use]
 pub fn count_tokens_for_model(text: &str, provider: &str, model_id: &str) -> u64 {
@@ -78,8 +98,96 @@ pub trait TokenCounter: Send + Sync {
 pub struct BpeCounter;
 
 #[cfg(feature = "bpe-tokens")]
+const BPE_CACHE_SLOTS: usize = 256;
+#[cfg(feature = "bpe-tokens")]
+const BPE_CACHE_MIN_BYTES: usize = 64;
+#[cfg(feature = "bpe-tokens")]
+const BPE_CACHE_MAX_BYTES: usize = 16 * 1024;
+#[cfg(feature = "bpe-tokens")]
+const BPE_CHUNK_TARGET_BYTES: usize = 512;
+#[cfg(feature = "bpe-tokens")]
+const BPE_LONG_RUN_PREFIX_FLUSH_BYTES: usize = 128;
+
+#[cfg(feature = "bpe-tokens")]
+struct CachedBpeChunk {
+    hash: u64,
+    table: TokenTable,
+    text: Box<str>,
+    tokens: u64,
+}
+
+#[cfg(feature = "bpe-tokens")]
+std::thread_local! {
+    static BPE_CHUNK_CACHE: std::cell::RefCell<Vec<Option<CachedBpeChunk>>> =
+        std::cell::RefCell::new((0..BPE_CACHE_SLOTS).map(|_| None).collect());
+}
+
+/// Returns `true` when `prev` (at `i - 1`) and `next` (at `i`) form a proven
+/// exact regex-piece boundary in both `cl100k_base` and `o200k_base`:
+/// - `prev` is ASCII `[A-Za-z0-9]` (`\S`), so no earlier whitespace lookahead
+///   (`\s+(?!\S)`) or end-of-input anchor (`\s++$`) can change in the left half.
+/// - `next` is 7-bit ASCII non-alphanumeric other than `'`, so neither `\p{N}`,
+///   `\p{L}\p{M}*`, nor English contractions (`'s`, `'ll`, ...) can continue
+///   across `i`, and neither tokenizer pattern contains lookbehind.
+#[cfg(feature = "bpe-tokens")]
+#[inline]
+const fn is_exact_bpe_split(prev: u8, next: u8) -> bool {
+    prev.is_ascii_alphanumeric() && next < 0x80 && !next.is_ascii_alphanumeric() && next != b'\''
+}
+
+#[cfg(feature = "bpe-tokens")]
+#[inline]
+fn hash_bpe_chunk(chunk: &str, table: TokenTable) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = rustc_hash::FxHasher::default();
+    table.as_str().hash(&mut hasher);
+    chunk.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(feature = "bpe-tokens")]
+fn count_bpe_chunk_cached(bpe: &tiktoken_rs::CoreBPE, chunk: &str, table: TokenTable) -> u64 {
+    if chunk.is_empty() {
+        return 0;
+    }
+    if !(BPE_CACHE_MIN_BYTES..=BPE_CACHE_MAX_BYTES).contains(&chunk.len()) {
+        return bpe.count_ordinary(chunk) as u64;
+    }
+    let hash = hash_bpe_chunk(chunk, table);
+    let slot_idx = usize::try_from(hash % (BPE_CACHE_SLOTS as u64)).unwrap_or(0);
+    let cached = BPE_CHUNK_CACHE.with(|cache| {
+        let borrow = cache.borrow();
+        borrow
+            .get(slot_idx)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.hash == hash && entry.table == table && &*entry.text == chunk)
+            .map(|entry| entry.tokens)
+    });
+    if let Some(tokens) = cached {
+        return tokens;
+    }
+    let tokens = bpe.count_ordinary(chunk) as u64;
+    BPE_CHUNK_CACHE.with(|cache| {
+        if let Ok(mut borrow) = cache.try_borrow_mut()
+            && let Some(slot) = borrow.get_mut(slot_idx)
+        {
+            *slot = Some(CachedBpeChunk {
+                hash,
+                table,
+                text: chunk.into(),
+                tokens,
+            });
+        }
+    });
+    tokens
+}
+
+#[cfg(feature = "bpe-tokens")]
 impl TokenCounter for BpeCounter {
     fn count(&self, text: &str, table: TokenTable) -> u64 {
+        if text.is_empty() {
+            return 0;
+        }
         let bpe = match table {
             TokenTable::O200k => tiktoken_rs::o200k_base_singleton(),
             TokenTable::Cl100k => tiktoken_rs::cl100k_base_singleton(),
@@ -89,7 +197,47 @@ impl TokenCounter for BpeCounter {
         // must not collapse to one control token and understate the context
         // budget. The counting API also avoids retaining a token-ID vector
         // for every message during long-session compaction scans.
-        bpe.count_ordinary(text) as u64
+        if text.len() < BPE_CACHE_MIN_BYTES {
+            return bpe.count_ordinary(text) as u64;
+        }
+
+        let bytes = text.as_bytes();
+        let mut total = 0_u64;
+        let mut start = 0_usize;
+        let mut last_split = None::<usize>;
+
+        for (pair_idx, pair) in bytes.windows(2).enumerate() {
+            let &[prev, next] = pair else {
+                continue;
+            };
+            let idx = pair_idx + 1;
+            if is_exact_bpe_split(prev, next) {
+                if idx - start >= BPE_CHUNK_TARGET_BYTES {
+                    if let Some(chunk) = text.get(start..idx) {
+                        total = total.saturating_add(count_bpe_chunk_cached(bpe, chunk, table));
+                    }
+                    start = idx;
+                    last_split = None;
+                } else {
+                    last_split = Some(idx);
+                }
+            } else if let Some(split) = last_split
+                && idx - split >= BPE_LONG_RUN_PREFIX_FLUSH_BYTES
+            {
+                if let Some(chunk) = text.get(start..split) {
+                    total = total.saturating_add(count_bpe_chunk_cached(bpe, chunk, table));
+                }
+                start = split;
+                last_split = None;
+            }
+        }
+
+        if let Some(tail) = text.get(start..)
+            && !tail.is_empty()
+        {
+            total = total.saturating_add(count_bpe_chunk_cached(bpe, tail, table));
+        }
+        total
     }
 }
 
@@ -329,5 +477,34 @@ mod tests {
             elapsed < std::time::Duration::from_secs(30),
             "1MB count took {elapsed:?}; tokenisation is super-linear, not merely slow"
         );
+    }
+
+    #[cfg(feature = "bpe-tokens")]
+    #[test]
+    fn chunked_bpe_counter_matches_direct_tiktoken_exactly_across_edge_cases() {
+        let long_x = "x".repeat(2_048);
+        let long_y = "y".repeat(1_024);
+        let tricky_cases = vec![
+            format!("export-0-{long_x}"),
+            format!("export-599-{long_x}"),
+            format!("fork-target-0-{long_y}"),
+            format!("fork-target-899-{long_y}"),
+            "don't won't we'll they've I'm it's foo'r-bar foo're-baz 12345-abc   \r\n  \n\tend   "
+                .repeat(12),
+            "混合 Unicode 🦀 café naïve 's 999: ".repeat(30) + &long_y,
+        ];
+        for table in [TokenTable::O200k, TokenTable::Cl100k] {
+            let tokenizer = match table {
+                TokenTable::O200k => tiktoken_rs::o200k_base_singleton(),
+                TokenTable::Cl100k => tiktoken_rs::cl100k_base_singleton(),
+            };
+            for sample in &tricky_cases {
+                assert_eq!(
+                    BpeCounter.count(sample, table),
+                    tokenizer.count_ordinary(sample) as u64,
+                    "exact parity mismatch for {table:?}"
+                );
+            }
+        }
     }
 }

@@ -57,6 +57,7 @@ fn test_web_client_authentication_and_capacity() {
         max_viewers: 3,
         require_auth_token: true,
         enable_audit_log: true,
+        ..WebRemoteSettings::default()
     };
 
     let manager = WebRemoteManager::new(settings);
@@ -152,6 +153,7 @@ fn test_input_arbitration_and_audit_ledger() {
         max_viewers: 4,
         require_auth_token: false,
         enable_audit_log: true,
+        ..WebRemoteSettings::default()
     };
 
     let manager = WebRemoteManager::new(settings);

@@ -4765,3 +4765,141 @@ fn e2e_verification_detects_post_migration_jsonl_modification() -> PiResult<()> 
 
     Ok(())
 }
+
+/// Live multi-turn saves on a migrated session keep the V2 sidecar fresh across
+/// 50 incremental appends, preserve full CRC32C + hash-chain parity, and detect
+/// single-byte segment tampering (bd-session-store-v2-live-append-log-o2k94).
+#[test]
+fn live_migrated_session_appends_50_turns_without_staling_v2_and_catches_crc_tamper() -> PiResult<()>
+{
+    let dir = tempdir()?;
+    let entries = vec![
+        make_message_entry("seed1", None, "seed turn 1"),
+        make_message_entry("seed2", Some("seed1"), "seed turn 2"),
+    ];
+    let jsonl = build_test_jsonl(dir.path(), &entries);
+    pi::session::migrate_jsonl_to_v2(&jsonl, "live-append-50")?;
+
+    let mut session = run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    assert!(
+        session.is_v2_live_sync_enabled(),
+        "opening a migrated V2 session must enable live V2 sidecar synchronization"
+    );
+
+    for turn in 1..=50 {
+        session.append_message(pi::session::SessionMessage::User {
+            content: pi::model::UserContent::Text(format!("live incremental turn {turn}")),
+            timestamp: Some(1_700_000_000_000 + turn),
+        });
+        run_async(async { session.save().await })?;
+    }
+
+    let trace = run_async(async { Session::cold_start_trace_bundle(&jsonl, dir.path()).await })?;
+    assert!(trace.storage.v2_sidecar_present);
+    assert!(
+        !trace.storage.v2_sidecar_stale,
+        "V2 sidecar must remain clean across 50 incremental live saves"
+    );
+    assert_eq!(trace.storage.selected_backend, "v2_sidecar");
+    assert_eq!(trace.storage.opened_backend, "v2_sidecar");
+
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    store.validate_integrity()?;
+    let verification = pi::session::verify_v2_against_jsonl(&jsonl, &store)?;
+    assert!(verification.entry_count_match);
+    assert!(verification.hash_chain_match);
+    assert!(verification.index_consistent);
+    assert_eq!(store.read_index()?.len(), 52);
+
+    let reopened_v2 = run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    let v2_messages = serde_json::to_value(reopened_v2.to_messages_for_current_path())?;
+
+    // Corrupt a single payload byte in the final segment frame and prove integrity check fails closed.
+    let seg_path = store.segment_file_path(1);
+    let mut seg_bytes = fs::read(&seg_path)?;
+    let needle = b"live incremental turn 50";
+    let offset = seg_bytes
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+        .expect("locate final turn payload in segment 1");
+    seg_bytes[offset] ^= 0x01;
+    fs::write(&seg_path, &seg_bytes)?;
+
+    let tamper_err = store
+        .validate_integrity()
+        .expect_err("single-byte segment tamper must fail CRC32C/SHA256 integrity verification");
+    let tamper_msg = tamper_err.to_string().to_ascii_lowercase();
+    assert!(
+        tamper_msg.contains("crc")
+            || tamper_msg.contains("checksum")
+            || tamper_msg.contains("hash")
+            || tamper_msg.contains("sha256"),
+        "unexpected integrity error diagnostic: {tamper_err}"
+    );
+
+    // Roll back tampered sidecar and verify authoritative JSONL matches V2 message projection.
+    pi::session::rollback_v2_sidecar(&jsonl, "verify-jsonl-parity")?;
+    let reopened_jsonl =
+        run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    let jsonl_messages = serde_json::to_value(reopened_jsonl.to_messages_for_current_path())?;
+    assert_eq!(v2_messages, jsonl_messages);
+
+    Ok(())
+}
+
+/// Opting into `session.store = "v2"` builds and maintains the V2 sidecar across
+/// both initial/header full rewrites and incremental appends.
+#[test]
+fn config_v2_store_opt_in_maintains_live_sidecar_across_rewrites_and_appends() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = dir.path().join("opt-in-v2.jsonl");
+    let config: pi::config::Config =
+        serde_json::from_str(r#"{"session":{"store":"v2"}}"#).expect("parse v2 session config");
+    assert!(config.session_v2_sidecar_enabled());
+
+    let cli = <pi::cli::Cli as clap::Parser>::parse_from([
+        "pi",
+        "--session",
+        jsonl.to_string_lossy().as_ref(),
+    ]);
+    let mut session = run_async(async { Session::new(&cli, &config).await })?;
+    assert!(session.is_v2_live_sync_enabled());
+
+    session.append_message(pi::session::SessionMessage::User {
+        content: pi::model::UserContent::Text("initial rewrite turn".to_string()),
+        timestamp: Some(1_700_000_000_001),
+    });
+    run_async(async { session.save().await })?;
+    assert!(pi::session_store_v2::has_v2_sidecar(&jsonl));
+
+    for idx in 1..=5 {
+        session.append_message(pi::session::SessionMessage::User {
+            content: pi::model::UserContent::Text(format!("opt-in append {idx}")),
+            timestamp: Some(1_700_000_000_100 + idx),
+        });
+        run_async(async { session.save().await })?;
+    }
+
+    session.set_model_header(
+        Some("anthropic".to_string()),
+        Some("claude-sonnet-4-5".to_string()),
+        None,
+    );
+    run_async(async { session.save().await })?;
+
+    let trace = run_async(async { Session::cold_start_trace_bundle(&jsonl, dir.path()).await })?;
+    assert!(trace.storage.v2_sidecar_present);
+    assert!(!trace.storage.v2_sidecar_stale);
+    assert_eq!(trace.storage.opened_backend, "v2_sidecar");
+
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let store = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let verification = pi::session::verify_v2_against_jsonl(&jsonl, &store)?;
+    assert!(verification.entry_count_match);
+    assert!(verification.hash_chain_match);
+    assert!(verification.index_consistent);
+    assert_eq!(store.read_index()?.len(), 6);
+
+    Ok(())
+}

@@ -161,10 +161,9 @@ pub(crate) use self::state::AutocompleteState;
 use self::state::{
     BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, ExtensionCustomOverlay,
     GoalCancellation, GoalInvocation, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
-    LoginAttempt, LoginAttemptControl,
-    PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
-    SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
-    ToolProgress, format_count,
+    LoginAttempt, LoginAttemptControl, PendingLoginKind, PendingOAuth, QueuedMessageKind,
+    SessionPickerOverlay, SettingsUiEntry, SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES,
+    ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
 use self::text_utils::{queued_message_preview, truncate};

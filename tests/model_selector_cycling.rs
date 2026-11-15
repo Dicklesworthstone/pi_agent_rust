@@ -153,9 +153,9 @@ fn build_app_with_models_and_config_and_events(
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
-    let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(Some(
-        harness.temp_dir().join("sessions"),
-    ))));
+    let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+        Some(harness.temp_dir().join("sessions")),
+    )));
     let resources = ResourceLoader::empty(config.enable_skill_commands());
     let resource_cli = ResourceCliOptions {
         no_skills: false,

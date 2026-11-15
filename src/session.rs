@@ -1516,6 +1516,25 @@ fn save_jsonl_full_rewrite_blocking(
     entries: &[SessionEntry],
     header_dirty: bool,
 ) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+    let (saved_header, saved_entries, _) = save_jsonl_full_rewrite_with_v2_blocking(
+        path,
+        sessions_root,
+        header,
+        entries,
+        header_dirty,
+        false,
+    )?;
+    Ok((saved_header, saved_entries))
+}
+
+fn save_jsonl_full_rewrite_with_v2_blocking(
+    path: &Path,
+    sessions_root: &Path,
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+    header_dirty: bool,
+    sync_v2_sidecar: bool,
+) -> Result<(SessionHeader, Vec<SessionEntry>, Option<PathBuf>)> {
     validate_jsonl_full_rewrite_lines(header, entries)?;
     let resolved_path = resolve_session_persistence_path(path)?;
     let path = resolved_path.as_path();
@@ -1528,6 +1547,11 @@ fn save_jsonl_full_rewrite_blocking(
         prepare_jsonl_full_rewrite(path, header, entries, header_dirty)?;
     let index_generation = begin_session_index_namespace_change(sessions_root)?;
     persist_jsonl_snapshot_locked(path, &header_to_write, &entries_to_write)?;
+    let synced_v2_root = if sync_v2_sidecar {
+        sync_v2_sidecar_full_rewrite_best_effort_locked(path)
+    } else {
+        None
+    };
     let mut entries_for_stats = entries_to_write.clone();
     let finalized = finalize_loaded_entries(&mut entries_for_stats);
     let message_count = finalized.message_count;
@@ -1541,7 +1565,126 @@ fn save_jsonl_full_rewrite_blocking(
         session_name,
         Some(index_generation),
     );
-    Ok((header_to_write, entries_to_write))
+    Ok((header_to_write, entries_to_write, synced_v2_root))
+}
+
+fn sync_v2_sidecar_full_rewrite_locked(jsonl_path: &Path) -> Result<PathBuf> {
+    let v2_root = session_store_v2::v2_sidecar_path(jsonl_path);
+    let v2_exists =
+        session_path_entry_exists(&v2_root).map_err(|err| crate::Error::Io(Box::new(err)))?;
+    if v2_exists {
+        preflight_v2_sidecar(&v2_root, true)?;
+        ensure_session_parent_writable(&v2_root).map_err(|err| crate::Error::Io(Box::new(err)))?;
+    }
+
+    let staging_root = unique_sidecar_aux_path(&v2_root, "staging");
+    let staged_store = match build_v2_sidecar_from_jsonl_into(jsonl_path, &staging_root) {
+        Ok(store) => store,
+        Err(err) => {
+            let _ = cleanup_sidecar_root(&staging_root);
+            return Err(err);
+        }
+    };
+    match verify_v2_against_jsonl(jsonl_path, &staged_store) {
+        Ok(verification) if v2_verification_is_complete(&verification) => {}
+        Ok(verification) => {
+            let _ = cleanup_sidecar_root(&staging_root);
+            return Err(Error::session(format!(
+                "V2 sidecar live verification failed: count={} hash={} index={}",
+                verification.entry_count_match,
+                verification.hash_chain_match,
+                verification.index_consistent,
+            )));
+        }
+        Err(err) => {
+            let _ = cleanup_sidecar_root(&staging_root);
+            return Err(err);
+        }
+    }
+    if let Err(err) = write_clean_v2_source_state(&staging_root, jsonl_path) {
+        let _ = cleanup_sidecar_root(&staging_root);
+        return Err(err);
+    }
+    install_verified_v2_sidecar(&v2_root, &staging_root, "live V2 sidecar sync")?;
+    preflight_v2_sidecar(&v2_root, true)?;
+    Ok(v2_root)
+}
+
+fn sync_v2_sidecar_full_rewrite_best_effort_locked(jsonl_path: &Path) -> Option<PathBuf> {
+    match sync_v2_sidecar_full_rewrite_locked(jsonl_path) {
+        Ok(v2_root) => Some(v2_root),
+        Err(err) => {
+            if has_v2_sidecar_checked(jsonl_path).unwrap_or(false) {
+                let v2_root = session_store_v2::v2_sidecar_path(jsonl_path);
+                let _ = write_dirty_v2_source_state(&v2_root);
+            }
+            tracing::warn!(
+                target: "pi.session.v2.append_failed",
+                path = %jsonl_path.display(),
+                error = %err,
+                "V2 sidecar full-rewrite sync failed after canonical JSONL commit; marking sidecar stale"
+            );
+            None
+        }
+    }
+}
+
+fn sync_v2_sidecar_incremental_locked(
+    jsonl_path: &Path,
+    header: &SessionHeader,
+    stored_entries_count: usize,
+    encoded_entry_lines: &[String],
+) -> Result<PathBuf> {
+    if !has_v2_sidecar_checked(jsonl_path)? {
+        return sync_v2_sidecar_full_rewrite_locked(jsonl_path);
+    }
+    let v2_root = session_store_v2::v2_sidecar_path(jsonl_path);
+    preflight_v2_sidecar(&v2_root, true)?;
+    let mut store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    let expected_existing = u64::try_from(stored_entries_count)
+        .map_err(|_| Error::session("persisted session entry count exceeds u64"))?;
+    if store.entry_count() != expected_existing {
+        return sync_v2_sidecar_full_rewrite_locked(jsonl_path);
+    }
+    for encoded_line in encoded_entry_lines {
+        let stored = attachments::decode_stored_entry(Some(jsonl_path), encoded_line)?;
+        let (entry_id, parent_entry_id, entry_type, payload) = stored.frame_args()?;
+        store.append_entry(entry_id, parent_entry_id, entry_type, payload)?;
+    }
+    if !encoded_entry_lines.is_empty() {
+        store.write_manifest(header.id.clone(), "jsonl_v3")?;
+    }
+    write_clean_v2_source_state(&v2_root, jsonl_path)?;
+    Ok(v2_root)
+}
+
+fn sync_v2_sidecar_incremental_best_effort_locked(
+    jsonl_path: &Path,
+    header: &SessionHeader,
+    stored_entries_count: usize,
+    encoded_entry_lines: &[String],
+) -> Option<PathBuf> {
+    match sync_v2_sidecar_incremental_locked(
+        jsonl_path,
+        header,
+        stored_entries_count,
+        encoded_entry_lines,
+    ) {
+        Ok(v2_root) => Some(v2_root),
+        Err(err) => {
+            if has_v2_sidecar_checked(jsonl_path).unwrap_or(false) {
+                let v2_root = session_store_v2::v2_sidecar_path(jsonl_path);
+                let _ = write_dirty_v2_source_state(&v2_root);
+            }
+            tracing::warn!(
+                target: "pi.session.v2.append_failed",
+                path = %jsonl_path.display(),
+                error = %err,
+                "V2 sidecar incremental append failed after canonical JSONL commit; leaving sidecar marked dirty"
+            );
+            None
+        }
+    }
 }
 
 struct JsonlAppendPlan {
@@ -1645,6 +1788,7 @@ enum JsonlPersistedEntry {
 struct JsonlAppendOutcome {
     header: SessionHeader,
     entries: Vec<JsonlPersistedEntry>,
+    synced_v2_root: Option<PathBuf>,
 }
 
 impl JsonlAppendOutcome {
@@ -1730,13 +1874,31 @@ fn open_jsonl_for_append(path: &Path) -> Result<(SessionHeader, Vec<attachments:
     Ok((header, entries))
 }
 
-#[allow(clippy::too_many_lines)]
 fn append_jsonl_entries_blocking(
     path: &Path,
     sessions_root: &Path,
     expected_session_id: &str,
     new_entries: Vec<SessionEntry>,
     reusable: &HashMap<String, JsonlReusableEntry>,
+) -> Result<JsonlAppendOutcome> {
+    append_jsonl_entries_with_v2_blocking(
+        path,
+        sessions_root,
+        expected_session_id,
+        new_entries,
+        reusable,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn append_jsonl_entries_with_v2_blocking(
+    path: &Path,
+    sessions_root: &Path,
+    expected_session_id: &str,
+    new_entries: Vec<SessionEntry>,
+    reusable: &HashMap<String, JsonlReusableEntry>,
+    sync_v2_sidecar: bool,
 ) -> Result<JsonlAppendOutcome> {
     validate_jsonl_entries_for_write(&new_entries)?;
     let resolved_path = resolve_session_persistence_path(path)?;
@@ -1757,6 +1919,7 @@ fn append_jsonl_entries_blocking(
         session_name,
     } = plan_jsonl_incremental_append(path, stored_entries, new_entries)?;
 
+    let stored_entries_count = stored_entries.len();
     let binding_entries = stored_entries
         .iter()
         .filter_map(attachments::StoredEntry::workdir_binding)
@@ -1769,13 +1932,16 @@ fn append_jsonl_entries_blocking(
 
     let mut attachments = attachments::EntryEncoder::new(path);
     let mut serialized_entries = Vec::new();
+    let mut encoded_entry_lines = Vec::with_capacity(entries_appended.len());
     for entry in &entries_appended {
-        serde_json::to_writer(&mut serialized_entries, &attachments.encode(entry)?)?;
+        let encoded_line = serde_json::to_string(&attachments.encode(entry)?)?;
+        serialized_entries.extend_from_slice(encoded_line.as_bytes());
         serialized_entries.push(b'\n');
+        encoded_entry_lines.push(encoded_line);
     }
 
     let rewrite_unterminated = !serialized_entries.is_empty() && !jsonl_ends_with_newline(path)?;
-    let persisted_entries = if rewrite_unterminated {
+    let (persisted_entries, synced_v2_root) = if rewrite_unterminated {
         // A complete final record can survive an interrupted delimiter write.
         // Never concatenate the next object onto it: atomically rewrite the
         // already-validated rows with their delimiters restored. An invalid
@@ -1789,6 +1955,11 @@ fn append_jsonl_entries_blocking(
         let entries = stable_parent_topological_order(entries)?;
         let generation = begin_session_index_namespace_change(sessions_root)?;
         persist_jsonl_snapshot_locked(path, &header, &entries)?;
+        let synced_v2_root = if sync_v2_sidecar {
+            sync_v2_sidecar_full_rewrite_best_effort_locked(path)
+        } else {
+            None
+        };
         enqueue_session_index_snapshot_update(
             sessions_root,
             path,
@@ -1804,6 +1975,7 @@ fn append_jsonl_entries_blocking(
                 .into_iter()
                 .map(|entry| JsonlPersistedEntry::Hydrated(Box::new(entry)))
                 .collect(),
+            synced_v2_root,
         });
     } else {
         // Materialize only rows genuinely adopted from another writer (or a
@@ -1868,6 +2040,16 @@ fn append_jsonl_entries_blocking(
             "jsonl_append_after_sync",
             Some("append_sync_completed=true"),
         )?;
+        let synced_v2_root = if sync_v2_sidecar {
+            sync_v2_sidecar_incremental_best_effort_locked(
+                path,
+                &header,
+                stored_entries_count,
+                &encoded_entry_lines,
+            )
+        } else {
+            None
+        };
         enqueue_session_index_snapshot_update(
             sessions_root,
             path,
@@ -1877,12 +2059,13 @@ fn append_jsonl_entries_blocking(
             session_name,
             index_generation,
         );
-        entries
+        (entries, synced_v2_root)
     };
 
     Ok(JsonlAppendOutcome {
         header,
         entries: persisted_entries,
+        synced_v2_root,
     })
 }
 
@@ -2715,11 +2898,21 @@ pub enum SessionStoreKind {
 
 impl SessionStoreKind {
     pub(crate) fn from_config(config: &Config) -> Self {
-        let Some(value) = config.session_store.as_deref() else {
+        let Some(value) = config
+            .session
+            .as_ref()
+            .and_then(|settings| settings.store.as_deref())
+            .or(config.session_store.as_deref())
+            .map(str::trim)
+        else {
             return Self::Jsonl;
         };
 
-        if value.eq_ignore_ascii_case("jsonl") {
+        if value.eq_ignore_ascii_case("jsonl")
+            || value.eq_ignore_ascii_case("v2")
+            || value.eq_ignore_ascii_case("jsonl_v2")
+            || value.eq_ignore_ascii_case("v2_sidecar")
+        {
             return Self::Jsonl;
         }
 
@@ -3029,6 +3222,8 @@ pub struct Session {
     pub entries: Vec<SessionEntry>,
     /// Path to the session file (None for in-memory)
     pub path: Option<PathBuf>,
+    /// Path against which `persisted_entry_count` was last verified on disk.
+    persisted_path: Option<PathBuf>,
     /// Stable future path exposed to extensions before the first save.
     /// Reserving a name never creates a directory or a transcript file.
     reserved_path: Option<SessionPathReservation>,
@@ -3082,6 +3277,8 @@ pub struct Session {
     /// Offset to add to `cached_message_count` to account for messages not loaded in memory
     /// (e.g. when using V2 tail hydration).
     v2_message_count_offset: u64,
+    /// True when live JSONL saves should keep the `.v2` segmented sidecar synchronized.
+    v2_live_sync: bool,
 }
 
 impl Clone for Session {
@@ -3090,6 +3287,7 @@ impl Clone for Session {
             header: self.header.clone(),
             entries: self.entries.clone(),
             path: self.path.clone(),
+            persisted_path: self.persisted_path.clone(),
             reserved_path: self.reserved_path.clone(),
             leaf_id: self.leaf_id.clone(),
             session_dir: self.session_dir.clone(),
@@ -3115,6 +3313,7 @@ impl Clone for Session {
             v2_resume_mode: self.v2_resume_mode,
             v2_sidecar_stale: self.v2_sidecar_stale,
             v2_message_count_offset: self.v2_message_count_offset,
+            v2_live_sync: self.v2_live_sync,
         }
     }
 }
@@ -3485,6 +3684,19 @@ struct PathRebuildState {
     checkpoint_positions: HashMap<String, usize>,
 }
 
+fn apply_entry_base_timestamp(message: &mut Message, rfc3339: &str) {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return;
+    };
+    let ts = parsed.timestamp_millis();
+    match message {
+        Message::User(m) => m.timestamp = ts,
+        Message::Assistant(m) => Arc::make_mut(m).timestamp = ts,
+        Message::ToolResult(m) => Arc::make_mut(m).timestamp = ts,
+        Message::Custom(m) => m.timestamp = ts,
+    }
+}
+
 impl PathRebuildState {
     fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -3496,11 +3708,12 @@ impl PathRebuildState {
     fn append(&mut self, entry: &SessionEntry) {
         match entry {
             SessionEntry::Message(msg_entry) => {
-                if let Some(message) = session_message_to_model(&msg_entry.message) {
-                    self.messages.push((
-                        message,
-                        session_message_has_synthetic_timestamp(&msg_entry.message),
-                    ));
+                if let Some(mut message) = session_message_to_model(&msg_entry.message) {
+                    let synthetic = session_message_has_synthetic_timestamp(&msg_entry.message);
+                    if synthetic {
+                        apply_entry_base_timestamp(&mut message, &msg_entry.base.timestamp);
+                    }
+                    self.messages.push((message, synthetic));
                 }
             }
             SessionEntry::BranchSummary(summary) => {
@@ -3508,7 +3721,8 @@ impl PathRebuildState {
                     summary: summary.summary.clone(),
                     from_id: summary.from_id.clone(),
                 };
-                if let Some(message) = session_message_to_model(&summary_message) {
+                if let Some(mut message) = session_message_to_model(&summary_message) {
+                    apply_entry_base_timestamp(&mut message, &summary.base.timestamp);
                     self.messages.push((message, true));
                 }
             }
@@ -3783,6 +3997,11 @@ impl Session {
                 session.session_dir = session_dir
                     .clone()
                     .or_else(|| infer_session_root_from_path(session_path));
+                if config.session_v2_sidecar_enabled()
+                    && session.store_kind == SessionStoreKind::Jsonl
+                {
+                    session.enable_v2_live_sync();
+                }
                 session.set_autosave_durability_mode(durability_mode);
                 return Ok(session);
             }
@@ -3793,6 +4012,9 @@ impl Session {
                 .clone()
                 .or_else(|| infer_session_root_from_path(session_path));
             let mut session = Self::create_with_dir_and_store(inferred_dir, store_kind);
+            if config.session_v2_sidecar_enabled() && store_kind == SessionStoreKind::Jsonl {
+                session.enable_v2_live_sync();
+            }
             if let Some(parent) = session_path.parent()
                 && !parent.as_os_str().is_empty()
                 && !parent.exists()
@@ -3815,18 +4037,29 @@ impl Session {
                 picker_input_override,
             ))
             .await?;
+            if config.session_v2_sidecar_enabled() && session.store_kind == SessionStoreKind::Jsonl
+            {
+                session.enable_v2_live_sync();
+            }
             session.set_autosave_durability_mode(durability_mode);
             return Ok(session);
         }
 
         if cli.r#continue {
             let mut session = Self::continue_recent_in_dir(session_dir.as_deref(), config).await?;
+            if config.session_v2_sidecar_enabled() && session.store_kind == SessionStoreKind::Jsonl
+            {
+                session.enable_v2_live_sync();
+            }
             session.set_autosave_durability_mode(durability_mode);
             return Ok(session);
         }
 
         let store_kind = SessionStoreKind::from_config(config);
         let mut session = Self::create_with_dir_and_store(session_dir, store_kind);
+        if config.session_v2_sidecar_enabled() && store_kind == SessionStoreKind::Jsonl {
+            session.enable_v2_live_sync();
+        }
         session.set_autosave_durability_mode(durability_mode);
 
         // Create a new session
@@ -4021,6 +4254,7 @@ impl Session {
             header: SessionHeader::new(),
             entries: Vec::new(),
             path: None,
+            persisted_path: None,
             reserved_path: None,
             leaf_id: None,
             session_dir: None,
@@ -4041,6 +4275,7 @@ impl Session {
             v2_resume_mode: None,
             v2_sidecar_stale: false,
             v2_message_count_offset: 0,
+            v2_live_sync: false,
         }
     }
 
@@ -4063,6 +4298,7 @@ impl Session {
             header,
             entries: Vec::new(),
             path: None,
+            persisted_path: None,
             reserved_path: None,
             leaf_id: None,
             session_dir,
@@ -4083,7 +4319,28 @@ impl Session {
             v2_resume_mode: None,
             v2_sidecar_stale: false,
             v2_message_count_offset: 0,
+            v2_live_sync: false,
         }
+    }
+
+    /// Enable live synchronization of the `.v2` segmented sidecar during
+    /// `Session::save` (incremental `SegmentFrame` + `OffsetIndexEntry` appends
+    /// on turn appends, verified staged rebuild on full rewrites).
+    pub fn enable_v2_live_sync(&mut self) {
+        if self.store_kind == SessionStoreKind::Jsonl {
+            self.v2_live_sync = true;
+            if let Some(path) = self.path.as_deref()
+                && self.v2_sidecar_root.is_none()
+                && has_v2_sidecar_checked(path).unwrap_or(false)
+            {
+                self.v2_sidecar_root = Some(session_store_v2::v2_sidecar_path(path));
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn is_v2_live_sync_enabled(&self) -> bool {
+        self.v2_live_sync
     }
 
     /// Return the existing or reserved persistence filename.
@@ -4699,6 +4956,7 @@ impl Session {
                 header,
                 entries,
                 path: None,
+                persisted_path: None,
                 reserved_path: None,
                 leaf_id: leaf_id.clone(),
                 session_dir: None,
@@ -4716,11 +4974,12 @@ impl Session {
                 source_integrity_failed,
                 header_dirty: normalized_header_dirty,
                 appends_since_checkpoint: 0,
-                v2_sidecar_root: None,
+                v2_sidecar_root: Some(store.root_dir().to_path_buf()),
                 v2_partial_hydration: !matches!(mode, V2OpenMode::Full),
                 v2_resume_mode: Some(mode),
                 v2_sidecar_stale: false,
                 v2_message_count_offset,
+                v2_live_sync: false,
             },
             diagnostics,
         ))
@@ -4770,10 +5029,13 @@ impl Session {
             &finalized.entry_index,
         );
 
+        let resolved_persisted_path =
+            resolve_session_persistence_path(path).unwrap_or_else(|_| path.to_path_buf());
         Ok(Self {
             header,
             entries,
             path: Some(path.to_path_buf()),
+            persisted_path: Some(resolved_persisted_path),
             reserved_path: None,
             leaf_id: leaf_id.clone(),
             session_dir: None,
@@ -4794,6 +5056,7 @@ impl Session {
             v2_resume_mode: None,
             v2_sidecar_stale: false,
             v2_message_count_offset: 0,
+            v2_live_sync: false,
         })
     }
 
@@ -4805,9 +5068,18 @@ impl Session {
     ) -> Result<Self> {
         let store_kind = SessionStoreKind::from_config(config);
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
-        match Self::resolve_recent_session_in_dir(override_dir).await? {
-            Some((session, _)) => Ok(session),
-            None => Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind)),
+        if let Some((mut session, _)) = Self::resolve_recent_session_in_dir(override_dir).await? {
+            if config.session_v2_sidecar_enabled() && session.store_kind == SessionStoreKind::Jsonl
+            {
+                session.enable_v2_live_sync();
+            }
+            Ok(session)
+        } else {
+            let mut session = Self::create_with_dir_and_store(Some(base_dir), store_kind);
+            if config.session_v2_sidecar_enabled() && store_kind == SessionStoreKind::Jsonl {
+                session.enable_v2_live_sync();
+            }
+            Ok(session)
         }
     }
 
@@ -4943,11 +5215,32 @@ impl Session {
     /// pending work exists.
     pub async fn flush_autosave(&mut self, trigger: AutosaveFlushTrigger) -> Result<()> {
         let Some(ticket) = self.autosave_queue.begin_flush(trigger) else {
+            if self.autosave_queue.metrics().pending_mutations == 0
+                && self.persisted_path.is_some()
+                && self.needs_unqueued_structural_rewrite()
+            {
+                return self.save_inner().await;
+            }
             return Ok(());
         };
         let result = self.save_inner().await;
         self.autosave_queue.finish_flush(ticket, result.is_ok());
         result
+    }
+
+    fn needs_unqueued_structural_rewrite(&self) -> bool {
+        if self.persisted_path.as_deref() != self.path.as_deref() {
+            return true;
+        }
+        if self
+            .path
+            .as_ref()
+            .is_some_and(|path| !matches!(std::fs::metadata(path), Ok(meta) if meta.is_file()))
+        {
+            return true;
+        }
+        let persisted_count = self.persisted_entry_count.load(Ordering::SeqCst);
+        !self.v2_partial_hydration && persisted_count > self.entries.len()
     }
 
     /// Final shutdown flush respecting the configured durability mode.
@@ -5038,9 +5331,7 @@ impl Session {
                 } else {
                     match is_v2_sidecar_stale_read_only(path, v2_root) {
                         Ok(stale) => stale,
-                        Err(Error::Io(error))
-                            if error.kind() == std::io::ErrorKind::NotFound =>
-                        {
+                        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                             true
                         }
                         Err(error) => return Err(error),
@@ -5091,9 +5382,7 @@ impl Session {
                     "missing JSONL path while rehydrating a partial V2 session",
                 )
             }
-            Err(error) if allow_sidecar_repair => {
-                self.recover_full_v2_rehydration(v2_root, &error)
-            }
+            Err(error) if allow_sidecar_repair => self.recover_full_v2_rehydration(v2_root, &error),
             Err(error) => Err(error),
         }
     }
@@ -5218,12 +5507,17 @@ impl Session {
         if persisted_count == 0 {
             return true;
         }
-        // If the backing file disappeared between saves, recover by rewriting
-        // the full in-memory session instead of attempting an append.
+        // If the backing file disappeared between saves, is not a regular file,
+        // or `self.path` was redirected to a different destination than the last
+        // persisted write, rewrite the full in-memory session instead of skipping
+        // or appending to an unrelated target.
+        if self.persisted_path.as_deref() != self.path.as_deref() {
+            return true;
+        }
         if self
             .path
             .as_ref()
-            .is_some_and(|path| path.try_exists().is_ok_and(|exists| !exists))
+            .is_some_and(|path| !matches!(std::fs::metadata(path), Ok(meta) if meta.is_file()))
         {
             return true;
         }
@@ -5235,8 +5529,10 @@ impl Session {
         if self.appends_since_checkpoint >= compaction_checkpoint_interval() {
             return true;
         }
-        // Defensive: if persisted count somehow exceeds entries, force full rewrite.
-        if persisted_count > self.entries.len() {
+        // Defensive: if persisted count somehow exceeds entries (outside lazy V2
+        // partial hydration, where entries intentionally hold only the tail
+        // window until an explicit full-rewrite mutation occurs), force rewrite.
+        if !self.v2_partial_hydration && persisted_count > self.entries.len() {
             return true;
         }
         false
@@ -5331,16 +5627,18 @@ impl Session {
                     let header_snapshot = self.header.clone();
                     let entries_to_save = self.entries.clone();
                     let header_dirty = self.header_dirty;
+                    let sync_v2_sidecar = self.v2_live_sync;
                     let path_for_task = path_clone.clone();
                     let sessions_root_for_task = sessions_root.clone();
-                    let (saved_header, saved_entries) =
+                    let (saved_header, saved_entries, synced_v2_root) =
                         asupersync::runtime::spawn_blocking(move || {
-                            save_jsonl_full_rewrite_blocking(
+                            save_jsonl_full_rewrite_with_v2_blocking(
                                 &path_for_task,
                                 &sessions_root_for_task,
                                 &header_snapshot,
                                 &entries_to_save,
                                 header_dirty,
+                                sync_v2_sidecar,
                             )
                         })
                         .await?;
@@ -5348,7 +5646,12 @@ impl Session {
                     self.accept_persisted_state(saved_header, saved_entries);
                     self.header_dirty = false;
                     self.appends_since_checkpoint = 0;
-                    self.v2_sidecar_stale = self.v2_sidecar_root.is_some();
+                    if let Some(v2_root) = synced_v2_root {
+                        self.v2_sidecar_root = Some(v2_root);
+                        self.v2_sidecar_stale = false;
+                    } else {
+                        self.v2_sidecar_stale = self.v2_sidecar_root.is_some();
+                    }
                 } else {
                     // === Incremental append path ===
                     let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
@@ -5356,19 +5659,22 @@ impl Session {
                         let new_entries = self.entries[new_start..].to_vec();
                         let reusable_entries = jsonl_reusable_entries(&self.entries).await?;
                         let expected_session_id = self.header.id.clone();
+                        let sync_v2_sidecar = self.v2_live_sync && !self.v2_sidecar_stale;
 
                         let path_for_task = path_clone.clone();
                         let sessions_root_for_task = sessions_root.clone();
                         let saved = asupersync::runtime::spawn_blocking(move || {
-                            append_jsonl_entries_blocking(
+                            append_jsonl_entries_with_v2_blocking(
                                 &path_for_task,
                                 &sessions_root_for_task,
                                 &expected_session_id,
                                 new_entries,
                                 &reusable_entries,
+                                sync_v2_sidecar,
                             )
                         })
                         .await?;
+                        let synced_v2_root = saved.synced_v2_root.clone();
                         let (saved_header, saved_entries) = saved.accept(&mut self.entries)?;
 
                         // The accepted receipt represents the full authoritative
@@ -5382,7 +5688,12 @@ impl Session {
                         }
                         self.accept_persisted_state(saved_header, saved_entries);
                         self.appends_since_checkpoint += 1;
-                        self.v2_sidecar_stale = self.v2_sidecar_root.is_some();
+                        if let Some(v2_root) = synced_v2_root {
+                            self.v2_sidecar_root = Some(v2_root);
+                            self.v2_sidecar_stale = false;
+                        } else {
+                            self.v2_sidecar_stale = self.v2_sidecar_root.is_some();
+                        }
                     }
                     // No new entries → no-op, nothing to write.
                 }
@@ -5476,6 +5787,7 @@ impl Session {
         self.is_linear = finalized.is_linear && self.leaf_id.eq(&finalized.leaf_id);
         self.persisted_entry_count
             .store(self.entries.len(), Ordering::SeqCst);
+        self.persisted_path.clone_from(&self.path);
         self.source_integrity_failed = false;
     }
 
@@ -6821,7 +7133,8 @@ impl Session {
                 summary: compaction.summary.clone(),
                 tokens_before: compaction.tokens_before,
             };
-            if let Some(message) = session_message_to_model(&summary_message) {
+            if let Some(mut message) = session_message_to_model(&summary_message) {
+                apply_entry_base_timestamp(&mut message, &compaction.base.timestamp);
                 // Snapcompact (bd-cv653.7.6): attach rasterized frames stored in
                 // this entry's details so vision-capable models can consume them.
                 let payload =
@@ -7371,8 +7684,10 @@ impl SessionHeader {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             cwd: std::env::current_dir()
+                .ok()
                 .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_string()),
             additional_roots: None,
             provider: None,
             model_id: None,
@@ -8639,6 +8954,7 @@ fn open_jsonl_blocking_with_entry_limit(
         Session {
             header,
             entries,
+            persisted_path: Some(path_buf.clone()),
             path: Some(path_buf),
             reserved_path: None,
             leaf_id: leaf_id.clone(),
@@ -8660,6 +8976,7 @@ fn open_jsonl_blocking_with_entry_limit(
             v2_resume_mode: None,
             v2_sidecar_stale: false,
             v2_message_count_offset: 0,
+            v2_live_sync: false,
         },
         diagnostics,
     ))
@@ -8986,10 +9303,12 @@ fn open_from_v2_store_blocking(jsonl_path: &Path) -> Result<(Session, SessionOpe
 
     // 4. Load entries using the selected mode.
     let mut session = hydration.session;
+    session.persisted_path = Some(jsonl_path.clone());
     session.path = Some(jsonl_path);
     session.v2_sidecar_root = Some(v2_root);
     session.v2_partial_hydration = !matches!(hydration.mode, V2OpenMode::Full);
     session.v2_resume_mode = Some(hydration.mode);
+    session.v2_live_sync = true;
     Ok((session, hydration.diagnostics))
 }
 
@@ -10239,25 +10558,33 @@ mod tests {
             .expect("create tempdir under TMPDIR")
     }
 
-    fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn current_dir_lock() -> crate::TestCurrentDirLockGuard {
         crate::test_current_dir_lock()
     }
 
     struct CurrentDirGuard {
         previous: PathBuf,
+        _lock: crate::TestCurrentDirLockGuard,
     }
 
     impl CurrentDirGuard {
         fn new(path: &Path) -> Self {
-            let previous = env::current_dir().expect("current dir");
+            let lock = current_dir_lock();
+            let previous =
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
             env::set_current_dir(path).expect("set current dir");
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
+            if env::set_current_dir(&self.previous).is_err() {
+                let _ = env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+            }
         }
     }
 
@@ -19288,7 +19615,10 @@ mod tests {
                     .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
             );
         }
-        assert_eq!(serde_json::to_value(&recovered.entries).unwrap(), before_entries);
+        assert_eq!(
+            serde_json::to_value(&recovered.entries).unwrap(),
+            before_entries
+        );
         assert_eq!(recovered.leaf_id(), Some(pending.as_str()));
         let error = run_async(async { recovered.save().await })
             .expect_err("valid-invalid-valid source must remain byte-preserved");

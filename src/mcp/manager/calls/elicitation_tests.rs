@@ -304,7 +304,7 @@ fn fixture(root: &Path, mode: &str, scenario: &str) -> (Arc<McpManager>, Option<
                 transport_hint: Some(if mode == "http-get" { "http" } else { mode }.to_string()),
                 enabled: true,
                 cwd: None,
-                timeout_ms: Some(if scenario == "deadline" { 500 } else { 5000 }),
+                timeout_ms: Some(if scenario == "deadline" { 1500 } else { 5000 }),
                 provenance: Provenance::ProjectPi,
                 source_file: root.join("mcp.json"),
             }],

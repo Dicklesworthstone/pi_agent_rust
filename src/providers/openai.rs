@@ -1482,11 +1482,13 @@ where
             // catalog pricing can fill the component breakdown afterward.
             self.partial.usage.cost = crate::model::Cost {
                 total: match &self.partial.usage.billing {
-                    Some(BillingUsage::ReportedTotal { total })
-                    | Some(BillingUsage::Tokens {
-                        reported_total: Some(total),
-                        ..
-                    }) => *total,
+                    Some(
+                        BillingUsage::ReportedTotal { total }
+                        | BillingUsage::Tokens {
+                            reported_total: Some(total),
+                            ..
+                        },
+                    ) => *total,
                     _ => 0.0,
                 },
                 ..Default::default()
@@ -1959,11 +1961,12 @@ where
         // Handle finish reason (MUST happen after delta processing to capture final chunks)
 
         if let Some(reason) = choice.finish_reason {
-            if self.partial.stop_reason != StopReason::Error {
+            if matches!(reason.as_str(), "content_filter" | "error") {
+                self.record_error(format!("OpenAI stream stopped with finish_reason={reason}"));
+            } else if self.partial.stop_reason != StopReason::Error {
                 self.partial.stop_reason = match reason.as_str() {
                     "length" => StopReason::Length,
                     "tool_calls" => StopReason::ToolUse,
-                    "content_filter" | "error" => StopReason::Error,
                     _ => StopReason::Stop,
                 };
             }

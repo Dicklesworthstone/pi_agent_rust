@@ -778,7 +778,15 @@ fn malformed_empty_text_block_no_crash() {
             .expect("empty text should not crash")
     });
 
-    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|err| err.contains("PI_EMPTY_RESPONSE")),
+        "Expected PI_EMPTY_RESPONSE diagnostic, got: {:?}",
+        message.error_message
+    );
     let text = assistant_text(&message);
     assert!(text.is_empty(), "Should have empty text content");
 

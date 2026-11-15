@@ -51,6 +51,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct DebugTool {
     cwd: PathBuf,
     adapters: Vec<AdapterSpec>,
+    allowed_adapters: Option<Vec<String>>,
+    pub(super) max_sessions: usize,
+    pub(super) default_startup_timeout_ms: u64,
+    step_timeout_ms: u64,
     session: Mutex<Option<Arc<DapSession>>>,
     session_scope: crate::jobs::JobSessionScope,
     session_owners: Mutex<ownership::SessionOwners>,
@@ -59,15 +63,69 @@ pub struct DebugTool {
 
 impl DebugTool {
     #[must_use]
-    pub fn new(cwd: &Path, _config: Option<&Config>) -> Self {
+    pub fn new(cwd: &Path, config: Option<&Config>) -> Self {
+        let mut adapters = adapters::default_adapters();
+        let debug_cfg = config.and_then(|c| c.debug.as_ref());
+        if let Some(overrides) = debug_cfg.and_then(|d| d.adapters.as_ref()) {
+            for adapter in &mut adapters {
+                if let Some(override_cfg) = overrides.get(&adapter.id) {
+                    if let Some(command) = override_cfg
+                        .command
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|cmd| !cmd.is_empty())
+                    {
+                        adapter.command_candidates = vec![command.to_string()];
+                    }
+                    if let Some(args) = &override_cfg.args {
+                        adapter.adapter_args.clone_from(args);
+                    }
+                }
+            }
+        }
+        let allowed_adapters = debug_cfg
+            .and_then(|d| d.allowed_adapters.as_ref())
+            .map(|list| {
+                list.iter()
+                    .map(|item| item.trim().to_ascii_lowercase())
+                    .filter(|item| !item.is_empty())
+                    .collect()
+            });
+        let max_sessions = debug_cfg
+            .and_then(|d| d.max_sessions)
+            .map_or(ownership::MAX_DEBUG_SESSIONS, |n| n.clamp(1, 16));
+        let default_startup_timeout_ms = debug_cfg
+            .and_then(|d| d.startup_timeout_ms)
+            .map_or(120_000, |ms| ms.clamp(1, 300_000));
+        let step_timeout_ms = debug_cfg
+            .and_then(|d| d.step_timeout_ms)
+            .map_or(5_000, |ms| ms.clamp(1, 60_000));
         Self {
             cwd: cwd.to_path_buf(),
-            adapters: adapters::default_adapters(),
+            adapters,
+            allowed_adapters,
+            max_sessions,
+            default_startup_timeout_ms,
+            step_timeout_ms,
             session: Mutex::new(None),
             session_scope: crate::jobs::JobSessionScope::default(),
             session_owners: Mutex::new(ownership::SessionOwners::default()),
             operations: Arc::new(asupersync::sync::Mutex::new(())),
         }
+    }
+
+    pub(super) fn require_adapter_allowed(&self, adapter_id: &str) -> Result<()> {
+        if let Some(allowed) = &self.allowed_adapters
+            && !allowed
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(adapter_id))
+        {
+            return Err(tool_err(
+                "DAP_ADAPTER_BLOCKED",
+                format!("adapter {adapter_id} is not permitted by debug.allowedAdapters"),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -163,6 +221,7 @@ impl DebugTool {
             &self.adapters,
         )?;
         let adapter = &selected.adapter;
+        self.require_adapter_allowed(&adapter.id)?;
         if input.go_mode.is_some() && adapter.id != "dlv" {
             return Err(tool_err("DAP_USAGE", "goMode requires the dlv adapter"));
         }
@@ -285,7 +344,9 @@ impl DebugTool {
         }
         .with_launch_artifacts(artifacts)
         .with_source_root(working_directory);
-        let timeout_ms = input.startup_timeout_ms.unwrap_or(120_000);
+        let timeout_ms = input
+            .startup_timeout_ms
+            .unwrap_or(self.default_startup_timeout_ms);
         session
             .start(
                 &input.action,
@@ -652,7 +713,9 @@ impl DebugTool {
         let stopped = if input.action == "continue" {
             None
         } else {
-            session.wait_stopped(Duration::from_secs(5)).await
+            session
+                .wait_stopped(Duration::from_millis(self.step_timeout_ms))
+                .await
         };
         AgentCx::for_current_or_request()
             .checkpoint()

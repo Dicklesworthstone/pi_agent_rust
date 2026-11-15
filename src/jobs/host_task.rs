@@ -327,7 +327,7 @@ where
     check_admission()?;
     let (id, sequence, slot) = reserve_job_slot()?;
     let (artifact_path, artifact, artifact_cleanup) =
-        task_artifact(artifact_root, &id, &check_admission)?;
+        task_artifact(artifact_root, &id, check_admission)?;
     let artifact = Arc::new(Mutex::new(ArtifactSink::new(artifact, MAX_ARTIFACT_BYTES)));
     let tail = Arc::new(Mutex::new(TailBuffer::new(OUTPUT_TAIL_BYTES)));
     // Shutdown can publish its fence while artifact I/O holds the lifecycle
@@ -908,7 +908,10 @@ mod tests {
             // a failure cannot leave a worker stuck in the test process.
             drop(holder);
             let joined = worker.join().expect("native artifact admission");
-            assert!(reserved, "task must reach its reservation before cancellation");
+            assert!(
+                reserved,
+                "task must reach its reservation before cancellation"
+            );
             let expected = if cancel_owner {
                 "PI_JOBS_TASK_CANCELLED"
             } else {
@@ -919,7 +922,10 @@ mod tests {
                 "task must refuse admission before the peer releases its lock: {before_release:?}"
             );
             assert!(joined.is_err());
-            assert!(dropped.load(Ordering::Acquire), "refusal must retire owned work");
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "refusal must retire owned work"
+            );
             assert!(super::super::list(&session).expect("owner jobs").is_empty());
             assert!(super::super::take_completion_notices(&session).is_empty());
             assert!(!super::super::has_pending_work(&session).expect("owner admission"));
@@ -1163,7 +1169,12 @@ mod tests {
             retired_before_release,
             "the task must retire without acquiring lifecycle"
         );
-        assert!(observed.result.expect("terminal cancellation result").is_error);
+        assert!(
+            observed
+                .result
+                .expect("terminal cancellation result")
+                .is_error
+        );
         assert!(
             super::super::take_completion_notices(&owner).is_empty(),
             "terminal notices are delivered once"

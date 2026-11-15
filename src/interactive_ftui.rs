@@ -2110,6 +2110,9 @@ pub enum UiCommand {
     /// (`AppAction::CycleModelForward`/`Backward`, ctrl+p / shift+ctrl+p by
     /// default). The driver owns it: only it knows the running model.
     CycleModel { forward: bool },
+    /// Switch to the next (`forward`) or previous sibling branch at the nearest
+    /// fork point (`AppAction::BranchNextSibling`/`BranchPrevSibling`).
+    CycleSiblingBranch { forward: bool },
     /// Set the session display name (`/name <name>`).
     SetName(String),
     /// Grant access to an additional workspace root
@@ -2256,6 +2259,54 @@ struct LoginDraft {
     input: TextArea,
     history_cursor: Option<usize>,
     history_draft: String,
+}
+
+const MAX_KILL_RING_ENTRIES: usize = 16;
+
+/// Bounded Emacs-style kill ring backing `AppAction::Yank` and `AppAction::YankPop`.
+#[derive(Debug, Default)]
+struct FtuiKillRing {
+    entries: VecDeque<String>,
+    /// `(ring_index, inserted_char_count)` of an immediately preceding yank/yank-pop.
+    active_yank: Option<(usize, usize)>,
+}
+
+impl FtuiKillRing {
+    fn push(&mut self, killed: String) {
+        if killed.is_empty() {
+            return;
+        }
+        if self.entries.len() >= MAX_KILL_RING_ENTRIES {
+            let _ = self.entries.pop_back();
+        }
+        self.entries.push_front(killed);
+        self.active_yank = None;
+    }
+
+    fn record_diff(&mut self, before: &str, after: &str) {
+        if before == after || after.len() >= before.len() {
+            return;
+        }
+        let prefix_bytes = before
+            .chars()
+            .zip(after.chars())
+            .take_while(|(left, right)| left == right)
+            .map(|(ch, _)| ch.len_utf8())
+            .sum::<usize>();
+        let before_tail = &before[prefix_bytes..];
+        let after_tail = &after[prefix_bytes..];
+        let suffix_bytes = before_tail
+            .chars()
+            .rev()
+            .zip(after_tail.chars().rev())
+            .take_while(|(left, right)| left == right)
+            .map(|(ch, _)| ch.len_utf8())
+            .sum::<usize>();
+        let deleted_end = before.len().saturating_sub(suffix_bytes);
+        if deleted_end > prefix_bytes {
+            self.push(before[prefix_bytes..deleted_end].to_string());
+        }
+    }
 }
 
 /// Bound captures retained for one draft while slow WSL interop finishes.
@@ -2553,6 +2604,10 @@ pub struct PiFtuiModel {
     /// Transcript markdown spacing policy (issue #202), resolved from
     /// `markdown.spacing` in settings at launch.
     markdown_spacing: crate::config::MarkdownSpacing,
+    /// Kill ring for `AppAction::Yank` / `AppAction::YankPop`.
+    kill_ring: FtuiKillRing,
+    /// Path, sort, and named-filter toggles for the `/resume` session picker.
+    session_picker_options: session_pins::SessionPickerOptions,
 }
 
 /// One cached transcript block (issue #201): the styled lines produced for
@@ -2961,6 +3016,8 @@ impl PiFtuiModel {
             busy: None,
             mcp_auth_request: None,
             markdown_spacing: crate::config::MarkdownSpacing::Comfortable,
+            kill_ring: FtuiKillRing::default(),
+            session_picker_options: session_pins::SessionPickerOptions::default(),
             #[cfg(test)]
             suspend_task_override: None,
             #[cfg(test)]
@@ -3534,7 +3591,7 @@ impl PiFtuiModel {
     /// consumed; Enter without a highlighted row closes the popup and falls
     /// through so the draft submits exactly as typed, matching the charmed
     /// stack (Tab always accepts, defaulting to the first row).
-    fn handle_completion_key(&mut self, key: &ftui::KeyEvent, submit: bool) -> bool {
+    fn handle_completion_key(&mut self, key: &ftui::KeyEvent, submit: bool, tab: bool) -> bool {
         match key.code {
             KeyCode::Up => {
                 self.autocomplete.select_prev();
@@ -3555,6 +3612,16 @@ impl PiFtuiModel {
                 true
             }
             KeyCode::Escape => {
+                self.autocomplete.close();
+                true
+            }
+            _ if tab => {
+                if self.autocomplete.selected.is_none() {
+                    self.autocomplete.select_next();
+                }
+                if let Some(item) = self.autocomplete.selected_item().cloned() {
+                    self.accept_autocomplete(&item);
+                }
                 self.autocomplete.close();
                 true
             }
@@ -5864,27 +5931,7 @@ impl PiFtuiModel {
             return true;
         }
         if canon == "/resume" || canon == "/r" {
-            // Re-read the index: sessions saved (and pins set) since launch
-            // belong in the list, as in OMP's picker.
-            if let Some((cwd, session_dir)) = &self.resume_scope {
-                self.available_sessions =
-                    session_pins::resume_entries(cwd, session_dir.as_deref(), &self.pins_dir);
-            }
-            if self.available_sessions.is_empty() {
-                self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
-            } else {
-                let (items, values) = self
-                    .available_sessions
-                    .iter()
-                    .map(|(label, path)| (label.clone(), path.clone()))
-                    .unzip();
-                self.picker = Some(PickerOverlay::new(
-                    "Resume session (Enter to load, Esc to close)",
-                    items,
-                    values,
-                    PickerKind::Session,
-                ));
-            }
+            self.open_session_picker(false);
             return true;
         }
         if canon == "/hotkeys" || canon == "/keys" || canon == "/keybindings" {
@@ -5904,13 +5951,13 @@ impl PiFtuiModel {
                      /session, /name <name>, /plan, /goal status, /compact [focus], /tree, /undo [n], /redo [n], \
                      /export [path], /copy [code|cmd|link], /dump, /pin, /delete, /share, /tan <task>, /usage, /mcp, \
                      /add-dir <dir>, /remove-dir <dir>, /crash [list|show|delete], \
-                     /thinking or /effort [level], /fast [on|off|status|default|flex|scale|priority|ultrafast], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
+                     /thinking or /effort [level], /fast [tier], /skillful [on|off|status], /branch (or Esc Esc), /theme [name], /changelog, /clear, /hotkeys, \
                      /login [provider], /logout [provider], /fork [n|id|list], /reload, \
                      /rename <name>, /plan-review, /btw <question>, /tools, /extensions, \
                      /skills, /dirs, /history, /fresh, /retry, /shake, /checkpoint [name], /rewind [name], /rules, /omfg <complaint>, \
                      /commit [--dry-run], /review [target], /handoff [focus], \
-                     /handoff --report [to] [path], /handoff --model [preview options], \
-                     /handoff --import <bundle> [import options], /prewalk [into] | restart [from] [into] | status | off, /approval [mode], \
+                     /handoff --report [to] [path], /handoff --model [opts], \
+                     /handoff --import <bundle>, /prewalk [into] | restart [from] [into] | status | off, /approval [mode], \
                      /advisor [on|off|status], /memory [view|list|search|forget|sync], /hub [id], \
                      /security [paths], /plugins, /open, /reload-plugins, \
                      /scoped-models [patterns|clear], /template [name args], /templates, /ssh, \
@@ -6200,6 +6247,81 @@ impl PiFtuiModel {
         false
     }
 
+    fn session_picker_title(&self) -> String {
+        let mut badges = Vec::new();
+        if self.session_picker_options.show_path {
+            badges.push("paths");
+        }
+        if self.session_picker_options.sort_by_name {
+            badges.push("A-Z");
+        }
+        if self.session_picker_options.named_only {
+            badges.push("named");
+        }
+        if badges.is_empty() {
+            String::from("Resume session (Enter to load, Esc to close)")
+        } else {
+            format!(
+                "Resume session [{}] (Enter to load, Esc to close)",
+                badges.join(", ")
+            )
+        }
+    }
+
+    fn open_session_picker(&mut self, preserve_query: bool) {
+        let prior_query = preserve_query
+            .then(|| self.picker.as_ref().map(|p| p.query.clone()))
+            .flatten()
+            .unwrap_or_default();
+        if let Some((cwd, session_dir)) = &self.resume_scope {
+            self.available_sessions = session_pins::resume_entries_with_options(
+                cwd,
+                session_dir.as_deref(),
+                &self.pins_dir,
+                self.session_picker_options,
+            );
+        }
+        let filtered_sessions: Vec<(String, String)> = if self.resume_scope.is_some() {
+            self.available_sessions.clone()
+        } else {
+            let mut rows = self.available_sessions.clone();
+            if self.session_picker_options.named_only {
+                rows.retain(|(label, _)| !label.contains(" · ") || !label.starts_with("unnamed"));
+            }
+            if self.session_picker_options.sort_by_name {
+                rows.sort_by(|left, right| {
+                    left.0
+                        .to_ascii_lowercase()
+                        .cmp(&right.0.to_ascii_lowercase())
+                });
+            }
+            if self.session_picker_options.show_path {
+                for (label, path) in &mut rows {
+                    if !label.contains(path.as_str()) {
+                        label.push_str(" · ");
+                        label.push_str(path);
+                    }
+                }
+            }
+            rows
+        };
+        if filtered_sessions.is_empty() && !preserve_query {
+            self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
+            return;
+        }
+        let (items, values) = filtered_sessions.into_iter().unzip();
+        let mut overlay = PickerOverlay::new(
+            self.session_picker_title(),
+            items,
+            values,
+            PickerKind::Session,
+        );
+        if !prior_query.is_empty() {
+            overlay.push_query_str(&prior_query);
+        }
+        self.picker = Some(overlay);
+    }
+
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
         if self.picker.is_none() {
             return;
@@ -6242,6 +6364,51 @@ impl PiFtuiModel {
                         (picker.selected + page).min(picker.shown.len().saturating_sub(1));
                 }
             }
+            AppAction::ToggleSessionPath => {
+                self.session_picker_options.show_path = !self.session_picker_options.show_path;
+                self.open_session_picker(true);
+            }
+            AppAction::ToggleSessionSort => {
+                self.session_picker_options.sort_by_name =
+                    !self.session_picker_options.sort_by_name;
+                self.open_session_picker(true);
+            }
+            AppAction::ToggleSessionNamedFilter => {
+                self.session_picker_options.named_only = !self.session_picker_options.named_only;
+                self.open_session_picker(true);
+            }
+            AppAction::RenameSession => {
+                self.picker = None;
+                self.input.set_text("/rename ");
+                self.input.move_to_document_end();
+                self.maybe_trigger_autocomplete();
+            }
+            AppAction::DeleteSession | AppAction::DeleteSessionNoninvasive => {
+                let selected_path = self.picker.as_ref().and_then(|picker| {
+                    let idx = *picker.shown.get(picker.selected)?;
+                    picker.values.get(idx).cloned()
+                });
+                if let Some(path) = selected_path {
+                    match crate::session_picker::delete_session_file(std::path::Path::new(&path)) {
+                        Ok(()) => {
+                            self.available_sessions
+                                .retain(|(_, entry_path)| entry_path != &path);
+                            self.push_entry(EntryRole::System, format!("Deleted session {path}"));
+                            self.open_session_picker(true);
+                            if self
+                                .picker
+                                .as_ref()
+                                .is_some_and(|picker| picker.items.is_empty())
+                            {
+                                self.picker = None;
+                            }
+                        }
+                        Err(err) => {
+                            self.push_entry(EntryRole::Error, format!("delete session: {err}"));
+                        }
+                    }
+                }
+            }
             AppAction::SelectCancel => {
                 let setting_value = self
                     .picker
@@ -6273,6 +6440,30 @@ impl PiFtuiModel {
     fn picker_action(&self, key: &ftui::KeyEvent) -> Option<AppAction> {
         let binding = KeyBinding::from_ftui_key(key)?;
         let matches = self.keybindings.matching_actions(&binding);
+        let in_session_picker = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == PickerKind::Session);
+        let query_empty = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.query.is_empty());
+        if in_session_picker {
+            for session_action in [
+                AppAction::ToggleSessionPath,
+                AppAction::ToggleSessionSort,
+                AppAction::ToggleSessionNamedFilter,
+                AppAction::RenameSession,
+                AppAction::DeleteSessionNoninvasive,
+            ] {
+                if matches.contains(&session_action) {
+                    return Some(session_action);
+                }
+            }
+            if query_empty && matches.contains(&AppAction::DeleteSession) {
+                return Some(AppAction::DeleteSession);
+            }
+        }
         [
             AppAction::SelectCancel,
             AppAction::SelectConfirm,
@@ -7200,10 +7391,32 @@ impl PiFtuiModel {
                     return Cmd::none();
                 }
                 if ctrl_c
+                    && !double_tap
                     && self.busy.is_some()
                     && (self.abort_handoff() || self.abort_driver_operation())
                 {
-                    self.last_ctrl_c = None;
+                    self.last_ctrl_c = Some(std::time::Instant::now());
+                    return Cmd::none();
+                }
+                if ctrl_c
+                    && !double_tap
+                    && self.active_ask.is_none()
+                    && self.active_ext.is_none()
+                    && self.login_pending.is_none()
+                    && self.picker.is_none()
+                    && self.busy.is_none()
+                    && self.state == AgentUiState::Ready
+                    && KeyBinding::from_ftui_key(key).as_ref().is_some_and(|b| {
+                        self.keybindings
+                            .matching_actions(b)
+                            .contains(&AppAction::Copy)
+                    })
+                    && let Some(selected) =
+                        self.input.selected_text().filter(|text| !text.is_empty())
+                {
+                    self.last_ctrl_c = Some(std::time::Instant::now());
+                    let outcome = crate::interactive::copy_text_to_clipboard(&selected);
+                    self.push_entry(EntryRole::System, outcome);
                     return Cmd::none();
                 }
                 if ctrl_c && !double_tap {
@@ -7264,7 +7477,11 @@ impl PiFtuiModel {
                 // while it shows (issue #208); anything it doesn't consume
                 // continues through the catalog and the editor as usual.
                 if self.completion_visible()
-                    && self.handle_completion_key(key, actions.contains(&AppAction::Submit))
+                    && self.handle_completion_key(
+                        key,
+                        actions.contains(&AppAction::Submit),
+                        actions.contains(&AppAction::Tab),
+                    )
                 {
                     return Cmd::none();
                 }
@@ -7301,6 +7518,21 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::SelectModel))
                     .or_else(|| pick(AppAction::OpenSettings))
                     .or_else(|| pick(AppAction::Help))
+                    .or_else(|| pick(AppAction::NewSession))
+                    .or_else(|| pick(AppAction::Tree))
+                    .or_else(|| pick(AppAction::Fork))
+                    .or_else(|| pick(AppAction::BranchPicker))
+                    .or_else(|| {
+                        if self.input.is_empty() {
+                            pick(AppAction::BranchNextSibling)
+                                .or_else(|| pick(AppAction::BranchPrevSibling))
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| pick(AppAction::Copy))
+                    .or_else(|| pick(AppAction::Clear))
+                    .or_else(|| pick(AppAction::RenameSession))
                     // shift+tab. Only the driver can see the model's catalog
                     // entry, so the cycle itself lives there; this is the
                     // routing that was missing. The completion popup claims
@@ -7310,6 +7542,8 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::CycleModelForward))
                     .or_else(|| pick(AppAction::CycleModelBackward))
                     .or_else(|| pick(AppAction::Dequeue))
+                    .or_else(|| pick(AppAction::Yank))
+                    .or_else(|| pick(AppAction::YankPop))
                     // Editor-native actions come last so nothing above changes
                     // meaning. They are routed at all because the ftui editor
                     // handles only ctrl+a/k/z/y, arrows, Home/End, Backspace,
@@ -7340,7 +7574,31 @@ impl PiFtuiModel {
                     .or_else(|| pick(AppAction::ExternalEditor))
                     .or_else(|| pick(AppAction::PasteImage))
                     .or_else(|| pick(AppAction::CursorUp))
-                    .or_else(|| pick(AppAction::CursorDown));
+                    .or_else(|| pick(AppAction::CursorDown))
+                    .or_else(|| {
+                        if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+                            None
+                        } else {
+                            pick(AppAction::Tab)
+                        }
+                    })
+                    .or_else(|| {
+                        if key.code == KeyCode::Char('d') && key.modifiers == Modifiers::CTRL {
+                            None
+                        } else {
+                            pick(AppAction::DeleteSession)
+                        }
+                    })
+                    .or_else(|| {
+                        if key.code == KeyCode::Backspace && key.modifiers == Modifiers::CTRL {
+                            None
+                        } else {
+                            pick(AppAction::DeleteSessionNoninvasive)
+                        }
+                    });
+                if !matches!(action, Some(AppAction::Yank | AppAction::YankPop)) {
+                    self.kill_ring.active_yank = None;
+                }
                 let page = self.body_height().saturating_sub(1).max(1);
                 if (self.handoff_in_progress()
                     || self.compaction_request.is_some()
@@ -7354,6 +7612,14 @@ impl PiFtuiModel {
                                 | AppAction::CycleThinkingLevel
                                 | AppAction::CycleModelForward
                                 | AppAction::CycleModelBackward
+                                | AppAction::NewSession
+                                | AppAction::Tree
+                                | AppAction::Fork
+                                | AppAction::BranchPicker
+                                | AppAction::BranchNextSibling
+                                | AppAction::BranchPrevSibling
+                                | AppAction::DeleteSession
+                                | AppAction::DeleteSessionNoninvasive
                         )
                     )
                 {
@@ -7492,6 +7758,98 @@ impl PiFtuiModel {
                         self.route_slash_command_tail("/help");
                         return Cmd::none();
                     }
+                    Some(AppAction::NewSession) if self.state == AgentUiState::Ready => {
+                        self.route_slash_command_tail("/new");
+                        return self.take_busy_tick();
+                    }
+                    Some(AppAction::Tree) if self.state == AgentUiState::Ready => {
+                        self.route_slash_command_tail("/tree");
+                        return self.take_busy_tick();
+                    }
+                    Some(AppAction::Fork) if self.state == AgentUiState::Ready => {
+                        self.request_message_picker(true);
+                        return self.take_busy_tick();
+                    }
+                    Some(AppAction::BranchPicker) if self.state == AgentUiState::Ready => {
+                        self.route_slash_command_tail("/branch");
+                        return self.take_busy_tick();
+                    }
+                    Some(AppAction::BranchNextSibling) if self.state == AgentUiState::Ready => {
+                        self.send_command(UiCommand::CycleSiblingBranch { forward: true });
+                        return Cmd::none();
+                    }
+                    Some(AppAction::BranchPrevSibling) if self.state == AgentUiState::Ready => {
+                        self.send_command(UiCommand::CycleSiblingBranch { forward: false });
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Copy) => {
+                        if let Some(selected) =
+                            self.input.selected_text().filter(|text| !text.is_empty())
+                        {
+                            let outcome = crate::interactive::copy_text_to_clipboard(&selected);
+                            self.push_entry(EntryRole::System, outcome);
+                        } else {
+                            self.route_slash_command_tail("/copy");
+                        }
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Clear) if self.input_active() => {
+                        self.input.set_text("");
+                        self.goal_draft = None;
+                        self.autocomplete.close();
+                        self.history_cursor = None;
+                        self.history_draft.clear();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::RenameSession)
+                        if self.input_active()
+                            && self.active_ask.is_none()
+                            && self.active_ext.is_none() =>
+                    {
+                        self.input.set_text("/rename ");
+                        self.input.move_to_document_end();
+                        self.maybe_trigger_autocomplete();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::DeleteSession | AppAction::DeleteSessionNoninvasive)
+                        if self.state == AgentUiState::Ready =>
+                    {
+                        self.route_slash_command_tail("/delete");
+                        return self.take_busy_tick();
+                    }
+                    Some(AppAction::Yank) if self.input_active() => {
+                        if let Some(top) = self.kill_ring.entries.front().cloned() {
+                            let chars = top.chars().count();
+                            self.input.insert_text(&top);
+                            self.kill_ring.active_yank = Some((0, chars));
+                            self.maybe_trigger_autocomplete();
+                        }
+                        return Cmd::none();
+                    }
+                    Some(AppAction::YankPop) if self.input_active() => {
+                        if let Some((idx, prev_chars)) = self.kill_ring.active_yank
+                            && self.kill_ring.entries.len() > 1
+                        {
+                            let next_idx = (idx + 1) % self.kill_ring.entries.len();
+                            if let Some(next_text) = self.kill_ring.entries.get(next_idx).cloned() {
+                                for _ in 0..prev_chars {
+                                    self.input.delete_backward();
+                                }
+                                let next_chars = next_text.chars().count();
+                                self.input.insert_text(&next_text);
+                                self.kill_ring.active_yank = Some((next_idx, next_chars));
+                                self.maybe_trigger_autocomplete();
+                            }
+                        }
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Tab) if self.input_active() => {
+                        self.maybe_trigger_autocomplete();
+                        if !self.completion_visible() {
+                            self.input.insert_text("\t");
+                        }
+                        return Cmd::none();
+                    }
                     Some(AppAction::CycleThinkingLevel) => {
                         self.send_command(UiCommand::CycleThinking);
                         return Cmd::none();
@@ -7572,7 +7930,19 @@ impl PiFtuiModel {
                     // smaller one. `input_active` keeps them out of the way
                     // while an ask card or extension prompt owns the editor.
                     Some(editing) if self.input_active() && is_editor_action(editing) => {
+                        let captures_kill = matches!(
+                            editing,
+                            AppAction::DeleteWordBackward
+                                | AppAction::DeleteWordForward
+                                | AppAction::DeleteToLineStart
+                                | AppAction::DeleteToLineEnd
+                        );
+                        let before = captures_kill.then(|| self.input.text());
                         apply_editor_action(&mut self.input, editing);
+                        if let Some(before) = before {
+                            let after = self.input.text();
+                            self.kill_ring.record_diff(&before, &after);
+                        }
                         self.maybe_trigger_autocomplete();
                         return Cmd::none();
                     }
@@ -8596,9 +8966,17 @@ impl Model for PiFtuiModel {
         };
         // Reconcile only events that can edit the draft. Streaming output,
         // ticks, and resize events must not repeatedly scan recalled text.
+        // Key chords that do not mutate the draft (such as extension shortcuts)
+        // must not detach the active history cursor either.
+        let key_edit_baseline = matches!(&msg, PiFtuiMsg::Term(Event::Key(_))).then(|| {
+            (
+                self.input.undo_op_count(),
+                self.input.replacement_generation(),
+            )
+        });
         let reconcile_history = matches!(
             &msg,
-            PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_))
+            PiFtuiMsg::Term(Event::Paste(_))
                 | PiFtuiMsg::Edited { .. }
                 | PiFtuiMsg::Agent(PiMsg::SetEditorText { .. })
         ) || matches!(
@@ -8679,7 +9057,13 @@ impl Model for PiFtuiModel {
                 }
             }
         };
-        if reconcile_history {
+        let key_edited_draft = key_edit_baseline.is_some_and(|before| {
+            (
+                self.input.undo_op_count(),
+                self.input.replacement_generation(),
+            ) != before
+        });
+        if reconcile_history || key_edited_draft {
             self.detach_edited_history();
         }
         self.apply_pending_input_restores();
@@ -10893,7 +11277,7 @@ async fn run_extension_command(
         let _ = agent_tx.send(PiMsg::System(unavailable(true)));
         return;
     };
-    if manager.runtime().is_none() {
+    if !manager.has_callable_command(name) {
         let _ = agent_tx.send(PiMsg::System(format!(
             "Extension command '/{name}' is not available (runtime not enabled)"
         )));
@@ -11836,6 +12220,70 @@ async fn run_tree_summary_command(
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
         }
+    }
+}
+
+/// Switch to the next or previous sibling branch at the nearest fork point
+/// (`AppAction::BranchNextSibling` / `AppAction::BranchPrevSibling`).
+async fn run_cycle_sibling_branch_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    forward: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let siblings = handle
+        .with_session(crate::session::Session::sibling_branches)
+        .await;
+    let branches = match siblings {
+        Ok(Some((_, branches))) if branches.len() > 1 => branches,
+        Ok(_) => {
+            let _ = agent_tx.send(PiMsg::System(String::from(
+                "No sibling branches at the current fork point.",
+            )));
+            return;
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("branch: {err}")));
+            return;
+        }
+    };
+    let current_index = branches
+        .iter()
+        .position(|branch| branch.is_current)
+        .unwrap_or(0);
+    let next_index = if forward {
+        (current_index + 1) % branches.len()
+    } else {
+        (current_index + branches.len() - 1) % branches.len()
+    };
+    let target = &branches[next_index];
+    if target.is_current {
+        return;
+    }
+    match handle.switch_to_entry(&target.leaf_id).await {
+        Ok(()) => {
+            let status = format!(
+                "Switched to sibling branch ({}/{}) {} - {}",
+                next_index + 1,
+                branches.len(),
+                target.leaf_id,
+                target.preview
+            );
+            send_conversation_reset(handle, agent_tx, &status).await;
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("branch: {err}")));
+        }
+    }
+}
+
+fn emit_extension_startup_warnings(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    for warning in handle.extension_startup_warnings() {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "Extension startup warning: {warning}\nRemediation: run `pi doctor` or fix the extension and run `/reload`."
+        )));
     }
 }
 
@@ -13209,6 +13657,31 @@ async fn run_bash_ui_command(
     abort_signal: &crate::agent::AbortSignal,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<crate::session::SessionMessage> {
+    let (output, terminal_msgs) = run_bash_ui_command_inner(
+        cwd,
+        shell,
+        command,
+        exclude,
+        extensions,
+        abort_signal,
+        agent_tx,
+    )
+    .await;
+    for msg in terminal_msgs {
+        let _ = agent_tx.send(msg);
+    }
+    output
+}
+
+async fn run_bash_ui_command_inner(
+    cwd: &std::path::Path,
+    shell: &BashUiShell,
+    command: &str,
+    exclude: bool,
+    extensions: Option<&crate::extensions::ExtensionManager>,
+    abort_signal: &crate::agent::AbortSignal,
+    agent_tx: &Sender<PiMsg>,
+) -> (Option<crate::session::SessionMessage>, Vec<PiMsg>) {
     // Start the running status immediately. The driver publishes the matching
     // BashFinished only after saving the returned record, so cancellation and
     // foreground admission stay owned through history completion.
@@ -13247,6 +13720,7 @@ async fn run_bash_ui_command(
     let is_error = result
         .as_ref()
         .map_or(true, |result| result.cancelled || result.exit_code != 0);
+    let mut terminal_msgs = Vec::with_capacity(2);
     let output = match result {
         Ok(result) => {
             let display = crate::session::bash_execution_to_text(
@@ -13269,7 +13743,7 @@ async fn run_bash_ui_command(
                     serde_json::Value::Bool(true),
                 );
             }
-            let _ = agent_tx.send(PiMsg::BashResult { display: shown });
+            terminal_msgs.push(PiMsg::BashResult { display: shown });
             Some(crate::session::SessionMessage::BashExecution {
                 command: command.to_string(),
                 output: result.output,
@@ -13285,7 +13759,7 @@ async fn run_bash_ui_command(
             // ToolEnd must precede AgentError: the error sweep settles
             // pending cards, and a card already settled there makes this
             // ToolEnd fall back to a duplicate trace line.
-            let _ = agent_tx.send(PiMsg::ToolEnd {
+            terminal_msgs.push(PiMsg::ToolEnd {
                 name: String::from("bash"),
                 tool_id: String::from("ftui-bash"),
                 is_error: true,
@@ -13296,12 +13770,12 @@ async fn run_bash_ui_command(
             } else {
                 format!("bash: {err}")
             };
-            let _ = agent_tx.send(PiMsg::AgentError(message));
+            terminal_msgs.push(PiMsg::AgentError(message));
             None
         }
     };
     if output.is_some() {
-        let _ = agent_tx.send(PiMsg::ToolEnd {
+        terminal_msgs.push(PiMsg::ToolEnd {
             name: String::from("bash"),
             tool_id: String::from("ftui-bash"),
             is_error,
@@ -13310,7 +13784,7 @@ async fn run_bash_ui_command(
             output: None,
         });
     }
-    output
+    (output, terminal_msgs)
 }
 
 /// Keep the cancellation owner published until output is recorded and the
@@ -13331,7 +13805,7 @@ async fn run_bash_driver_command(
         queued_compaction::OperationAbort::publish(turn_abort, turn_control, &request.abort);
     let abort_signal = request.abort.signal();
     let extensions = handle.extension_manager().cloned();
-    if let Some(record) = run_bash_ui_command(
+    let (record, terminal_msgs) = run_bash_ui_command_inner(
         cwd,
         shell,
         command,
@@ -13340,9 +13814,16 @@ async fn run_bash_driver_command(
         &abort_signal,
         agent_tx,
     )
-    .await
-        && let Err(err) = handle.record_bash_execution(record).await
-    {
+    .await;
+    let save_err = if let Some(record) = record {
+        handle.record_bash_execution(record).await.err()
+    } else {
+        None
+    };
+    for msg in terminal_msgs {
+        let _ = agent_tx.send(msg);
+    }
+    if let Some(err) = save_err {
         let _ = agent_tx.send(PiMsg::AgentError(format!(
             "The command ran, but its result could not be saved to the session: {err}",
         )));
@@ -13361,7 +13842,11 @@ async fn create_driver_session(
     ext_reply_rx: std::sync::mpsc::Receiver<ExtensionUiResponse>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
     command_registry: &ExtensionCommandRegistry,
-) -> Option<(crate::sdk::AgentSessionHandle, Arc<FtuiExtensionUiHandler>)> {
+) -> Option<(
+    crate::sdk::AgentSessionHandle,
+    Arc<FtuiExtensionUiHandler>,
+    Option<String>,
+)> {
     let ext_handler = Arc::new(FtuiExtensionUiHandler {
         command_registry: Arc::downgrade(command_registry),
         ..FtuiExtensionUiHandler::new(agent_tx.clone())
@@ -13374,10 +13859,33 @@ async fn create_driver_session(
     // (bd-82331).
     session_options.runtime_handle = Some(runtime_handle.clone());
     spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
+    let mut fallback_options = (!session_options.extension_paths.is_empty()).then(|| {
+        let mut degraded = session_options.clone();
+        degraded.extension_paths.clear();
+        degraded
+    });
     match crate::sdk::create_agent_session(session_options).await {
         Ok(handle) => {
             ext_handler.install_command_registry(&handle);
-            Some((handle, ext_handler))
+            Some((handle, ext_handler, None))
+        }
+        Err(crate::error::Error::Extension(ext_err)) if fallback_options.is_some() => {
+            let banner = format!(
+                "Extension startup failed: {ext_err}\nRemediation: run `pi doctor` or fix the extension and run `/reload`."
+            );
+            let fallback = fallback_options.take().expect("checked is_some above");
+            match crate::sdk::create_agent_session(fallback).await {
+                Ok(handle) => {
+                    ext_handler.install_command_registry(&handle);
+                    Some((handle, ext_handler, Some(banner)))
+                }
+                Err(err) => {
+                    let _ = agent_tx.send(PiMsg::AgentError(format!(
+                        "{banner}\nFallback session startup also failed: {err}"
+                    )));
+                    None
+                }
+            }
         }
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
@@ -13705,8 +14213,9 @@ pub fn run(
         .map(crate::web_remote::server::WebRemoteServer::start)
         .transpose()
         .map_err(std::io::Error::other)?;
-    let web_bridge = web_server.as_ref().map(|server| server.bridge());
-    let driver_web_bridge = web_bridge.clone();
+    let driver_web_bridge = web_server
+        .as_ref()
+        .map(crate::web_remote::server::WebRemoteServer::bridge);
     let web_privacy_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let driver_web_privacy_ready = Arc::clone(&web_privacy_ready);
     let prewalk_requested = session_options.prewalk.is_some();
@@ -13844,14 +14353,15 @@ pub fn run(
             let shutdown = runtime.block_on(async move {
                 // Boxed: clippy::large_futures (SessionOptions carries the
                 // advisor too).
-                let (mut handle, ext_handler) = Box::pin(create_driver_session(
-                    session_options,
-                    &agent_tx,
-                    ext_reply_rx,
-                    &runtime_handle,
-                    &driver_command_registry,
-                ))
-                .await?;
+                let (mut handle, ext_handler, startup_extension_error) =
+                    Box::pin(create_driver_session(
+                        session_options,
+                        &agent_tx,
+                        ext_reply_rx,
+                        &runtime_handle,
+                        &driver_command_registry,
+                    ))
+                    .await?;
                 if let Some(bridge) = &driver_web_bridge {
                     update_web_privacy(bridge, &handle);
                     driver_web_privacy_ready.store(true, std::sync::atomic::Ordering::Release);
@@ -13884,6 +14394,10 @@ pub fn run(
                     &agent_tx,
                 );
                 send_conversation_reset(&handle, &agent_tx, "pi interactive stack").await;
+                if let Some(ext_err) = startup_extension_error {
+                    let _ = agent_tx.send(PiMsg::AgentError(ext_err));
+                }
+                emit_extension_startup_warnings(&handle, &agent_tx);
                 if prewalk_requested {
                     let note = handle.prewalk_target().map_or_else(
                         || String::from("Prewalk: nothing to switch; target model and thinking already match"),
@@ -14550,6 +15064,9 @@ pub fn run(
                                 plans.forget_model_restore();
                             }
                         }
+                        Ok(UiCommand::CycleSiblingBranch { forward }) => {
+                            run_cycle_sibling_branch_command(&mut handle, forward, &agent_tx).await;
+                        }
                         Ok(UiCommand::Export { path }) => {
                             run_export_command(&handle, &bash_cwd, &path, &agent_tx).await;
                         }
@@ -14618,6 +15135,7 @@ pub fn run(
                                 ))
                                 .await;
                             }
+                            emit_extension_startup_warnings(&handle, &agent_tx);
                         }
                         Ok(UiCommand::Fork { args }) => {
                             auto_title.cancel_pending();
@@ -14920,7 +15438,7 @@ fn restart_argv(
         if text == "--" {
             break;
         }
-        if !saw_prompt && text == "web" {
+        if !saw_prompt && (text == "web" || text == "web-remote") {
             // A real subcommand position, not a root flag's consumed value.
             // Root session flags must precede either browser mode's arguments.
             web_tail.extend(args[i..].iter().cloned());
@@ -15530,7 +16048,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             parsed.command,
-            Some(crate::cli::Commands::Web { port: 9090, bind, view_only: true, max_viewers: 2, terminal: true })
+            Some(crate::cli::Commands::Web { port: 9090, bind, view_only: true, max_viewers: 2, terminal: true, .. })
                 if bind == "loopback"
         ));
         assert!(
@@ -19728,7 +20246,7 @@ mod tests {
         assert_eq!(cli.session.as_deref(), Some("saved.jsonl"));
         assert_eq!(cli.approval_mode.as_deref(), Some("write"));
         assert!(matches!(cli.command, Some(crate::cli::Commands::Web {
-            port: 0, bind, view_only: true, max_viewers: 2, terminal: false,
+            port: 0, bind, view_only: true, max_viewers: 2, terminal: false, ..
         }) if bind == "loopback"));
     }
 
@@ -27769,10 +28287,18 @@ mod tests {
         for name in ["shell.pid", "child.pid"] {
             let pid =
                 std::fs::read_to_string(directory.path().join(name)).expect("started process");
-            let running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                stat.rsplit_once(") ")
-                    .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
-            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut running = true;
+            while std::time::Instant::now() < deadline {
+                running = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_none_or(|(_, state)| !state.starts_with('Z') && !state.starts_with('X'))
+                });
+                if !running {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             assert!(!running, "cancelled process is still running: {pid}");
         }
         for event in agent_rx.try_iter() {
@@ -28122,7 +28648,7 @@ mod tests {
         std::fs::write(
             &path,
             serde_json::json!({"mcpServers": {
-                "docs  Europe": {
+                "docs--Europe": {
                     "url": url,
                     "headers": {"Authorization": "Bearer private-configuration-secret"}
                 },
@@ -28153,14 +28679,14 @@ mod tests {
                 &manager,
                 &tools,
                 "inspect",
-                Some("docs  Europe"),
+                Some("docs--Europe"),
                 &sender,
             )
             .await;
             let PiMsg::System(report) = receiver.try_recv().expect("inspection") else {
                 panic!("inspection must produce the local registry report");
             };
-            assert!(report.contains("docs  Europe"));
+            assert!(report.contains("docs--Europe"));
             assert!(report.contains("Trust: pending"));
             assert!(report.contains("Health: not started"));
             assert!(report.contains(&path.display().to_string()));
@@ -28171,7 +28697,7 @@ mod tests {
                 &manager,
                 &tools,
                 "refresh",
-                Some("docs  Europe"),
+                Some("docs--Europe"),
                 &sender,
             )
             .await;
@@ -28191,7 +28717,7 @@ mod tests {
                 &manager,
                 &tools,
                 "inspect",
-                Some("docs Europe"),
+                Some("docs-Europe"),
                 &sender,
             )
             .await;
@@ -29225,7 +29751,7 @@ mod tests {
         }
         type_str(&mut sim, "@no");
         // The project file index fills on a background thread.
-        for _ in 0..300 {
+        for _ in 0..1500 {
             if sim.model().completion_visible() {
                 break;
             }
@@ -30031,7 +30557,7 @@ mod tests {
                 match owner {
                     "settings" => fixture.ui.model_mut().settings_pending = true,
                     "login" => {
-                        fixture.ui.model_mut().login_pending = Some(("provider".into(), false))
+                        fixture.ui.model_mut().login_pending = Some(("provider".into(), false));
                     }
                     "ask" => {
                         fixture.ui.model_mut().active_ask = Some(ActiveAsk {
@@ -30041,14 +30567,14 @@ mod tests {
                             ),
                             question_index: 0,
                             answers: Vec::new(),
-                        })
+                        });
                     }
                     "extension" => {
                         fixture.ui.model_mut().active_ext = Some(ext_request(
                             "local-approval",
                             "confirm",
                             serde_json::json!({"title": "Allow local tool?"}),
-                        ))
+                        ));
                     }
                     "working" => fixture.ui.model_mut().state = AgentUiState::Working,
                     _ => unreachable!(),
@@ -30167,7 +30693,7 @@ mod tests {
             let extension = directory.path().join("late-models.mjs");
             std::fs::write(
                 &extension,
-                r#"
+                r"
                 export default function(pi) {
                     pi.registerCommand('publish-models', { handler: raw => {
                         const config = JSON.parse(raw);
@@ -30175,7 +30701,7 @@ mod tests {
                         pi.registerProvider('hidden-ftui', config);
                     }});
                 }
-            "#,
+            ",
             )
             .unwrap();
             let mut handle = native_prompt_handle(Arc::new(NativePromptProbe::default()));
@@ -34468,6 +34994,159 @@ mod tests {
             narrow,
             "the frame must record the wrapped total"
         );
+    }
+
+    #[test]
+    fn broken_extension_at_ftui_startup_emits_banner_and_keeps_driver_session_alive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let broken_ext = temp.path().join("broken-init.js");
+        std::fs::write(
+            &broken_ext,
+            "export default function () { throw new Error('boom during init'); }\n",
+        )
+        .expect("write broken extension");
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async {
+            let (agent_tx, _agent_rx) = mpsc::channel();
+            let (_ext_reply_tx, ext_reply_rx) = mpsc::channel();
+            let command_registry: ExtensionCommandRegistry = Arc::default();
+            let options = crate::sdk::SessionOptions {
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                api_key: Some("sk-ant-test-key".to_string()),
+                working_directory: Some(temp.path().to_path_buf()),
+                no_session: true,
+                extension_paths: vec![broken_ext.clone()],
+                ..Default::default()
+            };
+            let (handle, _ext_handler, startup_banner) = Box::pin(create_driver_session(
+                options,
+                &agent_tx,
+                ext_reply_rx,
+                &runtime_handle,
+                &command_registry,
+            ))
+            .await
+            .expect("degraded FTUI driver session must survive broken extension load");
+            let banner = startup_banner.expect("broken extension must produce startup banner");
+            assert!(
+                banner.contains("Extension startup failed") && banner.contains("/reload"),
+                "unexpected banner: {banner}"
+            );
+            assert!(
+                !handle.has_extensions(),
+                "fallback session runs cleanly without the broken extension until /reload"
+            );
+        });
+    }
+
+    #[test]
+    fn kill_ring_yank_session_picker_toggles_and_formerly_inert_actions_route_on_ftui() {
+        let raw_json = r#"{
+            "yank": ["ctrl+y"],
+            "yankPop": ["alt+y"],
+            "newSession": ["f5"],
+            "tree": ["f6"],
+            "fork": ["f7"],
+            "branchPicker": ["alt+b"],
+            "branchNextSibling": ["ctrl+shift+right"],
+            "branchPrevSibling": ["ctrl+shift+left"],
+            "renameSession": ["ctrl+r"],
+            "clear": ["f8"]
+        }"#;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kb_path = temp.path().join("keybindings.json");
+        std::fs::write(&kb_path, raw_json).expect("write keybindings");
+        let bindings = KeyBindings::load(&kb_path).expect("load keybindings");
+        let (_agent_tx, agent_rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let doomed_session = temp.path().join("doomed.jsonl");
+        let kept_session = temp.path().join("kept.jsonl");
+        std::fs::write(&doomed_session, "{}\n").expect("write doomed");
+        std::fs::write(&kept_session, "{}\n").expect("write kept");
+
+        let mut model = PiFtuiModel::new(agent_rx)
+            .with_submit_channel(submit_tx)
+            .with_keybindings(bindings);
+        model.available_sessions = vec![
+            (
+                "zeta session · 2 msgs".to_string(),
+                doomed_session.display().to_string(),
+            ),
+            (
+                "alpha session · 5 msgs".to_string(),
+                kept_session.display().to_string(),
+            ),
+        ];
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // 1. Kill ring: DeleteWordBackward twice -> Yank -> YankPop.
+        sim.model_mut().input.set_text("alpha beta gamma");
+        sim.model_mut().input.move_to_document_end();
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::ALT)); // kills "gamma"
+        sim.inject_event(key(KeyCode::Backspace, Modifiers::ALT)); // kills "beta "
+        assert_eq!(sim.model().input.text(), "alpha ");
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::CTRL)); // yanks "beta "
+        assert_eq!(sim.model().input.text(), "alpha beta ");
+        sim.inject_event(key(KeyCode::Char('y'), Modifiers::ALT)); // yankPop -> "gamma"
+        assert_eq!(sim.model().input.text(), "alpha gamma");
+
+        // 2. Custom Clear binding clears draft.
+        sim.inject_event(key(KeyCode::F(8), Modifiers::empty()));
+        assert!(sim.model().input.is_empty());
+
+        // 3. Sibling branch & session actions dispatch UiCommands.
+        sim.inject_event(key(KeyCode::Right, Modifiers::CTRL | Modifiers::SHIFT));
+        assert_eq!(
+            submit_rx.try_recv().unwrap(),
+            UiCommand::CycleSiblingBranch { forward: true }
+        );
+        sim.inject_event(key(KeyCode::Left, Modifiers::CTRL | Modifiers::SHIFT));
+        assert_eq!(
+            submit_rx.try_recv().unwrap(),
+            UiCommand::CycleSiblingBranch { forward: false }
+        );
+        sim.inject_event(key(KeyCode::F(6), Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().unwrap(),
+            UiCommand::Tree {
+                args: String::new()
+            }
+        );
+
+        // 4. `/resume` session picker toggles (`ctrl+p`, `ctrl+s`, `ctrl+n`), delete (`ctrl+d`), and rename (`ctrl+r`).
+        sim.model_mut().route_slash_command_tail("/resume");
+        assert!(sim.model().picker.is_some());
+        sim.inject_event(key(KeyCode::Char('p'), Modifiers::CTRL));
+        assert!(sim.model().session_picker_options.show_path);
+        assert!(
+            sim.model().picker.as_ref().unwrap().items[0]
+                .contains(&doomed_session.display().to_string())
+        );
+        sim.inject_event(key(KeyCode::Char('s'), Modifiers::CTRL));
+        assert!(sim.model().session_picker_options.sort_by_name);
+        assert!(sim.model().picker.as_ref().unwrap().items[0].starts_with("alpha session"));
+        // Move down to `zeta session` (`doomed_session`) and delete it via `ctrl+d`.
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert!(
+            !doomed_session.exists(),
+            "DeleteSession must remove session file"
+        );
+        assert_eq!(sim.model().picker.as_ref().unwrap().items.len(), 1);
+        // RenameSession (`ctrl+r`) closes picker and stages `/rename `.
+        sim.inject_event(key(KeyCode::Char('r'), Modifiers::CTRL));
+        assert!(sim.model().picker.is_none());
+        assert_eq!(sim.model().input.text(), "/rename ");
+
+        for action in AppAction::all() {
+            assert!(!crate::keybindings::is_inert_on_ftui(*action));
+        }
     }
 }
 

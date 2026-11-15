@@ -44,6 +44,8 @@ use std::time::Duration;
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
+pub use crate::agent_cx::AgentCx;
+pub use crate::approval::{ApprovalMode, ApprovalState};
 pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
@@ -53,14 +55,15 @@ pub use crate::extensions::{
 };
 pub use crate::model::ThinkingLevel;
 pub use crate::model::{
-    AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, MediaContent, Message,
-    StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall,
-    ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, Cost, CustomMessage, ImageContent,
+    MediaContent, Message, StopDetails, StopReason, StreamEvent, TextContent, ThinkingContent,
+    ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 pub use crate::models::{ModelEntry, ModelRegistry};
+pub use crate::plan::{PlanChange, PlanMode, PlanPersistence, SessionPlanReview};
 pub use crate::provider::{
-    Context as ProviderContext, InputType, Model, ModelCost, Provider, StreamOptions,
-    ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
+    Context as ProviderContext, InputType, Model, ModelCost, Provider, ProviderCapabilities,
+    StreamOptions, ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
 pub use crate::session::Session;
 pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
@@ -662,6 +665,36 @@ pub struct SessionOptions {
     /// `AgentConfig` semantics, for every tool call when `approval_state` is
     /// `None`).
     pub tool_approval: Option<crate::agent::ToolApprovalHandler>,
+
+    /// One-shot pre-initialized startup state handed from `main` into the
+    /// default FTUI launch (`bd-2crrf`), avoiding duplicate disk/network OAuth
+    /// token refreshes on startup while allowing subsequent `/new` and
+    /// `/resume` template clones to reload fresh disk state.
+    #[doc(hidden)]
+    pub startup_bootstrap: Arc<Mutex<Option<SdkStartupBootstrap>>>,
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct SdkStartupBootstrap {
+    pub config: Config,
+    pub auth: AuthStorage,
+    pub oauth_refresh: crate::auth::OAuthRefreshReport,
+    pub model_registry: ModelRegistry,
+}
+
+impl SessionOptions {
+    #[doc(hidden)]
+    pub fn set_startup_bootstrap(&mut self, bootstrap: SdkStartupBootstrap) {
+        self.startup_bootstrap = Arc::new(Mutex::new(Some(bootstrap)));
+    }
+
+    fn take_startup_bootstrap(&self) -> Option<SdkStartupBootstrap> {
+        self.startup_bootstrap
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
 }
 
 impl Default for SessionOptions {
@@ -714,6 +747,7 @@ impl Default for SessionOptions {
             compaction_settings: None,
             approval_state: None,
             tool_approval: None,
+            startup_bootstrap: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -887,6 +921,11 @@ pub struct AgentSessionHandle {
     /// Where the chain walk left off, what to return to, and when the cooldown
     /// on returning started. Per-process, matching both existing surfaces.
     failover_state: crate::failover::FailoverState,
+    /// Optional shared live credential store consulted dynamically during
+    /// failover and primary restoration so `/login` and `/logout` update
+    /// fallback eligibility immediately without restarting `pi`.
+    shared_auth: Option<Arc<Mutex<(u64, crate::auth::AuthStorage)>>>,
+    shared_auth_epoch: u64,
     /// Runtime this session built for itself because extensions were loaded and
     /// the embedder supplied no [`SessionOptions::runtime_handle`] (bd-8rvry).
     ///
@@ -2659,6 +2698,8 @@ impl AgentSessionHandle {
             retry: None,
             failover: None,
             failover_state: crate::failover::FailoverState::new_empty(),
+            shared_auth: None,
+            shared_auth_epoch: 0,
             event_runtime: None,
         }
     }
@@ -3180,6 +3221,14 @@ impl AgentSessionHandle {
             .map(ExtensionRegion::manager)
     }
 
+    /// Return any non-fatal extension `startup` / `session_start` hook warnings
+    /// recorded when this session initialized or reloaded its extensions.
+    #[must_use]
+    pub fn extension_startup_warnings(&self) -> Vec<String> {
+        self.extension_manager()
+            .map_or_else(Vec::new, ExtensionManager::startup_warnings)
+    }
+
     /// Return a reference to the extension region (if extensions are loaded).
     ///
     /// The region wraps the extension manager with lifecycle management.
@@ -3349,17 +3398,28 @@ impl AgentSessionHandle {
     /// path works for runtime CLIs that need to retitle a live session.
     pub async fn set_session_name(&mut self, name: impl Into<String>) -> Result<()> {
         let name = name.into();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.append_session_info(Some(name));
-        }
-        self.session.persist_session().await
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        candidate.append_session_info(Some(name));
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "session rename",
+                cx.cx(),
+            )
+            .await
     }
 
     /// OMP `/fresh`: reset provider stream state without touching the
@@ -3367,17 +3427,40 @@ impl AgentSessionHandle {
     /// re-derives the prompt cache key), and a `fresh` custom entry records
     /// the reset. Returns the new id.
     pub async fn fresh_stream_state(&mut self) -> Result<String> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let new_id = {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            crate::checkpoint::fresh_stream_state(&mut self.session.agent, &mut guard)
-        };
-        self.session.persist_session().await?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let new_id = format!("fresh-{now_ms}-{}", uuid::Uuid::new_v4().simple());
+        candidate.append_custom_entry(
+            "fresh".to_string(),
+            Some(serde_json::json!({
+                "schema": "pi.fresh.v1",
+                "newSessionId": new_id,
+                "reason": "operator /fresh: provider cache + stream bookkeeping reset",
+            })),
+        );
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "fresh stream state",
+                cx.cx(),
+            )
+            .await?;
+        crate::app::rebind_stream_options_session(self.session.agent.stream_options_mut(), &new_id);
         Ok(new_id)
     }
 
@@ -3387,20 +3470,31 @@ impl AgentSessionHandle {
         &mut self,
         mode: crate::approval::ApprovalMode,
     ) -> Result<()> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.append_custom_entry(
-                "approval_mode".to_string(),
-                Some(serde_json::json!({"mode": mode.as_str()})),
-            );
-        }
-        self.session.persist_session().await
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        candidate.append_custom_entry(
+            "approval_mode".to_string(),
+            Some(serde_json::json!({"mode": mode.as_str()})),
+        );
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "approval mode",
+                cx.cx(),
+            )
+            .await
     }
 
     /// Record a user `!` / `!!` shell run (a `BashExecution` message), as
@@ -3410,17 +3504,28 @@ impl AgentSessionHandle {
         &mut self,
         message: crate::session::SessionMessage,
     ) -> Result<()> {
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut guard = self
-                .session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            guard.append_message(message);
-        }
-        self.session.persist_session().await
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        candidate.append_message(message);
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "bash execution",
+                cx.cx(),
+            )
+            .await
     }
 
     /// `/checkpoint [name] [note]` (bd-cv653.3.7): mark the active context so
@@ -4031,11 +4136,99 @@ impl AgentSessionHandle {
 
     /// Apply credentials changed by an interactive login/logout to both the
     /// live model and future fallback candidates, retaining the CLI key pin.
-    pub(crate) fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
+    pub fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
         self.session.scope_auth_storage(&mut auth);
+        let previous = self
+            .session
+            .auth_storage()
+            .cloned()
+            .or_else(|| self.failover.as_ref().map(|opts| opts.auth.clone()));
+        let pre_registry = self.session.model_registry().cloned();
         self.session.adopt_auth_storage(auth.clone());
+        let post_registry = self.session.model_registry().cloned();
         if let Some(options) = &mut self.failover {
-            Arc::make_mut(options).auth = auth;
+            let opts = Arc::make_mut(options);
+            crate::models::refresh_entries_stored_credentials(
+                &mut opts.available_models,
+                previous.as_ref(),
+                &auth,
+            );
+            if let (Some(before), Some(after)) = (&pre_registry, &post_registry) {
+                for post_entry in after.models() {
+                    let was_ready = before
+                        .find(&post_entry.model.provider, &post_entry.model.id)
+                        .is_some_and(|pre| crate::models::model_entry_is_ready(&pre));
+                    let already_admitted = opts.available_models.iter().any(|existing| {
+                        existing
+                            .model
+                            .provider
+                            .eq_ignore_ascii_case(&post_entry.model.provider)
+                            && existing.model.id.eq_ignore_ascii_case(&post_entry.model.id)
+                    });
+                    if !was_ready
+                        && crate::models::model_entry_is_ready(post_entry)
+                        && !already_admitted
+                    {
+                        opts.available_models.push(post_entry.clone());
+                    }
+                }
+            }
+            opts.available_models
+                .retain(crate::models::model_entry_is_ready);
+            opts.auth = auth.clone();
+        }
+        if let Some(shared) = &self.shared_auth
+            && let Ok(mut guard) = shared.lock()
+        {
+            let next_epoch = guard.0.saturating_add(1);
+            *guard = (next_epoch, auth);
+            self.shared_auth_epoch = next_epoch;
+        }
+    }
+
+    /// Update credentials through a shared `Arc<Mutex<...>>` handle and refresh
+    /// fallback eligibility dynamically without restarting the session.
+    pub fn update_shared_auth_storage(&mut self, f: impl FnOnce(&mut crate::auth::AuthStorage)) {
+        let shared = self.ensure_shared_auth_storage();
+        let updated = {
+            let Ok(mut guard) = shared.lock() else {
+                return;
+            };
+            f(&mut guard.1);
+            guard.0 = guard.0.saturating_add(1);
+            guard.1.clone()
+        };
+        self.adopt_auth_storage(updated);
+    }
+
+    pub(crate) fn ensure_shared_auth_storage(
+        &mut self,
+    ) -> Arc<Mutex<(u64, crate::auth::AuthStorage)>> {
+        if let Some(shared) = &self.shared_auth {
+            return Arc::clone(shared);
+        }
+        let initial = self
+            .session
+            .auth_storage()
+            .cloned()
+            .or_else(|| self.failover.as_ref().map(|opts| opts.auth.clone()))
+            .unwrap_or_else(|| crate::auth::AuthStorage::empty_at(Config::auth_path()));
+        let shared = Arc::new(Mutex::new((1_u64, initial)));
+        self.shared_auth = Some(Arc::clone(&shared));
+        self.shared_auth_epoch = 1;
+        shared
+    }
+
+    pub(crate) fn sync_shared_auth_if_updated(&mut self) {
+        let Some(shared) = self.shared_auth.clone() else {
+            return;
+        };
+        let maybe_updated = shared.lock().ok().and_then(|guard| {
+            (guard.0 != self.shared_auth_epoch).then(|| (guard.0, guard.1.clone()))
+        });
+        if let Some((epoch, auth)) = maybe_updated {
+            self.shared_auth_epoch = epoch;
+            self.adopt_auth_storage(auth);
         }
     }
 
@@ -4338,12 +4531,17 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
 pub(crate) async fn create_agent_session_deferred_mcp(
     options: SessionOptions,
 ) -> Result<AgentSessionHandle> {
-    let process_cwd =
-        std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
-    let requested_cwd = options.working_directory.as_deref().map_or_else(
-        || process_cwd.clone(),
-        |path| resolve_path_for_cwd(path, &process_cwd),
-    );
+    let requested_cwd = match options.working_directory.as_deref() {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => {
+            let process_cwd = std::env::current_dir()
+                .map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
+            resolve_path_for_cwd(path, &process_cwd)
+        }
+        None => {
+            std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?
+        }
+    };
     // Resolve caller-supplied locations before discovering a saved workspace.
     // A relative session path must not be reinterpreted inside its own saved
     // cwd once metadata chooses the runtime's project directory.
@@ -4429,12 +4627,17 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             )
         },
     );
-    let mut config = load_session_config(
-        &cwd,
-        &global_dir,
-        config_override.as_deref(),
-        workspace_trusted,
-    )?;
+    let mut startup_bootstrap = options.take_startup_bootstrap();
+    let mut config = if let Some(bootstrap) = startup_bootstrap.as_ref() {
+        bootstrap.config.clone()
+    } else {
+        load_session_config(
+            &cwd,
+            &global_dir,
+            config_override.as_deref(),
+            workspace_trusted,
+        )?
+    };
     apply_session_out_config(&mut config, &options);
     let mut session = Session::new(&cli, &config).await?;
     if let Some(saved) = &saved_workdir {
@@ -4480,34 +4683,6 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // next save, including CLI --add-dir handed through the FTUI SDK.
         session.set_additional_roots(&workspace.additional_roots());
     }
-    let auth_path = global_dir.join("auth.json");
-    let auth_result = AuthStorage::load_async(auth_path.clone()).await;
-    let mut auth = match auth_result {
-        Ok(auth) => auth,
-        Err(err)
-            if options
-                .api_key
-                .as_deref()
-                .is_some_and(|k| !k.trim().is_empty()) =>
-        {
-            tracing::warn!(
-                "stored credentials are unavailable ({err}); continuing with explicit api_key only"
-            );
-            AuthStorage::empty_at(auth_path)
-        }
-        Err(err) => return Err(err),
-    };
-    auth.set_command_working_directory(&cwd)?;
-    // gh #218: refresh per provider; only a failure for the provider this
-    // session actually selects is an error (checked after selection below).
-    let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
-    if !oauth_refresh.failed.is_empty() {
-        tracing::warn!(
-            providers = ?oauth_refresh.failed_provider_ids(),
-            "stored OAuth credentials could not be refreshed; ignored unless the session selects one of them"
-        );
-    }
-
     let raw_package_dir = options
         .package_dir
         .clone()
@@ -4515,8 +4690,44 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // bd-jtehj: interpret relative package roots against the session cwd —
     // never the ambient process cwd — before prompt discovery sees them.
     let package_dir = crate::app::stable_package_dir(&raw_package_dir, Some(&cwd));
-    let models_path = default_models_path(&global_dir);
-    let mut model_registry = ModelRegistry::load(&auth, Some(models_path));
+    let (mut auth, oauth_refresh, mut model_registry) = if let Some(bootstrap) =
+        startup_bootstrap.take()
+    {
+        let mut auth = bootstrap.auth;
+        auth.set_command_working_directory(&cwd)?;
+        (auth, bootstrap.oauth_refresh, bootstrap.model_registry)
+    } else {
+        let auth_path = global_dir.join("auth.json");
+        let auth_result = AuthStorage::load_async(auth_path.clone()).await;
+        let mut auth = match auth_result {
+            Ok(auth) => auth,
+            Err(err)
+                if options
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|k| !k.trim().is_empty()) =>
+            {
+                tracing::warn!(
+                    "stored credentials are unavailable ({err}); continuing with explicit api_key only"
+                );
+                AuthStorage::empty_at(auth_path)
+            }
+            Err(err) => return Err(err),
+        };
+        auth.set_command_working_directory(&cwd)?;
+        // gh #218: refresh per provider; only a failure for the provider this
+        // session actually selects is an error (checked after selection below).
+        let oauth_refresh = auth.refresh_expired_oauth_tokens_report().await;
+        if !oauth_refresh.failed.is_empty() {
+            tracing::warn!(
+                providers = ?oauth_refresh.failed_provider_ids(),
+                "stored OAuth credentials could not be refreshed; ignored unless the session selects one of them"
+            );
+        }
+        let models_path = default_models_path(&global_dir);
+        let model_registry = ModelRegistry::load(&auth, Some(models_path));
+        (auth, oauth_refresh, model_registry)
+    };
 
     let scope_override = config
         .model_scope_overrides
@@ -4922,6 +5133,11 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         agent_session.scope_auth_storage(&mut options.auth);
         Arc::new(options)
     });
+    let shared_auth = agent_session
+        .auth_storage()
+        .cloned()
+        .map(|auth| Arc::new(Mutex::new((1_u64, auth))));
+    let shared_auth_epoch = u64::from(shared_auth.is_some());
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
@@ -4932,6 +5148,8 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         retry: options.retry,
         failover_state,
         failover,
+        shared_auth,
+        shared_auth_epoch,
         event_runtime,
     })
 }
@@ -5276,7 +5494,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         runtime.block_on(Box::pin(future))
     }
 
-    fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn current_dir_lock() -> crate::TestCurrentDirLockGuard {
         crate::test_current_dir_lock()
     }
 
@@ -5469,6 +5687,9 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
                 ];
                 return Ok(Box::pin(futures::stream::iter(events)));
             }
+            partial.content = vec![crate::model::ContentBlock::Text(
+                crate::model::TextContent::new("ok"),
+            )];
             partial.stop_reason = crate::model::StopReason::Stop;
             partial.error_message = None;
             let events = vec![
@@ -7777,19 +7998,27 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
 
     struct CurrentDirGuard {
         previous: PathBuf,
+        _lock: crate::TestCurrentDirLockGuard,
     }
 
     impl CurrentDirGuard {
         fn new(path: &Path) -> Self {
-            let previous = env::current_dir().expect("current dir");
+            let lock = current_dir_lock();
+            let previous =
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
             env::set_current_dir(path).expect("set current dir");
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for CurrentDirGuard {
         fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
+            if env::set_current_dir(&self.previous).is_err() {
+                let _ = env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
+            }
         }
     }
 
@@ -7956,6 +8185,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
             .process()
             .command(env::current_exe().expect("test executable"));
         command
+            .current_dir(directory.path())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env(CHILD, name)
             .env("NO_PROXY", "127.0.0.1,localhost,::1")
@@ -8235,9 +8465,21 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         );
         auth.save().expect("initial saved API key");
         let audio = media_audio_fixture();
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\n",
+            serde_json::json!({
+                "type": "speech.audio.delta",
+                "audio": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &audio),
+            }),
+            serde_json::json!({
+                "type": "speech.audio.done",
+                "usage": {"input_tokens": 10, "output_tokens": 100, "total_tokens": 110},
+            }),
+        )
+        .into_bytes();
         let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
-            (200, "audio/wav", audio.clone()),
-            (200, "audio/wav", audio.clone()),
+            (200, "text/event-stream", sse.clone()),
+            (200, "text/event-stream", sse),
         ]);
         options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
             name: "tts",
@@ -11870,7 +12112,10 @@ export default function init(pi) {
                 assert!(path.is_file());
                 let checkpoint_bytes = std::fs::read(&path).unwrap();
                 if with_extension {
-                    assert_eq!(probe.observed.lock().unwrap().as_slice(), &[path.clone()]);
+                    assert_eq!(
+                        probe.observed.lock().unwrap().as_slice(),
+                        std::slice::from_ref(&path)
+                    );
                 } else {
                     budget.record(0.25).unwrap();
                 }
@@ -12293,12 +12538,13 @@ export default function init(pi) {
                     "every public turn must retain the configured request cap"
                 );
 
-                let mut registry = handle.session.model_registry().unwrap().clone();
-                let mut current = registry.find("openai", "gpt-4o").unwrap();
+                let existing_registry = handle.session.model_registry().unwrap();
+                let mut current = existing_registry.find("openai", "gpt-4o").unwrap();
                 current.model.max_tokens = 1_536;
-                let mut next = registry.find("openai", "gpt-4o-mini").unwrap();
+                let mut next = existing_registry.find("openai", "gpt-4o-mini").unwrap();
                 next.model.max_tokens = 3_072;
-                registry.merge_entries(vec![current, next]);
+                let registry =
+                    crate::models::ModelRegistry::from_entries_for_tests(vec![current, next]);
                 handle.session.set_model_registry(registry);
                 handle
                     .prompt("refreshed catalog", |_| {})
@@ -12917,5 +13163,127 @@ export default function init(pi) {
         let handle = run_async(create_agent_session(options)).expect("create session");
         assert!(!handle.has_tool("ask"));
         assert!(handle.ask_tool().is_some());
+    }
+
+    #[test]
+    fn quarantined_session_mutators_fail_closed_without_mutating_state() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        // Positive healthy baseline: all 4 mutators succeed and persist cleanly.
+        run_async(handle.set_session_name("healthy-name")).expect("healthy rename");
+        let stream_id = run_async(handle.fresh_stream_state()).expect("healthy fresh");
+        run_async(handle.record_approval_mode(crate::approval::ApprovalMode::AlwaysAsk))
+            .expect("healthy approval mode");
+        run_async(
+            handle.record_bash_execution(crate::session::SessionMessage::BashExecution {
+                command: "echo ok".to_string(),
+                output: "ok".to_string(),
+                exit_code: 0,
+                cancelled: Some(false),
+                truncated: Some(false),
+                full_output_path: None,
+                timestamp: Some(1),
+                extra: HashMap::new(),
+            }),
+        )
+        .expect("healthy bash record");
+
+        // Planted negative: latch persistence quarantine and verify all 4 fail closed
+        // without mutating in-memory session entries or live stream session_id.
+        let store = handle.session_store();
+        let snapshot_before = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+        let stream_before = handle.session.agent.stream_options().session_id.clone();
+        assert_eq!(stream_before.as_deref(), Some(stream_id.as_str()));
+
+        let admission = handle.session.provider_admission_gate();
+        admission.block("simulated durable save quarantine".to_string());
+
+        let rename_err = run_async(handle.set_session_name("poisoned-name"))
+            .expect_err("quarantined rename must fail closed");
+        assert!(
+            rename_err
+                .to_string()
+                .contains("simulated durable save quarantine")
+        );
+
+        let fresh_err = run_async(handle.fresh_stream_state())
+            .expect_err("quarantined fresh_stream_state must fail closed");
+        assert!(
+            fresh_err
+                .to_string()
+                .contains("simulated durable save quarantine")
+        );
+
+        let approval_err =
+            run_async(handle.record_approval_mode(crate::approval::ApprovalMode::Yolo))
+                .expect_err("quarantined record_approval_mode must fail closed");
+        assert!(
+            approval_err
+                .to_string()
+                .contains("simulated durable save quarantine")
+        );
+
+        let bash_err = run_async(handle.record_bash_execution(
+            crate::session::SessionMessage::BashExecution {
+                command: "echo forbidden".to_string(),
+                output: "forbidden".to_string(),
+                exit_code: 0,
+                cancelled: Some(false),
+                truncated: Some(false),
+                full_output_path: None,
+                timestamp: Some(2),
+                extra: HashMap::new(),
+            },
+        ))
+        .expect_err("quarantined record_bash_execution must fail closed");
+        assert!(
+            bash_err
+                .to_string()
+                .contains("simulated durable save quarantine")
+        );
+
+        let snapshot_after = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+        assert!(
+            snapshot_after == snapshot_before,
+            "quarantined mutators must leave Session journal untouched"
+        );
+        assert_eq!(
+            handle.session.agent.stream_options().session_id,
+            stream_before,
+            "quarantined fresh_stream_state must not rebind live stream_options"
+        );
+    }
+
+    #[test]
+    fn startup_bootstrap_handoff_is_consumed_once_and_reloads_on_clone() {
+        let tmp = tempdir().expect("tempdir");
+        let mut options = hermetic_session_options(tmp.path());
+        let auth_path = tmp.path().join("auth.json");
+        let mut bootstrap_auth = AuthStorage::empty_at(auth_path);
+        bootstrap_auth.set(
+            "anthropic",
+            crate::auth::AuthCredential::ApiKey {
+                key: "bootstrap-only-key".to_string(),
+            },
+        );
+        options.provider = Some("anthropic".to_string());
+        options.model = Some("claude-sonnet-4-5".to_string());
+        options.api_key = None;
+        options.set_startup_bootstrap(SdkStartupBootstrap {
+            config: Config::default(),
+            auth: bootstrap_auth.clone(),
+            oauth_refresh: crate::auth::OAuthRefreshReport::default(),
+            model_registry: ModelRegistry::load(&bootstrap_auth, None),
+        });
+        let template_clone = options.clone();
+        let first = run_async(create_agent_session(options)).expect("bootstrap session");
+        assert_eq!(
+            first.session().agent.stream_options().api_key.as_deref(),
+            Some("bootstrap-only-key")
+        );
+        assert!(
+            template_clone.take_startup_bootstrap().is_none(),
+            "one-shot bootstrap handoff must already be consumed so /new and /resume reload fresh disk state"
+        );
     }
 }

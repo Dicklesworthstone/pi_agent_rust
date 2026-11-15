@@ -2513,6 +2513,7 @@ pub fn shutdown_session_services() {
 }
 
 #[cfg(test)]
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StartupTestStage {
     BeforeReservation,

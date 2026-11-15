@@ -279,22 +279,48 @@ fn vcr_anthropic_tool_schemas(cwd: &Path) -> Vec<Value> {
         .iter()
         .filter(|tool| !registry.is_discoverable(tool.name()))
         .map(|tool| {
+            let raw_schema = tool.parameters();
+            let schema = pi::providers::anthropic_tool_schema(&raw_schema);
             json!({
                 "name": tool.name(),
                 "description": tool.description(),
-                "input_schema": tool.parameters(),
+                "input_schema": schema,
             })
         })
         .collect();
-    // `submit_plan` is appended by main.rs via `agent.extend_tools` after
-    // registry construction ("always registered — self-errors outside plan
-    // mode"), so it is part of the live schema too.
-    let submit_plan = pi::plan::SubmitPlanTool::new(pi::plan::PlanState::new(), false);
-    schemas.push(json!({
-        "name": submit_plan.name(),
-        "description": submit_plan.description(),
-        "input_schema": submit_plan.parameters(),
-    }));
+    if enabled.contains(&"todo") {
+        let session = std::sync::Arc::new(asupersync::sync::Mutex::new(
+            pi::session::Session::in_memory(),
+        ));
+        let todo = pi::todo::TodoTool::new(session);
+        let raw_schema = todo.parameters();
+        let schema = pi::providers::anthropic_tool_schema(&raw_schema);
+        schemas.push(json!({
+            "name": todo.name(),
+            "description": todo.description(),
+            "input_schema": schema,
+        }));
+    }
+    if enabled.contains(&"submit_plan") {
+        let submit_plan = pi::plan::SubmitPlanTool::new(pi::plan::PlanState::new(), false);
+        let raw_schema = submit_plan.parameters();
+        let schema = pi::providers::anthropic_tool_schema(&raw_schema);
+        schemas.push(json!({
+            "name": submit_plan.name(),
+            "description": submit_plan.description(),
+            "input_schema": schema,
+        }));
+    }
+    if enabled.contains(&"ask") {
+        let ask = pi::ask::AskTool::new(pi::ask::AskPolicy::from_config(None));
+        let raw_schema = ask.parameters();
+        let schema = pi::providers::anthropic_tool_schema(&raw_schema);
+        schemas.push(json!({
+            "name": ask.name(),
+            "description": ask.description(),
+            "input_schema": schema,
+        }));
+    }
     schemas
 }
 
@@ -2093,6 +2119,9 @@ fn e2e_tui_stream_scroll_and_finalize_vcr() {
         1,
         "Expected final marker to render exactly once"
     );
+    let _ = session
+        .tmux
+        .wait_for_pane_contains("Type a message...", COMMAND_TIMEOUT);
     let pane = session
         .tmux
         .wait_for_pane_contains("PgUp/PgDn", COMMAND_TIMEOUT);

@@ -653,14 +653,14 @@ mod foreground_pipe_ownership {
     impl WriterOwner {
         fn is_live(&mut self) -> bool {
             let pid = self.pid.expect("writer remains owned");
-            match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG)
+            if rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG)
                 .expect("query owned writer")
+                .is_none()
             {
-                None => true,
-                Some(_) => {
-                    self.pid = None;
-                    false
-                }
+                true
+            } else {
+                self.pid = None;
+                false
             }
         }
     }
@@ -904,7 +904,7 @@ mod foreground_pipe_ownership {
                 );
                 harness.record_artifact(
                     format!("foreground-{backend}-{mode}-writer.json"),
-                    &root.join("result.json"),
+                    root.join("result.json"),
                 );
                 finish_case(&harness, &format!("foreground-{backend}-{mode}"));
                 return;

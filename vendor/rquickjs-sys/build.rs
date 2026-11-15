@@ -36,7 +36,9 @@ fn download_wasi_sdk() -> PathBuf {
             other => panic!("Unsupported platform tuple {:?}", other),
         };
 
-        let uri = format!("https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{major_version}/wasi-sdk-{major_version}.{minor_version}-{file_suffix}.tar.gz");
+        let uri = format!(
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-{major_version}/wasi-sdk-{major_version}.{minor_version}-{file_suffix}.tar.gz"
+        );
 
         println!("Downloading WASI SDK archive from {uri} to {archive_path:?}");
 

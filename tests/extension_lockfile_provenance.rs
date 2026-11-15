@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Extension lockfile and provenance verification integration tests (bd-3br2a, SEC-2.2).
 //!
 //! Tests the deterministic lockfile format, digest computation, trust state
@@ -7,9 +8,9 @@ mod common;
 
 use pi::package_manager::{
     PACKAGE_LOCK_SCHEMA, PACKAGE_TRUST_AUDIT_SCHEMA, PackageEntryTrustState, PackageLockAction,
-    PackageLockEntry, PackageLockfile, PackageResolvedProvenance, PackageSourceKind,
-    digest_package_path, evaluate_lock_transition, read_package_lockfile, sort_lock_entries,
-    write_package_lockfile_atomic,
+    PackageLockEntry, PackageLockfile, PackageManager, PackageResolvedProvenance,
+    PackageSourceKind, ResolveRoots, digest_package_path, evaluate_lock_transition,
+    read_package_lockfile, sort_lock_entries, write_package_lockfile_atomic,
 };
 
 // ============================================================================
@@ -510,4 +511,249 @@ fn sequential_install_verify_update_cycle() {
     let t5 = evaluate_lock_transition(Some(&v2), &tampered, PackageLockAction::Install);
     assert!(t5.is_err());
     assert_eq!(t5.unwrap_err().code, "digest_mismatch");
+}
+
+// ============================================================================
+// Startup / Resolution Merkle Verification (bd-package-lock-merkle-verify-startup-qh50t)
+// ============================================================================
+
+fn isolated_roots(root: &std::path::Path, cwd: &std::path::Path) -> ResolveRoots {
+    let global_base_dir = root.join("global-agent");
+    let project_base_dir = cwd.join(".pi");
+    std::fs::create_dir_all(&global_base_dir).unwrap();
+    std::fs::create_dir_all(&project_base_dir).unwrap();
+    ResolveRoots {
+        global_settings_path: global_base_dir.join("settings.json"),
+        project_settings_path: project_base_dir.join("settings.json"),
+        global_base_dir,
+        project_base_dir,
+        project_settings_enabled: true,
+        home_dir: None,
+    }
+}
+
+#[test]
+fn startup_resolve_verifies_ten_locked_packages_fast_and_fails_closed_on_single_byte_tamper() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let roots = isolated_roots(temp.path(), &cwd);
+
+    // Seed 10 installed project-scoped npm packages + matching packages.lock.json.
+    let npm_node_modules = roots.project_base_dir.join("npm").join("node_modules");
+    std::fs::create_dir_all(&npm_node_modules).unwrap();
+
+    let mut package_specs = Vec::new();
+    let mut lock_entries = Vec::new();
+    for idx in 0..10 {
+        let pkg_name = format!("verified-ext-{idx}");
+        let pkg_dir = npm_node_modules.join(&pkg_name);
+        let ext_dir = pkg_dir.join("extensions");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            serde_json::json!({
+                "name": pkg_name,
+                "version": "1.0.0",
+                "pi": { "extensions": ["extensions/index.js"] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("index.js"),
+            format!("export default function ext{idx}() {{ return {idx}; }}\n"),
+        )
+        .unwrap();
+        let digest = digest_package_path(&pkg_dir).unwrap();
+        package_specs.push(format!("npm:{pkg_name}@1.0.0"));
+        lock_entries.push(npm_entry(&pkg_name, "1.0.0", &digest));
+    }
+    sort_lock_entries(&mut lock_entries);
+
+    std::fs::write(
+        &roots.project_settings_path,
+        serde_json::json!({ "packages": package_specs }).to_string(),
+    )
+    .unwrap();
+    let lockfile_path = roots.project_base_dir.join("packages.lock.json");
+    write_package_lockfile_atomic(
+        &lockfile_path,
+        &PackageLockfile {
+            schema: PACKAGE_LOCK_SCHEMA.to_string(),
+            entries: lock_entries.clone(),
+        },
+    )
+    .unwrap();
+
+    let manager = PackageManager::new(cwd);
+
+    // Positive: untampered 10-package startup verification succeeds cleanly within budget.
+    let started = std::time::Instant::now();
+    let resolved = common::run_async({
+        let manager = manager.clone();
+        let roots = roots.clone();
+        async move { manager.resolve_with_roots(&roots).await }
+    })
+    .expect("untampered locked packages must resolve cleanly");
+    let elapsed = started.elapsed();
+    assert_eq!(resolved.extensions.len(), 10);
+    assert!(
+        elapsed < std::time::Duration::from_millis(250),
+        "10-package Merkle verification took unexpectedly long: {elapsed:?}"
+    );
+
+    // Planted negative: mutate 1 byte in verified-ext-3/extensions/index.js without updating lockfile.
+    let target_file = npm_node_modules
+        .join("verified-ext-3")
+        .join("extensions")
+        .join("index.js");
+    let expected_sha = lock_entries
+        .iter()
+        .find(|entry| entry.identity == "npm:verified-ext-3")
+        .unwrap()
+        .digest_sha256
+        .clone();
+    std::fs::write(
+        &target_file,
+        "export default function ext3() { return 9; }\n",
+    )
+    .unwrap();
+    let actual_sha = digest_package_path(&npm_node_modules.join("verified-ext-3")).unwrap();
+    assert_ne!(expected_sha, actual_sha);
+
+    let err = common::run_async(async move { manager.resolve_with_roots(&roots).await })
+        .expect_err("1-byte tamper in locked package must fail closed at startup");
+    let msg = err.to_string();
+    assert!(msg.contains("lock_digest_mismatch"), "got: {msg}");
+    assert!(
+        msg.contains("npm:verified-ext-3"),
+        "must name tampered package: {msg}"
+    );
+    assert!(
+        msg.contains(&expected_sha),
+        "must name expected sha256: {msg}"
+    );
+    assert!(msg.contains(&actual_sha), "must name actual sha256: {msg}");
+    assert!(
+        msg.contains("pi update") || msg.contains("pi remove"),
+        "must include remediation: {msg}"
+    );
+}
+
+#[test]
+fn startup_resolve_without_lockfile_preserves_legacy_compatibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("workspace");
+    let local_pkg = cwd.join("legacy-ext");
+    std::fs::create_dir_all(local_pkg.join("extensions")).unwrap();
+    std::fs::write(
+        local_pkg.join("package.json"),
+        r#"{"name":"legacy-ext","version":"0.1.0","pi":{"extensions":["extensions/index.js"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        local_pkg.join("extensions/index.js"),
+        "export default function legacy() {}\n",
+    )
+    .unwrap();
+
+    let roots = isolated_roots(temp.path(), &cwd);
+    std::fs::write(
+        &roots.project_settings_path,
+        r#"{"packages":["./legacy-ext"]}"#,
+    )
+    .unwrap();
+    assert!(!roots.project_base_dir.join("packages.lock.json").exists());
+
+    let manager = PackageManager::new(cwd);
+    let resolved = common::run_async(async move { manager.resolve_with_roots(&roots).await })
+        .expect("workspace without packages.lock.json must resolve cleanly");
+    assert_eq!(resolved.extensions.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn digest_package_path_rejects_symlink_escaping_package_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside_secret = temp.path().join("outside-secret.txt");
+    std::fs::write(&outside_secret, "top-secret-material\n").unwrap();
+
+    let pkg_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "export const ok = true;\n").unwrap();
+    std::os::unix::fs::symlink(&outside_secret, pkg_dir.join("escape.txt")).unwrap();
+
+    let err =
+        digest_package_path(&pkg_dir).expect_err("symlink escaping package root must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("symlink_escape"), "got: {msg}");
+}
+
+#[test]
+fn streaming_digest_handles_multi_chunk_files_with_crlf_normalization() {
+    let dir_lf = tempfile::tempdir().unwrap();
+    let dir_crlf = tempfile::tempdir().unwrap();
+    let lf_file = dir_lf.path().join("large.js");
+    let crlf_file = dir_crlf.path().join("large.js");
+
+    // > 128 KiB to cross multiple 64 KiB streaming read buffers, including CR across boundaries.
+    let line_lf = format!("{}\n", "a".repeat(1021));
+    let line_crlf = format!("{}\r\n", "a".repeat(1021));
+    std::fs::write(&lf_file, line_lf.repeat(180)).unwrap();
+    std::fs::write(&crlf_file, line_crlf.repeat(180)).unwrap();
+
+    let d_lf = digest_package_path(&lf_file).unwrap();
+    let d_crlf = digest_package_path(&crlf_file).unwrap();
+    assert_eq!(d_lf, d_crlf);
+}
+
+fn lockfile_package_version<'a>(lock_raw: &'a str, pkg_name: &str) -> Option<&'a str> {
+    let needle = format!("name = \"{pkg_name}\"");
+    let mut lines = lock_raw.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == needle {
+            for next in lines.by_ref() {
+                let trimmed = next.trim();
+                if trimmed.is_empty() || trimmed.starts_with("[[package]]") {
+                    break;
+                }
+                if let Some(rest) = trimmed.strip_prefix("version = \"")
+                    && let Some(ver) = rest.strip_suffix('"')
+                {
+                    return Some(ver);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn cargo_lock_resolves_patched_wasmtime_and_synced_fuzz_lockfile() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root_lock = std::fs::read_to_string(manifest_dir.join("Cargo.lock"))
+        .expect("read workspace Cargo.lock");
+    let wasmtime_ver =
+        lockfile_package_version(&root_lock, "wasmtime").expect("wasmtime entry in Cargo.lock");
+    let parts: Vec<u64> = wasmtime_ver
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .take(3)
+        .map(|s| s.parse::<u64>().expect("numeric semver component"))
+        .collect();
+    assert!(
+        parts.len() == 3 && (parts[0], parts[1], parts[2]) >= (48, 0, 8),
+        "GH #258 RUSTSEC remediation requires wasmtime >= 48.0.8 in Cargo.lock, found {wasmtime_ver}"
+    );
+
+    let fuzz_lock = std::fs::read_to_string(manifest_dir.join("fuzz/Cargo.lock"))
+        .expect("read fuzz/Cargo.lock");
+    let fuzz_pi_ver = lockfile_package_version(&fuzz_lock, "pi_agent_rust")
+        .expect("pi_agent_rust entry in fuzz/Cargo.lock");
+    assert_eq!(
+        fuzz_pi_ver,
+        env!("CARGO_PKG_VERSION"),
+        "fuzz/Cargo.lock pi_agent_rust version must match workspace CARGO_PKG_VERSION"
+    );
 }

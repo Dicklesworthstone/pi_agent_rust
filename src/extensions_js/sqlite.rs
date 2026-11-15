@@ -35,13 +35,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fsqlite::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
 use fsqlite_ast::Statement as SqlStatement;
-use fsqlite_parser::Parser;
+use fsqlite_parser::{Lexer, Parser, TokenKind};
 use rquickjs::Ctx;
 use rquickjs::function::Func;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -620,6 +620,944 @@ impl AdmittedSql {
             )
         )
     }
+
+    fn normalized_sql<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        let has_text_busy_timeout = self.statements.iter().any(|tokens| {
+            tokens.first().and_then(Token::word) == Some("pragma")
+                && tokens
+                    .get(1)
+                    .and_then(Token::name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("busy_timeout"))
+                && matches!(tokens.get(3), Some(Token::Text(_)))
+        });
+        if !has_text_busy_timeout {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        let slices = split_sql_statement_slices(sql);
+        if slices.len() != self.statements.len() {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        let rewritten = slices
+            .into_iter()
+            .zip(&self.statements)
+            .map(|(slice, tokens)| {
+                if tokens.first().and_then(Token::word) == Some("pragma")
+                    && tokens
+                        .get(1)
+                        .and_then(Token::name)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("busy_timeout"))
+                {
+                    if tokens.len() == 2 {
+                        return "PRAGMA busy_timeout".to_string();
+                    }
+                    if let Some(ms) = tokens
+                        .get(3)
+                        .and_then(Token::name)
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        return format!("PRAGMA busy_timeout = {ms}");
+                    }
+                }
+                slice.trim().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        std::borrow::Cow::Owned(rewritten)
+    }
+}
+
+fn collect_from_table_names<'a>(from: &'a fsqlite_ast::FromClause, out: &mut Vec<&'a str>) {
+    collect_source_table_names(&from.source, out);
+    for join in &from.joins {
+        collect_source_table_names(&join.table, out);
+    }
+}
+
+fn collect_source_table_names<'a>(
+    source: &'a fsqlite_ast::TableOrSubquery,
+    out: &mut Vec<&'a str>,
+) {
+    match source {
+        fsqlite_ast::TableOrSubquery::Table {
+            name: qualified,
+            alias,
+            ..
+        } => {
+            if qualified.schema.is_none() {
+                out.push(&qualified.name);
+            }
+            if let Some(alias) = alias.as_deref() {
+                out.push(alias);
+            }
+        }
+        fsqlite_ast::TableOrSubquery::ParenJoin(inner) => collect_from_table_names(inner, out),
+        fsqlite_ast::TableOrSubquery::Subquery { .. }
+        | fsqlite_ast::TableOrSubquery::TableFunction { .. } => {}
+    }
+}
+
+fn expr_contains_fts5_aux_call(expr: &fsqlite_ast::Expr, table_names: &[&str]) -> bool {
+    match expr {
+        fsqlite_ast::Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            let is_fts5_aux = (name.eq_ignore_ascii_case("bm25")
+                || name.eq_ignore_ascii_case("highlight")
+                || name.eq_ignore_ascii_case("snippet"))
+                && matches!(
+                    args,
+                    fsqlite_ast::FunctionArgs::List(list)
+                        if matches!(
+                            list.first(),
+                            Some(fsqlite_ast::Expr::Column(col_ref, _))
+                                if col_ref.schema.is_none()
+                                    && col_ref.table.is_none()
+                                    && table_names.iter().any(|t| col_ref.column.eq_ignore_ascii_case(t))
+                        )
+                );
+            if is_fts5_aux {
+                return true;
+            }
+            let in_args = match args {
+                fsqlite_ast::FunctionArgs::Star => false,
+                fsqlite_ast::FunctionArgs::List(list) => list
+                    .iter()
+                    .any(|arg| expr_contains_fts5_aux_call(arg, table_names)),
+            };
+            in_args
+                || order_by
+                    .iter()
+                    .any(|term| expr_contains_fts5_aux_call(&term.expr, table_names))
+                || filter
+                    .as_deref()
+                    .is_some_and(|f| expr_contains_fts5_aux_call(f, table_names))
+                || over.as_ref().is_some_and(|spec| {
+                    spec.partition_by
+                        .iter()
+                        .any(|e| expr_contains_fts5_aux_call(e, table_names))
+                        || spec
+                            .order_by
+                            .iter()
+                            .any(|t| expr_contains_fts5_aux_call(&t.expr, table_names))
+                })
+        }
+        fsqlite_ast::Expr::BinaryOp { left, right, .. }
+        | fsqlite_ast::Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            expr_contains_fts5_aux_call(left, table_names)
+                || expr_contains_fts5_aux_call(right, table_names)
+        }
+        fsqlite_ast::Expr::UnaryOp { expr: inner, .. }
+        | fsqlite_ast::Expr::Cast { expr: inner, .. }
+        | fsqlite_ast::Expr::Collate { expr: inner, .. }
+        | fsqlite_ast::Expr::IsNull { expr: inner, .. } => {
+            expr_contains_fts5_aux_call(inner, table_names)
+        }
+        fsqlite_ast::Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            expr_contains_fts5_aux_call(target, table_names)
+                || expr_contains_fts5_aux_call(low, table_names)
+                || expr_contains_fts5_aux_call(high, table_names)
+        }
+        fsqlite_ast::Expr::In {
+            expr: target, set, ..
+        } => {
+            expr_contains_fts5_aux_call(target, table_names)
+                || matches!(
+                    set,
+                    fsqlite_ast::InSet::List(list)
+                        if list.iter().any(|e| expr_contains_fts5_aux_call(e, table_names))
+                )
+        }
+        fsqlite_ast::Expr::Like {
+            expr: target,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_fts5_aux_call(target, table_names)
+                || expr_contains_fts5_aux_call(pattern, table_names)
+                || escape
+                    .as_deref()
+                    .is_some_and(|e| expr_contains_fts5_aux_call(e, table_names))
+        }
+        fsqlite_ast::Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|e| expr_contains_fts5_aux_call(e, table_names))
+                || whens.iter().any(|(w, t)| {
+                    expr_contains_fts5_aux_call(w, table_names)
+                        || expr_contains_fts5_aux_call(t, table_names)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|e| expr_contains_fts5_aux_call(e, table_names))
+        }
+        fsqlite_ast::Expr::RowValue(items, _) => items
+            .iter()
+            .any(|e| expr_contains_fts5_aux_call(e, table_names)),
+        fsqlite_ast::Expr::Literal(_, _)
+        | fsqlite_ast::Expr::BoundOuterValue { .. }
+        | fsqlite_ast::Expr::Column(_, _)
+        | fsqlite_ast::Expr::Exists { .. }
+        | fsqlite_ast::Expr::Subquery(_, _)
+        | fsqlite_ast::Expr::Raise { .. }
+        | fsqlite_ast::Expr::Placeholder(_, _) => false,
+    }
+}
+
+fn visit_window_spec_placeholders_mut(
+    spec: &mut fsqlite_ast::WindowSpec,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    for expr in &mut spec.partition_by {
+        visit_expr_placeholders_mut(expr, visit);
+    }
+    for term in &mut spec.order_by {
+        visit_expr_placeholders_mut(&mut term.expr, visit);
+    }
+    if let Some(frame) = &mut spec.frame {
+        if let fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) =
+            &mut frame.start
+        {
+            visit_expr_placeholders_mut(expr, visit);
+        }
+        if let Some(
+            fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr),
+        ) = &mut frame.end
+        {
+            visit_expr_placeholders_mut(expr, visit);
+        }
+    }
+}
+
+fn visit_expr_placeholders_mut(
+    expr: &mut fsqlite_ast::Expr,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    match expr {
+        fsqlite_ast::Expr::Placeholder(kind, span) => visit(kind, *span),
+        fsqlite_ast::Expr::BinaryOp { left, right, .. }
+        | fsqlite_ast::Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            visit_expr_placeholders_mut(left, visit);
+            visit_expr_placeholders_mut(right, visit);
+        }
+        fsqlite_ast::Expr::UnaryOp { expr: inner, .. }
+        | fsqlite_ast::Expr::Cast { expr: inner, .. }
+        | fsqlite_ast::Expr::Collate { expr: inner, .. }
+        | fsqlite_ast::Expr::IsNull { expr: inner, .. } => {
+            visit_expr_placeholders_mut(inner, visit);
+        }
+        fsqlite_ast::Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            visit_expr_placeholders_mut(target, visit);
+            visit_expr_placeholders_mut(low, visit);
+            visit_expr_placeholders_mut(high, visit);
+        }
+        fsqlite_ast::Expr::In {
+            expr: target, set, ..
+        } => {
+            visit_expr_placeholders_mut(target, visit);
+            match set {
+                fsqlite_ast::InSet::List(list) => {
+                    for item in list {
+                        visit_expr_placeholders_mut(item, visit);
+                    }
+                }
+                fsqlite_ast::InSet::Subquery(subquery) => {
+                    visit_select_placeholders_mut(subquery, visit);
+                }
+                fsqlite_ast::InSet::Table(_) => {}
+            }
+        }
+        fsqlite_ast::Expr::Like {
+            expr: target,
+            pattern,
+            escape,
+            ..
+        } => {
+            visit_expr_placeholders_mut(target, visit);
+            visit_expr_placeholders_mut(pattern, visit);
+            if let Some(esc) = escape {
+                visit_expr_placeholders_mut(esc, visit);
+            }
+        }
+        fsqlite_ast::Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand {
+                visit_expr_placeholders_mut(op, visit);
+            }
+            for (when_expr, then_expr) in whens {
+                visit_expr_placeholders_mut(when_expr, visit);
+                visit_expr_placeholders_mut(then_expr, visit);
+            }
+            if let Some(el) = else_expr {
+                visit_expr_placeholders_mut(el, visit);
+            }
+        }
+        fsqlite_ast::Expr::Exists { subquery, .. } | fsqlite_ast::Expr::Subquery(subquery, _) => {
+            visit_select_placeholders_mut(subquery, visit);
+        }
+        fsqlite_ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let fsqlite_ast::FunctionArgs::List(list) = args {
+                for arg in list {
+                    visit_expr_placeholders_mut(arg, visit);
+                }
+            }
+            for term in order_by {
+                visit_expr_placeholders_mut(&mut term.expr, visit);
+            }
+            if let Some(f) = filter {
+                visit_expr_placeholders_mut(f, visit);
+            }
+            if let Some(spec) = over {
+                visit_window_spec_placeholders_mut(spec, visit);
+            }
+        }
+        fsqlite_ast::Expr::RowValue(items, _) => {
+            for item in items {
+                visit_expr_placeholders_mut(item, visit);
+            }
+        }
+        fsqlite_ast::Expr::Literal(_, _)
+        | fsqlite_ast::Expr::BoundOuterValue { .. }
+        | fsqlite_ast::Expr::Column(_, _)
+        | fsqlite_ast::Expr::Raise { .. } => {}
+    }
+}
+
+fn visit_from_placeholders_mut(
+    from: &mut fsqlite_ast::FromClause,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    visit_table_source_placeholders_mut(&mut from.source, visit);
+    for join in &mut from.joins {
+        visit_table_source_placeholders_mut(&mut join.table, visit);
+        if let Some(fsqlite_ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            visit_expr_placeholders_mut(expr, visit);
+        }
+    }
+}
+
+fn visit_table_source_placeholders_mut(
+    source: &mut fsqlite_ast::TableOrSubquery,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    match source {
+        fsqlite_ast::TableOrSubquery::Table { .. } => {}
+        fsqlite_ast::TableOrSubquery::Subquery { query, .. } => {
+            visit_select_placeholders_mut(query, visit);
+        }
+        fsqlite_ast::TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                visit_expr_placeholders_mut(arg, visit);
+            }
+        }
+        fsqlite_ast::TableOrSubquery::ParenJoin(inner) => {
+            visit_from_placeholders_mut(inner, visit);
+        }
+    }
+}
+
+fn visit_select_core_placeholders_mut(
+    core: &mut fsqlite_ast::SelectCore,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    match core {
+        fsqlite_ast::SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for col in columns {
+                if let fsqlite_ast::ResultColumn::Expr { expr, .. } = col {
+                    visit_expr_placeholders_mut(expr, visit);
+                }
+            }
+            if let Some(from_clause) = from {
+                visit_from_placeholders_mut(from_clause, visit);
+            }
+            if let Some(where_expr) = where_clause {
+                visit_expr_placeholders_mut(where_expr, visit);
+            }
+            for expr in group_by {
+                visit_expr_placeholders_mut(expr, visit);
+            }
+            if let Some(having_expr) = having {
+                visit_expr_placeholders_mut(having_expr, visit);
+            }
+            for win in windows {
+                visit_window_spec_placeholders_mut(&mut win.spec, visit);
+            }
+        }
+        fsqlite_ast::SelectCore::Values(values) => {
+            for row in values.iter_mut() {
+                for expr in row {
+                    visit_expr_placeholders_mut(expr, visit);
+                }
+            }
+        }
+    }
+}
+
+fn visit_select_placeholders_mut(
+    select: &mut fsqlite_ast::SelectStatement,
+    visit: &mut impl FnMut(&mut fsqlite_ast::PlaceholderType, fsqlite_ast::Span),
+) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            visit_select_placeholders_mut(&mut cte.query, visit);
+        }
+    }
+    visit_select_core_placeholders_mut(&mut select.body.select, visit);
+    for (_, core) in &mut select.body.compounds {
+        visit_select_core_placeholders_mut(core, visit);
+    }
+    for term in &mut select.order_by {
+        visit_expr_placeholders_mut(&mut term.expr, visit);
+    }
+    if let Some(limit) = &mut select.limit {
+        visit_expr_placeholders_mut(&mut limit.limit, visit);
+        if let Some(offset) = &mut limit.offset {
+            visit_expr_placeholders_mut(offset, visit);
+        }
+    }
+}
+
+/// Work around `fsqlite-core 0.4.10` rejecting unprojected FTS5 auxiliary
+/// functions (`bm25`, `highlight`, `snippet`) in `ORDER BY` by projecting them
+/// as hidden trailing `SELECT` columns and truncating them from query output.
+fn rewrite_unprojected_fts5_order_by_select(
+    stmt: Option<&SqlStatement>,
+) -> (Option<String>, usize) {
+    let Some(SqlStatement::Select(select)) = stmt else {
+        return (None, 0);
+    };
+    if !select.body.compounds.is_empty() || select.order_by.is_empty() {
+        return (None, 0);
+    }
+    let fsqlite_ast::SelectCore::Select {
+        distinct: fsqlite_ast::Distinctness::All,
+        columns: select_cols,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return (None, 0);
+    };
+
+    let mut table_names = Vec::new();
+    collect_from_table_names(from, &mut table_names);
+    if table_names.is_empty() {
+        return (None, 0);
+    }
+
+    let mut needs_hidden = false;
+    for term in &select.order_by {
+        let already_projected = select_cols.iter().any(|col| {
+            matches!(
+                col,
+                fsqlite_ast::ResultColumn::Expr { expr, .. } if expr == &term.expr
+            )
+        });
+        if !already_projected && expr_contains_fts5_aux_call(&term.expr, &table_names) {
+            needs_hidden = true;
+            break;
+        }
+    }
+    if !needs_hidden {
+        return (None, 0);
+    }
+
+    let mut rewritten = select.clone();
+    let mut slots = Vec::new();
+    visit_select_placeholders_mut(&mut rewritten, &mut |kind, span| {
+        slots.push((span.start, kind.clone()));
+    });
+    if slots
+        .iter()
+        .any(|(_, kind)| matches!(kind, fsqlite_ast::PlaceholderType::Anonymous))
+    {
+        slots.sort_by_key(|(start, _)| *start);
+        let mut max_ordinal = 0_u32;
+        let mut named = HashMap::<(char, String), u32>::new();
+        let mut anon_ordinals = HashMap::<u32, u32>::new();
+        for (start, kind) in slots {
+            let ordinal = match kind {
+                fsqlite_ast::PlaceholderType::Anonymous => {
+                    let next = max_ordinal.saturating_add(1);
+                    anon_ordinals.insert(start, next);
+                    next
+                }
+                fsqlite_ast::PlaceholderType::Numbered(n) => n,
+                fsqlite_ast::PlaceholderType::ColonNamed(ident) => *named
+                    .entry((':', ident))
+                    .or_insert_with(|| max_ordinal.saturating_add(1)),
+                fsqlite_ast::PlaceholderType::AtNamed(ident) => *named
+                    .entry(('@', ident))
+                    .or_insert_with(|| max_ordinal.saturating_add(1)),
+                fsqlite_ast::PlaceholderType::DollarNamed(ident) => *named
+                    .entry(('$', ident))
+                    .or_insert_with(|| max_ordinal.saturating_add(1)),
+            };
+            max_ordinal = max_ordinal.max(ordinal);
+        }
+        visit_select_placeholders_mut(&mut rewritten, &mut |kind, span| {
+            if matches!(kind, fsqlite_ast::PlaceholderType::Anonymous)
+                && let Some(&ordinal) = anon_ordinals.get(&span.start)
+            {
+                *kind = fsqlite_ast::PlaceholderType::Numbered(ordinal);
+            }
+        });
+    }
+
+    let order_terms = rewritten.order_by.clone();
+    let fsqlite_ast::SelectCore::Select {
+        columns: rewritten_cols,
+        ..
+    } = &mut rewritten.body.select
+    else {
+        return (None, 0);
+    };
+    let mut hidden_col_count = 0_usize;
+    for term in order_terms {
+        let already_projected = rewritten_cols.iter().any(|col| {
+            matches!(
+                col,
+                fsqlite_ast::ResultColumn::Expr { expr, .. } if expr == &term.expr
+            )
+        });
+        if !already_projected && expr_contains_fts5_aux_call(&term.expr, &table_names) {
+            rewritten_cols.push(fsqlite_ast::ResultColumn::Expr {
+                expr: term.expr,
+                alias: None,
+            });
+            hidden_col_count += 1;
+        }
+    }
+    if hidden_col_count == 0 {
+        (None, 0)
+    } else {
+        (Some(rewritten.to_string()), hidden_col_count)
+    }
+}
+
+fn canonicalize_sql_parameter_tokens(sql: &str) -> Result<String> {
+    let mut chars = sql.chars().peekable();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut max_ordinal = 0_usize;
+    let mut named = HashMap::<String, usize>::new();
+    while let Some(ch) = chars.next() {
+        if ch == '-' && chars.peek() == Some(&'-') {
+            out.push(ch);
+            if let Some(second) = chars.next() {
+                out.push(second);
+            }
+            for comment_ch in chars.by_ref() {
+                out.push(comment_ch);
+                if comment_ch == '\n' || comment_ch == '\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            out.push(ch);
+            if let Some(second) = chars.next() {
+                out.push(second);
+            }
+            while let Some(comment_ch) = chars.next() {
+                out.push(comment_ch);
+                if comment_ch == '*' && chars.peek() == Some(&'/') {
+                    if let Some(end_slash) = chars.next() {
+                        out.push(end_slash);
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`' | '[') {
+            let close = if ch == '[' { ']' } else { ch };
+            out.push(ch);
+            while let Some(next) = chars.next() {
+                out.push(next);
+                if next == close {
+                    if close != ']' && chars.peek() == Some(&close) {
+                        if let Some(escaped) = chars.next() {
+                            out.push(escaped);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if matches!(ch, '?' | ':' | '@' | '$') {
+            let mut name = ch.to_string();
+            while let Some(&next) = chars.peek() {
+                if (ch == '?' && next.is_ascii_digit())
+                    || (ch != '?' && (next.is_alphanumeric() || next == '_'))
+                {
+                    name.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let ordinal = if name == "?" {
+                max_ordinal + 1
+            } else if let Some(index) = name.strip_prefix('?') {
+                index
+                    .parse::<usize>()
+                    .map_err(|_| "Invalid numbered SQL parameter")?
+            } else if let Some(&index) = named.get(&name) {
+                index
+            } else {
+                let index = max_ordinal + 1;
+                named.insert(name, index);
+                index
+            };
+            if ordinal == 0 || ordinal > MAX_PARAMETERS {
+                return Err("SQL parameter limit exceeded (1 through 999)".into());
+            }
+            max_ordinal = max_ordinal.max(ordinal);
+            out.push('?');
+            out.push_str(&ordinal.to_string());
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            out.push(ch);
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' || next == '$' {
+                    out.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    Ok(out)
+}
+
+fn dqs_double_quoted_identifier_tokens(sql: &str) -> Vec<(u32, u32, String)> {
+    Lexer::tokenize(sql)
+        .into_iter()
+        .filter_map(|tok| match tok.kind {
+            TokenKind::QuotedId(name, true) => {
+                Some((tok.span.start, tok.span.end, name.to_string()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn dqs_missing_column_name(err: &FrankenError) -> Option<String> {
+    let msg = match err {
+        FrankenError::Internal(m)
+        | FrankenError::NotImplemented(m)
+        | FrankenError::FunctionError(m) => m.as_str(),
+        _ => return None,
+    };
+    if let Some((_, rest)) = msg.split_once("no such column: ") {
+        let name = rest
+            .split_once(" in table ")
+            .map_or(rest, |(head, _)| head)
+            .trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(name) = msg
+        .strip_prefix("column not found: ")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    if let Some((_, rest)) = msg.split_once("column: \"")
+        && let Some((name, _)) = rest.split_once('"')
+        && !name.is_empty()
+    {
+        return Some(name.to_string());
+    }
+    None
+}
+
+fn dqs_rewrite_once(
+    sql: &str,
+    err: &FrankenError,
+    rewritten: &mut HashSet<String>,
+) -> Option<String> {
+    let name = dqs_missing_column_name(err)?;
+    if !rewritten.insert(name.clone()) {
+        return None;
+    }
+    let mut ranges: Vec<(u32, u32)> = dqs_double_quoted_identifier_tokens(sql)
+        .into_iter()
+        .filter(|(_, _, candidate)| candidate == &name)
+        .map(|(start, end, _)| (start, end))
+        .collect();
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|&(start, _)| std::cmp::Reverse(start));
+    let literal = format!("'{}'", name.replace('\'', "''"));
+    let mut out = sql.to_string();
+    for (start, end) in ranges {
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return None;
+        };
+        out.replace_range(start..end, &literal);
+    }
+    Some(out)
+}
+
+fn dqs_insert_values_rewrite(sql: &str) -> Option<String> {
+    let (stmts, errors) = Parser::from_sql(sql).parse_all();
+    if !errors.is_empty() || stmts.len() != 1 {
+        return None;
+    }
+    let SqlStatement::Insert(insert) = &stmts[0] else {
+        return None;
+    };
+    let fsqlite_ast::InsertSource::Values(rows) = &insert.source else {
+        return None;
+    };
+    let dq_tokens = dqs_double_quoted_identifier_tokens(sql);
+    if dq_tokens.is_empty() {
+        return None;
+    }
+    let mut ranges: Vec<(u32, u32, String)> = Vec::new();
+    for row in rows {
+        for expr in row {
+            if let fsqlite_ast::Expr::Column(col_ref, span) = expr
+                && col_ref.table.is_none()
+                && dq_tokens.iter().any(|(start, end, name)| {
+                    *start == span.start
+                        && *end == span.end
+                        && name.as_str() == col_ref.column.as_ref()
+                })
+            {
+                ranges.push((span.start, span.end, col_ref.column.to_string()));
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut out = sql.to_string();
+    for (start, end, name) in ranges {
+        let (Ok(start), Ok(end)) = (usize::try_from(start), usize::try_from(end)) else {
+            return None;
+        };
+        let literal = format!("'{}'", name.replace('\'', "''"));
+        out.replace_range(start..end, &literal);
+    }
+    Some(out)
+}
+
+async fn prepare_with_dqs<'conn, 'sql>(
+    conn: &'conn Connection,
+    sql: &'sql str,
+) -> NativeResult<(
+    fsqlite::PreparedStatement<'conn>,
+    std::borrow::Cow<'sql, str>,
+)> {
+    if !sql.contains('"') {
+        let stmt = conn.prepare(sql).await.map_err(SqliteFailure::from)?;
+        return Ok((stmt, std::borrow::Cow::Borrowed(sql)));
+    }
+    let candidate = dqs_insert_values_rewrite(sql)
+        .map_or(std::borrow::Cow::Borrowed(sql), std::borrow::Cow::Owned);
+    match conn.prepare(candidate.as_ref()).await {
+        Ok(stmt) => Ok((stmt, candidate)),
+        Err(first) => {
+            let mut rewritten = HashSet::new();
+            let Some(mut cur) = dqs_rewrite_once(candidate.as_ref(), &first, &mut rewritten) else {
+                return Err(SqliteFailure::from(first));
+            };
+            loop {
+                match conn.prepare(&cur).await {
+                    Ok(stmt) => return Ok((stmt, std::borrow::Cow::Owned(cur))),
+                    Err(err) => {
+                        let Some(next) = dqs_rewrite_once(&cur, &err, &mut rewritten) else {
+                            return Err(SqliteFailure::from(err));
+                        };
+                        cur = next;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn split_sql_statement_slices(sql: &str) -> Vec<&str> {
+    let mut slices = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b';' => {
+                let slice = sql[start..i].trim();
+                if !slice.is_empty() {
+                    slices.push(slice);
+                }
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        slices.push(tail);
+    }
+    slices
+}
+
+async fn dml_returning_column_names(
+    conn: &Connection,
+    stmt: Option<&SqlStatement>,
+) -> NativeResult<Vec<String>> {
+    let (table_name, returning) = match stmt {
+        Some(SqlStatement::Insert(ins)) => (ins.table.name.as_str(), ins.returning.as_slice()),
+        Some(SqlStatement::Update(upd)) => (upd.table.name.name.as_str(), upd.returning.as_slice()),
+        Some(SqlStatement::Delete(del)) => (del.table.name.name.as_str(), del.returning.as_slice()),
+        _ => return Ok(Vec::new()),
+    };
+    if returning.is_empty() {
+        return Ok(Vec::new());
+    }
+    let needs_star = returning.iter().any(|col| {
+        matches!(
+            col,
+            fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_)
+        )
+    });
+    let table_cols = if needs_star {
+        let escaped = table_name.replace('"', "\"\"");
+        let rows = conn
+            .query(&format!("PRAGMA table_info(\"{escaped}\")"))
+            .await
+            .map_err(SqliteFailure::from)?;
+        rows.into_iter()
+            .filter_map(|row| match row.get(1) {
+                Some(SqliteValue::Text(name)) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut cols = Vec::with_capacity(returning.len().max(table_cols.len()));
+    for (idx, col) in returning.iter().enumerate() {
+        match col {
+            fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_) => {
+                cols.extend(table_cols.iter().cloned());
+            }
+            fsqlite_ast::ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => {
+                cols.push(alias.clone());
+            }
+            fsqlite_ast::ResultColumn::Expr {
+                expr: fsqlite_ast::Expr::Column(col_ref, _),
+                alias: None,
+            } => {
+                cols.push(col_ref.column.to_string());
+            }
+            fsqlite_ast::ResultColumn::Expr { alias: None, .. } => {
+                cols.push(format!("column{}", idx + 1));
+            }
+        }
+    }
+    Ok(cols)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1331,18 +2269,163 @@ impl Drop for Worker {
     }
 }
 
+#[cfg(unix)]
+struct ExternalWalWriteLease {
+    file: fsqlite::fsqlite_vfs::UnixFile,
+}
+
+#[cfg(unix)]
+impl ExternalWalWriteLease {
+    fn try_acquire(
+        path: &Path,
+        cx: &fsqlite_types::cx::Cx,
+    ) -> std::result::Result<Self, FrankenError> {
+        use fsqlite::fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
+        use fsqlite_types::flags::VfsOpenFlags;
+
+        let vfs = UnixVfs::new();
+        let (mut file, _) = vfs.open(
+            cx,
+            Some(path),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+        )?;
+        if let Err(err) = file.compat_writer_hold_wal_write_lock(cx) {
+            let uncancelled = fsqlite_types::cx::Cx::new();
+            let _ = file.close(&uncancelled);
+            return Err(err);
+        }
+        Ok(Self { file })
+    }
+
+    fn release(mut self) -> std::result::Result<(), FrankenError> {
+        use fsqlite::fsqlite_vfs::VfsFile as _;
+
+        let uncancelled = fsqlite_types::cx::Cx::new();
+        let release_err = self
+            .file
+            .compat_writer_release_wal_write_lock(&uncancelled)
+            .err();
+        let close_err = self.file.close(&uncancelled).err();
+        release_err.or(close_err).map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(windows)]
+struct ExternalWalWriteLease {
+    file: fsqlite::fsqlite_vfs::WindowsFile,
+}
+
+#[cfg(windows)]
+impl ExternalWalWriteLease {
+    fn try_acquire(
+        path: &Path,
+        cx: &fsqlite_types::cx::Cx,
+    ) -> std::result::Result<Self, FrankenError> {
+        use fsqlite::fsqlite_vfs::shm::{SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, WAL_WRITE_LOCK};
+        use fsqlite::fsqlite_vfs::{Vfs as _, VfsFile as _, WindowsVfs};
+        use fsqlite_types::LockLevel;
+        use fsqlite_types::flags::VfsOpenFlags;
+
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs.open(
+            cx,
+            Some(path),
+            VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+        )?;
+        if let Err(err) = file.lock(cx, LockLevel::Shared) {
+            let uncancelled = fsqlite_types::cx::Cx::new();
+            let _ = file.close(&uncancelled);
+            return Err(err);
+        }
+        if let Err(err) = file.shm_lock(
+            cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        ) {
+            let uncancelled = fsqlite_types::cx::Cx::new();
+            let _ = file.unlock(&uncancelled, LockLevel::None);
+            let _ = file.close(&uncancelled);
+            return Err(err);
+        }
+        Ok(Self { file })
+    }
+
+    fn release(mut self) -> std::result::Result<(), FrankenError> {
+        use fsqlite::fsqlite_vfs::VfsFile as _;
+        use fsqlite::fsqlite_vfs::shm::{SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_UNLOCK, WAL_WRITE_LOCK};
+        use fsqlite_types::LockLevel;
+
+        let uncancelled = fsqlite_types::cx::Cx::new();
+        let shm_err = self
+            .file
+            .shm_lock(
+                &uncancelled,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .err();
+        let unlock_err = self.file.unlock(&uncancelled, LockLevel::None).err();
+        let close_err = self.file.close(&uncancelled).err();
+        shm_err.or(unlock_err).or(close_err).map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ExternalWalWriteLease;
+
+#[cfg(not(any(unix, windows)))]
+impl ExternalWalWriteLease {
+    fn try_acquire(
+        _path: &Path,
+        _cx: &fsqlite_types::cx::Cx,
+    ) -> std::result::Result<Self, FrankenError> {
+        Ok(Self)
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn release(self) -> std::result::Result<(), FrankenError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SchemaFailProfile {
+    auto_ipk_col_lower: Option<String>,
+}
+
 struct EngineDatabase {
+    // Drop/release the external WAL write lease before closing the engine, and
+    // drop/close the engine before releasing its directory guards.
+    wal_write_lease: RefCell<Option<ExternalWalWriteLease>>,
     conn: Connection,
-    // Drop/close the engine before releasing its directory guards.
     parent: Option<storage::StorageParent>,
+    readonly: bool,
     strict: bool,
     safe_integers: bool,
+    txn_has_writes: Cell<bool>,
     schema_version: Cell<Option<i64>>,
+    schema_fail_tables: RefCell<HashMap<String, SchemaFailProfile>>,
+    has_temp_schema: Cell<bool>,
     namespace_valid: Cell<bool>,
     poisoned: Cell<bool>,
 }
 
 impl EngineDatabase {
+    fn writable_db_path(&self) -> Option<&Path> {
+        (!self.readonly)
+            .then(|| self.parent.as_ref().map(storage::StorageParent::path))
+            .flatten()
+    }
+
+    fn release_wal_write_lease(&self) -> NativeResult<()> {
+        if let Some(lease) = self.wal_write_lease.borrow_mut().take() {
+            lease.release().map_err(SqliteFailure::from)?;
+        }
+        Ok(())
+    }
+
     fn verify_paths(&self) -> Result<()> {
         if self.poisoned.get() {
             return Err(
@@ -1475,11 +2558,16 @@ fn execute_work(
             })
             .map_err(SqliteFailure::from)?;
             let database = EngineDatabase {
+                wal_write_lease: RefCell::new(None),
                 conn,
                 parent,
+                readonly,
                 strict,
                 safe_integers,
+                txn_has_writes: Cell::new(false),
                 schema_version: Cell::new(None),
+                schema_fail_tables: RefCell::new(HashMap::new()),
+                has_temp_schema: Cell::new(false),
                 namespace_valid: Cell::new(true),
                 poisoned: Cell::new(false),
             };
@@ -1492,6 +2580,8 @@ fn execute_work(
             let database = databases.get_mut(&id).ok_or("SQLite database is closed")?;
             database.verify_paths()?;
             budget.reserve_database(database, false)?;
+            database.txn_has_writes.set(false);
+            database.release_wal_write_lease()?;
             // Close cannot borrow a binding guard and &mut Connection at once;
             // cancelling this terminal operation cancels the connection root.
             let cx = database.conn.root_cx().clone();
@@ -1514,7 +2604,7 @@ fn execute_work(
             let binding = database.conn.bind_operation_cx(&operation_cx);
             let result = futures::executor::block_on(async {
                 validate_schema(database, budget).await?;
-                execute_request(database, request, budget).await
+                execute_request(database, request, budget, &operation_cx).await
             });
             drop(binding);
             if database.poisoned.get() {
@@ -1543,6 +2633,10 @@ fn execute_work(
                 if let Err(error) = budget.reserve_database(&database, false) {
                     first_error.get_or_insert(error);
                     continue;
+                }
+                database.txn_has_writes.set(false);
+                if let Err(error) = database.release_wal_write_lease() {
+                    first_error.get_or_insert(error);
                 }
                 let cx = database.conn.root_cx().clone();
                 set_cancel(cancel, stopped, Arc::new(move || cx.cancel()));
@@ -1592,25 +2686,447 @@ async fn validate_schema(database: &EngineDatabase, budget: &OperationBudget) ->
         return Ok(());
     }
     budget.reserve_database(database, true)?;
-    let rows = database
+    let mut rows = database
         .conn
-        .query("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
+        .query("SELECT type, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
         .await
         .map_err(SqliteFailure::from)?;
     if rows.len() > 1024 {
         return Err("SQLite schema exceeds 1024 objects".into());
     }
+    if database.has_temp_schema.get()
+        && let Ok(temp_rows) = database
+            .conn
+            .query(
+                "SELECT type, tbl_name, sql FROM sqlite_temp_master WHERE sql IS NOT NULL LIMIT 1025",
+            )
+            .await
+    {
+        rows.extend(temp_rows);
+    }
+    let mut fail_tables = HashMap::new();
+    let mut tables_with_aux_ddl = HashSet::new();
     for row in rows {
-        if matches!(row.get(0), Some(SqliteValue::Text(kind)) if kind.as_ref() == "trigger") {
+        let Some(SqliteValue::Text(kind)) = row.get(0) else {
+            return Err("Invalid SQLite schema object type".into());
+        };
+        if kind.as_ref() == "trigger" {
             return Err("Existing SQLite triggers are not permitted in extension databases".into());
         }
-        let Some(SqliteValue::Text(sql)) = row.get(1) else {
+        let Some(SqliteValue::Text(sql)) = row.get(2) else {
             return Err("Invalid SQLite schema text".into());
         };
-        admit_sql(sql.as_ref(), true)?;
+        let admitted = admit_sql(sql.as_ref(), true)?;
+        if let Some(SqliteValue::Text(tbl_name)) = row.get(1) {
+            let key = tbl_name.as_ref().to_ascii_lowercase();
+            if kind.as_ref() == "table" {
+                if let Some(SqlStatement::CreateTable(create)) = admitted.parsed.first()
+                    && let Some(profile) = schema_fail_profile(create)
+                {
+                    fail_tables.insert(key, profile);
+                } else {
+                    fail_tables.remove(&key);
+                }
+            } else {
+                tables_with_aux_ddl.insert(key);
+            }
+        }
     }
+    for tbl in tables_with_aux_ddl {
+        fail_tables.remove(&tbl);
+    }
+    *database.schema_fail_tables.borrow_mut() = fail_tables;
     database.schema_version.set(Some(version));
     Ok(())
+}
+
+fn schema_fail_profile(create: &fsqlite_ast::CreateTableStatement) -> Option<SchemaFailProfile> {
+    let fsqlite_ast::CreateTableBody::Columns {
+        columns,
+        constraints,
+    } = &create.body
+    else {
+        return None;
+    };
+    let mut has_fail = false;
+    let mut has_non_fail = false;
+    let mut saw_pk = false;
+    let mut auto_ipk_col_lower = None;
+    for col in columns {
+        let is_integer = col
+            .type_name
+            .as_ref()
+            .is_some_and(|ty| ty.name.eq_ignore_ascii_case("integer"));
+        for constraint in &col.constraints {
+            match &constraint.kind {
+                fsqlite_ast::ColumnConstraintKind::PrimaryKey { conflict, .. } => {
+                    if saw_pk {
+                        has_non_fail = true;
+                    } else {
+                        saw_pk = true;
+                        match conflict {
+                            Some(fsqlite_ast::ConflictAction::Fail) => has_fail = true,
+                            None if !create.without_rowid && is_integer => {
+                                auto_ipk_col_lower = Some(col.name.to_ascii_lowercase());
+                            }
+                            _ => has_non_fail = true,
+                        }
+                    }
+                }
+                fsqlite_ast::ColumnConstraintKind::Unique { conflict }
+                | fsqlite_ast::ColumnConstraintKind::NotNull { conflict } => {
+                    if *conflict == Some(fsqlite_ast::ConflictAction::Fail) {
+                        has_fail = true;
+                    } else {
+                        has_non_fail = true;
+                    }
+                }
+                fsqlite_ast::ColumnConstraintKind::Check(_)
+                | fsqlite_ast::ColumnConstraintKind::ForeignKey(_) => {
+                    has_non_fail = true;
+                }
+                fsqlite_ast::ColumnConstraintKind::Null
+                | fsqlite_ast::ColumnConstraintKind::Default(_)
+                | fsqlite_ast::ColumnConstraintKind::Collate(_)
+                | fsqlite_ast::ColumnConstraintKind::Generated { .. } => {}
+            }
+        }
+    }
+    for constraint in constraints {
+        match &constraint.kind {
+            fsqlite_ast::TableConstraintKind::PrimaryKey { conflict, .. } => {
+                if saw_pk {
+                    has_non_fail = true;
+                } else {
+                    saw_pk = true;
+                    auto_ipk_col_lower = None;
+                    if *conflict == Some(fsqlite_ast::ConflictAction::Fail) {
+                        has_fail = true;
+                    } else {
+                        has_non_fail = true;
+                    }
+                }
+            }
+            fsqlite_ast::TableConstraintKind::Unique { conflict, .. } => {
+                if *conflict == Some(fsqlite_ast::ConflictAction::Fail) {
+                    has_fail = true;
+                } else {
+                    has_non_fail = true;
+                }
+            }
+            fsqlite_ast::TableConstraintKind::Check(_)
+            | fsqlite_ast::TableConstraintKind::ForeignKey { .. } => {
+                has_non_fail = true;
+            }
+        }
+    }
+    if create.strict {
+        has_non_fail = true;
+    }
+    (has_fail && !has_non_fail).then_some(SchemaFailProfile { auto_ipk_col_lower })
+}
+
+fn note_schema_mutation(database: &EngineDatabase, parsed: &[SqlStatement]) {
+    let mut invalidate = false;
+    for stmt in parsed {
+        match stmt {
+            SqlStatement::CreateTable(create) => {
+                invalidate = true;
+                if create.temporary {
+                    database.has_temp_schema.set(true);
+                }
+            }
+            SqlStatement::CreateIndex(_)
+            | SqlStatement::CreateView(_)
+            | SqlStatement::CreateVirtualTable(_)
+            | SqlStatement::Drop(_)
+            | SqlStatement::AlterTable(_)
+            | SqlStatement::Rollback(_) => {
+                invalidate = true;
+            }
+            _ => {}
+        }
+    }
+    if invalidate {
+        database.schema_version.set(None);
+    }
+}
+
+/// `fsqlite-core 0.4.10` preserves prior row changes on a mid-statement
+/// constraint halt only when the DML statement AST carries `OR FAIL`, rolling
+/// back its internal statement savepoint when `ON CONFLICT FAIL` is declared
+/// solely in the table schema. Promote `INSERT`/`UPDATE` without an explicit
+/// `OR` or `UPSERT` clause to `OR FAIL` when every constraint on the target
+/// table resolves conflicts via `FAIL`.
+fn rewrite_schema_fail_dml<'a>(
+    database: &EngineDatabase,
+    stmt: Option<&SqlStatement>,
+    sql: std::borrow::Cow<'a, str>,
+) -> std::borrow::Cow<'a, str> {
+    let fail_tables = database.schema_fail_tables.borrow();
+    if fail_tables.is_empty() {
+        return sql;
+    }
+    let is_insert = match stmt {
+        Some(SqlStatement::Insert(ins)) if ins.or_conflict.is_none() && ins.upsert.is_empty() => {
+            if ins.table.schema.as_deref().is_some_and(|schema| {
+                !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+            }) {
+                return sql;
+            }
+            let Some(profile) = fail_tables.get(&ins.table.name.to_ascii_lowercase()) else {
+                return sql;
+            };
+            if let Some(ipk) = &profile.auto_ipk_col_lower
+                && (ins.columns.is_empty()
+                    || ins.columns.iter().any(|col| col.eq_ignore_ascii_case(ipk)))
+            {
+                return sql;
+            }
+            true
+        }
+        Some(SqlStatement::Update(upd)) if upd.or_conflict.is_none() => {
+            if upd.table.name.schema.as_deref().is_some_and(|schema| {
+                !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp")
+            }) {
+                return sql;
+            }
+            let Some(profile) = fail_tables.get(&upd.table.name.name.to_ascii_lowercase()) else {
+                return sql;
+            };
+            if let Some(ipk) = &profile.auto_ipk_col_lower
+                && upd.assignments.iter().any(|assign| match &assign.target {
+                    fsqlite_ast::AssignmentTarget::Column(col) => col.eq_ignore_ascii_case(ipk),
+                    fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
+                        cols.iter().any(|col| col.eq_ignore_ascii_case(ipk))
+                    }
+                })
+            {
+                return sql;
+            }
+            false
+        }
+        _ => return sql,
+    };
+    let mut paren_depth = 0_usize;
+    for tok in Lexer::tokenize(sql.as_ref()) {
+        match tok.kind {
+            TokenKind::LeftParen => paren_depth += 1,
+            TokenKind::RightParen => paren_depth = paren_depth.saturating_sub(1),
+            TokenKind::KwInsert | TokenKind::KwUpdate
+                if paren_depth == 0
+                    && matches!(
+                        (&tok.kind, is_insert),
+                        (TokenKind::KwInsert, true) | (TokenKind::KwUpdate, false)
+                    ) =>
+            {
+                let end = usize::try_from(tok.span.end).unwrap_or(usize::MAX);
+                if let Some((head, tail)) = sql.as_ref().split_at_checked(end) {
+                    let mut out = String::with_capacity(sql.len() + 8);
+                    out.push_str(head);
+                    out.push_str(" OR FAIL");
+                    out.push_str(tail);
+                    return std::borrow::Cow::Owned(out);
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    sql
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreExecWalAction {
+    None,
+    Release,
+    Acquire,
+}
+
+#[derive(Clone, Copy)]
+struct WalLeasePlan {
+    had_writes: bool,
+    pre_exec: PreExecWalAction,
+    expected_writes_if_open: bool,
+}
+
+fn statement_writes(statement: &SqlStatement) -> bool {
+    match statement {
+        SqlStatement::Begin(begin) => matches!(
+            begin.mode,
+            Some(fsqlite_ast::TransactionMode::Immediate | fsqlite_ast::TransactionMode::Exclusive)
+        ),
+        SqlStatement::Insert(_)
+        | SqlStatement::Update(_)
+        | SqlStatement::Delete(_)
+        | SqlStatement::CreateTable(_)
+        | SqlStatement::CreateIndex(_)
+        | SqlStatement::CreateView(_)
+        | SqlStatement::CreateVirtualTable(_)
+        | SqlStatement::Drop(_)
+        | SqlStatement::AlterTable(_) => true,
+        _ => false,
+    }
+}
+
+fn plan_wal_lease(was_in_txn: bool, had_writes: bool, parsed: &[SqlStatement]) -> WalLeasePlan {
+    let mut in_txn = was_in_txn;
+    let mut writes_in_txn = was_in_txn && had_writes;
+    let mut release_before_exec = false;
+    for statement in parsed {
+        match statement {
+            SqlStatement::Begin(_) => {
+                in_txn = true;
+                if statement_writes(statement) {
+                    writes_in_txn = true;
+                }
+            }
+            SqlStatement::Commit => {
+                release_before_exec = true;
+                in_txn = false;
+                writes_in_txn = false;
+            }
+            SqlStatement::Rollback(rollback) if rollback.to_savepoint.is_none() => {
+                release_before_exec = true;
+                in_txn = false;
+                writes_in_txn = false;
+            }
+            SqlStatement::Pragma(_) => {
+                release_before_exec = true;
+            }
+            other if in_txn && statement_writes(other) => {
+                writes_in_txn = true;
+            }
+            _ => {}
+        }
+    }
+    let pre_exec = if release_before_exec {
+        PreExecWalAction::Release
+    } else if in_txn && writes_in_txn {
+        PreExecWalAction::Acquire
+    } else {
+        PreExecWalAction::None
+    };
+    WalLeasePlan {
+        had_writes,
+        pre_exec,
+        expected_writes_if_open: writes_in_txn,
+    }
+}
+
+async fn is_wal_journal_mode(conn: &Connection) -> NativeResult<bool> {
+    let rows = conn
+        .query("PRAGMA journal_mode")
+        .await
+        .map_err(SqliteFailure::from)?;
+    Ok(matches!(
+        rows.first().and_then(|row| row.get(0)),
+        Some(SqliteValue::Text(mode)) if mode.as_ref().eq_ignore_ascii_case("wal")
+    ))
+}
+
+async fn current_busy_timeout_ms(conn: &Connection) -> NativeResult<u64> {
+    let rows = conn
+        .query("PRAGMA busy_timeout")
+        .await
+        .map_err(SqliteFailure::from)?;
+    let raw = rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(|value| match value {
+            SqliteValue::Integer(ms) => Some(u64::try_from(*ms).unwrap_or(0)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    Ok(raw.min(MAX_BUSY_TIMEOUT_MS))
+}
+
+async fn ensure_wal_write_lease(
+    database: &EngineDatabase,
+    operation_cx: &fsqlite_types::cx::Cx,
+    budget: &OperationBudget,
+) -> NativeResult<()> {
+    if database.wal_write_lease.borrow().is_some() {
+        return Ok(());
+    }
+    let Some(path) = database.writable_db_path() else {
+        return Ok(());
+    };
+    if !is_wal_journal_mode(&database.conn).await? {
+        return Ok(());
+    }
+    let timeout_ms = current_busy_timeout_ms(&database.conn).await?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match ExternalWalWriteLease::try_acquire(path, operation_cx) {
+            Ok(lease) => {
+                *database.wal_write_lease.borrow_mut() = Some(lease);
+                return Ok(());
+            }
+            Err(FrankenError::Busy) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(SqliteFailure::from(FrankenError::Busy));
+                }
+                if operation_cx.is_cancel_requested() || budget.expire_at(now) {
+                    return Err(SqliteFailure::from(FrankenError::Interrupt));
+                }
+                let sleep_for = deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(2));
+                std::thread::sleep(sleep_for);
+            }
+            Err(err) => return Err(SqliteFailure::from(err)),
+        }
+    }
+}
+
+async fn prepare_wal_lease_before_exec(
+    database: &EngineDatabase,
+    plan: WalLeasePlan,
+    operation_cx: &fsqlite_types::cx::Cx,
+    budget: &OperationBudget,
+) -> NativeResult<()> {
+    match plan.pre_exec {
+        PreExecWalAction::Release => database.release_wal_write_lease()?,
+        PreExecWalAction::Acquire => ensure_wal_write_lease(database, operation_cx, budget).await?,
+        PreExecWalAction::None => {}
+    }
+    Ok(())
+}
+
+async fn reconcile_wal_lease_after_exec<T>(
+    database: &EngineDatabase,
+    plan: WalLeasePlan,
+    outcome: NativeResult<T>,
+    operation_cx: &fsqlite_types::cx::Cx,
+    budget: &OperationBudget,
+) -> NativeResult<T> {
+    if !database.conn.in_transaction() {
+        database.txn_has_writes.set(false);
+        database.release_wal_write_lease()?;
+        return outcome;
+    }
+    match outcome {
+        Ok(value) => {
+            database.txn_has_writes.set(plan.expected_writes_if_open);
+            if plan.expected_writes_if_open {
+                ensure_wal_write_lease(database, operation_cx, budget).await?;
+            } else {
+                database.release_wal_write_lease()?;
+            }
+            Ok(value)
+        }
+        Err(err) => {
+            database.txn_has_writes.set(plan.had_writes);
+            if plan.had_writes {
+                let _ = ensure_wal_write_lease(database, operation_cx, budget).await;
+            } else {
+                let _ = database.release_wal_write_lease();
+            }
+            Err(err)
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1618,18 +3134,21 @@ async fn execute_request(
     database: &EngineDatabase,
     request: Request,
     budget: &OperationBudget,
+    operation_cx: &fsqlite_types::cx::Cx,
 ) -> NativeResult<Json> {
     match request {
         Request::Prepare { sql, .. } => {
             let admitted = admit_sql(&sql, true)?;
+            let exec_sql = admitted.normalized_sql(&sql);
             let columns = if admitted.uses_native_prepare() {
                 budget.reserve_database(database, true)?;
-                database
-                    .conn
-                    .prepare(&sql)
-                    .await
-                    .map_err(SqliteFailure::from)?
-                    .column_names()
+                let (statement, _) = prepare_with_dqs(&database.conn, exec_sql.as_ref()).await?;
+                let mut cols = statement.column_names();
+                if cols.is_empty() && admitted.is_dml() {
+                    cols =
+                        dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
+                }
+                cols
             } else {
                 // DDL/control syntax was parsed above, with no mutations.
                 // Those statements produce no result columns; native engine
@@ -1645,131 +3164,191 @@ async fn execute_request(
             ..
         } => {
             let admitted = admit_sql(&sql, true)?;
+            let (rewritten_fts_sql, hidden_col_count) = if matches!(mode, QueryMode::Run) {
+                (None, 0)
+            } else {
+                rewrite_unprojected_fts5_order_by_select(admitted.parsed.first())
+            };
+            let exec_sql = match rewritten_fts_sql {
+                Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+                None => admitted.normalized_sql(&sql),
+            };
+            let exec_sql = rewrite_schema_fail_dml(database, admitted.parsed.first(), exec_sql);
             budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
-            if !admitted.uses_native_prepare() {
-                if params.is_empty() {
-                    // execute() retains the original DDL source for default
-                    // expressions and CHECK constraints. The parameterized
-                    // dispatcher does not publish that source in 0.4.10.
-                    database
-                        .conn
-                        .execute(&sql)
-                        .await
-                        .map_err(SqliteFailure::from)?;
-                } else {
-                    database
-                        .conn
-                        .execute_with_params(&sql, &params)
-                        .await
-                        .map_err(SqliteFailure::from)?;
+            let wal_plan = plan_wal_lease(
+                database.conn.in_transaction(),
+                database.txn_has_writes.get(),
+                &admitted.parsed,
+            );
+            prepare_wal_lease_before_exec(database, wal_plan, operation_cx, budget).await?;
+            let query_outcome: NativeResult<Json> = async {
+                if !admitted.uses_native_prepare() {
+                    if params.is_empty() {
+                        // execute() retains the original DDL source for default
+                        // expressions and CHECK constraints. The parameterized
+                        // dispatcher does not publish that source in 0.4.10.
+                        database
+                            .conn
+                            .execute(exec_sql.as_ref())
+                            .await
+                            .map_err(SqliteFailure::from)?;
+                    } else {
+                        database
+                            .conn
+                            .execute_with_params(exec_sql.as_ref(), &params)
+                            .await
+                            .map_err(SqliteFailure::from)?;
+                    }
+                    return if matches!(mode, QueryMode::Run) {
+                        change_result(database, budget).await
+                    } else {
+                        Ok(json!({ "columns": [], "rows": [] }))
+                    };
                 }
-                return if matches!(mode, QueryMode::Run) {
-                    change_result(database, budget).await
-                } else {
-                    Ok(json!({ "columns": [], "rows": [] }))
-                };
-            }
-            budget.reserve_database(database, true)?;
-            let statement = database
-                .conn
-                .prepare(&sql)
-                .await
-                .map_err(SqliteFailure::from)?;
-            if matches!(mode, QueryMode::Run) {
-                statement
-                    .execute_with_params(&params)
-                    .await
-                    .map_err(SqliteFailure::from)?;
-                return change_result(database, budget).await;
-            }
-            let columns = statement.column_names();
-            let mut bytes = serde_json::to_vec(&columns)
-                .map_err(|error| error.to_string())?
-                .len()
-                + 64;
-            if columns.len() > 256 || bytes > MAX_RESULT_BYTES {
-                return Err("SQLite result has too many columns".into());
-            }
-            let is_dml = admitted.is_dml();
-            if is_dml {
-                // The pinned engine materializes RETURNING before invoking
-                // row callbacks. Keep its writes uncommitted until every
-                // result has passed the bridge's row/encoding limits.
-                database
-                    .conn
-                    .execute("SAVEPOINT __pijs_row_result")
-                    .await
-                    .map_err(SqliteFailure::from)?;
-            }
-            let mut rows = Vec::new();
-            let mut seen = 0_usize;
-            let mut limit_error = None;
-            let mut stopped_after_first = false;
-            let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
-                seen += 1;
-                if seen > MAX_RESULT_ROWS || budget.expire_at(Instant::now()) {
-                    limit_error = Some("SQLite result exceeds the row or time limit".to_string());
-                    return Err(FrankenError::Abort);
-                }
-                if matches!(mode, QueryMode::Get) && !rows.is_empty() {
-                    return Ok(());
-                }
-                bytes += 3; // enclosing row brackets and its separator
-                match row
-                    .values()
-                    .iter()
-                    .map(|value| encode_value(value, database.safe_integers, &mut bytes))
-                    .collect::<Result<Vec<_>>>()
-                {
-                    Ok(row) => {
-                        rows.push(row);
-                        if matches!(mode, QueryMode::Get) && !is_dml {
-                            // A read-only get() needs one row. The engine's
-                            // callback-abort path closes only its read cursor
-                            // and preserves an enclosing transaction.
-                            stopped_after_first = true;
-                            return Err(FrankenError::Abort);
+                budget.reserve_database(database, true)?;
+                let (statement, prepared_sql) =
+                    prepare_with_dqs(&database.conn, exec_sql.as_ref()).await?;
+                if matches!(mode, QueryMode::Run) {
+                    match statement.execute_with_params(&params).await {
+                        Ok(_) => {}
+                        Err(
+                            FrankenError::NotImplemented(message) | FrankenError::Internal(message),
+                        ) if admitted.is_dml()
+                            && !params.is_empty()
+                            && (message.contains("Placeholder(")
+                                || message.contains("canonicalized numbered placeholder")) =>
+                        {
+                            // fsqlite-core 0.4.10's PreparedDmlDispatch::Deferred skips
+                            // placeholder canonicalization on live virtual tables (such
+                            // as FTS5), and Connection::execute_with_params re-enters the
+                            // same prepared fast lane for simple VALUES inserts. Rewrite
+                            // parameter tokens to canonical ?N ordinals and re-prepare.
+                            let canonical_sql =
+                                canonicalize_sql_parameter_tokens(prepared_sql.as_ref())?;
+                            database
+                                .conn
+                                .prepare(&canonical_sql)
+                                .await
+                                .map_err(SqliteFailure::from)?
+                                .execute_with_params(&params)
+                                .await
+                                .map_err(SqliteFailure::from)?;
                         }
-                        Ok(())
+                        Err(error) => return Err(SqliteFailure::from(error)),
                     }
-                    Err(error) => {
-                        limit_error = Some(error);
-                        Err(FrankenError::Abort)
-                    }
+                    return change_result(database, budget).await;
                 }
-            };
-            // PreparedStatement's query API rejects DML, including RETURNING.
-            // The connection query dispatcher is its actual DML row interface.
-            // Consume all DML rows even for get(), retaining only the first.
-            let mut preserve_native_constraint = false;
-            let outcome = if is_dml {
-                // This API also applies the engine's DQS rewrites and error
-                // offsets. Its for_each variant omits those wrappers, while
-                // materializing DML rows in exactly the same way.
-                match database.conn.query_with_params(&sql, &params).await {
-                    Ok(native_rows) => native_rows.iter().try_for_each(&mut accept),
-                    Err(error) => {
-                        preserve_native_constraint = is_native_constraint_error(&error);
-                        Err(error)
-                    }
+                let mut columns = statement.column_names();
+                if columns.is_empty() && admitted.is_dml() {
+                    columns =
+                        dml_returning_column_names(&database.conn, admitted.parsed.first()).await?;
                 }
-            } else {
-                statement
-                    .query_with_params_for_each(&params, &mut accept)
-                    .await
-            };
-            let outcome = match (outcome, limit_error) {
-                (_, Some(error)) => Err(error.into()),
-                (Err(FrankenError::Abort), None) if stopped_after_first => Ok(()),
-                (result, None) => result.map_err(SqliteFailure::from),
-            };
-            if is_dml {
-                finish_row_savepoint(database, outcome, preserve_native_constraint).await?;
-            } else {
-                outcome?;
+                let visible_col_count = if hidden_col_count > 0 {
+                    let count = columns.len().saturating_sub(hidden_col_count);
+                    columns.truncate(count);
+                    Some(count)
+                } else {
+                    None
+                };
+                let mut bytes = serde_json::to_vec(&columns)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    + 64;
+                if columns.len() > 256 || bytes > MAX_RESULT_BYTES {
+                    return Err("SQLite result has too many columns".into());
+                }
+                let is_dml = admitted.is_dml();
+                if is_dml {
+                    // The pinned engine materializes RETURNING before invoking
+                    // row callbacks. Keep its writes uncommitted until every
+                    // result has passed the bridge's row/encoding limits.
+                    database
+                        .conn
+                        .execute("SAVEPOINT __pijs_row_result")
+                        .await
+                        .map_err(SqliteFailure::from)?;
+                }
+                let mut rows = Vec::new();
+                let mut seen = 0_usize;
+                let mut limit_error = None;
+                let mut stopped_after_first = false;
+                let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
+                    seen += 1;
+                    if seen > MAX_RESULT_ROWS || budget.expire_at(Instant::now()) {
+                        limit_error =
+                            Some("SQLite result exceeds the row or time limit".to_string());
+                        return Err(FrankenError::Abort);
+                    }
+                    if matches!(mode, QueryMode::Get) && !rows.is_empty() {
+                        return Ok(());
+                    }
+                    bytes += 3; // enclosing row brackets and its separator
+                    let values = row.values();
+                    let visible_values = visible_col_count
+                        .map_or(values, |count| &values[..values.len().min(count)]);
+                    match visible_values
+                        .iter()
+                        .map(|value| encode_value(value, database.safe_integers, &mut bytes))
+                        .collect::<Result<Vec<_>>>()
+                    {
+                        Ok(row) => {
+                            rows.push(row);
+                            if matches!(mode, QueryMode::Get) && !is_dml {
+                                // A read-only get() needs one row. The engine's
+                                // callback-abort path closes only its read cursor
+                                // and preserves an enclosing transaction.
+                                stopped_after_first = true;
+                                return Err(FrankenError::Abort);
+                            }
+                            Ok(())
+                        }
+                        Err(error) => {
+                            limit_error = Some(error);
+                            Err(FrankenError::Abort)
+                        }
+                    }
+                };
+                // PreparedStatement's query API rejects DML, including RETURNING.
+                // The connection query dispatcher is its actual DML row interface.
+                // Consume all DML rows even for get(), retaining only the first.
+                let mut preserve_native_constraint = false;
+                let outcome = if is_dml {
+                    // This API also applies the engine's DQS rewrites and error
+                    // offsets. Its for_each variant omits those wrappers, while
+                    // materializing DML rows in exactly the same way.
+                    match database
+                        .conn
+                        .query_with_params(exec_sql.as_ref(), &params)
+                        .await
+                    {
+                        Ok(native_rows) => native_rows.iter().try_for_each(&mut accept),
+                        Err(error) => {
+                            preserve_native_constraint = is_native_constraint_error(&error);
+                            Err(error)
+                        }
+                    }
+                } else {
+                    statement
+                        .query_with_params_for_each(&params, &mut accept)
+                        .await
+                };
+                let outcome = match (outcome, limit_error) {
+                    (_, Some(error)) => Err(error.into()),
+                    (Err(FrankenError::Abort), None) if stopped_after_first => Ok(()),
+                    (result, None) => result.map_err(SqliteFailure::from),
+                };
+                if is_dml {
+                    finish_row_savepoint(database, outcome, preserve_native_constraint).await?;
+                } else {
+                    outcome?;
+                }
+                Ok(json!({ "columns": columns, "rows": rows }))
             }
-            Ok(json!({ "columns": columns, "rows": rows }))
+            .await;
+            note_schema_mutation(database, &admitted.parsed);
+            reconcile_wal_lease_after_exec(database, wal_plan, query_outcome, operation_cx, budget)
+                .await
         }
         Request::Exec { sql, .. } => {
             let admitted = admit_sql(&sql, false)?;
@@ -1789,14 +3368,27 @@ async fn execute_request(
                 )
             });
             budget.reserve_database(database, may_prepare)?;
-            if !admitted.statements.is_empty() {
-                database
-                    .conn
-                    .execute_batch(&sql)
-                    .await
-                    .map_err(SqliteFailure::from)?;
+            let wal_plan = plan_wal_lease(
+                database.conn.in_transaction(),
+                database.txn_has_writes.get(),
+                &admitted.parsed,
+            );
+            prepare_wal_lease_before_exec(database, wal_plan, operation_cx, budget).await?;
+            let exec_outcome: NativeResult<Json> = async {
+                if !admitted.statements.is_empty() {
+                    let exec_sql = admitted.normalized_sql(&sql);
+                    database
+                        .conn
+                        .execute_batch(exec_sql.as_ref())
+                        .await
+                        .map_err(SqliteFailure::from)?;
+                }
+                change_result(database, budget).await
             }
-            change_result(database, budget).await
+            .await;
+            note_schema_mutation(database, &admitted.parsed);
+            reconcile_wal_lease_after_exec(database, wal_plan, exec_outcome, operation_cx, budget)
+                .await
         }
         Request::InTransaction { .. } => Ok(json!(database.conn.in_transaction())),
         Request::Open { .. } | Request::Close { .. } => Err("Invalid SQLite operation".into()),
@@ -2335,5 +3927,225 @@ mod tests {
         // This is a real engine acknowledgment check, not merely a host
         // recv_timeout assertion. The worker must also release its connection.
         wait_for_worker_exit(&worker);
+    }
+
+    #[test]
+    fn canonicalize_sql_parameter_tokens_preserves_literals_and_numbers_slots() {
+        let sql = "/* ? :skip */ INSERT INTO foo$bar(\"col$1\", [?raw], `tick?`) VALUES (?, :same, '? :lit', :same, ?4, ?) -- ?\n";
+        let canonical = canonicalize_sql_parameter_tokens(sql).expect("canonicalize SQL");
+        assert_eq!(
+            canonical,
+            "/* ? :skip */ INSERT INTO foo$bar(\"col$1\", [?raw], `tick?`) VALUES (?1, ?2, '? :lit', ?2, ?4, ?5) -- ?\n"
+        );
+    }
+
+    #[test]
+    fn fts5_parameterized_insert_and_bm25_query_use_canonical_placeholders() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("real memory database");
+        exec(
+            &mut worker,
+            1,
+            "CREATE VIRTUAL TABLE chunks USING fts5(title, content, tokenize='porter unicode61')",
+        );
+        for (title, content) in [
+            (
+                "SQLite",
+                "Transactions keep persistent session records consistent",
+            ),
+            ("Unrelated", "A completely different document"),
+        ] {
+            let run_result = worker
+                .call(Command::Request(Request::Query {
+                    id: 1,
+                    sql: "INSERT INTO chunks(title, content) VALUES (?, ?)".into(),
+                    bindings: Bindings::Positional(vec![json!(title), json!(content)]),
+                    mode: QueryMode::Run,
+                }))
+                .expect("FTS5 parameterized insert");
+            assert_eq!(run_result["changes"], json!(1));
+        }
+        let search = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT title FROM chunks WHERE chunks MATCH ? ORDER BY bm25(chunks)".into(),
+                bindings: Bindings::Positional(vec![json!("transaction")]),
+                mode: QueryMode::All,
+            }))
+            .expect("FTS5 parameterized bm25 query");
+        assert_eq!(
+            search,
+            json!({ "columns": ["title"], "rows": [["SQLite"]] })
+        );
+        worker
+            .call(Command::Request(Request::Close { id: 1 }))
+            .expect("close");
+    }
+
+    #[test]
+    fn prepared_dml_and_select_preserve_dqs_literals_and_reject_missing_tables() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("open memory database");
+        exec(
+            &mut worker,
+            1,
+            "CREATE TABLE conflicts(id INTEGER PRIMARY KEY, value TEXT)",
+        );
+        let dml_sql = "INSERT INTO conflicts VALUES (9, \"DQS literal\") RETURNING id, value";
+        let prepared = worker
+            .call(Command::Request(Request::Prepare {
+                id: 1,
+                sql: dml_sql.into(),
+            }))
+            .expect("prepare DQS DML with RETURNING");
+        assert_eq!(prepared["columns"], json!(["id", "value"]));
+        let got = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: dml_sql.into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Get,
+            }))
+            .expect("execute DQS DML with RETURNING");
+        assert_eq!(
+            got,
+            json!({ "columns": ["id", "value"], "rows": [[9, "DQS literal"]] })
+        );
+        let run_sql = "INSERT INTO conflicts VALUES (10, \"DQS run literal\")";
+        worker
+            .call(Command::Request(Request::Prepare {
+                id: 1,
+                sql: run_sql.into(),
+            }))
+            .expect("prepare DQS DML without RETURNING");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: run_sql.into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Run,
+            }))
+            .expect("run DQS DML without RETURNING");
+        let rows = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id, value, \"DQS select\" AS tag FROM conflicts ORDER BY id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::All,
+            }))
+            .expect("select DQS literal");
+        assert_eq!(
+            rows["rows"],
+            json!([
+                [9, "DQS literal", "DQS select"],
+                [10, "DQS run literal", "DQS select"]
+            ])
+        );
+        let missing_table = worker
+            .call(Command::Request(Request::Prepare {
+                id: 1,
+                sql: "SELECT * FROM \"database is locked\"".into(),
+            }))
+            .expect_err("missing quoted table must still fail at prepare");
+        assert!(
+            missing_table.message.contains("no such table"),
+            "unexpected prepare failure: {}",
+            missing_table.message
+        );
+        worker
+            .call(Command::Request(Request::Close { id: 1 }))
+            .expect("close");
+    }
+
+    #[test]
+    fn worker_preserves_schema_level_on_conflict_fail_with_returning_and_run() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("open memory database");
+        exec(
+            &mut worker,
+            1,
+            "CREATE TABLE schema_fail(id INTEGER UNIQUE ON CONFLICT FAIL); \
+             CREATE TABLE schema_abort(id INTEGER UNIQUE);",
+        );
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_fail VALUES (9)".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Run,
+            }))
+            .expect("seed schema_fail");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_abort VALUES (9)".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Run,
+            }))
+            .expect("seed schema_abort");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_fail VALUES (1), (9), (2) RETURNING id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::All,
+            }))
+            .expect_err("duplicate row must still reject statement");
+        worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "INSERT INTO schema_abort VALUES (1), (9), (2) RETURNING id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::All,
+            }))
+            .expect_err("duplicate row in abort table must reject statement");
+        let fail_rows = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id FROM schema_fail ORDER BY id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Values,
+            }))
+            .expect("select schema_fail");
+        assert_eq!(fail_rows["rows"], json!([[1], [9]]));
+        let abort_rows = worker
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id FROM schema_abort ORDER BY id".into(),
+                bindings: Bindings::Positional(Vec::new()),
+                mode: QueryMode::Values,
+            }))
+            .expect("select schema_abort");
+        assert_eq!(abort_rows["rows"], json!([[9]]));
+        worker
+            .call(Command::Request(Request::Close { id: 1 }))
+            .expect("close");
     }
 }

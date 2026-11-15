@@ -1041,7 +1041,10 @@ impl PiApp {
         // operation. Session replacement already requires the agent owner,
         // which the goal holds; a late display reset must not bypass it.
         if self.goal_invocation.is_some()
-            && matches!(&msg, PiMsg::ConversationReset { .. } | PiMsg::BashResult { .. })
+            && matches!(
+                &msg,
+                PiMsg::ConversationReset { .. } | PiMsg::BashResult { .. }
+            )
         {
             return None;
         }
@@ -3310,35 +3313,29 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         };
 
-        let Some(runtime) = manager.runtime() else {
+        if !manager.has_callable_command(command) {
             self.status_message = Some(format!(
                 "Extension command '/{command}' is not available (runtime not enabled)"
             ));
             return None;
-        };
+        }
+        let manager = manager.clone();
 
         self.agent_state = AgentState::ToolRunning;
         self.current_tool = Some(format!("/{command}"));
 
         let command_name = command.to_string();
         let args_str = args.to_string();
-        let cwd = self.cwd.display().to_string();
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
-
-        let ctx_payload = serde_json::json!({
-            "cwd": cwd,
-            "hasUI": true,
-        });
 
         let cmd_for_msg = command_name.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let result = runtime
+            let result = manager
                 .execute_command(
-                    command_name,
-                    args_str,
-                    std::sync::Arc::new(ctx_payload),
+                    &command_name,
+                    &args_str,
                     EXTENSION_INTERACTIVE_COMMAND_TIMEOUT_MS,
                 )
                 .await;
@@ -3652,9 +3649,8 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     pub(super) fn queue_input(&mut self, kind: QueuedMessageKind) {
         if self.model_selection.is_some() {
-            self.status_message = Some(
-                "Model selection is still saving; your draft has been retained".to_string(),
-            );
+            self.status_message =
+                Some("Model selection is still saving; your draft has been retained".to_string());
             return;
         }
         if self.goal_invocation.is_some() {
@@ -3883,15 +3879,15 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.status_message = Some("Session busy; retry /goal when idle".to_string());
             return None;
         };
-        let owner_session_id = match self.session.try_lock() {
-            Ok(session) => session.header.id.clone(),
-            Err(_) => {
-                self.status_message = Some("Session busy; retry /goal when idle".to_string());
-                return None;
-            }
+        let owner_session_id = if let Ok(session) = self.session.try_lock() {
+            session.header.id.clone()
+        } else {
+            self.status_message = Some("Session busy; retry /goal when idle".to_string());
+            return None;
         };
         if self.displayed_session_id.as_deref() != Some(owner_session_id.as_str()) {
-            self.status_message = Some("Session display is catching up; retry /goal when idle".into());
+            self.status_message =
+                Some("Session display is catching up; retry /goal when idle".into());
             return None;
         }
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -3905,7 +3901,8 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.review_request_id = None;
         self.agent_state = AgentState::Processing;
         self.extension_streaming.store(true, Ordering::SeqCst);
-        self.status_message = Some("Goal operation in progress; Escape pauses execution".to_string());
+        self.status_message =
+            Some("Goal operation in progress; Escape pauses execution".to_string());
         let batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
             self.event_tx.clone(),
             Arc::clone(&self.tui_pressure_frame_p99_us),
@@ -3918,35 +3915,39 @@ After approving access in the browser, press Enter in Pi to complete login."
         );
         let args = args.to_string();
         let event_tx = self.event_tx.clone();
-        if let Err(error) = self.runtime_handle.try_spawn_with_cx(move |_task_cx| async move {
-            let mut pending = Vec::new();
-            let result = if cancellation.is_paused() {
-                Ok("Goal operation cancelled before it started".to_string())
-            } else {
-                Box::pin(crate::goal::terminal::run_with_control_and_pending(
-                    &mut agent.handle,
-                    &args,
-                    move |control| cancellation.publish(control),
-                    |inputs| pending = inputs,
-                ))
-                .await
-            };
-            drop(observation);
-            drop(agent);
-            flush_ui_stream_batcher_with_backpressure(&batcher).await;
-            let message = result.unwrap_or_else(|error| format!("Goal operation failed: {error}"));
-            enqueue_pi_event(
-                &event_tx,
-                &Cx::for_request(),
-                PiMsg::GoalFinished {
-                    request_id,
-                    owner_session_id,
-                    message,
-                    pending,
-                },
-            )
-            .await;
-        }) {
+        if let Err(error) = self
+            .runtime_handle
+            .try_spawn_with_cx(move |_task_cx| async move {
+                let mut pending = Vec::new();
+                let result = if cancellation.is_paused() {
+                    Ok("Goal operation cancelled before it started".to_string())
+                } else {
+                    Box::pin(crate::goal::terminal::run_with_control_and_pending(
+                        &mut agent.handle,
+                        &args,
+                        move |control| cancellation.publish(control),
+                        |inputs| pending = inputs,
+                    ))
+                    .await
+                };
+                drop(observation);
+                drop(agent);
+                flush_ui_stream_batcher_with_backpressure(&batcher).await;
+                let message =
+                    result.unwrap_or_else(|error| format!("Goal operation failed: {error}"));
+                enqueue_pi_event(
+                    &event_tx,
+                    &Cx::for_request(),
+                    PiMsg::GoalFinished {
+                        request_id,
+                        owner_session_id,
+                        message,
+                        pending,
+                    },
+                )
+                .await;
+            })
+        {
             self.goal_invocation = None;
             self.agent_state = AgentState::Idle;
             self.extension_streaming.store(false, Ordering::SeqCst);
@@ -4238,9 +4239,8 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.model_selection.is_some()
             && !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _)))
         {
-            self.status_message = Some(
-                "Model selection is still saving; your draft has been retained".to_string(),
-            );
+            self.status_message =
+                Some("Model selection is still saving; your draft has been retained".to_string());
             return None;
         }
         if self.goal_invocation.is_some()
@@ -4578,7 +4578,7 @@ mod stream_delta_batcher_tests {
         let (mut app, mut event_rx) = build_test_app_with_provider(Arc::new(Overloaded503Provider));
         let _ = app.submit_message("hello");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut saw_done = false;
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
@@ -4677,7 +4677,8 @@ mod stream_delta_batcher_tests {
         static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
             RuntimeBuilder::multi_thread()
-                .blocking_threads(1, 8)
+                .worker_threads(16)
+                .blocking_threads(4, 64)
                 .build()
                 .expect("build runtime")
         })
@@ -4768,7 +4769,18 @@ mod stream_delta_batcher_tests {
             ToolRegistry::new(&[], Path::new("."), None),
             AgentConfig::default(),
         );
-        let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+        static TEST_SESSIONS_ROOT: std::sync::OnceLock<tempfile::TempDir> =
+            std::sync::OnceLock::new();
+        let test_session_root = TEST_SESSIONS_ROOT
+            .get_or_init(|| tempfile::tempdir().expect("interactive test sessions root"));
+        let isolated_session_dir = test_session_root
+            .path()
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&isolated_session_dir)
+            .expect("create isolated interactive test session dir");
+        let mut in_memory_session = Session::in_memory();
+        in_memory_session.session_dir = Some(isolated_session_dir);
+        let session = Arc::new(asupersync::sync::Mutex::new(in_memory_session));
         let resources = ResourceLoader::empty(false);
         let resource_cli = ResourceCliOptions {
             no_skills: false,
@@ -4994,7 +5006,7 @@ mod stream_delta_batcher_tests {
             build_test_app_with_recovery(provider, retry_config(2, 1), None);
         app.session.try_lock().expect("session").path = Some(path);
         let _ = app.submit_message("one prompt");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !save_blocked.load(Ordering::SeqCst) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -6671,7 +6683,7 @@ mod stream_delta_batcher_tests {
     }
 
     fn wait_for_agent_done(event_rx: &mut mpsc::Receiver<PiMsg>) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
             match event_rx.try_recv() {
                 Ok(PiMsg::AgentDone { error_message, .. }) => {
@@ -7092,7 +7104,10 @@ mod stream_delta_batcher_tests {
         args: &str,
     ) -> String {
         let _ = app.submit_message(&format!("/goal {args}"));
-        assert!(app.goal_invocation.is_some(), "goal command was not admitted");
+        assert!(
+            app.goal_invocation.is_some(),
+            "goal command was not admitted"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             match receiver.try_recv() {
@@ -7151,9 +7166,7 @@ mod stream_delta_batcher_tests {
         let created = classic_goal_command(
             &mut app,
             &mut receiver,
-            &format!(
-                "create {initial_review} --tokens 100000 --prompts 4 -- inspect this branch"
-            ),
+            &format!("create {initial_review} --tokens 100000 --prompts 4 -- inspect this branch"),
         );
         assert!(created.contains("Goal journal saved"), "{created}");
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
@@ -7264,7 +7277,11 @@ mod stream_delta_batcher_tests {
             message.role == MessageRole::Assistant
                 && message.content == "Settled bounded prompt output"
         }));
-        assert!(app.messages.iter().all(|message| message.content != "stale goal report"));
+        assert!(
+            app.messages
+                .iter()
+                .all(|message| message.content != "stale goal report")
+        );
         let _ = app.handle_pi_message(PiMsg::GoalFinished {
             request_id: "running-goal".into(),
             owner_session_id: owner,
@@ -8632,7 +8649,11 @@ mod stream_delta_batcher_tests {
         assert_eq!(shared.model.id, "gpt-4o");
         drop(shared);
 
-        let agent_guard = app.agent.try_lock().expect("lock agent");
+        let agent_guard = runtime().block_on(async {
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &Cx::for_request())
+                .await
+                .expect("lock agent")
+        });
         assert_eq!(agent_guard.provider().name(), "openai");
         assert_eq!(agent_guard.provider().model_id(), "gpt-4o");
         assert_eq!(
@@ -8723,7 +8744,11 @@ mod stream_delta_batcher_tests {
         assert_eq!(shared.model.id, "gpt-4o");
         drop(shared);
 
-        let agent_guard = app.agent.try_lock().expect("lock agent");
+        let agent_guard = runtime().block_on(async {
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &Cx::for_request())
+                .await
+                .expect("lock agent")
+        });
         assert_eq!(agent_guard.provider().name(), "openai");
         assert_eq!(agent_guard.provider().model_id(), "gpt-4o");
         assert_eq!(

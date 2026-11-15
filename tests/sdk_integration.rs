@@ -934,6 +934,20 @@ fn sdk_model_switching() {
     let options = default_session_options(&harness);
 
     let mut handle = run_async(create_agent_session(options)).expect("create session");
+    let mut auth = pi::auth::AuthStorage::empty_at(harness.temp_path("auth.json"));
+    auth.set(
+        "anthropic",
+        pi::auth::AuthCredential::ApiKey {
+            key: "test-anthropic-key".to_string(),
+        },
+    );
+    auth.set(
+        "openai",
+        pi::auth::AuthCredential::ApiKey {
+            key: "test-openai-key".to_string(),
+        },
+    );
+    handle.adopt_auth_storage(auth);
 
     // Switch to openai/gpt-4o
     let (prov, model) = run_async(async move {

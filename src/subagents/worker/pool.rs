@@ -1154,7 +1154,9 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
         }
         items.push(json!({"id":id, "workerIndex":item.worker + 1, "status":turn.status, "summary":summary(turn.result.as_ref()), "resultRef":{"poolId":state.id,"itemId":id}}));
         if selected == Some(id) {
-            selected_item = Some(json!({"id":id, "workerIndex":item.worker + 1, "status":turn.status, "result":turn.result}));
+            selected_item = Some(
+                json!({"id":id, "workerIndex":item.worker + 1, "status":turn.status, "result":turn.result}),
+            );
         }
     }
     let mut value = json!({
@@ -1239,12 +1241,10 @@ fn projected_snapshot_with(
         || value.pointer("/item/workerIndex") != details.pointer("/item/workerIndex")
         || value.pointer("/item/status") != details.pointer("/item/status")
         || value.pointer("/item/result").is_some_and(|before| {
-            details
-                .pointer("/item/result")
-                .is_none_or(|after| {
-                    !super::output_contract::preserves_typed_result(before, after)
-                        || !super::isolation::preserves_result(before, after)
-                })
+            details.pointer("/item/result").is_none_or(|after| {
+                !super::output_contract::preserves_typed_result(before, after)
+                    || !super::isolation::preserves_result(before, after)
+            })
         })
     {
         return Err(Error::tool(
@@ -1734,7 +1734,10 @@ done
             assert_eq!(started["items"][1]["workerIndex"], 2);
             // Acknowledgment owns one snapshot even if a member has yet to
             // materialize it. Subsequent source edits must not leak into it.
-            std::fs::write(fixture.root.path().join("nested/base.txt"), "later parent\n")?;
+            std::fs::write(
+                fixture.root.path().join("nested/base.txt"),
+                "later parent\n",
+            )?;
             std::fs::write(
                 fixture.root.path().join("nested/untracked.txt"),
                 "later untracked\n",
@@ -1744,7 +1747,9 @@ done
             let running = fixture
                 .call(json!({"operation":"pool_status","poolId":pool}))
                 .await;
-            let workspaces = running["workerWorkspaces"].as_array().expect("member workspaces");
+            let workspaces = running["workerWorkspaces"]
+                .as_array()
+                .expect("member workspaces");
             assert_eq!(workspaces.len(), 2);
             assert_ne!(
                 workspaces[0]["workspace"]["worktreePath"],
@@ -1763,7 +1768,10 @@ done
                 assert_eq!(workspace["applyMode"], "keep");
                 assert_eq!(workspace["applied"], false);
                 let path = std::path::PathBuf::from(field(workspace, "worktreePath"));
-                assert_eq!(workspace["cwd"], json!(path.join("nested").to_string_lossy()));
+                assert_eq!(
+                    workspace["cwd"],
+                    json!(path.join("nested").to_string_lossy())
+                );
                 assert_eq!(
                     std::fs::read_to_string(path.join("nested/base.txt"))?,
                     "dirty parent\n"
@@ -1808,7 +1816,9 @@ done
                 assert_eq!(native["iso"]["worktreePath"], workspace["worktreePath"]);
                 assert_eq!(native["iso"]["applyMode"], "keep");
                 assert_eq!(native["iso"]["applied"], false);
-                let patch = native["iso"]["patch"].as_str().expect("cumulative worker diff");
+                let patch = native["iso"]["patch"]
+                    .as_str()
+                    .expect("cumulative worker diff");
                 assert!(patch.contains("nested/worker.txt"));
                 assert!(patch.contains(&format!("+{expected}\n")));
                 assert!(!patch.contains("nested/base.txt"));
@@ -1825,9 +1835,7 @@ done
             {
                 assert_eq!(row["workspace"], workspaces[index]["workspace"]);
                 assert_eq!(row["closed"], true);
-                assert!(
-                    std::path::Path::new(&field(&row["workspace"], "worktreePath")).is_dir()
-                );
+                assert!(std::path::Path::new(&field(&row["workspace"], "worktreePath")).is_dir());
             }
             let page = fixture
                 .call(json!({"operation":"pool_drain","poolId":pool}))
@@ -1842,7 +1850,11 @@ done
             )
             .await
             .expect_err("redacted workspace paths cannot remain actionable identities");
-            assert!(hidden_identity.to_string().contains("PI_SUBAGENT_POOL_PRIVACY"));
+            assert!(
+                hidden_identity
+                    .to_string()
+                    .contains("PI_SUBAGENT_POOL_PRIVACY")
+            );
             let hidden_patch = execute(
                 &fixture.tool,
                 json!({"operation":"pool_drain","poolId":pool}),
@@ -1850,7 +1862,11 @@ done
             )
             .await
             .expect_err("redacted bytes cannot retain an actionable patch contract");
-            assert!(hidden_patch.to_string().contains("PI_SUBAGENT_POOL_PRIVACY"));
+            assert!(
+                hidden_patch
+                    .to_string()
+                    .contains("PI_SUBAGENT_POOL_PRIVACY")
+            );
             assert_eq!(
                 std::fs::read_to_string(fixture.root.path().join("nested/base.txt"))?,
                 "later parent\n"
@@ -1860,7 +1876,10 @@ done
                 "later untracked\n"
             );
             assert!(!fixture.root.path().join("nested/worker.txt").exists());
-            assert_eq!(isolation_git(fixture.root.path(), &["rev-parse", "HEAD"])?, head);
+            assert_eq!(
+                isolation_git(fixture.root.path(), &["rev-parse", "HEAD"])?,
+                head
+            );
             assert_eq!(
                 std::fs::read(fixture.root.path().join(".git/index"))?,
                 index
@@ -1935,10 +1954,8 @@ done
             // All subsequent refusal cases have a valid Git source, so a
             // missing repository cannot mask an ignored disposition.
             init_dirty_workspace(&fixture)?;
-            let original = isolation_git(
-                fixture.root.path(),
-                &["worktree", "list", "--porcelain"],
-            )?;
+            let original =
+                isolation_git(fixture.root.path(), &["worktree", "list", "--porcelain"])?;
             for controls in [
                 json!({"isolation":"worktree","isoApply":"apply"}),
                 json!({"isolation":"worktree","isoApply":"drop"}),

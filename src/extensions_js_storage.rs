@@ -381,6 +381,14 @@ impl PersistentStorage {
             .any(|root| within_boundary(path, root))
     }
 
+    pub(super) fn registered_roots(&self) -> impl Iterator<Item = &Path> {
+        self.roots
+            .values()
+            .flatten()
+            .map(|grant| grant.root.as_path())
+            .chain(self.foreign_roots.values().flatten().map(PathBuf::as_path))
+    }
+
     pub(super) fn resolve(&self, path: &Path, owner: Option<&str>) -> io::Result<Option<PathBuf>> {
         self.resolve_grant(path, owner)
             .map(|resolved| resolved.map(|(path, _)| path))
@@ -499,6 +507,27 @@ impl PersistentStorage {
         }) && self.policy.as_ref().is_none_or(|policy| {
             policy.evaluate_for(capability, owner).decision == PolicyDecision::Allow
         })
+    }
+
+    /// Lazily materialize an owned `ReadWriteDirectory` root (`0700`, `NOFOLLOW`)
+    /// when an extension writes directly into `<dataDir>/<leaf>` without calling
+    /// `mkdirSync(dataDir, { recursive: true })` first. Nested uncreated
+    /// subdirectories (`<dataDir>/missing/leaf`) still fail with standard `ENOENT`.
+    fn ensure_owned_root_if_direct_parent(
+        &self,
+        path: &Path,
+        owner: Option<&str>,
+    ) -> io::Result<()> {
+        let Some((_, grant)) = self.resolve_grant(path, owner)? else {
+            return Ok(());
+        };
+        if grant.access == StorageAccess::ReadWriteDirectory
+            && path.parent() == Some(grant.root.as_path())
+            && !grant.root.exists()
+        {
+            pin_parent(&grant.root.join(".pijs-directory-sentinel"), true)?.verify()?;
+        }
+        Ok(())
     }
 }
 
@@ -922,6 +951,8 @@ pub(super) fn install(
                         if !registry.allows(&candidate, owner.as_deref(), "write") {
                             return Err(denied("persistent temporary directory escaped its grant"));
                         }
+                        registry
+                            .ensure_owned_root_if_direct_parent(&candidate, owner.as_deref())?;
                         match mutate(
                             "mkdir",
                             &candidate,
@@ -1048,6 +1079,9 @@ pub(super) fn install(
                     } else {
                         None
                     };
+                    if matches!(op.as_str(), "write" | "append") {
+                        registry.ensure_owned_root_if_direct_parent(&resolved, owner.as_deref())?;
+                    }
                     mutate(&op, &resolved, &args, target.as_deref())
                 };
                 run().map_err(|error| {

@@ -492,6 +492,15 @@ fn check_config(cwd: &Path, findings: &mut Vec<Finding>) {
     // Global settings
     let global_path = Config::global_dir().join("settings.json");
     check_settings_file(cat, &global_path, "Global settings", findings);
+    let manager = crate::package_manager::PackageManager::new(cwd.to_path_buf());
+    check_package_lockfile(
+        cat,
+        &manager,
+        crate::package_manager::PackageScope::User,
+        &Config::global_dir().join("packages.lock.json"),
+        "Global package lockfile",
+        findings,
+    );
 
     // Project settings
     let project_path = cwd.join(Config::project_dir()).join("settings.json");
@@ -504,6 +513,58 @@ fn check_config(cwd: &Path, findings: &mut Vec<Finding>) {
         );
     } else {
         findings.push(Finding::pass(cat, "No project settings (OK)"));
+    }
+    check_package_lockfile(
+        cat,
+        &manager,
+        crate::package_manager::PackageScope::Project,
+        &cwd.join(Config::project_dir()).join("packages.lock.json"),
+        "Project package lockfile (.pi/packages.lock.json)",
+        findings,
+    );
+}
+
+fn check_package_lockfile(
+    cat: CheckCategory,
+    manager: &crate::package_manager::PackageManager,
+    scope: crate::package_manager::PackageScope,
+    lockfile_path: &Path,
+    label: &str,
+    findings: &mut Vec<Finding>,
+) {
+    if !lockfile_path.exists() {
+        return;
+    }
+    if crate::package_manager::skip_package_integrity_from_env() {
+        findings.push(
+            Finding::warn(
+                cat,
+                format!("{label}: integrity check bypassed (PI_SKIP_PACKAGE_INTEGRITY)"),
+            )
+            .with_detail(format!(
+                "Skipped SHA-256 check for {}",
+                lockfile_path.display()
+            ))
+            .with_remediation("Unset PI_SKIP_PACKAGE_INTEGRITY to enforce lockfile verification"),
+        );
+        return;
+    }
+    match manager.verify_lockfile_at_path(scope, lockfile_path) {
+        Ok(count) => {
+            findings.push(Finding::pass(
+                cat,
+                format!("{label}: {count} locked package(s) verified"),
+            ));
+        }
+        Err(err) => {
+            findings.push(
+                Finding::fail(cat, format!("{label}: integrity verification failed"))
+                    .with_detail(err.to_string())
+                    .with_remediation(
+                        "Inspect modified package files or run `pi update <pkg>` / `pi remove <pkg> && pi install <pkg>`",
+                    ),
+            );
+        }
     }
 }
 
@@ -590,7 +651,14 @@ fn check_settings_file(cat: CheckCategory, path: &Path, label: &str, findings: &
 
 #[cfg(test)]
 mod doctor_typed_settings_regressions {
-    use super::{CheckCategory, DoctorReport, Severity, check_settings_file};
+    use super::{
+        CheckCategory, DoctorReport, Severity, check_package_lockfile, check_settings_file,
+    };
+    use crate::package_manager::{
+        PACKAGE_LOCK_SCHEMA, PackageEntryTrustState, PackageLockEntry, PackageLockfile,
+        PackageManager, PackageResolvedProvenance, PackageScope, PackageSourceKind,
+        digest_package_path, write_package_lockfile_atomic,
+    };
 
     #[test]
     fn invalid_typed_settings_fail_without_leaking_values() {
@@ -632,6 +700,69 @@ mod doctor_typed_settings_regressions {
             check_settings_file(CheckCategory::Config, &path, "Settings", &mut findings);
             assert_eq!(DoctorReport::from_findings(findings).overall, expected);
         }
+    }
+
+    #[test]
+    fn package_lockfile_doctor_check_passes_untampered_and_fails_on_tamper() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path();
+        let pkg_dir = cwd.join("pkg-alpha");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let entry_js = pkg_dir.join("index.js");
+        std::fs::write(&entry_js, "export default function init() { return 1; }\n").unwrap();
+
+        let digest = digest_package_path(&pkg_dir).unwrap();
+        let lockfile_path = cwd.join(".pi").join("packages.lock.json");
+        std::fs::create_dir_all(lockfile_path.parent().unwrap()).unwrap();
+        let resolved_pkg = pkg_dir.display().to_string();
+        let lockfile = PackageLockfile {
+            schema: PACKAGE_LOCK_SCHEMA.to_string(),
+            entries: vec![PackageLockEntry {
+                identity: format!("local:{resolved_pkg}"),
+                source: "./pkg-alpha".to_string(),
+                source_kind: PackageSourceKind::Local,
+                resolved: PackageResolvedProvenance::Local {
+                    resolved_path: resolved_pkg,
+                },
+                digest_sha256: digest.clone(),
+                trust_state: PackageEntryTrustState::Trusted,
+            }],
+        };
+        write_package_lockfile_atomic(&lockfile_path, &lockfile).unwrap();
+
+        let manager = PackageManager::new(cwd.to_path_buf());
+        let mut ok_findings = Vec::new();
+        check_package_lockfile(
+            CheckCategory::Config,
+            &manager,
+            PackageScope::Project,
+            &lockfile_path,
+            "Project package lockfile",
+            &mut ok_findings,
+        );
+        assert_eq!(
+            DoctorReport::from_findings(ok_findings).overall,
+            Severity::Pass
+        );
+
+        // Planted negative: 1-byte tamper in installed package file must fail closed.
+        std::fs::write(&entry_js, "export default function init() { return 2; }\n").unwrap();
+        let mut bad_findings = Vec::new();
+        check_package_lockfile(
+            CheckCategory::Config,
+            &manager,
+            PackageScope::Project,
+            &lockfile_path,
+            "Project package lockfile",
+            &mut bad_findings,
+        );
+        let report = DoctorReport::from_findings(bad_findings);
+        assert_eq!(report.overall, Severity::Fail);
+        let rendered = report.render_text();
+        assert!(
+            rendered.contains(&digest),
+            "expected locked sha256 in failure output: {rendered}"
+        );
     }
 }
 
@@ -1227,6 +1358,7 @@ fn check_swarm(cwd: &Path, findings: &mut Vec<Finding>) {
     check_swarm_next_action(cwd, findings);
     check_swarm_git(cwd, findings);
     check_swarm_rch(findings);
+    check_swarm_dsr_config(cwd, findings);
     check_swarm_rch_affinity(cwd, findings);
     check_swarm_temp_dirs(findings);
     check_swarm_context_intelligence(cwd, findings);
@@ -1234,6 +1366,117 @@ fn check_swarm(cwd: &Path, findings: &mut Vec<Finding>) {
     check_swarm_progress_slo(cwd, findings);
     check_swarm_operations_dashboard(cwd, findings);
     check_swarm_incident_diagnostics(findings);
+}
+
+fn check_swarm_dsr_config(cwd: &Path, findings: &mut Vec<Finding>) {
+    let repo_registry = cwd.join(".dsr/repos.yaml");
+    let repo_authority = cwd.join(".dsr/repos.d/pi_agent_rust.yaml");
+    if !repo_registry.exists() && !repo_authority.exists() {
+        return;
+    }
+    let dsr_config_dir = std::env::var_os("DSR_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config/dsr")));
+    let Some(host_dir) = dsr_config_dir else {
+        return;
+    };
+    findings.push(evaluate_dsr_config_drift(cwd, &host_dir));
+}
+
+fn evaluate_dsr_config_drift(cwd: &Path, host_dsr_dir: &Path) -> Finding {
+    let repo_registry_path = cwd.join(".dsr/repos.yaml");
+    let repo_authority_path = cwd.join(".dsr/repos.d/pi_agent_rust.yaml");
+    let Ok(repo_registry) = std::fs::read_to_string(&repo_registry_path) else {
+        return Finding::warn(
+            CheckCategory::Swarm,
+            "Checked-in .dsr/repos.yaml is unreadable",
+        )
+        .with_detail(repo_registry_path.display().to_string());
+    };
+    let Ok(repo_authority) = std::fs::read_to_string(&repo_authority_path) else {
+        return Finding::warn(
+            CheckCategory::Swarm,
+            "Checked-in .dsr/repos.d/pi_agent_rust.yaml is unreadable",
+        )
+        .with_detail(repo_authority_path.display().to_string());
+    };
+
+    let host_registry_path = host_dsr_dir.join("repos.yaml");
+    let host_authority_path = host_dsr_dir.join("repos.d/pi_agent_rust.yaml");
+    let mut drift_reasons = Vec::new();
+
+    match std::fs::read_to_string(&host_registry_path) {
+        Ok(host_registry) => {
+            if !host_registry.contains("pi_agent_rust:") {
+                drift_reasons.push(format!(
+                    "{} is missing tools.pi_agent_rust",
+                    host_registry_path.display()
+                ));
+            }
+        }
+        Err(_) => {
+            drift_reasons.push(format!(
+                "{} is missing (dsr quality requires host registry or DSR_REPOS_FILE=.dsr/repos.yaml)",
+                host_registry_path.display()
+            ));
+        }
+    }
+
+    match std::fs::read_to_string(&host_authority_path) {
+        Ok(host_authority) => {
+            if !host_authority.contains("tool_name: pi_agent_rust") {
+                drift_reasons.push(format!(
+                    "{} does not declare tool_name: pi_agent_rust",
+                    host_authority_path.display()
+                ));
+            }
+            if repo_authority.contains("build_profile: dist")
+                && !host_authority.contains("build_profile: dist")
+            {
+                drift_reasons.push(format!(
+                    "{} build_profile drifted from checked-in dist profile",
+                    host_authority_path.display()
+                ));
+            }
+            if host_authority.contains("workflow:") {
+                drift_reasons.push(format!(
+                    "{} retains retired GitHub Actions workflow key",
+                    host_authority_path.display()
+                ));
+            }
+        }
+        Err(_) => {
+            drift_reasons.push(format!(
+                "{} is missing (dsr build/release requires repos.d authority)",
+                host_authority_path.display()
+            ));
+        }
+    }
+
+    if !repo_registry.contains("--features wasm-host") {
+        drift_reasons.push(".dsr/repos.yaml is missing the wasm-host check lane".to_string());
+    }
+
+    if drift_reasons.is_empty() {
+        Finding::pass(
+            CheckCategory::Swarm,
+            "DSR host registry and build authority match checked-in .dsr recipe",
+        )
+        .with_detail(format!(
+            "verified {} and {}",
+            host_registry_path.display(),
+            host_authority_path.display()
+        ))
+    } else {
+        Finding::warn(
+            CheckCategory::Swarm,
+            "DSR host configuration drifted from checked-in .dsr recipe",
+        )
+        .with_detail(drift_reasons.join("; "))
+        .with_remediation(
+            "Sync ~/.config/dsr/ from .dsr/repos.yaml and .dsr/repos.d/pi_agent_rust.yaml, then run `dsr repos validate --repo pi_agent_rust`.",
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -14647,6 +14890,52 @@ export default function(pi) {
                 assert_eq!(fixed.severity, Severity::Pass);
                 assert_eq!(fixed.fixability, Fixability::Fixed);
             }
+        }
+
+        #[test]
+        fn dsr_config_drift_detects_legacy_host_drift_and_passes_when_synced() {
+            let repo_dir = tempfile::tempdir().expect("repo tempdir");
+            let host_dir = tempfile::tempdir().expect("host tempdir");
+            std::fs::create_dir_all(repo_dir.path().join(".dsr/repos.d")).unwrap();
+            std::fs::create_dir_all(host_dir.path().join("repos.d")).unwrap();
+
+            let checked_in_repos =
+                "tools:\n  pi_agent_rust:\n    checks:\n      - cargo test --features wasm-host\n";
+            let checked_in_authority = "tool_name: pi_agent_rust\nbuild_profile: dist\n";
+            std::fs::write(repo_dir.path().join(".dsr/repos.yaml"), checked_in_repos).unwrap();
+            std::fs::write(
+                repo_dir.path().join(".dsr/repos.d/pi_agent_rust.yaml"),
+                checked_in_authority,
+            )
+            .unwrap();
+
+            // Planted negative: legacy host config with tool_name: pi, build_profile: release, workflow key
+            std::fs::write(host_dir.path().join("repos.yaml"), "tools:\n  ntm: {}\n").unwrap();
+            std::fs::write(
+                host_dir.path().join("repos.d/pi_agent_rust.yaml"),
+                "tool_name: pi\nbuild_profile: release\nworkflow: .github/workflows/release.yml\n",
+            )
+            .unwrap();
+            let drifted = evaluate_dsr_config_drift(repo_dir.path(), host_dir.path());
+            assert_eq!(drifted.severity, Severity::Warn);
+            let detail = drifted.detail.unwrap_or_default();
+            assert!(detail.contains("missing tools.pi_agent_rust"), "{detail}");
+            assert!(
+                detail.contains("does not declare tool_name: pi_agent_rust"),
+                "{detail}"
+            );
+            assert!(detail.contains("build_profile drifted"), "{detail}");
+            assert!(detail.contains("workflow key"), "{detail}");
+
+            // Positive: synced host config passes cleanly
+            std::fs::write(host_dir.path().join("repos.yaml"), checked_in_repos).unwrap();
+            std::fs::write(
+                host_dir.path().join("repos.d/pi_agent_rust.yaml"),
+                checked_in_authority,
+            )
+            .unwrap();
+            let synced = evaluate_dsr_config_drift(repo_dir.path(), host_dir.path());
+            assert_eq!(synced.severity, Severity::Pass);
         }
     }
 }

@@ -417,9 +417,7 @@ impl Mp3Frame {
             (false, true) => 9,
         };
         let protected = header & (1 << 16) == 0;
-        if bytes < 4 + usize::from(protected) * 2 + side_info
-            || offset.checked_add(bytes)? > end
-        {
+        if bytes < 4 + usize::from(protected) * 2 + side_info || offset.checked_add(bytes)? > end {
             return None;
         }
         Some(Self {
@@ -500,7 +498,11 @@ fn mp3_indexed_duration(
     // omitted. This preserves bounded inspection without claiming to verify
     // compressed audio or every header of an indexed, possibly long file.
     let audio_bytes = stream_bytes.checked_sub(u64::try_from(first.bytes).ok()?)?;
-    let (min_bitrate, max_bitrate) = if first.version == 3 { (32, 320) } else { (8, 160) };
+    let (min_bitrate, max_bitrate) = if first.version == 3 {
+        (32, 320)
+    } else {
+        (8, 160)
+    };
     let min_frame_bytes = first.samples * 125 * min_bitrate / first.rate;
     let max_frame_bytes = first.samples * 125 * max_bitrate / first.rate + 1;
     if frames == 0
@@ -1169,7 +1171,16 @@ mod tests {
                     continue;
                 }
                 let header = [
-                    b'I', b'D', b'3', version, 0, if footer { 0x10 } else { 0 }, 0, 0, 0, 3,
+                    b'I',
+                    b'D',
+                    b'3',
+                    version,
+                    0,
+                    if footer { 0x10 } else { 0 },
+                    0,
+                    0,
+                    0,
+                    3,
                 ];
                 let mut tagged = header.to_vec();
                 tagged.extend_from_slice(b"abc");
@@ -1288,8 +1299,8 @@ mod tests {
         let len = u32::try_from(valid.len()).unwrap();
         valid[48..52].copy_from_slice(&len.to_be_bytes());
         for (offset, replacement) in [
-            (40, 0_u32),        // Missing frame count.
-            (40, 0x8000_0001),  // Reserved index flags.
+            (40, 0_u32),       // Missing frame count.
+            (40, 0x8000_0001), // Reserved index flags.
             (44, 0),           // No audio frames.
             (44, u32::MAX),    // Impossible frame count.
             (48, len - 1),     // Inconsistent total stream size.

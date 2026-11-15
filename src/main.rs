@@ -87,7 +87,7 @@ use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
 const EXIT_CODE_USAGE: i32 = 2;
-const EXIT_CODE_COST_CAP: i32 = 3;
+const EXIT_CODE_COST_CAP: i32 = 5;
 
 /// A print-mode run whose stdout reader closed the pipe first, e.g.
 /// `pi --print --mode json ... | head -5`.
@@ -789,6 +789,19 @@ fn handle_recover_blocking(
 
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
+    // Fast-path standalone `--version` / `-v` before constructing Clap's full
+    // Command metadata so startup/idle RSS stays minimal while preserving
+    // multi-argument conflict validation (such as `pi --fetch-models --version`).
+    {
+        let mut args = std::env::args_os();
+        if let (Some(_bin), Some(only_arg), None) = (args.next(), args.next(), args.next())
+            && (only_arg == "--version" || only_arg == "-v")
+        {
+            print_version()?;
+            return Ok(());
+        }
+    }
+
     // Parse CLI arguments
     let Some((mut cli, extension_flags, raw_args)) = parse_cli_from_env()? else {
         return Ok(());
@@ -2567,7 +2580,7 @@ async fn run(
                 .map(str::to_string)
                 .collect(),
             runtime_handle: runtime_handle.clone(),
-            session_dir: cli.session_dir.as_ref().map(PathBuf::from),
+            session_dir: pi::acp::resolve_acp_session_dir(&cli),
             // The ACP prompt builder advertises skills only when this launch
             // enables the read tool, as on the terminal stacks.
             skills_prompt: Some(resources.format_skills_for_prompt()),
@@ -2759,7 +2772,7 @@ async fn run(
         // written.
         drop(session);
         let ftui_enabled_tools = ftui_tool_selection(&cli, &enabled_tools);
-        let options = pi::sdk::SessionOptions {
+        let mut options = pi::sdk::SessionOptions {
             provider: cli.provider.clone(),
             model: cli.model.clone(),
             model_scope: cli.models.as_deref().map(pi::app::parse_models_arg),
@@ -2855,6 +2868,12 @@ async fn run(
             ),
             ..Default::default()
         };
+        options.set_startup_bootstrap(pi::sdk::SdkStartupBootstrap {
+            config: config.clone(),
+            auth: auth.clone(),
+            oauth_refresh: startup_oauth_refresh.clone(),
+            model_registry: model_registry.clone(),
+        });
         let theme = pi::theme::Theme::resolve(&config, &cwd);
         // Same `disabledProviders` filter the classic stack applies when it
         // builds its model list: without it the setting was silently
@@ -3706,6 +3725,9 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
         bind,
         view_only,
         max_viewers,
+        tls_cert,
+        tls_key,
+        allow_insecure_lan,
     }) = cli.command.as_ref()
     else {
         return Ok(());
@@ -3729,23 +3751,27 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
             "`pi web` runs the local FrankenTUI session; output/query modes and --classic cannot be combined with it"
         );
     }
+    let parsed_bind: pi::web_remote::BindMode = bind.parse().map_err(anyhow::Error::msg)?;
+    if tls_cert.is_some() != tls_key.is_some() {
+        bail!("`pi web` TLS requires both --tls-cert <PATH> and --tls-key <PATH>");
+    }
     if *terminal && cli.inline {
         bail!("`pi web --terminal` requires fullscreen rendering; remove --inline");
-    }
-    if !has_local_terminal {
-        bail!(
-            "`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported"
-        );
     }
     let (mode, bind_mode, viewer_limit) = if *terminal {
         (
             pi::web_remote::WebRemoteMode::Terminal,
-            bind.parse().map_err(anyhow::Error::msg)?,
+            parsed_bind,
             pi::web_remote::MAX_WEB_VIEWERS,
         )
     } else {
-        if bind != "loopback" {
-            bail!("`pi web` supports only --bind loopback; other bindings require --terminal");
+        if parsed_bind != pi::web_remote::BindMode::Loopback {
+            bail!(
+                "`pi web` supports only --bind loopback; other bindings require --terminal with --tls-cert <PATH> and --tls-key <PATH> (or --allow-insecure-lan)"
+            );
+        }
+        if tls_cert.is_some() {
+            bail!("`pi web` TLS (--tls-cert/--tls-key) requires --terminal");
         }
         (
             pi::web_remote::WebRemoteMode::Companion,
@@ -3756,11 +3782,34 @@ fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) ->
     if !(1..=viewer_limit).contains(max_viewers) {
         bail!("`pi web --max-viewers` must be between 1 and {viewer_limit}");
     }
+    if *terminal
+        && parsed_bind != pi::web_remote::BindMode::Loopback
+        && tls_cert.is_none()
+        && !*allow_insecure_lan
+    {
+        bail!(
+            "`pi web` refuses cleartext non-loopback binding (--bind {bind}) without TLS: pass --tls-cert <PATH> and --tls-key <PATH> (with --terminal), or pass --allow-insecure-lan to explicitly permit unencrypted network traffic"
+        );
+    }
+    if !has_local_terminal {
+        bail!(
+            "`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported"
+        );
+    }
+    if bind_mode != pi::web_remote::BindMode::Loopback && tls_cert.is_none() && *allow_insecure_lan
+    {
+        eprintln!(
+            "SECURITY WARNING: `pi web` is binding to {bind} WITHOUT TLS (--allow-insecure-lan); pairing bearer tokens and terminal frames will traverse the network in cleartext."
+        );
+    }
     cli.web_companion = Some(pi::web_remote::WebRemoteSettings {
         port: *port,
         bind_mode,
         view_only: *view_only,
         max_viewers: *max_viewers,
+        tls_cert: tls_cert.clone(),
+        tls_key: tls_key.clone(),
+        allow_insecure_lan: *allow_insecure_lan,
         ..Default::default()
     });
     cli.web_remote_mode = mode;
@@ -10727,12 +10776,23 @@ fn finish_print_text_response(
         // When piped, emit plain text via output_final_text to avoid escape codes.
         if std::io::IsTerminal::is_terminal(&io::stdout()) {
             let mut markdown = String::new();
+            let mut inline_images = Vec::new();
             for block in &message.content {
-                if let ContentBlock::Text(text) = block {
-                    markdown.push_str(&text.text);
-                    if !markdown.ends_with('\n') {
-                        markdown.push('\n');
+                match block {
+                    ContentBlock::Text(text) => {
+                        markdown.push_str(&text.text);
+                        if !markdown.ends_with('\n') {
+                            markdown.push('\n');
+                        }
                     }
+                    ContentBlock::Image(image) => {
+                        inline_images.push(pi::terminal_images::render_inline(
+                            &image.data,
+                            &image.mime_type,
+                            80,
+                        ));
+                    }
+                    _ => {}
                 }
             }
 
@@ -10740,6 +10800,9 @@ fn finish_print_text_response(
                 let console = PiConsole::new();
                 let code_block_indent = Some(config.markdown_code_block_indent() as usize);
                 console.render_markdown_with_indent(&markdown, code_block_indent);
+            }
+            for rendered in inline_images {
+                emit_text_delta(&format!("{rendered}\n"))?;
             }
         } else {
             pi::app::output_final_text(message);
@@ -12047,7 +12110,7 @@ mod tests {
             ("tailscale", pi::web_remote::BindMode::Tailscale),
             ("lan", pi::web_remote::BindMode::Lan),
         ] {
-            let mut cli = cli::Cli::parse_from([
+            let mut args = vec![
                 "pi",
                 "--session",
                 "saved-session.jsonl",
@@ -12069,7 +12132,11 @@ mod tests {
                 "--max-viewers",
                 "64",
                 "--view-only",
-            ]);
+            ];
+            if bind != "loopback" {
+                args.push("--allow-insecure-lan");
+            }
+            let mut cli = cli::Cli::parse_from(args);
             prepare_web_companion_launch(&mut cli, true).unwrap();
             assert_eq!(cli.web_remote_mode, pi::web_remote::WebRemoteMode::Terminal);
             assert!(cli.command.is_none());
@@ -13611,7 +13678,25 @@ mod tests {
             cap: 2.0,
         })
         .context("print request failed");
-        assert_eq!(exit_code_for_error(&error), 3);
+        assert_eq!(exit_code_for_error(&error), EXIT_CODE_COST_CAP);
+        assert_eq!(EXIT_CODE_COST_CAP, 5);
+        // Injective exit-code mapping: cost-cap must never collide with
+        // ordinary failure (1), usage (2), approval-unavailable (3), or
+        // configured resource load failure (4).
+        let distinct_codes = [
+            EXIT_CODE_STDOUT_CLOSED,
+            EXIT_CODE_FAILURE,
+            EXIT_CODE_USAGE,
+            EXIT_CODE_APPROVAL_UNAVAILABLE,
+            EXIT_CODE_RESOURCE_LOAD_FAILED,
+            EXIT_CODE_COST_CAP,
+        ];
+        let unique: std::collections::HashSet<i32> = distinct_codes.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            distinct_codes.len(),
+            "all non-zero CLI exit code classes must be injective: {distinct_codes:?}"
+        );
         assert_eq!(exit_code_for_error(&anyhow::anyhow!("ordinary failure")), 1);
     }
 
@@ -16190,7 +16275,11 @@ mod tests {
             }
             let failed = call == 0;
             let message = AssistantMessage {
-                content: Vec::new(),
+                content: if failed {
+                    Vec::new()
+                } else {
+                    vec![ContentBlock::Text(pi::model::TextContent::new("ok"))]
+                },
                 api: self.api().to_string(),
                 provider: self.name().to_string(),
                 model: self.model_id().to_string(),

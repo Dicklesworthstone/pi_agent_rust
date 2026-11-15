@@ -730,3 +730,68 @@ fn sdk_rpc_shutdown_and_drop_stop_live_and_reaped_root_descendants() {
         }
     }
 }
+
+#[test]
+fn sdk_is_only_public_root_module_and_basic_sdk_imports_exclusively_from_sdk() {
+    fn unhidden_root_pub_mods(lib_source: &str) -> Vec<String> {
+        let mut unhidden = Vec::new();
+        let mut pending_hidden = false;
+        for raw_line in lib_source.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if line == "#[doc(hidden)]" {
+                pending_hidden = true;
+                continue;
+            }
+            if line.starts_with("#[") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pub mod ") {
+                let name = rest
+                    .trim_end_matches(';')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches('{');
+                if !pending_hidden {
+                    unhidden.push(name.to_string());
+                }
+            }
+            pending_hidden = false;
+        }
+        unhidden
+    }
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lib_rs = std::fs::read_to_string(manifest_dir.join("src/lib.rs")).expect("read src/lib.rs");
+    assert_eq!(
+        unhidden_root_pub_mods(&lib_rs),
+        vec!["sdk".to_string()],
+        "pi::sdk must be the sole non-#[doc(hidden)] root pub mod in src/lib.rs"
+    );
+
+    // Planted negative: an accidental unhidden `pub mod tools;` must be caught.
+    assert_eq!(
+        unhidden_root_pub_mods("#[doc(hidden)]\npub mod agent;\npub mod sdk;\npub mod tools;\n"),
+        vec!["sdk".to_string(), "tools".to_string()]
+    );
+
+    let basic_sdk = std::fs::read_to_string(manifest_dir.join("examples/basic_sdk.rs"))
+        .expect("read examples/basic_sdk.rs");
+    for (line_no, raw_line) in basic_sdk.lines().enumerate() {
+        let code = raw_line.split("//").next().unwrap_or("");
+        let mut rest = code;
+        while let Some(pos) = rest.find("pi::") {
+            let after = &rest[pos + 4..];
+            assert!(
+                after.starts_with("sdk::") || after.starts_with("sdk "),
+                "examples/basic_sdk.rs:{} imports internal module outside pi::sdk: {}",
+                line_no + 1,
+                raw_line.trim()
+            );
+            rest = after;
+        }
+    }
+}

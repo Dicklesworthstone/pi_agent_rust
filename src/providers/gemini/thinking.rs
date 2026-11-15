@@ -134,15 +134,19 @@ pub(crate) fn push_text(
     } else {
         let index = partial.content.len();
         if thought {
-            partial.content.push(ContentBlock::Thinking(ThinkingContent {
-                thinking: String::new(),
-                thinking_signature: None,
-            }));
+            partial
+                .content
+                .push(ContentBlock::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: None,
+                }));
             events.push_back(StreamEvent::ThinkingStart {
                 content_index: index,
             });
         } else {
-            partial.content.push(ContentBlock::Text(TextContent::new("")));
+            partial
+                .content
+                .push(ContentBlock::Text(TextContent::new("")));
             events.push_back(StreamEvent::TextStart {
                 content_index: index,
             });
@@ -279,8 +283,12 @@ mod tests {
             max_tokens: Some(4096),
             ..Default::default()
         };
-        let value = serde_json::to_value(config("models/gemini-2.5-flash", &options).unwrap()).unwrap();
-        assert_eq!(value, json!({"includeThoughts": true, "thinkingBudget": 1234}));
+        let value =
+            serde_json::to_value(config("models/gemini-2.5-flash", &options).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({"includeThoughts": true, "thinkingBudget": 1234})
+        );
         assert_eq!(options.max_tokens, Some(4096));
     }
 
@@ -294,10 +302,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let value = serde_json::to_value(config("gemini-2.5-flash-lite", &options).unwrap()).unwrap();
+        let value =
+            serde_json::to_value(config("gemini-2.5-flash-lite", &options).unwrap()).unwrap();
         assert_eq!(value["thinkingBudget"], 512);
         options.thinking_level = Some(ThinkingLevel::Max);
-        let value = serde_json::to_value(config("gemini-2.5-pro-preview", &options).unwrap()).unwrap();
+        let value =
+            serde_json::to_value(config("gemini-2.5-pro-preview", &options).unwrap()).unwrap();
         assert_eq!(value["thinkingBudget"], 32768);
         let value = serde_json::to_value(config("gemini-2.5-flash", &options).unwrap()).unwrap();
         assert_eq!(value["thinkingBudget"], 24576);
@@ -333,18 +343,42 @@ mod tests {
             assert!(value.get("thinkingBudget").is_none());
             assert_eq!(value["includeThoughts"], true);
         }
-        assert_eq!(configuration("gemini-3-pro-preview", ThinkingLevel::Medium)["thinkingLevel"], "HIGH");
-        assert_eq!(configuration("gemini-3.1-pro-preview", ThinkingLevel::Medium)["thinkingLevel"], "MEDIUM");
-        assert_eq!(configuration("gemini-3-flash-preview", ThinkingLevel::Minimal)["thinkingLevel"], "MINIMAL");
+        assert_eq!(
+            configuration("gemini-3-pro-preview", ThinkingLevel::Medium)["thinkingLevel"],
+            "HIGH"
+        );
+        assert_eq!(
+            configuration("gemini-3.1-pro-preview", ThinkingLevel::Medium)["thinkingLevel"],
+            "MEDIUM"
+        );
+        assert_eq!(
+            configuration("gemini-3-flash-preview", ThinkingLevel::Minimal)["thinkingLevel"],
+            "MINIMAL"
+        );
     }
 
     #[test]
     fn newer_flash_and_image_variants_only_receive_supported_levels() {
-        assert_eq!(configuration("gemini-3.8-flash", ThinkingLevel::Minimal)["thinkingLevel"], "LOW");
-        assert_eq!(configuration("gemini-3.7-flash", ThinkingLevel::Off)["thinkingLevel"], "LOW");
-        assert_eq!(configuration("gemini-3.5-flash", ThinkingLevel::Minimal)["thinkingLevel"], "MINIMAL");
-        assert_eq!(configuration("gemini-3.1-flash-lite-image", ThinkingLevel::Low)["thinkingLevel"], "MINIMAL");
-        assert_eq!(configuration("gemini-3.1-flash-lite-image", ThinkingLevel::Medium)["thinkingLevel"], "HIGH");
+        assert_eq!(
+            configuration("gemini-3.8-flash", ThinkingLevel::Minimal)["thinkingLevel"],
+            "LOW"
+        );
+        assert_eq!(
+            configuration("gemini-3.7-flash", ThinkingLevel::Off)["thinkingLevel"],
+            "LOW"
+        );
+        assert_eq!(
+            configuration("gemini-3.5-flash", ThinkingLevel::Minimal)["thinkingLevel"],
+            "MINIMAL"
+        );
+        assert_eq!(
+            configuration("gemini-3.1-flash-lite-image", ThinkingLevel::Low)["thinkingLevel"],
+            "MINIMAL"
+        );
+        assert_eq!(
+            configuration("gemini-3.1-flash-lite-image", ThinkingLevel::Medium)["thinkingLevel"],
+            "HIGH"
+        );
     }
 
     #[test]
@@ -352,16 +386,54 @@ mod tests {
         let mut partial = AssistantMessage::default();
         let mut events = VecDeque::new();
         let mut started = false;
-        push_text(&mut partial, &mut events, &mut started, "Consider ".into(), true, None);
-        push_text(&mut partial, &mut events, &mut started, "the cases".into(), true, None);
-        push_text(&mut partial, &mut events, &mut started, "Answer".into(), false, None);
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            "Consider ".into(),
+            true,
+            None,
+        );
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            "the cases".into(),
+            true,
+            None,
+        );
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            "Answer".into(),
+            false,
+            None,
+        );
         assert_eq!(partial.content.len(), 2);
-        assert!(matches!(&partial.content[0], ContentBlock::Thinking(t) if t.thinking == "Consider the cases"));
+        assert!(
+            matches!(&partial.content[0], ContentBlock::Thinking(t) if t.thinking == "Consider the cases")
+        );
         assert!(matches!(&partial.content[1], ContentBlock::Text(t) if t.text == "Answer"));
         assert!(matches!(events[0], StreamEvent::Start { .. }));
-        assert!(matches!(events[1], StreamEvent::ThinkingStart { content_index: 0 }));
-        assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::ThinkingDelta { .. })).count(), 2);
-        assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::TextDelta { .. })).count(), 1);
+        assert!(matches!(
+            events[1],
+            StreamEvent::ThinkingStart { content_index: 0 }
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ThinkingDelta { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::TextDelta { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -369,13 +441,40 @@ mod tests {
         let mut partial = AssistantMessage::default();
         let mut events = VecDeque::new();
         let mut started = false;
-        push_text(&mut partial, &mut events, &mut started, "reasoning".into(), true, None);
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            "reasoning".into(),
+            true,
+            None,
+        );
         let event_count = events.len();
-        push_text(&mut partial, &mut events, &mut started, String::new(), true, Some("signature-one".into()));
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            String::new(),
+            true,
+            Some("signature-one".into()),
+        );
         assert_eq!(events.len(), event_count);
-        assert!(matches!(&partial.content[0], ContentBlock::Thinking(t) if t.thinking_signature.as_deref() == Some("signature-one")));
-        push_text(&mut partial, &mut events, &mut started, "another part".into(), true, None);
-        assert_eq!(partial.content.len(), 2, "do not merge unsigned content into a signed part");
+        assert!(
+            matches!(&partial.content[0], ContentBlock::Thinking(t) if t.thinking_signature.as_deref() == Some("signature-one"))
+        );
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            "another part".into(),
+            true,
+            None,
+        );
+        assert_eq!(
+            partial.content.len(),
+            2,
+            "do not merge unsigned content into a signed part"
+        );
     }
 
     #[test]
@@ -384,13 +483,22 @@ mod tests {
         let mut events = VecDeque::new();
         let mut started = false;
         for (text, signature) in [("a", "sig-a"), ("b", "sig-b"), ("", "sig-c")] {
-            push_text(&mut partial, &mut events, &mut started, text.into(), false, Some(signature.into()));
+            push_text(
+                &mut partial,
+                &mut events,
+                &mut started,
+                text.into(),
+                false,
+                Some(signature.into()),
+            );
         }
         assert_eq!(partial.content.len(), 3);
         let serialized = serde_json::to_string(&partial).unwrap();
         let replay: AssistantMessage = serde_json::from_str(&serialized).unwrap();
         for (block, signature) in replay.content.iter().zip(["sig-a", "sig-b", "sig-c"]) {
-            assert!(matches!(block, ContentBlock::Text(t) if t.text_signature.as_deref() == Some(signature)));
+            assert!(
+                matches!(block, ContentBlock::Text(t) if t.text_signature.as_deref() == Some(signature))
+            );
         }
     }
 
@@ -399,7 +507,14 @@ mod tests {
         let mut partial = AssistantMessage::default();
         let mut events = VecDeque::new();
         let mut started = false;
-        push_text(&mut partial, &mut events, &mut started, String::new(), false, None);
+        push_text(
+            &mut partial,
+            &mut events,
+            &mut started,
+            String::new(),
+            false,
+            None,
+        );
         assert!(partial.content.is_empty());
         assert!(events.is_empty());
         assert!(!started);
@@ -408,11 +523,21 @@ mod tests {
     #[test]
     fn foreign_thought_signatures_are_not_google_history() {
         let mut message = AssistantMessage::default();
-        for api in ["anthropic-messages", "openai-responses", "openai-completions", ""] {
+        for api in [
+            "anthropic-messages",
+            "openai-responses",
+            "openai-completions",
+            "",
+        ] {
             message.api = api.into();
             assert!(!google_history(&message));
         }
-        for api in ["google-generative-ai", "google-gemini-cli", "google-vertex", "google"] {
+        for api in [
+            "google-generative-ai",
+            "google-gemini-cli",
+            "google-vertex",
+            "google",
+        ] {
             message.api = api.into();
             assert!(google_history(&message));
         }
@@ -423,10 +548,19 @@ mod tests {
         let metadata: UsageMetadata = serde_json::from_value(json!({
             "promptTokenCount": 100, "cachedContentTokenCount": 80,
             "candidatesTokenCount": 10, "thoughtsTokenCount": 30, "totalTokenCount": 140
-        })).unwrap();
+        }))
+        .unwrap();
         let mut usage = Usage::default();
         UsageAccumulator::default().update(metadata, &mut usage);
-        assert_eq!((usage.input, usage.cache_read, usage.output, usage.total_tokens), (20, 80, 40, 140));
+        assert_eq!(
+            (
+                usage.input,
+                usage.cache_read,
+                usage.output,
+                usage.total_tokens
+            ),
+            (20, 80, 40, 140)
+        );
     }
 
     #[test]
@@ -434,23 +568,48 @@ mod tests {
         let mut accumulator = UsageAccumulator::default();
         let mut usage = Usage::default();
         for _ in 0..2 {
-            accumulator.update(serde_json::from_value(json!({
-                "promptTokenCount": 100, "candidatesTokenCount": 10
-            })).unwrap(), &mut usage);
+            accumulator.update(
+                serde_json::from_value(json!({
+                    "promptTokenCount": 100, "candidatesTokenCount": 10
+                }))
+                .unwrap(),
+                &mut usage,
+            );
         }
-        accumulator.update(serde_json::from_value(json!({"thoughtsTokenCount": 30, "cachedContentTokenCount": 80})).unwrap(), &mut usage);
-        assert_eq!((usage.input, usage.cache_read, usage.output, usage.total_tokens), (20, 80, 40, 140));
-        accumulator.update(serde_json::from_value(json!({"thoughtsTokenCount": 0})).unwrap(), &mut usage);
+        accumulator.update(
+            serde_json::from_value(
+                json!({"thoughtsTokenCount": 30, "cachedContentTokenCount": 80}),
+            )
+            .unwrap(),
+            &mut usage,
+        );
+        assert_eq!(
+            (
+                usage.input,
+                usage.cache_read,
+                usage.output,
+                usage.total_tokens
+            ),
+            (20, 80, 40, 140)
+        );
+        accumulator.update(
+            serde_json::from_value(json!({"thoughtsTokenCount": 0})).unwrap(),
+            &mut usage,
+        );
         assert_eq!(usage.output, 10, "explicit zero is not an omitted field");
     }
 
     #[test]
     fn malformed_usage_cannot_underflow_or_overflow() {
         let mut usage = Usage::default();
-        UsageAccumulator::default().update(serde_json::from_value(json!({
-            "promptTokenCount": 1, "cachedContentTokenCount": u64::MAX,
-            "candidatesTokenCount": u64::MAX, "thoughtsTokenCount": u64::MAX
-        })).unwrap(), &mut usage);
+        UsageAccumulator::default().update(
+            serde_json::from_value(json!({
+                "promptTokenCount": 1, "cachedContentTokenCount": u64::MAX,
+                "candidatesTokenCount": u64::MAX, "thoughtsTokenCount": u64::MAX
+            }))
+            .unwrap(),
+            &mut usage,
+        );
         assert_eq!(usage.input, 0);
         assert_eq!(usage.cache_read, 1);
         assert_eq!(usage.output, u64::MAX);

@@ -297,6 +297,17 @@ const fn is_jpeg_sof_marker(marker: u8) -> bool {
 // High-level render function
 // ---------------------------------------------------------------------------
 
+/// Generate a sanitized, control-sequence-free text placeholder for base64
+/// image data, extracting `WxH` dimensions when structurally recognizable.
+#[must_use]
+pub fn placeholder_for_base64(image_b64: &str, mime_type: &str) -> String {
+    let Some(bytes) = decode_base64_bounded(image_b64, MAX_INLINE_IMAGE_BYTES) else {
+        return placeholder(mime_type, None, None);
+    };
+    let dims = image_dimensions(&bytes);
+    placeholder(mime_type, dims.map(|(w, _)| w), dims.map(|(_, h)| h))
+}
+
 /// Render an image for inline terminal display.
 ///
 /// - `image_b64`: base64-encoded image data (as stored in `ImageContent.data`).
@@ -306,17 +317,10 @@ const fn is_jpeg_sof_marker(marker: u8) -> bool {
 /// Returns the string to write to the terminal.
 ///
 pub fn render_inline(image_b64: &str, mime_type: &str, max_cols: usize) -> String {
-    let fallback = placeholder(mime_type, None, None);
-    let protocol = detect_protocol();
-    if protocol == ImageProtocol::Unsupported {
-        return fallback;
-    }
-
     let Some(bytes) = decode_base64_bounded(image_b64, MAX_INLINE_IMAGE_BYTES) else {
-        return fallback;
+        return placeholder(mime_type, None, None);
     };
-
-    render_inline_bytes(&bytes, mime_type, max_cols, protocol)
+    render_inline_bytes(&bytes, mime_type, max_cols, detect_protocol())
 }
 
 fn decode_base64_bounded(image_b64: &str, max_decoded_bytes: usize) -> Option<Vec<u8>> {

@@ -759,6 +759,7 @@ fn run_fd_list_files(bin: &str, cwd: &Path) -> Option<Vec<String>> {
         .current_dir(cwd)
         .arg("--type")
         .arg("f")
+        .arg("--hidden")
         .arg("--strip-cwd-prefix")
         .output()
         .ok()?;
@@ -919,7 +920,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "share",
-            description: "Share the session as a GitHub Gist",
+            description: "Share the session as a secret, unlisted GitHub Gist",
         },
         BuiltinSlashCommand {
             name: "mcp",

@@ -395,7 +395,8 @@ fn recovery_http_status(lower: &str) -> Option<u16> {
         headline = rest.split_once(": ").map_or(rest, |(_, message)| message);
     }
     if let Some(rest) = headline
-        .strip_prefix("api error:")
+        .strip_prefix("io error:")
+        .or_else(|| headline.strip_prefix("api error:"))
         .or_else(|| headline.strip_prefix("error:"))
     {
         headline = rest.trim_start();
@@ -1622,6 +1623,7 @@ pub fn retry_delay_ms(base_delay_ms: u32, max_delay_ms: u32, attempt: u32) -> u3
 #[must_use]
 pub fn marks_session_persistence(error_text: &str) -> bool {
     error_text.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
+        || error_text.contains("SESSION_PERSISTENCE_FAILED")
 }
 
 /// No credential is available until a local cooldown expires. Repeating the
@@ -2042,7 +2044,10 @@ mod logical_turn_event_tests {
         assert!(state.observe(start()).is_none());
         let reply = assistant(StopReason::Stop);
         assert!(state.observe(end(vec![reply.clone()])).is_none());
-        let Some(AgentEvent::AgentEnd { messages, error, .. }) = state.finish(None) else {
+        let Some(AgentEvent::AgentEnd {
+            messages, error, ..
+        }) = state.finish(None)
+        else {
             panic!("one final logical end");
         };
         let mut expected = completed;
@@ -2062,15 +2067,20 @@ mod logical_turn_event_tests {
 
     #[test]
     fn rejected_rewind_keeps_failed_output_and_reports_the_later_failure() {
-        for final_error in ["Retry aborted", "session save failed", "fallback setup failed"] {
+        for final_error in [
+            "Retry aborted",
+            "session save failed",
+            "fallback setup failed",
+        ] {
             let mut state = LogicalTurnEventState::default();
             let _ = state.observe(start());
             let failed = assistant(StopReason::Error);
             let _ = state.observe(end(vec![failed.clone()]));
             // No successful restoration occurred, so the failed tail is still
             // part of the current conversation and must not disappear.
-            let Some(AgentEvent::AgentEnd { messages, error, .. }) =
-                state.finish(Some(final_error.to_string()))
+            let Some(AgentEvent::AgentEnd {
+                messages, error, ..
+            }) = state.finish(Some(final_error.to_string()))
             else {
                 panic!("one terminal result even without another provider attempt");
             };

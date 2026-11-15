@@ -592,11 +592,38 @@ impl TextArea {
                 true
             }
             KeyCode::Home => {
-                self.move_to_line_start();
+                if shift {
+                    let target = if ctrl {
+                        CursorPosition::default()
+                    } else {
+                        CursorNavigator::new(self.editor.rope())
+                            .from_line_grapheme(self.editor.cursor().line, 0)
+                    };
+                    self.editor.extend_selection_to(target);
+                    self.ensure_cursor_visible();
+                } else if ctrl {
+                    self.move_to_document_start();
+                } else {
+                    self.move_to_line_start();
+                }
                 true
             }
             KeyCode::End => {
-                self.move_to_line_end();
+                if shift {
+                    let rope = self.editor.rope();
+                    let nav = CursorNavigator::new(rope);
+                    let target = if ctrl {
+                        nav.from_byte_index(rope.len_bytes())
+                    } else {
+                        nav.from_line_grapheme(self.editor.cursor().line, usize::MAX)
+                    };
+                    self.editor.extend_selection_to(target);
+                    self.ensure_cursor_visible();
+                } else if ctrl {
+                    self.move_to_document_end();
+                } else {
+                    self.move_to_line_end();
+                }
                 true
             }
             KeyCode::PageUp => {

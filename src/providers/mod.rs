@@ -41,6 +41,7 @@ pub mod model_fetch;
 pub mod openai;
 pub mod openai_responses;
 mod tool_schema;
+pub use tool_schema::anthropic_tool_schema;
 pub mod vertex;
 
 pub use model_fetch::{
@@ -914,7 +915,15 @@ impl ExtensionStreamSimpleProvider {
     fn build_js_options(options: &StreamOptions) -> Value {
         let mut map = serde_json::Map::new();
         if let Some(temp) = options.temperature {
-            map.insert("temperature".to_string(), serde_json::json!(temp));
+            let number = temp
+                .to_string()
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64);
+            map.insert(
+                "temperature".to_string(),
+                number.map_or_else(|| serde_json::json!(temp), Value::Number),
+            );
         }
         if let Some(max_tokens) = options.max_tokens {
             map.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
@@ -1184,6 +1193,10 @@ impl Provider for PricedProvider {
         self.inner.model_id()
     }
 
+    fn capabilities(&self) -> crate::provider::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
     fn model_cost(&self) -> Option<crate::provider::ModelCost> {
         Some(self.cost.clone())
     }
@@ -1402,7 +1415,13 @@ fn create_transport_provider(
             let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
                 .with_provider_name(&entry.model.provider)
                 .with_compat(entry.compat.clone())
+                .with_reasoning(entry.model.reasoning)
+                .with_input_types(&entry.model.input)
+                .with_model_cost(entry.model.cost.clone())
                 .with_client(client);
+            if let Some(auth) = auth {
+                provider = provider.with_auth_storage(auth)?;
+            }
             if !entry.model.base_url.is_empty() {
                 // The catalog `base_url` is a chat-completions endpoint hint
                 // (as for every other provider), never the GitHub REST API

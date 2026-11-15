@@ -62,7 +62,7 @@ use swc_ecma_transforms_typescript::strip;
 
 mod executable;
 mod intl;
-mod process_session;
+pub(crate) mod process_session;
 mod sqlite;
 #[path = "extensions_js_storage.rs"]
 mod storage;
@@ -5367,21 +5367,110 @@ fn path_is_in_registered_extension_root(
             .any(|root| path.starts_with(root))
 }
 
+fn lexical_normalize_fs_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn temp_sandbox_container_for_root(root: &Path, temp_base: &Path) -> Option<PathBuf> {
+    let rel = root.strip_prefix(temp_base).ok()?;
+    let first = rel.components().find_map(|component| match component {
+        std::path::Component::Normal(name) => Some(name),
+        _ => None,
+    })?;
+    Some(temp_base.join(first))
+}
+
 fn path_is_in_workspace_or_registered_extension_root(
     path: &Path,
     workspace_root: &Path,
     module_state: &Rc<RefCell<PiJsModuleState>>,
+    env: &HashMap<String, String>,
+    windows_environment: bool,
+    extension_temp_roots: &[String],
 ) -> bool {
     if module_state.borrow().persistent_storage.is_registered(path) {
         return true;
     }
+    let lexical_path = lexical_normalize_fs_path(path);
     let checked_path = crate::extensions::safe_canonicalize(path);
-    checked_path.starts_with(workspace_root)
+    if checked_path.starts_with(workspace_root)
+        || lexical_path.starts_with(workspace_root)
         || path_is_in_registered_extension_root(&checked_path, module_state)
+        || path_is_in_registered_extension_root(&lexical_path, module_state)
         || module_state
             .borrow()
             .persistent_storage
             .is_registered(&checked_path)
+    {
+        return true;
+    }
+
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "PI_CODING_AGENT_DIR",
+        "PI_CONFIG_DIR",
+    ] {
+        if let Some(raw_dir) = configured_environment_value(env, key, windows_environment)
+            && !raw_dir.trim().is_empty()
+        {
+            let raw_path = Path::new(raw_dir);
+            let lexical_dir = lexical_normalize_fs_path(raw_path);
+            let canonical_dir = crate::extensions::safe_canonicalize(raw_path);
+            if (!lexical_dir.as_os_str().is_empty()
+                && (lexical_path.starts_with(&lexical_dir)
+                    || checked_path.starts_with(&lexical_dir)))
+                || (!canonical_dir.as_os_str().is_empty()
+                    && (lexical_path.starts_with(&canonical_dir)
+                        || checked_path.starts_with(&canonical_dir)))
+            {
+                return true;
+            }
+        }
+    }
+
+    let state = module_state.borrow();
+    for raw_temp in extension_temp_roots {
+        let temp_path = Path::new(raw_temp);
+        for temp_base in [
+            lexical_normalize_fs_path(temp_path),
+            crate::extensions::safe_canonicalize(temp_path),
+        ] {
+            if temp_base.as_os_str().is_empty() {
+                continue;
+            }
+            let host_roots = std::iter::once(workspace_root)
+                .chain(state.canonical_extension_roots.iter().map(PathBuf::as_path))
+                .chain(
+                    state
+                        .foreign_extension_root_boundaries_by_id
+                        .values()
+                        .flatten()
+                        .map(PathBuf::as_path),
+                )
+                .chain(state.persistent_storage.registered_roots());
+            for host_root in host_roots {
+                if let Some(container) = temp_sandbox_container_for_root(host_root, &temp_base)
+                    && (lexical_path.starts_with(&container)
+                        || checked_path.starts_with(&container))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn persistent_storage_path(
@@ -6532,7 +6621,7 @@ fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
         url.to_string()
     } else if module_name.starts_with('/') {
         let mut url = url::Url::parse("file:///").expect("static file URL");
-        url.set_path(module_name);
+        url.set_path(&module_name.replace('%', "%25"));
         url.to_string()
     } else if module_name.len() > 2
         && module_name.as_bytes()[1] == b':'
@@ -6541,8 +6630,25 @@ fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
     {
         // Also encode Windows paths correctly in host-independent diagnostics.
         let mut url = url::Url::parse("file:///").expect("static file URL");
-        url.set_path(&format!("/{}", module_name.replace('\\', "/")));
+        url.set_path(&format!(
+            "/{}",
+            module_name.replace('\\', "/").replace('%', "%25")
+        ));
         url.to_string()
+    } else if let Some(unc_tail) = module_name
+        .strip_prefix("\\\\")
+        .or_else(|| module_name.strip_prefix("//"))
+    {
+        let normalized = unc_tail.replace('\\', "/");
+        if let Some((host, rest)) = normalized.split_once('/')
+            && !host.is_empty()
+        {
+            let mut url = url::Url::parse(&format!("file://{host}/")).expect("static UNC file URL");
+            url.set_path(&format!("/{}", rest.replace('%', "%25")));
+            url.to_string()
+        } else {
+            format!("pi://{module_name}")
+        }
     } else {
         format!("pi://{module_name}")
     };
@@ -10014,6 +10120,91 @@ function builtinToolExecute(name, cwd, opts, supported = {}) {
 }
 
 export function createBashTool(cwd, opts = {}) {
+  const baseExecute = builtinToolExecute("bash", cwd, opts, {
+    commandPrefix: "string",
+    spawnHook: "function",
+  });
+  const spawnHook = opts && typeof opts === "object" ? opts.spawnHook : undefined;
+  const commandPrefix = opts && typeof opts === "object" ? opts.commandPrefix : undefined;
+  const execute = typeof spawnHook !== "function"
+    ? baseExecute
+    : async function executeWithSpawnHook(_id, params, signal, onUpdate) {
+        if (!params || typeof params !== "object" || Array.isArray(params)) {
+          throw new TypeError("bash tool input must be an object");
+        }
+        if (onUpdate !== undefined && onUpdate !== null && typeof onUpdate !== "function") {
+          throw new TypeError("bash tool onUpdate must be a function");
+        }
+        if (typeof __pi_builtin_tool_hostcall !== "function") {
+          throw new Error("Native tool factory delegation is unavailable in this runtime");
+        }
+        const baseOptions = Object.create(null);
+        if (commandPrefix !== undefined) baseOptions.commandPrefix = commandPrefix;
+        if (typeof params.command !== "string") {
+          const fallbackMeta = { options: baseOptions, stream: typeof onUpdate === "function" };
+          if (cwd !== undefined) fallbackMeta.cwd = cwd;
+          return __pi_builtin_tool_hostcall("bash", params, fallbackMeta, signal, onUpdate);
+        }
+        const proc = typeof globalThis.process === "object" && globalThis.process ? globalThis.process : null;
+        const baseEnv = Object.assign(Object.create(null), proc && proc.env ? proc.env : {});
+        const effectiveCwd = cwd !== undefined
+          ? cwd
+          : (proc && typeof proc.cwd === "function" ? proc.cwd() : "");
+        const hooked = await spawnHook({
+          command: params.command,
+          cwd: effectiveCwd,
+          env: { ...baseEnv },
+        });
+        if (!hooked || typeof hooked !== "object" || Array.isArray(hooked)) {
+          throw new TypeError("bash spawnHook must return an object");
+        }
+        const nextCommand = hooked.command !== undefined ? hooked.command : params.command;
+        if (typeof nextCommand !== "string") {
+          throw new TypeError("bash spawnHook command must be a string");
+        }
+        const nextCwd = hooked.cwd !== undefined ? hooked.cwd : cwd;
+        if (nextCwd !== undefined && (typeof nextCwd !== "string" || !nextCwd || nextCwd.includes("\0"))) {
+          throw new TypeError("bash spawnHook cwd must be a non-empty path");
+        }
+        const callOptions = Object.assign(Object.create(null), baseOptions);
+        if (hooked.env !== undefined) {
+          if (!hooked.env || typeof hooked.env !== "object" || Array.isArray(hooked.env)) {
+            throw new TypeError("bash spawnHook env must be an object");
+          }
+          const spawnEnv = Object.create(null);
+          const spawnEnvUnset = [];
+          for (const [key, value] of Object.entries(hooked.env)) {
+            if (value === undefined) {
+              if (Object.prototype.hasOwnProperty.call(baseEnv, key)) {
+                spawnEnvUnset.push(key);
+              }
+            } else {
+              if (typeof value !== "string") {
+                throw new TypeError(`bash spawnHook env '${key}' must be a string`);
+              }
+              if (!Object.prototype.hasOwnProperty.call(baseEnv, key) || baseEnv[key] !== value) {
+                spawnEnv[key] = value;
+              }
+            }
+          }
+          for (const key of Object.keys(baseEnv)) {
+            if (!Object.prototype.hasOwnProperty.call(hooked.env, key) && !spawnEnvUnset.includes(key)) {
+              spawnEnvUnset.push(key);
+            }
+          }
+          if (Object.keys(spawnEnv).length > 0) callOptions.spawnEnv = spawnEnv;
+          if (spawnEnvUnset.length > 0) callOptions.spawnEnvUnset = spawnEnvUnset;
+        }
+        const metadata = { options: callOptions, stream: typeof onUpdate === "function" };
+        if (nextCwd !== undefined) metadata.cwd = nextCwd;
+        return __pi_builtin_tool_hostcall(
+          "bash",
+          { ...params, command: nextCommand },
+          metadata,
+          signal,
+          onUpdate,
+        );
+      };
   return {
     name: "bash",
     label: "bash",
@@ -10026,7 +10217,7 @@ export function createBashTool(cwd, opts = {}) {
       },
       required: ["command"],
     },
-    execute: builtinToolExecute("bash", cwd, opts, { commandPrefix: "string" }),
+    execute,
   };
 }
 
@@ -14227,9 +14418,19 @@ export function symlinkSync(target, path, _type) {
   }
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
-    throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
+    const parentStat = __pi_vfs.readHostStat(parent, true);
+    if (parentStat && parentStat.kind === "dir") {
+      __pi_vfs.ensureDir(parent);
+    } else {
+      throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
+    }
   }
-  if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized) || __pi_vfs.symlinks.has(normalized)) {
+  if (
+    __pi_vfs.files.has(normalized) ||
+    __pi_vfs.dirs.has(normalized) ||
+    __pi_vfs.symlinks.has(normalized) ||
+    __pi_vfs.readHostStat(normalized, false) != null
+  ) {
     throw new Error(`EEXIST: file already exists, symlink '${String(path ?? "")}'`);
   }
   __pi_vfs.symlinks.set(normalized, String(target ?? ""));
@@ -15721,12 +15922,21 @@ function __pi_net_apply_options(socket, options) {
   socket.localPort = socket.localPort || 0;
 }
 
+function __pi_net_unsupported(op) {
+  const err = new Error(`${op} is not supported in the PiJS QuickJS sandbox (raw TCP sockets are unavailable; use pi.http / fetch instead)`);
+  err.code = 'ERR_PI_SHIM_UNSUPPORTED_OPERATION';
+  return err;
+}
+
 function __pi_net_finish_connect(socket) {
   __pi_net_schedule(() => {
     if (socket.destroyed) return;
     socket.connecting = false;
-    socket.readyState = 'open';
-    socket.emit('connect');
+    socket.readyState = 'closed';
+    if (typeof socket.listenerCount === 'function' && socket.listenerCount('error') > 0) {
+      socket.emit('error', __pi_net_unsupported('node:net.Socket.connect'));
+    }
+    socket.emit('close', true);
   });
 }
 
@@ -15755,14 +15965,14 @@ export class Socket extends EventEmitter {
     return this;
   }
 
-  write(data, _encoding, cb) {
-    this.bytesWritten += __pi_net_bytes(data);
-    if (typeof cb === 'function') cb(null);
-    return true;
+  write(_data, _encoding, _cb) {
+    throw __pi_net_unsupported('node:net.Socket.write');
   }
 
   end(data, _encoding, cb) {
-    if (data !== undefined) this.write(data);
+    if (data !== undefined) {
+      throw __pi_net_unsupported('node:net.Socket.end(data)');
+    }
     if (typeof cb === 'function') cb(null);
     this.destroy();
     return this;
@@ -15803,7 +16013,7 @@ export function connect(...args) {
 }
 
 export function createServer(_opts, _callback) {
-  throw new Error('node:net.createServer is not available in PiJS');
+  throw __pi_net_unsupported('node:net.createServer');
 }
 
 function __pi_net_is_ipv4(input) {
@@ -17674,20 +17884,29 @@ import EventEmitter from 'node:events';
 export const DEFAULT_MIN_VERSION = 'TLSv1.2';
 export const DEFAULT_MAX_VERSION = 'TLSv1.3';
 
+function __pi_tls_unsupported(op) {
+  const err = new Error(`${op} is not available in PiJS`);
+  err.code = 'ERR_PI_SHIM_UNSUPPORTED_OPERATION';
+  return err;
+}
+
 export class TLSSocket extends EventEmitter {
   constructor(_socket, _options) {
     super();
     this.authorized = false;
     this.encrypted = true;
   }
+  write() {
+    throw __pi_tls_unsupported('node:tls.TLSSocket.write');
+  }
 }
 
 export function connect(_portOrOptions, _host, _options, _callback) {
-  throw new Error('node:tls.connect is not available in PiJS');
+  throw __pi_tls_unsupported('node:tls.connect');
 }
 
 export function createServer(_options, _secureConnectionListener) {
-  throw new Error('node:tls.createServer is not available in PiJS');
+  throw __pi_tls_unsupported('node:tls.createServer');
 }
 
 export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_MAX_VERSION };
@@ -18018,6 +18237,11 @@ export default { getText, setText };
         "node-pty".to_string(),
         r"
 let _pid = 1000;
+function __pi_pty_unsupported(op) {
+    const err = new Error(`${op} is not supported in the PiJS QuickJS sandbox (native PTY allocation is unavailable; use pi.exec instead)`);
+    err.code = 'ERR_PI_SHIM_UNSUPPORTED_OPERATION';
+    return err;
+}
 export function spawn(shell, args, options) {
     const pid = _pid++;
     const handlers = {};
@@ -18025,9 +18249,9 @@ export function spawn(shell, args, options) {
         pid,
         onData(cb) { handlers.data = cb; },
         onExit(cb) { if (cb) setTimeout(() => cb({ exitCode: 1, signal: undefined }), 0); },
-        write(d) {},
-        resize(c, r) {},
-        kill(s) {},
+        write(_d) { throw __pi_pty_unsupported('node-pty.write'); },
+        resize(_c, _r) {},
+        kill(_s) {},
     };
 }
 export default { spawn };
@@ -18576,51 +18800,616 @@ export default {
     modules.insert(
         "zod".to_string(),
         compressed_js_literal!(
-            r"
-const __schema = {
-  parse(value) { return value; },
-  safeParse(value) { return { success: true, data: value }; },
-  optional() { return this; },
-  nullable() { return this; },
-  nullish() { return this; },
-  default() { return this; },
-  array() { return this; },
-  transform() { return this; },
-  refine() { return this; },
-  describe() { return this; },
-  min() { return this; },
-  max() { return this; },
-  length() { return this; },
-  regex() { return this; },
-  url() { return this; },
-  email() { return this; },
-  uuid() { return this; },
-  int() { return this; },
-  positive() { return this; },
-  nonnegative() { return this; },
-  nonempty() { return this; },
-};
-function makeSchema() { return Object.create(__schema); }
+            r#"
+export class ZodError extends Error {
+  constructor(issues) {
+    const list = Array.isArray(issues) ? issues : [];
+    const summary = list
+      .map((i) => {
+        const p = i.path && i.path.length ? i.path.join(".") + ": " : "";
+        return p + i.message;
+      })
+      .join("; ");
+    super(summary || "Validation error");
+    this.name = "ZodError";
+    this.issues = list;
+    this.errors = list;
+  }
+  flatten() {
+    const formErrors = [];
+    const fieldErrors = {};
+    for (const issue of this.issues) {
+      if (issue.path && issue.path.length > 0) {
+        const k = String(issue.path[0]);
+        if (!fieldErrors[k]) fieldErrors[k] = [];
+        fieldErrors[k].push(issue.message);
+      } else {
+        formErrors.push(issue.message);
+      }
+    }
+    return { formErrors, fieldErrors };
+  }
+}
+
+function __issue(path, message, code = "custom") {
+  return { code, path: path.slice(), message };
+}
+
+export class ZodType {
+  constructor(validator) {
+    this._validate = validator;
+    this._checks = [];
+    this.description = undefined;
+  }
+  _clone() {
+    const next = new ZodType(this._validate);
+    next._checks = this._checks.slice();
+    next.description = this.description;
+    if (this.shape) next.shape = { ...this.shape };
+    if (this._unknownKeys) next._unknownKeys = this._unknownKeys;
+    if (this._catchall) next._catchall = this._catchall;
+    if (this.options) next.options = this.options.slice();
+    if (this.enum) next.enum = { ...this.enum };
+    if (this.element) next.element = this.element;
+    return next;
+  }
+  _addCheck(fn) {
+    const next = this._clone();
+    next._checks.push(fn);
+    return next;
+  }
+  _run(value, path) {
+    const base = this._validate(value, path);
+    if (!base.ok) return base;
+    let current = base.value;
+    for (const check of this._checks) {
+      const res = check(current, path);
+      if (!res.ok) return res;
+      current = res.value;
+    }
+    return { ok: true, value: current };
+  }
+  parse(value) {
+    const res = this._run(value, []);
+    if (!res.ok) throw new ZodError(res.issues);
+    return res.value;
+  }
+  safeParse(value) {
+    const res = this._run(value, []);
+    if (!res.ok) return { success: false, error: new ZodError(res.issues) };
+    return { success: true, data: res.value };
+  }
+  async parseAsync(value) {
+    return this.parse(value);
+  }
+  async safeParseAsync(value) {
+    return this.safeParse(value);
+  }
+  optional() {
+    const inner = this;
+    return new ZodType((v, path) =>
+      v === undefined ? { ok: true, value: undefined } : inner._run(v, path)
+    );
+  }
+  nullable() {
+    const inner = this;
+    return new ZodType((v, path) =>
+      v === null ? { ok: true, value: null } : inner._run(v, path)
+    );
+  }
+  nullish() {
+    const inner = this;
+    return new ZodType((v, path) =>
+      v === undefined || v === null ? { ok: true, value: v } : inner._run(v, path)
+    );
+  }
+  default(def) {
+    const inner = this;
+    return new ZodType((v, path) => {
+      if (v === undefined) {
+        const resolved = typeof def === "function" ? def() : def;
+        return { ok: true, value: resolved };
+      }
+      return inner._run(v, path);
+    });
+  }
+  catch(fallback) {
+    const inner = this;
+    return new ZodType((v, path) => {
+      const res = inner._run(v, path);
+      if (res.ok) return res;
+      const resolved = typeof fallback === "function" ? fallback({ error: new ZodError(res.issues), input: v }) : fallback;
+      return { ok: true, value: resolved };
+    });
+  }
+  array() { return makeArray(this); }
+  or(other) { return makeUnion([this, other]); }
+  and(other) { return makeIntersection(this, other); }
+  transform(fn) {
+    return this._addCheck((v, path) => {
+      try {
+        return { ok: true, value: fn(v) };
+      } catch (err) {
+        return { ok: false, issues: [__issue(path, err && err.message ? err.message : String(err))] };
+      }
+    });
+  }
+  pipe(target) {
+    const inner = this;
+    return new ZodType((v, path) => {
+      const first = inner._run(v, path);
+      if (!first.ok) return first;
+      return target._run(first.value, path);
+    });
+  }
+  refine(check, messageOrOpts) {
+    const msg =
+      typeof messageOrOpts === "string"
+        ? messageOrOpts
+        : (messageOrOpts && messageOrOpts.message) || "Invalid input";
+    const extraPath =
+      messageOrOpts && Array.isArray(messageOrOpts.path) ? messageOrOpts.path : [];
+    return this._addCheck((v, path) =>
+      check(v)
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path.concat(extraPath), msg, "custom")] }
+    );
+  }
+  superRefine(fn) {
+    return this._addCheck((v, path) => {
+      const issues = [];
+      const ctx = {
+        path: path.slice(),
+        addIssue(issue) {
+          const p = issue && Array.isArray(issue.path) ? path.concat(issue.path) : path.slice();
+          issues.push(__issue(p, (issue && issue.message) || "Invalid input", (issue && issue.code) || "custom"));
+        },
+      };
+      fn(v, ctx);
+      return issues.length ? { ok: false, issues } : { ok: true, value: v };
+    });
+  }
+  describe(text) {
+    const next = this._clone();
+    next.description = String(text ?? "");
+    return next;
+  }
+  readonly() { return this._clone(); }
+  brand() { return this._clone(); }
+  min(n, msg) {
+    return this._addCheck((v, path) => {
+      if (typeof v === "string" || Array.isArray(v)) {
+        return v.length >= n
+          ? { ok: true, value: v }
+          : { ok: false, issues: [__issue(path, msg || `Must have length >= ${n}`, "too_small")] };
+      }
+      if (typeof v === "number" || typeof v === "bigint") {
+        return v >= n
+          ? { ok: true, value: v }
+          : { ok: false, issues: [__issue(path, msg || `Must be >= ${n}`, "too_small")] };
+      }
+      return { ok: true, value: v };
+    });
+  }
+  max(n, msg) {
+    return this._addCheck((v, path) => {
+      if (typeof v === "string" || Array.isArray(v)) {
+        return v.length <= n
+          ? { ok: true, value: v }
+          : { ok: false, issues: [__issue(path, msg || `Must have length <= ${n}`, "too_big")] };
+      }
+      if (typeof v === "number" || typeof v === "bigint") {
+        return v <= n
+          ? { ok: true, value: v }
+          : { ok: false, issues: [__issue(path, msg || `Must be <= ${n}`, "too_big")] };
+      }
+      return { ok: true, value: v };
+    });
+  }
+  gte(n, msg) { return this.min(n, msg); }
+  lte(n, msg) { return this.max(n, msg); }
+  gt(n, msg) {
+    return this._addCheck((v, path) =>
+      (typeof v === "number" || typeof v === "bigint") && v <= n
+        ? { ok: false, issues: [__issue(path, msg || `Must be > ${n}`, "too_small")] }
+        : { ok: true, value: v }
+    );
+  }
+  lt(n, msg) {
+    return this._addCheck((v, path) =>
+      (typeof v === "number" || typeof v === "bigint") && v >= n
+        ? { ok: false, issues: [__issue(path, msg || `Must be < ${n}`, "too_big")] }
+        : { ok: true, value: v }
+    );
+  }
+  length(n, msg) {
+    return this._addCheck((v, path) =>
+      (typeof v === "string" || Array.isArray(v)) && v.length !== n
+        ? { ok: false, issues: [__issue(path, msg || `Must have length ${n}`, "custom")] }
+        : { ok: true, value: v }
+    );
+  }
+  nonempty(msg) { return this.min(1, msg || "Cannot be empty"); }
+  trim() { return this.transform((v) => (typeof v === "string" ? v.trim() : v)); }
+  toLowerCase() { return this.transform((v) => (typeof v === "string" ? v.toLowerCase() : v)); }
+  toUpperCase() { return this.transform((v) => (typeof v === "string" ? v.toUpperCase() : v)); }
+  startsWith(prefix, msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "string" && !v.startsWith(prefix)
+        ? { ok: false, issues: [__issue(path, msg || `Must start with "${prefix}"`, "invalid_string")] }
+        : { ok: true, value: v }
+    );
+  }
+  endsWith(suffix, msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "string" && !v.endsWith(suffix)
+        ? { ok: false, issues: [__issue(path, msg || `Must end with "${suffix}"`, "invalid_string")] }
+        : { ok: true, value: v }
+    );
+  }
+  includes(sub, msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "string" && !v.includes(sub)
+        ? { ok: false, issues: [__issue(path, msg || `Must include "${sub}"`, "invalid_string")] }
+        : { ok: true, value: v }
+    );
+  }
+  regex(re, msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "string" && !re.test(v)
+        ? { ok: false, issues: [__issue(path, msg || "Invalid string format", "invalid_string")] }
+        : { ok: true, value: v }
+    );
+  }
+  email(msg) { return this.regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, msg || "Invalid email"); }
+  url(msg) { return this.regex(/^[a-zA-Z][a-zA-Z\d+\-.]*:\/\/[^\s]+$/, msg || "Invalid url"); }
+  uuid(msg) {
+    return this.regex(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      msg || "Invalid uuid"
+    );
+  }
+  int(msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "number" && !Number.isInteger(v)
+        ? { ok: false, issues: [__issue(path, msg || "Expected integer", "invalid_type")] }
+        : { ok: true, value: v }
+    );
+  }
+  positive(msg) { return this.gt(0, msg || "Expected positive number"); }
+  nonnegative(msg) { return this.min(0, msg || "Expected nonnegative number"); }
+  negative(msg) { return this.lt(0, msg || "Expected negative number"); }
+  nonpositive(msg) { return this.max(0, msg || "Expected nonpositive number"); }
+  finite(msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "number" && !Number.isFinite(v)
+        ? { ok: false, issues: [__issue(path, msg || "Expected finite number", "not_finite")] }
+        : { ok: true, value: v }
+    );
+  }
+  safe(msg) {
+    return this._addCheck((v, path) =>
+      typeof v === "number" && !Number.isSafeInteger(v)
+        ? { ok: false, issues: [__issue(path, msg || "Expected safe integer", "too_big")] }
+        : { ok: true, value: v }
+    );
+  }
+  passthrough() { return makeObject(this.shape || {}, "passthrough", this._catchall, this._checks); }
+  strict() { return makeObject(this.shape || {}, "strict", this._catchall, this._checks); }
+  strip() { return makeObject(this.shape || {}, "strip", this._catchall, this._checks); }
+  catchall(schema) { return makeObject(this.shape || {}, this._unknownKeys || "strip", schema, this._checks); }
+  partial(mask) {
+    const nextShape = {};
+    const src = this.shape || {};
+    for (const k of Object.keys(src)) {
+      nextShape[k] = !mask || mask[k] ? src[k].optional() : src[k];
+    }
+    return makeObject(nextShape, this._unknownKeys || "strip", this._catchall);
+  }
+  pick(mask) {
+    const nextShape = {};
+    const src = this.shape || {};
+    for (const k of Object.keys(mask || {})) {
+      if (mask[k] && src[k]) nextShape[k] = src[k];
+    }
+    return makeObject(nextShape, this._unknownKeys || "strip", this._catchall);
+  }
+  omit(mask) {
+    const nextShape = {};
+    const src = this.shape || {};
+    for (const k of Object.keys(src)) {
+      if (!mask || !mask[k]) nextShape[k] = src[k];
+    }
+    return makeObject(nextShape, this._unknownKeys || "strip", this._catchall);
+  }
+  extend(extra) {
+    return makeObject({ ...(this.shape || {}), ...(extra || {}) }, this._unknownKeys || "strip", this._catchall);
+  }
+  merge(other) { return this.extend((other && other.shape) || {}); }
+  keyof() { return makeEnum(Object.keys(this.shape || {})); }
+}
+
+export const ZodSchema = ZodType;
+
+function makeArray(elemSchema) {
+  const inner = elemSchema || new ZodType((v) => ({ ok: true, value: v }));
+  const schema = new ZodType((v, path) => {
+    if (!Array.isArray(v)) {
+      return { ok: false, issues: [__issue(path, "Expected array", "invalid_type")] };
+    }
+    const out = [];
+    const issues = [];
+    for (let i = 0; i < v.length; i++) {
+      const res = inner._run(v[i], path.concat([i]));
+      if (!res.ok) issues.push(...res.issues);
+      else out.push(res.value);
+    }
+    return issues.length ? { ok: false, issues } : { ok: true, value: out };
+  });
+  schema.element = inner;
+  return schema;
+}
+
+function makeObject(rawShape = {}, unknownKeys = "strip", catchall = null, extraChecks = []) {
+  const shape = rawShape && typeof rawShape === "object" ? { ...rawShape } : {};
+  const schema = new ZodType((v, path) => {
+    if (typeof v !== "object" || v === null || Array.isArray(v)) {
+      return { ok: false, issues: [__issue(path, "Expected object", "invalid_type")] };
+    }
+    const out = {};
+    const issues = [];
+    const known = new Set(Object.keys(shape));
+    for (const k of known) {
+      const propSchema = shape[k];
+      if (!propSchema || typeof propSchema._run !== "function") {
+        if (k in v) out[k] = v[k];
+        continue;
+      }
+      const res = propSchema._run(v[k], path.concat([k]));
+      if (!res.ok) issues.push(...res.issues);
+      else if (res.value !== undefined || k in v) out[k] = res.value;
+    }
+    for (const k of Object.keys(v)) {
+      if (known.has(k)) continue;
+      if (catchall && typeof catchall._run === "function") {
+        const res = catchall._run(v[k], path.concat([k]));
+        if (!res.ok) issues.push(...res.issues);
+        else out[k] = res.value;
+      } else if (unknownKeys === "strict") {
+        issues.push(__issue(path, `Unrecognized key: "${k}"`, "unrecognized_keys"));
+      } else if (unknownKeys === "passthrough") {
+        out[k] = v[k];
+      }
+    }
+    return issues.length ? { ok: false, issues } : { ok: true, value: out };
+  });
+  schema.shape = shape;
+  schema._unknownKeys = unknownKeys;
+  schema._catchall = catchall;
+  schema._checks = extraChecks.slice();
+  return schema;
+}
+
+function makeEnum(values) {
+  const list = Array.isArray(values) ? values.slice() : [];
+  const allowed = new Set(list);
+  const schema = new ZodType((v, path) =>
+    allowed.has(v)
+      ? { ok: true, value: v }
+      : { ok: false, issues: [__issue(path, `Invalid enum value. Expected ${list.join(" | ")}`, "invalid_enum_value")] }
+  );
+  schema.options = list;
+  const enumMap = {};
+  for (const item of list) enumMap[item] = item;
+  schema.enum = enumMap;
+  return schema;
+}
+
+function makeUnion(options) {
+  const list = Array.isArray(options) ? options.slice() : [];
+  const schema = new ZodType((v, path) => {
+    for (const opt of list) {
+      const res = opt._run(v, path);
+      if (res.ok) return res;
+    }
+    return { ok: false, issues: [__issue(path, "Invalid union value", "invalid_union")] };
+  });
+  schema.options = list;
+  return schema;
+}
+
+function makeIntersection(left, right) {
+  return new ZodType((v, path) => {
+    const r1 = left._run(v, path);
+    if (!r1.ok) return r1;
+    const r2 = right._run(v, path);
+    if (!r2.ok) return r2;
+    if (
+      r1.value &&
+      r2.value &&
+      typeof r1.value === "object" &&
+      typeof r2.value === "object" &&
+      !Array.isArray(r1.value) &&
+      !Array.isArray(r2.value)
+    ) {
+      return { ok: true, value: { ...r1.value, ...r2.value } };
+    }
+    return r2;
+  });
+}
+
 export const z = {
-  string() { return makeSchema(); },
-  number() { return makeSchema(); },
-  boolean() { return makeSchema(); },
-  object() { return makeSchema(); },
-  array() { return makeSchema(); },
-  enum() { return makeSchema(); },
-  literal() { return makeSchema(); },
-  union() { return makeSchema(); },
-  intersection() { return makeSchema(); },
-  record() { return makeSchema(); },
-  any() { return makeSchema(); },
-  unknown() { return makeSchema(); },
-  null() { return makeSchema(); },
-  undefined() { return makeSchema(); },
-  optional(inner) { return inner ?? makeSchema(); },
-  nullable(inner) { return inner ?? makeSchema(); },
+  ZodError,
+  ZodType,
+  ZodSchema,
+  string() {
+    return new ZodType((v, path) =>
+      typeof v === "string"
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, `Expected string, received ${typeof v}`, "invalid_type")] }
+    );
+  },
+  number() {
+    return new ZodType((v, path) =>
+      typeof v === "number" && !Number.isNaN(v)
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, "Expected number", "invalid_type")] }
+    );
+  },
+  boolean() {
+    return new ZodType((v, path) =>
+      typeof v === "boolean"
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, "Expected boolean", "invalid_type")] }
+    );
+  },
+  bigint() {
+    return new ZodType((v, path) =>
+      typeof v === "bigint"
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, "Expected bigint", "invalid_type")] }
+    );
+  },
+  symbol() {
+    return new ZodType((v, path) =>
+      typeof v === "symbol"
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, "Expected symbol", "invalid_type")] }
+    );
+  },
+  date() {
+    return new ZodType((v, path) =>
+      v instanceof Date && !Number.isNaN(v.getTime())
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, "Expected valid Date", "invalid_date")] }
+    );
+  },
+  literal(expected) {
+    return new ZodType((v, path) =>
+      Object.is(v, expected)
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, `Expected literal ${String(expected)}`, "invalid_literal")] }
+    );
+  },
+  enum: makeEnum,
+  nativeEnum(enumObj) {
+    const vals = Object.entries(enumObj || {})
+      .filter(([k]) => Number.isNaN(Number(k)))
+      .map(([, v]) => v);
+    return makeEnum(vals);
+  },
+  array: makeArray,
+  tuple(items = []) {
+    const schemas = Array.isArray(items) ? items.slice() : [];
+    let restSchema = null;
+    const tupleSchema = new ZodType((v, path) => {
+      if (!Array.isArray(v)) {
+        return { ok: false, issues: [__issue(path, "Expected tuple array", "invalid_type")] };
+      }
+      if (!restSchema && v.length !== schemas.length) {
+        return { ok: false, issues: [__issue(path, `Expected tuple of length ${schemas.length}`, "invalid_type")] };
+      }
+      if (restSchema && v.length < schemas.length) {
+        return { ok: false, issues: [__issue(path, `Expected at least ${schemas.length} tuple elements`, "too_small")] };
+      }
+      const out = [];
+      const issues = [];
+      for (let i = 0; i < v.length; i++) {
+        const s = i < schemas.length ? schemas[i] : restSchema;
+        const res = s._run(v[i], path.concat([i]));
+        if (!res.ok) issues.push(...res.issues);
+        else out.push(res.value);
+      }
+      return issues.length ? { ok: false, issues } : { ok: true, value: out };
+    });
+    tupleSchema.rest = (r) => {
+      restSchema = r;
+      return tupleSchema;
+    };
+    return tupleSchema;
+  },
+  object(shape) { return makeObject(shape, "strip", null); },
+  strictObject(shape) { return makeObject(shape, "strict", null); },
+  looseObject(shape) { return makeObject(shape, "passthrough", null); },
+  record(first, second) {
+    const keySchema = second ? first : null;
+    const valSchema = second || first || new ZodType((v) => ({ ok: true, value: v }));
+    return new ZodType((v, path) => {
+      if (typeof v !== "object" || v === null || Array.isArray(v)) {
+        return { ok: false, issues: [__issue(path, "Expected record object", "invalid_type")] };
+      }
+      const out = {};
+      const issues = [];
+      for (const [k, item] of Object.entries(v)) {
+        let outKey = k;
+        if (keySchema) {
+          const kres = keySchema._run(k, path.concat([k]));
+          if (!kres.ok) {
+            issues.push(...kres.issues);
+            continue;
+          }
+          outKey = kres.value;
+        }
+        const vres = valSchema._run(item, path.concat([k]));
+        if (!vres.ok) issues.push(...vres.issues);
+        else out[outKey] = vres.value;
+      }
+      return issues.length ? { ok: false, issues } : { ok: true, value: out };
+    });
+  },
+  union: makeUnion,
+  discriminatedUnion(discriminator, options = []) {
+    const list = Array.isArray(options) ? options.slice() : [];
+    return new ZodType((v, path) => {
+      if (typeof v !== "object" || v === null || Array.isArray(v)) {
+        return { ok: false, issues: [__issue(path, "Expected object for discriminatedUnion", "invalid_type")] };
+      }
+      const tag = v[discriminator];
+      for (const opt of list) {
+        const discSchema = opt && opt.shape && opt.shape[discriminator];
+        if (discSchema && discSchema._run(tag, path.concat([discriminator])).ok) {
+          return opt._run(v, path);
+        }
+      }
+      return makeUnion(list)._run(v, path);
+    });
+  },
+  intersection: makeIntersection,
+  any() { return new ZodType((v) => ({ ok: true, value: v })); },
+  unknown() { return new ZodType((v) => ({ ok: true, value: v })); },
+  never() { return new ZodType((_v, path) => ({ ok: false, issues: [__issue(path, "Expected never", "invalid_type")] })); },
+  void() { return new ZodType((v, path) => (v === undefined ? { ok: true, value: v } : { ok: false, issues: [__issue(path, "Expected void", "invalid_type")] })); },
+  null() { return new ZodType((v, path) => (v === null ? { ok: true, value: null } : { ok: false, issues: [__issue(path, "Expected null", "invalid_type")] })); },
+  undefined() { return new ZodType((v, path) => (v === undefined ? { ok: true, value: undefined } : { ok: false, issues: [__issue(path, "Expected undefined", "invalid_type")] })); },
+  nan() { return new ZodType((v, path) => (typeof v === "number" && Number.isNaN(v) ? { ok: true, value: v } : { ok: false, issues: [__issue(path, "Expected NaN", "invalid_type")] })); },
+  optional(inner) { return (inner || z.any()).optional(); },
+  nullable(inner) { return (inner || z.any()).nullable(); },
+  lazy(getter) { return new ZodType((v, path) => getter()._run(v, path)); },
+  custom(check, message) {
+    return new ZodType((v, path) =>
+      !check || check(v)
+        ? { ok: true, value: v }
+        : { ok: false, issues: [__issue(path, typeof message === "string" ? message : "Invalid custom value", "custom")] }
+    );
+  },
+  preprocess(fn, schema) {
+    return new ZodType((v, path) => schema._run(fn(v), path));
+  },
+  coerce: {
+    string() { return z.preprocess((v) => String(v ?? ""), z.string()); },
+    number() { return z.preprocess((v) => Number(v), z.number()); },
+    boolean() { return z.preprocess((v) => Boolean(v), z.boolean()); },
+    bigint() {
+      return new ZodType((v, path) => {
+        try { return { ok: true, value: BigInt(v) }; }
+        catch (_e) { return { ok: false, issues: [__issue(path, "Cannot coerce to bigint", "invalid_type")] }; }
+      });
+    },
+    date() { return z.preprocess((v) => (v instanceof Date ? v : new Date(v)), z.date()); },
+  },
 };
 export default z;
-"
+"#
         )
         .trim()
         .to_string(),
@@ -18698,6 +19487,12 @@ function __makeEmitter(target) {
   return target;
 }
 
+function __pi_ws_unsupported(op) {
+  const err = new Error(`${op} is not supported in the PiJS QuickJS sandbox (WebSocket I/O is unavailable; use pi.http / fetch instead)`);
+  err.code = "ERR_PI_SHIM_UNSUPPORTED_OPERATION";
+  return err;
+}
+
 export class WebSocket {
   constructor(url, protocols) {
     this.url = String(url ?? "");
@@ -18723,13 +19518,21 @@ export class WebSocket {
       }
     };
     schedule(() => {
-      this.readyState = WebSocket.OPEN;
-      const evt = { type: "open" };
-      if (typeof this.onopen === "function") this.onopen(evt);
-      this.emit("open", evt);
+      if (this.readyState === WebSocket.CLOSED) return;
+      this.readyState = WebSocket.CLOSED;
+      const err = __pi_ws_unsupported("ws.WebSocket.connect");
+      if (typeof this.onerror === "function") this.onerror({ type: "error", error: err, message: err.message });
+      if (this._listeners && this._listeners.error && this._listeners.error.length > 0) {
+        this.emit("error", err);
+      }
+      const evt = { code: 1006, reason: err.code, wasClean: false };
+      if (typeof this.onclose === "function") this.onclose(evt);
+      this.emit("close", evt);
     });
   }
-  send(_data, cb) { if (typeof cb === "function") cb(); }
+  send(_data, _cb) {
+    throw __pi_ws_unsupported("ws.WebSocket.send");
+  }
   close(code, reason) {
     if (this.readyState === WebSocket.CLOSED) return;
     this.readyState = WebSocket.CLOSING;
@@ -18751,11 +19554,8 @@ export class WebSocketServer {
     this.clients = new Set();
     __makeEmitter(this);
   }
-  handleUpgrade(_req, _socket, _head, cb) {
-    const ws = new WebSocket("ws://stub");
-    this.clients.add(ws);
-    if (typeof cb === "function") cb(ws);
-    this.emit("connection", ws);
+  handleUpgrade(_req, _socket, _head, _cb) {
+    throw __pi_ws_unsupported("ws.WebSocketServer.handleUpgrade");
   }
   close(cb) { if (typeof cb === "function") cb(); }
 }
@@ -19297,6 +20097,17 @@ impl PiJsRuntime<WallClock> {
     #[allow(clippy::future_not_send)]
     pub async fn new() -> Result<Self> {
         Self::with_clock(WallClock).await
+    }
+}
+
+struct NullableJsString(Option<String>);
+
+impl<'js> rquickjs::IntoJs<'js> for NullableJsString {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.0 {
+            Some(value) => value.into_js(ctx),
+            None => Ok(Value::new_null(ctx.clone())),
+        }
     }
 }
 
@@ -20799,7 +21610,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .map_err(|error| Error::extension(format!("Invalid configuration read grant: {error}")))
     }
 
-    pub(crate) fn register_foreign_persistent_storage_root(
+    pub fn register_foreign_persistent_storage_root(
         &self,
         root: PathBuf,
         extension_id: &str,
@@ -20811,6 +21622,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .map_err(|error| {
                 Error::extension(format!("Invalid persistent storage boundary: {error}"))
             })
+    }
+
+    pub(crate) fn process_environment(
+        &self,
+        explicit: Option<&serde_json::Value>,
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, String> {
+        self.process_sessions.environment(explicit)
     }
 
     /// Resolve host-supplied state configuration before any guest code runs.
@@ -20845,6 +21663,41 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .join(".pi")
                 .join(namespace),
         )
+    }
+
+    /// Resolve the confined per-extension persistent data directory
+    /// (`<agent_dir>/extension-data/<sanitized_id>`, defaulting to
+    /// `~/.pi/agent/extension-data/<sanitized_id>`) before guest code runs.
+    pub(crate) fn extension_data_root(&self, sanitized_id: &str) -> Option<PathBuf> {
+        let sanitized_id = sanitized_id.trim();
+        if sanitized_id.is_empty() {
+            return None;
+        }
+        let is_win_env = uses_windows_environment(&self.config.env);
+        let configured_agent_dir =
+            configured_environment_value(&self.config.env, "PI_CODING_AGENT_DIR", is_win_env)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from);
+        let configured_home_agent_dir = ["HOME", "USERPROFILE"]
+            .into_iter()
+            .find_map(|key| configured_environment_value(&self.config.env, key, is_win_env))
+            .filter(|value| !value.trim().is_empty())
+            .map(|home| {
+                crate::extensions::safe_canonicalize(Path::new(home))
+                    .join(".pi")
+                    .join("agent")
+            });
+        let agent_dir = configured_agent_dir
+            .map(|dir| crate::extensions::safe_canonicalize(&dir))
+            .or(configured_home_agent_dir)
+            .or_else(|| {
+                std::env::var("PI_CODING_AGENT_DIR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|dir| crate::extensions::safe_canonicalize(Path::new(&dir)))
+            })
+            .or_else(|| self.application_storage_root(Path::new("agent")))?;
+        Some(agent_dir.join("extension-data").join(sanitized_id))
     }
 
     /// Register a peer extension root as an ownership boundary without
@@ -21617,7 +22470,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let env = env.clone();
                         let policy_for_env = policy.clone();
-                        move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
+                        move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<NullableJsString> {
                             // Compat fallback runs BEFORE deny_env so conformance
                             // scanning can inject deterministic dummy keys even when
                             // the policy denies env access (ext-conformance feature
@@ -21628,11 +22481,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     key = %key,
                                     "env compat fallback"
                                 );
-                                return Ok(Some(value));
+                                return Ok(NullableJsString(Some(value)));
                             }
                             if deny_env {
                                 tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
-                                return Ok(None);
+                                return Ok(NullableJsString(None));
                             }
                             // If a policy is present, use its SecretBroker (including
                             // disclosure_allowlist). Otherwise fall back to default
@@ -21648,10 +22501,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "env get"
                             );
                             if !allowed {
-                                return Ok(None);
+                                return Ok(NullableJsString(None));
                             }
-                            Ok(configured_environment_value(&env, &key, windows_environment)
-                                .map(str::to_string))
+                            Ok(NullableJsString(
+                                configured_environment_value(&env, &key, windows_environment)
+                                    .map(str::to_string),
+                            ))
                         }
                     }),
                 )?;
@@ -21865,11 +22720,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let workspace_root =
                             crate::extensions::safe_canonicalize(Path::new(&process_cwd));
                         let module_state = Rc::clone(&module_state);
+                        let env = env.clone();
+                        let extension_temp_roots = extension_temp_roots.clone();
                         move |_ctx: Ctx<'_>, path: String| -> bool {
                             path_is_in_workspace_or_registered_extension_root(
                                 Path::new(&path),
                                 &workspace_root,
                                 &module_state,
+                                &env,
+                                windows_environment,
+                                &extension_temp_roots,
                             )
                         }
                     }),
@@ -23541,6 +24401,9 @@ function __pi_get_or_create_extension(extension_id, meta) {
             name: (meta && meta.name) ? String(meta.name) : id,
             version: (meta && meta.version) ? String(meta.version) : '0.0.0',
             apiVersion: (meta && meta.apiVersion) ? String(meta.apiVersion) : '1.0',
+            dataDir: (meta && typeof meta.dataDir === 'string' && meta.dataDir.length > 0)
+                ? String(meta.dataDir)
+                : undefined,
             tools: new Map(),
             commands: new Map(),
             hooks: new Map(),
@@ -23553,9 +24416,23 @@ function __pi_get_or_create_extension(extension_id, meta) {
             messageRenderers: new Map(),
             activeTools: null,
         });
+    } else if (meta && typeof meta.dataDir === 'string' && meta.dataDir.length > 0) {
+        const existing = __pi_extensions.get(id);
+        if (existing && !existing.dataDir) {
+            existing.dataDir = String(meta.dataDir);
+        }
     }
 
     return __pi_extensions.get(id);
+}
+
+function __pi_current_extension_data_dir() {
+    const activeId = __pi_current_extension_id || __pi_fixed_extension_id;
+    if (!activeId) {
+        return undefined;
+    }
+    const ext = __pi_extensions.get(activeId);
+    return ext && typeof ext.dataDir === 'string' ? ext.dataDir : undefined;
 }
 
 function __pi_begin_extension(extension_id, meta) {
@@ -25136,6 +26013,9 @@ function __pi_make_extension_ctx(ctx_payload) {
     return {
         hasUI: hasUI,
         cwd: cwd,
+        get dataDir() {
+            return __pi_current_extension_data_dir();
+        },
         ui: __pi_make_extension_ui(hasUI),
         sessionManager: sessionManager,
         model: model,
@@ -25479,6 +26359,7 @@ const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
 	    }
 
 	    let last = undefined;
+	    const startupHookErrors = [];
 	    for (const entry of handlers) {
 	        const handler = entry && entry.handler;
 	        if (typeof handler !== 'function') continue;
@@ -25489,6 +26370,12 @@ const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
 	            try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
 	            if (eventName === 'tool_call' || eventName === 'user_bash' || eventName.startsWith('session_before_')) {
 	                throw e;
+	            }
+	            if (eventName === 'startup' || eventName === 'session_start') {
+	                const detail = (e && typeof e === 'object' && 'message' in e && e.message)
+	                    ? String(e.message)
+	                    : String(e);
+	                startupHookErrors.push(`[${entry.extensionId}] ${eventName}: ${detail}`);
 	            }
 	            continue;
 	        }
@@ -25523,6 +26410,9 @@ const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
         if (eventName.startsWith('session_before_') && value && typeof value === 'object' && value.cancel) {
             return value;
         }
+    }
+    if (startupHookErrors.length > 0) {
+        return { __pi_hook_errors: startupHookErrors };
     }
     return last;
 }
@@ -26323,6 +27213,11 @@ const __pi_events_hostcall = __pi_make_hostcall(__pi_events_native);
 
     // The signal is runtime-local and never serialized into host authority.
     events: (op, args, options = undefined) => {
+        const normalizedOp = String(op || '').trim();
+        if (normalizedOp === 'on') {
+            const payload = (args && typeof args === 'object') ? args : {};
+            return __pi_register_event_bus_hook(payload.event, payload.handler);
+        }
         const signal = options && options.signal;
         if (signal === undefined || signal === null) return __pi_events_hostcall(op, args);
         if (op !== 'compact') return Promise.reject(new TypeError('events: signal is only supported for compact'));
@@ -26333,6 +27228,9 @@ const __pi_events_hostcall = __pi_make_hostcall(__pi_events_native);
     log: __pi_make_hostcall(__pi_log_native),
 
     // Extension API (legacy-compatible subset)
+    get dataDir() {
+        return __pi_current_extension_data_dir();
+    },
     registerTool: __pi_register_tool,
     registerCommand: __pi_register_command,
     registerProvider: __pi_register_provider,
@@ -26785,7 +27683,26 @@ if (typeof globalThis.URL === 'undefined') {
             this._hasAuthority = parts.hasAuthority;
             this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
             this.origin = parts.origin;
-            this.href = parts.href;
+        }
+        get href() {
+            return this.toString();
+        }
+        set href(value) {
+            const parsed = parseURL(String(value), null);
+            if (typeof parsed !== 'string') throw new TypeError('Invalid URL');
+            const parts = JSON.parse(parsed);
+            this.protocol = parts.protocol;
+            this.username = parts.username;
+            this._pw = parts.password;
+            this.host = parts.host;
+            this.hostname = parts.hostname;
+            this.port = parts.port;
+            this.pathname = parts.pathname;
+            this.search = parts.search;
+            this.hash = parts.hash;
+            this._hasAuthority = parts.hasAuthority;
+            this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
+            this.origin = parts.origin;
         }
         get password() {
             return this._pw;
@@ -27799,9 +28716,8 @@ if (typeof globalThis.process === 'undefined') {
         },
     };
 
-    try { Object.freeze(envProxy); } catch (_) {}
     try { Object.freeze(globalThis.process.argv); } catch (_) {}
-    // Do NOT freeze globalThis.process — extensions may need to monkey-patch it
+    // Do NOT freeze envProxy or globalThis.process — extensions/tests define properties or call Object.freeze(process.env) themselves.
 }
 
 // Node.js global alias compatibility.
@@ -29428,26 +30344,30 @@ mod tests {
     /// 261_609) and 1_832 trimmed coding-agent module bytes (29_584 -> 31_416).
     /// These baselines include earlier source drift from the prior receipts;
     /// only the two sources changed by this feature are re-pinned here.
+    /// Re-pinned 2026-11-13: updates `<bridge>`, `node:fs`, `node:child_process`,
+    /// `@mariozechner/pi-coding-agent`, and synchronizes prior main-branch
+    /// module drift (`@mariozechner/pi-ai`, `node:net`, `node:url`) against
+    /// exact decompressed source bytes.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            264_302,
-            "d643e92c66d93d1eb229ccadac85eafa36da11b7843bde7cd31d3ada445d916b",
+            268_637,
+            "f6d0335191ae2ff525bbc6a5486b9a503051f0e3cf4441330c28eb9c35353c06",
         ),
         (
             "node:fs",
-            64_611,
-            "00009b3d960524a1c9d37f6fd8e2a014d29520a06fa3b1283f607db8dc068151",
+            64_849,
+            "7899ca631ab76d2e60b302bfb20af984ed74cb77d123a9e4fbbcf260ba1b639b",
         ),
         (
             "@mariozechner/pi-ai",
-            24_612,
-            "33423d306e358a879c8b9e763dfc7e9fddf628ea275855aa2a89d1e52411547a",
+            26_951,
+            "85428dcd645a499d5629be188e51d65334e07febfd50e004834088dbb701a21c",
         ),
         (
             "node:child_process",
-            20_034,
-            "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
+            33_715,
+            "9c9d98f2f627ad734f2bf8279faa1a0de0418df939903292a26593d93759cf1e",
         ),
         // Completion observers and owned reader teardown add 9_516 bytes.
         // Only this deliberately changed module is re-pinned.
@@ -29456,11 +30376,11 @@ mod tests {
             41_648,
             "414b4dd3b5e7e0f10aa2a09881b0e6ebe882074ce56cc52eb8c23566e6b88589",
         ),
-        // Re-pinned with native tool factory execution.
+        // Re-pinned with native tool factory execution + bash spawnHook support.
         (
             "@mariozechner/pi-coding-agent",
-            31_416,
-            "7b445ed9b02ea58abd24b614b5f3a0a1d48fb2f10929975bd07eefc2d81b2550",
+            35_556,
+            "7b5b12ab8fdd09329c596a28947243bdb59455e3cf07ad748c0ed7d6b3a2fb2d",
         ),
         (
             "@mariozechner/pi-tui",
@@ -29487,13 +30407,13 @@ mod tests {
         ),
         (
             "node:net",
-            5_894,
-            "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
+            6_309,
+            "c5ec2f2bbcec5a6122d179486a8eb11222ab0c83fc32d731e5d43ccbbd772bf1",
         ),
         (
             "node:url",
-            5_637,
-            "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
+            9_049,
+            "2cd9c8ac69eb0a1ee11d4a48dfe81678db05553e316dea844fe7352041957c54",
         ),
     ];
 
@@ -30045,7 +30965,7 @@ mod tests {
                         () => mod.createReadTool('/workspace', { operations: {} }),
                         () => mod.createWriteTool('/workspace', { operations: {} }),
                         () => mod.createEditTool('/workspace', { operations: {} }),
-                        () => mod.createBashTool('/workspace', { spawnHook() {} }),
+                        () => mod.createBashTool('/workspace', { operations: {} }),
                         () => mod.createReadTool('/workspace', { autoResizeImages: 'false' }),
                     ]) {
                         try { create(); factoryProbe.errors.push('accepted'); }
@@ -38422,8 +39342,17 @@ globalThis.__spawn_abort_result = result;
                 assert_eq!(actual[name]["stdout"], serde_json::json!(["€"]), "{name}");
             }
             for name in [
-                "utf8", "utf16", "base64", "base64url", "raw", "rejected", "replaced", "reset",
-                "default", "null", "empty",
+                "utf8",
+                "utf16",
+                "base64",
+                "base64url",
+                "raw",
+                "rejected",
+                "replaced",
+                "reset",
+                "default",
+                "null",
+                "empty",
             ] {
                 let events = actual[name]["events"].as_array().expect("stream events");
                 assert!(
@@ -38663,7 +39592,14 @@ globalThis.__spawn_abort_result = result;
     #[allow(clippy::too_many_lines)]
     fn pijs_child_process_output_only_readline_settles_terminal_paths() {
         futures::executor::block_on(async {
-            for mode in ["normal", "nonzero", "denied", "transport", "timeout", "cancel"] {
+            for mode in [
+                "normal",
+                "nonzero",
+                "denied",
+                "transport",
+                "timeout",
+                "cancel",
+            ] {
                 let clock = Arc::new(DeterministicClock::new(0));
                 let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
                     .await
@@ -38828,8 +39764,12 @@ globalThis.__spawn_abort_result = result;
                 assert_eq!(
                     result["events"],
                     serde_json::json!([
-                        format!("stdout:{event}"), "stdout:close",
-                        format!("stderr:{event}"), "stderr:close", "child:exit", "child:close",
+                        format!("stdout:{event}"),
+                        "stdout:close",
+                        format!("stderr:{event}"),
+                        "stderr:close",
+                        "child:exit",
+                        "child:close",
                     ]),
                     "{mode}"
                 );
@@ -38837,7 +39777,11 @@ globalThis.__spawn_abort_result = result;
                     "readable": false, "ended": success, "destroyed": true,
                     "closed": true, "error": failure,
                 });
-                assert_eq!(result["states"], serde_json::json!([state, state]), "{mode}");
+                assert_eq!(
+                    result["states"],
+                    serde_json::json!([state, state]),
+                    "{mode}"
+                );
                 assert_eq!(
                     result["childErrors"],
                     if matches!(mode, "denied" | "transport") {

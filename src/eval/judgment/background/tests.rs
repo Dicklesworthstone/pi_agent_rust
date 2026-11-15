@@ -1375,7 +1375,7 @@ fn retained_jobs_capture_each_selected_role_before_the_invocation_disappears() -
         let mut invocation = Invocation::new(None, &json!({"judge_model":{"role":"smol"}}), None)?
             .with_host(Some(&fast.host)).with_snapshot_privacy(Some(&factory));
         invocation.bind_host_session(&fast.host.owner);
-        invocation.resolved = vec![(smol, true, false, fast_judge.into()), (deep.clone(), true, false, slow_judge.clone().into()), (deep, false, false, slow_judge.clone().into())];
+        invocation.resolved = vec![(smol, true, true, fast_judge.into()), (deep.clone(), true, false, slow_judge.clone().into()), (deep, false, false, slow_judge.clone().into())];
         let first = acknowledgment(invocation.start_background(&fast.tool, Operation::Completion,
             json!({"prompt":"extract","images":["image.png"],"schema":{"type":"object","properties":{"source":{"type":"string"}},"required":["source"]}}))
             .await.map_err(bridge_error)?)?;

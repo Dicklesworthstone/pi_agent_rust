@@ -360,7 +360,9 @@ fn attached_notebook_cells_refuse_code_conversion_without_writing_or_undo() {
             asupersync::test_utils::run_test(|| async {
                 let directory = tempfile::tempdir().unwrap();
                 let (path, mut original, _) = fixture(directory.path());
-                original["cells"][1]["cell_type"] = json!(kind);
+                if let Some(cell_type) = original.pointer_mut("/cells/1/cell_type") {
+                    *cell_type = json!(kind);
+                }
                 let mut original_bytes = serde_json::to_vec_pretty(&original).unwrap();
                 original_bytes.push(b'\n');
                 std::fs::write(&path, &original_bytes).unwrap();
@@ -575,8 +577,9 @@ fn notebook_edits_detect_concurrent_changes_to_hidden_saved_outputs() {
                 .unwrap();
             let tag = anchor(&text(&view), "value = 1");
             let inode = std::fs::metadata(&path).unwrap().ino();
-            concurrent["cells"][0]["outputs"][0]["text"] =
-                json!(["new output from another writer\n"]);
+            if let Some(output_text) = concurrent.pointer_mut("/cells/0/outputs/0/text") {
+                *output_text = json!(["new output from another writer\n"]);
+            }
             let concurrent_bytes = serde_json::to_vec_pretty(&concurrent).unwrap();
             let hook_path = path.clone();
             let hook_bytes = concurrent_bytes.clone();

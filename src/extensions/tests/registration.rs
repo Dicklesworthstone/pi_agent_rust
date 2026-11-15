@@ -1,4 +1,5 @@
 //! Registration, model control, session, and message API tests.
+#![cfg(test)]
 
 use super::*;
 

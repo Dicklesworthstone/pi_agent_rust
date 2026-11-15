@@ -1992,27 +1992,26 @@ mod tests {
                 let mut session = Session::in_memory();
                 session.append_message(assistant(1.0));
                 let mut malformed = assistant(0.25);
-                let SessionMessage::Assistant { message } = &mut malformed else {
-                    unreachable!();
-                };
-                match field {
-                    "input" => message.usage.cost.input = invalid,
-                    "output" => message.usage.cost.output = invalid,
-                    "cache_read" => message.usage.cost.cache_read = invalid,
-                    "cache_write" => message.usage.cost.cache_write = invalid,
-                    "total" => message.usage.cost.total = invalid,
-                    "reported_total" => {
-                        message.usage.billing =
-                            Some(crate::model::BillingUsage::ReportedTotal { total: invalid });
+                if let SessionMessage::Assistant { message } = &mut malformed {
+                    match field {
+                        "input" => message.usage.cost.input = invalid,
+                        "output" => message.usage.cost.output = invalid,
+                        "cache_read" => message.usage.cost.cache_read = invalid,
+                        "cache_write" => message.usage.cost.cache_write = invalid,
+                        "total" => message.usage.cost.total = invalid,
+                        "reported_total" => {
+                            message.usage.billing =
+                                Some(crate::model::BillingUsage::ReportedTotal { total: invalid });
+                        }
+                        _ => {
+                            assert_eq!(field, "token_reported_total");
+                            message.usage.billing = Some(crate::model::BillingUsage::Tokens {
+                                text: crate::model::BillingTokenCounts::default(),
+                                audio: crate::model::BillingTokenCounts::default(),
+                                reported_total: Some(invalid),
+                            });
+                        }
                     }
-                    "token_reported_total" => {
-                        message.usage.billing = Some(crate::model::BillingUsage::Tokens {
-                            text: crate::model::BillingTokenCounts::default(),
-                            audio: crate::model::BillingTokenCounts::default(),
-                            reported_total: Some(invalid),
-                        });
-                    }
-                    _ => unreachable!(),
                 }
                 session.append_message(malformed);
                 assert!(
@@ -2683,10 +2682,8 @@ mod tests {
                     Some("sqlite") => SessionStoreKind::Sqlite,
                     _ => panic!("unsupported active-cost fixture backend"),
                 };
-                let mut stored = Session::create_with_dir_and_store(
-                    path.parent().map(Path::to_path_buf),
-                    kind,
-                );
+                let mut stored =
+                    Session::create_with_dir_and_store(path.parent().map(Path::to_path_buf), kind);
                 stored.path = Some(path.to_path_buf());
                 stored.append_message(assistant(1.0));
                 let source_id = stored.header.id.clone();
@@ -2711,7 +2708,10 @@ mod tests {
                     .unwrap();
                 let expected = if run_primary { 2.75 } else { 2.25 };
                 assert_eq!(budget.spent(), expected);
-                assert_eq!(provider.streams.load(Ordering::SeqCst), usize::from(run_primary));
+                assert_eq!(
+                    provider.streams.load(Ordering::SeqCst),
+                    usize::from(run_primary)
+                );
                 assert_eq!(provider.compactions.load(Ordering::SeqCst), 1);
                 assert_eq!(std::fs::read(path).unwrap(), checkpoint_bytes);
                 assert_eq!(live.session.try_lock().unwrap().header.id, source_id);
@@ -2726,10 +2726,7 @@ mod tests {
             const CHILD_PATH: &str = "PI_ACTIVE_COST_CRASH_SESSION";
             const CHILD_PRIMARY: &str = "PI_ACTIVE_COST_CRASH_PRIMARY";
             if let Some(path) = std::env::var_os(CHILD_PATH) {
-                crash_after_live_save(
-                    Path::new(&path),
-                    std::env::var_os(CHILD_PRIMARY).is_some(),
-                );
+                crash_after_live_save(Path::new(&path), std::env::var_os(CHILD_PRIMARY).is_some());
             }
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
                 .build()
@@ -2863,7 +2860,12 @@ mod tests {
                 stored.path = Some(blocked.join("session.jsonl"));
                 let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
                 let (mut live, provider) = live_session(stored, &budget, true);
-                assert!(live.persist_session().await.unwrap_err().is_session_persistence());
+                assert!(
+                    live.persist_session()
+                        .await
+                        .unwrap_err()
+                        .is_session_persistence()
+                );
                 assert!(budget.state.lock().unwrap().retired.is_empty());
                 assert!(matches!(budget.start_attempt(), Err(Error::Session(_))));
                 assert!(
@@ -2881,7 +2883,10 @@ mod tests {
                     Err(Error::Session(_))
                 ));
                 assert_eq!(provider.compactions.load(Ordering::SeqCst), 0);
-                assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "retain this file");
+                assert_eq!(
+                    std::fs::read_to_string(&blocked).unwrap(),
+                    "retain this file"
+                );
 
                 let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
                 let (mut ephemeral, _) = live_session(Session::in_memory(), &budget, false);
@@ -2919,7 +2924,11 @@ mod tests {
                 "a raw candidate checkpoint/save must not activate a live account"
             );
             let unrelated = CostBudget::new(None, Some(5.0), 0.0).unwrap();
-            assert!(unrelated.acknowledge_saved_session(&candidate, owner.cx()).is_err());
+            assert!(
+                unrelated
+                    .acknowledge_saved_session(&candidate, owner.cx())
+                    .is_err()
+            );
             assert!(!origin.key.exists());
             runtime.block_on(complete_saved_registration(
                 &budget,
@@ -4733,34 +4742,37 @@ mod tests {
                 );
                 let completed = session.append_message(assistant(1.0));
                 let mut invalid = assistant(0.25);
-                let SessionMessage::Assistant { message } = &mut invalid else {
-                    unreachable!();
-                };
-                match malformed {
-                    "negative_total" => message.usage.cost.total = -0.25,
-                    "negative_component" => message.usage.cost.input = -0.25,
-                    "negative_reported_total" | "contradictory_reported_total" => {
-                        let total = if malformed == "negative_reported_total" {
-                            -0.25
-                        } else {
-                            0.0
-                        };
-                        message.usage.billing =
-                            Some(crate::model::BillingUsage::ReportedTotal { total });
+                if let SessionMessage::Assistant { message } = &mut invalid {
+                    match malformed {
+                        "negative_total" => message.usage.cost.total = -0.25,
+                        "negative_component" => message.usage.cost.input = -0.25,
+                        "negative_reported_total" | "contradictory_reported_total" => {
+                            let total = if malformed == "negative_reported_total" {
+                                -0.25
+                            } else {
+                                0.0
+                            };
+                            message.usage.billing =
+                                Some(crate::model::BillingUsage::ReportedTotal { total });
+                        }
+                        _ => {
+                            assert!(matches!(
+                                malformed,
+                                "negative_token_reported_total"
+                                    | "contradictory_token_reported_total"
+                            ));
+                            let total = if malformed == "negative_token_reported_total" {
+                                -0.25
+                            } else {
+                                0.5
+                            };
+                            message.usage.billing = Some(crate::model::BillingUsage::Tokens {
+                                text: crate::model::BillingTokenCounts::default(),
+                                audio: crate::model::BillingTokenCounts::default(),
+                                reported_total: Some(total),
+                            });
+                        }
                     }
-                    "negative_token_reported_total" | "contradictory_token_reported_total" => {
-                        let total = if malformed == "negative_token_reported_total" {
-                            -0.25
-                        } else {
-                            0.5
-                        };
-                        message.usage.billing = Some(crate::model::BillingUsage::Tokens {
-                            text: crate::model::BillingTokenCounts::default(),
-                            audio: crate::model::BillingTokenCounts::default(),
-                            reported_total: Some(total),
-                        });
-                    }
-                    _ => unreachable!(),
                 }
                 session.append_message(invalid);
                 assert!(session.create_branch_from(&completed));

@@ -1008,7 +1008,10 @@ impl JsonRpcClient {
             if err.kind() != std::io::ErrorKind::InvalidInput {
                 self.kill();
             }
-            return Err(TransportError::from_write_error("request queue failed", &err));
+            return Err(TransportError::from_write_error(
+                "request queue failed",
+                &err,
+            ));
         }
         request.frame = None;
         Ok((id, rx))

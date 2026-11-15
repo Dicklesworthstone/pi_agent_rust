@@ -198,6 +198,7 @@ pub enum SlashCommand {
     Crash,
     Btw,
     Tan,
+    Web,
 }
 
 impl SlashCommand {
@@ -264,6 +265,7 @@ impl SlashCommand {
             Self::Crash => "/crash",
             Self::Omfg => "/omfg",
             Self::Commit => "/commit",
+            Self::Web => "/web",
         }
     }
 
@@ -325,6 +327,7 @@ impl SlashCommand {
         Self::Crash,
         Self::Omfg,
         Self::Commit,
+        Self::Web,
     ];
 
     /// Parse a slash command from input.
@@ -387,6 +390,7 @@ impl SlashCommand {
             "/crash" => Self::Crash,
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
+            "/web" => Self::Web,
             _ => return None,
         };
 
@@ -445,6 +449,7 @@ impl SlashCommand {
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
   /usage [refresh]   - Show provider usage/quota state
+  /web               - Browser companion (requires FrankenTUI; run without --classic)
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -1542,29 +1547,35 @@ impl PiApp {
         let model = next.model.id.clone();
         let event_tx = self.event_tx.clone();
         self.model_selection = Some(request);
-        if let Err(error) = self.runtime_handle.try_spawn_with_cx(move |_task_cx| async move {
-            let error = agent
-                .handle
-                .set_model_from_origin(&provider, &model, &origin)
-                .await
-                .err()
-                .map(|error| error.to_string());
-            if error.is_none() {
-                // An explicit choice also retires plan-mode restoration.
-                agent.plan_state().take_previous_model();
-            }
-            drop(agent);
-            enqueue_pi_event(
-                &event_tx,
-                &Cx::for_request(),
-                PiMsg::ModelSelectionFinished { request_id, error },
-            )
-            .await;
-        }) {
+        if let Err(error) = self
+            .runtime_handle
+            .try_spawn_with_cx(move |_task_cx| async move {
+                let error = agent
+                    .handle
+                    .set_model_from_origin(&provider, &model, &origin)
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
+                if error.is_none() {
+                    // An explicit choice also retires plan-mode restoration.
+                    agent.plan_state().take_previous_model();
+                }
+                drop(agent);
+                enqueue_pi_event(
+                    &event_tx,
+                    &Cx::for_request(),
+                    PiMsg::ModelSelectionFinished { request_id, error },
+                )
+                .await;
+            })
+        {
             self.model_selection = None;
             return Err(format!("Could not start model selection: {error}"));
         }
-        self.status_message = Some(format!("Switching model to {}...", next.model.display_label()));
+        self.status_message = Some(format!(
+            "Switching model to {}...",
+            next.model.display_label()
+        ));
         Ok(())
     }
 
@@ -2324,6 +2335,19 @@ impl PiApp {
             SlashCommand::Thinking => self.handle_slash_thinking(args),
             SlashCommand::Fast => self.handle_slash_fast(args),
             SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
+            SlashCommand::Web => {
+                let msg = "Browser companion (/web) requires FrankenTUI; restart without --classic (`pi web`)"
+                    .to_string();
+                self.status_message = Some(msg.clone());
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: msg,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                None
+            }
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
                 self.messages.push(ConversationMessage {
@@ -2354,7 +2378,8 @@ impl PiApp {
                     match session_guard.export_snapshot() {
                         Ok(snapshot) => (output_path, snapshot),
                         Err(error) => {
-                            self.status_message = Some(format!("Failed to export session: {error}"));
+                            self.status_message =
+                                Some(format!("Failed to export session: {error}"));
                             return None;
                         }
                     }
@@ -7478,8 +7503,9 @@ mod tests {
                     .block_on(app.settle_model_selection_for_test(&mut events))
                     .is_none()
             );
-            let reopened =
-                runtime().block_on(Session::open(&path.display().to_string())).unwrap();
+            let reopened = runtime()
+                .block_on(Session::open(&path.display().to_string()))
+                .unwrap();
             assert!(
                 reopened
                     .active_failover_provenance_for_current_path()
@@ -7649,7 +7675,9 @@ mod tests {
             (target.model.provider.clone(), target.model.id.clone())
         );
         let path = app.session.try_lock().unwrap().path.clone().unwrap();
-        let reopened = runtime().block_on(Session::open(&path.display().to_string())).unwrap();
+        let reopened = runtime()
+            .block_on(Session::open(&path.display().to_string()))
+            .unwrap();
         assert_eq!(
             reopened.effective_model_for_current_path(),
             Some(("dummy".to_string(), "dummy-model".to_string()))
@@ -7887,13 +7915,13 @@ mod tests {
         let extension = directory.path().join("live-model.mjs");
         std::fs::write(
             &extension,
-            r#"
+            r"
             export default function(pi) {
                 pi.registerCommand('publish-model', { handler: raw => {
                     pi.registerProvider('live-classic', JSON.parse(raw));
                 }});
             }
-            "#,
+            ",
         )
         .unwrap();
         let session = Arc::new(Mutex::new(Session::in_memory()));
@@ -7914,7 +7942,7 @@ mod tests {
             app.extensions = Some(manager.clone());
             let mut original_provider = None;
             for revision in [1, 2] {
-                let spec = json!({
+                let spec = serde_json::json!({
                     "api": "openai-completions",
                     "baseUrl": format!("https://revision-{revision}.example.test/v1"),
                     "apiKey": "classic-metadata-fixture-key",
@@ -8011,8 +8039,15 @@ mod tests {
             assert!(error.contains("unknown provider/model live-classic/chat"));
             assert_eq!(session.try_lock().unwrap().entries.len(), entries);
             assert_eq!(app.model_entry.model.name, "Revision 2");
-            let mut agent = app.agent.try_lock().unwrap();
-            assert!(Arc::ptr_eq(&rebound, &agent.provider()));
+            assert!(Arc::ptr_eq(
+                &rebound,
+                &app.agent.try_lock().unwrap().provider()
+            ));
+            let agent = Arc::try_unwrap(app.agent)
+                .ok()
+                .expect("sole InteractiveAgent owner")
+                .into_inner()
+                .expect("unpoisoned mutex");
             assert!(
                 agent
                     .handle
@@ -8681,9 +8716,24 @@ mod tests {
         app: &mut PiApp,
         auth_path: &Path,
     ) -> (String, u16, crate::agent::AbortSignal) {
+        static NEXT_CALLBACK_TEST_PORT: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(21000);
         let attempt_id = app.begin_login_attempt(auth_path).expect("login attempt");
-        let (server, redirect_uri) =
-            crate::auth::start_oauth_callback_server_random_port().expect("callback listener");
+        // Bind outside Linux's ephemeral outbound port range (32768..60999) so
+        // concurrent test clients cannot steal the released port before the
+        // immediate re-bind assertion in `login_cancel_command_quit_and_drop...`.
+        let (server, redirect_uri) = (0..2048u16)
+            .find_map(|_| {
+                let raw =
+                    NEXT_CALLBACK_TEST_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let candidate = 20000 + (raw % 10000);
+                let uri = format!("http://localhost:{candidate}/callback");
+                crate::auth::start_oauth_callback_server(&uri)
+                    .ok()
+                    .map(|srv| (srv, uri))
+            })
+            .or_else(|| crate::auth::start_oauth_callback_server_random_port().ok())
+            .expect("callback listener");
         let port = server.port;
         let attempt = app.login_attempt.as_mut().expect("login owner");
         let signal = attempt.control.signal();
@@ -8777,53 +8827,65 @@ mod tests {
     #[test]
     fn login_cancel_command_quit_and_drop_release_the_callback_owner() {
         for action in ["escape", "ctrl-c", "command", "new", "busy", "quit", "drop"] {
-            let temp = TempDir::new().expect("tempdir");
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let (mut app, _events) = build_bash_test_app(session, temp.path());
-            let (attempt_id, port, signal) =
-                install_callback_login(&mut app, &temp.path().join("auth.json"));
-            app.input.set_value("private credential draft");
-            match action {
-                "escape" => {
-                    let _ =
-                        app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+            for attempt in 0..4 {
+                let temp = TempDir::new().expect("tempdir");
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let (mut app, _events) = build_bash_test_app(session, temp.path());
+                let (attempt_id, port, signal) =
+                    install_callback_login(&mut app, &temp.path().join("auth.json"));
+                app.input.set_value("private credential draft");
+                match action {
+                    "escape" => {
+                        let _ = app
+                            .handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+                    }
+                    "ctrl-c" => {
+                        let _ =
+                            app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                    }
+                    "command" => {
+                        let _ = app.submit_message("/help");
+                    }
+                    "new" => {
+                        let _ = app.submit_message("/new");
+                    }
+                    "busy" => {
+                        let session = Arc::clone(&app.session);
+                        let _guard = session.try_lock().expect("hold source session");
+                        let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
+                            event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
+                            attempts_remaining: 0,
+                        });
+                        assert_eq!(
+                            app.status_message.as_deref(),
+                            Some(
+                                "Login cancelled because the session remained busy; run /login again"
+                            )
+                        );
+                    }
+                    "quit" => {
+                        let _ = app.quit_cmd();
+                    }
+                    "drop" => {}
+                    _ => unreachable!(),
                 }
-                "ctrl-c" => {
-                    let _ = app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                if action != "drop" {
+                    assert!(app.pending_oauth.is_none());
+                    assert!(app.login_attempt.is_none());
+                    assert!(app.input.value().is_empty());
                 }
-                "command" => {
-                    let _ = app.submit_message("/help");
+                drop(app);
+                assert!(signal.is_aborted(), "{action} cancels its network exchange");
+                match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                    Ok(_rebound) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && attempt < 3 => {}
+                    Err(err) => {
+                        panic!(
+                            "retiring login immediately releases callback port ({action}): {err}"
+                        )
+                    }
                 }
-                "new" => {
-                    let _ = app.submit_message("/new");
-                }
-                "busy" => {
-                    let session = Arc::clone(&app.session);
-                    let _guard = session.try_lock().expect("hold source session");
-                    let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
-                        event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
-                        attempts_remaining: 0,
-                    });
-                    assert_eq!(
-                        app.status_message.as_deref(),
-                        Some("Login cancelled because the session remained busy; run /login again")
-                    );
-                }
-                "quit" => {
-                    let _ = app.quit_cmd();
-                }
-                "drop" => {}
-                _ => unreachable!(),
             }
-            if action != "drop" {
-                assert!(app.pending_oauth.is_none());
-                assert!(app.login_attempt.is_none());
-                assert!(app.input.value().is_empty());
-            }
-            drop(app);
-            assert!(signal.is_aborted(), "{action} cancels its network exchange");
-            let _rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                .expect("retiring login immediately releases callback port");
         }
     }
 

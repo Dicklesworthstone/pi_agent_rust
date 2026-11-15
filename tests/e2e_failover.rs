@@ -934,6 +934,8 @@ fn e2e_print_retry_terminal_retains_completed_tool_output() {
     let mut command = env.command(&binary);
     command.current_dir(&env.root).args([
         "--print",
+        "--approval-mode",
+        "yolo",
         "--mode",
         "json",
         "--no-session",
@@ -977,7 +979,9 @@ fn e2e_print_retry_terminal_retains_completed_tool_output() {
     let terminal = events.last().expect("final event");
     assert_eq!(terminal["type"], "agent_end");
     assert!(terminal["error"].is_null(), "{stdout}\n{stderr}");
-    let messages = terminal["messages"].as_array().expect("terminal transcript");
+    let messages = terminal["messages"]
+        .as_array()
+        .expect("terminal transcript");
     assert_eq!(
         messages
             .iter()

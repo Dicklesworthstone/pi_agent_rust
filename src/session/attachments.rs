@@ -933,6 +933,7 @@ mod tests {
             Self
         }
 
+        #[allow(clippy::unused_self)]
         fn calls(&self) -> usize {
             DIRECTORY_SYNC_FAULT
                 .with(|slot| slot.borrow().as_ref().expect("installed sync fault").calls)
@@ -2162,13 +2163,9 @@ mod tests {
             source.append_message(text_message("export-active-sentinel"));
             save(&mut source);
             let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
-            let (mut partial, diagnostics) = Session::open_from_v2_with_source(
-                &store,
-                source.header.clone(),
-                mode,
-                Some(&path),
-            )
-            .expect("open partial export source");
+            let (mut partial, diagnostics) =
+                Session::open_from_v2_with_source(&store, source.header.clone(), mode, Some(&path))
+                    .expect("open partial export source");
             assert!(diagnostics.skipped_entries.is_empty());
             assert!(diagnostics.orphaned_parent_links.is_empty());
             assert!(partial.has_partial_v2_hydration());
@@ -2183,7 +2180,9 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst);
             let before_disk = fs::read(&path).unwrap();
 
-            let snapshot = partial.export_snapshot().expect("complete partial snapshot");
+            let snapshot = partial
+                .export_snapshot()
+                .expect("complete partial snapshot");
             assert_eq!(snapshot.entries.len(), source.entries.len() + 1);
             assert_eq!(
                 serde_json::to_value(
@@ -2208,11 +2207,20 @@ mod tests {
                 image_data.as_str(),
                 media_data.as_str(),
             ] {
-                assert!(html.contains(text), "missing exported content under {mode:?}");
+                assert!(
+                    html.contains(text),
+                    "missing exported content under {mode:?}"
+                );
             }
             assert!(!html.contains("$piBlob"));
-            assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
-            assert_eq!(serde_json::to_value(&partial.header).unwrap(), before_header);
+            assert_eq!(
+                serde_json::to_value(&partial.entries).unwrap(),
+                before_entries
+            );
+            assert_eq!(
+                serde_json::to_value(&partial.header).unwrap(),
+                before_header
+            );
             assert_eq!(partial.leaf_id(), Some(pending.as_str()));
             assert_eq!(
                 partial
@@ -2232,9 +2240,10 @@ mod tests {
             let path = directory.path().join("broken-export.jsonl");
             let mut source = session_at(&path);
             let root = source.append_message(text_message("root"));
-            let hidden = source.append_message(message(vec![image(
-                STANDARD.encode(vec![0x63; INLINE_BYTES + 2]),
-            )]));
+            let hidden =
+                source.append_message(message(vec![image(
+                    STANDARD.encode(vec![0x63; INLINE_BYTES + 2]),
+                )]));
             assert!(source.navigate_to(&root));
             source.append_message(text_message("active"));
             save(&mut source);
@@ -2274,7 +2283,10 @@ mod tests {
                     .expect_err("do not render a truncated export"),
                 detail,
             );
-            assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
+            assert_eq!(
+                serde_json::to_value(&partial.entries).unwrap(),
+                before_entries
+            );
             assert_eq!(partial.leaf_id(), Some(pending.as_str()));
             assert!(partial.has_partial_v2_hydration());
             assert_eq!(fs::read(&path).unwrap(), before_disk);
@@ -2351,8 +2363,14 @@ mod tests {
         for (blob, bytes) in before_blobs {
             assert_eq!(fs::read(blob).unwrap(), bytes);
         }
-        assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
-        assert_eq!(serde_json::to_value(&partial.header).unwrap(), before_header);
+        assert_eq!(
+            serde_json::to_value(&partial.entries).unwrap(),
+            before_entries
+        );
+        assert_eq!(
+            serde_json::to_value(&partial.header).unwrap(),
+            before_header
+        );
         assert_eq!(partial.leaf_id(), Some(pending.as_str()));
         assert_eq!(
             partial
@@ -2423,8 +2441,14 @@ mod tests {
             .expect_err("direct export must not silently repair a corrupt V2 manifest");
 
         assert_eq!(snapshot_files(directory.path()), before_files);
-        assert_eq!(serde_json::to_value(&partial.entries).unwrap(), before_entries);
-        assert_eq!(serde_json::to_value(&partial.header).unwrap(), before_header);
+        assert_eq!(
+            serde_json::to_value(&partial.entries).unwrap(),
+            before_entries
+        );
+        assert_eq!(
+            serde_json::to_value(&partial.header).unwrap(),
+            before_header
+        );
         assert_eq!(partial.leaf_id(), Some(pending.as_str()));
         assert_eq!(
             partial

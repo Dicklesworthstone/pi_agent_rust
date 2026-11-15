@@ -374,8 +374,28 @@
           "justification": "Extension event registration/dispatch wiring correctness checks."
         },
         {
+          "path": "tests/extensions_ai_completion.rs",
+          "justification": "Extension AI completion host state and provider catalog routing coverage."
+        },
+        {
+          "path": "tests/extensions_axios.rs",
+          "justification": "Extension axios HTTP client shim parity and policy mediation coverage."
+        },
+        {
+          "path": "tests/extensions_better_sqlite3.rs",
+          "justification": "Extension better-sqlite3 shim transactions, isolation, and native SQLite backing."
+        },
+        {
+          "path": "tests/extensions_executable_discovery.rs",
+          "justification": "Bounded executable discovery and PATH resolution for QuickJS extensions."
+        },
+        {
           "path": "tests/extensions_fs_shim.rs",
           "justification": "Filesystem shim behavior consistency and sandbox semantics coverage."
+        },
+        {
+          "path": "tests/extensions_sqlite.rs",
+          "justification": "Node sqlite shim statement execution, RETURNING projection, and isolation coverage."
         },
         {
           "path": "tests/extensions_manifest.rs",

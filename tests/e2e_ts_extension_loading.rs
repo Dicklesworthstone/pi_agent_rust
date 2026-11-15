@@ -2442,3 +2442,206 @@ fn npm_context_mode_worktree_metadata_aligns_persistent_database_and_child() {
         }));
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn extension_data_dir_persists_under_default_policy_and_isolates_peers_and_escapes() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = base.join("home");
+    let agent_dir = home.join(".pi/agent");
+    let ssh_dir = home.join(".ssh");
+    let alpha_dir = base.join("ext-alpha");
+    let beta_dir = base.join("ext-beta");
+    for dir in [&workspace, &home, &ssh_dir, &alpha_dir, &beta_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(ssh_dir.join("id_rsa"), "PRIVATE-KEY-DO-NOT-READ").unwrap();
+
+    let alpha_entry = alpha_dir.join("index.js");
+    std::fs::write(
+        &alpha_entry,
+        r#"
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+export default function (pi) {
+    const initDataDir = pi.dataDir;
+    pi.on("startup", () => {
+        throw new Error("alpha startup boom");
+    });
+    pi.registerCommand("alpha-datadir-probe", {
+        description: "probe confined dataDir",
+        handler: async (_args, ctx) => {
+            const stateFile = path.join(ctx.dataDir, "state.json");
+            fs.writeFileSync(stateFile, JSON.stringify({ saved: 42, sameAsInit: ctx.dataDir === initDataDir }));
+            const roundtrip = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+
+            let parentEscapeDenied = false;
+            try {
+                fs.writeFileSync(path.join(ctx.dataDir, "..", "escape.json"), "bad");
+            } catch (_err) {
+                parentEscapeDenied = true;
+            }
+
+            let sshReadDenied = false;
+            try {
+                fs.readFileSync(path.join(ctx.dataDir, "..", "..", "..", "..", ".ssh", "id_rsa"), "utf8");
+            } catch (_err) {
+                sshReadDenied = true;
+            }
+
+            return {
+                display: JSON.stringify({
+                    dataDir: ctx.dataDir,
+                    roundtrip,
+                    parentEscapeDenied,
+                    sshReadDenied,
+                }),
+            };
+        },
+    });
+}
+"#,
+    )
+    .unwrap();
+
+    let beta_entry = beta_dir.join("index.js");
+    std::fs::write(
+        &beta_entry,
+        r#"
+import * as fs from "node:fs";
+
+export default function (pi) {
+    pi.registerCommand("beta-peer-probe", {
+        description: "attempt reading peer dataDir",
+        handler: async (peerFile, ctx) => {
+            let peerReadDenied = false;
+            let peerWriteDenied = false;
+            try {
+                fs.readFileSync(peerFile, "utf8");
+            } catch (_err) {
+                peerReadDenied = true;
+            }
+            try {
+                fs.writeFileSync(peerFile, "tampered");
+            } catch (_err) {
+                peerWriteDenied = true;
+            }
+            return {
+                display: JSON.stringify({
+                    betaDataDir: ctx.dataDir,
+                    peerReadDenied,
+                    peerWriteDenied,
+                }),
+            };
+        },
+    });
+}
+"#,
+    )
+    .unwrap();
+
+    let mut env = std::collections::HashMap::new();
+    env.insert("HOME".to_string(), home.display().to_string());
+    env.insert("USERPROFILE".to_string(), home.display().to_string());
+    env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        agent_dir.display().to_string(),
+    );
+    let config = PiJsRuntimeConfig {
+        cwd: workspace.display().to_string(),
+        env,
+        disk_cache_dir: None,
+        repair_mode: pi::extensions_js::RepairMode::Off,
+        ..Default::default()
+    };
+    // Default ExtensionPolicy (no extra env/exec grants!).
+    let policy = pi::extensions::ExtensionPolicy::default();
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        config,
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("start runtime");
+    manager.set_js_runtime(runtime);
+
+    let alpha_spec = JsExtensionLoadSpec::from_entry_path(&alpha_entry).unwrap();
+    let beta_spec = JsExtensionLoadSpec::from_entry_path(&beta_entry).unwrap();
+    let loading_manager = manager.clone();
+    common::run_async(async move {
+        loading_manager
+            .load_js_extensions(vec![alpha_spec, beta_spec])
+            .await
+    })
+    .expect("load both extensions");
+
+    // Startup hook throw must be surfaced via `__pi_hook_errors` without failing `dispatch_event`.
+    let startup_mgr = manager.clone();
+    let startup_outcome = common::run_async(async move {
+        startup_mgr
+            .dispatch_event_with_response(
+                pi::extensions::ExtensionEventName::Startup,
+                Some(serde_json::json!({ "version": "0.8.0" })),
+                10_000,
+            )
+            .await
+    })
+    .expect("startup dispatch remains fail-open");
+    let hook_errors = startup_outcome
+        .as_ref()
+        .and_then(|v| v.get("__pi_hook_errors"))
+        .and_then(Value::as_array)
+        .expect("startup hook errors returned");
+    assert!(
+        hook_errors
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|msg| msg.contains("alpha startup boom")),
+        "expected startup hook failure in {hook_errors:?}"
+    );
+
+    let cmd_mgr = manager.clone();
+    let alpha_resp = common::run_async(async move {
+        cmd_mgr
+            .execute_command("alpha-datadir-probe", "", 10_000)
+            .await
+    })
+    .expect("alpha probe");
+    let alpha_json: Value = serde_json::from_str(alpha_resp["display"].as_str().unwrap()).unwrap();
+    assert_eq!(alpha_json["roundtrip"]["saved"], 42, "{alpha_json}");
+    assert_eq!(alpha_json["roundtrip"]["sameAsInit"], true, "{alpha_json}");
+    assert_eq!(alpha_json["parentEscapeDenied"], true, "{alpha_json}");
+    assert_eq!(alpha_json["sshReadDenied"], true, "{alpha_json}");
+
+    let alpha_data_dir = std::path::PathBuf::from(alpha_json["dataDir"].as_str().unwrap());
+    assert!(
+        alpha_data_dir.starts_with(agent_dir.join("extension-data")),
+        "dataDir {} must live under {}/extension-data",
+        alpha_data_dir.display(),
+        agent_dir.display()
+    );
+    let alpha_state_file = alpha_data_dir.join("state.json");
+    assert!(alpha_state_file.is_file());
+
+    let peer_mgr = manager.clone();
+    let peer_target = alpha_state_file.display().to_string();
+    let beta_resp = common::run_async(async move {
+        peer_mgr
+            .execute_command("beta-peer-probe", &peer_target, 10_000)
+            .await
+    })
+    .expect("beta probe");
+    let beta_json: Value = serde_json::from_str(beta_resp["display"].as_str().unwrap()).unwrap();
+    assert_eq!(beta_json["peerReadDenied"], true, "{beta_json}");
+    assert_eq!(beta_json["peerWriteDenied"], true, "{beta_json}");
+    assert_ne!(beta_json["betaDataDir"], alpha_json["dataDir"]);
+
+    assert!(common::run_async(async move {
+        manager.shutdown(std::time::Duration::from_secs(5)).await
+    }));
+}

@@ -1,23 +1,23 @@
 ## Test Coverage Matrix (Current Source Inventory)
 
-> Last regenerated: 2026-10-24
+> Last regenerated: 2026-11-13
 > Owner bead: `bd-8t27h.1`
 
 This document is the current source-file coverage inventory for `src/**/*.rs`. It is not a drop-in certification artifact and does not override `docs/evidence/dropin-certification-verdict.json`.
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 676 current source files.
-- `rg --files tests -g '*.rs' | wc -l` -> 457 Rust test files under `tests/`.
+- `rg --files src -g '*.rs' | sort` -> 739 current source files.
+- `rg --files tests -g '*.rs' | wc -l` -> 462 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
-- `python3 scripts/check_traceability_matrix.py` passes with 431/431 classified tests traced (100.00%) and 56/56 classified E2E suites covered (100.00%).
-- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 676-file current tree.
+- `python3 scripts/check_traceability_matrix.py` passes with 100.00% classified tests traced and 100.00% classified E2E suites covered.
+- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 739-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
 
 ### Current Drift Check
 
-- Latest recorded full `src/` inventory: 676 files (2026-10-24), with no missing or stale rows.
-- Source-file rows below: 676, one per file in the current `src/` inventory.
+- Latest recorded full `src/` inventory: 739 files (2026-11-13), with no missing or stale rows.
+- Source-file rows below: 739, one per file in the current `src/` inventory.
 - The 224 rows added on 2026-10-24 state only what each file shows: its own `//!` summary, its `#[test]` count, and the test modules it declares. Their integration-suite links were not audited, and a listed test count is not a passing result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -711,6 +711,69 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/worktree_iso/snapshot/sparse/tests.rs` | Test suite for `src/worktree_iso/snapshot/sparse.rs` | Test module (12 tests). |
 | `src/worktree_iso/snapshot_tests.rs` | Worktree isolation snapshot test cases | Test support module; exercises snapshotting. |
 | `src/xdev.rs` | xdev tool development | `tests/e2e_xdev.rs`. |
+| `src/acp/client_files.rs` | ACP editor-mediated client filesystem bridge | `src/acp/client_files/tests.rs`. |
+| `src/acp/client_files/tests.rs` | Test suite for `src/acp/client_files.rs` | Test module. |
+| `src/acp/client_terminals.rs` | ACP editor-mediated client terminal bridge | `src/acp/client_terminals/tests.rs`. |
+| `src/acp/client_terminals/tests.rs` | Test suite for `src/acp/client_terminals.rs` | Test module. |
+| `src/agent/sampling.rs` | Agent sampling bridge for MCP/extension completion requests | Unit; exercised through `src/agent.rs` and MCP sampling suites. |
+| `src/agent_hub/ipc/cost.rs` | Child-to-parent cost accounting over authenticated hub IPC | Unit; exercised through `tests/agent_hub.rs`. |
+| `src/agent_hub/wait/result_tests.rs` | Test suite for hub wait result projection | Test module. |
+| `src/archive_read/tar.rs` | Bounded read-only TAR archive navigation | `src/archive_read/tar/tests.rs`. |
+| `src/archive_read/tar/tests.rs` | Test suite for `src/archive_read/tar.rs` | Test module. |
+| `src/cost.rs` | Session and turn cost accounting | Unit; exercised through provider and agent cost suites. |
+| `src/cost/durability.rs` | Durable cost journal and crash-safe settlement | Unit; exercised through `src/provider.rs` journal tests. |
+| `src/eval/js_kernel/modules/commonjs.rs` | Scoped CommonJS loader for `eval` JS kernel | `src/eval/js_kernel/modules/commonjs/tests.rs`. |
+| `src/eval/js_kernel/modules/commonjs/tests.rs` | Test suite for `src/eval/js_kernel/modules/commonjs.rs` | Test module. |
+| `src/eval/judgment/fallback.rs` | Structured judgment fallback policies | Unit; exercised through `src/eval/judgment` tests. |
+| `src/extensions_js/executable.rs` | Bounded executable discovery for QuickJS extensions | `tests/extensions_executable_discovery.rs`. |
+| `src/extensions_js/intl.rs` | Deterministic `Intl` runtime shims for QuickJS | Unit; exercised through QuickJS runtime tests. |
+| `src/extensions_js/process_session.rs` | Persistent supervised child-process sessions for QuickJS | Unit; `tests/extensions_process_shim.rs`, `tests/node_child_process_shim.rs`. |
+| `src/extensions_js/sqlite.rs` | Native FrankenSQLite backing for `node:sqlite` and `better-sqlite3` | Unit; `tests/extensions_sqlite.rs`, `tests/extensions_better_sqlite3.rs`. |
+| `src/extensions_js/worktree_metadata.rs` | Worktree and git metadata alignment for extension persistence | Unit; `tests/e2e_ts_extension_loading.rs`. |
+| `src/extensions_js_storage.rs` | Per-extension persistent storage root provisioning and confinement | Unit; `tests/e2e_ts_extension_loading.rs`, `tests/extensions_fs_shim.rs`. |
+| `src/interactive_ftui/browser.rs` | FrankenTUI browser companion lifecycle integration | Unit; exercised through `src/interactive_ftui.rs` tests. |
+| `src/interactive_ftui/goal_control.rs` | FrankenTUI goal-mode budget and control surface | `src/interactive_ftui/goal_control/tests.rs`. |
+| `src/interactive_ftui/goal_control/tests.rs` | Test suite for `src/interactive_ftui/goal_control.rs` | Test module. |
+| `src/interactive_ftui/queued_compaction.rs` | Queued compaction coordination in FrankenTUI | Unit; exercised through `src/interactive_ftui.rs` tests. |
+| `src/interactive_ftui/textarea.rs` | Rope-backed multi-line editor widget for FrankenTUI | Unit; in-module editor, wrap, mouse, and keybinding tests. |
+| `src/interactive_ftui/tool_progress.rs` | Streaming tool-progress cards in FrankenTUI | Unit; exercised through `src/interactive_ftui.rs` tests. |
+| `src/lsp/recording.rs` | Deterministic LSP session transcript recording | Unit; `tests/lsp.rs`. |
+| `src/mcp/elicitation.rs` | MCP server elicitation protocol and schema validation | `src/mcp/elicitation/tests.rs`, `src/mcp/manager/calls/elicitation_tests.rs`. |
+| `src/mcp/elicitation/tests.rs` | Test suite for `src/mcp/elicitation.rs` | Test module. |
+| `src/mcp/manager/calls/elicitation_tests.rs` | Loopback integration tests for MCP elicitation | Test module. |
+| `src/mcp/manager/calls/sampling_tests.rs` | Loopback integration tests for MCP sampling | Test module. |
+| `src/mcp/manager/calls/task_tests.rs` | Loopback integration tests for MCP async tasks | Test module. |
+| `src/mcp/manager/calls/tasks.rs` | MCP async task call orchestration and polling | `src/mcp/manager/calls/task_tests.rs`. |
+| `src/mcp/manager/reauth.rs` | MCP server credential refresh and reauthentication | `src/mcp/manager/reauth/tests.rs`. |
+| `src/mcp/manager/reauth/tests.rs` | Test suite for `src/mcp/manager/reauth.rs` | Test module. |
+| `src/mcp/sampling.rs` | MCP `sampling/createMessage` protocol types and guards | Unit; `src/mcp/manager/calls/sampling_tests.rs`. |
+| `src/mcp/tasks.rs` | MCP task state models and cancellation tracking | Unit; `src/mcp/manager/calls/task_tests.rs`. |
+| `src/mcp/updates.rs` | MCP resource/tool list-changed notification handling | `src/mcp/updates/tests.rs`. |
+| `src/mcp/updates/tests.rs` | Test suite for `src/mcp/updates.rs` | Test module. |
+| `src/mcp/updates/tests/native_peer.rs` | Native loopback peer for MCP update tests | Test support module. |
+| `src/media_tools/generation/billing.rs` | Media generation cost attribution and settlement | Unit; exercised through media tool suites. |
+| `src/memory/extraction.rs` | Local memory extraction pipeline | `src/memory/extraction/tests.rs`. |
+| `src/memory/extraction/tests.rs` | Test suite for `src/memory/extraction.rs` | Test module. |
+| `src/notebook.rs` | Jupyter `.ipynb` parsing, rendering, and cell editing | `src/notebook/tests.rs`, `src/tools/notebook_tests.rs`. |
+| `src/notebook/tests.rs` | Test suite for `src/notebook.rs` | Test module. |
+| `src/providers/azure/usage.rs` | Azure OpenAI streaming usage extraction | Unit; exercised through `src/providers/azure.rs` tests. |
+| `src/providers/tool_schema.rs` | Provider-specific JSON Schema normalization and strict-mode repair | Unit; exercised through provider schema and streaming suites. |
+| `src/subagents/model_selection.rs` | Role-based child model selection for subagents | Unit; exercised through `src/subagents.rs` tests. |
+| `src/subagents/task_file.rs` | Durable task-file contract for subagent delegation | `src/subagents/task_file/tests.rs`. |
+| `src/subagents/task_file/tests.rs` | Test suite for `src/subagents/task_file.rs` | Test module. |
+| `src/tools/bash_capture_tests.rs` | Test suite for bash output capture and spilling | Test module. |
+| `src/tools/client_files.rs` | Client-delegated file tool execution adapter | Exercised through `src/acp/client_files/tests.rs`. |
+| `src/tools/client_terminals.rs` | Client-delegated terminal tool execution adapter | Exercised through `src/acp/client_terminals/tests.rs`. |
+| `src/tools/interim_response.rs` | Interim streaming tool status payloads | Unit; exercised through `src/tools.rs` tests. |
+| `src/tools/notebook_tests.rs` | Test suite for `.ipynb` read/edit tool integration | Test module. |
+| `src/undo/journal.rs` | Durable undo/redo file-mutation journal | Unit; exercised through `src/undo.rs` tests. |
+| `src/validation_broker/freshness.rs` | Receipt freshness and tree-fingerprint checks for validation admission | Unit; `tests/validation_broker_store.rs`. |
+| `src/web_remote/bridge.rs` | Native-to-browser frame/event bridge and secret redaction | Unit; `tests/web_remote.rs`, `tests/web_security.rs`. |
+| `src/web_remote/companion.rs` | Local loopback browser companion controller | `src/web_remote/companion/tests.rs`. |
+| `src/web_remote/companion/http.rs` | Browser companion HTTP/SSE asset and action routes | `src/web_remote/companion/tests.rs`. |
+| `src/web_remote/companion/projection.rs` | Redacted session projection for browser companion | `src/web_remote/companion/tests.rs`. |
+| `src/web_remote/companion/tests.rs` | Test suite for `src/web_remote/companion.rs` | Test module. |
+| `src/web_remote/server.rs` | Web-remote HTTP/1.1, TLS 1.3, and WebSocket listener | Unit; `tests/web_remote.rs`, `tests/web_security.rs`. |
 
 ---
 

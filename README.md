@@ -642,7 +642,7 @@ use different thresholds.
 The Rust SDK exposes `SessionOptions.warn_cost`, `max_cost` and an optional
 shared `cost_budget`; `CostBudget` clones share one account. Warnings arrive
 as `AgentEvent::CostWarning` (`type: "cost_warning"` in JSON). A refused request
-returns `Error::CostCap`; print mode exits with status **3**. Native RPC marks
+returns `Error::CostCap`; print mode exits with status **5** (`EXIT_CODE_COST_CAP`; status **3** is reserved for non-interactive approval unavailability). Native RPC marks
 the terminal failure with `errorCode: "cost_cap"`, `retryable: false`, and
 `costCap: { "spent": ..., "cap": ... }`.
 
@@ -2702,10 +2702,9 @@ Concrete engineering work in this codebase includes:
 
 Optimization spans algorithms, execution lanes, memory movement, queue discipline, storage layout, and validation policy as one system.
 
-### Release Profile and Binary Size Gate
+### Release and Distribution Profiles
 
-The shipping release profile is tuned to keep release artifacts inside the
-binary-size budget while preserving cross-crate optimization:
+`Cargo.toml` defines `[profile.release]` (`opt-level = "z"`) for size-oriented local builds and perf-budget schema harnesses, while DSR builds published shipping binaries with `[profile.dist]` (`opt-level = 3`):
 
 ```toml
 [profile.release]
@@ -2716,21 +2715,13 @@ panic = "abort"      # No unwinding machinery
 strip = true         # Remove symbol tables
 ```
 
-Binary size is explicitly budgeted by the DSR quality recipe via `binary_size_release`, with a target
-threshold of `48.0 MiB` (the harness computes bytes / 1024 / 1024; raised from
-`26.0 MiB` for the v0.3.0 capability wave — BPE token tables, LSP/DAP
-bridges, the MCP client, and eval kernels — and previously from
-`22.0 MiB` with the FrankenSQLite cutover). A fresh
-`v0.3.0` release measurement is required before reporting the achieved size.
-Default release builds keep heavyweight extras opt-in; use `--features full`
+Default builds keep heavyweight extras opt-in; use `--features full`
 when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting
 extras in one build.
 
 Published binaries (GitHub Releases, the installer, `pi self-update`) are built
-by DSR with `--profile dist`. It inherits every setting above and sets
-`opt-level = 3`, so the binaries people download are optimized for speed and are
-larger than a `release` build. The `binary_size_release` budget keeps measuring
-the `release` profile.
+by DSR with `--profile dist` (`build_profile: dist`). It inherits LTO, single-codegen-unit, `panic = "abort"`, and symbol stripping from `release` while setting
+`opt-level = 3`, so the binaries people download are optimized for runtime speed without an arbitrary shipping binary-size ceiling.
 
 ### Benchmark Evidence vs Shipping Artifacts
 

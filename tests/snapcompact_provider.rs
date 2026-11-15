@@ -281,7 +281,10 @@ fn smaller_model_window_clips_only_outbound_archive_and_reports_the_omission() {
             model_id: "capture-model".to_string(),
         }),
         ToolRegistry::new(&[], std::path::Path::new("."), None),
-        AgentConfig::default(),
+        AgentConfig {
+            model_accepts_images: false,
+            ..AgentConfig::default()
+        },
     );
     agent.add_message(source_archive(&source));
     let mut session = pi::agent::AgentSession::new(

@@ -37,7 +37,7 @@ pub(super) fn serve(listener: TcpListener, handle: &CompanionHandle, stop: &Atom
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return,
             }
         }
@@ -94,7 +94,7 @@ impl Connection {
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => return false,
                 }
             }
@@ -115,7 +115,10 @@ impl Connection {
             }
         }
         self.input.clear();
-        let end = response.bytes.len().min(self.written.saturating_add(16 * 1024));
+        let end = response
+            .bytes
+            .len()
+            .min(self.written.saturating_add(16 * 1024));
         match self.socket.write(&response.bytes[self.written..end]) {
             Ok(0) => false,
             Ok(count) => {
@@ -180,7 +183,9 @@ fn parse(input: &[u8]) -> Result<Option<Request<'_>>, Response> {
     for line in lines {
         let (name, value) = line.split_once(':').ok_or_else(invalid)?;
         if name.is_empty()
-            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             || value.bytes().any(|byte| byte < b' ' && byte != b'\t')
         {
             return Err(invalid());
@@ -301,15 +306,18 @@ fn dispatch(handle: &CompanionHandle, request: Request<'_>) -> Response {
     let authority = handle.address.to_string();
     let origin = format!("http://{authority}");
     // An exact Host also prevents DNS rebinding into this loopback service.
-    if request.host != authority
-        || request.origin.is_some_and(|value| value != origin)
-    {
-        return Response::error(403, "This request does not belong to the local browser origin.");
+    if request.host != authority || request.origin.is_some_and(|value| value != origin) {
+        return Response::error(
+            403,
+            "This request does not belong to the local browser origin.",
+        );
     }
     if request.method == "GET" && request.body.is_empty() {
         return match request.path {
             "/" => Response::new(200, "text/html; charset=utf-8", HTML.as_bytes()),
-            "/client.js" => Response::new(200, "text/javascript; charset=utf-8", JAVASCRIPT.as_bytes()),
+            "/client.js" => {
+                Response::new(200, "text/javascript; charset=utf-8", JAVASCRIPT.as_bytes())
+            }
             "/client.css" => Response::new(200, "text/css; charset=utf-8", CSS.as_bytes()),
             _ => Response::error(404, "Unknown browser companion route."),
         };
@@ -319,7 +327,9 @@ fn dispatch(handle: &CompanionHandle, request: Request<'_>) -> Response {
     }
     if request.origin != Some(origin.as_str())
         || request.fetch_site.is_some_and(|site| site != "same-origin")
-        || request.content_type.map(|value| value.split(';').next().unwrap_or("").trim())
+        || request
+            .content_type
+            .map(|value| value.split(';').next().unwrap_or("").trim())
             != Some("application/json")
     {
         return Response::error(403, "Browser API requests require the exact local origin.");
@@ -327,7 +337,9 @@ fn dispatch(handle: &CompanionHandle, request: Request<'_>) -> Response {
     if request.path == "/api/pair" {
         return pair(handle, request.body);
     }
-    let Some(credential) = request.authorization.and_then(|value| value.strip_prefix("Bearer "))
+    let Some(credential) = request
+        .authorization
+        .and_then(|value| value.strip_prefix("Bearer "))
     else {
         return Response::error(401, "Pair with a fresh link from the local terminal.");
     };
@@ -342,7 +354,10 @@ fn dispatch(handle: &CompanionHandle, request: Request<'_>) -> Response {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.expire(now);
     if !state.active || !state.viewers.contains_key(&client) {
-        return Response::error(401, "Browser access expired or was revoked. Pair again locally.");
+        return Response::error(
+            401,
+            "Browser access expired or was revoked. Pair again locally.",
+        );
     }
     if let Some(viewer) = state.viewers.get_mut(&client) {
         viewer.last_seen = now;
@@ -399,7 +414,10 @@ fn dispatch(handle: &CompanionHandle, request: Request<'_>) -> Response {
                 return Response::error(409, "The local session is not ready.");
             };
             if state.busy || proposal.generation != state.generation || state.proposal.is_some() {
-                return Response::error(409, "Wait for the local terminal and any pending proposal.");
+                return Response::error(
+                    409,
+                    "Wait for the local terminal and any pending proposal.",
+                );
             }
             let Ok(id) = random_token() else {
                 return Response::error(503, "Proposal identity is temporarily unavailable.");
@@ -431,7 +449,11 @@ fn dispatch(handle: &CompanionHandle, request: Request<'_>) -> Response {
                 return Response::error(400, "Invalid disconnect request.");
             }
             state.viewers.remove(&client);
-            if state.proposal.as_ref().is_some_and(|slot| slot.client == client) {
+            if state
+                .proposal
+                .as_ref()
+                .is_some_and(|slot| slot.client == client)
+            {
                 state.reject_proposal("The browser disconnected.");
             }
             state.changed();
@@ -467,19 +489,29 @@ fn pair(handle: &CompanionHandle, body: &[u8]) -> Response {
     // Capacity is checked before consumption; a rejected viewer can retry
     // its still-valid one-time link after a slot becomes available.
     if state.viewers.len() >= state.settings.max_viewers || state.viewers.contains_key(&client) {
-        return Response::error(503, "Browser viewer capacity is full. Disconnect a viewer or revoke locally.");
+        return Response::error(
+            503,
+            "Browser viewer capacity is full. Disconnect a viewer or revoke locally.",
+        );
     }
     state.tokens.remove(&token);
-    state.viewers.insert(client, Viewer {
-        kind,
-        last_seen: now,
-        next_proposal: now,
-        receipt: None,
-    });
+    state.viewers.insert(
+        client,
+        Viewer {
+            kind,
+            last_seen: now,
+            next_proposal: now,
+            receipt: None,
+        },
+    );
     state.changed();
     state.record("viewer_paired");
-    Response::json(200, &serde_json::json!({
-        "credential": credential,
-        "view_only": state.settings.view_only || kind == TokenKind::View,
-    })).for_client(client)
+    Response::json(
+        200,
+        &serde_json::json!({
+            "credential": credential,
+            "view_only": state.settings.view_only || kind == TokenKind::View,
+        }),
+    )
+    .for_client(client)
 }

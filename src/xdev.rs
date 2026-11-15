@@ -141,9 +141,54 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
     ]
 }
 
+/// Canonical inventory of all 36 built-in tools.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "hashline_edit",
+    "ask",
+    "todo",
+    "web_search",
+    "submit_plan",
+    "current_time",
+    "xdev",
+    "ast_grep",
+    "ast_edit",
+    "lsp",
+    "debug",
+    "jobs",
+    "hub",
+    "manage_skill",
+    "retain",
+    "recall",
+    "reflect",
+    "memory_edit",
+    "learn",
+    "eval",
+    "github",
+    "security_scan",
+    "subagent",
+    "browser",
+    "computer",
+    "inspect_image",
+    "read_media",
+    "generate_image",
+    "tts",
+];
+
+pub const DISCOVERABLE_PROMPT_HEADER: &str =
+    "\n\nAdditional tools are available via the `xdev` dispatcher (not in your schema):\n";
+pub const DISCOVERABLE_PROMPT_FOOTER: &str =
+    "Use `xdev` with action describe/run/promote to inspect, call, or promote them.\n";
+
 /// Curated one-line purposes for built-in tools, used for the system-prompt
 /// discoverable index (bd-cv653.1.6). Kept honest by a unit test that
-/// compares each entry against the live tool description.
+/// compares each entry against the live tool description across all 36 built-ins.
 #[must_use]
 pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -184,6 +229,37 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "subagent" => "Delegate an isolated task to a named Pi child agent",
         "ask" => "Ask the user structured questions mid-turn instead of guessing",
         "todo" => "Maintain the session task list",
+        "submit_plan" => "Submit a completed plan for user review and exit read-only planning",
+        "manage_skill" => "Create, update, delete, or list agent-authored managed skills",
+        "retain" => {
+            "Store a durable project fact, lesson, preference or decision (default scope: project)"
+        }
+        "recall" => {
+            "Search project facts by query (default scope=project, full-text ranked by recency)"
+        }
+        "reflect" => {
+            "Answer a question from active project memories using the configured default model"
+        }
+        "memory_edit" => {
+            "Edit a memory by id: `update` (replace content), `invalidate` (tombstone — excluded from …"
+        }
+        "learn" => "Capture a reusable lesson into this project's memory bank (survives sessions)",
+        "browser" => {
+            "Chromium automation with an owned isolated browser, or explicit loopback attachment throu…"
+        }
+        "computer" => {
+            "Inspect the authorized desktop, capture actual screenshots, and perform OS input/clipboar…"
+        }
+        "inspect_image" => {
+            "Send a local PNG, JPEG, WebP or GIF to a vision provider for description, OCR or diagram …"
+        }
+        "read_media" => {
+            "Attach a local video or audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) to the conv…"
+        }
+        "generate_image" => {
+            "Generate or edit an image through OpenAI, Gemini or xAI and save the actual provider bytes"
+        }
+        "tts" => "Synthesize speech through OpenAI or xAI and save the actual audio to a new file",
         "xdev" => "Discover and run rarely-used tools that are not in the live schema",
         "current_time" => {
             "Return the host's current wall-clock time: UTC and local ISO-8601 timestamps, UTC offset,…"
@@ -192,10 +268,64 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Implicit built-in tools automatically mounted by [`crate::tools::ToolRegistry`]
+/// when no explicit `--tools` restriction is active, matching the exact settings
+/// admission rules in `ToolRegistry::with_builtin_tool_policy`.
+#[must_use]
+pub fn implicit_enabled_tools(config: Option<&Config>) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if config.is_some_and(|cfg| matches!(cfg.memory_backend(), "local" | "cass")) {
+        names.extend(["retain", "recall", "reflect", "memory_edit", "learn"]);
+    }
+    if let Some(media_cfg) = config.and_then(|c| c.media.as_ref()) {
+        if media_cfg
+            .enable_inspect_image
+            .or(media_cfg.enable_media)
+            .unwrap_or(false)
+        {
+            names.push("inspect_image");
+        }
+        if media_cfg.enable_read_media.unwrap_or(false) {
+            names.push("read_media");
+        }
+        if media_cfg
+            .enable_generate_image
+            .or(media_cfg.enable_media)
+            .unwrap_or(false)
+        {
+            names.push("generate_image");
+        }
+        if media_cfg
+            .enable_tts
+            .or(media_cfg.enable_media)
+            .unwrap_or(false)
+        {
+            names.push("tts");
+        }
+    }
+    if config
+        .and_then(|c| c.computer.as_ref())
+        .and_then(|comp| comp.enable_computer)
+        .unwrap_or(false)
+    {
+        names.push("computer");
+    }
+    if config
+        .and_then(|c| c.browser.as_ref())
+        .and_then(|b| b.enable_browser)
+        .unwrap_or(false)
+    {
+        names.push("browser");
+    }
+    names.push("manage_skill");
+    names.retain(|name| configured_tier(name, config) != Some(LoadMode::Off));
+    names
+}
+
 /// The system-prompt discoverable index: `(name, one-liner)` for tools that
 /// are enabled AND discoverable-tier AND known built-ins. Extension/custom
-/// tools still surface via `xdev list` at runtime. When the dispatcher is
-/// disabled, there is no discovery route to advertise.
+/// tools still surface via `xdev list` and live prompt synchronization. When
+/// the dispatcher is disabled, there is no discovery route to advertise.
 #[must_use]
 pub fn prompt_index_for(enabled: &[&str], config: Option<&Config>) -> Vec<(String, String)> {
     if tier_for("xdev", config) == LoadMode::Off {
@@ -206,6 +336,69 @@ pub fn prompt_index_for(enabled: &[&str], config: Option<&Config>) -> Vec<(Strin
         .filter(|name| tier_for(name, config) == LoadMode::Discoverable)
         .filter_map(|name| builtin_one_liner(name).map(|line| (name.to_string(), line.to_string())))
         .collect()
+}
+
+/// System-prompt discoverable index accounting for CLI selection policy:
+/// explicit `--tools` restricts discovery to the named slice, whereas default
+/// implicit selection also advertises settings-enabled built-in tools
+/// (`manage_skill`, memory bank, media tools, `browser`, `computer`).
+#[must_use]
+pub fn prompt_index_for_cli(
+    cli: &crate::cli::Cli,
+    enabled: &[&str],
+    config: Option<&Config>,
+) -> Vec<(String, String)> {
+    if cli.builtin_tools_disabled() {
+        return Vec::new();
+    }
+    if cli.no_implicit_tools {
+        return prompt_index_for(enabled, config);
+    }
+    let mut combined: Vec<&str> = enabled.to_vec();
+    for implicit in implicit_enabled_tools(config) {
+        if !combined.contains(&implicit) {
+            combined.push(implicit);
+        }
+    }
+    prompt_index_for(&combined, config)
+}
+
+/// Render the `xdev` discoverable-tools system prompt block.
+#[must_use]
+pub fn format_discoverable_section(index: &[(String, String)]) -> String {
+    if index.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(DISCOVERABLE_PROMPT_HEADER);
+    for (name, line) in index {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("- {name}: {line}\n"));
+    }
+    out.push_str(DISCOVERABLE_PROMPT_FOOTER);
+    out
+}
+
+/// Replace an existing discoverable-tools prompt block with the live registry
+/// snapshot's unpromoted index (including dynamically mounted MCP/extension
+/// discoverable tools, or removing promoted tools after `xdev promote`).
+#[must_use]
+pub fn sync_discoverable_prompt_section(
+    system_prompt: &str,
+    live_index: &[(String, String)],
+) -> Option<String> {
+    let (prefix, after_header) = system_prompt.split_once(DISCOVERABLE_PROMPT_HEADER)?;
+    let (body, suffix) = after_header.split_once(DISCOVERABLE_PROMPT_FOOTER)?;
+    let replacement = format_discoverable_section(live_index);
+    let expected_body = replacement
+        .strip_prefix(DISCOVERABLE_PROMPT_HEADER)
+        .and_then(|s| s.strip_suffix(DISCOVERABLE_PROMPT_FOOTER));
+    if expected_body == Some(body) {
+        return None;
+    }
+    let mut updated = String::with_capacity(system_prompt.len() + replacement.len());
+    updated.push_str(prefix);
+    updated.push_str(&replacement);
+    updated.push_str(suffix);
+    Some(updated)
 }
 
 /// One-line summary of a tool for the system-prompt discoverable index.
@@ -545,7 +738,16 @@ mod tests {
         let registry = if cli.builtin_tools_disabled() {
             crate::tools::ToolRegistry::without_builtins(Some(config))
         } else {
-            crate::tools::ToolRegistry::new(&enabled, cwd, Some(config))
+            crate::tools::ToolRegistry::with_builtin_tool_policy(
+                &enabled,
+                cwd,
+                Some(config),
+                None,
+                None,
+                true,
+                None,
+                !cli.no_implicit_tools,
+            )
         };
         let prompt = crate::app::build_system_prompt(
             cli, cwd, &enabled, None, cwd, cwd, true, false, None, config,
@@ -711,26 +913,148 @@ mod tests {
 
     #[test]
     fn one_liner_table_matches_live_descriptions() {
-        // Anti-drift gate: every built-in that exists in a default registry
-        // must have its curated one-liner equal the live description's first
-        // sentence (so the prompt index can never lie about a tool).
-        let temp = tempfile::tempdir().expect("tempdir");
-        let registry = crate::tools::ToolRegistry::new(&default_enabled_tools(), temp.path(), None);
-        let mut checked = 0;
-        for tool in registry.tools() {
-            if let Some(line) = builtin_one_liner(tool.name()) {
-                assert_eq!(
-                    line,
-                    one_liner(tool.description()),
-                    "one-liner table drifted from live description for {}",
-                    tool.name()
-                );
-                checked += 1;
-            }
+        // Anti-drift bijection gate across all 36 built-in tools:
+        // BUILTIN_TOOL_NAMES == KNOWN_TOOL_NAMES ∪ TOOLS_NOT_SELECTED_BY_FLAG,
+        // and every built-in's curated one-liner equals `one_liner(tool.description())`.
+        assert_eq!(BUILTIN_TOOL_NAMES.len(), 36);
+        let catalog_set: std::collections::BTreeSet<&str> =
+            BUILTIN_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(catalog_set.len(), 36, "BUILTIN_TOOL_NAMES must be unique");
+
+        let mut registry_known: std::collections::BTreeSet<&str> =
+            crate::tools::ToolRegistry::KNOWN_TOOL_NAMES
+                .iter()
+                .copied()
+                .collect();
+        for (name, _) in crate::tools::ToolRegistry::TOOLS_NOT_SELECTED_BY_FLAG {
+            registry_known.insert(name);
         }
-        assert!(
-            checked >= 10,
-            "expected to check the built-ins, got {checked}"
+        assert_eq!(
+            catalog_set, registry_known,
+            "BUILTIN_TOOL_NAMES must match ToolRegistry known + automatic lists"
         );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let full_config: Config = serde_json::from_value(json!({
+            "memory": { "backend": "local" },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": { "enableMedia": true, "enableReadMedia": true },
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            }
+        }))
+        .expect("full tool config");
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        let mut registry = crate::tools::ToolRegistry::new(
+            &cli.enabled_tools(&full_config),
+            temp.path(),
+            Some(&full_config),
+        );
+        let session = std::sync::Arc::new(asupersync::sync::Mutex::new(
+            crate::session::Session::in_memory(),
+        ));
+        let tools_to_mount: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(crate::ask::AskTool::new(crate::ask::AskPolicy::Error)),
+            Box::new(crate::todo::TodoTool::new(session)),
+            Box::new(crate::plan::SubmitPlanTool::new(
+                crate::plan::PlanState::new(),
+                false,
+            )),
+        ];
+        registry.extend(tools_to_mount);
+
+        for &name in BUILTIN_TOOL_NAMES {
+            let curated_opt = builtin_one_liner(name);
+            assert!(
+                curated_opt.is_some(),
+                "missing builtin_one_liner entry for {name}"
+            );
+            let curated = curated_opt.expect("checked builtin_one_liner");
+            let tool_opt = registry.get(name);
+            assert!(tool_opt.is_some(), "full registry missing built-in {name}");
+            let tool = tool_opt.expect("checked registry built-in");
+            assert_eq!(
+                curated,
+                one_liner(tool.description()),
+                "one-liner table drifted from live description for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_gated_discoverable_tools_reach_system_prompt_and_live_registry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config: Config = serde_json::from_value(json!({
+            "memory": { "backend": "local" },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": { "enableMedia": true, "enableReadMedia": true }
+        }))
+        .expect("settings-gated tools config");
+        let implicit_twelve = [
+            "manage_skill",
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+        ];
+
+        let cli = crate::cli::Cli::parse_from(["pi"]);
+        let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+        for name in implicit_twelve {
+            let tool_opt = registry.get(name);
+            assert!(
+                tool_opt.is_some(),
+                "{name} must be registered when configured"
+            );
+            let tool = tool_opt.expect("checked configured tool");
+            assert!(
+                registry.is_discoverable(name),
+                "{name} must be discoverable"
+            );
+            let expected_line = one_liner(tool.description());
+            assert!(
+                prompt.contains(&format!("- {name}: {expected_line}\n")),
+                "system prompt must advertise {name}"
+            );
+        }
+
+        // Planted negative: explicit `--tools read --no-implicit-tools` must NOT leak any implicit configured tool.
+        let restricted =
+            crate::cli::Cli::parse_from(["pi", "--tools", "read", "--no-implicit-tools"]);
+        let (restricted_reg, restricted_prompt) =
+            selected_registry_and_prompt(&restricted, &config, temp.path());
+        for name in implicit_twelve {
+            assert!(
+                restricted_reg.get(name).is_none(),
+                "{name} leaked into --tools read"
+            );
+            assert!(
+                !restricted_prompt.contains(&format!("- {name}:")),
+                "{name} leaked into --tools read prompt"
+            );
+        }
+
+        // Live sync updates the prompt block when an MCP/extension tool joins or a tool is promoted.
+        let mut live = registry.discoverable_index();
+        live.push((
+            "mcp__demo__search".to_string(),
+            "Search demo catalog".to_string(),
+        ));
+        live.retain(|(name, _)| name != "retain");
+        let synced = sync_discoverable_prompt_section(&prompt, &live).expect("prompt updated");
+        assert!(synced.contains("- mcp__demo__search: Search demo catalog\n"));
+        assert!(!synced.contains("- retain:"));
     }
 }

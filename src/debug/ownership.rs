@@ -97,7 +97,7 @@ impl DebugTool {
         let owners = lock(&self.session_owners);
         let count = owners.parked.len() + usize::from(lock(&self.session).is_some());
         drop(owners);
-        if count >= MAX_DEBUG_SESSIONS {
+        if count >= self.max_sessions {
             return Err(tool_err(
                 "DAP_SESSION_CAPACITY",
                 "four debugger sessions are retained by this tool; disconnect or terminate a target from its owning conversation before starting another",

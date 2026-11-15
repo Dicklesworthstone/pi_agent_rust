@@ -259,8 +259,7 @@ fn direct_diagnostics_preserves_stable_aliases_but_rejects_retargeting() {
         };
         std::fs::write(temp.path().join("other.pidiag"), "source").unwrap();
         std::os::unix::fs::symlink("source.pidiag", temp.path().join("alias.pidiag")).unwrap();
-        std::os::unix::fs::symlink("other.pidiag", temp.path().join("next-alias.pidiag"))
-            .unwrap();
+        std::os::unix::fs::symlink("other.pidiag", temp.path().join("next-alias.pidiag")).unwrap();
         let result = run(&tool, "alias.pidiag");
         if mode == "pull_empty" {
             assert_eq!(result.unwrap().details.unwrap()["count"], 0);
@@ -284,7 +283,11 @@ fn glob_diagnostics_selects_matching_cached_reports_without_protocol_requests() 
     std::fs::create_dir(temp.path().join("nested")).unwrap();
     std::fs::write(temp.path().join("nested/selected.pidiag"), "nested").unwrap();
     std::fs::write(temp.path().join("excluded.otherdiag"), "other").unwrap();
-    for file in ["source.pidiag", "nested/selected.pidiag", "excluded.otherdiag"] {
+    for file in [
+        "source.pidiag",
+        "nested/selected.pidiag",
+        "excluded.otherdiag",
+    ] {
         let output = run(&tool, file).expect("populate the actual client diagnostic cache");
         assert_eq!(output.details.unwrap()["count"], 1);
     }
@@ -292,7 +295,10 @@ fn glob_diagnostics_selects_matching_cached_reports_without_protocol_requests() 
     let before = std::fs::read_to_string(&frames_path).unwrap();
 
     for (pattern, expected) in [
-        ("**/*.pidiag", vec!["nested/selected.pidiag", "source.pidiag"]),
+        (
+            "**/*.pidiag",
+            vec!["nested/selected.pidiag", "source.pidiag"],
+        ),
         ("nested/*.pidiag", vec!["nested/selected.pidiag"]),
         ("**/*.missing", vec![]),
     ] {

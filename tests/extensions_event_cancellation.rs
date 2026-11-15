@@ -684,9 +684,11 @@ mod runtime_lifetime {
 
     async fn fixture() -> Fixture {
         let directory = tempfile::tempdir().expect("event fixture directory");
-        let completed = directory.path().join("completed.mjs");
-        let active = directory.path().join("active.mjs");
-        let peer = directory.path().join("peer.mjs");
+        let extensions_dir = directory.path().join("extensions");
+        std::fs::create_dir_all(&extensions_dir).expect("extensions directory");
+        let completed = extensions_dir.join("completed.mjs");
+        let active = extensions_dir.join("active.mjs");
+        let peer = extensions_dir.join("peer.mjs");
         std::fs::write(&completed, COMPLETED_OWNER).expect("completed owner source");
         std::fs::write(&active, ACTIVE_OWNER).expect("active owner source");
         std::fs::write(&peer, UNTOUCHED_PEER).expect("peer source");

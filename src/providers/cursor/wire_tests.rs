@@ -363,7 +363,8 @@ impl Stream for UsageWireBody {
     type Item = std::io::Result<Vec<u8>>;
 
     fn poll_next(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(chunk) = self.0.chunks.lock().unwrap().pop_front() {
+        let next_chunk = self.0.chunks.lock().unwrap().pop_front();
+        if let Some(chunk) = next_chunk {
             Poll::Ready(Some(chunk))
         } else if self.0.pending {
             Poll::Pending

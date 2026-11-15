@@ -350,7 +350,9 @@ impl AttachmentCatalog {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(super) enum AttachmentReadError {
-    #[error("Invalid RPC attachment reference; expected attachmentId, $piBlob, sizeBytes and encoding")]
+    #[error(
+        "Invalid RPC attachment reference; expected attachmentId, $piBlob, sizeBytes and encoding"
+    )]
     InvalidReference,
     #[error("Invalid RPC attachment ID")]
     InvalidId,
@@ -940,7 +942,7 @@ mod tests {
             AttachmentReadError::UnknownId
         );
         assert_eq!(
-            first.clone().resolve_input(&first_ref).unwrap().into_base64(),
+            first.resolve_input(&first_ref).unwrap().into_base64(),
             original
         );
     }
@@ -971,7 +973,10 @@ mod tests {
         let resolved = catalog.resolve_input(&unpadded).unwrap();
         assert_eq!(resolved.encoded_len(), 2);
         assert_eq!(resolved.into_base64(), "eA");
-        assert_eq!(catalog.resolve_input(&original).unwrap().into_base64(), "eA==");
+        assert_eq!(
+            catalog.resolve_input(&original).unwrap().into_base64(),
+            "eA=="
+        );
     }
 
     #[test]

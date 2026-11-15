@@ -14,8 +14,44 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Added
+
+- **Agent Client Protocol (`pi --acp`) persistent sessions, extensions, and MCP parity.**
+  ACP sessions now default to persistent project session directories unless `--no-session` is passed, wire trust-gated extension loading (`ExtensionPolicy::evaluate_startup_trust`), and honor `mcp_servers` updates during `session/load` with deterministic invalid-transport error reporting (`-32602`).
+- **Mobile Web Remote (`pi --web`) TLS 1.3, fail-closed LAN bind gate, and scannable terminal QR.**
+  `--web-tls-cert` and `--web-tls-key` serve HTTPS and WSS via `asupersync` TLS 1.3 (`rustls`); non-loopback `--web-bind` addresses fail closed unless paired with TLS or `--web-allow-insecure-lan`; and terminal pairing renders a real ISO/IEC 18004 QR Model 2 matrix using Unicode half-blocks (`▀`/`▄`/`█`).
+- **Progressive `xdev` tool discovery bijection and configurable `DebugTool` allowlist.**
+  `TOOL_TIERS` now covers all 36 built-in tools in exact 1:1 bijection with `BUILTIN_TOOL_NAMES` + `subagent`, exposes `discoverable_index()` in system prompts, syncs activated tools into `Agent::extend_tools` mid-session, and supports `debug.extraAdapters` / `debug.allowCustomAdapters` with `DAP_ADAPTER_BLOCKED` diagnostics.
+- **Provider capability introspection and agentic tool-use parity across GitLab Duo, Cursor, Copilot, and Codex OAuth.**
+  Added `ProviderCapabilities` (`pi::sdk::ProviderCapabilities`), wired multi-turn history and `<pi_tool_call>` tool execution (`StopReason::ToolUse`) for `GitLabProvider` and streaming `CursorProvider`, forwarded model reasoning/vision/cost metadata plus live `AuthStorage` reload on Copilot's Chat Completions route, and implemented `openai-codex` OAuth refresh.
+- **FrankenTUI extension `dataDir`, terminal inline image sizing, and complete `KeyAction` wiring.**
+  Exposed per-extension persistent `ctx.dataDir` / `pi.dataDir`, wired TTY `render_inline` with configurable cell dimensions, surfaced startup session-recovery diagnostics, and connected all 15 previously inert `AppAction` keybindings (tree navigation, session rename/pin/export/share, retry, reload, thinking toggle, editor launch, background job inspector, subagent overlay).
+- **Segmented `SessionStoreV2` live synchronization.**
+  Opt-in `sessionStore: "v2"` (`PI_SESSION_STORE=v2`) atomically maintains `.v2` segments, sidecar offset indexes, manifests, and clean `source-state.json` lineage markers alongside canonical JSONL saves and appends without startup full-replay stalls.
+- **DSR recipe `wasm-host` gates and `pi doctor --only swarm` DSR drift check.**
+  Added `--keep-going` and `--features wasm-host` Clippy/test lanes to `.dsr/repos.yaml`, aligned `.dsr/repos.d/pi_agent_rust.yaml` to `build_profile: dist`, documented all 43 RPC commands in `docs/rpc.md` with an automated parity test, and added host DSR drift detection to `pi doctor`.
+
+### Changed
+
+- **Crate-root SemVer surface sealing (`pi::sdk`).**
+  Internal root modules in `src/lib.rs` now carry `#[doc(hidden)]`, keeping `pi::Error`, `pi::PiResult`, and `pi::sdk` as the sole documented SemVer contract; `main.rs` consumes `SdkStartupBootstrap` directly for interactive FTUI handoff without double session initialization.
+- **Distinct cost-cap exit code (`EXIT_CODE_COST_CAP = 5`).**
+  Print/JSON runs halted by `Error::CostCap` now exit with status `5`, preserving status `3` exclusively for non-interactive approval unavailability.
+- **Honest Node compatibility shims and real `npm:zod` validation.**
+  Replaced silent fake-success stubs in `node:zlib`, `node:http2`, `node:tls`, `node:net`, `node:dgram`, `node:vm`, `node:worker_threads`, `node:cluster`, `node:inspector`, and `node:dns` with fail-closed `ERR_PI_SHIM_UNSUPPORTED_OPERATION` errors, and replaced the permissive `npm:zod` stub with recursive runtime validation (`safeParse`/`parse` rejecting invalid inputs with structured `ZodError.issues`).
+
 ### Fixed
 
+- **Clap-derived CLI flag pre-parser (`--wait-async`).**
+  Replaced the hand-maintained `known_long_option()` flag list in `src/cli.rs` with introspection over `Cli::command()`, fixing `Unknown option: --wait-async` while still isolating dynamic extension flags.
+- **Lock-free optimistic concurrency control (OCC) for RPC `rewind`.**
+  Refactored `run_rpc_rewind` into a cancellable 3-phase read/persist/validate-commit pipeline so `abort` and state reads remain responsive during slow saves and concurrent session mutations abort cleanly without partial state corruption.
+- **Live `/login` and `/logout` credential refresh across active sessions.**
+  Interactive `/login` and `/logout` flows now reload `AuthStorage` and rebuild the available model list immediately without requiring a process restart.
+- **Hostcall overload telemetry and Gibbs-Candès ACI step sign.**
+  Wired real inter-arrival `interval_ms` into `ExtensionManager::record_hostcall_Telemetry`, fixed the inverted `adaptive_alpha` update direction under miscoverage spikes, and eliminated duplicate SHA-256 arena hashing during QuickJS bytecode cache population.
+- **WASM extension slash-command dispatch.**
+  `ExtensionManager::execute_interaction_with_abort` now routes `/slash` invocations to loaded WASM components via `WasmExtensionHandle::handle_slash` across FTUI, classic TUI, RPC, and SDK surfaces.
 - **Installer on a stock Mac.** `install.sh` required an `xz` program before
   extracting a release archive. macOS has none unless Homebrew or MacPorts
   installed one, and its `tar` reads xz without it, so the documented install
@@ -41,6 +77,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   refused before it is read. This takes effect only in builds that contain
   it: v0.7.1 and v0.8.0 users on those platforms run the installer once
   ([#266](https://github.com/Dicklesworthstone/pi_agent_rust/issues/266)).
+
+### Security
+
+- **Startup Merkle `package-lock.json` verification and streaming digest hardening.**
+  `PackageManager::ensure_installed_packages_verified` now verifies installed package trees at startup against `package-lock.json` using 64 KiB streaming CRLF-normalized SHA-256 digests without unbounded file buffering, rejecting escaping symlinks (`..` or external targets) fail-closed.
+- **Zero RUSTSEC advisories across workspace and fuzz lockfiles (`wasmtime 48.0.8`).**
+  Upgraded optional `wasmtime` to `48.0.8` (remediating GH [#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258) / `RUSTSEC-2026-0422`, `0423`, `0424`, and prior Wasmtime advisories), dropped the unused `pprof` `flamegraph` feature, updated transitive `rustls`/`webpki`/`zstd`/`pulldown-cmark`/`rustix`/`tokio` lock entries, and synchronized `fuzz/Cargo.lock` (`0` advisories in `cargo audit`).
 
 ## [v0.8.0] — 2026-10-13 — Release
 

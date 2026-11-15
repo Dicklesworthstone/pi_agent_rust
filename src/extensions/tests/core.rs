@@ -24,7 +24,7 @@ const NEVER_FINISHES_EXTENSION_SOURCE: &str = r#"
               pi.sendMessage({ customType: "handler-start", content: "start" });
               setTimeout(() => {
                 pi.sendMessage({ customType: "delayed-side-effect", content: "late" });
-              }, 700);
+              }, 2600);
               await new Promise(() => {});
             },
           });
@@ -2435,16 +2435,20 @@ fn isolated_runtime_timeout_quarantines_and_peer_work_skips_failed_shard() {
                 "never-finishes".to_string(),
                 String::new(),
                 Arc::new(json!({})),
-                500,
+                2_000,
             )
             .await;
-        assert!(first.is_err(), "never-finishing handler must time out");
+        let first_err = first.expect_err("never-finishing handler must time out");
+        assert!(
+            !first_err.to_string().contains("expired before"),
+            "handler must enter JavaScript before timing out: {first_err}"
+        );
         assert_only_host_message(
             &actions,
             "handler-start",
             "the first handler must have started",
         );
-        sleep(wall_now(), Duration::from_millis(400)).await;
+        sleep(wall_now(), Duration::from_millis(800)).await;
         js_runtime
             .pump_once()
             .await

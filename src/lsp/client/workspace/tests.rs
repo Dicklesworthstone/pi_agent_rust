@@ -233,27 +233,51 @@ fn parsed_settings_are_immutable_copies_not_caller_owned_references() {
 
 mod protocol;
 
+static PRESSURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_pressure_test() -> std::sync::MutexGuard<'static, ()> {
+    PRESSURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn saturate_writer(client: &LspClient) {
-    // The peer must already have acknowledged stall_reads. Smaller filler
-    // frames leave less room than the 64-KiB configuration we will attempt.
-    let payload = "x".repeat(32 * 1024);
-    for _ in 0..4096 {
-        let mut batch = JsonRpcClient::prepare_notifications(vec![(
-            "test/outboundPressure",
-            json!({"payload":payload}),
-        )]);
-        match client.rpc.try_admit_notifications(&mut batch) {
-            Ok(()) => {}
-            Err(TransportError::Backpressure(_)) => return,
-            Err(error) => panic!("unexpected pressure admission error: {error:?}"),
+    // The peer must already have acknowledged stall_reads. Coarse frames reach
+    // the byte cap in a handful of writes; the final 32-KiB tier leaves less
+    // room than the 64-KiB configuration transaction we will attempt.
+    for chunk_bytes in [16 * 1024 * 1024, 1024 * 1024, 32 * 1024] {
+        let payload = "x".repeat(chunk_bytes);
+        let mut exhausted_tier = false;
+        for _ in 0..4096 {
+            let mut batch = JsonRpcClient::prepare_notifications(vec![(
+                "test/outboundPressure",
+                json!({"payload":payload}),
+            )]);
+            match client.rpc.try_admit_notifications(&mut batch) {
+                Ok(()) => {}
+                Err(TransportError::Backpressure(_)) => {
+                    exhausted_tier = true;
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(error, TransportError::Backpressure(_)),
+                        "unexpected pressure admission error: {error:?}"
+                    );
+                }
+            }
         }
+        assert!(
+            exhausted_tier,
+            "the stopped peer must exhaust the bounded writer budget"
+        );
     }
-    panic!("the stopped peer must exhaust the bounded writer budget");
 }
 
 #[test]
 #[allow(clippy::too_many_lines)]
 fn configuration_backpressure_preserves_state_and_retry_closes_before_updating() {
+    let _pressure_serial = lock_pressure_test();
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
         return;
@@ -458,6 +482,7 @@ fn assert_unconfigured(peer: &Fixture, uri: &str, version: u64) {
 
 #[test]
 fn asynchronous_configuration_waits_for_capacity_and_commits_exactly_once() {
+    let _pressure_serial = lock_pressure_test();
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
         return;
@@ -498,6 +523,7 @@ fn asynchronous_configuration_waits_for_capacity_and_commits_exactly_once() {
 
 #[test]
 fn asynchronous_configuration_timeout_preserves_the_previous_baseline() {
+    let _pressure_serial = lock_pressure_test();
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
         return;
@@ -523,6 +549,7 @@ fn asynchronous_configuration_timeout_preserves_the_previous_baseline() {
 
 #[test]
 fn cancelling_configuration_capacity_wait_has_no_remote_effects() {
+    let _pressure_serial = lock_pressure_test();
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
         return;
@@ -552,6 +579,7 @@ fn cancelling_configuration_capacity_wait_has_no_remote_effects() {
 
 #[test]
 fn dropping_configuration_capacity_wait_releases_the_request_lane() {
+    let _pressure_serial = lock_pressure_test();
     let temp = tempfile::tempdir().unwrap();
     let Some(peer) = Fixture::connect(temp.path(), json!({"textDocumentSync":1})) else {
         return;
@@ -622,6 +650,7 @@ fn agent_facing_configure_waits_for_transport_capacity_before_reporting_success(
     use crate::tools::Tool as _;
     use std::process::{Command, Stdio};
 
+    let _pressure_serial = lock_pressure_test();
     let python = ["python3", "python"].into_iter().find(|program| {
         Command::new(program)
             .arg("--version")

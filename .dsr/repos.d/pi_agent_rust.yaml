@@ -56,10 +56,10 @@ local_path: /data/projects/pi_agent_rust
 language: rust
 binary_name: pi
 build_cmd: >-
-  cargo build --locked --release --bin pi &&
-  cp "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/pi"
-  "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/pi_${os}_${arch}"
-build_profile: release
+  cargo build --locked --profile dist --bin pi &&
+  cp "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/dist/pi"
+  "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/dist/pi_${os}_${arch}"
+build_profile: dist
 
 # DSR is the only quality/build/release authority for this repository.
 # Null mappings force native/local or SSH execution and prohibit act/GitHub
@@ -105,9 +105,9 @@ cross_compile:
     # the public release name remains pi_windows_amd64.exe.
     build_cmd: >-
       call C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat &&
-      cargo build --locked --release --bin pi &&
-      copy /b "%CARGO_TARGET_DIR%\%CARGO_BUILD_TARGET%\release\pi.exe"
-      "%CARGO_TARGET_DIR%\%CARGO_BUILD_TARGET%\release\pi_windows_amd64.exe.exe"
+      cargo build --locked --profile dist --bin pi &&
+      copy /b "%CARGO_TARGET_DIR%\%CARGO_BUILD_TARGET%\dist\pi.exe"
+      "%CARGO_TARGET_DIR%\%CARGO_BUILD_TARGET%\dist\pi_windows_amd64.exe.exe"
 
 artifact_naming: "pi-${os}-${arch}"
 install_script_compat: "pi-${os}-${arch}"

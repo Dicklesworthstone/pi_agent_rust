@@ -670,7 +670,10 @@ mod tests {
                     "SELECT name FROM sqlite_master WHERE name = 'pi_session_blobs'",
                     &[],
                 ))?;
-                assert!(rows.is_empty(), "opaque metadata must not create blob storage");
+                assert!(
+                    rows.is_empty(),
+                    "opaque metadata must not create blob storage"
+                );
                 map_sqlite_result(conn.close())
             })
             .expect("inspect opaque-only database");
@@ -697,7 +700,7 @@ mod tests {
             }),
             json!({"$piBlob":"../../opaque","sizeBytes":"unknown"}),
             Value::Null,
-            json!(["arbitrary",42]),
+            json!(["arbitrary", 42]),
         ] {
             let mut expected = serde_json::to_value(&original).unwrap();
             expected["message"]["content"] = json!([{"type":"media","data":data}]);

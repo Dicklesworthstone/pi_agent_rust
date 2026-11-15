@@ -7,7 +7,7 @@ mod ownership;
 
 use super::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, AgentSessionHandle, AssistantMessage,
-    ContentBlock, Error, FailoverOptions, ImageContent, Message, Result, RpcControlHandle,
+    ContentBlock, Error, FailoverOptions, ImageContent, Result, RpcControlHandle,
     RpcExtensionUiResponse, SessionPromptResult, SessionTransport, SessionTransportEvent,
     StopReason, TextContent, UserContent,
 };
@@ -51,9 +51,9 @@ impl LogicalTurnState {
     /// At most two pending lifecycles close before an incoming event. A fixed
     /// array avoids allocating a Vec for every streamed text delta.
     fn observe(&mut self, event: AgentEvent) -> [Option<AgentEvent>; 3] {
-        self.events.observe(event).map_or([None, None, None], |event| {
-            self.recovery.observe(event)
-        })
+        self.events
+            .observe(event)
+            .map_or([None, None, None], |event| self.recovery.observe(event))
     }
 }
 
@@ -308,7 +308,8 @@ impl AgentSessionHandle {
                 .and_then(|options| options.cli_api_key.clone()),
         );
         let shared: EventCallback = Arc::new(self.make_combined_callback(on_event));
-        self.maybe_restore_primary(&shared, Some(&abort_signal)).await?;
+        self.maybe_restore_primary(&shared, Some(&abort_signal))
+            .await?;
         ensure_not_aborted(&abort_signal)?;
         let turn = LogicalTurn::new(shared);
         let _ownership = ownership::TurnGuard::new(&turn, self.session.provider_admission_gate());
@@ -423,14 +424,13 @@ impl AgentSessionHandle {
         cx: &crate::agent_cx::AgentCx,
         abort: Option<&AbortSignal>,
     ) -> Result<bool> {
-        let session = await_session_preparation(abort, async {
-            self.session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|err| Error::session(format!("failover provenance lock failed: {err}")))
-        })
-        .await?;
+        let session =
+            await_session_preparation(abort, async {
+                self.session.session.lock(cx.cx()).await.map_err(|err| {
+                    Error::session(format!("failover provenance lock failed: {err}"))
+                })
+            })
+            .await?;
         let runtime = self.session.agent.provider();
         let runtime_matches_session =
             session
@@ -467,6 +467,7 @@ impl AgentSessionHandle {
         shared: &EventCallback,
         abort: Option<&AbortSignal>,
     ) -> Result<bool> {
+        self.sync_shared_auth_if_updated();
         let Some(options) = self.failover.clone() else {
             return Ok(false);
         };
@@ -600,6 +601,7 @@ impl AgentSessionHandle {
         shared: &EventCallback,
         abort: Option<&AbortSignal>,
     ) -> Result<()> {
+        self.sync_shared_auth_if_updated();
         let Some(options) = self.failover.clone() else {
             return Ok(());
         };
@@ -1287,7 +1289,7 @@ mod persistence_fence_tests {
 mod stream_terminal_tests {
     use super::*;
     use crate::model::{AssistantMessageEvent, StreamEvent, Usage, UserMessage};
-    use crate::sdk::StreamTerminalForwarder;
+    use crate::sdk::{Message, StreamTerminalForwarder};
 
     fn assistant(reason: StopReason) -> Arc<AssistantMessage> {
         Arc::new(AssistantMessage {

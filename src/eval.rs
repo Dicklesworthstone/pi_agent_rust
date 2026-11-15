@@ -576,7 +576,7 @@ impl EvalTool {
                 )
                 .await?;
                 session_guard.check_tool().await?;
-                bridge_io::delivery::send_python(
+                if let Err(send_err) = bridge_io::delivery::send_python(
                     &mut kernel,
                     id,
                     deadline,
@@ -584,7 +584,43 @@ impl EvalTool {
                     session_guard,
                     &json!({"bridge_result": reply}),
                 )
-                .await?;
+                .await
+                {
+                    // When guest-side bridge corruption poisons the exchange,
+                    // Python flushes its final `bridgeError` frame to stdout
+                    // and exits `main()`, closing stdin while the host's
+                    // `bridge_result` write is in flight. Surface that protocol
+                    // corruption diagnosis rather than masking it as EPIPE.
+                    if send_err.to_string().contains("EVAL_IO:") {
+                        let probe_deadline =
+                            deadline.min(Instant::now() + Duration::from_millis(250));
+                        while let Ok(Some(early_line)) = kernel
+                            .next_line(probe_deadline, capture, session_guard)
+                            .await
+                        {
+                            let trimmed_early = early_line.trim();
+                            if trimmed_early.is_empty() {
+                                continue;
+                            }
+                            let Ok(early_frame) = serde_json::from_str::<Value>(trimmed_early)
+                            else {
+                                break;
+                            };
+                            if early_frame.get("stream").is_some() {
+                                let _ = capture.accept(&early_frame, id);
+                                continue;
+                            }
+                            if early_frame.get("bridgeError").is_some() {
+                                return Err(Error::tool(
+                                    "eval",
+                                    "EVAL_BRIDGE_PROTOCOL: incomplete tool exchange; EVAL_STATE_RESET: Python kernel discarded",
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                    return Err(send_err);
+                }
                 continue;
             }
             transport::validate_response(&parsed, id)?;

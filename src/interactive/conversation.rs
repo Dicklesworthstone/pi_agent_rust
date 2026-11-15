@@ -45,7 +45,7 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
                 // structured image blocks remain available to model input.
                 push_line(
                     &mut output,
-                    &crate::terminal_images::placeholder(&image.mime_type, None, None),
+                    &crate::terminal_images::placeholder_for_base64(&image.data, &image.mime_type),
                 );
             }
             // Media blocks are never rendered inline; the sanitized
@@ -75,7 +75,10 @@ pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: 
                 if show_images {
                     push_line(
                         &mut output,
-                        &crate::terminal_images::placeholder(&image.mime_type, None, None),
+                        &crate::terminal_images::placeholder_for_base64(
+                            &image.data,
+                            &image.mime_type,
+                        ),
                     );
                 } else {
                     hidden_images = hidden_images.saturating_add(1);
@@ -587,5 +590,35 @@ mod tests {
             timestamp: 0,
         })];
         assert!(last_assistant_message(&messages).is_none());
+    }
+
+    #[test]
+    fn content_blocks_image_placeholder_surfaces_real_dimensions_and_stays_control_free() {
+        use base64::Engine as _;
+        let mut png = vec![0_u8; 33];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
+        png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&320_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&240_u32.to_be_bytes());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let blocks = vec![
+            ContentBlock::Image(crate::model::ImageContent {
+                data: encoded,
+                mime_type: "image/png".to_string(),
+            }),
+            ContentBlock::Image(crate::model::ImageContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: "image/png\x1b[31m".to_string(),
+            }),
+        ];
+        let rendered = content_blocks_to_text(&blocks);
+        assert!(
+            rendered.contains("[image: image/png, 320x240]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[image: image/png]"), "{rendered}");
+        assert!(!rendered.contains('\x1b'), "{rendered:?}");
     }
 }

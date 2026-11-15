@@ -273,10 +273,10 @@ pub enum AuthCredential {
         refresh_token: String,
         expires: i64, // Unix ms
         /// Token endpoint URL for self-contained refresh (optional; backward-compatible).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, alias = "tokenUrl", skip_serializing_if = "Option::is_none")]
         token_url: Option<String>,
         /// Client ID for self-contained refresh (optional; backward-compatible).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, alias = "clientId", skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
         /// Any additional keys present in an upstream-written OAuth credential,
         /// preserved verbatim so a load→save round-trip never drops fields
@@ -2341,6 +2341,29 @@ impl AuthStorage {
                         &refresh_token,
                     ))
                     .await
+                }
+                "openai-codex" => {
+                    let token_url = std::env::var("PI_OPENAI_CODEX_REFRESH_URL")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .or(stored_token_url)
+                        .unwrap_or_else(openai_codex_oauth_token_url);
+                    let client_id = stored_client_id.unwrap_or_else(openai_codex_oauth_client_id);
+                    if refresh_token.trim().is_empty() {
+                        Err(Error::auth(
+                            "openai-codex OAuth credential is expired and has no refresh_token; run `/login openai-codex` to re-authenticate".to_string(),
+                        ))
+                    } else {
+                        Box::pin(refresh_self_contained_oauth_token(
+                            client,
+                            &token_url,
+                            &client_id,
+                            &refresh_token,
+                            &provider,
+                        ))
+                        .await
+                    }
                 }
                 _ => {
                     if let (Some(url), Some(cid)) = (&stored_token_url, &stored_client_id) {
@@ -7323,10 +7346,26 @@ mod tests {
 
     #[test]
     fn oauth_callback_drop_releases_idle_fixed_and_random_ports() {
-        let (server, uri) =
-            start_oauth_callback_server_random_port().expect("random callback server");
-        let port = server.port;
-        let check_drop = |server: OAuthCallbackServer| {
+        static NEXT_AUTH_DROP_TEST_PORT: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(0);
+        // `cargo test --all-targets` executes both the `lib` and `bin` (`pi`)
+        // unit-test binaries concurrently on the same host. Serialize across
+        // processes via a dedicated loopback guard port so two test processes
+        // never race on the fixed localhost callback port during drop/rebind.
+        let lock_deadline = Instant::now() + Duration::from_secs(15);
+        let cross_process_guard = loop {
+            match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 17_999)) {
+                Ok(guard) => break guard,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AddrInUse
+                        && Instant::now() < lock_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("acquire cross-process callback drop test lock: {err}"),
+            }
+        };
+        let check_drop = |server: OAuthCallbackServer, port: u16| {
             let io = Arc::clone(&server.io);
             drop(server);
             // Rebinding is immediate, even if the worker has not run yet.
@@ -7335,13 +7374,61 @@ mod tests {
             assert_oauth_callback_worker_retired(&io);
             drop(rebound);
         };
-        check_drop(server);
+        // `:0` picks from the OS ephemeral range (32768..60999), where one of
+        // the thousands of parallel `--lib` loopback clients can grab the port
+        // between `drop` and `bind`. Always verify immediate listener release
+        // and worker retirement on drop; retry only an external `AddrInUse`.
+        let mut rebound_random = false;
+        for attempt in 0..4 {
+            let (random_server, _) =
+                start_oauth_callback_server_random_port().expect("random callback server");
+            let random_port = random_server.port;
+            let io = Arc::clone(&random_server.io);
+            drop(random_server);
+            assert!(
+                io.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .listener
+                    .is_none(),
+                "drop must synchronously clear the callback listener"
+            );
+            match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, random_port)) {
+                Ok(rebound) => {
+                    assert_oauth_callback_worker_retired(&io);
+                    drop(rebound);
+                    rebound_random = true;
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && attempt < 3 => {
+                    assert_oauth_callback_worker_retired(&io);
+                }
+                Err(err) => panic!("dropped callback listener releases its port: {err}"),
+            }
+        }
+        assert!(rebound_random, "rebound dropped random callback port");
+
+        // Choose a localhost port strictly below both `interactive::commands`'s
+        // 20000..30000 callback test range and the OS ephemeral range
+        // (32768..65535) so concurrent test threads cannot collide on it.
+        let pid_salt = u16::try_from(std::process::id().wrapping_mul(131) % 1_900).unwrap_or(0);
+        let fixed_port = (0..1_900_u16)
+            .map(|_| {
+                let raw =
+                    NEXT_AUTH_DROP_TEST_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                18_000 + (pid_salt.wrapping_add(raw) % 1_900)
+            })
+            .find(|&candidate| {
+                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, candidate)).is_ok()
+            })
+            .expect("available non-ephemeral localhost port");
+        let fixed_uri = format!("http://localhost:{fixed_port}/auth/callback");
         for _ in 0..3 {
             let server =
-                start_oauth_callback_server(&uri).expect("replacement fixed-port callback");
-            assert_eq!(server.port, port);
-            check_drop(server);
+                start_oauth_callback_server(&fixed_uri).expect("replacement fixed-port callback");
+            assert_eq!(server.port, fixed_port);
+            check_drop(server, fixed_port);
         }
+        drop(cross_process_guard);
     }
 
     #[test]
@@ -8310,8 +8397,10 @@ mod tests {
     fn media_api_keys_resolve_stored_environment_references() {
         const CHILD: &str = "PI_MEDIA_STORED_ENV_KEY_CHILD";
         if std::env::var_os(CHILD).is_none() {
+            let child_cwd = tempfile::tempdir().expect("isolated child cwd");
             let output =
                 std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .current_dir(child_cwd.path())
                     .args([
                         "--exact",
                         "auth::tests::media_api_keys_resolve_stored_environment_references",
@@ -15225,5 +15314,121 @@ sso_region = us-east-1
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn openai_codex_oauth_refresh_uses_override_or_canonical_defaults_and_rejects_empty_refresh_token()
+     {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind codex oauth mock");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).expect("read");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let hdrs = String::from_utf8_lossy(&raw[..hdr_end]);
+                    let content_len = hdrs
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= hdr_end + 4 + content_len {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&raw[hdr_end + 4..hdr_end + 4 + content_len])
+                                .expect("json");
+                        assert_eq!(body["grant_type"], "refresh_token");
+                        assert_eq!(body["client_id"], OPENAI_CODEX_OAUTH_CLIENT_ID);
+                        assert_eq!(body["refresh_token"], "rt_codex_valid");
+                        break;
+                    }
+                }
+            }
+            let resp = r#"{"access_token":"at_codex_fresh","refresh_token":"rt_codex_next","expires_in":3600}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp.len(),
+                resp
+            )
+            .expect("write");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        // Stored without explicit `client_id` so canonical Codex OAuth fallback is exercised;
+        // `token_url` points to our local mock server.
+        let initial = serde_json::json!({
+            "openai-codex": {
+                "type": "oauth",
+                "access": "at_codex_expired",
+                "refresh": "rt_codex_valid",
+                "expires": 1000,
+                "tokenUrl": format!("http://{addr}/oauth/token")
+            }
+        });
+        std::fs::write(&auth_path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let mut storage = AuthStorage::load(auth_path.clone()).expect("load");
+            let client = crate::http::client::Client::new();
+            let report = storage
+                .refresh_expired_oauth_tokens_report_with_client(&client)
+                .await;
+            assert_eq!(report.refreshed, vec!["openai-codex".to_string()]);
+            assert!(
+                report.failed.is_empty(),
+                "unexpected failures: {:?}",
+                report.failed
+            );
+            assert_eq!(
+                storage.resolve_api_key("openai-codex", None).as_deref(),
+                Some("at_codex_fresh")
+            );
+
+            // Planted negative: expired credential with empty refresh_token fails with re-login hint.
+            let broken_path = dir.path().join("broken_auth.json");
+            let broken = serde_json::json!({
+                "openai-codex": {
+                    "type": "oauth",
+                    "access": "at_codex_expired",
+                    "refresh": "   ",
+                    "expires": 1000
+                }
+            });
+            std::fs::write(&broken_path, serde_json::to_string_pretty(&broken).unwrap()).unwrap();
+            let mut broken_storage = AuthStorage::load(broken_path).expect("load broken");
+            let broken_report = broken_storage
+                .refresh_expired_oauth_tokens_report_with_client(&client)
+                .await;
+            assert_eq!(broken_report.failed.len(), 1);
+            assert!(
+                broken_report.failed[0]
+                    .error
+                    .contains("/login openai-codex"),
+                "expected actionable re-login hint, got: {}",
+                broken_report.failed[0].error
+            );
+        });
+        server.join().expect("server");
     }
 }

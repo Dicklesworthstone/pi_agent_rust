@@ -799,3 +799,52 @@ fn unversioned_baselines_cannot_reuse_result_ids_or_accept_close_reopen_races() 
     });
     assert!(!peer.client.diagnostics_snapshot().contains_key(&uri));
 }
+
+#[test]
+fn document_diagnostics_retries_after_concurrent_push_within_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(peer) = peer(temp.path()) else {
+        return;
+    };
+    let (_, uri) = source(&peer, temp.path(), "pub fn broken() {\n");
+    let push_error = diagnostic("concurrent server push");
+    let fresh_report = diagnostic("revalidated syntax diagnostic");
+    peer.configure(json!({"textDocument/diagnostic":[
+        {"hold":true},
+        {"result":{"kind":"full","resultId":"fresh","items":[fresh_report]}}
+    ]}));
+    let items = peer
+        .runtime
+        .block_on(async {
+            let mut pending = Box::pin(
+                peer.client
+                    .document_diagnostics(&uri, Duration::from_secs(5)),
+            );
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            peer.client
+                .call_no_wait_notify(
+                    "test/release",
+                    json!({"result":{"kind":"full","resultId":"stale","items":[]}}),
+                )
+                .expect("release buffered pull response");
+            let push = json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/publishDiagnostics",
+                "params":{"uri":uri,"diagnostics":[push_error]}
+            });
+            let (id, response) = peer
+                .client
+                .rpc
+                .request("test/notifications", json!({"notifications":[push]}))
+                .expect("push notification request");
+            crate::lsp::jsonrpc::await_completion(response, Duration::from_secs(5), || {
+                peer.client.rpc.cancel_request(id);
+            })
+            .await
+            .expect("push acknowledgement")
+            .expect("push succeeded");
+            pending.await
+        })
+        .expect("document_diagnostics must revalidate after concurrent push");
+    assert_eq!(items, vec![fresh_report]);
+}

@@ -5,10 +5,11 @@
 
 use super::{
     AgentCx, AuxiliaryPrivacySnapshot, ContentBlock, Deadline, DrainRequest, Duration, Instant,
-    MAX_ITEMS, MAX_SNAPSHOT_BYTES, POLL_INTERVAL, Pool, Result, SubagentTool, TextContent, ToolOutput,
-    Value, background, check_owner, commit_batch, drain_snapshot, hold_results, invalid, lookup,
-    manifest, optional_integer, prepare_batch, project_drain_snapshot, projected_snapshot_with,
-    recheck_owner, required_text, result_dependencies, seal, stopped, tasks, validate_fields,
+    MAX_ITEMS, MAX_SNAPSHOT_BYTES, POLL_INTERVAL, Pool, Result, SubagentTool, TextContent,
+    ToolOutput, Value, background, check_owner, commit_batch, drain_snapshot, hold_results,
+    invalid, lookup, manifest, optional_integer, prepare_batch, project_drain_snapshot,
+    projected_snapshot_with, recheck_owner, required_text, result_dependencies, seal, stopped,
+    tasks, validate_fields,
 };
 use serde_json::json;
 
@@ -200,9 +201,9 @@ fn response(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
     use super::super::drain_cursor;
     use super::super::tests::{Fixture, RPC_CHILD, field, private_projection, runtime};
+    use super::*;
     use crate::tools::Tool as _;
 
     #[test]
@@ -237,12 +238,22 @@ mod tests {
                     "tasks":["must not execute"], "seal":true,
                 });
                 input[key] = value;
-                assert!(fixture.tool.execute("invalid-exchange", input, None).await.is_err()); // ubs:ignore[rust.panic.assert-macros] -- Invalid tails and acknowledgment state must reject the complete mutation.
-                let observed = fixture.call(json!({"operation":"pool_status","poolId":pool})).await;
+                assert!(
+                    fixture
+                        .tool
+                        .execute("invalid-exchange", input, None)
+                        .await
+                        .is_err()
+                ); // ubs:ignore[rust.panic.assert-macros] -- Invalid tails and acknowledgment state must reject the complete mutation.
+                let observed = fixture
+                    .call(json!({"operation":"pool_status","poolId":pool}))
+                    .await;
                 assert_eq!(observed["admittedItems"], 1); // ubs:ignore[rust.panic.assert-macros] -- No rejected mutation may consume a turn or lifetime capacity.
                 assert_eq!(observed["sealed"], false); // ubs:ignore[rust.panic.assert-macros] -- An invalid read request cannot close otherwise valid admission.
             }
-            fixture.call(json!({"operation":"pool_close","poolId":pool})).await;
+            fixture
+                .call(json!({"operation":"pool_close","poolId":pool}))
+                .await;
             fixture.assert_reaped();
         });
     }
@@ -317,7 +328,9 @@ mod tests {
             )
             .await;
             assert!(rejected.is_err()); // ubs:ignore[rust.panic.assert-macros] -- An undisclosable sealed acknowledgment cannot commit either mutation.
-            let unchanged = fixture.call(json!({"operation":"pool_status","poolId":pool})).await;
+            let unchanged = fixture
+                .call(json!({"operation":"pool_status","poolId":pool}))
+                .await;
             assert_eq!(unchanged["admittedItems"], 1); // ubs:ignore[rust.panic.assert-macros] -- Privacy refusal must not enqueue the proposed batch.
             assert_eq!(unchanged["sealed"], false); // ubs:ignore[rust.panic.assert-macros] -- Privacy refusal must not seal the existing pool.
             let output = execute(
@@ -336,7 +349,11 @@ mod tests {
             let retained = fixture
                 .call(json!({"operation":"pool_wait","poolId":pool,"timeoutMs":5000}))
                 .await;
-            assert!(!serde_json::to_string(&retained).expect("retained aggregate").contains("silver")); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- A weaker later observer cannot undo an accepted batch's privacy floor.
+            assert!(
+                !serde_json::to_string(&retained)
+                    .expect("retained aggregate")
+                    .contains("silver")
+            ); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect,rust.ownership.unwrap-expect] -- A weaker later observer cannot undo an accepted batch's privacy floor.
             fixture.assert_reaped();
         });
     }

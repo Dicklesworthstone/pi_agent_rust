@@ -223,19 +223,14 @@ pub fn build_system_prompt(
     let mut prompt =
         custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
 
-    // Discoverable-tool index (bd-cv653.1.6): a compact name + one-liner
-    // listing so the model knows xdev exists and what it can reach.
-    let discoverable_index = crate::xdev::prompt_index_for(enabled_tools, Some(config));
+    // Discoverable-tool index (bd-cv653.1.6 / bd-xdev-registry-tool-discovery-17sy3):
+    // a compact name + one-liner listing so the model knows xdev exists and what
+    // it can reach, including implicit settings-gated built-ins when `--tools` is unset.
+    let discoverable_index = crate::xdev::prompt_index_for_cli(cli, enabled_tools, Some(config));
     if !discoverable_index.is_empty() && !has_custom_prompt {
-        prompt.push_str(
-            "\n\nAdditional tools are available via the `xdev` dispatcher (not in your schema):\n",
-        );
-        for (name, line) in &discoverable_index {
-            let _ = std::fmt::Write::write_fmt(&mut prompt, format_args!("- {name}: {line}\n"));
-        }
-        prompt.push_str(
-            "Use `xdev` with action describe/run/promote to inspect, call, or promote them.\n",
-        );
+        prompt.push_str(&crate::xdev::format_discoverable_section(
+            &discoverable_index,
+        ));
     }
 
     if let Some(append_prompt) = append_prompt {

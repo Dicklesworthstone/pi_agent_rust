@@ -1391,8 +1391,7 @@ mod tests {
         let entry_path = temp_dir.path().join("ext.mjs");
         std::fs::write(&entry_path, source).expect("write extension entry");
         let manager = ExtensionManager::new();
-        let shared =
-            crate::tools::SharedToolRegistry::new(ToolRegistry::new(&[], temp_dir.path(), None));
+        let shared = crate::tools::SharedToolRegistry::new(ToolRegistry::without_builtins(None));
         let js_runtime = JsExtensionRuntimeHandle::start_with_policy(
             PiJsRuntimeConfig {
                 cwd: temp_dir.path().display().to_string(),

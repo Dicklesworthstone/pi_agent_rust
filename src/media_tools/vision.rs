@@ -704,8 +704,8 @@ mod tests {
                 .unwrap();
                 let mut response = json!({"choices":[{"finish_reason":"stop","message":{"content":"A diagram."}}],
                     "usage":{"prompt_tokens":1_000_000,"completion_tokens":0}});
-                if let Value::Object(bill) = bill {
-                    response["usage"].as_object_mut().unwrap().extend(bill);
+                if let Value::Object(bill_obj) = bill.clone() {
+                    response["usage"].as_object_mut().unwrap().extend(bill_obj);
                 }
                 let (endpoint, worker) = peer(
                     200,

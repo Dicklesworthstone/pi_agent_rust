@@ -1002,13 +1002,17 @@ done
             .build()
             .unwrap();
         runtime.block_on(async {
-            let started = fixture.call(json!({
-                "operation":"worker_start", "agent":"worker", "task":"hold",
-                "cwd":"nested", "isolation":"worktree", "isoApply":"keep"
-            })).await;
+            let started = fixture
+                .call(json!({
+                    "operation":"worker_start", "agent":"worker", "task":"hold",
+                    "cwd":"nested", "isolation":"worktree", "isoApply":"keep"
+                }))
+                .await;
             let worker = field(&started, "workerId");
             fixture.await_file("first-running").await;
-            let live = fixture.call(json!({"operation":"worker_status", "workerId":worker})).await;
+            let live = fixture
+                .call(json!({"operation":"worker_status", "workerId":worker}))
+                .await;
             let descriptor = live["workspace"].clone();
             let handle = retained_handle(&fixture, &descriptor);
             assert_eq!(descriptor["schema"], "pi.subagent.worker.workspace.v1");
@@ -1018,8 +1022,14 @@ done
                 descriptor["cwd"].as_str(),
                 handle.path.join("nested").to_str()
             );
-            std::fs::write(fixture.root.path().join("nested/tracked.txt"), "later parent\n").unwrap();
-            fixture.call(json!({"operation":"worker_send", "workerId":worker, "task":"continue"})).await;
+            std::fs::write(
+                fixture.root.path().join("nested/tracked.txt"),
+                "later parent\n",
+            )
+            .unwrap();
+            fixture
+                .call(json!({"operation":"worker_send", "workerId":worker, "task":"continue"}))
+                .await;
             std::fs::write(fixture.root.path().join("release"), "continue").unwrap();
             let first = fixture.wait(&worker, 1).await;
             let second = fixture.wait(&worker, 2).await;
@@ -1038,7 +1048,9 @@ done
                 .and_then(|pid| i32::try_from(pid).ok())
                 .and_then(rustix::process::Pid::from_raw)
                 .unwrap();
-            let closed = fixture.call(json!({"operation":"worker_close", "workerId":worker})).await;
+            let closed = fixture
+                .call(json!({"operation":"worker_close", "workerId":worker}))
+                .await;
             assert_eq!(closed["workspace"], descriptor);
             assert!(rustix::process::test_kill_process(pid).is_err());
             assert_eq!(
@@ -1050,8 +1062,14 @@ done
                 std::fs::read_to_string(fixture.root.path().join("nested/tracked.txt")).unwrap(),
                 "later parent\n"
             );
-            assert_eq!(isolation_git(fixture.root.path(), &["rev-parse", "HEAD"]), before_head);
-            assert_eq!(std::fs::read(fixture.root.path().join(".git/index")).unwrap(), before_index);
+            assert_eq!(
+                isolation_git(fixture.root.path(), &["rev-parse", "HEAD"]),
+                before_head
+            );
+            assert_eq!(
+                std::fs::read(fixture.root.path().join(".git/index")).unwrap(),
+                before_index
+            );
             crate::worktree_iso::drop_worktree(&handle).expect("retire asserted test fixture");
         });
     }
@@ -1065,16 +1083,22 @@ done
             .build()
             .unwrap();
         runtime.block_on(async {
-            let started = fixture.call(json!({
-                "operation":"worker_start", "agent":"worker", "task":"hold",
-                "cwd":"nested", "isolation":"worktree"
-            })).await;
+            let started = fixture
+                .call(json!({
+                    "operation":"worker_start", "agent":"worker", "task":"hold",
+                    "cwd":"nested", "isolation":"worktree"
+                }))
+                .await;
             let worker = field(&started, "workerId");
             fixture.await_file("first-running").await;
-            let live = fixture.call(json!({"operation":"worker_status", "workerId":worker})).await;
+            let live = fixture
+                .call(json!({"operation":"worker_status", "workerId":worker}))
+                .await;
             let descriptor = live["workspace"].clone();
             let handle = retained_handle(&fixture, &descriptor);
-            let closed = fixture.call(json!({"operation":"worker_close", "workerId":worker})).await;
+            let closed = fixture
+                .call(json!({"operation":"worker_close", "workerId":worker}))
+                .await;
             assert_eq!(closed["workspace"], descriptor);
             assert_eq!(closed["turn"]["status"], "cancelled");
             assert_eq!(

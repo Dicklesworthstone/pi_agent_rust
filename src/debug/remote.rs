@@ -185,6 +185,7 @@ impl DebugTool {
     /// Called only under normal ownership/admission, after capacity validation.
     pub(super) async fn run_remote_start(&self, input: &DebugInput) -> Result<ToolOutput> {
         input.remote.validate(input)?;
+        self.require_adapter_allowed("debugpy")?;
         let owner = AgentCx::for_current_or_request();
         owner
             .checkpoint()
@@ -206,7 +207,9 @@ impl DebugTool {
             input.initial_breakpoints.as_deref().unwrap_or(&[]),
         )?;
         let connect_ms = input.remote.connect_timeout_ms.unwrap_or(5_000);
-        let startup_ms = input.startup_timeout_ms.unwrap_or(120_000);
+        let startup_ms = input
+            .startup_timeout_ms
+            .unwrap_or(self.default_startup_timeout_ms);
         let transport =
             DapTransport::connect_loopback(endpoint, Duration::from_millis(connect_ms)).await?;
         let session = DapSession::begin(transport)

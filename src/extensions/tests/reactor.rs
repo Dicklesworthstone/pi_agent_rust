@@ -1555,6 +1555,7 @@ fn conformal_interval_empirical_coverage_matches_confidence() {
                 running_m2: 0.0,
                 observation_count: CALIBRATION_SAMPLES as u64,
                 anomaly_count: 0,
+                adaptive_alpha: None,
             };
 
             let threshold = state.interval_width(confidence);
@@ -3024,4 +3025,77 @@ fn outcome_to_host_result_non_canonical_code_variants_fail_closed() {
         );
         assert_eq!(err.message, "variant");
     }
+}
+
+#[test]
+fn record_budget_overload_signal_feeds_real_inter_arrival_latency_into_safety_envelope() {
+    let manager = ExtensionManager::new();
+    manager.set_budget_controller_config(ExtensionBudgetControllerConfig {
+        enabled: true,
+        tier: ExtensionBudgetTier::Balanced,
+        overload_window_ms: 60_000,
+        overload_signals_to_fallback: 10,
+        recovery_successes_to_exit: 3,
+        ..Default::default()
+    });
+
+    manager.record_budget_overload_signal(Some("ext.latency.real"), "overload", None, None);
+    std::thread::sleep(std::time::Duration::from_millis(4));
+    manager.record_budget_overload_signal(Some("ext.latency.real"), "overload", None, None);
+    std::thread::sleep(std::time::Duration::from_millis(8));
+    manager.record_budget_overload_signal(Some("ext.latency.real"), "overload", None, None);
+
+    let snap = manager
+        .safety_envelope_snapshot("ext.latency.real")
+        .expect("safety envelope snapshot");
+    assert_eq!(snap.conformal_calibration_size, 3);
+    assert!(
+        snap.conformal_interval_width > 0.0 && snap.conformal_interval_width.is_finite(),
+        "safety envelope must receive real elapsed ms (> 0.0), got width={}",
+        snap.conformal_interval_width
+    );
+}
+
+#[test]
+fn gibbs_candes_aci_widens_interval_after_anomalies_and_relaxes_on_normal_samples() {
+    let mut state = ConformalState::default();
+    let nominal_conf = 0.90;
+    for i in 0..12 {
+        let _ = state.observe(10.0 + f64::from(i % 2), nominal_conf, 32);
+    }
+    let baseline_alpha = state.adaptive_alpha.expect("adaptive_alpha initialized");
+    // Spike outside the calibrated interval triggers err_t = 1 -> alpha_{t+1} < alpha_t.
+    let is_anomaly = state.observe(500.0, nominal_conf, 32);
+    assert!(is_anomaly, "500ms spike must be detected as anomalous");
+    let post_spike_alpha = state.adaptive_alpha.expect("post-spike alpha");
+    assert!(
+        post_spike_alpha < baseline_alpha,
+        "ACI must lower alpha_t (widen quantile) after anomaly: {post_spike_alpha} vs {baseline_alpha}"
+    );
+}
+
+#[test]
+fn hostcall_marshal_fast_opcode_detects_case_divergence_and_preserves_canonical_hash() {
+    let _guard = superinstruction_test_lock();
+    reset_hostcall_superinstruction_state_for_tests();
+    let upper_params = json!({
+        "name": "READ",
+        "input": { "path": "src/lib.rs" }
+    });
+    let artifacts =
+        HostcallPayloadArena::new("tool", &upper_params, Some(CommonHostcallOpcode::ToolRead))
+            .marshal();
+    assert_eq!(
+        artifacts.params_hash,
+        hostcall_params_hash("tool", &upper_params)
+    );
+    assert_eq!(
+        artifacts.telemetry.path,
+        HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK
+    );
+    assert_eq!(
+        artifacts.telemetry.fallback_reason.as_deref(),
+        Some(HOSTCALL_MARSHALLING_FALLBACK_REWRITE_DIVERGENCE)
+    );
+    reset_hostcall_superinstruction_state_for_tests();
 }

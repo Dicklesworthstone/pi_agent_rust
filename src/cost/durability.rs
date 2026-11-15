@@ -615,11 +615,14 @@ impl Origin {
         let name = format!("{}.lock", self.journal_name);
         let expected = FileIdentity::of_open_file(lock)?;
         #[cfg(unix)]
-        let current = FileIdentity::of_directory_member_nofollow(&self.directory, OsStr::new(&name));
+        let current =
+            FileIdentity::of_directory_member_nofollow(&self.directory, OsStr::new(&name));
         #[cfg(not(unix))]
         let current = FileIdentity::of_path_nofollow(&self.parent.join(&name));
         let current = current.map_err(|error| {
-            Error::session(format!("late model cost journal lock is unavailable: {error}"))
+            Error::session(format!(
+                "late model cost journal lock is unavailable: {error}"
+            ))
         })?;
         if current != expected {
             return Err(Error::session("late model cost journal lock changed"));
@@ -986,7 +989,8 @@ mod tests {
         let root = tempfile::tempdir().expect("journal directory");
         let parent = std::fs::canonicalize(root.path()).expect("canonical journal directory");
         let directory = open_directory(&parent).expect("pin journal directory");
-        let directory_identity = FileIdentity::of_open_file(&directory).expect("directory identity");
+        let directory_identity =
+            FileIdentity::of_open_file(&directory).expect("directory identity");
         let journal_name = format!(".pi-cost-{}.json", "0".repeat(64));
         let origin = Arc::new(Origin {
             key: parent.join(&journal_name),
@@ -1063,7 +1067,10 @@ mod tests {
                 .acquire_journal_lock(waiter, deadline())
                 .expect_err("an acquired stale lock must not authorize journal reads or writes");
             assert!(error.to_string().contains("journal lock"), "{error}");
-            assert_eq!(std::fs::read(&origin.key).expect("unchanged journal"), before);
+            assert_eq!(
+                std::fs::read(&origin.key).expect("unchanged journal"),
+                before
+            );
         }
     }
 
@@ -1085,10 +1092,15 @@ mod tests {
                 .write(&journal, &holder, deadline())
                 .expect_err("a stale locked handle must not authorize publication");
             assert!(error.to_string().contains("journal lock"), "{error}");
-            assert_eq!(std::fs::read(&origin.key).expect("unchanged journal"), before);
-            assert!(std::fs::read_dir(&origin.parent).unwrap().all(|entry| {
-                entry.unwrap().path().extension() != Some(OsStr::new("pending"))
-            }));
+            assert_eq!(
+                std::fs::read(&origin.key).expect("unchanged journal"),
+                before
+            );
+            assert!(
+                std::fs::read_dir(&origin.parent).unwrap().all(|entry| {
+                    entry.unwrap().path().extension() != Some(OsStr::new("pending"))
+                })
+            );
         }
     }
 
@@ -1123,8 +1135,14 @@ mod tests {
                     .acquire_journal_lock(waiter, deadline())
                     .expect_err("acquisition must inspect the entry without following its link")
             };
-            assert!(error.to_string().contains("journal lock changed"), "{error}");
-            assert_eq!(std::fs::read(&origin.key).expect("unchanged journal"), before);
+            assert!(
+                error.to_string().contains("journal lock changed"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read(&origin.key).expect("unchanged journal"),
+                before
+            );
             assert!(
                 std::fs::symlink_metadata(&path)
                     .unwrap()

@@ -2578,6 +2578,10 @@ impl SessionStoreV2 {
         Ok(store)
     }
 
+    pub fn root_dir(&self) -> &Path {
+        &self.root
+    }
+
     pub fn segment_file_path(&self, segment_seq: u64) -> PathBuf {
         self.root
             .join("segments")

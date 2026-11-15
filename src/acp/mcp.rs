@@ -9,7 +9,6 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -106,7 +105,7 @@ pub(super) struct SessionMcp {
     // ACP's host tool set is fixed at session construction. Preserve the
     // actual handles and registry metadata, not newly constructed built-ins.
     // Only this session's MCP overlay is replaced during catalog refresh.
-    host_registry: OnceLock<crate::tools::ToolRegistry>,
+    host_registry: StdMutex<Option<crate::tools::ToolRegistry>>,
 }
 
 fn signatures(servers: &[ConfiguredServer], cwd: &Path) -> Vec<(String, String)> {
@@ -155,7 +154,7 @@ pub(super) fn prepare(
         descriptions,
         started: AtomicBool::new(false),
         refresh: StdMutex::new(CatalogRefresh::default()),
-        host_registry: OnceLock::new(),
+        host_registry: StdMutex::new(None),
     }))
 }
 
@@ -165,7 +164,12 @@ pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     let shared = agent.agent.shared_tools();
     shared.bind_mcp_manager(&state.manager);
     let current = shared.snapshot();
-    let host = state.host_registry.get_or_init(|| current.clone_shallow());
+    let host = state
+        .host_registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(|| current.clone_shallow())
+        .clone_shallow();
     let mut next = host.clone_shallow();
 
     // xdev promotions can change after construction. Keep those decisions
@@ -177,6 +181,7 @@ pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
             next.mark_promoted(tool.name());
         }
     }
+    next.reuse_generated_dispatcher_from(&current);
 
     // The native manager exposes only complete, fresh, healthy, trusted
     // catalogs; context wrappers are gated on that same admitted catalog
@@ -190,6 +195,60 @@ pub(super) fn mount(agent: &mut AgentSession, state: &Arc<SessionMcp>) {
     // SharedToolRegistry's version invalidates the provider schema cache.
     // Old snapshots held by an in-flight caller still use native per-call
     // trust/catalog checks; publishing a new snapshot does not grant access.
+}
+
+pub(super) async fn sync_extensions(state: &mut super::AcpSessionState, no_mcp: bool) {
+    let Some(handle) = state.agent_session.as_mut() else {
+        return;
+    };
+    let snapshot = handle
+        .session()
+        .agent
+        .shared_tools()
+        .snapshot()
+        .clone_shallow();
+    if let Some(mcp_state) = state.mcp.as_ref() {
+        *mcp_state
+            .host_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone_shallow());
+    }
+    if no_mcp {
+        return;
+    }
+    let Some(ext_mgr) = handle.extension_manager().cloned() else {
+        return;
+    };
+    if ext_mgr.extension_mcp_servers().is_empty() {
+        return;
+    }
+    let mcp_state = state
+        .mcp
+        .get_or_insert_with(|| {
+            Arc::new(SessionMcp {
+                manager: Arc::new(McpManager::new(
+                    &state.cwd,
+                    &state.global_dir,
+                    McpDiscovery {
+                        servers: Vec::new(),
+                        warnings: Vec::new(),
+                    },
+                )),
+                signatures: Vec::new(),
+                descriptions: Vec::new(),
+                started: AtomicBool::new(false),
+                refresh: StdMutex::new(CatalogRefresh::default()),
+                host_registry: StdMutex::new(Some(snapshot)),
+            })
+        })
+        .clone();
+    let _ = crate::mcp::sync_extension_registrations(
+        &mcp_state.manager,
+        &ext_mgr,
+        &mut handle.session_mut().agent,
+    )
+    .await;
+    mount(handle.session_mut(), &mcp_state);
 }
 
 /// Reattaching an existing live session must not silently swap out its tool
@@ -840,6 +899,12 @@ mod tests {
                 // A real xdev promotion publishes through this same registry.
                 // Refresh must not reset it to the construction-time tier.
                 shared.update(|registry| registry.mark_promoted("lsp"));
+                let post_promotion_xdev = shared
+                    .snapshot()
+                    .tools()
+                    .iter()
+                    .find(|tool| tool.name() == "xdev")
+                    .cloned();
 
                 *server.catalog.lock().unwrap() = json!({"tools": [
                     {"name":"echo", "description":"revised catalog description",
@@ -954,7 +1019,12 @@ mod tests {
                 let current = shared.snapshot();
                 for original in host_snapshot.tools() {
                     let retained = current.tools().iter().find(|tool| tool.name() == original.name()).unwrap();
-                    assert!(Arc::ptr_eq(original, retained), "host tool was reconstructed: {}", original.name());
+                    if original.name() == "xdev" {
+                        let expected = post_promotion_xdev.as_ref().expect("promoted xdev");
+                        assert!(Arc::ptr_eq(expected, retained), "xdev was reconstructed after promotion");
+                    } else {
+                        assert!(Arc::ptr_eq(original, retained), "host tool was reconstructed: {}", original.name());
+                    }
                 }
                 assert!(!current.is_discoverable("lsp"), "promotion survives removal, failure, and denial");
                 let version = shared.version();

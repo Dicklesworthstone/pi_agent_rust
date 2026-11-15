@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 fn finish_package_task<T, E>(
     handle: thread::JoinHandle<()>,
@@ -533,6 +533,7 @@ impl PackageManager {
         let global_npm_root = self.pass_global_npm_root_blocking(&package_sources)?;
 
         let mut accumulator = ResourceAccumulator::new();
+        let mut lock_cache = ScopeLockfileCache::from_env();
 
         for entry in package_sources {
             let source_str = entry.pkg.source.trim();
@@ -550,6 +551,9 @@ impl PackageManager {
 
             match parsed {
                 ParsedSource::Local { path } => {
+                    if path.exists() {
+                        lock_cache.verify_entry(self, roots, entry.scope, source_str, &path)?;
+                    }
                     Self::resolve_local_extension_source(
                         &path,
                         &mut accumulator,
@@ -566,6 +570,13 @@ impl PackageManager {
                         return Ok(None);
                     }
 
+                    lock_cache.verify_entry(
+                        self,
+                        roots,
+                        entry.scope,
+                        source_str,
+                        &installed_path,
+                    )?;
                     metadata.base_dir = Some(installed_path.clone());
                     Self::collect_package_resources(
                         &installed_path,
@@ -581,6 +592,13 @@ impl PackageManager {
                         return Ok(None);
                     }
 
+                    lock_cache.verify_entry(
+                        self,
+                        roots,
+                        entry.scope,
+                        source_str,
+                        &installed_path,
+                    )?;
                     metadata.base_dir = Some(installed_path.clone());
                     Self::collect_package_resources(
                         &installed_path,
@@ -738,6 +756,7 @@ impl PackageManager {
         Box::pin(self.resolve_package_sources(
             &package_sources,
             global_npm_root.as_deref(),
+            roots,
             &mut accumulator,
         ))
         .await?;
@@ -836,10 +855,12 @@ impl PackageManager {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let roots = self.effective_roots();
         let global_npm_root = self.pass_global_npm_root(&package_sources).await?;
         Box::pin(self.resolve_package_sources(
             &package_sources,
             global_npm_root.as_deref(),
+            &roots,
             &mut accumulator,
         ))
         .await?;
@@ -1916,8 +1937,11 @@ impl PackageManager {
         &self,
         sources: &[ScopedPackage],
         global_npm_root: Option<&Path>,
+        roots: &ResolveRoots,
         accumulator: &mut ResourceAccumulator,
     ) -> Result<()> {
+        let mut lock_cache = ScopeLockfileCache::from_env();
+
         for entry in sources {
             let source_str = entry.pkg.source.trim();
             if source_str.is_empty() {
@@ -1934,6 +1958,9 @@ impl PackageManager {
 
             match parsed {
                 ParsedSource::Local { path } => {
+                    if path.exists() {
+                        lock_cache.verify_entry(self, roots, entry.scope, source_str, &path)?;
+                    }
                     Self::resolve_local_extension_source(
                         &path,
                         accumulator,
@@ -1950,8 +1977,16 @@ impl PackageManager {
                         || Box::pin(npm_needs_update(&spec, &installed_path)).await;
                     if needs_install {
                         self.install(source_str, entry.scope).await?;
+                        lock_cache.invalidate(entry.scope);
                     }
 
+                    lock_cache.verify_entry(
+                        self,
+                        roots,
+                        entry.scope,
+                        source_str,
+                        &installed_path,
+                    )?;
                     metadata.base_dir = Some(installed_path.clone());
                     Self::collect_package_resources(
                         &installed_path,
@@ -1972,8 +2007,16 @@ impl PackageManager {
 
                     if !installed_path.exists() {
                         self.install(source_str, entry.scope).await?;
+                        lock_cache.invalidate(entry.scope);
                     }
 
+                    lock_cache.verify_entry(
+                        self,
+                        roots,
+                        entry.scope,
+                        source_str,
+                        &installed_path,
+                    )?;
                     metadata.base_dir = Some(installed_path.clone());
                     Self::collect_package_resources(
                         &installed_path,
@@ -4500,6 +4543,228 @@ pub fn write_package_lockfile_atomic(path: &Path, lockfile: &PackageLockfile) ->
     write_settings_json_atomic(path, &value)
 }
 
+fn lockfile_path_for_roots(roots: &ResolveRoots, scope: PackageScope) -> Option<PathBuf> {
+    match scope {
+        PackageScope::User => Some(roots.global_base_dir.join("packages.lock.json")),
+        PackageScope::Project => roots
+            .project_settings_enabled
+            .then(|| roots.project_base_dir.join("packages.lock.json")),
+        PackageScope::Temporary => None,
+    }
+}
+
+#[must_use]
+pub fn skip_package_integrity_from_env() -> bool {
+    std::env::var("PI_SKIP_PACKAGE_INTEGRITY").is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+struct ScopeLockfileCache {
+    skip_integrity: bool,
+    warned_user_bypass: bool,
+    warned_project_bypass: bool,
+    user: Option<Option<PackageLockfile>>,
+    project: Option<Option<PackageLockfile>>,
+}
+
+impl ScopeLockfileCache {
+    fn from_env() -> Self {
+        Self {
+            skip_integrity: skip_package_integrity_from_env(),
+            warned_user_bypass: false,
+            warned_project_bypass: false,
+            user: None,
+            project: None,
+        }
+    }
+
+    fn invalidate(&mut self, scope: PackageScope) {
+        match scope {
+            PackageScope::User => self.user = None,
+            PackageScope::Project => self.project = None,
+            PackageScope::Temporary => {}
+        }
+    }
+
+    fn verify_entry(
+        &mut self,
+        manager: &PackageManager,
+        roots: &ResolveRoots,
+        scope: PackageScope,
+        source_str: &str,
+        package_path: &Path,
+    ) -> Result<()> {
+        let Some(lockfile_path) = lockfile_path_for_roots(roots, scope) else {
+            return Ok(());
+        };
+        if self.skip_integrity {
+            if lockfile_path.exists() {
+                let warned = match scope {
+                    PackageScope::User => &mut self.warned_user_bypass,
+                    PackageScope::Project => &mut self.warned_project_bypass,
+                    PackageScope::Temporary => return Ok(()),
+                };
+                if !*warned {
+                    *warned = true;
+                    warn!(
+                        event = "pi.package.integrity_bypassed",
+                        scope = scope_label(scope),
+                        lockfile = %lockfile_path.display(),
+                        "Bypassing packages.lock.json SHA-256 verification because PI_SKIP_PACKAGE_INTEGRITY is set"
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let slot = match scope {
+            PackageScope::User => &mut self.user,
+            PackageScope::Project => &mut self.project,
+            PackageScope::Temporary => return Ok(()),
+        };
+        if slot.is_none() {
+            let loaded = if lockfile_path.exists() {
+                Some(read_package_lockfile(&lockfile_path)?)
+            } else {
+                None
+            };
+            *slot = Some(loaded);
+        }
+        let Some(Some(lockfile)) = slot.as_ref() else {
+            return Ok(());
+        };
+
+        let identity = manager.package_identity(source_str);
+        let Some(locked) = lockfile
+            .entries
+            .iter()
+            .find(|entry| entry.identity == identity)
+        else {
+            return Ok(());
+        };
+
+        verify_locked_entry_against_disk(scope, source_str, &identity, locked, package_path)
+    }
+}
+
+fn verify_locked_entry_against_disk(
+    scope: PackageScope,
+    source_str: &str,
+    identity: &str,
+    locked: &PackageLockEntry,
+    package_path: &Path,
+) -> Result<()> {
+    if locked.trust_state == PackageEntryTrustState::Rejected {
+        let reason =
+            format!("package '{source_str}' ({identity}) is marked rejected in packages.lock.json");
+        let remediation = format!(
+            "Inspect {} and run `pi remove {source_str}` then `pi install {source_str}` after verifying provenance.",
+            package_path.display()
+        );
+        error!(
+            event = "pi.package.lock_trust_rejected",
+            scope = scope_label(scope),
+            identity = %identity,
+            source = %source_str,
+            path = %package_path.display(),
+            "Refusing to load rejected package entry"
+        );
+        return Err(verification_error("trust_rejected", &reason, &remediation));
+    }
+
+    let actual_digest = digest_package_path(package_path)?;
+    let expected_digest = &locked.digest_sha256;
+    if &actual_digest != expected_digest {
+        let reason = format!(
+            "package '{source_str}' ({identity}) failed startup lockfile integrity check: expected sha256 {expected_digest}, got {actual_digest}"
+        );
+        let remediation = format!(
+            "Inspect {} for unexpected modifications, or run `pi update {source_str}` (for unpinned packages) / `pi remove {source_str} && pi install {source_str}` to re-establish trust.",
+            package_path.display()
+        );
+        error!(
+            event = "pi.package.lock_digest_mismatch",
+            scope = scope_label(scope),
+            identity = %identity,
+            source = %source_str,
+            expected_sha256 = %expected_digest,
+            actual_sha256 = %actual_digest,
+            path = %package_path.display(),
+            "Installed package failed packages.lock.json SHA-256 verification"
+        );
+        return Err(verification_error(
+            "lock_digest_mismatch",
+            &reason,
+            &remediation,
+        ));
+    }
+
+    Ok(())
+}
+
+impl PackageManager {
+    /// Verify every entry recorded in a `packages.lock.json` file against its
+    /// resolved on-disk package tree. Used by `pi doctor` and startup audits.
+    pub fn verify_lockfile_at_path(
+        &self,
+        scope: PackageScope,
+        lockfile_path: &Path,
+    ) -> Result<usize> {
+        if !lockfile_path.exists() {
+            return Ok(0);
+        }
+        let lockfile = read_package_lockfile(lockfile_path)?;
+        let global_npm_root = lockfile
+            .entries
+            .iter()
+            .any(|entry| {
+                scope == PackageScope::User && matches!(entry.source_kind, PackageSourceKind::Npm)
+            })
+            .then(|| self.global_npm_root().ok())
+            .flatten();
+
+        for entry in &lockfile.entries {
+            let package_path = match parse_source(&entry.source, &self.cwd) {
+                ParsedSource::Npm { name, .. } => {
+                    self.npm_install_dir(&name, scope, global_npm_root.as_deref())?
+                }
+                ParsedSource::Git { host, path, .. } => {
+                    self.checked_git_install_path(&host, &path, scope)?
+                }
+                ParsedSource::Local { path } => path,
+            };
+            if !package_path.exists() {
+                return Err(verification_error(
+                    "missing_locked_package",
+                    &format!(
+                        "locked package '{}' ({}) is missing on disk at {}",
+                        entry.source,
+                        entry.identity,
+                        package_path.display()
+                    ),
+                    &format!(
+                        "Run `pi install {}` to restore the package or `pi remove {}` to prune it.",
+                        entry.source, entry.source
+                    ),
+                ));
+            }
+            verify_locked_entry_against_disk(
+                scope,
+                &entry.source,
+                &entry.identity,
+                entry,
+                &package_path,
+            )?;
+        }
+
+        Ok(lockfile.entries.len())
+    }
+}
+
 pub fn digest_package_path(path: &Path) -> Result<String> {
     if path.is_file() {
         let mut hasher = Sha256::new();
@@ -4510,11 +4775,7 @@ pub fn digest_package_path(path: &Path) -> Result<String> {
             .unwrap_or("entry");
         hasher.update(file_name.as_bytes());
         hasher.update(b"\0");
-        let bytes = fs::read(path)?
-            .into_iter()
-            .filter(|byte| *byte != b'\r')
-            .collect::<Vec<_>>();
-        hasher.update(&bytes);
+        hash_file_streaming_crlf_normalized(&mut hasher, path)?;
         hasher.update(b"\0");
         return Ok(hex_encode(hasher.finalize().as_slice()));
     }
@@ -4529,28 +4790,54 @@ pub fn digest_package_path(path: &Path) -> Result<String> {
         ));
     }
 
+    let canonical_root = fs::canonicalize(path).ok();
     let mut files = Vec::new();
-    collect_digest_files_recursive(path, path, &mut files)?;
-    files.sort_by_key(|(_, relative)| relative.clone());
+    collect_digest_files_recursive(path, canonical_root.as_deref(), path, &mut files)?;
+    files.sort_by(|(_, left_rel), (_, right_rel)| left_rel.cmp(right_rel));
 
     let mut hasher = Sha256::new();
     for (full_path, relative) in files {
         hasher.update(b"file\0");
         hasher.update(relative.as_bytes());
         hasher.update(b"\0");
-        let bytes = fs::read(full_path)?
-            .into_iter()
-            .filter(|byte| *byte != b'\r')
-            .collect::<Vec<_>>();
-        hasher.update(&bytes);
+        hash_file_streaming_crlf_normalized(&mut hasher, &full_path)?;
         hasher.update(b"\0");
     }
 
     Ok(hex_encode(hasher.finalize().as_slice()))
 }
 
+fn hash_file_streaming_crlf_normalized(hasher: &mut Sha256, path: &Path) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    let mut buf = vec![0u8; 65_536].into_boxed_slice();
+    let mut filtered = vec![0u8; 65_536].into_boxed_slice();
+    loop {
+        let read_len = file.read(&mut buf)?;
+        if read_len == 0 {
+            break;
+        }
+        let chunk = &buf[..read_len];
+        if !chunk.contains(&b'\r') {
+            hasher.update(chunk);
+            continue;
+        }
+        let mut out_len = 0usize;
+        for &byte in chunk {
+            if byte != b'\r' {
+                filtered[out_len] = byte;
+                out_len += 1;
+            }
+        }
+        if out_len > 0 {
+            hasher.update(&filtered[..out_len]);
+        }
+    }
+    Ok(())
+}
+
 fn collect_digest_files_recursive(
     root: &Path,
+    canonical_root: Option<&Path>,
     dir: &Path,
     out: &mut Vec<(PathBuf, String)>,
 ) -> Result<()> {
@@ -4563,8 +4850,27 @@ fn collect_digest_files_recursive(
             continue;
         }
 
+        if file_type.is_symlink() {
+            if let Some(canonical_root) = canonical_root {
+                let target_ok =
+                    fs::canonicalize(&path).is_ok_and(|target| target.starts_with(canonical_root));
+                if !target_ok {
+                    return Err(verification_error(
+                        "symlink_escape",
+                        &format!(
+                            "package directory {} contains a symlink '{}' whose target escapes the package root",
+                            root.display(),
+                            relative_posix(root, &path)
+                        ),
+                        "Remove escaping symlinks or reinstall the package from a trusted source.",
+                    ));
+                }
+            }
+            continue;
+        }
+
         if file_type.is_dir() {
-            collect_digest_files_recursive(root, &path, out)?;
+            collect_digest_files_recursive(root, canonical_root, &path, out)?;
             continue;
         }
 

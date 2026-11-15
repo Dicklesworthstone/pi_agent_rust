@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AssistantMessage, ContentBlock, Message, StopReason, TextContent};
+use crate::model::{AssistantMessage, ContentBlock, Message, StopReason};
 
 /// Schema/marker tag carried in nudge messages and logs.
 pub const TURN_RECOVERY_SCHEMA: &str = "pi.turn_recovery.v1";
@@ -127,9 +127,6 @@ pub(crate) fn finish_empty_response(message: &mut AssistantMessage, exhausted: b
              {MAX_AUTO_CONTINUATIONS} automatic continuations; select another model \
              or send a new request"
         );
-        message
-            .content
-            .push(ContentBlock::Text(TextContent::new(diagnostic.clone())));
         message.stop_reason = StopReason::Error;
         message.error_message = Some(diagnostic);
     }
@@ -426,7 +423,7 @@ mod tests {
     use super::*;
     use crate::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
     use crate::model::{
-        ImageContent, MediaContent, RedactedThinkingContent, StopDetails, StreamEvent,
+        ImageContent, MediaContent, RedactedThinkingContent, StopDetails, StreamEvent, TextContent,
         ThinkingContent, ToolCall, UserContent,
     };
     use crate::provider::{Context, Provider, StreamOptions};

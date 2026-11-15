@@ -65,6 +65,14 @@ pub fn sort_pinned_first<T, S: std::hash::BuildHasher>(
     top
 }
 
+/// Display and filtering toggles for the `/resume` session picker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPickerOptions {
+    pub show_path: bool,
+    pub sort_by_name: bool,
+    pub named_only: bool,
+}
+
 /// The `/resume` picker rows for `cwd`, newest first with pinned sessions
 /// on top and marked, as `(label, session path)`.
 ///
@@ -77,38 +85,77 @@ pub fn resume_entries(
     session_dir: Option<&Path>,
     pins_dir: &Path,
 ) -> Vec<(String, String)> {
+    resume_entries_with_options(cwd, session_dir, pins_dir, SessionPickerOptions::default())
+}
+
+/// Build `/resume` picker rows honoring path, sort, and named-session toggles.
+pub fn resume_entries_with_options(
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    pins_dir: &Path,
+    options: SessionPickerOptions,
+) -> Vec<(String, String)> {
     let pinned = load_pinned(pins_dir);
-    sort_pinned_first(
-        crate::session_picker::list_sessions_for_project(cwd, session_dir),
-        &pinned,
-        |meta| meta.id.as_str(),
-    )
-    .into_iter()
-    .map(|meta| {
-        let pin = if pinned.contains(&meta.id) {
-            "📌 "
-        } else {
-            ""
-        };
-        // As the classic picker shows them: the name, or the first eight
-        // characters of the id, then when the session was last saved. Rows
-        // of full ids and message counts gave nothing to tell sessions apart.
-        let title = meta
-            .name
-            .as_deref()
-            .unwrap_or_else(|| crate::session_picker::truncate_session_id(&meta.id, 8));
-        let saved = chrono::DateTime::from_timestamp_millis(meta.last_modified_ms)
-            .filter(|_| meta.last_modified_ms > 0)
-            .map(|time| {
-                time.with_timezone(&chrono::Local)
-                    .format(" · %Y-%m-%d %H:%M")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let label = format!("{pin}{title}{saved} · {} msgs", meta.message_count);
-        (label, meta.path)
-    })
-    .collect()
+    let mut sessions = crate::session_picker::list_sessions_for_project(cwd, session_dir);
+    if options.named_only {
+        sessions.retain(|meta| {
+            meta.name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty())
+        });
+    }
+    if options.sort_by_name {
+        sessions.sort_by(|left, right| {
+            let left_key = left
+                .name
+                .as_deref()
+                .unwrap_or(&left.id)
+                .to_ascii_lowercase();
+            let right_key = right
+                .name
+                .as_deref()
+                .unwrap_or(&right.id)
+                .to_ascii_lowercase();
+            left_key
+                .cmp(&right_key)
+                .then_with(|| right.last_modified_ms.cmp(&left.last_modified_ms))
+        });
+    }
+    sort_pinned_first(sessions, &pinned, |meta| meta.id.as_str())
+        .into_iter()
+        .map(|meta| {
+            let pin = if pinned.contains(&meta.id) {
+                "📌 "
+            } else {
+                ""
+            };
+            // As the classic picker shows them: the name, or the first eight
+            // characters of the id, then when the session was last saved. Rows
+            // of full ids and message counts gave nothing to tell sessions apart.
+            let title = meta
+                .name
+                .as_deref()
+                .unwrap_or_else(|| crate::session_picker::truncate_session_id(&meta.id, 8));
+            let saved = chrono::DateTime::from_timestamp_millis(meta.last_modified_ms)
+                .filter(|_| meta.last_modified_ms > 0)
+                .map(|time| {
+                    time.with_timezone(&chrono::Local)
+                        .format(" · %Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let path_suffix = if options.show_path {
+                format!(" · {}", meta.path)
+            } else {
+                String::new()
+            };
+            let label = format!(
+                "{pin}{title}{saved} · {} msgs{path_suffix}",
+                meta.message_count
+            );
+            (label, meta.path)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -152,10 +152,12 @@ fn reordering_and_source_edits_preserve_identity_metadata_and_saved_outputs() {
 #[test]
 fn changing_cell_type_changes_only_type_source_and_code_execution_fields() {
     let mut original = notebook_fixture();
-    original["cells"][1]
-        .as_object_mut()
-        .unwrap()
-        .remove("attachments");
+    if let Some(cell) = original
+        .pointer_mut("/cells/1")
+        .and_then(Value::as_object_mut)
+    {
+        cell.remove("attachments");
+    }
     let saved = save(
         &decode(&original),
         "# %% [markdown] cell:0\nExplain the result\n# %% [code] cell:1\nprint('new code')",
@@ -231,8 +233,10 @@ fn fresh_cells_preserve_legacy_minor_versions_without_adding_ids() {
                 "outputs": [{"output_type": "stream", "name": "stdout", "text": ["saved\n"]}]
             }]
         });
-        if let Some(minor) = minor {
-            original["nbformat_minor"] = json!(minor);
+        if let Some(minor) = minor
+            && let Some(obj) = original.as_object_mut()
+        {
+            obj.insert("nbformat_minor".to_string(), json!(minor));
         }
         let saved = save(
             &decode(&original),
@@ -246,13 +250,16 @@ fn fresh_cells_preserve_legacy_minor_versions_without_adding_ids() {
         assert_eq!(saved.get("nbformat_minor"), original.get("nbformat_minor"));
         assert_eq!(saved["nbformat"], 4);
         assert_eq!(saved["metadata"], original["metadata"]);
-        let cells = saved["cells"].as_array().unwrap();
+        let cells = saved
+            .get("cells")
+            .and_then(Value::as_array)
+            .expect("cells array");
         assert_eq!(cells.len(), 4);
         assert_eq!(cells[0], original["cells"][0]);
         for cell in cells {
             assert!(cell.get("id").is_none(), "minor {minor:?}: {cell}");
         }
-        for cell in &cells[1..] {
+        for cell in cells.iter().skip(1) {
             assert_eq!(cell["metadata"], json!({}));
         }
         assert_eq!(cells[1]["cell_type"], "markdown");
@@ -304,7 +311,7 @@ fn attached_cells_require_explicit_raw_edits_before_conversion_to_code() {
                 }]
             });
             let notebook = decode(&original);
-            let editable = notebook.editable_text().unwrap();
+            let editable = notebook.editable_text().expect("editable text");
             let marker = format!("# %% [{kind}] cell:0");
             let error = notebook
                 .serialize_edited(&editable.replacen(&marker, "# %% [code] cell:0", 1))
@@ -313,7 +320,11 @@ fn attached_cells_require_explicit_raw_edits_before_conversion_to_code() {
             assert!(error.to_string().contains("raw=true"), "{error}");
             assert_eq!(save(&notebook, &editable), original);
 
-            let other_kind = if kind == "markdown" { "raw" } else { "markdown" };
+            let other_kind = if kind == "markdown" {
+                "raw"
+            } else {
+                "markdown"
+            };
             let converted = save(
                 &notebook,
                 &editable.replacen(&marker, &format!("# %% [{other_kind}] cell:0"), 1),

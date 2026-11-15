@@ -1972,9 +1972,7 @@ mod tests {
         class: Option<crate::failover::FailoverClass>,
         usage_limit: bool,
     ) {
-        use crate::failover::{
-            FallbackOn, RetryPolicy, TurnDecision, TurnOutcome, TurnProgress,
-        };
+        use crate::failover::{FallbackOn, RetryPolicy, TurnDecision, TurnOutcome, TurnProgress};
 
         assert_eq!(
             crate::failover::call_error_is_retryable(error),
@@ -1993,7 +1991,10 @@ mod tests {
             "{error}"
         );
         if class.is_some() {
-            assert_eq!(FallbackOn::UsageLimit.allows(&error.to_string()), usage_limit);
+            assert_eq!(
+                FallbackOn::UsageLimit.allows(&error.to_string()),
+                usage_limit
+            );
             assert_eq!(
                 FallbackOn::ExceptUsageLimit.allows(&error.to_string()),
                 !usage_limit
@@ -2045,29 +2046,27 @@ mod tests {
         use crate::failover::FailoverClass;
 
         for (diagnostic, retryable, usage_limit) in [
-            ("HTTP 429: quota exceeded; GenerateRequestsPerDay", true, true),
+            (
+                "HTTP 429: quota exceeded; GenerateRequestsPerDay",
+                true,
+                true,
+            ),
             (
                 "HTTP 429: quota exceeded; GenerateRequestsPerMinute",
                 true,
                 false,
             ),
             ("HTTP 402: insufficient_quota", false, true),
-            ("HTTP 400: quota exceeded; concurrent requests", false, false),
+            (
+                "HTTP 400: quota exceeded; concurrent requests",
+                false,
+                false,
+            ),
         ] {
             let cause = Error::api(format!("{diagnostic}; private-upload-capability"));
-            assert_file_recovery_policy(
-                &cause,
-                retryable,
-                Some(FailoverClass::Quota),
-                usage_limit,
-            );
+            assert_file_recovery_policy(&cause, retryable, Some(FailoverClass::Quota), usage_limit);
             let error = request_error("media transfer failed", cause);
-            assert_file_recovery_policy(
-                &error,
-                retryable,
-                Some(FailoverClass::Quota),
-                usage_limit,
-            );
+            assert_file_recovery_policy(&error, retryable, Some(FailoverClass::Quota), usage_limit);
             assert!(!format!("{error:?} {error}").contains("private-upload-capability"));
         }
     }
@@ -2149,11 +2148,9 @@ mod tests {
     fn files_http_failures_preserve_recovery_policy_without_echoing_private_bodies() {
         use crate::failover::FailoverClass::{Overload, Quota, Transient};
 
-        for (boundary, expected_requests) in [
-            ("upload-start", 1),
-            ("upload-transfer", 2),
-            ("metadata", 3),
-        ] {
+        for (boundary, expected_requests) in
+            [("upload-start", 1), ("upload-transfer", 2), ("metadata", 3)]
+        {
             for (status, message, retryable, class, usage_limit) in [
                 (
                     429,
@@ -2225,7 +2222,11 @@ mod tests {
                     original
                 );
                 let requests = server.finish();
-                assert_eq!(requests.len(), expected_requests, "{boundary}: HTTP {status}");
+                assert_eq!(
+                    requests.len(),
+                    expected_requests,
+                    "{boundary}: HTTP {status}"
+                );
                 for request in &requests {
                     assert!(!request.path.contains(":streamGenerateContent"));
                     if request
@@ -2261,7 +2262,9 @@ mod tests {
                     vec![Reply {
                         status,
                         headers: Vec::new(),
-                        body: "private-error-body; retry delay; ".repeat(repetitions).into_bytes(),
+                        body: "private-error-body; retry delay; "
+                            .repeat(repetitions)
+                            .into_bytes(),
                         delivery,
                     }]
                 });
@@ -2783,11 +2786,13 @@ mod tests {
                 content: UserContent::Blocks(
                     payloads
                         .iter()
-                        .map(|bytes| ContentBlock::Media(MediaContent {
-                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                            mime_type: "audio/wav".to_string(),
-                            name: None,
-                        }))
+                        .map(|bytes| {
+                            ContentBlock::Media(MediaContent {
+                                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                mime_type: "audio/wav".to_string(),
+                                name: None,
+                            })
+                        })
                         .collect(),
                 ),
                 timestamp: 0,
@@ -4146,8 +4151,7 @@ mod tests {
             let error = cache
                 .prepare_inner(&context, &mut body, plan, &mut prepared)
                 .await
-                .err()
-                .expect("cancelled staging");
+                .expect_err("cancelled staging");
             assert!(error.to_string().contains("cancelled"));
             assert!(cache.state.lock().unwrap().entries.is_empty());
         });

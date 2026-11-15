@@ -1047,7 +1047,7 @@ fn sqlite_file_open_requires_its_own_storage_grant_and_write_capability() {
         assert!(!root.join("outside.db").exists());
         assert!(!root.join("escape.db").exists());
         let peer = self::runtime(&root, "peer", None).await;
-        peer.add_persistent_storage_root(storage.clone(), "owner")
+        peer.register_foreign_persistent_storage_root(storage.clone(), "owner")
             .expect("foreign owner grant");
         assert_eq!(
             evaluate(

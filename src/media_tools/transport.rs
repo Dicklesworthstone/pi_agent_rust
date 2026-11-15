@@ -266,8 +266,10 @@ fn reject_duplicate_billing(
     attempt: Option<&mut crate::cost::CostAttempt>,
 ) -> Result<()> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    if let Ok(true) = (BillingKeys { envelope: true }).deserialize(&mut decoder)
-        && decoder.end().is_ok()
+    if matches!(
+        (BillingKeys { envelope: true }).deserialize(&mut decoder),
+        Ok(true)
+    ) && decoder.end().is_ok()
     {
         // Do not select either conflicting bill or replace previously known
         // spend. The attempt's normal cleanup retains its valid observations.
@@ -545,10 +547,8 @@ impl Api<'_> {
                         "speech provider did not return the requested SSE stream",
                     ));
                 }
-                let bytes = super::speech::read_stream(
-                    response.bytes_stream(),
-                    limit,
-                    |raw, event| {
+                let bytes =
+                    super::speech::read_stream(response.bytes_stream(), limit, |raw, event| {
                         reject_duplicate_billing(raw, attempt.as_mut())?;
                         if let Some(attempt) = attempt.as_mut() {
                             self.settle_usage(billing, event, attempt)?;
@@ -556,9 +556,8 @@ impl Api<'_> {
                             super::speech::response_cost(model, event)?;
                         }
                         Ok(())
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 // The wrapper is SSE; the adapter validates the requested
                 // audio codec against the reconstructed bytes themselves.
                 content_type.clear();
@@ -574,17 +573,17 @@ impl Api<'_> {
                         ),
                     )
                 })?;
-                let parsed_json =
-                    if let (Some(billing), Some(attempt)) = (billing, attempt.as_mut()) {
-                        reject_duplicate_billing(&bytes, Some(&mut *attempt))?;
-                        let json = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
-                            Error::tool(self.tool, "provider returned invalid JSON")
-                        })?;
-                        self.settle_usage(billing, &json, attempt)?;
-                        Some(json)
-                    } else {
-                        None
-                    };
+                let parsed_json = if let (Some(billing), Some(attempt)) =
+                    (billing, attempt.as_mut())
+                {
+                    reject_duplicate_billing(&bytes, Some(&mut *attempt))?;
+                    let json = serde_json::from_slice::<Value>(&bytes)
+                        .map_err(|_| Error::tool(self.tool, "provider returned invalid JSON"))?;
+                    self.settle_usage(billing, &json, attempt)?;
+                    Some(json)
+                } else {
+                    None
+                };
                 (bytes, parsed_json)
             };
             check_owner(self.tool, &self.owner)?;
@@ -960,7 +959,7 @@ pub(super) mod tests {
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let read_patiently = |socket: &mut std::net::TcpStream, chunk: &mut [u8]| loop {
-            match socket.read(chunk) {
+            match std::io::Read::read(socket, chunk) {
                 Ok(n) => return n,
                 Err(error)
                     if matches!(
@@ -1036,7 +1035,7 @@ pub(super) mod tests {
             let name = match billing {
                 Billing::Image(_) => "generate_image",
                 Billing::Vision(_) => "inspect_image",
-                Billing::Speech(_) => unreachable!("speech billing uses the SSE fixture"),
+                Billing::Speech(_) => "tts",
             };
             let api = transport
                 .api(
@@ -1055,7 +1054,10 @@ pub(super) mod tests {
                     api.post_vision(model, "chat/completions", serde_json::json!({}), 4096)
                         .await
                 }
-                Billing::Speech(_) => unreachable!("speech billing uses the SSE fixture"),
+                Billing::Speech(model) => api
+                    .post_speech(model, "audio/speech", &serde_json::json!({}), 4096)
+                    .await?
+                    .json(api.tool),
             }
         });
         worker.join().unwrap();

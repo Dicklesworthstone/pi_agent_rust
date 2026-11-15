@@ -97,13 +97,24 @@ fn live_identity(hub: &AgentHubRegistry, sender: &str) -> Result<(PathBuf, u32)>
 }
 
 fn current_identity(sender: &str) -> Result<(PathBuf, u32)> {
-    let hub = registry().try_lock().map_err(|error| match error {
-        std::sync::TryLockError::WouldBlock => ipc_error("BUSY", "parent agent registry is busy"),
-        std::sync::TryLockError::Poisoned(_) => {
-            ipc_error("UNAVAILABLE", "parent agent registry is unavailable")
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        match registry().try_lock() {
+            Ok(hub) => return live_identity(&hub, sender),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(ipc_error("BUSY", "parent agent registry is busy"));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(ipc_error(
+                    "UNAVAILABLE",
+                    "parent agent registry is unavailable",
+                ));
+            }
         }
-    })?;
-    live_identity(&hub, sender)
+    }
 }
 
 fn check_owner(owner: &AgentCx) -> Result<()> {
@@ -177,7 +188,17 @@ pub fn resolve_from_env(reference: &str) -> Result<ResolvedDoc> {
         .ok_or_else(|| ipc_error("CONFIG", "parent result channel is unavailable"))?;
     let owner = AgentCx::for_current_or_request();
     let deadline = read_deadline(&owner)?;
-    resolve_at(&owner, address, token, reference, deadline)
+    loop {
+        match resolve_at(&owner, address, token.clone(), reference, deadline) {
+            Err(error)
+                if error.to_string().contains("PI_HUB_IPC_BUSY:") && Instant::now() < deadline =>
+            {
+                check_owner(&owner)?;
+                std::thread::sleep(Duration::from_millis(5).min(remaining(&owner, deadline)?));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn read_deadline(owner: &AgentCx) -> Result<Instant> {

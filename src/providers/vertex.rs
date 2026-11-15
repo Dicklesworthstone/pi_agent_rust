@@ -1001,10 +1001,7 @@ mod tests {
 
     #[test]
     fn vertex_terminal_failure_is_preserved_with_a_tool_call() {
-        for (finish, expected) in [
-            ("SAFETY", StopReason::Error),
-            ("MAX_TOKENS", StopReason::Length),
-        ] {
+        for finish in ["SAFETY", "MAX_TOKENS"] {
             let events = [serde_json::json!({"candidates": [{
                 "content": {"parts": [{"functionCall": {"name": "read", "args": {}}}]},
                 "finishReason": finish
@@ -1013,8 +1010,8 @@ mod tests {
             let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
                 panic!("expected Done");
             };
-            assert_eq!(*reason, expected);
-            assert_eq!(message.stop_reason, expected);
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(message.stop_reason, StopReason::Error);
         }
     }
 

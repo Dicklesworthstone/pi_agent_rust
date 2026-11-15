@@ -172,7 +172,9 @@ pub(super) fn normalize(raw: &RawValue, rates: Option<&ModelCost>) -> Usage {
     let reported_total = match serde_json::from_str::<ReportedCost>(raw.get()) {
         Ok(ReportedCost { cost: None }) => None,
         Ok(ReportedCost { cost: Some(cost) }) => {
-            let Some(total) = cost.as_f64().filter(|total| total.is_finite() && *total >= 0.0)
+            let Some(total) = cost
+                .as_f64()
+                .filter(|total| total.is_finite() && *total >= 0.0)
             else {
                 normalized.billing = Some(unavailable("Azure reported an invalid billed total"));
                 return normalized;
@@ -193,7 +195,9 @@ pub(super) fn normalize(raw: &RawValue, rates: Option<&ModelCost>) -> Usage {
         return normalized;
     };
     let details = usage.prompt_tokens_details.as_ref();
-    let cached = details.and_then(|details| details.cached_tokens).unwrap_or(0);
+    let cached = details
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(0);
     let written = details.map_or(0, |details| details.cache_write_tokens);
     normalized = Usage {
         input: usage
@@ -261,14 +265,21 @@ impl AzureUsage {
         if let Some(lifetimes) =
             details.and_then(|details| details.cache_write_tokens_details.as_ref())
         {
-            if lifetimes.ttl_30m_tokens.checked_add(lifetimes.ttl_12h_tokens) != Some(written) {
+            if lifetimes
+                .ttl_30m_tokens
+                .checked_add(lifetimes.ttl_12h_tokens)
+                != Some(written)
+            {
                 return Err("Azure reported inconsistent cache write lifetimes");
             }
             if lifetimes.ttl_12h_tokens > 0 {
                 return Err("Azure 12-hour cache writes require a billed total");
             }
         }
-        if details.and_then(|details| details.audio_tokens).unwrap_or(0) > 0
+        if details
+            .and_then(|details| details.audio_tokens)
+            .unwrap_or(0)
+            > 0
             || self
                 .completion_tokens_details
                 .as_ref()

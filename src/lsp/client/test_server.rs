@@ -12,6 +12,11 @@ use super::LspClient;
 
 pub(in crate::lsp) const SERVER: &str = r"
 import json, os, sys, time
+try:
+    import fcntl
+    fcntl.fcntl(sys.stdin.fileno(), 1031, 1048576)
+except Exception:
+    pass
 capabilities = json.loads(sys.argv[1])
 hold_initialize = capabilities.pop('_fixtureHoldInitialize', False)
 frames, replies, held = [], {}, []
@@ -41,9 +46,12 @@ while True:
         key, value = line.decode('ascii').split(':', 1)
         headers[key.lower()] = value.strip()
     body = sys.stdin.buffer.read(int(headers['content-length']))
-    message = json.loads(body)
     # Keep pressure traffic observable without echoing megabytes back through
-    # test/frames. All actual protocol payloads remain recorded verbatim.
+    # test/frames or spending seconds in json.loads under parallel test load.
+    if b'test/outboundPressure' in body[:128]:
+        frames.append({'method':'test/outboundPressure','payloadBytes':len(body)})
+        continue
+    message = json.loads(body)
     if message.get('method') == 'test/outboundPressure':
         frames.append({'method':'test/outboundPressure','payloadBytes':len(body)})
     else:

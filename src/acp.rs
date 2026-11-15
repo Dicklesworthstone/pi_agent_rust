@@ -654,6 +654,10 @@ pub struct AcpLaunchOptions {
     pub no_implicit_tools: bool,
     /// Host-level refusal of all client-supplied MCP servers.
     pub no_mcp: bool,
+    pub extensions: Vec<String>,
+    pub no_extensions: bool,
+    pub extension_policy: Option<String>,
+    pub repair_policy: Option<String>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub no_context_files: bool,
@@ -686,6 +690,10 @@ impl AcpLaunchOptions {
             no_tools: cli.no_tools,
             no_implicit_tools: cli.no_implicit_tools,
             no_mcp: cli.no_mcp,
+            extensions: cli.extension.clone(),
+            no_extensions: cli.no_extensions,
+            extension_policy: cli.extension_policy.clone(),
+            repair_policy: cli.repair_policy.clone(),
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             no_context_files: cli.no_context_files,
@@ -732,6 +740,10 @@ impl AcpLaunchOptions {
         cli.no_tools = self.no_tools;
         cli.no_implicit_tools = self.no_implicit_tools;
         cli.no_mcp = self.no_mcp;
+        cli.extension.clone_from(&self.extensions);
+        cli.no_extensions = self.no_extensions;
+        cli.extension_policy.clone_from(&self.extension_policy);
+        cli.repair_policy.clone_from(&self.repair_policy);
         cli.system_prompt.clone_from(&self.system_prompt);
         cli.append_system_prompt
             .clone_from(&self.append_system_prompt);
@@ -1193,6 +1205,15 @@ async fn run(
                             Some(&permission_client),
                         ) {
                             Ok((session_id, mut state)) => {
+                                if let Err(error) = boot_acp_extensions(&mut state, &options).await
+                                {
+                                    let _ = out_tx.send(json_rpc_error(
+                                        id,
+                                        INTERNAL_ERROR,
+                                        format!("Cannot load ACP extensions: {error}"),
+                                    ));
+                                    continue;
+                                }
                                 if let Err(error) = arm_acp_prewalk(&mut state, &options).await {
                                     let _ = out_tx.send(json_rpc_error(
                                         id,
@@ -2336,6 +2357,24 @@ fn acp_enabled_tools(cli: &crate::cli::Cli, config: &Config) -> Vec<String> {
 /// (#102). Without it, ACP keeps its existing in-memory, non-persisted behavior.
 /// Takes the two inputs it needs (rather than the whole `AcpOptions`) so it can
 /// be unit-tested without constructing auth/runtime handles.
+/// Resolve the session persistence directory for `pi --acp`.
+///
+/// Mirrors interactive/RPC CLI behavior: sessions persist per-project under
+/// `Config::sessions_dir()` (or `--session-dir` when specified) unless
+/// `--no-session` disables persistence.
+#[must_use]
+pub fn resolve_acp_session_dir(cli: &crate::cli::Cli) -> Option<PathBuf> {
+    if cli.no_session {
+        None
+    } else {
+        Some(
+            cli.session_dir
+                .as_ref()
+                .map_or_else(Config::sessions_dir, PathBuf::from),
+        )
+    }
+}
+
 fn new_acp_session(
     session_dir: Option<&PathBuf>,
     config: &Config,
@@ -2344,6 +2383,9 @@ fn new_acp_session(
     let mut session = session_dir.map_or_else(Session::in_memory, |dir| {
         Session::create_with_dir_and_store(Some(dir.clone()), SessionStoreKind::from_config(config))
     });
+    if session_dir.is_some() && config.session_v2_sidecar_enabled() {
+        session.enable_v2_live_sync();
+    }
     session.header.cwd = cwd.display().to_string();
     (session, session_dir.is_some())
 }
@@ -2570,7 +2612,7 @@ fn build_acp_session_with_budget(
         // a tool bound to another session's state.
         let todo_session = Arc::clone(&agent_session.session);
         agent_session.agent.extend_tools(vec![
-            Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>,
+            Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
         ]);
     }
     // Keep the exact configured AgentSession for the lifetime of the editor
@@ -2607,7 +2649,8 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
     if cli.no_prewalk || (!cli.prewalk && cli.prewalk_into.is_none()) {
         return Ok(());
     }
-    let config = Arc::clone(&state.config);
+    let workspace_options = options.for_workspace(&state.cwd)?;
+    let config = &workspace_options.config;
     let handle = state
         .agent_session
         .as_mut()
@@ -2621,12 +2664,133 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
             .as_deref()
             .unwrap_or_else(|| config.prewalk_into()),
         &cli,
-        &config,
+        config,
         &registry,
         &state.cwd,
     )
     .map_err(|error| Error::config(error.to_string()))?;
     handle.arm_prewalk(target).await?;
+    Ok(())
+}
+
+/// Discover and boot QuickJS/native/WASM extensions for an ACP session using
+/// workspace trust policy, then sync extension-contributed MCP definitions.
+async fn boot_acp_extensions(state: &mut AcpSessionState, options: &AcpOptions) -> Result<()> {
+    let workspace_options = options.for_workspace(&state.cwd)?;
+    let has_provenance = workspace_options.settings_source.is_some()
+        || workspace_options.workspace_trust_guard.is_some();
+    if !has_provenance && workspace_options.launch.extensions.is_empty() {
+        return Ok(());
+    }
+    let workspace_trusted = workspace_options
+        .workspace_trust_guard
+        .as_ref()
+        .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted);
+    let extension_paths: Vec<String> = workspace_options
+        .launch
+        .extensions
+        .iter()
+        .map(|raw| {
+            let candidate = std::path::Path::new(raw);
+            if !candidate.is_absolute()
+                && let Some(source) = &workspace_options.settings_source
+            {
+                let anchored = source.launch_cwd.join(candidate);
+                if anchored.exists() {
+                    return anchored.to_string_lossy().into_owned();
+                }
+            }
+            raw.clone()
+        })
+        .collect();
+
+    let package_manager = crate::package_manager::PackageManager::new(state.cwd.clone())
+        .with_project_trust(workspace_trusted);
+    let resource_cli = crate::resources::ResourceCliOptions {
+        no_skills: true,
+        no_prompt_templates: true,
+        no_extensions: workspace_options.launch.no_extensions,
+        no_themes: true,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths,
+        theme_paths: Vec::new(),
+    };
+    let resources = crate::resources::ResourceLoader::load(
+        &package_manager,
+        &state.cwd,
+        &workspace_options.config,
+        &resource_cli,
+    )
+    .await?;
+    if resources.extensions().is_empty() {
+        return Ok(());
+    }
+
+    let cli = workspace_options.launch.selection_cli()?;
+    let enabled_tools = acp_enabled_tools(&cli, &workspace_options.config);
+    let enabled_tools_refs: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
+    let resolved_ext_policy = workspace_options
+        .config
+        .resolve_extension_policy_with_metadata(
+            workspace_options.launch.extension_policy.as_deref(),
+        );
+    let resolved_repair_policy = workspace_options
+        .config
+        .resolve_repair_policy_with_metadata(workspace_options.launch.repair_policy.as_deref());
+    let effective_repair_policy = if resolved_repair_policy.source == "default" {
+        crate::extensions::RepairPolicyMode::AutoStrict
+    } else {
+        resolved_repair_policy.effective_mode
+    };
+
+    {
+        let handle = state
+            .agent_session
+            .as_mut()
+            .ok_or_else(|| Error::session("Cannot boot extensions while the session is busy"))?;
+        handle
+            .session_mut()
+            .enable_extensions_with_policy(
+                &enabled_tools_refs,
+                &state.cwd,
+                Some(&workspace_options.config),
+                resources.extensions(),
+                Some(resolved_ext_policy.policy),
+                Some(effective_repair_policy),
+                None,
+                crate::agent::ExtensionHostConfiguration {
+                    ui_handler: None,
+                    persist_permission_decisions: true,
+                    cli_flags: Vec::new(),
+                },
+            )
+            .await?;
+
+        if let Some(ext_mgr) = handle.extension_manager().cloned() {
+            let ext_models = ext_mgr.extension_model_entries();
+            if !ext_models.is_empty() {
+                if let Ok(Some(registry)) = handle.session().model_registry_snapshot() {
+                    let mut updated_registry = (*registry).clone();
+                    updated_registry.merge_missing_entries(ext_models.clone());
+                    handle.session_mut().set_model_registry(updated_registry);
+                }
+                for entry in ext_models {
+                    if !state.available_models.iter().any(|existing| {
+                        existing
+                            .model
+                            .provider
+                            .eq_ignore_ascii_case(&entry.model.provider)
+                            && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
+                    }) {
+                        state.available_models.push(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    mcp::sync_extensions(state, workspace_options.launch.no_mcp).await;
     Ok(())
 }
 
@@ -4787,7 +4951,9 @@ mod tests {
             }
             assert_eq!(
                 handle.has_tool("todo"),
-                acp_enabled_tools(&cli, &config).iter().any(|name| name == "todo"),
+                acp_enabled_tools(&cli, &config)
+                    .iter()
+                    .any(|name| name == "todo"),
                 "native task registration follows the selected tools",
             );
             for name in ["ask", "submit_plan"] {

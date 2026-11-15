@@ -418,6 +418,8 @@ impl Default for SecretBrokerPolicy {
                 "PRIVATE_KEY".to_string(),
                 "NPM_TOKEN".to_string(),
                 "DOCKER_PASSWORD".to_string(),
+                "PASSWORD".to_string(),
+                "PASSWD".to_string(),
                 "SLACK_TOKEN".to_string(),
                 "STRIPE_SECRET_KEY".to_string(),
                 "TWILIO_AUTH_TOKEN".to_string(),

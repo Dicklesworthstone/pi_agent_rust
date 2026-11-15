@@ -121,7 +121,7 @@ fn every_native_task_is_validated_including_later_nodes() {
         ("task", json!("")),
         ("agent", json!(3)),
         ("tools", json!(["bash"])),
-        ("model", json!("another-model")),
+        ("model", json!("default")),
     ] {
         let mut later = node("b", &["a"]);
         later["call"][field] = value;

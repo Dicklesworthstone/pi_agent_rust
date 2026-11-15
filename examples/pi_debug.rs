@@ -133,11 +133,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
         &cwd,
         &file_args,
         &mut messages,
-        config
-            .images
-            .as_ref()
-            .and_then(|i| i.auto_resize)
-            .unwrap_or(true),
+        pi::tools::FileArgumentOptions::from_config(&config),
         &pi::workspace::WorkspaceHandle::default(),
     )?;
     step!(

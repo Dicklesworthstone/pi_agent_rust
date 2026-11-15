@@ -64,16 +64,42 @@
 // paths the same way integration tests do.
 extern crate self as pi;
 
+#[cfg(test)]
+pub(crate) struct TestCurrentDirLockGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl Drop for TestCurrentDirLockGuard {
+    fn drop(&mut self) {
+        TEST_CWD_LOCK_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CWD_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Serialize unit tests that temporarily change the process-wide current
 /// directory. Rust's test runner executes modules concurrently, so separate
 /// per-module locks do not prevent one module from observing another module's
-/// temporary directory.
+/// temporary directory. Re-entrant on the holding thread so nested guards do
+/// not self-deadlock.
 #[cfg(test)]
-pub(crate) fn test_current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn test_current_dir_lock() -> TestCurrentDirLockGuard {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    let current_depth = TEST_CWD_LOCK_DEPTH.with(std::cell::Cell::get);
+    if current_depth > 0 {
+        TEST_CWD_LOCK_DEPTH.with(|depth| depth.set(current_depth + 1));
+        return TestCurrentDirLockGuard(None);
+    }
+    let guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    TEST_CWD_LOCK_DEPTH.with(|depth| depth.set(1));
+    TestCurrentDirLockGuard(Some(guard))
 }
 
 // Gap H: jemalloc allocator for allocation-heavy paths.
@@ -84,8 +110,12 @@ pub(crate) fn test_current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// All internal root modules remain `pub mod` for integration/bench test crates
+// under `tests/*.rs` and `benches/*.rs`, while `#[doc(hidden)]` seals the
+// supported SemVer surface to `pi::sdk` (`docs/sdk.md`).
 #[doc(hidden)]
 pub mod acp;
+#[doc(hidden)]
 pub mod advisor;
 #[doc(hidden)]
 pub mod agent;
@@ -95,10 +125,12 @@ pub mod agent_cx;
 pub mod agent_hub;
 #[doc(hidden)]
 pub mod app;
+#[doc(hidden)]
 pub mod approval;
 pub(crate) mod archive_read;
 #[doc(hidden)]
 pub(crate) mod artifact_output;
+#[doc(hidden)]
 pub mod ask;
 #[doc(hidden)]
 pub mod ast_tools;
@@ -114,9 +146,11 @@ pub mod browser;
 pub mod btw;
 #[doc(hidden)]
 pub mod buffer_shim;
+#[doc(hidden)]
 pub mod checkpoint;
 #[doc(hidden)]
 pub mod cli;
+#[doc(hidden)]
 pub mod commit_split;
 #[doc(hidden)]
 pub mod compaction;
@@ -124,6 +158,7 @@ pub mod compaction;
 pub mod compaction_snap;
 #[doc(hidden)]
 pub mod compaction_worker;
+#[doc(hidden)]
 pub mod completions;
 #[doc(hidden)]
 pub mod computer;
@@ -135,11 +170,15 @@ pub mod conformance;
 pub mod conformance_shapes;
 #[doc(hidden)]
 pub mod connectors;
+#[doc(hidden)]
 pub mod context_files;
+#[doc(hidden)]
 pub mod cost;
+#[doc(hidden)]
 pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;
+#[doc(hidden)]
 pub mod current_time;
 // Always declared: the module is dual-mode internally (its non-feature
 // `imp` degrades to named errors), and main.rs's `pi profile` arm calls
@@ -148,6 +187,7 @@ pub mod current_time;
 pub mod debug;
 #[doc(hidden)]
 pub mod delight;
+#[doc(hidden)]
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
@@ -188,6 +228,7 @@ pub mod extension_validation;
 pub mod extensions;
 #[doc(hidden)]
 pub mod extensions_js;
+#[doc(hidden)]
 pub mod failover;
 #[doc(hidden)]
 pub mod file_identity;
@@ -197,10 +238,13 @@ pub mod file_lock;
 pub mod flake_classifier;
 #[doc(hidden)]
 pub mod gallery;
+#[doc(hidden)]
 pub mod gc;
 #[doc(hidden)]
 pub mod github;
+#[doc(hidden)]
 pub mod goal;
+#[doc(hidden)]
 pub mod handoff;
 #[doc(hidden)]
 pub mod hostcall_amac;
@@ -210,6 +254,7 @@ pub mod hostcall_egraph;
 pub mod hostcall_io_uring_lane;
 #[doc(hidden)]
 pub mod hostcall_queue;
+#[doc(hidden)]
 pub mod hostcall_rewrite;
 #[doc(hidden)]
 pub mod hostcall_s3_fifo;
@@ -231,6 +276,7 @@ pub mod interactive;
 pub mod interactive_ftui;
 #[doc(hidden)]
 pub mod jobs;
+#[doc(hidden)]
 pub mod judgment;
 #[doc(hidden)]
 pub mod keybindings;
@@ -268,12 +314,15 @@ pub mod permissions;
 #[cfg(feature = "wasm-host")]
 #[doc(hidden)]
 pub mod pi_wasm;
+#[doc(hidden)]
 pub mod plan;
 #[doc(hidden)]
 pub mod platform;
 #[doc(hidden)]
 pub mod pmu_telemetry;
+#[doc(hidden)]
 pub mod prewalk;
+#[doc(hidden)]
 pub mod profiler;
 #[doc(hidden)]
 pub mod provider;
@@ -302,6 +351,7 @@ pub mod self_update;
 pub mod semantic_workspace_graph;
 #[doc(hidden)]
 pub mod session;
+#[doc(hidden)]
 pub mod session_control;
 #[doc(hidden)]
 pub mod session_import;
@@ -312,6 +362,7 @@ pub mod session_metrics;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod session_picker;
+#[doc(hidden)]
 pub mod session_recovery;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
@@ -325,10 +376,13 @@ pub mod session_title;
 pub mod session_workdir;
 #[doc(hidden)]
 pub mod skills_managed;
+#[doc(hidden)]
 pub mod sse;
+#[doc(hidden)]
 pub mod stats;
 #[doc(hidden)]
 pub mod status_line;
+#[doc(hidden)]
 pub mod stream_rules;
 #[doc(hidden)]
 pub mod subagents;
@@ -349,14 +403,19 @@ pub mod theme;
 pub mod todo;
 #[doc(hidden)]
 pub mod token_count;
+#[doc(hidden)]
 pub mod tools;
 #[doc(hidden)]
 pub mod tui;
+#[doc(hidden)]
 pub mod turn_recovery;
+#[doc(hidden)]
 pub mod undo;
+#[doc(hidden)]
 pub mod url_read;
 #[doc(hidden)]
 pub mod url_router;
+#[doc(hidden)]
 pub mod usage;
 #[doc(hidden)]
 pub mod validation_broker;
@@ -364,12 +423,17 @@ pub mod validation_broker;
 pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
+#[doc(hidden)]
 pub mod web_remote;
+#[doc(hidden)]
 pub mod web_search;
+#[doc(hidden)]
 pub mod workspace;
+#[doc(hidden)]
 pub mod workspace_trust;
 #[doc(hidden)]
 pub mod worktree_iso;
+#[doc(hidden)]
 pub mod xdev;
 
 pub use error::{Error, Result as PiResult};
