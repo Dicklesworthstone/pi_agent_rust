@@ -11618,6 +11618,75 @@ function __emitCloseOnce(child, code, signal = null) {
   child.emit("close", code, signal);
 }
 
+function __makeOutputPipes(child, stdio) {
+  child.stdout = stdio[1] === "pipe" ? __makeEmitter() : null;
+  child.stderr = stdio[2] === "pipe" ? __makeEmitter() : null;
+  const streams = { stdout: child.stdout, stderr: child.stderr };
+  const decoders = new Map();
+  let closed = false;
+  for (const stream of Object.values(streams)) {
+    if (!stream) continue;
+    stream.readable = true;
+    stream.readableEnded = false;
+    stream.destroyed = false;
+    stream.closed = false;
+    stream.errored = null;
+    stream.setEncoding = (encoding) => {
+      // Validate before replacing the decoder so a rejected encoding does not
+      // discard a partially received character. Successful calls start fresh.
+      const decoder = new StringDecoder(encoding || "utf8");
+      if (!closed) decoders.set(stream, decoder);
+      stream.encoding = decoder.encoding;
+      return stream;
+    };
+  }
+  return {
+    write(name, chunk) {
+      const stream = streams[name];
+      if (closed || !stream) return;
+      const decoder = decoders.get(stream);
+      const data = decoder
+        ? decoder.write(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk)
+        : chunk;
+      if (data.length > 0) stream.emit("data", data);
+    },
+    close(failure) {
+      if (closed) return;
+      closed = true;
+      for (const stream of Object.values(streams)) {
+        if (!stream) continue;
+        const decoder = decoders.get(stream);
+        decoders.delete(stream);
+        if (failure) {
+          // A failed or interrupted transport is not EOF. Readline must
+          // reject instead of accepting a truncated final protocol record.
+          stream.errored = failure;
+          stream.destroyed = true;
+          stream.readable = false;
+          stream.emit("error", failure);
+        } else {
+          if (decoder) {
+            const tail = decoder.end();
+            if (tail.length > 0) stream.emit("data", tail);
+          }
+          stream.readable = false;
+          stream.readableEnded = true;
+          stream.emit("end");
+          stream.destroyed = true;
+        }
+        stream.closed = true;
+        stream.emit("close");
+      }
+    },
+  };
+}
+
+function __interruptedOutputError(signal) {
+  const error = new Error(`Process output interrupted by ${signal}`);
+  error.code = "ERR_STREAM_PREMATURE_CLOSE";
+  return error;
+}
+
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
   const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "env", "signal"]);
@@ -11765,27 +11834,8 @@ function __spawnPersistent(cmd, argv, opts) {
   child.exitCode = null;
   child.signalCode = null;
   child.__pi_done = false;
-  child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
-  child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
+  const output = __makeOutputPipes(child, opts.stdio);
   child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
-  const streams = [child.stdout, child.stderr];
-  const decoders = new Map();
-  for (const stream of streams) {
-    if (!stream) continue;
-    stream.readable = true;
-    stream.readableEnded = false;
-    stream.destroyed = false;
-    stream.closed = false;
-    stream.errored = null;
-    stream.setEncoding = (encoding) => {
-      // Validate before replacing the decoder so a rejected encoding does not
-      // discard a partially received character. Successful calls start fresh.
-      const decoder = new StringDecoder(encoding || "utf8");
-      decoders.set(stream, decoder);
-      stream.encoding = decoder.encoding;
-      return stream;
-    };
-  }
   let handle = null;
   let timer = null;
   let referenced = true;
@@ -11878,31 +11928,7 @@ function __spawnPersistent(cmd, argv, opts) {
       child.stdin.destroyed = true;
       child.stdin.closed = true;
     }
-    for (const stream of streams) {
-      if (!stream) continue;
-      const decoder = decoders.get(stream);
-      decoders.delete(stream);
-      if (failure) {
-        // Overflow, pipe failures and lifetime expiry are not EOF. In
-        // particular, readline must reject instead of accepting a truncated
-        // final JSON record or a decoder's replacement-character tail.
-        stream.errored = failure;
-        stream.destroyed = true;
-        stream.readable = false;
-        stream.emit("error", failure);
-      } else {
-        if (decoder) {
-          const tail = decoder.end();
-          if (tail.length > 0) stream.emit("data", tail);
-        }
-        stream.readable = false;
-        stream.readableEnded = true;
-        stream.emit("end");
-        stream.destroyed = true;
-      }
-      stream.closed = true;
-      stream.emit("close");
-    }
+    output.close(failure || (signal ? __interruptedOutputError(signal) : null));
     if (failure && (!abortEmitted || failure !== abortFailure)) {
       if (failure === abortFailure) emitAbort();
       else child.emit("error", failure);
@@ -11935,13 +11961,7 @@ function __spawnPersistent(cmd, argv, opts) {
       const result = JSON.parse(__pi_process_session_poll_native(handle));
       for (const frame of result.frames || []) {
         if (frame.stream) {
-          const stream = frame.stream === "stdout" ? child.stdout : child.stderr;
-          if (stream) {
-            const bytes = Buffer.from(frame.data, "base64");
-            const decoder = decoders.get(stream);
-            const chunk = decoder ? decoder.write(bytes) : bytes;
-            if (chunk.length > 0) stream.emit("data", chunk);
-          }
+          output.write(frame.stream, Buffer.from(frame.data, "base64"));
         } else if (frame.writeId !== undefined) {
           const error = frame.error ? pipeError(frame.error) : null;
           settleWrite(frame.writeId, error);
@@ -12171,12 +12191,31 @@ export function spawn(command, args = [], options = {}) {
   child.signalCode = null;
   child.__pi_done = false;
   child.__pi_call_id = null;
-  child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
-  child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
+  const output = __makeOutputPipes(child, opts.stdio);
   child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
+  let closing = false;
+
+  function close(code, signal, failure = null, reportError = false) {
+    if (child.__pi_done || closing) return;
+    // A pipe listener can reenter kill(), attach another reader, or cause a
+    // host callback. Fence those paths before publishing terminal events.
+    closing = true;
+    output.close(failure);
+    if (reportError) child.emit("error", failure);
+    __emitCloseOnce(child, code, signal);
+  }
+
+  function failed(source) {
+    const error = source instanceof Error
+      ? source
+      : new Error(String(source?.message || source || "spawn failed"));
+    if (!error.code && source && source.code !== undefined) error.code = String(source.code);
+    close(1, null, error, true);
+  }
 
   child.kill = (signal = "SIGTERM") => {
-    if (child.__pi_done) return false;
+    if (child.__pi_done || closing) return false;
+    const requested = String(signal || "SIGTERM");
     if (
       child.__pi_call_id === null ||
       typeof __pi_cancel_hostcall_native !== "function"
@@ -12191,7 +12230,7 @@ export function spawn(command, args = [], options = {}) {
       return false;
     }
     child.killed = true;
-    __emitCloseOnce(child, null, String(signal || "SIGTERM"));
+    close(null, requested, __interruptedOutputError(requested));
     return true;
   };
 
@@ -12202,25 +12241,33 @@ export function spawn(command, args = [], options = {}) {
   if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
   execOptions.stream = true;
   execOptions.onChunk = (chunk) => {
-    if (child.__pi_done || !chunk || typeof chunk !== "object") {
+    if (child.__pi_done || closing || !chunk || typeof chunk !== "object") {
       return;
     }
     if (child.stdout && chunk.stdout !== undefined && chunk.stdout !== null && chunk.stdout !== "") {
-      child.stdout.emit("data", String(chunk.stdout));
+      output.write("stdout", String(chunk.stdout));
     }
     if (child.stderr && chunk.stderr !== undefined && chunk.stderr !== null && chunk.stderr !== "") {
-      child.stderr.emit("data", String(chunk.stderr));
+      output.write("stderr", String(chunk.stderr));
     }
   };
   const onChunk = execOptions.onChunk;
   delete execOptions.onChunk;
-  const hostPromise = globalThis.pi.exec(cmd, argv, {
-    ...execOptions,
-    stream: true,
-    onChunk,
-  });
-  child.__pi_call_id = hostPromise.__pi_call_id || null;
-  const execPromise = hostPromise.then(
+  let hostPromise;
+  try {
+    hostPromise = globalThis.pi.exec(cmd, argv, {
+      ...execOptions,
+      stream: true,
+      onChunk,
+    });
+    child.__pi_call_id = hostPromise.__pi_call_id || null;
+  } catch (error) {
+    // Admission can fail synchronously before it supplies a hostcall ID.
+    // Return the child first so callers can observe its error and pipe close.
+    Promise.resolve().then(() => failed(error));
+    return child;
+  }
+  const execPromise = Promise.resolve(hostPromise).then(
     (result) => ({ kind: "result", result }),
     (error) => ({ kind: "error", error })
   );
@@ -12241,21 +12288,12 @@ export function spawn(command, args = [], options = {}) {
         result.killed || child.killed
           ? String(result.signal || "SIGTERM")
           : null;
-      __emitCloseOnce(child, signal ? null : code, signal);
+      close(signal ? null : code, signal, signal ? __interruptedOutputError(signal) : null);
       return;
     }
 
     if (outcome.kind === "error") {
-      const source = outcome.error || {};
-      const error =
-        source instanceof Error
-          ? source
-          : new Error(String(source.message || source || "spawn failed"));
-      if (!error.code && source && source.code !== undefined) {
-        error.code = String(source.code);
-      }
-      child.emit("error", error);
-      __emitCloseOnce(child, 1, null);
+      failed(outcome.error);
     }
   });
 
@@ -38476,7 +38514,8 @@ globalThis.__spawn_abort_result = result;
                       const { createInterface } = await import('node:readline');
                       const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
                       async function collect(mode) {
-                        const failure = mode === 'normal' ? null : mode + ' failed';
+                        const failure = mode === 'normal' ? null
+                          : mode === 'signal' ? 'Process output interrupted by SIGTERM' : mode + ' failed';
                         if (mode === 'spawn') rejectSpawn(failure);
                         const child = spawn('readline-peer');
                         const result = { lines: [], terminal: 'pending', late: 'pending',
@@ -38515,7 +38554,12 @@ globalThis.__spawn_abort_result = result;
                           const data = mode === 'decoder' ? Buffer.concat([bytes, Buffer.from([0xe2, 0x82])]) : bytes;
                           feed({ frames: [{ stream: 'stdout', data: data.toString('base64') }] });
                           await settle();
+                          if (mode === 'signal') {
+                            result.killAccepted = child.kill('SIGTERM');
+                            result.closedBeforeAcknowledgement = reader.closed;
+                          }
                           feed(mode === 'poll' ? { nativeError: failure }
+                            : mode === 'signal' ? { terminal: { code: null, signal: 'SIGTERM' } }
                             : { terminal: { code: failure ? null : 0, error: failure } });
                         }
                         await settle();
@@ -38529,7 +38573,7 @@ globalThis.__spawn_abort_result = result;
                         return result;
                       }
                       const result = {};
-                      for (const mode of ['normal', 'overflow', 'decoder', 'poll', 'spawn']) {
+                      for (const mode of ['normal', 'overflow', 'decoder', 'poll', 'spawn', 'signal']) {
                         result[mode] = await collect(mode);
                       }
                       result.counts = counts();
@@ -38552,10 +38596,16 @@ globalThis.__spawn_abort_result = result;
             assert_eq!(result["normal"]["duringClose"], "done");
             assert_eq!(
                 result["counts"],
-                serde_json::json!({ "closes": 4, "kills": 1 })
+                serde_json::json!({ "closes": 5, "kills": 2 })
             );
-            for mode in ["normal", "overflow", "decoder", "poll", "spawn"] {
-                let failure = (mode != "normal").then(|| format!("{mode} failed"));
+            for mode in ["normal", "overflow", "decoder", "poll", "spawn", "signal"] {
+                let failure = (mode != "normal").then(|| {
+                    if mode == "signal" {
+                        "Process output interrupted by SIGTERM".to_string()
+                    } else {
+                        format!("{mode} failed")
+                    }
+                });
                 let observed = &result[mode];
                 assert_eq!(observed["ends"], u64::from(failure.is_none()), "{mode}");
                 assert_eq!(observed["streamCloses"], 1, "{mode}");
@@ -38581,7 +38631,11 @@ globalThis.__spawn_abort_result = result;
                     assert_eq!(observed["duringClose"], failure, "{mode}");
                     assert_eq!(
                         observed["childErrors"],
-                        serde_json::json!([failure]),
+                        if mode == "signal" {
+                            serde_json::json!([])
+                        } else {
+                            serde_json::json!([failure])
+                        },
                         "{mode}"
                     );
                     let lines = if mode == "spawn" {
@@ -38597,6 +38651,210 @@ globalThis.__spawn_abort_result = result;
                 } else {
                     assert_eq!(observed["childErrors"], serde_json::json!([]));
                 }
+                if mode == "signal" {
+                    assert_eq!(observed["killAccepted"], true);
+                    assert_eq!(observed["closedBeforeAcknowledgement"], false);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_child_process_output_only_readline_settles_terminal_paths() {
+        futures::executor::block_on(async {
+            for mode in ["normal", "nonzero", "denied", "transport", "timeout", "cancel"] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                    .await
+                    .expect("create output-only runtime");
+                runtime
+                    .eval(
+                        r"
+                        globalThis.outputOnlyResult = {
+                          lines: [], events: [], childErrors: [], terminalKills: [],
+                          terminal: 'pending', late: 'pending', duringError: 'unobserved',
+                          duringClose: 'pending', status: null,
+                        };
+                        void (async () => {
+                          const { spawn } = await import('node:child_process');
+                          const { createInterface } = await import('node:readline');
+                          const result = globalThis.outputOnlyResult;
+                          const child = spawn('output-only-peer', [], { stdio: ['ignore', 'pipe', 'pipe'] });
+                          globalThis.outputOnlyChild = child;
+                          const terminalRead = key => {
+                            const reader = createInterface({ input: child.stdout });
+                            void reader[Symbol.asyncIterator]().next().then(
+                              value => { result[key] = value.done ? 'done' : value.value; },
+                              error => { result[key] = error.code; },
+                            );
+                          };
+                          globalThis.outputOnlyLateRead = () => terminalRead('late');
+                          for (const name of ['stdout', 'stderr']) {
+                            child[name].on('end', () => {
+                              result.events.push(name + ':end');
+                              result.terminalKills.push(child.kill());
+                            });
+                            child[name].on('error', error => {
+                              result.events.push(name + ':error');
+                              result.terminalKills.push(child.kill());
+                              if (name === 'stdout') terminalRead('duringError');
+                            });
+                            child[name].on('close', () => {
+                              result.events.push(name + ':close');
+                              if (name === 'stdout') terminalRead('duringClose');
+                            });
+                          }
+                          child.on('error', error => result.childErrors.push(error.code));
+                          child.on('exit', () => result.events.push('child:exit'));
+                          child.on('close', (code, signal) => {
+                            result.events.push('child:close');
+                            result.status = { code, signal };
+                            result.states = ['stdout', 'stderr'].map(name => ({
+                              readable: child[name].readable, ended: child[name].readableEnded,
+                              destroyed: child[name].destroyed, closed: child[name].closed,
+                              error: child[name].errored?.code ?? null,
+                            }));
+                          });
+                          // Exercise decoding on the output-only transport as
+                          // well as readline's own final-line buffering.
+                          child.stdout.setEncoding('utf8');
+                          const reader = createInterface({ input: child.stdout });
+                          try {
+                            for await (const line of reader) result.lines.push(line);
+                            result.terminal = 'success';
+                          } catch (error) { result.terminal = error.code; }
+                          result.readerClosed = reader.closed;
+                        })().catch(error => { outputOnlyResult.failure = String(error.stack || error); });
+                        ",
+                    )
+                    .await
+                    .expect("start output-only readline");
+                runtime
+                    .drain_microtasks()
+                    .await
+                    .expect("finish output-only module imports");
+                let mut requests = runtime.drain_hostcall_requests();
+                assert_eq!(requests.len(), 1, "{mode}");
+                let request = requests.pop_front().expect("output-only exec request");
+                assert_eq!(request.payload["options"]["stream"], true, "{mode}");
+                assert!(request.payload["options"].get("persistent").is_none());
+                if mode != "denied" {
+                    runtime.complete_hostcall(
+                        request.call_id.clone(),
+                        HostcallOutcome::StreamChunk {
+                            sequence: 0,
+                            chunk: serde_json::json!({ "stdout": "accepted λ\n42", "stderr": "warning" }),
+                            is_final: false,
+                        },
+                    );
+                    runtime.tick().await.expect("deliver output-only data");
+                    runtime
+                        .drain_microtasks()
+                        .await
+                        .expect("consume accepted protocol line");
+                }
+                if mode == "cancel" {
+                    runtime
+                        .eval("outputOnlyResult.killAccepted = outputOnlyChild.kill('SIGKILL');")
+                        .await
+                        .expect("cancel output-only hostcall");
+                    assert_eq!(runtime.pending_hostcall_count(), 0);
+                    // Neither a queued late chunk nor a late completion may
+                    // reopen the pipes or turn cancellation into clean EOF.
+                    runtime.complete_hostcall(
+                        request.call_id.clone(),
+                        HostcallOutcome::StreamChunk {
+                            sequence: 1,
+                            chunk: serde_json::json!({ "stdout": "late data\n" }),
+                            is_final: false,
+                        },
+                    );
+                }
+                runtime.complete_hostcall(
+                    request.call_id,
+                    if matches!(mode, "denied" | "transport") {
+                        HostcallOutcome::Error {
+                            code: mode.to_string(),
+                            message: format!("{mode} failed"),
+                        }
+                    } else {
+                        HostcallOutcome::StreamChunk {
+                            sequence: if mode == "cancel" { 2 } else { 1 },
+                            chunk: serde_json::json!({
+                                "code": if mode == "nonzero" { 7 } else { 0 },
+                                "killed": mode == "timeout",
+                            }),
+                            is_final: true,
+                        }
+                    },
+                );
+                drain_until_idle(&runtime, &clock).await;
+                runtime
+                    .eval("outputOnlyLateRead();")
+                    .await
+                    .expect("attach reader after output-only completion");
+                drain_until_idle(&runtime, &clock).await;
+                let result = get_global_json(&runtime, "outputOnlyResult").await;
+                assert!(result.get("failure").is_none(), "{mode}: {result}");
+                let success = matches!(mode, "normal" | "nonzero");
+                let failure = match mode {
+                    "denied" | "transport" => Some(mode),
+                    "timeout" | "cancel" => Some("ERR_STREAM_PREMATURE_CLOSE"),
+                    _ => None,
+                };
+                assert_eq!(
+                    result["lines"],
+                    if success {
+                        serde_json::json!(["accepted λ", "42"])
+                    } else if mode == "denied" {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!(["accepted λ"])
+                    },
+                    "{mode}: {result}"
+                );
+                assert_eq!(result["terminal"], failure.unwrap_or("success"), "{mode}");
+                assert_eq!(result["late"], failure.unwrap_or("done"), "{mode}");
+                assert_eq!(result["duringClose"], failure.unwrap_or("done"), "{mode}");
+                assert_eq!(
+                    result["duringError"],
+                    failure.unwrap_or("unobserved"),
+                    "{mode}"
+                );
+                assert_eq!(result["readerClosed"], true, "{mode}");
+                assert_eq!(result["terminalKills"], serde_json::json!([false, false]));
+                let event = if success { "end" } else { "error" };
+                assert_eq!(
+                    result["events"],
+                    serde_json::json!([
+                        format!("stdout:{event}"), "stdout:close",
+                        format!("stderr:{event}"), "stderr:close", "child:exit", "child:close",
+                    ]),
+                    "{mode}"
+                );
+                let state = serde_json::json!({
+                    "readable": false, "ended": success, "destroyed": true,
+                    "closed": true, "error": failure,
+                });
+                assert_eq!(result["states"], serde_json::json!([state, state]), "{mode}");
+                assert_eq!(
+                    result["childErrors"],
+                    if matches!(mode, "denied" | "transport") {
+                        serde_json::json!([mode])
+                    } else {
+                        serde_json::json!([])
+                    },
+                    "{mode}"
+                );
+                if mode == "cancel" {
+                    assert_eq!(result["killAccepted"], true);
+                    assert_eq!(
+                        result["status"],
+                        serde_json::json!({"code": null, "signal": "SIGKILL"})
+                    );
+                }
+                assert_eq!(runtime.pending_hostcall_count(), 0, "{mode}");
             }
         });
     }
@@ -38724,6 +38982,56 @@ globalThis.__spawn_abort_result = result;
                 r["events"],
                 serde_json::json!(["stdout", "stderr", "stdout", "stdout", "exit", "close"])
             );
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_output_only_admission_throw_releases_pipes_and_registry() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create admission failure runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.outputAdmissionResult = { events: [] };
+                    void import('node:child_process').then(({ spawn }) => {
+                      const result = outputAdmissionResult;
+                      // A synchronous bridge admission refusal must not strand
+                      // an already-registered child before returning its pipes.
+                      const exec = pi.exec;
+                      pi.exec = () => { throw Object.assign(new Error('admission failed'), { code: 'refused' }); };
+                      try {
+                        const child = spawn('refused-output', [], { stdio: ['ignore', 'pipe', 'pipe'] });
+                        result.returned = true;
+                        result.synchronousEvents = result.events.length;
+                        child.stdout.on('end', () => result.events.push('end'));
+                        child.stdout.on('error', error => result.events.push(error.code));
+                        child.stdout.on('close', () => result.events.push('pipe-close'));
+                        child.on('error', error => result.events.push('child:' + error.code));
+                        child.on('close', () => {
+                          result.events.push('child-close');
+                          result.registry = __pi_child_process_registry_size();
+                          result.killAfterClose = child.kill();
+                          result.stderrClosed = child.stderr.closed;
+                        });
+                      } finally { pi.exec = exec; }
+                    }).catch(error => { outputAdmissionResult.failure = String(error); });
+                    ",
+                )
+                .await
+                .expect("run synchronous output admission refusal");
+            drain_until_idle(&runtime, &clock).await;
+            assert_eq!(
+                get_global_json(&runtime, "outputAdmissionResult").await,
+                serde_json::json!({
+                    "returned": true, "synchronousEvents": 0,
+                    "events": ["refused", "pipe-close", "child:refused", "child-close"],
+                    "registry": 0, "killAfterClose": false, "stderrClosed": true,
+                })
+            );
+            assert_eq!(runtime.pending_hostcall_count(), 0);
         });
     }
 

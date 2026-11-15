@@ -103,6 +103,14 @@ rejects pending iterator reads. Leaving a `for await` loop closes the
 interface; it does not destroy the supplied stream or terminate its child.
 `pause()` and `resume()` forward to inputs that provide those methods.
 
+Output-only subprocesses (`stdio: ["ignore", "pipe", "pipe"]`) settle both
+readers before the child's `close` event, including final lines without a
+newline. A nonzero exit code still ends a fully received stream normally.
+Host failures, timeouts, and accepted cancellation close the streams with an
+error instead; partial protocol records are discarded. Late readers observe
+the same terminal state. This applies to both the streaming hostcall and
+managed persistent-process paths without changing their process ownership.
+
 A logical line is limited to 4 MiB of UTF-8 text. An active async iterator may
 retain at most 1,024 lines totaling 4 MiB; inputs without pause support are
 subject to the same bounds. Exceeding either bound reports

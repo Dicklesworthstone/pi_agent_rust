@@ -1179,6 +1179,94 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn output_only_subprocess_readers_finish_before_child_close() {
+    let harness = common::TestHarness::new("cp_output_only_readline");
+    let cwd = harness.temp_dir().to_path_buf();
+    let source = r#"
+        import { spawn } from 'node:child_process';
+        import { createInterface } from 'node:readline';
+        export default function(pi) {
+            pi.on('agent_start', async () => {
+                const child = spawn('sh', ['-c', "printf 'accepted λ\\n42'; printf 'warning tail' >&2; exit 7"],
+                    { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
+                const events = [];
+                const readers = ['stdout', 'stderr'].map(name => {
+                    const reader = createInterface({ input: child[name], terminal: false });
+                    reader.on('close', () => events.push(name + ':reader-close'));
+                    child[name].on('close', () => events.push(name + ':pipe-close'));
+                    return reader;
+                });
+                const collect = async reader => {
+                    const lines = [];
+                    for await (const line of reader) lines.push(line);
+                    return lines;
+                };
+                const closed = new Promise((resolve, reject) => {
+                    child.on('error', reject);
+                    child.on('close', (code, signal) => {
+                        events.push('child:close');
+                        resolve({ code, signal });
+                    });
+                });
+                // Await both real pipe readers, so a child close without EOF
+                // fails this fixture at its bounded dispatch deadline.
+                const [stdout, stderr, status] = await Promise.all([
+                    collect(readers[0]), collect(readers[1]), closed,
+                ]);
+                const late = createInterface({ input: child.stdout });
+                const lateResult = await late[Symbol.asyncIterator]().next();
+                return { result: { stdout, stderr, status, events,
+                    lateDone: lateResult.done, closed: readers.every(reader => reader.closed),
+                    pipeEnds: [child.stdout.readableEnded, child.stderr.readableEnded],
+                    killAfterClose: child.kill() } };
+            });
+        }
+    "#;
+    let entry = harness.create_file("extensions/output_only.mjs", source.as_bytes());
+    let spec = JsExtensionLoadSpec::from_entry_path(entry).expect("output-only extension spec");
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "exec");
+    policy.default_caps.push("exec".to_string());
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("start output-only runtime");
+    manager.set_js_runtime(runtime);
+    let response = common::run_async(async move {
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load output-only extension");
+        manager
+            .dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10000)
+            .await
+            .expect("dispatch output-only read")
+            .expect("output-only result")
+    });
+    assert_eq!(
+        response["result"],
+        serde_json::json!({
+            "stdout": ["accepted λ", "42"], "stderr": ["warning tail"],
+            "status": {"code": 7, "signal": null},
+            "events": ["stdout:reader-close", "stdout:pipe-close",
+                "stderr:reader-close", "stderr:pipe-close", "child:close"],
+            "lateDone": true, "closed": true, "pipeEnds": [true, true], "killAfterClose": false,
+        }),
+        "{response}"
+    );
+}
+
 /// A failed owner remains in the actor for diagnostics and frozen name
 /// reservations. Its already-admitted MCP process must not survive there, and
 /// cancelling it must not disturb a different owner's live server.
