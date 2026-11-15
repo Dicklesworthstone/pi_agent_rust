@@ -18,6 +18,25 @@ classes, and brace alternatives are supported. Absolute globs, parent traversal,
 negated globs, control characters, and drive prefixes are rejected rather than
 interpreted as empty scans. A leading `./` is permitted.
 
+## Single-file and cached queries
+
+`{"action":"diagnostics","file":"src/lib.rs"}` obtains a push or pull report
+for the synchronized file and checks the current source again before returning.
+A changed, moved, unreadable, or oversized source produces
+`LSP_DIAGNOSTIC_STALE`, including when the server returned an empty report.
+Repeat the request to synchronize the new text and obtain fresh diagnostics.
+Source validation uses the existing 16 MiB document-read bound and retains the
+synchronized document incarnation. A symlink alias remains usable while it
+resolves to the same document; retargeting it invalidates the result even when
+the replacement contains identical text.
+
+`{"action":"diagnostics","file":"**/*.rs"}` filters the already cached
+reports to matching Rust paths. It does not query a server or reread source
+files. Its `cachedOnly:true` and `complete:false` describe a partial historical
+view, including when the matching cache is empty. Use a single-file query or
+`workspace_diagnostics` to actively check current sources. Neither form proves
+server-side freshness for an unversioned push or a snapshot of every dependency.
+
 ## Reading the result
 
 The result remains a JSON object, including when individual reports are omitted

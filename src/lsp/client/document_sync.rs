@@ -226,7 +226,7 @@ fn incremental_change(before: &str, after: &str) -> Value {
     })
 }
 
-fn read_document(path: &Path) -> Result<String> {
+pub(super) fn read_document(path: &Path) -> Result<String> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(Error::tool(
             "lsp",

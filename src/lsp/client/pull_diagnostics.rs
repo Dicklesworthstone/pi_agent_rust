@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -202,6 +203,58 @@ impl LspClient {
             .raw
             .get("diagnosticProvider")
             .is_some_and(Value::is_object)
+    }
+
+    /// A direct file query must still describe the caller's current path when
+    /// it returns. The pull/push machinery checks synchronized incarnations,
+    /// but an editor or another agent can change the disk without a resync.
+    /// Reuse the bounded synchronization reader, preserve source aliases that
+    /// still resolve to the same URI, and never turn failed revalidation into
+    /// an empty, apparently clean diagnostic report.
+    pub(in crate::lsp) fn verify_diagnostic_source(
+        &self,
+        path: &Path,
+        uri: &str,
+        source: &Arc<str>,
+    ) -> Result<()> {
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::from(super::LspCallError::Cancelled))?;
+        if !owner.capabilities().io {
+            return Err(Error::tool(
+                "lsp",
+                "[LSP_IO_PERMISSION] diagnostic source validation requires filesystem I/O",
+            ));
+        }
+        let stale = |reason: &str| {
+            Error::tool(
+                "lsp",
+                format!("[LSP_DIAGNOSTIC_STALE] {reason}; repeat the request"),
+            )
+        };
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| stale(&format!("diagnostic source is unavailable: {error}")))?;
+        if super::try_path_to_uri(&canonical)?.as_str() != uri {
+            return Err(stale("diagnostic source path changed its target"));
+        }
+        let current = super::document_sync::read_document(&canonical)
+            .map_err(|error| stale(&format!("cannot revalidate diagnostic source: {error}")))?;
+        if current.as_str() != source.as_ref() {
+            return Err(stale("source changed while obtaining diagnostics"));
+        }
+        if !self.is_alive()
+            || !self
+                .synchronized_text(uri)
+                .is_some_and(|current| Arc::ptr_eq(&current, source))
+        {
+            return Err(stale("diagnostic source or server incarnation changed"));
+        }
+        owner
+            .checkpoint()
+            .map_err(|_| Error::from(super::LspCallError::Cancelled))?;
+        Ok(())
     }
 
     /// Obtain a diagnostic report for the currently synchronized document.

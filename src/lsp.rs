@@ -267,7 +267,7 @@ impl LspTool {
                     for (uri, diags) in entry.client.diagnostics_snapshot() {
                         if let Some(path) = uri_to_path(&uri) {
                             let rel = path.strip_prefix(&self.cwd).unwrap_or(&path);
-                            if override_filter.matched(rel, false).is_ignore() {
+                            if override_filter.matched(rel, false).is_whitelist() {
                                 matched.push(json!({"file":display_path(&path,&self.cwd),"server":status.name,"diagnostics":diags}));
                             }
                         }
@@ -285,6 +285,12 @@ impl LspTool {
         let (uri, entry) = self
             .synced_with_timeout(&path, self.request_timeout(input))
             .await?;
+        let source = entry.client.synchronized_text(&uri).ok_or_else(|| {
+            tool_err(
+                "LSP_DIAGNOSTIC_STALE",
+                "diagnostic source was not synchronized; repeat the request",
+            )
+        })?;
         let wait = input
             .timeout
             .filter(|secs| *secs > 0)
@@ -292,6 +298,9 @@ impl LspTool {
                 Duration::from_secs(secs).min(Duration::from_secs(60))
             });
         let diags = entry.client.document_diagnostics(&uri, wait).await?;
+        entry
+            .client
+            .verify_diagnostic_source(&path, &uri, &source)?;
         let payload = json!({"action":"diagnostics","file":display_path(&path,&self.cwd),"server":entry.spec_name,"count":diags.len(),"diagnostics":diags});
         Ok(text_output(payload.to_string(), payload))
     }
