@@ -4493,12 +4493,17 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
 pub(crate) async fn create_agent_session_deferred_mcp(
     options: SessionOptions,
 ) -> Result<AgentSessionHandle> {
-    let process_cwd =
-        std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
-    let requested_cwd = options.working_directory.as_deref().map_or_else(
-        || process_cwd.clone(),
-        |path| resolve_path_for_cwd(path, &process_cwd),
-    );
+    let requested_cwd = match options.working_directory.as_deref() {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => {
+            let process_cwd = std::env::current_dir()
+                .map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
+            resolve_path_for_cwd(path, &process_cwd)
+        }
+        None => {
+            std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?
+        }
+    };
     // Resolve caller-supplied locations before discovering a saved workspace.
     // A relative session path must not be reinterpreted inside its own saved
     // cwd once metadata chooses the runtime's project directory.
@@ -8142,6 +8147,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
             .process()
             .command(env::current_exe().expect("test executable"));
         command
+            .current_dir(directory.path())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env(CHILD, name)
             .env("NO_PROXY", "127.0.0.1,localhost,::1")

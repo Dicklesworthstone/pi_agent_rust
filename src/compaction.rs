@@ -2151,6 +2151,16 @@ fn estimate_model_message_with_table(
     message: &Message,
     table: crate::token_count::TokenTable,
 ) -> u64 {
+    if let Message::User(user) = message
+        && let UserContent::Text(value) = &user.content
+    {
+        return crate::token_count::active_counter().count(value, table);
+    }
+    if let Message::Custom(custom) = message
+        && crate::compaction_snap::source_for_custom(custom).is_none()
+    {
+        return crate::token_count::active_counter().count(&custom.content, table);
+    }
     let mut text = String::new();
     let mut flat_tokens = 0;
     match message {

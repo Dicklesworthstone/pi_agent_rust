@@ -26,6 +26,7 @@ const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REFERENCES: usize = 4096;
 const BLOB_READ_BUFFER_BYTES: usize = 16 * 1024;
 const ERROR_PREFIX: &str = "PI_SESSION_ATTACHMENT_INVALID:";
+const NATIVE_CONTENT_ROLES: &[&str] = &["user", "assistant", "toolResult"];
 
 fn blob_error(reason: impl std::fmt::Display) -> Error {
     Error::session(format!("{ERROR_PREFIX} {reason}"))
@@ -127,11 +128,21 @@ fn digest(bytes: &[u8]) -> String {
     )
 }
 
-fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
+/// Only these message roles own native content blocks. In particular,
+/// Flattened Bash execution metadata may contain an opaque "content" field.
+pub(crate) fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
     if value.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
-    value.get_mut("message")?.get_mut("content")?.as_array_mut()
+    let message = value.get_mut("message")?;
+    if !message
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| NATIVE_CONTENT_ROLES.contains(&role))
+    {
+        return None;
+    }
+    message.get_mut("content")?.as_array_mut()
 }
 
 fn is_attachment(block: &Value) -> bool {
@@ -754,9 +765,9 @@ impl<'de> Deserialize<'de> for RawObject<'de> {
 }
 
 impl RawObject<'_> {
-    fn has_type(&self, allowed: &[&str]) -> bool {
+    fn has_string_field(&self, name: &str, allowed: &[&str]) -> bool {
         self.0.iter().any(|(key, value)| {
-            key == "type"
+            key == name
                 && serde_json::from_str::<String>(value.get())
                     .is_ok_and(|kind| allowed.contains(&kind.as_str()))
         })
@@ -781,7 +792,7 @@ fn native_attachment_data_spans(json: &str) -> Result<Vec<(usize, &RawValue)>> {
     let Ok(entry) = serde_json::from_str::<RawObject<'_>>(json) else {
         return Ok(Vec::new());
     };
-    if !entry.has_type(&["message"]) {
+    if !entry.has_string_field("type", &["message"]) {
         return Ok(Vec::new());
     }
     let mut references = Vec::new();
@@ -790,6 +801,11 @@ fn native_attachment_data_spans(json: &str) -> Result<Vec<(usize, &RawValue)>> {
         let Ok(message) = serde_json::from_str::<RawObject<'_>>(message.get()) else {
             continue;
         };
+        // Inspect every role occurrence so duplicate tags cannot conceal a
+        // native reference before the typed envelope rejects the duplicate.
+        if !message.has_string_field("role", NATIVE_CONTENT_ROLES) {
+            continue;
+        }
         for (_, content) in message.0.iter().filter(|(key, _)| key == "content") {
             let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(content.get()) else {
                 continue;
@@ -798,7 +814,7 @@ fn native_attachment_data_spans(json: &str) -> Result<Vec<(usize, &RawValue)>> {
                 let Ok(block) = serde_json::from_str::<RawObject<'_>>(block.get()) else {
                     continue;
                 };
-                if !block.has_type(&["image", "media"]) {
+                if !block.has_string_field("type", &["image", "media"]) {
                     continue;
                 }
                 for (_, data) in block.0.iter().filter(|(key, _)| key == "data") {
@@ -1431,7 +1447,7 @@ mod tests {
         let fork_target = parent.append_message(text_message("try another path"));
         save(&mut parent);
         let parent = open(&path).expect("hydrate parent");
-        let snapshot = parent.export_snapshot();
+        let snapshot = parent.export_snapshot().expect("complete export snapshot");
 
         let copied_path = directory.path().join("copy.jsonl");
         let mut copied = parent.clone();
@@ -1498,6 +1514,71 @@ mod tests {
             serde_json::to_value(&session.entries).unwrap()
         );
         assert!(fs::read_to_string(&path).unwrap().contains(&invalid));
+    }
+
+    #[test]
+    fn bash_content_metadata_survives_save_append_rewrite_and_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("opaque-bash.jsonl");
+        let bytes = vec![0x46; INLINE_BYTES + 5];
+        let contents = [
+            json!([
+                {"type":"image","mimeType":"image/png","data":STANDARD.encode(&bytes)},
+                {"type":"media","mimeType":"audio/wav","data":STANDARD_NO_PAD.encode(&bytes)}
+            ]),
+            json!([
+                {"type":"image","data":{
+                    "$piBlob":format!("sha256:{}", "0".repeat(64)),
+                    "sizeBytes":1,"encoding":"base64"
+                }},
+                {"type":"media","data":{"$piBlob":"../../opaque","sizeBytes":"unknown"}},
+                {"type":"image","data":null},
+                {"type":"media","data":["arbitrary",42]}
+            ]),
+        ];
+        let mut session = session_at(&path);
+        for content in contents {
+            let bash: SessionMessage = serde_json::from_value(json!({
+                "role":"bashExecution","command":"printf done","output":"done",
+                "exitCode":0,"timestamp":1,"content":content
+            }))
+            .expect("bash execution accepts opaque metadata");
+            session.append_message(bash);
+            let original = serde_json::to_value(&session.entries).expect("native entries");
+            save(&mut session);
+            assert_eq!(Value::Array(wire_entries(&path)), original);
+            assert!(!sidecar_path(&path).exists());
+            assert_eq!(
+                serde_json::to_value(open(&path).expect("reopen opaque metadata").entries).unwrap(),
+                original
+            );
+            let entry = session.entries.last().expect("appended bash entry");
+            let json = serde_json::to_string(entry).expect("native JSON");
+            assert!(
+                native_reference_spans(&json)
+                    .expect("inspect native content")
+                    .is_empty()
+            );
+            let stored =
+                decode_stored_entry(None, &json).expect("opaque metadata needs no source path");
+            assert_eq!(
+                stored.payload().unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+        assert_eq!(session.appends_since_checkpoint, 1, "exercise append path");
+        let original = serde_json::to_value(&session.entries).unwrap();
+        let mut loaded = open(&path).expect("open before rewrite");
+        loaded.header.provider = Some("test-provider".to_string());
+        loaded.header_dirty = true;
+        save(&mut loaded);
+        assert_eq!(loaded.appends_since_checkpoint, 0, "exercise full rewrite");
+        assert_eq!(Value::Array(wire_entries(&path)), original);
+        assert!(!sidecar_path(&path).exists());
+        assert_eq!(
+            serde_json::to_value(open(&path).expect("reopen rewritten metadata").entries).unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -1591,7 +1672,14 @@ mod tests {
                 "timestamp":"2026-01-01T00:00:00Z",
                 "message":{original_message},"customType":"opaque"}}"#
         );
-        for source in [duplicate_content, duplicate_message, duplicate_type] {
+        let mut duplicate_wrappers = vec![duplicate_content, duplicate_message, duplicate_type];
+        for (first, second) in [("user", "bashExecution"), ("bashExecution", "user")] {
+            duplicate_wrappers.push(format!(
+                r#"{entry_prefix}{{"role":"{first}","role":"{second}",
+                    "command":"true","output":"","exitCode":0,"content":{content}}}}}"#
+            ));
+        }
+        for source in duplicate_wrappers {
             assert_attachment_error(
                 decode_entry(Some(&path), &source).expect_err("duplicate wrapper cannot hide ref"),
                 "duplicate",
@@ -2055,6 +2143,320 @@ mod tests {
         let dry_run =
             crate::session::migrate_dry_run(&path).expect("portable dry-run source context");
         assert!(dry_run.entry_count_match && dry_run.hash_chain_match && dry_run.index_consistent);
+    }
+
+    #[test]
+    fn partial_exports_include_hidden_media_and_pending_entries_without_mutating_the_source() {
+        for mode in [V2OpenMode::ActivePath, V2OpenMode::Tail(1)] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("export-branches.jsonl");
+            let mut source = session_at(&path);
+            let root = source.append_message(text_message("export-root-sentinel"));
+            let image_data = STANDARD.encode(vec![0x61; INLINE_BYTES + 2]);
+            let media_data = STANDARD_NO_PAD.encode(vec![0x62; INLINE_BYTES + 3]);
+            let hidden = source.append_message(message(vec![
+                ContentBlock::Text(crate::model::TextContent::new("hidden-media-sentinel")),
+                image(image_data.clone()),
+                media(media_data.clone(), "audio/wav"),
+            ]));
+            assert!(source.navigate_to(&root));
+            source.append_message(text_message("export-active-sentinel"));
+            save(&mut source);
+            let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+            let (mut partial, diagnostics) =
+                Session::open_from_v2_with_source(&store, source.header.clone(), mode, Some(&path))
+                    .expect("open partial export source");
+            assert!(diagnostics.skipped_entries.is_empty());
+            assert!(diagnostics.orphaned_parent_links.is_empty());
+            assert!(partial.has_partial_v2_hydration());
+            assert!(partial.get_entry(&hidden).is_none());
+            partial.path = Some(path.clone());
+            partial.v2_sidecar_root = Some(session_store_v2::v2_sidecar_path(&path));
+            let pending = partial.append_message(text_message("export-pending-sentinel"));
+            let before_entries = serde_json::to_value(&partial.entries).unwrap();
+            let before_header = serde_json::to_value(&partial.header).unwrap();
+            let before_persisted = partial
+                .persisted_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let before_disk = fs::read(&path).unwrap();
+
+            let snapshot = partial
+                .export_snapshot()
+                .expect("complete partial snapshot");
+            assert_eq!(snapshot.entries.len(), source.entries.len() + 1);
+            assert_eq!(
+                serde_json::to_value(
+                    snapshot
+                        .entries
+                        .iter()
+                        .find(|entry| entry.base_id() == Some(&hidden))
+                        .expect("hidden branch is exported"),
+                )
+                .unwrap(),
+                serde_json::to_value(source.get_entry(&hidden).unwrap()).unwrap()
+            );
+            assert_eq!(snapshot.entries.last().unwrap().base_id(), Some(&pending));
+            let html = snapshot.to_html();
+            assert_eq!(partial.to_html().expect("complete direct export"), html);
+            assert!(html.contains("media-src data:"));
+            for text in [
+                "export-root-sentinel",
+                "hidden-media-sentinel",
+                "export-active-sentinel",
+                "export-pending-sentinel",
+                image_data.as_str(),
+                media_data.as_str(),
+            ] {
+                assert!(
+                    html.contains(text),
+                    "missing exported content under {mode:?}"
+                );
+            }
+            assert!(!html.contains("$piBlob"));
+            assert_eq!(
+                serde_json::to_value(&partial.entries).unwrap(),
+                before_entries
+            );
+            assert_eq!(
+                serde_json::to_value(&partial.header).unwrap(),
+                before_header
+            );
+            assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+            assert_eq!(
+                partial
+                    .persisted_entry_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                before_persisted
+            );
+            assert!(partial.has_partial_v2_hydration());
+            assert_eq!(fs::read(&path).unwrap(), before_disk);
+        }
+    }
+
+    #[test]
+    fn partial_exports_fail_closed_on_missing_or_corrupt_hidden_media() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("broken-export.jsonl");
+            let mut source = session_at(&path);
+            let root = source.append_message(text_message("root"));
+            let hidden =
+                source.append_message(message(vec![image(
+                    STANDARD.encode(vec![0x63; INLINE_BYTES + 2]),
+                )]));
+            assert!(source.navigate_to(&root));
+            source.append_message(text_message("active"));
+            save(&mut source);
+            let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+            let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+                &store,
+                source.header.clone(),
+                V2OpenMode::ActivePath,
+                Some(&path),
+            )
+            .unwrap();
+            assert!(diagnostics.skipped_entries.is_empty());
+            assert!(partial.get_entry(&hidden).is_none());
+            partial.path = Some(path.clone());
+            partial.v2_sidecar_root = Some(session_store_v2::v2_sidecar_path(&path));
+            let pending = partial.append_message(text_message("unsaved operator work"));
+            let before_entries = serde_json::to_value(&partial.entries).unwrap();
+            let before_disk = fs::read(&path).unwrap();
+            let blob = blobs(&path).pop().unwrap();
+            let detail = if corrupt {
+                fs::write(&blob, vec![0x64; INLINE_BYTES + 2]).unwrap();
+                "digest"
+            } else {
+                fs::rename(&blob, directory.path().join("unavailable-attachment")).unwrap();
+                "missing"
+            };
+
+            assert_attachment_error(
+                partial
+                    .export_snapshot()
+                    .expect_err("do not export a partial snapshot"),
+                detail,
+            );
+            assert_attachment_error(
+                partial
+                    .to_html()
+                    .expect_err("do not render a truncated export"),
+                detail,
+            );
+            assert_eq!(
+                serde_json::to_value(&partial.entries).unwrap(),
+                before_entries
+            );
+            assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+            assert!(partial.has_partial_v2_hydration());
+            assert_eq!(fs::read(&path).unwrap(), before_disk);
+        }
+    }
+
+    #[test]
+    fn partial_exports_use_jsonl_when_the_v2_cache_disappears() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("missing-export-cache.jsonl");
+        let mut source = session_at(&path);
+        let root = source.append_message(text_message("root"));
+        let image_data = STANDARD.encode(vec![0x65; INLINE_BYTES + 2]);
+        let media_data = STANDARD_NO_PAD.encode(vec![0x66; INLINE_BYTES + 3]);
+        let hidden = source.append_message(message(vec![
+            image(image_data.clone()),
+            media(media_data.clone(), "audio/wav"),
+        ]));
+        assert!(source.navigate_to(&root));
+        source.append_message(text_message("active branch"));
+        save(&mut source);
+        let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+        let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+            &store,
+            source.header.clone(),
+            V2OpenMode::ActivePath,
+            Some(&path),
+        )
+        .unwrap();
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert!(partial.has_partial_v2_hydration());
+        assert!(partial.get_entry(&hidden).is_none());
+        partial.path = Some(path.clone());
+        let v2_root = session_store_v2::v2_sidecar_path(&path);
+        partial.v2_sidecar_root = Some(v2_root.clone());
+        let pending = partial.append_message(text_message("unsaved operator work"));
+        fs::rename(&v2_root, directory.path().join("parked-v2-cache")).unwrap();
+        let before_disk = fs::read(&path).unwrap();
+        let before_blobs = blobs(&path)
+            .into_iter()
+            .map(|blob| {
+                let bytes = fs::read(&blob).unwrap();
+                (blob, bytes)
+            })
+            .collect::<Vec<_>>();
+        let before_entries = serde_json::to_value(&partial.entries).unwrap();
+        let before_header = serde_json::to_value(&partial.header).unwrap();
+        let before_persisted = partial
+            .persisted_entry_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let snapshot = partial.export_snapshot().expect("read authoritative JSONL");
+        assert_eq!(snapshot.entries.len(), source.entries.len() + 1);
+        assert_eq!(
+            serde_json::to_value(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.base_id() == Some(&hidden))
+                    .expect("hidden media branch is exported"),
+            )
+            .unwrap(),
+            serde_json::to_value(source.get_entry(&hidden).unwrap()).unwrap()
+        );
+        assert_eq!(snapshot.entries.last().unwrap().base_id(), Some(&pending));
+        let html = snapshot.to_html();
+        assert_eq!(partial.to_html().expect("direct JSONL export"), html);
+        assert!(html.contains(&image_data));
+        assert!(html.contains(&media_data));
+        assert!(html.contains("unsaved operator work"));
+        assert!(!v2_root.exists(), "export must not recreate the V2 cache");
+        assert_eq!(fs::read(&path).unwrap(), before_disk);
+        assert_eq!(blobs(&path).len(), before_blobs.len());
+        for (blob, bytes) in before_blobs {
+            assert_eq!(fs::read(blob).unwrap(), bytes);
+        }
+        assert_eq!(
+            serde_json::to_value(&partial.entries).unwrap(),
+            before_entries
+        );
+        assert_eq!(
+            serde_json::to_value(&partial.header).unwrap(),
+            before_header
+        );
+        assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+        assert_eq!(
+            partial
+                .persisted_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before_persisted
+        );
+        assert!(partial.has_partial_v2_hydration());
+    }
+
+    #[test]
+    fn partial_exports_do_not_repair_corrupt_v2_sidecars() {
+        fn snapshot_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut snapshot = std::collections::BTreeMap::new();
+            let mut directories = vec![root.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    if entry.file_type().unwrap().is_dir() {
+                        snapshot.insert(relative, None);
+                        directories.push(path);
+                    } else {
+                        snapshot.insert(relative, Some(fs::read(path).unwrap()));
+                    }
+                }
+            }
+            snapshot
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("corrupt-export-cache.jsonl");
+        let mut source = session_at(&path);
+        let root = source.append_message(text_message("root"));
+        let hidden = source.append_message(text_message("hidden branch"));
+        assert!(source.navigate_to(&root));
+        source.append_message(text_message("active branch"));
+        save(&mut source);
+        let store = crate::session::create_v2_sidecar_from_jsonl(&path).unwrap();
+        let (mut partial, diagnostics) = Session::open_from_v2_with_source(
+            &store,
+            source.header.clone(),
+            V2OpenMode::ActivePath,
+            Some(&path),
+        )
+        .unwrap();
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert!(partial.has_partial_v2_hydration());
+        assert!(partial.get_entry(&hidden).is_none());
+        partial.path = Some(path.clone());
+        let v2_root = session_store_v2::v2_sidecar_path(&path);
+        partial.v2_sidecar_root = Some(v2_root.clone());
+        let pending = partial.append_message(text_message("unsaved operator work"));
+        fs::write(v2_root.join("manifest.json"), b"{ invalid manifest\n").unwrap();
+        let before_files = snapshot_files(directory.path());
+        let before_entries = serde_json::to_value(&partial.entries).unwrap();
+        let before_header = serde_json::to_value(&partial.header).unwrap();
+        let before_persisted = partial
+            .persisted_entry_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        partial
+            .export_snapshot()
+            .expect_err("export must not silently repair a corrupt V2 manifest");
+        partial
+            .to_html()
+            .expect_err("direct export must not silently repair a corrupt V2 manifest");
+
+        assert_eq!(snapshot_files(directory.path()), before_files);
+        assert_eq!(
+            serde_json::to_value(&partial.entries).unwrap(),
+            before_entries
+        );
+        assert_eq!(
+            serde_json::to_value(&partial.header).unwrap(),
+            before_header
+        );
+        assert_eq!(partial.leaf_id(), Some(pending.as_str()));
+        assert_eq!(
+            partial
+                .persisted_entry_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before_persisted
+        );
+        assert!(partial.has_partial_v2_hydration());
     }
 
     #[test]

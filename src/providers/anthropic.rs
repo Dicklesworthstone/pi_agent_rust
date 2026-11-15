@@ -450,7 +450,9 @@ fn mark_last_user_block_for_caching(
             | AnthropicContent::ToolResult { cache_control, .. } => {
                 *cache_control = Some(cc);
             }
-            AnthropicContent::Thinking { .. } | AnthropicContent::ToolUse { .. } => {}
+            AnthropicContent::Thinking { .. }
+            | AnthropicContent::RedactedThinking { .. }
+            | AnthropicContent::ToolUse { .. } => {}
         }
     }
 }
@@ -517,10 +519,28 @@ impl AnthropicProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> AnthropicRequest<'a> {
+        self.build_request_for_api(context, options, self.api())
+    }
+
+    /// Vertex shares the Messages wire format but records its own API identity.
+    fn build_request_for_api<'a>(
+        &'a self,
+        context: &'a Context<'_>,
+        options: &StreamOptions,
+        destination_api: &str,
+    ) -> AnthropicRequest<'a> {
         let mut messages: Vec<AnthropicMessage<'_>> = context
             .messages
             .iter()
-            .map(convert_message_to_anthropic)
+            .filter_map(|message| {
+                let replay_thinking = matches!(message, Message::Assistant(assistant)
+                    if can_replay_thinking(assistant, &self.provider, destination_api));
+                let converted = convert_message_to_anthropic(message, replay_thinking);
+                // A foreign reasoning-only turn has no Messages content after
+                // projection. Sending an empty assistant message is invalid.
+                (converted.role != "assistant" || !converted.content.is_empty())
+                    .then_some(converted)
+            })
             .collect();
 
         // Prompt-cache breakpoints. One marker on the system block, one on the
@@ -1282,6 +1302,9 @@ enum AnthropicContent<'a> {
         thinking: &'a str,
         signature: &'a str,
     },
+    RedactedThinking {
+        data: &'a str,
+    },
     Image {
         source: AnthropicImageSource<'a>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1484,7 +1507,25 @@ struct AnthropicError {
 // Conversion Functions
 // ============================================================================
 
-fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
+/// Reasoning is opaque provider state, not portable text. Its message origin
+/// decides whether it can be replayed; inspecting a signature's bytes cannot.
+/// Compatible model changes on the same route keep the original blocks so the
+/// API can decide which model signatures it understands.
+fn can_replay_thinking(message: &AssistantMessage, provider: &str, destination_api: &str) -> bool {
+    if provider.is_empty() || message.provider != provider || message.api != destination_api {
+        return false;
+    }
+    // Vertex uses one API/provider identity for both Gemini and Claude. Only
+    // Claude history has Anthropic thinking blocks, including resource IDs.
+    destination_api != "google-vertex"
+        || message
+            .model
+            .rsplit('/')
+            .next()
+            .is_some_and(|model| model.to_ascii_lowercase().starts_with("claude-"))
+}
+
+fn convert_message_to_anthropic(message: &Message, replay_thinking: bool) -> AnthropicMessage<'_> {
     match message {
         Message::User(user) => AnthropicMessage {
             role: "user",
@@ -1502,7 +1543,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
             content: assistant
                 .content
                 .iter()
-                .filter_map(convert_content_block_to_anthropic)
+                .filter_map(|block| convert_content_block_to_anthropic(block, replay_thinking))
                 .collect(),
         },
         Message::ToolResult(result) => AnthropicMessage {
@@ -1569,7 +1610,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     }
 }
 
-fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
+fn convert_content_block_to_anthropic(
+    block: &ContentBlock,
+    replay_thinking: bool,
+) -> Option<AnthropicContent<'_>> {
     match block {
         ContentBlock::Text(t) => Some(AnthropicContent::Text {
             text: Cow::Borrowed(&t.text),
@@ -1580,39 +1624,25 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
             name: &tc.name,
             input: &tc.arguments,
         }),
-        // Thinking blocks must be echoed back with their signature for
-        // multi-turn extended thinking.  Skip blocks without a signature
-        // (the API would reject them).
-        ContentBlock::Thinking(t) => {
+        // Tool-result continuations must echo every native thinking block,
+        // including empty signed thinking and opaque redacted payloads, in the
+        // original order. Unsigned thinking is not a valid Messages input.
+        ContentBlock::Thinking(t) if replay_thinking => {
             t.thinking_signature
                 .as_ref()
-                // Only echo a signature that is actually an Anthropic one.
-                // A session recorded on the openai-responses route stores its
-                // raw reasoning item (a JSON object) in `thinking_signature`;
-                // on a mid-session switch to an Anthropic model that JSON would
-                // be sent as an Anthropic `signature` and rejected with a 400.
-                // Anthropic signatures are opaque base64 tokens, so they never
-                // begin with `{` — foreign JSON payloads are dropped, matching
-                // the TS reference's cross-model signature stripping.
-                .filter(|sig| !is_foreign_reasoning_signature(sig))
                 .map(|sig| AnthropicContent::Thinking {
                     thinking: &t.thinking,
                     signature: sig,
                 })
         }
-        // Images and redacted-thinking markers don't round-trip back to the
-        // Anthropic input surface — Anthropic discards redacted-thinking on
-        // subsequent turns, so we do the same.
-        ContentBlock::Image(_) | ContentBlock::Media(_) | ContentBlock::RedactedThinking(_) => None,
+        ContentBlock::RedactedThinking(t) if replay_thinking => {
+            Some(AnthropicContent::RedactedThinking { data: &t.data })
+        }
+        ContentBlock::Image(_)
+        | ContentBlock::Media(_)
+        | ContentBlock::Thinking(_)
+        | ContentBlock::RedactedThinking(_) => None,
     }
-}
-
-/// True when a `thinking_signature` is a foreign (non-Anthropic) reasoning
-/// payload rather than a native Anthropic base64 signature. The openai-responses
-/// route stores its raw reasoning item — a JSON object — in this field; a native
-/// Anthropic signature is opaque base64 and can never begin with `{`.
-fn is_foreign_reasoning_signature(signature: &str) -> bool {
-    signature.trim_start().starts_with('{')
 }
 
 fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
@@ -1643,35 +1673,194 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn thinking_block_drops_foreign_reasoning_signature() {
-        // A native Anthropic signature (opaque base64) is echoed back.
-        let native = ContentBlock::Thinking(ThinkingContent {
-            thinking: "step".to_string(),
-            thinking_signature: Some("Cg8KDXNvbWViYXNlNjQ=".to_string()),
-        });
-        match convert_content_block_to_anthropic(&native) {
-            Some(AnthropicContent::Thinking { signature, .. }) => {
-                assert_eq!(signature, "Cg8KDXNvbWViYXNlNjQ=");
-            }
-            other => panic!("expected thinking block with signature, got {other:?}"),
+    fn replay_test_assistant(provider: &str, api: &str, model: &str) -> AssistantMessage {
+        AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some("c2lnLWVtcHR5".to_string()),
+                }),
+                ContentBlock::RedactedThinking(RedactedThinkingContent {
+                    data: "b3BhcXVlCg==".to_string(),
+                }),
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "Read the file.".to_string(),
+                    // Synthetic opaque token deliberately defeats the former
+                    // prefix heuristic: origin, not token shape, is decisive.
+                    thinking_signature: Some("  {opaque-signature}\n".to_string()),
+                }),
+                ContentBlock::Text(TextContent::new("I will read the file.")),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_read".to_string(),
+                    name: "read".to_string(),
+                    arguments: json!({"path": "src/lib.rs"}),
+                    thought_signature: None,
+                }),
+            ],
+            api: api.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            stop_reason: StopReason::ToolUse,
+            ..Default::default()
         }
+    }
 
-        // A foreign openai-responses raw reasoning item (JSON) is dropped so it
-        // is never sent to Anthropic as a signature (would 400).
-        let foreign = ContentBlock::Thinking(ThinkingContent {
-            thinking: "step".to_string(),
-            thinking_signature: Some(
-                r#"{"type":"reasoning","id":"rs_1","encrypted_content":"x"}"#.to_string(),
+    #[test]
+    fn request_preserves_native_thinking_order_and_opaque_payloads_across_model_changes() {
+        for provider_name in ["anthropic", "configured-claude-relay"] {
+            let provider =
+                AnthropicProvider::new("claude-sonnet-4-6").with_provider_name(provider_name);
+            let context = Context {
+                messages: vec![Message::assistant(replay_test_assistant(
+                    provider_name,
+                    "anthropic-messages",
+                    "claude-opus-4-6",
+                ))]
+                .into(),
+                ..Default::default()
+            };
+            let saved = serde_json::to_value(context.messages.as_ref()).unwrap();
+            let body =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .unwrap();
+
+            assert_eq!(
+                body["messages"],
+                json!([{"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": "c2lnLWVtcHR5"},
+                    {"type": "redacted_thinking", "data": "b3BhcXVlCg=="},
+                    {"type": "thinking", "thinking": "Read the file.", "signature": "  {opaque-signature}\n"},
+                    {"type": "text", "text": "I will read the file."},
+                    {"type": "tool_use", "id": "call_read", "name": "read", "input": {"path": "src/lib.rs"}}
+                ]}]),
+                "{provider_name}"
+            );
+            assert_eq!(
+                serde_json::to_value(context.messages.as_ref()).unwrap(),
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn request_excludes_foreign_reasoning_without_losing_text_or_tool_results() {
+        let provider = AnthropicProvider::new("claude-sonnet-4-6")
+            .with_provider_name("configured-claude-relay");
+        for (source_provider, source_api, source_model) in [
+            ("google", "google-generative-ai", "gemini-2.5-pro"),
+            (
+                "amazon-bedrock",
+                "bedrock-converse-stream",
+                "anthropic.claude-sonnet",
             ),
-        });
-        assert!(
-            convert_content_block_to_anthropic(&foreign).is_none(),
-            "foreign JSON reasoning signature must be dropped, not echoed to Anthropic"
-        );
+            ("openai", "openai-responses", "gpt-5"),
+            ("anthropic", "anthropic-messages", "claude-sonnet-4-6"),
+            ("other-relay", "anthropic-messages", "claude-sonnet-4-6"),
+            (
+                "configured-claude-relay",
+                "bedrock-converse-stream",
+                "claude-sonnet-4-6",
+            ),
+            (
+                "configured-claude-relay",
+                "google-vertex",
+                "claude-sonnet-4-6",
+            ),
+            ("configured-claude-relay", "", "claude-sonnet-4-6"),
+            ("", "anthropic-messages", "claude-sonnet-4-6"),
+        ] {
+            let assistant = replay_test_assistant(source_provider, source_api, source_model);
+            let mut reasoning_only = assistant.clone();
+            reasoning_only.content.truncate(3);
+            let context = Context {
+                messages: vec![
+                    Message::assistant(reasoning_only),
+                    Message::assistant(assistant),
+                    Message::tool_result(crate::model::ToolResultMessage {
+                        tool_call_id: "call_read".to_string(),
+                        tool_name: "read".to_string(),
+                        content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+                        details: None,
+                        is_error: false,
+                        timestamp: 0,
+                    }),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let saved = serde_json::to_value(context.messages.as_ref()).unwrap();
+            let body =
+                serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                    .unwrap();
 
-        assert!(is_foreign_reasoning_signature("  {\"type\":\"reasoning\"}"));
-        assert!(!is_foreign_reasoning_signature("Cg8KDXNvbWViYXNlNjQ="));
+            assert_eq!(
+                body["messages"],
+                json!([
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "I will read the file."},
+                        {"type": "tool_use", "id": "call_read", "name": "read", "input": {"path": "src/lib.rs"}}
+                    ]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_read",
+                        "content": [{"type": "text", "text": "file contents"}]}]}
+                ]),
+                "{source_provider}/{source_api}/{source_model}"
+            );
+            assert_eq!(
+                serde_json::to_value(context.messages.as_ref()).unwrap(),
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn vertex_replays_only_claude_history_from_the_same_provider_and_api() {
+        let provider =
+            AnthropicProvider::new("claude-sonnet-4-6").with_provider_name("google-vertex");
+        for (source_provider, source_api, source_model, expected_blocks) in [
+            ("google-vertex", "google-vertex", "claude-opus-4-6", 5),
+            (
+                "google-vertex",
+                "google-vertex",
+                "publishers/anthropic/models/claude-opus-4-6",
+                5,
+            ),
+            ("google-vertex", "google-vertex", "gemini-2.5-pro", 2),
+            (
+                "google-vertex",
+                "google-vertex",
+                "publishers/google/models/gemini-2.5-pro",
+                2,
+            ),
+            ("google-vertex", "google-vertex", "", 2),
+            ("anthropic", "google-vertex", "claude-opus-4-6", 2),
+            ("google-vertex", "anthropic-messages", "claude-opus-4-6", 2),
+        ] {
+            let context = Context {
+                messages: vec![Message::assistant(replay_test_assistant(
+                    source_provider,
+                    source_api,
+                    source_model,
+                ))]
+                .into(),
+                ..Default::default()
+            };
+            let body = serde_json::to_value(provider.build_request_for_api(
+                &context,
+                &StreamOptions::default(),
+                "google-vertex",
+            ))
+            .unwrap();
+            let content = body["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(content.len(), expected_blocks, "{source_model}");
+            if expected_blocks == 5 {
+                assert_eq!(content[0]["signature"], "c2lnLWVtcHR5");
+                assert_eq!(content[1]["data"], "b3BhcXVlCg==");
+                assert_eq!(content[2]["signature"], "  {opaque-signature}\n");
+            } else {
+                assert_eq!(content[0]["type"], "text");
+                assert_eq!(content[1]["type"], "tool_use");
+            }
+        }
     }
 
     #[test]
@@ -1743,7 +1932,8 @@ mod tests {
             is_error: false,
             timestamp: 0,
         });
-        let wire = serde_json::to_value(convert_message_to_anthropic(&result)).expect("serialize");
+        let wire =
+            serde_json::to_value(convert_message_to_anthropic(&result, false)).expect("serialize");
         assert_eq!(wire["content"][0]["type"], "tool_result");
         assert_eq!(
             wire["content"][0]["content"],
@@ -1759,7 +1949,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_anthropic(&message);
+        let converted = convert_message_to_anthropic(&message, false);
         assert_eq!(converted.role, "user");
         assert_eq!(converted.content.len(), 1);
     }

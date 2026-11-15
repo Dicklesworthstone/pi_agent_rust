@@ -7347,7 +7347,24 @@ mod tests {
     #[test]
     fn oauth_callback_drop_releases_idle_fixed_and_random_ports() {
         static NEXT_AUTH_DROP_TEST_PORT: std::sync::atomic::AtomicU16 =
-            std::sync::atomic::AtomicU16::new(19_100);
+            std::sync::atomic::AtomicU16::new(0);
+        // `cargo test --all-targets` executes both the `lib` and `bin` (`pi`)
+        // unit-test binaries concurrently on the same host. Serialize across
+        // processes via a dedicated loopback guard port so two test processes
+        // never race on the fixed localhost callback port during drop/rebind.
+        let lock_deadline = Instant::now() + Duration::from_secs(15);
+        let cross_process_guard = loop {
+            match TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 17_999)) {
+                Ok(guard) => break guard,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AddrInUse
+                        && Instant::now() < lock_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("acquire cross-process callback drop test lock: {err}"),
+            }
+        };
         let check_drop = |server: OAuthCallbackServer, port: u16| {
             let io = Arc::clone(&server.io);
             drop(server);
@@ -7393,11 +7410,12 @@ mod tests {
         // Choose a localhost port strictly below both `interactive::commands`'s
         // 20000..30000 callback test range and the OS ephemeral range
         // (32768..65535) so concurrent test threads cannot collide on it.
-        let fixed_port = (0..800_u16)
+        let pid_salt = u16::try_from(std::process::id().wrapping_mul(131) % 1_900).unwrap_or(0);
+        let fixed_port = (0..1_900_u16)
             .map(|_| {
                 let raw =
                     NEXT_AUTH_DROP_TEST_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                19_100 + (raw % 800)
+                18_000 + (pid_salt.wrapping_add(raw) % 1_900)
             })
             .find(|&candidate| {
                 TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, candidate)).is_ok()
@@ -7410,6 +7428,7 @@ mod tests {
             assert_eq!(server.port, fixed_port);
             check_drop(server, fixed_port);
         }
+        drop(cross_process_guard);
     }
 
     #[test]
@@ -8378,8 +8397,10 @@ mod tests {
     fn media_api_keys_resolve_stored_environment_references() {
         const CHILD: &str = "PI_MEDIA_STORED_ENV_KEY_CHILD";
         if std::env::var_os(CHILD).is_none() {
+            let child_cwd = tempfile::tempdir().expect("isolated child cwd");
             let output =
                 std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .current_dir(child_cwd.path())
                     .args([
                         "--exact",
                         "auth::tests::media_api_keys_resolve_stored_environment_references",

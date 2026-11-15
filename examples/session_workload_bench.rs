@@ -334,7 +334,7 @@ fn run_realistic_ops(session: &mut Session, args: &Args) -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("session");
         for idx in 0..args.exports {
-            let html = session.to_html();
+            let html = session.to_html()?;
             let export_path = args
                 .session_path
                 .with_file_name(format!("{stem}.export.{idx}.html"));
