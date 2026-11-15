@@ -80,6 +80,14 @@ def fixture(**settings):
                                    "itemIds": sorted([*before, *chosen])},
                     "done": done, "status": status, "timedOut": not items and not done}
 
+        async def exchange(self, tasks, *, cursor, timeout, max_items, seal):
+            state.events.append("exchange")
+            handles = await self.push(tasks) if tasks else []
+            if seal:
+                await self.finish()
+            page = await self.drain(cursor=cursor, timeout=timeout, max_items=max_items)
+            return {**page, "admittedItemIds": [handle.item_id for handle in handles]}
+
         async def close(self):
             state.events.append("close")
             state.close_calls += 1
@@ -249,12 +257,29 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lost_drain_reply_does_not_advance_cursor(self):
         cause = OSError("read failed")
+        f = fixture(concurrency=1, drain_error=cause)
+        with self.assertRaises(RuntimeError) as caught:
+            await f.run(["a", "b"], mapper, reduction(f), [])
+        self.assertEqual(caught.exception.stage, "drain")
+        self.assertIs(caught.exception.__cause__, cause)
+        self.assertIsNone(caught.exception.cursor)
+        self.assertEqual(len(f.state.tasks), 1)
+
+    async def test_lost_exchange_retains_unacknowledged_mapped_inputs(self):
+        cause = OSError("exchange reply lost after admission")
         f = fixture(drain_error=cause)
         with self.assertRaises(RuntimeError) as caught:
             await f.run(["a", "b"], mapper, reduction(f), [])
-        self.assertIs(caught.exception.__cause__, cause)
-        self.assertIsNone(caught.exception.cursor)
+        error = caught.exception
+        self.assertEqual(error.stage, "admission")
+        self.assertIs(error.__cause__, cause)
+        self.assertIsNone(error.cursor)
+        self.assertEqual(error.progress["admitted"], 1)
+        self.assertEqual(error.pending, ({"itemId": 1, "index": 0, "input": "a"},))
+        self.assertEqual(error.prepared, ({"index": 1, "input": "b"},))
         self.assertEqual(len(f.state.tasks), 2)
+        self.assertEqual(f.state.events.count("exchange"), 1)
+        self.assertEqual(f.state.close_calls, 1)
 
     async def test_shared_timeout_budget_shrinks_between_pages(self):
         f = fixture(concurrency=1)

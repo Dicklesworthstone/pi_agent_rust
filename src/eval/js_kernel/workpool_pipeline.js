@@ -11,6 +11,8 @@
     const freeze = Object.freeze;
     const define = Object.defineProperty;
     const create = Object.create;
+    const setPrototype = Object.setPrototypeOf;
+    const stringify = JSON.stringify;
     const hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     const clock = Date.now;
     const MapType = Map;
@@ -45,6 +47,51 @@
         return freeze({schema: 'pi.subagent.pool.cursor.v1', poolId, itemIds: freeze(ids)});
     };
 
+    // Match the bridge's encoded request cap. A valid individual prompt may
+    // grow substantially when JSON escapes it, so a whole window need not fit.
+    const batchSize = (prepared, poolId, cursor) => {
+        const args = create(null);
+        args.operation = 'pool_exchange';
+        args.poolId = poolId;
+        const tasks = [];
+        setPrototype(tasks, null);
+        args.tasks = tasks;
+        args.seal = false;
+        args.timeoutMs = 600000;
+        args.maxItems = 4;
+        if (cursor !== null) {
+            const position = create(null);
+            position.schema = cursor.schema;
+            position.poolId = cursor.poolId;
+            const ids = [];
+            for (const id of cursor.itemIds) ids[ids.length] = id;
+            setPrototype(ids, null);
+            position.itemIds = ids;
+            args.cursor = position;
+        }
+        const request = create(null);
+        request.name = 'subagent';
+        request.args = args;
+        let count = 0;
+        for (const item of prepared) {
+            tasks[tasks.length] = item.prompt;
+            const encoded = stringify(request);
+            let bytes = 0;
+            for (let index = 0; index < encoded.length; index++) {
+                const code = encoded.charCodeAt(index);
+                if (code < 0x80) bytes++;
+                else if (code < 0x800) bytes += 2;
+                else if (code >= 0xd800 && code <= 0xdbff) { bytes += 4; index++; }
+                else bytes += 3;
+            }
+            if (bytes > 256 * 1024) break;
+            count++;
+        }
+        // Let the existing facade report an oversized individual task without
+        // admitting a prefix or silently truncating the input.
+        return prepared.length ? Math.max(1, count) : 0;
+    };
+
     async function mapReduce(source, mapTask, reduce, initial, options = {}) {
         const fields = optionsRecord(options);
         const maxItems = hasOwn(fields, 'maxItems') ? fields.maxItems : 32;
@@ -68,6 +115,7 @@
         const deadline = clock() + timeout * 1000;
         const pending = new MapType();
         const buffered = new MapType();
+        const prepared = [];
         let pool = null;
         let cursor = null;
         // Private receive position: buffered results must not be fetched
@@ -100,8 +148,8 @@
                 await onPool(pool);
                 remaining();
             }
-            const fill = async () => {
-                while (!exhausted && pending.size < window) {
+            const fill = async (capacity = window) => {
+                while (!exhausted && pending.size + prepared.length < capacity) {
                     stage = 'source';
                     current = null;
                     remaining();
@@ -114,33 +162,28 @@
                     }
                     // One lookahead distinguishes exact capacity from overflow.
                     // Never silently truncate a generator or map the extra item.
-                    if (admitted === maxItems) {
+                    if (admitted + prepared.length === maxItems) {
                         throw new ErrorType('EVAL_PIPELINE_CAPACITY: source exceeds maxItems; accepted work was not replayed');
                     }
-                    const index = admitted;
+                    const index = admitted + prepared.length;
                     const input = step.value;
                     current = freeze({index, input});
                     stage = 'map';
                     const prompt = await mapTask(input, index);
                     remaining();
                     if (typeof prompt !== 'string' || !prompt.trim()) throw inputError();
-                    stage = 'admission';
-                    const handles = await pool.push([prompt]);
-                    // An absent/invalid acknowledgment is never retried, even
-                    // if the host may already have accepted the prompt.
-                    if (!isArray(handles) || handles.length !== 1
-                        || handles[0].itemId !== index + 1 || handles[0].poolId !== pool.id) throw protocolError();
-                    pending.set(handles[0].itemId, {index, input});
-                    admitted++;
-                    remaining();
+                    prepared.push({index, input, prompt});
                 }
-                if (exhausted && admitted > 0 && !sealed) {
-                    stage = 'finish';
-                    current = null;
-                    await pool.finish();
-                    sealed = true;
-                    remaining();
+            };
+            const acknowledge = (ids, count = prepared.length) => {
+                if (!isArray(ids) || ids.length !== count
+                    || ids.some((id,index) => !integer(id) || id !== admitted + index + 1)) throw protocolError();
+                for (let index = 0; index < ids.length; index++) {
+                    const {input, index: sourceIndex} = prepared[index];
+                    pending.set(ids[index], {index: sourceIndex, input});
                 }
+                admitted += count;
+                prepared.splice(0, count);
             };
             const reduceOne = async (id, outcome) => {
                 const {item, ok} = outcome;
@@ -161,13 +204,38 @@
                 if (ok) succeeded++; else failed++;
                 remaining();
             };
+            // Establish a native identity with the first item promptly. Later
+            // bounded windows combine admission and observation in one host
+            // call, so even 32 serial items fit the unchanged 64-call budget.
+            await fill(1);
+            if (prepared.length === 0) return freeze({...progress(), pool, cursor, status: 'empty'});
+            stage = 'admission';
+            const handles = await pool.push([prepared[0].prompt]);
+            if (!isArray(handles) || handles.length !== 1 || handles[0].poolId !== pool.id) throw protocolError();
+            acknowledge(handles.map(handle => handle.itemId));
+            remaining();
             await fill();
-            // workpool() is lazy: empty input creates no native pool or worker.
-            if (admitted === 0) return freeze({...progress(), pool, cursor, status: 'empty'});
             for (;;) {
-                stage = 'drain';
-                current = null;
-                const page = await pool.drain({cursor: received, timeout: remaining(), maxItems: 4});
+                const count = batchSize(prepared, pool.id, received);
+                const sealing = exhausted && !sealed && count === prepared.length;
+                let page;
+                if (prepared.length || sealing) {
+                    stage = prepared.length ? 'admission' : 'finish';
+                    current = count ? freeze({index: prepared[count - 1].index, input: prepared[count - 1].input}) : null;
+                    const budget = remaining();
+                    // Fill an oversized window with bounded nonblocking
+                    // exchanges before waiting, preserving worker concurrency.
+                    page = await pool.exchange(prepared.slice(0, count).map(item => item.prompt),
+                        {cursor: received, timeout: count < prepared.length ? 0 : budget, maxItems: 4, seal: sealing});
+                    if (!page || typeof page !== 'object') throw protocolError();
+                    acknowledge(page.admittedItemIds, count);
+                    sealed ||= sealing;
+                    remaining();
+                } else {
+                    stage = 'drain';
+                    current = null;
+                    page = await pool.drain({cursor: received, timeout: remaining(), maxItems: 4});
+                }
                 if (!page || !isArray(page.items) || typeof page.done !== 'boolean'
                     || page.poolId !== pool.id) throw protocolError();
                 for (const item of page.items) {
@@ -199,7 +267,7 @@
                     }
                     return freeze({...progress(), pool, cursor, status: page.status});
                 }
-                if (page.items.length === 0) throw timeoutError();
+                if (page.items.length === 0 && prepared.length === 0) throw timeoutError();
                 await fill();
             }
         } catch (cause) {
@@ -213,6 +281,9 @@
             error.item = current;
             error.pending = freeze([...pending].map(([itemId, record]) =>
                 freeze({itemId, index: record.index, input: record.input})));
+            // Mapped inputs without a trustworthy acknowledgment may already
+            // exist natively after a lost exchange reply; never replay them.
+            error.prepared = freeze(prepared.map(({index, input}) => freeze({index, input})));
             error.cleanupErrors = [];
             // Stop accepted work before invoking potentially arbitrary iterator
             // cleanup. Native close owns cancellation/reaping; no retry, new

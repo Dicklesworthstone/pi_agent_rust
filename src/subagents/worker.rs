@@ -113,6 +113,7 @@ pub(super) fn requested(input: &Value) -> Result<bool> {
                     | "pool_result"
                     | "pool_wait"
                     | "pool_drain"
+                    | "pool_exchange"
                     | "pool_close"
             ) =>
         {

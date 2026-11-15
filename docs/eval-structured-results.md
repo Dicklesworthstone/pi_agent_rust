@@ -587,12 +587,27 @@ and `details.results[0]`, including the child PID, hub identity and
 `sessionIsolation: "persistent_rpc_worker"`.
 
 Reusable workers support Unix and Windows and accept `agent`, `model`, `cwd`,
-`scope`, `timeoutSeconds` / `timeout_seconds`, and `isolation: "none"`.
+`scope`, `timeoutSeconds` / `timeout_seconds`, and
+`isolation: "none" | "worktree"`. Worktree workers accept
+`isoApply: "keep"` / `iso_apply="keep"`; keep is also the default when the
+option is omitted. Apply and drop are rejected before launch. The native host
+captures the dirty repository state once and gives the child one private worktree
+reused by every turn of its conversation, preserving a nested `cwd` within that tree.
+Close, cancellation and failure preserve the tree for explicit review.
+
+The worker snapshot's `workspace` descriptor records its `worktreePath`,
+`branch`, `baseline`, effective `cwd` and keep disposition once materialized.
+Each completed turn's native result may include `details.results[0].iso` with
+the cumulative patch against that same baseline. Later patches include earlier
+turns' changes: select the latest relevant patch instead of stacking turn
+patches. A cancelled turn may leave recoverable files and a descriptor without
+a final patch. See [isolated reusable workspaces](subagent-builtins.md#keep-an-isolated-reusable-workspace)
+for the native descriptor and preservation rules.
+
 `outputSchema` / `output_schema` or a schema-bearing definition freezes a strict
 contract for every turn, without corrective retries. If supplied,
-`schemaMode` / `schema_mode` must be `"strict"`. Worktree isolation and
-`isoApply` / `iso_apply` remain on the independent-task path. Invalid
-combinations are rejected before a worker starts.
+`schemaMode` / `schema_mode` must be `"strict"`. Invalid combinations are rejected
+before a worker starts.
 
 Each worker admits at most 32 turns, with at most 64 KiB of UTF-8 text per
 prompt and no NUL characters. Its fixed lifetime includes startup, idle time,
@@ -689,6 +704,7 @@ method: cancellation belongs to the entire pool.
 | `push(tasks)` | Atomically admit a batch and return its fixed item handles in input order. |
 | `peek()` / `status()` | One native manifest: pool state, counts, ordered item summaries and result references. |
 | `drain({cursor, timeout, maxItems})` / `drain(cursor=None, timeout=0, max_items=4)` | One native page of previously unacknowledged completed, failed or cancelled item results. Does not seal admission. |
+| `exchange(tasks, {cursor, timeout, maxItems, seal})` / `exchange(tasks=(), cursor=None, timeout=0, max_items=4, seal=False)` | One native operation admits an optional batch, optionally seals, and returns a bounded result page plus the admitted IDs and current manifest. Requires an established pool. |
 | `finish()` | Seal admission and return the aggregate `AgentJob`; accepted work continues draining. |
 | `wait(seconds=30)` | Seal admission, then await the aggregate native `ToolOutput`; raise on failure or timeout. |
 | `output()` | Poll the aggregate job result without sealing; null/`None` while pending. |
@@ -701,7 +717,10 @@ bounded excerpts with `resultRef: {poolId, itemId}`; they are not full task
 results. Its `workerContexts` rows contain a one-based `workerIndex`, `tokens`
 and `window`; null values mean the child has not supplied that measurement.
 These are the latest observed context estimates, not provider billing usage or
-a live measurement of a running prompt. `item.output()` retrieves the selected
+a live measurement of a running prompt. Each item row also records its
+`workerIndex`; the manifest's `workerWorkspaces` associates each member with
+its `workspace` descriptor and `closed` state. The descriptor is null until
+materialization, or for a member without worktree isolation. `item.output()` retrieves the selected
 native `ToolOutput`, or null/`None` while pending. `item.wait()` waits for that item without sealing
 the pool. Global `wait()` accepts a mixture of pool items, one-shot jobs,
 reusable workers and fixed worker turns, preserving input order and one shared
@@ -756,10 +775,11 @@ print({'pending': page['pendingItems'], 'hasMore': page['hasMore'], 'done': page
 
 The returned `pi.subagent.pool.drain.v1` page contains `poolId`, `jobId`,
 `agent`, `status`, `sealed`, `admittedItems`, `settledItems`, `pendingItems`,
-`items`, `cursor`, `nextCursor`, `hasMore`, `done` and `timedOut`. Each item has
-`id`, terminal `status`, and its full native `result` (`content`, `details`,
-optional `isError`). Item failures and cancellation are returned alongside
-successful results; they do not throw away the page or its partial successes.
+`workerWorkspaces`, `items`, `cursor`, `nextCursor`, `hasMore`, `done` and
+`timedOut`. Each item has `id`, `workerIndex`, terminal `status`, and its full
+native `result` (`content`, `details`, optional `isError`). Item failures and
+cancellation are returned alongside successful results; they do not throw away
+the page or its partial successes.
 
 `cursor` echoes the acknowledged IDs supplied to this call. `nextCursor` adds
 the returned IDs. Only a later call that supplies `nextCursor` acknowledges
@@ -788,6 +808,68 @@ final page. Bridge, ownership, privacy and malformed protocol failures remain
 errors, with no automatic retry or acknowledgment. The eval watchdog and
 current host-call budget still apply.
 
+### Admit work and collect results together
+
+Use `exchange()` after the first acknowledged nonempty `push()` when a pipeline
+needs to submit more work and collect completed results in the same cell. It
+combines batch admission, optional sealing and one bounded drain page into
+**one host call**. This leaves more of the cell's 64-call allowance for useful
+work than separate push, finish and drain operations.
+
+JavaScript accepts an optional task array and the ordinary drain options,
+plus `seal`:
+
+```javascript
+const page = await pool.exchange(
+    ['Review the remaining parser edge cases.'],
+    {cursor: poolCursor, timeout: 20, maxItems: 4, seal: true},
+);
+console.log({admitted: page.admittedItemIds, total: page.snapshot.admittedItems});
+for (const item of page.items) {
+    console.log({id: item.id, status: item.status, details: item.result.details});
+}
+globalThis.poolCursor = page.nextCursor;
+```
+
+Python uses an optional list or tuple and keyword options:
+
+```python
+page = await pool.exchange(
+    ['Review the remaining parser edge cases.'],
+    cursor=pool_cursor, timeout=20, max_items=4, seal=True,
+)
+print({'admitted': page['admittedItemIds'], 'total': page['snapshot']['admittedItems']})
+for item in page['items']:
+    print({'id': item['id'], 'status': item['status'], 'details': item['result']['details']})
+pool_cursor = page['nextCursor']
+```
+
+The response has the same page schema and cursor semantics as `drain()`, with
+two extra fields. `admittedItemIds` contains exactly this call's new IDs in
+input order; `snapshot` is an ordinary pool manifest. The helper validates the
+reply before adding corresponding handles to `pool.items`. Returned results
+can include any previously unacknowledged settled item, including earlier
+batches; they are not restricted to the tasks just submitted. The manifest and
+page are consecutive observations, so other submissions may make the page's
+counts newer than the embedded manifest.
+
+An empty task list submits no work. It can still seal admission and collect a
+page, and an empty exchange can read a closed pool. An unused lazy pool rejects
+`exchange()` because it has no native identity. `seal: true` / `seal=True`
+closes admission atomically with a nonempty accepted batch; accepted tasks
+continue running. Later empty exchanges or `drain()` collect the remaining
+results until `done` is true. A read timeout never cancels the pool or rolls
+back accepted tasks, and admission time counts against the same read window.
+
+Advance the cursor only after processing results. Unlike a plain drain, an
+exchange can mutate admission: **never replay it after a lost or unusable
+reply**. The helper preserves previously acknowledged handles and closes
+further local admission after an uncertain mutation. Recover membership with
+`peek()`, and read results using `drain()` with the last acknowledged cursor;
+do not resubmit the attempted tasks. Cursor, task, size and option validation
+occurs before admission. The native batch is accepted in full or rejected in
+full, and a malformed cursor cannot admit tasks or seal the pool.
+
 ### Bounds, admission and ownership
 
 Concurrency defaults to four and accepts 1–8 children. Each pool occupies
@@ -803,8 +885,8 @@ UTF-8 text of at most 64 KiB without NUL. JavaScript accepts an array; Python
 accepts a list or tuple. Empty pushes on an open pool are local no-ops. The
 entire encoded guest batch request is limited to **256 KiB** in both languages;
 split larger submissions into smaller pushes. All text, capacity and encoded
-size checks happen before dispatch. A nonempty push, `peek()`, `status()` or `drain()`
-uses one host call, not one call per item. The normal 64-call cell allowance
+size checks happen before dispatch. A nonempty push, `peek()`, `status()`,
+`drain()` or `exchange()` uses one host call, not one call per item. The normal 64-call cell allowance
 and eval watchdog still apply, and pool commands **must be awaited**.
 
 Native batch admission is atomic: a rejected batch does not enqueue a prefix.
@@ -828,13 +910,27 @@ guest object does not automatically bind to a recovered identity. No batch is
 replayed during recovery.
 
 Pool options are `name`, `agent`, `model`, `concurrency`, `cwd`, `scope`,
-`isolation: "none"`, and `timeoutSeconds` / `timeout_seconds`. Names are labels
-for the guest object. Agent definition, model, child tools and working directory
-are captured at native startup and cannot be changed by later pushes. Pools
-support Unix and Windows. `outputSchema` / `output_schema` or a schema-bearing
-definition freezes one strict output contract for every member and turn;
-`schemaMode` / `schema_mode`, when supplied, must be `"strict"`. Pools do not
-support worktree isolation or historical `seance` consultation.
+`isolation: "none" | "worktree"`, `isoApply` / `iso_apply`, and
+`timeoutSeconds` / `timeout_seconds`. Names are labels for the guest object.
+Agent definition, model, child tools and working directory are captured at
+native startup and cannot be changed by later pushes. Pools support Unix and
+Windows. `outputSchema` / `output_schema` or a schema-bearing definition freezes
+one strict output contract for every member and turn; `schemaMode` /
+`schema_mode`, when supplied, must be `"strict"`. Historical `seance`
+consultation remains on the independent-task path.
+
+For `isolation: "worktree"`, keep is the only supported disposition:
+`isoApply: "keep"` / `iso_apply="keep"` is optional, and apply or drop is
+rejected. One immutable dirty-parent baseline is captured before native
+admission; each member receives a distinct private worktree at the same
+relative `cwd`. Later turns reuse that member's worktree and conversation.
+The `workerIndex` on manifest, selected-result and drain rows identifies the
+member whose descriptor appears in `workerWorkspaces`. Result `iso` patches
+are cumulative for that member against the original baseline. Two turns on
+one member do not yield independent patches to stack, and a sibling's edits
+are never incorporated into another member's launch baseline. Finish,
+cancellation, failure and deadline expiry preserve the directories and
+descriptors for explicit review; they never apply changes to the parent.
 
 Every native launch, control request and result read re-enters the active
 Agent's current policy. Pool operations need `subagent`; aggregate job methods

@@ -704,9 +704,9 @@
         // Callers cannot overwrite the operation or turn a launch foreground.
         args.task = prompt;
         if (hasOwn(options, 'keepAlive') && options.keepAlive === true) {
-            if ((hasOwn(args, 'isolation') && args.isolation !== 'none')
-                || hasOwn(args, 'isoApply')) {
-                throw new TypeErrorType('EVAL_AGENT_INPUT: warm workers require isolation none and do not accept isoApply');
+            if ((hasOwn(args, 'isolation') && !['none','worktree'].includes(args.isolation))
+                || (hasOwn(args, 'isoApply') && (args.isolation !== 'worktree' || args.isoApply !== 'keep'))) {
+                throw new TypeErrorType('EVAL_AGENT_INPUT: warm workers accept isolation none or worktree; isolated changes require isoApply keep');
             }
             args.operation = 'worker_start';
             const started = checkWorker(await nativeResult('subagent', args), undefined, 1);
@@ -996,17 +996,17 @@
     });
     const poolCommand = async (state, operation, extra = {}) => adoptPool(state,
         await nativeResult('subagent',{operation,poolId:state.poolId,...extra}));
-    const poolBatchArgs = (state, tasks) => {
-        const args = state.poolId === null
-            ? {...state.options,operation:'pool_start',concurrency:state.concurrency,tasks}
-            : {operation:'pool_push',poolId:state.poolId,tasks};
+    const poolBoundedArgs = args => {
         // The JS bridge admits at most 256 KiB per encoded request. Keep the
         // same guest contract in Python and reject before a native admission.
         if (!boundedText(stringify({name:'subagent',args}),256 * 1024)) {
-            throw new RangeErrorType('EVAL_POOL_INPUT: encoded batch exceeds 256 KiB; split tasks across smaller push() calls');
+            throw new RangeErrorType('EVAL_POOL_INPUT: encoded batch exceeds 256 KiB; split tasks across smaller batches');
         }
         return args;
     };
+    const poolBatchArgs = (state, tasks) => poolBoundedArgs(state.poolId === null
+        ? {...state.options,operation:'pool_start',concurrency:state.concurrency,tasks}
+        : {operation:'pool_push',poolId:state.poolId,tasks});
     const peekPool = async state => {
         if (state.poolId !== null) await poolCommand(state,'pool_status');
         return poolView(state);
@@ -1101,6 +1101,76 @@
                 return page;
             });
         }
+        async exchange(tasks = [], options = {}) {
+            const state = poolGet(this);
+            const invalid = () => new TypeErrorType('EVAL_POOL_INPUT: exchange requires an existing pool, task strings, a cursor and typed drain/seal options');
+            const fields = drainRecord(options,['cursor','timeout','maxItems','seal'],invalid);
+            const seconds = hasOwn(fields,'timeout') ? fields.timeout : 0;
+            const maximum = hasOwn(fields,'maxItems') ? fields.maxItems : 4;
+            const seal = hasOwn(fields,'seal') ? fields.seal : false;
+            if (!isArray(tasks) || tasks.length > 32 || state.poolId === null || typeof seal !== 'boolean'
+                || typeof seconds !== 'number' || !finite(seconds) || seconds < 0 || seconds > 600
+                || !integer(maximum) || maximum < 1 || maximum > 4) throw invalid();
+            const batch = [...tasks];
+            if (batch.some(task => !boundedText(task,65536))) {
+                throw new TypeErrorType('EVAL_POOL_INPUT: every task must be nonempty UTF-8 text of at most 65536 bytes without NUL');
+            }
+            const cursor = poolDrainCursor(hasOwn(fields,'cursor') ? fields.cursor : null,state.poolId,invalid);
+            // Snapshot arguments before entering the serialized pool queue.
+            // A later inherited serializer cannot alter the admitted tasks.
+            drainSetPrototype(batch,null);
+            return serialPool(state, async () => {
+                if (batch.length && state.closed) throw new ErrorType('EVAL_POOL_CLOSED: pool admission is closed; inspect items or close existing workers');
+                if (state.items.length + batch.length > 32) throw new RangeErrorType('EVAL_POOL_CAPACITY: at most 32 items may be admitted per pool');
+                const args = drainCreate(null);
+                args.operation = 'pool_exchange';
+                args.poolId = state.poolId;
+                args.tasks = batch;
+                args.seal = seal;
+                args.timeoutMs = Math.floor(seconds * 1000);
+                args.maxItems = maximum;
+                if (cursor !== null) args.cursor = cursor;
+                poolBoundedArgs(args);
+                const previous = state.items.length;
+                try {
+                    state.admissionPending = batch.length > 0;
+                    if (seal) state.closed = true;
+                    const page = await nativeResult('subagent',args);
+                    if (!modelRecord(page)) throw poolDrainProtocol();
+                    const snapshot = checkPool(page.snapshot,state.poolId);
+                    const ids = page.admittedItemIds;
+                    if (snapshot.jobId !== state.jobId || snapshot.agent !== state.options.agent
+                        || snapshot.concurrency !== state.concurrency || snapshot.admittedItems < previous
+                        || !isArray(ids) || ids.length !== batch.length || ids.some((id,index) =>
+                            !validTurnId(id) || id <= previous || id > snapshot.admittedItems
+                            || (index > 0 && id !== ids[index - 1] + 1))
+                        || (seal && !snapshot.sealed)) {
+                        throw new ErrorType('EVAL_POOL_PROTOCOL: invalid atomic exchange acknowledgment');
+                    }
+                    checkPoolDrain(page,state,cursor,maximum);
+                    if (page.admittedItems < snapshot.admittedItems || (seal && !page.sealed)) throw poolDrainProtocol();
+                    adoptPool(state,snapshot);
+                    state.closed ||= page.sealed;
+                    state.finishAcknowledged ||= seal;
+                    state.lastError = null;
+                    return page;
+                } catch (cause) {
+                    if (batch.length) {
+                        state.closed = true;
+                        state.unknownAdmission = true;
+                    }
+                    state.lastError = poolErrorText(cause);
+                    if (batch.length === 0) throw cause;
+                    const error = new ErrorType('EVAL_POOL_ADMISSION: exchange acknowledgment failed; admission closed without retry. Retained handles remain in pool.items; peek() can reconcile a known pool. ' + state.lastError);
+                    error.admitted = freeze([...state.items]);
+                    error.requested = batch.length;
+                    error.cause = cause;
+                    throw error;
+                } finally {
+                    state.admissionPending = false;
+                }
+            });
+        }
         async finish() {
             const state = poolGet(this);
             return serialPool(state, async () => {
@@ -1183,8 +1253,11 @@
                 if (value !== 'user' && value !== 'project' && value !== 'both') throw new TypeErrorType('EVAL_POOL_INPUT: scope must be user, project or both');
                 native.scope = value;
             } else if (key === 'isolation') {
-                if (value !== 'none') throw new TypeErrorType('EVAL_POOL_INPUT: workpool requires isolation none');
+                if (value !== 'none' && value !== 'worktree') throw new TypeErrorType('EVAL_POOL_INPUT: workpool isolation must be none or worktree');
                 native.isolation = value;
+            } else if (key === 'isoApply') {
+                if (value !== 'keep') throw new TypeErrorType('EVAL_POOL_INPUT: retained workpools require isoApply keep');
+                native.isoApply = value;
             } else if (key === 'timeoutSeconds') {
                 if (!integer(value) || value < 1 || value > 86400) throw new RangeErrorType('EVAL_POOL_INPUT: timeoutSeconds must be an integer from 1 to 86400');
                 native.timeoutSeconds = value;
@@ -1192,6 +1265,9 @@
                 // Native pool_start validates the frozen model and contract before admission.
                 native[key] = value;
             } else throw new TypeErrorType(`EVAL_POOL_INPUT: unknown option ${key}`);
+        }
+        if (hasOwn(native,'isoApply') && native.isolation !== 'worktree') {
+            throw new TypeErrorType('EVAL_POOL_INPUT: isoApply requires worktree isolation');
         }
         poolBatchArgs({options:native,poolId:null,concurrency},[]);
         return new AgentPool(freeze(native),name,concurrency);

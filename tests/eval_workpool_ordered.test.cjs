@@ -25,6 +25,11 @@ function fixture(options = {}) {
             });
         },
         async finish() { state.sealed = true; state.finishes++; },
+        async exchange(tasks, args) {
+            const handles = tasks.length ? await this.push(tasks) : [];
+            if (args.seal) await this.finish();
+            return {...await this.drain(args), admittedItemIds: handles.map(handle => handle.itemId)};
+        },
         async close() { state.closes++; return {allClosed: true}; },
         async drain(args) {
             state.calls.push(plain(args));

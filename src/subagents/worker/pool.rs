@@ -18,6 +18,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod exchange;
+
 const SCHEMA: &str = "pi.subagent.pool.v1";
 const MAX_POOLS: usize = 16;
 const MAX_CHILDREN: u64 = 8;
@@ -514,8 +516,77 @@ fn ensure_admission(state: &PoolState, count: usize, initial: bool) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::significant_drop_tightening)] // Every member guard spans the atomic commit.
+fn commit_batch(
+    state: &mut PoolState,
+    batch: &Batch,
+    assignments: &[String],
+    privacy: &AuxiliaryPrivacySnapshot,
+    initial: bool,
+    seal_requested: bool,
+) -> Result<bool> {
+    ensure_admission(state, assignments.len(), initial)?;
+    if state.items.len() != batch.base {
+        return Ok(false);
+    }
+    if batch.placements.len() != assignments.len() {
+        return Err(stopped());
+    }
+    // The caller already holds jobs -> pool. Lock every member in index order
+    // and validate every placement before publishing any item or sealing.
+    let members = state.workers.clone();
+    let mut workers = members
+        .iter()
+        .map(|worker| worker.lock().map_err(|_| stopped()))
+        .collect::<Result<Vec<_>>>()?;
+    let mut latest: Vec<_> = workers.iter().map(|worker| worker.latest).collect();
+    for &(index, turn) in &batch.placements {
+        let worker = workers.get(index).ok_or_else(stopped)?;
+        let latest = latest.get_mut(index).ok_or_else(stopped)?;
+        if worker.closed || worker.closing || *latest + 1 != turn {
+            return Ok(false);
+        }
+        *latest = turn;
+    }
+    let mut dependencies = Vec::with_capacity(batch.placements.len());
+    for ((index, id), task) in batch.placements.iter().zip(assignments) {
+        // Every placement was checked above; the locked member vector is
+        // unchanged throughout the winning commit.
+        let worker = workers.get_mut(*index).ok_or_else(stopped)?;
+        worker.latest = *id;
+        let dependency = crate::agent_hub::ResultDependency::new(worker.hub_id.as_deref());
+        dependencies.push(Arc::clone(&dependency));
+        worker.turns.insert(
+            *id,
+            Turn {
+                status: "queued",
+                result: None,
+                privacy: Some(privacy.clone()),
+                dependency,
+            },
+        );
+        worker.queue.push_back(PendingTurn {
+            id: *id,
+            task: task.clone(),
+        }); // ubs:ignore[rust.collections.clone-in-loop] -- Only the winning atomic admission copies each distinct accepted task into its native owned queue.
+        state.items.push(Item {
+            worker: *index,
+            turn: *id,
+        });
+    }
+    state.dependencies.extend(dependencies);
+    state.privacy.push(privacy.clone());
+    state.sealed |= seal_requested;
+    if initial {
+        for worker in &mut workers {
+            worker.acknowledged = true;
+        }
+        state.acknowledged = true;
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::significant_drop_tightening)] // Pool and member guards span the atomic commit.
 async fn admit(
     tool: &SubagentTool,
     pool: &Pool,
@@ -532,62 +603,8 @@ async fn admit(
         let job_id = pool.lock().map_err(|_| stopped())?.job_id.clone();
         let accepted = crate::jobs::with_owned_task_progress(owner_id, &job_id, || {
             let mut state = pool.lock().map_err(|_| stopped())?;
-            ensure_admission(&state, assignments.len(), initial)?;
-            if state.items.len() != batch.base {
-                return Ok((false, None));
-            }
-            // Linearize the whole batch under jobs -> pool -> all member
-            // locks, in index order. No item is queued until every placement
-            // has been checked, so a failure cannot admit a partial batch.
-            let members = state.workers.clone();
-            let mut workers = members
-                .iter()
-                .map(|worker| worker.lock().map_err(|_| stopped()))
-                .collect::<Result<Vec<_>>>()?;
-            let mut latest: Vec<_> = workers.iter().map(|worker| worker.latest).collect();
-            for &(index, turn) in &batch.placements {
-                let worker = workers.get(index).ok_or_else(stopped)?;
-                let latest = latest.get_mut(index).ok_or_else(stopped)?;
-                if worker.closed || worker.closing || *latest + 1 != turn {
-                    return Ok((false, None));
-                }
-                *latest = turn;
-            }
-            let mut dependencies = Vec::with_capacity(batch.placements.len());
-            for ((index, id), task) in batch.placements.iter().zip(assignments) {
-                // Every placement was checked above; the locked member
-                // vector is unchanged throughout the winning commit.
-                let worker = workers.get_mut(*index).ok_or_else(stopped)?;
-                worker.latest = *id;
-                let dependency = crate::agent_hub::ResultDependency::new(worker.hub_id.as_deref());
-                dependencies.push(Arc::clone(&dependency));
-                worker.turns.insert(
-                    *id,
-                    Turn {
-                        status: "queued",
-                        result: None,
-                        privacy: Some(privacy.clone()),
-                        dependency,
-                    },
-                );
-                worker.queue.push_back(PendingTurn {
-                    id: *id,
-                    task: task.clone(),
-                }); // ubs:ignore[rust.collections.clone-in-loop] -- Only the winning atomic admission copies each distinct accepted task into its native owned queue.
-                state.items.push(Item {
-                    worker: *index,
-                    turn: *id,
-                });
-            }
-            state.dependencies.extend(dependencies);
-            state.privacy.push(privacy.clone());
-            if initial {
-                for worker in &mut workers {
-                    worker.acknowledged = true;
-                }
-                state.acknowledged = true;
-            }
-            Ok((true, None))
+            let accepted = commit_batch(&mut state, &batch, assignments, privacy, initial, false)?;
+            Ok((accepted, None))
         })?;
         if accepted {
             return Ok(batch.acknowledgment);
@@ -610,6 +627,9 @@ pub(super) async fn execute(
         .ok_or_else(|| invalid("operation is required"))?;
     if operation == "pool_start" {
         return start(tool, input, privacy).await;
+    }
+    if operation == "pool_exchange" {
+        return exchange::execute(tool, input, privacy).await;
     }
     let allowed: &[&str] = match operation {
         "pool_push" => &["operation", "poolId", "tasks"],
@@ -896,6 +916,14 @@ fn drain_snapshot(
         });
         (value, state.privacy.clone())
     };
+    project_drain_snapshot(&value, &policies, privacy)
+}
+
+fn project_drain_snapshot(
+    value: &Value,
+    policies: &[AuxiliaryPrivacySnapshot],
+    privacy: &AuxiliaryPrivacySnapshot,
+) -> Result<ToolOutput> {
     let mut details = value.clone();
     for policy in policies.iter().chain(std::iter::once(privacy)) {
         details = policy.project_json(&details)?;
@@ -1441,14 +1469,14 @@ mod tests {
     use crate::tools::Tool as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    struct Fixture {
-        root: tempfile::TempDir,
-        tool: SubagentTool,
-        owner: String,
+    pub(super) struct Fixture {
+        pub(super) root: tempfile::TempDir,
+        pub(super) tool: SubagentTool,
+        pub(super) owner: String,
     }
 
     impl Fixture {
-        fn new(script: &str) -> Self {
+        pub(super) fn new(script: &str) -> Self {
             let root = tempfile::tempdir().expect("pool fixture root"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Real lifecycle tests require isolated process and artifact paths.
             let global = root.path().join("global");
             std::fs::create_dir_all(global.join("agents")).expect("agent directory"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The fixture must not discover ambient agent definitions.
@@ -1464,7 +1492,7 @@ mod tests {
             Self { root, tool, owner }
         }
 
-        async fn call(&self, input: Value) -> Value {
+        pub(super) async fn call(&self, input: Value) -> Value {
             self.tool
                 .execute("pool-fixture", input, None)
                 .await
@@ -1473,7 +1501,7 @@ mod tests {
                 .expect("pool details") // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Structured native identity and result metadata are the tested contract.
         }
 
-        async fn await_file(&self, name: &str) {
+        pub(super) async fn await_file(&self, name: &str) {
             let started = Instant::now();
             while !self.root.path().join(name).exists()
                 && started.elapsed() < Duration::from_secs(5)
@@ -1486,12 +1514,12 @@ mod tests {
             ); // ubs:ignore[rust.panic.assert-macros] -- A gate proves the child is executing before cancellation or dynamic admission.
         }
 
-        fn release(&self) {
+        pub(super) fn release(&self) {
             std::fs::write(self.root.path().join("release"), b"continue")
                 .expect("release RPC child"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This explicit gate releases real accepted work.
         }
 
-        fn assert_reaped(&self) {
+        pub(super) fn assert_reaped(&self) {
             let launches =
                 std::fs::read_to_string(self.root.path().join("launches")).expect("child PIDs"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Independently recorded PIDs prove cleanup of each actual process.
             for pid in launches.lines() {
@@ -1516,13 +1544,13 @@ mod tests {
         }
     }
 
-    fn runtime() -> asupersync::runtime::Runtime {
+    pub(super) fn runtime() -> asupersync::runtime::Runtime {
         asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("native pool runtime") // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The actual native jobs and RPC actors run on their production executor.
     }
 
-    fn field(value: &Value, key: &str) -> String {
+    pub(super) fn field(value: &Value, key: &str) -> String {
         value
             .get(key)
             .and_then(Value::as_str)
@@ -1536,14 +1564,14 @@ mod tests {
             .expect("completed native item") // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The result must be produced by the real child, not by its admission acknowledgment.
     }
 
-    fn private_projection(secret: &str) -> AuxiliaryPrivacySnapshot {
+    pub(super) fn private_projection(secret: &str) -> AuxiliaryPrivacySnapshot {
         let mut vault = crate::secrets::SecretVault::default();
         let pattern = regex::Regex::new(secret).expect("controlled secret pattern"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This literal pattern records the later-cell secret discovery.
         crate::secrets::obfuscate(secret, &mut vault, &[pattern]);
         AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::from_settings(None), &vault)
     }
 
-    const RPC_CHILD: &str = r#"
+    pub(super) const RPC_CHILD: &str = r#"
 printf '%s\n' "$$" >> launches
 memory=empty
 busy=0

@@ -56,6 +56,13 @@ function fixture(settings = {}) {
                 nextCursor: {schema: 'pi.subagent.pool.cursor.v1', poolId: this.id, itemIds: [...before, ...chosen].sort((a,b) => a-b)},
                 done, status, timedOut: items.length === 0 && !done};
         },
+        async exchange(tasks, options) {
+            state.events.push('exchange');
+            const handles = tasks.length ? await this.push(tasks) : [];
+            if (options.seal) await this.finish();
+            const page = await this.drain(options);
+            return {...page, admittedItemIds: handles.map(handle => handle.itemId)};
+        },
         async close() {
             state.events.push('close'); state.closeCalls++;
             if (settings.closeError) throw settings.closeError;
@@ -205,12 +212,27 @@ test('ambiguous admission is attempted once and exposes native cleanup uncertain
 
 test('lost drain reply never retries admission or advances the cursor', async () => {
     const cause = new Error('drain unavailable');
-    const f = fixture({drainError: cause});
+    const f = fixture({concurrency: 1, drainError: cause});
     const error = await f.run(['a','b'], mapper, reduction(f), []).catch(error => error);
     assert.equal(error.stage, 'drain');
     assert.equal(error.cause, cause);
     assert.equal(error.cursor, null);
-    assert.equal(f.state.tasks.length, 2);
+    assert.equal(f.state.tasks.length, 1);
+    assert.equal(f.state.closeCalls, 1);
+});
+
+test('lost exchange retains mapped inputs separately from acknowledged pending items', async () => {
+    const cause = new Error('exchange reply lost after admission');
+    const f = fixture({drainError: cause});
+    const error = await f.run(['a','b'], mapper, reduction(f), []).catch(error => error);
+    assert.equal(error.stage, 'admission');
+    assert.equal(error.cause, cause);
+    assert.equal(error.cursor, null);
+    assert.equal(error.progress.admitted, 1);
+    assert.deepEqual(plain(error.pending), [{itemId: 1, index: 0, input: 'a'}]);
+    assert.deepEqual(plain(error.prepared), [{index: 1, input: 'b'}]);
+    assert.equal(f.state.tasks.length, 2, 'accepted exchange is never replayed');
+    assert.equal(f.state.events.filter(event=>event==='exchange').length, 1);
     assert.equal(f.state.closeCalls, 1);
 });
 

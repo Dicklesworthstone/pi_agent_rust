@@ -392,6 +392,7 @@ All controls use the `subagent` tool with an explicit `operation` field:
 | `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
 | `pool_wait` | Requires `poolId`; accepts `itemId` and `timeoutMs`. Waits for that item, or for terminal pool state when `itemId` is omitted. Does not seal admission. |
 | `pool_drain` | Requires `poolId`; accepts `cursor`, `maxItems` (1–4, default 4) and `timeoutMs` (default 0). Returns newly settled full results and a replayable acknowledgment cursor. Does not seal or consume results. |
+| `pool_exchange` | Requires an existing `poolId`; accepts optional `tasks`, `seal` (default false), `cursor`, `maxItems` (1–4, default 4) and `timeoutMs` (default 0). Atomically admits a batch and optionally seals, then returns one drain page plus `admittedItemIds` and a `snapshot` manifest. |
 | `pool_finish` | Requires `poolId`. Seals admission and acknowledges immediately; accepted items continue draining. Repeated finish is safe. |
 | `pool_close` | Requires `poolId`. Cancels running and queued work and waits for owned child cleanup. Repeated close is safe. |
 
@@ -469,6 +470,48 @@ available after shutdown, and each read reapplies captured and current privacy
 policy. Later pushes retain earlier item IDs and remain compatible with a saved
 cursor. The cursor carries no permission and can be used after a kernel reset
 only through the owning session's permitted native tool path.
+
+### Admit a batch and observe results in one operation
+
+`pool_exchange` combines admission, optional sealing and a bounded drain page
+for an established pool. A pipeline can submit its next batch and observe
+completed work with one native operation:
+
+```json
+{
+  "operation":"pool_exchange",
+  "poolId":"pool-…",
+  "tasks":["Review the remaining parser edge cases."],
+  "seal":true,
+  "timeoutMs":10000,
+  "maxItems":4
+}
+```
+
+The response keeps `details.schema: "pi.subagent.pool.drain.v1"`, including
+ordinary drain cursors, results, workspace descriptors and lifecycle fields.
+It adds `admittedItemIds` for exactly this accepted batch and `snapshot`
+containing the ordinary `pi.subagent.pool.v1` manifest. The result page may
+include previously accepted items as well as the new batch. Its observation
+follows the manifest, so page counts can be newer if another caller submits
+work concurrently.
+
+`tasks` may be omitted or empty. A nonempty batch follows the same lifetime
+capacity, task validation and atomic admission rules as `pool_push`.
+`seal: true` commits with that batch, preventing later admission while already
+accepted work continues. An empty exchange may seal without submitting work,
+or collect a page from a terminal pool. The command never creates a pool.
+`timeoutMs` accepts 0 through 600,000 and covers admission plus observation
+without renewing the pool deadline; expiry does not undo accepted tasks.
+
+Cursor membership, settled state, options and the projected response are
+checked before admission. An invalid cursor cannot consume capacity or seal
+the pool. The read phase never repeats the mutation. Because acknowledgment
+can still be lost after a successful commit, **never replay an uncertain
+exchange**. Recover the actual membership with `pool_status`; use
+`pool_drain` and the last acknowledged cursor to read results again. The
+`nextCursor` acknowledgment still belongs to the reader and advances only
+after that reader successfully processes a page.
 
 ### Finish, cancellation and aggregate delivery
 
@@ -552,5 +595,6 @@ resume or reconstruction of child conversations from job artifacts.
 
 See [eval workpool examples](eval-structured-results.md#reusable-workpools) for
 JavaScript and Python handles, aggregate jobs and mixed waits. Native regression
-coverage lives in `src/subagents/worker/pool.rs`; the authoritative acceptance
-entry point remains `dsr quality --tool pi_agent_rust`.
+coverage lives in `src/subagents/worker/pool.rs` and its `pool/exchange.rs`
+module; the authoritative acceptance entry point remains
+`dsr quality --tool pi_agent_rust`.

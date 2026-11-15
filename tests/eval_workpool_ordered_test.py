@@ -43,6 +43,13 @@ class Fixture:
         self.sealed = True
         self.finishes += 1
 
+    async def exchange(self, tasks, *, seal, **options):
+        handles = await self.push(tasks) if tasks else []
+        if seal:
+            await self.finish()
+        page = await self.drain(**options)
+        return {**page, 'admittedItemIds': [handle.item_id for handle in handles]}
+
     async def close(self):
         self.closes += 1
         return {'allClosed': True}

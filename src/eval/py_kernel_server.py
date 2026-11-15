@@ -1659,9 +1659,10 @@ async def _agent(prompt, **options):
     # No caller-controlled field can replace the operation or select foreground.
     arguments["task"] = prompt
     if options.get("keep_alive", False):
-        if (("isolation" in arguments and arguments["isolation"] != "none")
-                or "isoApply" in arguments):
-            raise TypeError("EVAL_AGENT_INPUT: warm workers require isolation none and do not accept iso_apply")
+        if (("isolation" in arguments and arguments["isolation"] not in ("none", "worktree"))
+                or ("isoApply" in arguments and (arguments.get("isolation") != "worktree"
+                                                or arguments["isoApply"] != "keep"))):
+            raise TypeError("EVAL_AGENT_INPUT: warm workers accept isolation none or worktree; isolated changes require iso_apply keep")
         arguments["operation"] = "worker_start"
         started = _agent_worker_snapshot(await _agent_native_result("subagent", arguments), turn_id=1)
         if started["agent"] != arguments["agent"]:
@@ -1996,6 +1997,10 @@ class _AgentPool:
     def _batch_arguments(self, tasks):
         arguments = ({**self._options, "operation": "pool_start", "concurrency": self._concurrency, "tasks": tasks}
                      if self._pool_id is None else {"operation": "pool_push", "poolId": self._pool_id, "tasks": tasks})
+        return self._bounded_arguments(arguments)
+
+    @staticmethod
+    def _bounded_arguments(arguments):
         # Match the JS bridge's 256 KiB payload cap before any native mutation;
         # Python's larger outer protocol frame limit is not a pool API promise.
         try:
@@ -2004,7 +2009,7 @@ class _AgentPool:
         except (UnicodeError, ValueError):
             raise TypeError("EVAL_POOL_INPUT: pool arguments must be valid UTF-8 JSON") from None
         if len(encoded) > 256 * 1024:
-            raise ValueError("EVAL_POOL_INPUT: encoded batch exceeds 256 KiB; split tasks across smaller push() calls")
+            raise ValueError("EVAL_POOL_INPUT: encoded batch exceeds 256 KiB; split tasks across smaller batches")
         return arguments
 
     async def push(self, tasks):
@@ -2092,6 +2097,77 @@ class _AgentPool:
             # Only the caller's next explicit cursor acknowledges these results.
             # Failed observations never replay work or close further admission.
             return page
+
+    async def exchange(self, tasks=(), *, cursor=None, timeout=0, max_items=4, seal=False):
+        """Admit one batch, optionally seal, and collect one native result page.
+
+        This is one host operation under the unchanged per-cell call budget.
+        A missing response never retries a possibly admitted batch.
+        """
+        if (type(tasks) not in (list, tuple) or len(tasks) > 32
+                or self._pool_id is None or type(seal) is not bool
+                or type(timeout) not in (int, float) or not math.isfinite(timeout)
+                or not 0 <= timeout <= 600 or type(max_items) is not int or not 1 <= max_items <= 4):
+            raise TypeError("EVAL_POOL_INPUT: exchange requires an existing pool, task strings, a cursor and typed drain/seal options")
+        batch = tuple(tasks)
+        if any(not _pool_bounded_text(task, 65536) for task in batch):
+            raise TypeError("EVAL_POOL_INPUT: every task must be nonempty UTF-8 text of at most 65536 bytes without NUL")
+        previous_cursor = _pool_drain_cursor(cursor, self._pool_id, _pool_drain_input)
+        owner = _bridge_owner()
+        async with self._lock:
+            if _bridge_owner() is not owner:
+                raise ToolBridgeError("EVAL_POOL_INTERRUPTED: queued command belongs to a completed cell")
+            if batch and self._closed:
+                raise ToolBridgeError("EVAL_POOL_CLOSED: pool admission is closed; inspect items or close existing workers")
+            if len(self._items) + len(batch) > 32:
+                raise ValueError("EVAL_POOL_CAPACITY: at most 32 items may be admitted per pool")
+            arguments = {"operation": "pool_exchange", "poolId": self._pool_id, "tasks": list(batch),
+                         "seal": seal, "timeoutMs": int(timeout * 1000), "maxItems": max_items}
+            if previous_cursor is not None:
+                arguments["cursor"] = previous_cursor
+            arguments = self._bounded_arguments(arguments)
+            previous = len(self._items)
+            try:
+                self._admission_pending = bool(batch)
+                if seal:
+                    self._closed = True
+                page = await _agent_native_result("subagent", arguments)
+                if type(page) is not dict:
+                    raise _pool_drain_protocol()
+                snapshot = _pool_snapshot(page.get("snapshot"), self._pool_id)
+                ids = page.get("admittedItemIds")
+                if (snapshot["jobId"] != self._job_id or snapshot["agent"] != self._options["agent"]
+                        or snapshot["concurrency"] != self._concurrency or snapshot["admittedItems"] < previous
+                        or type(ids) is not list or len(ids) != len(batch)
+                        or any(type(item_id) is not int or not previous < item_id <= snapshot["admittedItems"]
+                               or (index > 0 and item_id != ids[index - 1] + 1)
+                               for index, item_id in enumerate(ids))
+                        or (seal and not snapshot["sealed"])):
+                    raise ToolBridgeError("EVAL_POOL_PROTOCOL: invalid atomic exchange acknowledgment")
+                _pool_check_drain(page, self, previous_cursor, max_items)
+                if page["admittedItems"] < snapshot["admittedItems"] or (seal and not page["sealed"]):
+                    raise _pool_drain_protocol()
+                self._adopt(snapshot)
+                self._closed |= page["sealed"]
+                self._finish_acknowledged |= seal
+                self._last_error = None
+                return page
+            except BaseException as cause:
+                if batch:
+                    self._closed = True
+                    self._unknown_admission = True
+                self._last_error = str(cause) or type(cause).__name__
+                if not isinstance(cause, Exception) or not batch:
+                    raise
+                error = ToolBridgeError(
+                    "EVAL_POOL_ADMISSION: exchange acknowledgment failed; admission closed without retry. "
+                    f"Retained handles remain in pool.items; peek() can reconcile a known pool. {self._last_error}"
+                )
+                error.admitted = tuple(self._items)
+                error.requested = len(batch)
+                raise error from cause
+            finally:
+                self._admission_pending = False
 
     async def finish(self):
         owner = _bridge_owner()
@@ -2187,9 +2263,13 @@ async def _workpool(**options):
                 raise TypeError("EVAL_POOL_INPUT: scope must be user, project or both")
             native[key] = value
         elif key == "isolation":
-            if value != "none":
-                raise TypeError("EVAL_POOL_INPUT: workpool requires isolation none")
+            if value not in ("none", "worktree"):
+                raise TypeError("EVAL_POOL_INPUT: workpool isolation must be none or worktree")
             native[key] = value
+        elif key == "iso_apply":
+            if value != "keep":
+                raise TypeError("EVAL_POOL_INPUT: retained workpools require iso_apply keep")
+            native["isoApply"] = value
         elif key == "timeout_seconds":
             if type(value) is not int or not 1 <= value <= 86400:
                 raise ValueError("EVAL_POOL_INPUT: timeout_seconds must be an integer from 1 to 86400")
@@ -2202,6 +2282,8 @@ async def _workpool(**options):
             native["outputSchema" if key == "output_schema" else "schemaMode"] = value
         else:
             raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
+    if "isoApply" in native and native.get("isolation") != "worktree":
+        raise TypeError("EVAL_POOL_INPUT: iso_apply requires worktree isolation")
     pool = _AgentPool(native, name, concurrency)
     pool._batch_arguments([])
     return pool

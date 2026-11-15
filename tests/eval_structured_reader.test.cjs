@@ -687,8 +687,9 @@ test('worker timeout does not cancel and turn cancellation explicitly closes the
 });
 test('warm options reject unsupported or ambiguous execution before dispatch', async () => {
     for (const options of [{keepAlive:1},{keepAlive:'true'},{keepAlive:null},
-        {keepAlive:true,isolation:'worktree'},{keepAlive:true,isoApply:false},
-        {keepAlive:true,outputSchema:{}},{keepAlive:true,schemaMode:'strict'},
+        {keepAlive:true,isolation:'container'},{keepAlive:true,isoApply:false},
+        {keepAlive:true,isoApply:'keep'},{keepAlive:true,isolation:'none',isoApply:'keep'},
+        {keepAlive:true,isolation:'worktree',isoApply:'apply'},{keepAlive:true,isolation:'worktree',isoApply:'drop'},
         {keepAlive:true,op:'worker_close'},{keepAlive:true,workerId:'foreign'}]) {
         const h = host();
         await assert.rejects(vm.runInContext(`agent('inspect',${JSON.stringify(options)})`,h.context),/EVAL_AGENT_INPUT/);
@@ -760,13 +761,20 @@ function poolHost(h) {
             assert.ok(pool,'operation must reference an acknowledged native pool');
         }
         const admittedItemIds = [];
-        if (args.operation === 'pool_start' || args.operation === 'pool_push') {
-            assert.ok(!pool.sealed);
+        if (args.operation === 'pool_start' || args.operation === 'pool_push' || args.operation === 'pool_exchange') {
+            assert.ok(!pool.sealed || args.tasks.length === 0);
             for (const task of args.tasks) {
                 const id = pool.items.length+1;
                 pool.items.push({id,task,status:id<=pool.concurrency ? 'running' : 'queued',result:null});
                 admittedItemIds.push(id);
             }
+        }
+        if (args.operation === 'pool_exchange' && args.seal) {
+            pool.sealed = true;
+            pool.status = pool.items.some(item=>item.result===null) ? 'draining' : 'completed';
+        }
+        if (args.operation === 'pool_exchange') {
+            return {...poolDrainPage(pool,args),admittedItemIds,snapshot:snapshot(pool)};
         } else if (args.operation === 'pool_finish') {
             pool.sealed = true;
             pool.status = pool.items.some(item=>item.result===null) ? 'draining' : 'completed';
@@ -778,7 +786,7 @@ function poolHost(h) {
                 item.result = {content:[],details:{cancelled:true},isError:true};
             }
         } else if (args.operation === 'pool_drain') return poolDrainPage(pool,args);
-        else assert.ok(['pool_status','pool_result','pool_wait'].includes(args.operation));
+        else assert.ok(['pool_start','pool_push','pool_status','pool_result','pool_wait'].includes(args.operation));
         const result = snapshot(pool);
         if (args.operation === 'pool_start' || args.operation === 'pool_push') result.admittedItemIds = admittedItemIds;
         if (args.itemId !== undefined) {
@@ -1025,7 +1033,9 @@ test('workpool validates every task and option before dispatch and admits 32 ite
     assert.equal(h.requests.length,1);
     await assert.rejects(vm.runInContext("pool.push(['over capacity'])",h.context),/EVAL_POOL_CAPACITY/);
     for (const options of [{concurrency:0},{concurrency:9},{concurrency:1.5},{concurrency:true},
-        {isolation:'worktree'},{timeoutSeconds:0},{scope:'all'},{keepAlive:false},{outputSchema:{}},{cwd:null}]) {
+        {isolation:'container'},{isoApply:'keep'},{isolation:'none',isoApply:'keep'},
+        {isolation:'worktree',isoApply:'apply'},{isolation:'worktree',isoApply:'drop'},
+        {timeoutSeconds:0},{scope:'all'},{keepAlive:false},{cwd:null}]) {
         await assert.rejects(vm.runInContext(`workpool(${JSON.stringify(options)})`,h.context),/EVAL_POOL_INPUT/);
     }
     assert.equal(h.requests.length,1);
@@ -1172,4 +1182,208 @@ test('workpool reports uncertainty after a lost start acknowledgment without ret
     assert.equal(closed.allClosed,false);
     await assert.rejects(vm.runInContext('pool.finish()',h.context),/EVAL_POOL_CLOSED/);
     assert.equal(h.requests.length,1);
+});
+
+test('retained workers and pools forward schema options for native validation', async () => {
+    for (const contract of [{outputSchema:{}},{schemaMode:'strict'},
+        {outputSchema:{type:'object'},schemaMode:'strict'}]) {
+        const h = host();
+        const pending = vm.runInContext(`agent('inspect',{agent:'scout',keepAlive:true,...${JSON.stringify(contract)}})`,h.context);
+        assert.deepEqual(h.requests[0].args,{name:'subagent',args:{agent:'scout',...contract,
+            task:'inspect',operation:'worker_start'}});
+        answer(h,h.requests[0],workerSnapshot('typed-worker'));
+        assert.equal((await pending).id,'typed-worker');
+        const p = host(); const native = poolHost(p);
+        await createPool(p,{agent:'scout',concurrency:1,...contract});
+        assert.equal(p.requests.length,0,'native launch retains contract validation');
+        await runPool(p,"pool.push(['inspect'])",native.reply);
+        assert.deepEqual(p.requests[0].args.args,{agent:'scout',...contract,
+            operation:'pool_start',concurrency:1,tasks:['inspect']});
+    }
+});
+
+test('retained isolation forwards worktree and keep for warm workers and pools', async () => {
+    for (const retention of [{isolation:'worktree'},{isolation:'worktree',isoApply:'keep'}]) {
+        const h = host();
+        const pending = vm.runInContext(`agent('inspect',{agent:'scout',keepAlive:true,...${JSON.stringify(retention)}})`,h.context);
+        assert.deepEqual(h.requests[0].args,{name:'subagent',args:{agent:'scout',...retention,
+            task:'inspect',operation:'worker_start'}});
+        answer(h,h.requests[0],workerSnapshot('isolated-worker'));
+        assert.equal((await pending).id,'isolated-worker');
+        assert.equal(h.requests.length,1);
+
+        const p = host(); const native = poolHost(p);
+        await createPool(p,{agent:'scout',concurrency:2,...retention});
+        await runPool(p,"pool.push(['inspect'])",native.reply);
+        assert.deepEqual(p.requests[0].args.args,{agent:'scout',...retention,
+            operation:'pool_start',concurrency:2,tasks:['inspect']});
+    }
+});
+
+test('pool exchange admits one batch and seals with one replayable drain page', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h);
+    await runPool(h,"pool.push(['first'])",native.reply);
+    const pool = native.pools.get('pool-native-1');
+    native.complete(pool,1);
+    const page = await runPool(h,"pool.exchange(['second','third'],{maxItems:1,seal:true}).then(value=>globalThis.page=value)",native.reply);
+    assert.deepEqual(Array.from(page.admittedItemIds),[2,3]);
+    assert.deepEqual(Array.from(page.items,item=>item.id),[1]);
+    assert.equal(page.snapshot.sealed,true);
+    assert.equal(page.sealed,true);
+    assert.equal(page.done,false);
+    assert.equal(vm.runInContext('pool.items.length',h.context),3);
+    assert.equal(vm.runInContext('pool.closed',h.context),true);
+    assert.deepEqual(h.requests.at(-1).args.args,{operation:'pool_exchange',poolId:pool.id,
+        tasks:['second','third'],seal:true,timeoutMs:0,maxItems:1});
+    await assert.rejects(vm.runInContext("pool.exchange(['late'])",h.context),/EVAL_POOL_CLOSED/);
+    assert.equal(h.requests.length,2);
+    native.complete(pool,2); native.complete(pool,3); pool.status='completed';
+    const next = await runPool(h,"pool.exchange([],{cursor:page.nextCursor,maxItems:1})",native.reply);
+    assert.deepEqual(Array.from(next.admittedItemIds),[]);
+    assert.deepEqual(Array.from(next.items,item=>item.id),[2]);
+    assert.equal(next.done,false);
+    assert.deepEqual(native.operations,['pool_start','pool_exchange','pool_exchange']);
+});
+
+test('pool exchange validates arguments before dispatch or admission', async () => {
+    const lazy = host(); await createPool(lazy);
+    await assert.rejects(vm.runInContext("pool.exchange(['task'])",lazy.context),/EVAL_POOL_INPUT/);
+    assert.equal(lazy.requests.length,0);
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['first'])",native.reply);
+    for (const expression of [
+        "pool.exchange('task')", "pool.exchange([''])", "pool.exchange([true])",
+        "pool.exchange(['x\\0y'])", "pool.exchange([],{seal:1})",
+        "pool.exchange([],{timeout:NaN})", "pool.exchange([],{timeout:601})",
+        "pool.exchange([],{maxItems:0})", "pool.exchange([],{maxItems:5})",
+        "pool.exchange([],{unexpected:true})",
+        "pool.exchange([],{cursor:{schema:'pi.subagent.pool.cursor.v1',poolId:'foreign',itemIds:[]}})",
+        "pool.exchange([],{get seal(){throw Error('getter executed')}})",
+    ]) {
+        await assert.rejects(vm.runInContext(expression,h.context),/EVAL_POOL_INPUT/);
+    }
+    assert.equal(h.requests.length,1);
+    assert.equal(native.pools.get('pool-native-1').items.length,1);
+});
+
+test('pool exchange lost or malformed acknowledgment never replays accepted work', async () => {
+    for (const fault of ['lost','ids','cursor','identity','seal']) {
+        const h = host(); const native = poolHost(h);
+        await createPool(h); await runPool(h,"pool.push(['first'])",native.reply);
+        const failure = await runPool(h,"pool.exchange(['second'],{seal:true})",request=>{
+            const page = native.apply(request);
+            if (fault==='lost') return h.dispatch.dispatch(request.id,false,false,'reply lost');
+            if (fault==='ids') page.admittedItemIds=[1];
+            if (fault==='cursor') page.nextCursor.itemIds=[1];
+            if (fault==='identity') page.snapshot.jobId='different-job';
+            if (fault==='seal') page.sealed=false;
+            answer(h,request,page);
+        }).catch(error=>error);
+        assert.match(failure.message,/EVAL_POOL_ADMISSION/);
+        assert.equal(failure.admitted.length,1);
+        assert.equal(failure.requested,1);
+        assert.equal(vm.runInContext('pool.closed',h.context),true);
+        await assert.rejects(vm.runInContext("pool.exchange(['second'])",h.context),/EVAL_POOL_CLOSED/);
+        assert.deepEqual(native.operations,['pool_start','pool_exchange']);
+        assert.equal(native.pools.get('pool-native-1').items.length,2);
+    }
+});
+
+test('pool exchange preserves recovered read-only admission fences', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h); await runPool(h,"pool.push(['first'])",native.reply);
+    await runPool(h,"workpool.attach(pool.id).then(value=>globalThis.recovered=value)",native.reply);
+    const before = h.requests.length;
+    await assert.rejects(vm.runInContext("recovered.exchange(['never'])",h.context),/EVAL_POOL_CLOSED/);
+    assert.equal(h.requests.length,before);
+    const page = await runPool(h,"recovered.exchange()",native.reply);
+    assert.equal(page.admittedItems,1);
+    assert.deepEqual(Array.from(page.admittedItemIds),[]);
+});
+
+const pipelineSource = fs.readFileSync(path.join(__dirname, '../src/eval/js_kernel/workpool_pipeline.js'), 'utf8');
+function budgetedPipelineHost(h, native, reverse = false) {
+    const state = {calls:0,highWater:0};
+    const reply = request => {
+        state.calls++;
+        if (state.calls > 64) return h.dispatch.dispatch(request.id,false,false,'EVAL_TOOL_LIMIT:64');
+        if (request.name !== '__pi_tool_result') return h.dispatch.dispatch(request.id,false,true,'callback');
+        assert.ok(Buffer.byteLength(JSON.stringify(request.args),'utf8') <= 256 * 1024);
+        const args = request.args.args;
+        const details = native.apply(request);
+        const pool = native.pools.get(args.poolId) ?? Array.from(native.pools.values()).at(-1);
+        state.highWater = Math.max(state.highWater,pool.items.filter(item=>item.result===null).length);
+        if (args.operation==='pool_drain' || args.operation==='pool_exchange') {
+            const pending = pool.items.filter(item=>item.result===null);
+            if (args.timeoutMs && pending.length) native.complete(pool,(reverse ? pending.at(-1) : pending[0]).id);
+            if (pool.sealed && pool.items.every(item=>item.result!==null)) pool.status='completed';
+            // Keep the earlier manifest to exercise the real snapshot/page race.
+            Object.assign(details,poolDrainPage(pool,args));
+        }
+        answer(h,request,details);
+    };
+    return {state,reply};
+}
+
+test('pipeline actual facade completes 32 items within 64 host calls at every concurrency', async () => {
+    for (const concurrency of [1,2,4,8]) for (const ordered of [false,true]) {
+        const h = host(); const native = poolHost(h);
+        vm.runInContext(pipelineSource,h.context);
+        const budget = budgetedPipelineHost(h,native,true);
+        const report = await runPool(h,`
+            globalThis.order=[];
+            workpool.mapReduce(Array.from({length:32},(_,i)=>i),i=>'task '+i,
+                (sum,item)=>{order.push(item.index);return sum+item.input;},0,
+                {pool:{concurrency:${concurrency}},ordered:${ordered}})
+        `,budget.reply);
+        assert.equal(report.value,496);
+        assert.equal(report.completed,32);
+        assert.equal(report.status,'completed');
+        assert.ok(budget.state.calls<=34,'orchestration must leave budget for callbacks and cleanup');
+        assert.equal(native.operations.filter(op=>op==='pool_start').length,1);
+        assert.equal(native.operations.filter(op=>op==='pool_push'||op==='pool_finish').length,0);
+        assert.equal(native.pools.get('pool-native-1').items.length,32);
+        if (ordered) assert.deepEqual(Array.from(h.context.order),Array.from({length:32},(_,i)=>i));
+    }
+});
+
+test('pipeline actual facade leaves room for 24 mapper tool calls and failure cleanup', async () => {
+    const h = host(); const native = poolHost(h); vm.runInContext(pipelineSource,h.context);
+    const budget = budgetedPipelineHost(h,native);
+    const report = await runPool(h,`
+        workpool.mapReduce(Array.from({length:32},(_,i)=>i),
+            async i=>{if(i<24)await tool.call('read',{path:'callback'});return 'task '+i;},
+            (sum,item)=>sum+item.input,0,{pool:{concurrency:1}})
+    `,budget.reply);
+    assert.equal(report.completed,32);
+    assert.equal(budget.state.calls,58);
+    const f = host(); const failing = poolHost(f); vm.runInContext(pipelineSource,f.context);
+    const cleanupBudget = budgetedPipelineHost(f,failing);
+    const error = await runPool(f,`
+        workpool.mapReduce([0,1,2,3],i=>'task '+i,
+            (sum,item)=>{if(item.id===2)throw Error('reducer failed');return sum+item.input;},
+            0,{pool:{concurrency:4}})
+    `,cleanupBudget.reply).catch(error=>error);
+    assert.equal(error.stage,'reduce');
+    assert.deepEqual(Array.from(error.cursor.itemIds),[1]);
+    assert.deepEqual(Array.from(error.cleanupErrors),[]);
+    assert.equal(failing.operations.at(-1),'pool_close');
+    assert.ok(cleanupBudget.state.calls<64);
+});
+
+test('pipeline actual facade splits escaped large prompts within request and input windows', async () => {
+    for (const ordered of [false,true]) {
+        const h = host(); const native = poolHost(h); vm.runInContext(pipelineSource,h.context);
+        const budget = budgetedPipelineHost(h,native,true);
+        const report = await runPool(h,`
+            workpool.mapReduce(Array.from({length:32},(_,i)=>i),()=>String.fromCharCode(92).repeat(65536),
+                (sum,item)=>sum+item.input,0,{pool:{concurrency:8},ordered:${ordered}})
+        `,budget.reply);
+        assert.equal(report.value,496);
+        assert.equal(report.completed,32);
+        assert.equal(budget.state.calls,ordered ? 61 : 39);
+        assert.equal(budget.state.highWater,8);
+        assert.equal(native.pools.get('pool-native-1').items.length,32);
+    }
 });

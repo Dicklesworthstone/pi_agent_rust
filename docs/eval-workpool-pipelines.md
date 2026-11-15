@@ -63,9 +63,9 @@ subsequent operation still goes through the current kernel bridge.
 ## Admission and ordering
 
 Inputs may be synchronous or asynchronous iterables. The helper retains at
-most `pool.concurrency` admitted-but-not-yet-reduced inputs (1–8), rather than
-materializing the whole source or submitting every task at once. A completed
-result frees a slot only after its reducer returns successfully.
+most `pool.concurrency` mapped or admitted inputs awaiting reduction (1–8),
+rather than materializing the whole source or submitting every task at once.
+A completed result frees a slot only after its reducer returns successfully.
 
 The mapper runs in source order. By default the reducer runs sequentially in
 **result arrival order**, not necessarily source order. Set `ordered: true`
@@ -103,8 +103,38 @@ pipeline. No fresh pool is silently created to evade native limits.
 
 Empty input returns the initial value with `status: "empty"` and a lazy pool
 handle whose native ID is still null. No child or aggregate native job is
-started. Nonempty input is sealed with `finish()` once exhaustion is observed;
-the helper drains through native terminal completion before returning.
+started. The first nonempty input establishes the native pool promptly.
+Subsequent admissions use `pool.exchange()` to combine a bounded batch, one
+result page, and an optional seal in one native operation. Once exhaustion is
+observed, the final exchange seals admission; the helper drains through native
+terminal completion before returning.
+
+## Host-call and request budgets
+
+The eval cell retains its **64-host-call limit**. A pipeline no longer spends
+a separate push and result read for each item: `pool_exchange` admits a batch
+atomically, optionally seals it, and collects up to four full results.
+With compact prompts and one completion per page, the 32-item protocol
+regressions finish in at most 34 host calls, including concurrency 1.
+The unchanged native operation still checks session ownership, privacy,
+deadlines, cursor membership and settled-result acknowledgments before
+admitting anything.
+
+Mapper, reducer and `onPool` callbacks share the same cell budget, as do any
+earlier tool calls in that cell. Their arbitrary tool use is not reserved or
+guaranteed to fit. The protocol regressions also cover 24 mapper calls plus a
+32-item serial pipeline in 58 calls, leaving capacity for ordinary cleanup.
+A failure after the overall cell limit is exhausted can still prevent cleanup.
+
+Every encoded request retains the 256 KiB cap. JSON escaping can make a mapped
+window too large even when each prompt meets the 64 KiB task-text limit.
+The pipeline splits such windows into bounded nonblocking exchanges before
+waiting, preserving the original concurrency and input window. This costs
+additional calls: the regression with 32 maximum-length backslash prompts
+uses 39 calls in arrival order, or 61 with ordered reduction and reversed
+completions. Oversized individual requests still fail before admission.
+No new pool, higher call limit, implicit task retry, or renewed deadline is
+used to finish a pipeline.
 
 ## Results and error handling
 
@@ -129,6 +159,10 @@ JavaScript, `__cause__` in Python) and exposes:
   accumulator with completed-reduction counts.
 - `pool`, `cursor`, `pending`: the existing pool handle, acknowledged result
   IDs, and bounded unprocessed item/input/index associations.
+- `prepared`: mapped input/index associations without a trustworthy admission
+  acknowledgment. These can include an accepted batch whose exchange reply was
+  lost, as well as later mapped inputs that have not been sent. Inspect the
+  retained pool before attempting recovery; never automatically replay them.
 - `cleanup` and `cleanupErrors` / `cleanup_errors`: native cancellation receipt
   and secondary cleanup failures, without replacing the primary cause.
 
@@ -145,9 +179,12 @@ its own idempotency; a cursor cannot roll that side effect back.
 On a caught failure the helper requests native `pool.close()` before closing
 the source iterator. That cancels pending work rather than leaving a pipeline
 running after an ordinary mapper/reducer/source error. The native close owns
-cancellation and reaping. A lost launch acknowledgment is never retried;
-`cleanup.unknownAdmission` can remain true, and an unknown native ID must be
-resolved through ordinary job inspection rather than by resubmitting tasks.
+cancellation and reaping. A lost launch or exchange acknowledgment is never
+retried; `cleanup.unknownAdmission` can remain true. Known pools remain
+inspectable through `peek()` or native status/drain calls. An unknown native ID
+must be resolved through ordinary job inspection rather than by resubmitting
+tasks. A failed exchange retains the already acknowledged handles and closes
+local admission, including when its batch may have succeeded natively.
 
 Python preserves `asyncio.CancelledError`, interrupts and other control
 exceptions instead of wrapping them as successful/ordinary task outcomes.
@@ -189,8 +226,13 @@ node --test tests/eval_workpool_pipeline.test.cjs
 python3 -m unittest discover -s tests -p 'eval_workpool_pipeline_test.py'
 node --test tests/eval_workpool_ordered.test.cjs
 python3 -m unittest discover -s tests -p 'eval_workpool_ordered_test.py'
+node --test tests/eval_structured_reader.test.cjs
+python3 -m unittest discover -s tests -p 'eval_structured_reader_test.py'
 ```
 
+The structured-reader regressions run the actual native facades with a
+controlled host that denies calls after 64, including serial execution,
+out-of-order completion, escaped request sizes, callback overhead and cleanup.
 The Python bootstrap regression also checks installation before kernel main
 and rejects workspace shadowing of the staged helper. Protocol fixtures are
 not live-provider, native QuickJS, Rust or child-process acceptance. The

@@ -178,14 +178,20 @@ class PoolHost:
         else:
             pool = self.pools[args["poolId"]]
         admitted = []
-        if operation in ("pool_start", "pool_push"):
-            if pool["sealed"]:
+        if operation in ("pool_start", "pool_push", "pool_exchange"):
+            if pool["sealed"] and args["tasks"]:
                 raise AssertionError("guest must not admit work after sealing")
             for task in args["tasks"]:
                 item_id = len(pool["items"]) + 1
                 pool["items"].append({"id": item_id, "task": task, "result": None,
                                       "status": "running" if item_id <= pool["concurrency"] else "queued"})
                 admitted.append(item_id)
+        if operation == "pool_exchange" and args.get("seal"):
+            pool["sealed"] = True
+            pool["status"] = "draining" if any(item["result"] is None for item in pool["items"]) else "completed"
+        if operation == "pool_exchange":
+            return {**pool_drain_page(pool, args), "admittedItemIds": admitted,
+                    "snapshot": self.snapshot(pool)}
         elif operation == "pool_finish":
             pool["sealed"] = True
             pool["status"] = "draining" if any(item["result"] is None for item in pool["items"]) else "completed"
@@ -196,7 +202,7 @@ class PoolHost:
                     item.update(status="cancelled", result={"content": [], "details": {"cancelled": True}, "isError": True})
         elif operation == "pool_drain":
             return pool_drain_page(pool, args)
-        elif operation not in ("pool_status", "pool_result", "pool_wait"):
+        elif operation not in ("pool_start", "pool_push", "pool_status", "pool_result", "pool_wait"):
             raise AssertionError(f"unexpected operation {operation}")
         snapshot = self.snapshot(pool)
         if operation in ("pool_start", "pool_push"):
@@ -211,10 +217,22 @@ class PoolHost:
 
 
 class Kernel:
-    def __init__(self):
+    def __init__(self, *, with_pipeline=False):
         self.directory = tempfile.TemporaryDirectory(prefix="pi-structured-protocol-")
+        command = [sys.executable, "-u", str(SCRIPT)]
+        if with_pipeline:
+            # Use the production bootstrap: recovery and the pipeline must be
+            # installed before kernel main starts reading any guest cells.
+            launcher = ("import sys\n"
+                        "with open(sys.argv[1], encoding='utf-8') as source:\n"
+                        "    script = source.read()\n"
+                        "exec(compile(script, sys.argv[1], 'exec'))")
+            command = [sys.executable, "-u", "-c", launcher,
+                       str(SCRIPT.with_name("python_browser.py")), str(SCRIPT),
+                       str(SCRIPT.with_name("python_agent_recovery.py")),
+                       str(SCRIPT.with_name("python_workpool_pipeline.py"))]
         self.process = subprocess.Popen(
-            [sys.executable, "-u", str(SCRIPT)], cwd=self.directory.name,
+            command, cwd=self.directory.name,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1,
         )
@@ -1184,10 +1202,12 @@ await sent
 
     def test_warm_options_and_empty_sends_fail_before_dispatch(self):
         for options in ({"keep_alive": 1}, {"keep_alive": "true"}, {"keep_alive": None},
-                        {"keep_alive": True, "isolation": "worktree"},
+                        {"keep_alive": True, "isolation": "container"},
                         {"keep_alive": True, "iso_apply": False},
-                        {"keep_alive": True, "output_schema": {}},
-                        {"keep_alive": True, "schema_mode": "strict"},
+                        {"keep_alive": True, "iso_apply": "keep"},
+                        {"keep_alive": True, "isolation": "none", "iso_apply": "keep"},
+                        {"keep_alive": True, "isolation": "worktree", "iso_apply": "apply"},
+                        {"keep_alive": True, "isolation": "worktree", "iso_apply": "drop"},
                         {"keep_alive": True, "op": "worker_close"},
                         {"keep_alive": True, "worker_id": "foreign"}):
             with self.subTest(options=options):
@@ -1536,8 +1556,11 @@ await pool.close()
         self.assertIn("EVAL_POOL_CAPACITY", response["error"])
         self.assertEqual(len(self.kernel.calls), 1)
         for options in ({"concurrency": 0}, {"concurrency": 9}, {"concurrency": 1.5}, {"concurrency": True},
-                        {"timeout_seconds": 0}, {"scope": "all"}, {"isolation": "worktree"},
-                        {"keep_alive": False}, {"output_schema": {}}, {"cwd": None}):
+                        {"timeout_seconds": 0}, {"scope": "all"}, {"isolation": "container"},
+                        {"iso_apply": "keep"}, {"isolation": "none", "iso_apply": "keep"},
+                        {"isolation": "worktree", "iso_apply": "apply"},
+                        {"isolation": "worktree", "iso_apply": "drop"},
+                        {"keep_alive": False}, {"cwd": None}):
             response = self.kernel.cell(f"await workpool(**{options!r})")
             self.assertFalse(response["ok"])
             self.assertIn("EVAL_POOL_INPUT", response["error"])
@@ -1553,6 +1576,149 @@ await pool.close()
             "agent": "scout", "cwd": ".", "scope": "project", "isolation": "none", "timeoutSeconds": 120,
             "operation": "pool_start", "concurrency": 3, "tasks": ["inspect"], "model": {"role": "tiny"},
         })
+
+
+    def test_retained_schema_options_are_forwarded_for_native_validation(self):
+        for contract in ({"output_schema": {}}, {"schema_mode": "strict"},
+                         {"output_schema": {"type": "object"}, "schema_mode": "strict"}):
+            with self.subTest(contract=contract):
+                expected = {}
+                if "output_schema" in contract:
+                    expected["outputSchema"] = contract["output_schema"]
+                if "schema_mode" in contract:
+                    expected["schemaMode"] = contract["schema_mode"]
+                response = self.kernel.cell(
+                    f"worker = await agent('inspect', agent='scout', keep_alive=True, **{contract!r}); worker.id",
+                    self.reply_with(envelope(worker_snapshot("typed-worker"))))
+                self.assertEqual(self.value(response), "typed-worker")
+                self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+                    "name": "subagent", "args": {"agent": "scout", **expected,
+                        "task": "inspect", "operation": "worker_start"}})
+                native = PoolHost(self.kernel)
+                before = len(self.kernel.calls)
+                self.value(self.kernel.cell(
+                    f"pool = await workpool(agent='scout', concurrency=1, **{contract!r}); pool.concurrency"))
+                self.assertEqual(len(self.kernel.calls), before)
+                self.value(self.kernel.cell("await pool.push(['inspect']); len(pool.items)", native))
+                self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"], {
+                    "agent": "scout", **expected, "operation": "pool_start",
+                    "concurrency": 1, "tasks": ["inspect"]})
+
+    def test_retained_isolation_forwards_worktree_and_keep(self):
+        for retention in ({"isolation": "worktree"}, {"isolation": "worktree", "iso_apply": "keep"}):
+            with self.subTest(retention=retention):
+                response = self.kernel.cell(
+                    f"worker = await agent('inspect', agent='scout', keep_alive=True, **{retention!r}); worker.id",
+                    self.reply_with(envelope(worker_snapshot("isolated-worker"))))
+                self.assertEqual(self.value(response), "isolated-worker")
+                expected = {"isolation": "worktree"}
+                if "iso_apply" in retention:
+                    expected["isoApply"] = retention["iso_apply"]
+                self.assertEqual(self.kernel.calls[-1]["bridge"]["input"], {
+                    "name": "subagent", "args": {"agent": "scout", **expected,
+                        "task": "inspect", "operation": "worker_start"}})
+                native = PoolHost(self.kernel)
+                response = self.kernel.cell(
+                    f"pool = await workpool(agent='scout', concurrency=2, **{retention!r}); "
+                    "await pool.push(['inspect']); pool.id", native)
+                self.assertEqual(self.value(response), "pool-native-1")
+                self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"], {
+                    "agent": "scout", **expected, "operation": "pool_start",
+                    "concurrency": 2, "tasks": ["inspect"]})
+
+    def test_pool_exchange_admits_seals_and_returns_one_replayable_page(self):
+        self.create_pool()
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("await pool.push(['first']); len(pool.items)", native))
+        pool = native.pools["pool-native-1"]
+        native.complete(pool, 1)
+        page = self.value(self.kernel.cell(
+            "page = await pool.exchange(['second','third'], max_items=1, seal=True); page", native))
+        self.assertEqual(page["admittedItemIds"], [2, 3])
+        self.assertEqual([item["id"] for item in page["items"]], [1])
+        self.assertTrue(page["snapshot"]["sealed"])
+        self.assertTrue(page["sealed"])
+        self.assertFalse(page["done"])
+        self.assertEqual(self.value(self.kernel.cell("(len(pool.items), pool.closed)")), (3, True))
+        self.assertEqual(self.kernel.calls[-1]["bridge"]["input"]["args"], {
+            "operation": "pool_exchange", "poolId": pool["id"], "tasks": ["second", "third"],
+            "seal": True, "timeoutMs": 0, "maxItems": 1})
+        before = len(self.kernel.calls)
+        response = self.kernel.cell("await pool.exchange(['late'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
+        self.assertEqual(len(self.kernel.calls), before)
+        native.complete(pool, 2)
+        native.complete(pool, 3)
+        pool["status"] = "completed"
+        next_page = self.value(self.kernel.cell(
+            "await pool.exchange(cursor=page['nextCursor'], max_items=1)", native))
+        self.assertEqual(next_page["admittedItemIds"], [])
+        self.assertEqual([item["id"] for item in next_page["items"]], [2])
+        self.assertFalse(next_page["done"])
+        self.assertEqual(native.operations, ["pool_start", "pool_exchange", "pool_exchange"])
+
+    def test_pool_exchange_rejects_inputs_before_dispatch(self):
+        self.create_pool()
+        response = self.kernel.cell("await pool.exchange(['task'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(self.kernel.calls, [])
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("await pool.push(['first']); len(pool.items)", native))
+        for expression in (
+                "await pool.exchange('task')", "await pool.exchange([''])",
+                "await pool.exchange([True])", "await pool.exchange(['x\\0y'])",
+                "await pool.exchange(seal=1)", "await pool.exchange(timeout=float('nan'))",
+                "await pool.exchange(timeout=601)", "await pool.exchange(max_items=0)",
+                "await pool.exchange(max_items=5)",
+                "await pool.exchange(cursor={'schema':'pi.subagent.pool.cursor.v1','poolId':'foreign','itemIds':[]})"):
+            with self.subTest(expression=expression):
+                response = self.kernel.cell(expression)
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 1)
+        self.assertEqual(len(native.pools["pool-native-1"]["items"]), 1)
+
+    def test_pool_exchange_lost_or_invalid_reply_never_replays(self):
+        for fault in ("lost", "ids", "cursor", "identity", "seal"):
+            with self.subTest(fault=fault):
+                self.create_pool()
+                native = PoolHost(self.kernel)
+                self.value(self.kernel.cell("await pool.push(['first']); len(pool.items)", native))
+
+                def bridge(frame):
+                    page = native.apply(frame)
+                    if fault == "lost":
+                        self.kernel.reply(frame, error="reply lost")
+                        return
+                    if fault == "ids":
+                        page["admittedItemIds"] = [1]
+                    elif fault == "cursor":
+                        page["nextCursor"]["itemIds"] = [1]
+                    elif fault == "identity":
+                        page["snapshot"]["jobId"] = "different-job"
+                    elif fault == "seal":
+                        page["sealed"] = False
+                    self.kernel.reply(frame, json.dumps(envelope(page)))
+
+                response = self.kernel.cell("""
+try:
+    await pool.exchange(['second'], seal=True)
+except Exception as error:
+    failure = (str(error), len(error.admitted), error.requested, pool.closed, pool.unknown_admission)
+failure
+""", bridge)
+                message, known, requested, closed, unknown = self.value(response)
+                self.assertIn("EVAL_POOL_ADMISSION", message)
+                self.assertEqual((known, requested, closed, unknown), (1, 1, True, True))
+                before = len(self.kernel.calls)
+                response = self.kernel.cell("await pool.exchange(['second'])")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_CLOSED", response["error"])
+                self.assertEqual(len(self.kernel.calls), before)
+                self.assertEqual(native.operations, ["pool_start", "pool_exchange"])
+                self.assertEqual(len(native.pools["pool-native-1"]["items"]), 2)
 
     def test_pool_lost_batch_acknowledgment_recovers_native_admission_without_replay(self):
         self.create_pool()
@@ -1856,6 +2022,141 @@ await asyncio.to_thread(lambda: asyncio.run(tool.result('read', {})))
         self.assertIn("EVAL_BRIDGE_THREAD", response["error"])
         self.assertEqual(self.kernel.calls, [])
         self.assert_next_cell_works()
+
+
+
+class BudgetPoolHost(PoolHost):
+    """One result per wait, with the real 64-call and 256 KiB guest input caps."""
+    def __init__(self, kernel, *, reverse=False):
+        super().__init__(kernel)
+        self.calls = 0
+        self.high_water = 0
+        self.reverse = reverse
+
+    def __call__(self, frame):
+        self.calls += 1
+        if self.calls > 64:
+            self.kernel.reply(frame, error="EVAL_TOOL_LIMIT:64")
+            return
+        request = frame["bridge"]["input"]
+        if request["name"] != "subagent":
+            self.kernel.reply(frame, "callback")
+            return
+        encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 256 * 1024:
+            raise AssertionError("pipeline exceeded the shared encoded request budget")
+        args = request["args"]
+        details = self.apply(frame)
+        pool = self.pools[args["poolId"]] if "poolId" in args else list(self.pools.values())[-1]
+        self.high_water = max(self.high_water, sum(item["result"] is None for item in pool["items"]))
+        if args["operation"] in ("pool_drain", "pool_exchange"):
+            pending = [item for item in pool["items"] if item["result"] is None]
+            if args["timeoutMs"] and pending:
+                self.complete(pool, pending[-1 if self.reverse else 0]["id"])
+            if pool["sealed"] and all(item["result"] is not None for item in pool["items"]):
+                pool["status"] = "completed"
+            # Preserve the earlier manifest to exercise the real lifecycle race.
+            details.update(pool_drain_page(pool, args))
+        self.kernel.reply(frame, json.dumps(envelope(details)))
+
+
+class WorkpoolBudgetTests(unittest.TestCase):
+    def setUp(self):
+        self.kernel = Kernel(with_pipeline=True)
+        self.addCleanup(self.kernel.close)
+
+    def value(self, response):
+        self.assertTrue(response["ok"], response.get("error"))
+        return ast.literal_eval(response["result"])
+
+    def test_actual_facade_completes_32_items_within_64_calls_at_every_concurrency(self):
+        for concurrency in (1, 2, 4, 8):
+            for ordered in (False, True):
+                with self.subTest(concurrency=concurrency, ordered=ordered):
+                    native = BudgetPoolHost(self.kernel, reverse=True)
+                    response = self.kernel.cell(f"""
+order = []
+def reduce_item(total, item):
+    order.append(item['index'])
+    return total + item['input']
+report = await workpool.map_reduce(range(32), lambda value, index: f'task {{value}}',
+                                  reduce_item, 0, pool={{'concurrency':{concurrency}}}, ordered={ordered!r})
+(report['value'], report['completed'], report['status'], order)
+""", native)
+                    total, completed, status, order = self.value(response)
+                    self.assertEqual((total, completed, status), (496, 32, "completed"))
+                    self.assertLessEqual(native.calls, 34)
+                    self.assertEqual(native.operations.count("pool_start"), 1)
+                    self.assertEqual(native.operations.count("pool_push"), 0)
+                    self.assertEqual(native.operations.count("pool_finish"), 0)
+                    self.assertEqual(len(native.pools["pool-native-1"]["items"]), 32)
+                    if ordered:
+                        self.assertEqual(order, list(range(32)))
+
+    def test_actual_facade_leaves_room_for_24_mapper_tool_calls(self):
+        native = BudgetPoolHost(self.kernel)
+        response = self.kernel.cell("""
+async def map_task(value, index):
+    if value < 24:
+        await tool.call('read', {'path':'callback'})
+    return f'task {value}'
+report = await workpool.map_reduce(range(32), map_task,
+                                  lambda total, item: total + item['input'], 0,
+                                  pool={'concurrency':1})
+(report['value'], report['completed'])
+""", native)
+        self.assertEqual(self.value(response), (496, 32))
+        self.assertEqual(native.calls, 58)
+
+    def test_actual_facade_splits_large_escaped_prompts_and_preserves_concurrency(self):
+        for ordered in (False, True):
+            with self.subTest(ordered=ordered):
+                native = BudgetPoolHost(self.kernel, reverse=True)
+                response = self.kernel.cell(f"""
+report = await workpool.map_reduce(range(32), lambda value, index: chr(92) * 65536,
+                                  lambda total, item: total + item['input'], 0,
+                                  pool={{'concurrency':8}}, ordered={ordered!r})
+(report['value'], report['completed'])
+""", native)
+                self.assertEqual(self.value(response), (496, 32))
+                self.assertEqual(native.calls, 61 if ordered else 39)
+                self.assertEqual(native.high_water, 8)
+
+    def test_actual_facade_keeps_failure_cursor_and_cleanup_within_budget(self):
+        native = BudgetPoolHost(self.kernel)
+        response = self.kernel.cell("""
+def reduce_item(total, item):
+    if item['id'] == 2:
+        raise ValueError('reducer failed')
+    return total + item['input']
+try:
+    await workpool.map_reduce(range(4), lambda value, index: f'task {value}', reduce_item, 0,
+                              pool={'concurrency':4})
+except Exception as error:
+    failure = (error.stage, error.cursor['itemIds'], error.progress['completed'], len(error.cleanup_errors))
+failure
+""", native)
+        self.assertEqual(self.value(response), ("reduce", [1], 1, 0))
+        self.assertEqual(native.operations[-1], "pool_close")
+        self.assertLess(native.calls, 64)
+
+    def test_exchange_respects_recovered_read_only_admission(self):
+        native = PoolHost(self.kernel)
+        response = self.kernel.cell("""
+pool = await workpool(concurrency=1)
+await pool.push(['first'])
+recovered = await workpool.attach(pool.id)
+try:
+    await recovered.exchange(['never'])
+except Exception as error:
+    admission_error = str(error)
+page = await recovered.exchange()
+(admission_error, page['admittedItems'], page['admittedItemIds'])
+""", native)
+        error, admitted, ids = self.value(response)
+        self.assertIn("EVAL_POOL_CLOSED", error)
+        self.assertEqual((admitted, ids), (1, []))
+        self.assertEqual(native.operations, ["pool_start", "pool_status", "pool_exchange"])
 
 
 if __name__ == "__main__":

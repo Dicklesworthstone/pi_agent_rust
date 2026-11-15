@@ -6,6 +6,7 @@ introduced. The native pool remains responsible for admission and cancellation.
 
 import asyncio
 import inspect
+import json
 import math
 import time
 
@@ -16,6 +17,7 @@ def install(kernel):
     clock = time.monotonic
     is_awaitable = inspect.isawaitable
     finite = math.isfinite
+    encode_json = json.dumps
 
     class WorkpoolPipelineError(RuntimeError):
         """Failure with the pool, successful-reduction cursor and partial value."""
@@ -68,6 +70,7 @@ def install(kernel):
         current = None
         pending = {}
         buffered = {}
+        prepared = []
 
         def remaining():
             seconds = deadline - clock()
@@ -110,9 +113,9 @@ def install(kernel):
                 await resolve(on_pool(carrier))
                 remaining()
 
-            async def fill():
-                nonlocal admitted, exhausted, sealed, stage, current
-                while not exhausted and len(pending) < window:
+            async def fill(capacity=window):
+                nonlocal exhausted, stage, current
+                while not exhausted and len(pending) + len(prepared) < capacity:
                     stage = "source"
                     current = None
                     remaining()
@@ -122,33 +125,53 @@ def install(kernel):
                         break
                     # Probe exactly one extra value to detect capacity overflow;
                     # it is neither mapped nor silently dropped as success.
-                    if admitted == max_items:
+                    if admitted + len(prepared) == max_items:
                         raise RuntimeError(
                             "EVAL_PIPELINE_CAPACITY: source exceeds max_items; "
                             "accepted work was not replayed"
                         )
-                    index = admitted
+                    index = admitted + len(prepared)
                     current = {"index": index, "input": input_value}
                     stage = "map"
                     prompt = await resolve(map_task(input_value, index))
                     remaining()
                     if type(prompt) is not str or not prompt.strip():
                         raise invalid()
-                    stage = "admission"
-                    handles = await carrier.push([prompt])
-                    if (type(handles) not in (list, tuple) or len(handles) != 1
-                            or handles[0].item_id != index + 1
-                            or handles[0].pool_id != carrier.id):
-                        raise protocol()
-                    pending[handles[0].item_id] = (index, input_value)
-                    admitted += 1
-                    remaining()
-                if exhausted and admitted and not sealed:
-                    stage = "finish"
-                    current = None
-                    await carrier.finish()
-                    sealed = True
-                    remaining()
+                    prepared.append((index, input_value, prompt))
+
+            def batch_size():
+                # Keep an encoded window inside the shared 256 KiB input cap,
+                # including JSON escapes and the current acknowledgment cursor.
+                arguments = {"operation": "pool_exchange", "poolId": carrier.id,
+                             "tasks": [], "seal": False, "timeoutMs": 600000, "maxItems": 4}
+                if received is not None:
+                    arguments["cursor"] = received
+                count = 0
+                for _, _, prompt in prepared:
+                    arguments["tasks"].append(prompt)
+                    try:
+                        encoded = encode_json({"name": "subagent", "args": arguments},
+                                              ensure_ascii=False, allow_nan=False,
+                                              separators=(",", ":")).encode("utf-8")
+                    except (UnicodeError, ValueError):
+                        break
+                    if len(encoded) > 256 * 1024:
+                        break
+                    count += 1
+                # Preserve the facade's error for an invalid individual task.
+                return max(1, count) if prepared else 0
+
+            def acknowledge(item_ids, count=None):
+                nonlocal admitted
+                count = len(prepared) if count is None else count
+                if (type(item_ids) not in (list, tuple) or len(item_ids) != count
+                        or any(type(item_id) is not int or item_id != admitted + offset + 1
+                               for offset, item_id in enumerate(item_ids))):
+                    raise protocol()
+                for item_id, (index, input_value, _) in zip(item_ids, prepared):
+                    pending[item_id] = (index, input_value)
+                admitted += count
+                del prepared[:count]
 
             async def reduce_one(item_id, outcome):
                 nonlocal current, stage, value, cursor, completed, succeeded, failed
@@ -171,13 +194,43 @@ def install(kernel):
                     failed += 1
                 remaining()
 
-            await fill()
-            if admitted == 0:
+            # Establish a native identity with the first item promptly. Later
+            # bounded windows combine admission and observation in one host
+            # call, so even 32 serial items fit the unchanged 64-call budget.
+            await fill(1)
+            if not prepared:
                 return {**progress(), "pool": carrier, "cursor": cursor, "status": "empty"}
+            stage = "admission"
+            handles = await carrier.push([prepared[0][2]])
+            if (type(handles) not in (list, tuple) or len(handles) != 1
+                    or handles[0].pool_id != carrier.id):
+                raise protocol()
+            acknowledge([handles[0].item_id])
+            remaining()
+            await fill()
             while True:
-                stage = "drain"
-                current = None
-                page = await carrier.drain(cursor=received, timeout=remaining(), max_items=4)
+                count = batch_size()
+                sealing = exhausted and not sealed and count == len(prepared)
+                if prepared or sealing:
+                    stage = "admission" if prepared else "finish"
+                    current = ({"index": prepared[count - 1][0], "input": prepared[count - 1][1]}
+                               if count else None)
+                    budget = remaining()
+                    # Admit an oversized window in nonblocking bounded pieces
+                    # before waiting, so worker concurrency is still available.
+                    page = await carrier.exchange([entry[2] for entry in prepared[:count]],
+                                                  cursor=received,
+                                                  timeout=0 if count < len(prepared) else budget,
+                                                  max_items=4, seal=sealing)
+                    if type(page) is not dict:
+                        raise protocol()
+                    acknowledge(page.get("admittedItemIds"), count)
+                    sealed |= sealing
+                    remaining()
+                else:
+                    stage = "drain"
+                    current = None
+                    page = await carrier.drain(cursor=received, timeout=remaining(), max_items=4)
                 if (type(page) is not dict or type(page.get("items")) is not list
                         or type(page.get("done")) is not bool or page.get("poolId") != carrier.id):
                     raise protocol()
@@ -210,7 +263,7 @@ def install(kernel):
                         stage = "finish"
                         raise RuntimeError("EVAL_PIPELINE_POOL_FAILED: native pool terminated unsuccessfully")
                     return {**progress(), "pool": carrier, "cursor": cursor, "status": page["status"]}
-                if not page["items"]:
+                if not page["items"] and not prepared:
                     raise TimeoutError("EVAL_PIPELINE_TIMEOUT: shared pipeline wait budget exhausted")
                 await fill()
         except BaseException as cause:
@@ -228,6 +281,10 @@ def install(kernel):
             error.item = current
             error.pending = tuple({"itemId": item_id, "index": record[0], "input": record[1]}
                                   for item_id, record in pending.items())
+            # These mapped inputs have no trustworthy admission acknowledgment.
+            # A lost exchange reply may mean they exist natively; never replay.
+            error.prepared = tuple({"index": index, "input": input_value}
+                                   for index, input_value, _ in prepared)
             error.cleanup_errors = []
             cleanup_control = None
             if carrier is not None:
