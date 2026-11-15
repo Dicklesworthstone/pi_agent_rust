@@ -1477,6 +1477,10 @@ mod tests {
 
     impl Fixture {
         pub(super) fn new(script: &str) -> Self {
+            Self::with_timeout(script, Duration::from_secs(60))
+        }
+
+        pub(super) fn with_timeout(script: &str, timeout: Duration) -> Self {
             let root = tempfile::tempdir().expect("pool fixture root"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- Real lifecycle tests require isolated process and artifact paths.
             let global = root.path().join("global");
             std::fs::create_dir_all(global.join("agents")).expect("agent directory"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The fixture must not discover ambient agent definitions.
@@ -1487,7 +1491,7 @@ mod tests {
                 .expect("executable child"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The test transport must be executable.
             let owner = format!("pool-fixture-{}", uuid::Uuid::new_v4());
             let mut tool = SubagentTool::with_paths(root.path().to_path_buf(), global, binary)
-                .with_timeout(Duration::from_secs(60));
+                .with_timeout(timeout);
             tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&owner));
             Self { root, tool, owner }
         }
