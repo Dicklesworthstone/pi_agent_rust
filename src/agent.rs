@@ -20671,6 +20671,46 @@ impl AgentSession {
             .or_else(|| normalize_api_key_opt(entry.api_key.clone())))
     }
 
+    pub(crate) fn ensure_manual_model_credentials(
+        &self,
+        requested: &ModelEntry,
+    ) -> std::result::Result<(), String> {
+        let registry = if self.extensions.is_some() {
+            self.extension_model_catalog()
+                .snapshot()
+                .ok()
+                .and_then(|catalog| catalog.registry)
+        } else {
+            self.model_registry.clone()
+        };
+        let resolved_entry = registry
+            .as_ref()
+            .and_then(|reg| reg.resolve(&requested.model.provider, &requested.model.id));
+        let entry = resolved_entry.as_ref().unwrap_or(requested);
+        if !model_requires_configured_credential(entry) {
+            return Ok(());
+        }
+        let active_provider = self.agent.provider();
+        let already_active = active_provider.name() == entry.model.provider
+            && active_provider.model_id() == entry.model.id;
+        let resolved_key = self
+            .resolve_stream_api_key_for_model(entry)
+            .map_err(|error| error.to_string())?
+            .or_else(|| normalize_api_key_opt(requested.api_key.clone()))
+            .or_else(|| {
+                already_active
+                    .then(|| normalize_api_key_opt(self.agent.stream_options().api_key.clone()))
+                    .flatten()
+            });
+        if resolved_key.is_none() {
+            return Err(format!(
+                "Missing credentials for provider {}. Run /login {}.",
+                entry.model.provider, entry.model.provider
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
         let provider = self.agent.provider();
         let entry = self.current_model_entry();

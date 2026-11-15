@@ -5421,7 +5421,7 @@ impl Session {
 
         let Some(v2_root) = self.v2_sidecar_root.clone() else {
             return Err(Error::session(
-                "cannot fully hydrate a V2 session because its sidecar root is unavailable",
+                "cannot fully hydrate a partially hydrated V2 session because its sidecar root is unavailable",
             ));
         };
 

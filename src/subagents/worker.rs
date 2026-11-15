@@ -941,7 +941,8 @@ mod tests {
 
     fn private_projection(secret: &str) -> AuxiliaryPrivacySnapshot {
         let mut vault = crate::secrets::SecretVault::default();
-        let pattern = regex::Regex::new(secret).expect("controlled privacy fixture"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This literal regex seeds the remembered-secret regression.
+        let pattern =
+            regex::Regex::new(&regex::escape(secret)).expect("controlled privacy fixture"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This literal regex seeds the remembered-secret regression.
         crate::secrets::obfuscate(secret, &mut vault, &[pattern]);
         AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::from_settings(None), &vault)
     }

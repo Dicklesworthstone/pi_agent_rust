@@ -330,15 +330,16 @@ fn hydration_plan(value: &mut Value) -> Result<Vec<(usize, BlobRef)>> {
 pub(super) fn decode_entry(conn: &SqliteConnection, json: &str) -> Result<SessionEntry> {
     let mut value: Value = parse_sqlite_json("session entry", json)?;
     let plan = hydration_plan(&mut value)?;
+    // `Value` retains only the last occurrence of a member. Validate the raw
+    // native envelope and every reference even when `plan` is empty, so a
+    // trailing non-native role/type/content/inline-data duplicate cannot
+    // conceal a native attachment reference or missing blob.
+    crate::session::attachments::validate_native_attachment_references(json)?;
     if plan.is_empty() {
         // Preserve the existing typed reader's validation for inline/legacy
         // rows, including its handling of duplicate native message fields.
         return parse_sqlite_json("session entry", json);
     }
-    // `Value` retains only the last occurrence of a member. Validate the raw
-    // native envelope and every reference first, so a duplicate cannot hide
-    // a missing blob or silently change an immutable persisted message.
-    crate::session::attachments::validate_native_attachment_references(json)?;
     if let Some(blocks) = message_blocks(&mut value) {
         for (index, reference) in plan {
             let bytes = load_blob(conn, &reference)?;
@@ -1017,7 +1018,8 @@ mod tests {
             }
         });
         let mut value = json!({
-            "type": "message", "message": {"content": vec![block; MAX_REFERENCES + 1]}
+            "type": "message",
+            "message": {"role": "user", "content": vec![block; MAX_REFERENCES + 1]}
         });
         assert!(
             hydration_plan(&mut value)

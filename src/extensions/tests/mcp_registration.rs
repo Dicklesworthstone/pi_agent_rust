@@ -10,7 +10,9 @@ async fn mcp_session_fixture(
     let mut paths = Vec::new();
     let mut owners = Vec::new();
     for (name, source) in sources {
-        let path = directory.join(name);
+        let extension_dir = directory.join(Path::new(name).file_stem().unwrap_or_default());
+        let _ = std::fs::create_dir_all(&extension_dir);
+        let path = extension_dir.join(name);
         std::fs::write(&path, source).expect("write MCP extension fixture");
         owners.push(
             JsExtensionLoadSpec::from_entry_path(&path)

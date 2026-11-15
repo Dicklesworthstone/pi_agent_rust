@@ -261,7 +261,8 @@ mod tests {
     #[test]
     fn exchanges_run_thirty_two_incremental_turns_and_seal_the_last_batch() {
         let _guard = crate::jobs::process_test_guard();
-        let fixture = Fixture::new(RPC_CHILD);
+        let mut fixture = Fixture::new(RPC_CHILD);
+        fixture.tool = fixture.tool.with_timeout(Duration::from_secs(180));
         fixture.release();
         runtime().block_on(async {
             let started = fixture

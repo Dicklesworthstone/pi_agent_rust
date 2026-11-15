@@ -1518,6 +1518,10 @@ impl PiApp {
             .session()
             .ensure_provider_reentry_allowed()
             .map_err(|error| error.to_string())?;
+        agent
+            .handle
+            .session()
+            .ensure_manual_model_credentials(next)?;
         let owner_session_id = self
             .session
             .try_lock()

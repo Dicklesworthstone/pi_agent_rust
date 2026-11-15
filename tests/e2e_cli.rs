@@ -7862,10 +7862,10 @@ fn e2e_cli_startup_migrations_run_by_default() {
     let export_entry = json!({
         "type": "message",
         "id": "m1",
-        "parentId": "root",
+        "parentId": null,
         "timestamp": "2026-02-14T00:05:01.000Z",
         "message": {
-            "type": "user",
+            "role": "user",
             "content": "migration smoke"
         }
     });
@@ -7961,10 +7961,10 @@ fn e2e_cli_no_migrations_skips_startup_migrations() {
     let export_entry = json!({
         "type": "message",
         "id": "m1",
-        "parentId": "root",
+        "parentId": null,
         "timestamp": "2026-02-14T00:05:01.000Z",
         "message": {
-            "type": "user",
+            "role": "user",
             "content": "migration skip smoke"
         }
     });

@@ -30342,17 +30342,16 @@ mod tests {
     ///
     /// Native tool factory delegation adds 1_640 bridge bytes (259_969 ->
     /// 261_609) and 1_832 trimmed coding-agent module bytes (29_584 -> 31_416).
-    /// These baselines include earlier source drift from the prior receipts;
-    /// only the two sources changed by this feature are re-pinned here.
-    /// Re-pinned 2026-11-13: updates `<bridge>`, `node:fs`, `node:child_process`,
-    /// `@mariozechner/pi-coding-agent`, and synchronizes prior main-branch
-    /// module drift (`@mariozechner/pi-ai`, `node:net`, `node:url`) against
+    /// Re-pinned 2026-11-15: updates `<bridge>` (`61035a4e3`: +448 bytes for
+    /// provider read interruption and bounded cleanup) and `node:child_process`
+    /// (`768124dcc` +829, `38faea6ca` +3_259, `3dc3336a2` +1_240 = +5_328 bytes
+    /// for subprocess output-reader settlement across terminal paths) against
     /// exact decompressed source bytes.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            268_637,
-            "f6d0335191ae2ff525bbc6a5486b9a503051f0e3cf4441330c28eb9c35353c06",
+            269_085,
+            "af5bcf72537e6d486d6c6e1c38f2ad09d9f3cac6e19bacadb5a086e084ff48f6",
         ),
         (
             "node:fs",
@@ -30366,8 +30365,8 @@ mod tests {
         ),
         (
             "node:child_process",
-            33_715,
-            "9c9d98f2f627ad734f2bf8279faa1a0de0418df939903292a26593d93759cf1e",
+            39_043,
+            "c496331afa268ea323d999aae67693ce6900c3975d89cffb1557de1f8e77ee06",
         ),
         // Completion observers and owned reader teardown add 9_516 bytes.
         // Only this deliberately changed module is re-pinned.
@@ -39695,7 +39694,8 @@ globalThis.__spawn_abort_result = result;
                         .eval("outputOnlyResult.killAccepted = outputOnlyChild.kill('SIGKILL');")
                         .await
                         .expect("cancel output-only hostcall");
-                    assert_eq!(runtime.pending_hostcall_count(), 0);
+                    assert!(!runtime.is_hostcall_active(&request.call_id));
+                    assert_eq!(runtime.pending_hostcall_count(), 1);
                     // Neither a queued late chunk nor a late completion may
                     // reopen the pipes or turn cancellation into clean EOF.
                     runtime.complete_hostcall(

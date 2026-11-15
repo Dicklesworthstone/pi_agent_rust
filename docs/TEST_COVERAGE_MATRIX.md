@@ -1,23 +1,23 @@
 ## Test Coverage Matrix (Current Source Inventory)
 
-> Last regenerated: 2026-11-13
+> Last regenerated: 2026-11-15
 > Owner bead: `bd-8t27h.1`
 
 This document is the current source-file coverage inventory for `src/**/*.rs`. It is not a drop-in certification artifact and does not override `docs/evidence/dropin-certification-verdict.json`.
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 739 current source files.
+- `rg --files src -g '*.rs' | sort` -> 742 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 462 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 100.00% classified tests traced and 100.00% classified E2E suites covered.
-- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 739-file current tree.
+- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 742-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
 
 ### Current Drift Check
 
-- Latest recorded full `src/` inventory: 739 files (2026-11-13), with no missing or stale rows.
-- Source-file rows below: 739, one per file in the current `src/` inventory.
+- Latest recorded full `src/` inventory: 742 files (2026-11-15), with no missing or stale rows.
+- Source-file rows below: 742, one per file in the current `src/` inventory.
 - The 224 rows added on 2026-10-24 state only what each file shows: its own `//!` summary, its `#[test]` count, and the test modules it declares. Their integration-suite links were not audited, and a listed test count is not a passing result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -265,6 +265,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extensions/tests/enforcement.rs` | Extension tests: enforcement | In-source test module (waived glue). |
 | `src/extensions/tests/event_timeouts.rs` | Extension tests: event timeouts | In-source test module (waived glue). |
 | `src/extensions/tests/exec_security.rs` | Extension tests: exec security | In-source test module (waived glue). |
+| `src/extensions/tests/mcp_registration.rs` | Extension tests: MCP server registration | In-source test module (3 tests; waived glue). |
 | `src/extensions/tests/policy_transition.rs` | Extension tests: policy transition | In-source test module (waived glue). |
 | `src/extensions/tests/reactor.rs` | Extension tests: reactor | In-source test module (waived glue). |
 | `src/extensions/tests/registration.rs` | Extension tests: registration | In-source test module (waived glue). |
@@ -647,9 +648,11 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/subagents/protocol.rs` | Subagent inter-process protocol messages | Unit; `tests/subagent.rs`. |
 | `src/subagents/seance.rs` | Read-only consultation of one saved session through the native child runner | Unit (12 in-module tests). |
 | `src/subagents/worker.rs` | Session-owned, reusable RPC children | Unit (5 in-module tests). |
+| `src/subagents/worker/isolation.rs` | Frozen, keep-only worktree isolation for retained RPC workers and pools | Unit (2 in-module tests); exercised by isolated worker and pool suites in `src/subagents/execution/worker.rs` and `src/subagents/worker/pool.rs`. |
 | `src/subagents/worker/output_contract.rs` | Strict output contracts for retained RPC conversations | Unit (5 in-module tests); `src/subagents/worker/output_contract/native_tests.rs` (12 tests). |
 | `src/subagents/worker/output_contract/native_tests.rs` | Actual SubagentTool admission, RPC children, retained results and privacy | Test module (12 tests). |
-| `src/subagents/worker/pool.rs` | A session-owned pool is one native job, including its idle RPC children, admission queue and ordered result manifest | Unit (14 in-module tests). |
+| `src/subagents/worker/pool.rs` | A session-owned pool is one native job, including its idle RPC children, admission queue and ordered result manifest | Unit (17 in-module tests). |
+| `src/subagents/worker/pool/exchange.rs` | Compound workpool turn (`pool_exchange`): atomic batch admission, optional seal, and bounded result observation | Unit (3 in-module tests). |
 | `src/subagents/workflow.rs` | Dependency-ordered native delegation, not a second child runtime | `src/subagents/workflow/background_tests.rs` (8 tests); `src/subagents/workflow/tests.rs` (25 tests). |
 | `src/subagents/workflow/background_tests.rs` | Exercise actual background admission, jobs and the native DAG runner | Test module (8 tests). |
 | `src/subagents/workflow/decision.rs` | Typed branch selection over settled native results | `src/subagents/workflow/decision/tests.rs` (19 tests). |

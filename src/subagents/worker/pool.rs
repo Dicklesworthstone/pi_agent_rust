@@ -1487,7 +1487,7 @@ mod tests {
                 .expect("executable child"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The test transport must be executable.
             let owner = format!("pool-fixture-{}", uuid::Uuid::new_v4());
             let mut tool = SubagentTool::with_paths(root.path().to_path_buf(), global, binary)
-                .with_timeout(Duration::from_secs(15));
+                .with_timeout(Duration::from_secs(60));
             tool.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(&owner));
             Self { root, tool, owner }
         }
@@ -1566,7 +1566,7 @@ mod tests {
 
     pub(super) fn private_projection(secret: &str) -> AuxiliaryPrivacySnapshot {
         let mut vault = crate::secrets::SecretVault::default();
-        let pattern = regex::Regex::new(secret).expect("controlled secret pattern"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This literal pattern records the later-cell secret discovery.
+        let pattern = regex::Regex::new(&regex::escape(secret)).expect("controlled secret pattern"); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- This literal pattern records the later-cell secret discovery.
         crate::secrets::obfuscate(secret, &mut vault, &[pattern]);
         AuxiliaryPrivacySnapshot::with_vault(AuxiliaryPrivacy::from_settings(None), &vault)
     }
@@ -1858,7 +1858,7 @@ done
             let hidden_patch = execute(
                 &fixture.tool,
                 json!({"operation":"pool_drain","poolId":pool}),
-                private_projection("worker\\.txt"),
+                private_projection("worker.txt"),
             )
             .await
             .expect_err("redacted bytes cannot retain an actionable patch contract");

@@ -1408,9 +1408,19 @@ mod tests {
         let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
         let mut keyless = model_entry("ollama", "llama3.2", None, HashMap::new());
         keyless.auth_header = false;
-        let mut app = build_test_app(current.clone(), vec![current, keyless]);
+        let (mut app, mut events) =
+            build_test_app_with_event_rx(current.clone(), vec![current, keyless]);
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("old-key".to_string());
+        }
 
         let _ = app.handle_slash_command(SlashCommand::Model, "ollama/llama3.2");
+        assert!(
+            runtime()
+                .block_on(app.settle_model_selection_for_test(&mut events))
+                .is_none()
+        );
 
         assert_eq!(app.model, "ollama/llama3.2");
         let mut guard = app.agent.try_lock().expect("agent lock");

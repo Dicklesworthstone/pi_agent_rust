@@ -16375,14 +16375,7 @@ async fn dispatch_extension_event_phase_sharded(
     } else {
         match outcome {
             JsCancellableTaskOutcome::Finished(result) => {
-                let phase_absent = result
-                    .as_ref()
-                    .is_ok_and(|value| value.get("present") == Some(&Value::Bool(false)));
-                let refreshed = if phase_absent {
-                    Ok(())
-                } else {
-                    refresh_runtime_shard_snapshot(shards, shard_index).await
-                };
+                let refreshed = refresh_runtime_shard_snapshot(shards, shard_index).await;
                 if fence.was_interrupted() || cancelled.load(StdOrdering::Acquire) {
                     Err(quarantine_runtime_shard(
                         shards,
