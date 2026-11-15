@@ -441,9 +441,10 @@ fn mcp_publication_fences_stale_actors_and_preserves_host_replacements() {
                 error.to_string().contains("server name collision"),
                 "{error}"
             );
+            // ubs:ignore[rust.panic.assert-macros]
             assert_eq!(
                 extensions.extension_mcp_servers(),
-                [host_replacement.clone()]
+                std::slice::from_ref(&host_replacement)
             );
             let shutdown = handle.shutdown_owned_resources().await;
             // ubs:ignore[rust.panic.assert-macros]

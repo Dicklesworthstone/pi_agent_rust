@@ -5971,7 +5971,7 @@ fn recovery_cancellation_releases_admission_without_changing_history() {
                             // internal helper's optional cancellation argument.
                             handle
                                 .prompt_with_abort("must not be appended", signal, move |event| {
-                                    callback(event)
+                                    callback(event);
                                 })
                                 .await
                                 .map(|_| ())

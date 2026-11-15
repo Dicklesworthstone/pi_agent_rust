@@ -130,7 +130,7 @@ fn digest(bytes: &[u8]) -> String {
 
 /// Only these message roles own native content blocks. In particular,
 /// Flattened Bash execution metadata may contain an opaque "content" field.
-pub(crate) fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
+pub fn message_blocks(value: &mut Value) -> Option<&mut Vec<Value>> {
     if value.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }

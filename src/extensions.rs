@@ -17914,8 +17914,8 @@ async fn start_extension_provider_stream_simple_sharded(
         }
         drop(recovery_fence);
     }
-    if let Some(inner_stream_id) = inner_stream_id {
-        if let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
+    if let Some(inner_stream_id) = inner_stream_id
+        && let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
             shards,
             host,
             shard_index,
@@ -17925,11 +17925,10 @@ async fn start_extension_provider_stream_simple_sharded(
             None,
         )
         .await
-        {
-            cleanup_failure = Some(format!(
-                "provider start iterator cleanup failed: {cleanup_err}"
-            ));
-        }
+    {
+        cleanup_failure = Some(format!(
+            "provider start iterator cleanup failed: {cleanup_err}"
+        ));
     }
     if let Some(cleanup_failure) = cleanup_failure {
         let quarantine = quarantine_runtime_shard(shards, shard_index, &cleanup_failure);

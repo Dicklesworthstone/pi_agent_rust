@@ -265,7 +265,7 @@ struct CacheState {
 /// Per-provider, bounded metadata-only cache. A per-content async lock prevents
 /// concurrent foreground/background requests from uploading the same blob twice.
 #[derive(Default)]
-pub(crate) struct FileCache {
+pub struct FileCache {
     state: Mutex<CacheState>,
     policy: StagingPolicy,
     #[cfg(test)]

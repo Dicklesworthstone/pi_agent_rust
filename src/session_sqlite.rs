@@ -2151,7 +2151,7 @@ mod tests {
             assert!(opened_sidecar_is_read_only(&archive).unwrap());
             let original_files = [&archive, &wal, &journal].map(|path| {
                 (
-                    path.to_path_buf(),
+                    path.clone(),
                     std::fs::read(path).unwrap(),
                     std::fs::metadata(path).unwrap().permissions().mode(),
                 )
