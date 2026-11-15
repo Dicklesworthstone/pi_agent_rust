@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+pub(super) mod isolation;
 pub(super) mod output_contract;
 mod pool;
 
@@ -68,6 +69,9 @@ pub(super) struct WorkerState {
     // used for scheduling retained workers.
     context_tokens: Option<u64>,
     context_window: Option<u64>,
+    // Recovery identity survives process retirement, including a cancelled turn
+    // that never produced a complete cumulative patch.
+    workspace: Option<Value>,
 }
 
 fn registry() -> &'static Mutex<VecDeque<Shared>> {
@@ -226,6 +230,17 @@ pub(super) fn bind_hub(state: &Shared, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Retain the exact workspace identity before spawning its child. Even a
+/// startup failure or interrupted turn must leave its files discoverable.
+pub(super) fn bind_workspace(state: &Shared, descriptor: Value) -> Result<()> {
+    let mut state = state.lock().map_err(|_| stopped())?;
+    if state.workspace.is_some() {
+        return Err(stopped());
+    }
+    state.workspace = Some(descriptor);
+    Ok(())
+}
+
 fn hold_results(
     results: Arc<crate::agent_hub::ResultDependencies>,
     acknowledged: Vec<u64>,
@@ -271,6 +286,7 @@ async fn start(
             "scope",
             "timeoutSeconds",
             "isolation",
+            "isoApply",
             "outputSchema",
             "schemaMode",
         ],
@@ -289,14 +305,7 @@ async fn start(
         ));
     }
     workspace::validate_request(&input)?;
-    if input
-        .get("isolation")
-        .is_some_and(|value| value.as_str() != Some("none"))
-    {
-        return Err(invalid(
-            "workers currently support isolation none; use ordinary subagent tasks for worktrees",
-        ));
-    }
+    isolation::validate(&input)?;
     let timeout = optional_integer(&input, "timeoutSeconds", 1, 86_400)?;
     let scope: AgentScope = input.get("scope").map_or_else(
         || Ok(AgentScope::default()),
@@ -344,6 +353,11 @@ async fn start(
     }
     let (model_selection, fallback_policy) =
         super::model_selection::prepare_worker(tool, &input, &agent, &cwd, deadline)?;
+    check_owner(&owner)?;
+    deadline
+        .check()
+        .map_err(|error| Error::tool("subagent", error))?;
+    let isolation = isolation::Capture::prepare(&input, &cwd, &privacy)?;
     if background::resolve_session(&tool.job_session_scope, &owner, deadline).await? != owner_id {
         return Err(Error::tool(
             "subagent",
@@ -382,6 +396,7 @@ async fn start(
         result_bytes: 0,
         context_tokens: None,
         context_window: None,
+        workspace: None,
     }));
     register(Arc::clone(&state))?;
     let runner = ChildRunner::new(
@@ -395,7 +410,8 @@ async fn start(
     .with_parent_model(parent_model)
     .with_cost_budget(cost_budget)
     .with_worker_model_selection(model_selection)
-    .with_worker_fallback_policy(fallback_policy);
+    .with_worker_fallback_policy(fallback_policy)
+    .with_worker_isolation(isolation);
     let cleanup = FinishGuard(Arc::clone(&state));
     let actor_state = Arc::clone(&state);
     let artifacts = tool.global_dir.join("tool-output-artifacts");
@@ -682,6 +698,7 @@ fn snapshot(
             "turn": {"id": turn_id, "status": turn.status, "result": turn.result},
             "admittedTurns": state.latest, "queuedTurns": state.queue.len(),
             "contextTokens": state.context_tokens, "contextWindow": state.context_window,
+            "workspace": state.workspace,
             "remainingMs": u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
         })
     };
@@ -694,14 +711,17 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
     // A later discovery may be stricter than the snapshot that admitted a turn.
     let details = privacy.project_json(&value)?;
     if let Some(result) = value.pointer("/turn/result")
-        && !output_contract::preserves_typed_result(
+        && (!output_contract::preserves_typed_result(
             result,
             details.pointer("/turn/result").unwrap_or(&Value::Null),
-        )
+        ) || !isolation::preserves_result(
+            result,
+            details.pointer("/turn/result").unwrap_or(&Value::Null),
+        ))
     {
         return Err(Error::tool(
             "subagent",
-            "PI_SUBAGENT_WORKER_PRIVACY: privacy policy withheld a schema-validated result",
+            "PI_SUBAGENT_WORKER_PRIVACY: privacy policy withheld typed data or a worktree patch",
         ));
     }
     for path in [
@@ -715,6 +735,7 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
         "/turn/status",
         "/contextTokens",
         "/contextWindow",
+        "/workspace",
     ] {
         if value.pointer(path) != details.pointer(path) {
             return Err(Error::tool(
@@ -801,6 +822,7 @@ fn protected_result(result: Result<ToolOutput>, privacy: &AuxiliaryPrivacySnapsh
         let value = serde_json::from_slice::<Value>(&bytes).ok()?;
         let projected = privacy.project_json(&value).ok()?;
         if !output_contract::preserves_typed_result(&value, &projected)
+            || !isolation::preserves_result(&value, &projected)
             || serde_json::to_vec(&projected).ok()?.len() > MAX_TURN_RESULT_BYTES
         {
             return None;

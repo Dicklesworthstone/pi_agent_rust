@@ -269,16 +269,60 @@ their closed handle is evicted. Existing filesystem effects are not rolled back.
   and notices, and observations are screened again under the caller's current
   policy. A canceled or closing job cannot accept another turn or a late result.
 - `worker_start` accepts `agent`, `task`, `model`, `cwd`, `scope`, `timeoutSeconds`
-  and `isolation: "none"` on Unix and Windows. Follow-ups cannot change frozen
-  launch options. An `outputSchema` or the definition's `output_schema` freezes
-  a strict contract for every turn: answers must be bare JSON that validates,
-  with no corrective retry. `schemaMode`, when supplied, must be `"strict"`.
-  Worktree isolation and historical `seance` consultation remain on the ordinary
+  and `isolation: "none" | "worktree"` on Unix and Windows. Isolated workers
+  accept only `isoApply: "keep"`, which is also their default. Follow-ups cannot
+  change frozen launch options. An `outputSchema` or the definition's
+  `output_schema` freezes a strict contract for every turn: answers must be bare
+  JSON that validates, with no corrective retry. `schemaMode`, when supplied,
+  must be `"strict"`. Historical `seance` consultation remains on the ordinary
   delegation path.
+
+### Keep an isolated reusable workspace
+
+Use `isolation: "worktree"` to keep reusable workers' edits separate from the
+parent and from other pool members:
+
+```json
+{"operation":"worker_start","agent":"task","task":"Implement the parser correction","cwd":"packages/parser","isolation":"worktree","isoApply":"keep"}
+```
+
+The launch captures the parent's tracked changes and non-ignored untracked
+files before acknowledgment, including staged and unstaged edits. A nested
+`cwd` keeps its corresponding location in the isolated tree. Each worker
+retains its worktree for all turns. A pool captures one baseline for the whole
+launch and creates a separate worktree for each member; later parent or sibling
+edits cannot change that baseline. The existing snapshot limits and source
+validation still apply.
+
+Retained workers always keep their worktrees. Omit `isoApply` or set it to
+`"keep"`; `"apply"` and `"drop"` are rejected before launch. Closing,
+cancellation, timeout, failure and session shutdown reap processes without
+applying or deleting the workspace. Review and reconcile the retained edits
+explicitly.
+
+Worker snapshots expose `workspace` with schema
+`pi.subagent.worker.workspace.v1`, `mode: "worktree"`, `worktreePath`,
+`branch`, `baseline`, `cwd`, `applyMode: "keep"` and `applied: false`.
+Before materialization, or without isolation, it is null. Pool manifests and
+drain pages expose `workerWorkspaces` rows of
+`{workerIndex, workspace, closed}`; each item carries the same 1-based
+`workerIndex`. The descriptor remains available after that member closes.
+
+A completed turn's native result carries `iso` with the cumulative patch
+against the original captured baseline. Later turns on the same member include
+earlier edits: these are successive snapshots, so do not apply them as
+independent patches. Different pool members retain separate worktrees and
+patches. A cancelled or failed turn may have only its workspace descriptor;
+inspect the retained files rather than assuming no changes occurred. Existing
+result-size limits still apply. Privacy projection cannot rewrite an actionable
+workspace identity or patch while retaining its original contract.
 
 The native regression suite includes a controlled RPC child that remembers a
 first prompt in its second response while keeping one PID, queued turn ordering,
 the post-turn streaming/compaction barrier, idle cancellation and session ownership.
+Worktree regressions cover a shared dirty baseline, distinct member paths,
+nested working directories, cumulative turns, unchanged parent HEAD/index,
+prelaunch refusal and preservation of interrupted edits.
 Rust acceptance remains the DSR quality lane; guest-language diagnostics alone
 do not establish native execution correctness.
 
@@ -306,8 +350,10 @@ interpreter is not needed to keep them running.
 The acknowledgment has `details.schema: "pi.subagent.pool.v1"`, a stable
 `poolId`, a carrier `jobId`, and `admittedItemIds` in input order. Item IDs are
 1-based, never reused and independent of internal worker/turn assignments.
-The `items` manifest retains admission order. Internal member worker handles
-are not published and cannot be used to cancel a shared carrier accidentally.
+The `items` manifest retains admission order and exposes each item's stable
+`workerIndex` for association with `workerContexts` and `workerWorkspaces`.
+Internal member worker handles are not published and cannot be used to cancel
+a shared carrier accidentally.
 
 Later batches use the existing pool identity:
 
@@ -340,7 +386,7 @@ All controls use the `subagent` tool with an explicit `operation` field:
 
 | Operation | Fields and behavior |
 | --- | --- |
-| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), `cwd`, `scope`, `timeoutSeconds`, and `isolation: "none"`. Returns the new identity and admitted item IDs. |
+| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), `cwd`, `scope`, `timeoutSeconds`, `isolation: "none" \| "worktree"`, and keep-only `isoApply`. Returns the new identity and admitted item IDs. |
 | `pool_push` | Requires `poolId` and a nonempty `tasks` array. Returns all newly admitted item IDs; cannot change launch settings. |
 | `pool_status` | Requires `poolId`. Returns one bounded manifest with status, counts, ordered summaries and result references. |
 | `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
@@ -356,7 +402,7 @@ includes `concurrency`, `admittedItems`, `queuedItems`, `runningItems`,
 cancelled items. Each manifest entry has this shape:
 
 ```json
-{"id":1,"status":"completed","summary":"Bounded task summary…","resultRef":{"poolId":"pool-…","itemId":1}}
+{"id":1,"workerIndex":1,"status":"completed","summary":"Bounded task summary…","resultRef":{"poolId":"pool-…","itemId":1}}
 ```
 
 The summary is an excerpt, not a replacement for the task's native output.
@@ -366,7 +412,7 @@ Fetch one exact result with:
 {"operation":"pool_result","poolId":"pool-…","itemId":1}
 ```
 
-This adds `details.itemId` and `details.item: {id, status, result}`. Pending
+This adds `details.itemId` and `details.item: {id, workerIndex, status, result}`. Pending
 items have status `queued` or `running` and `result: null`; terminal items have
 status `completed`, `failed` or `cancelled` and a non-null native `ToolOutput`.
 That output preserves content, native details, error status, child PID and hub
@@ -391,7 +437,7 @@ full results per page:
 ```
 
 The returned `details.schema` is `pi.subagent.pool.drain.v1`. Its `items` are
-`{id, status, result}` records in ascending item order among currently settled
+`{id, workerIndex, status, result}` records in ascending item order among currently settled
 results. `result` is the full native `ToolOutput`. The page includes pool/job/
 agent identity, pool `status`, `sealed`, and `admittedItems`, `settledItems` and
 `pendingItems` counts.
@@ -467,11 +513,11 @@ runtime's error result rather than a successful aggregate manifest.
   time. The host limit defaults to 900 seconds; `timeoutSeconds` may shorten it.
   Push, finish and observation waits never renew the deadline.
 - Children use the definition, model selection, tools and working directory
-  captured at startup. Pools support Unix and Windows with `isolation: "none"`.
-  A launch-time `outputSchema` or schema-bearing definition applies one strict
-  output contract to every member and turn, without corrective retries.
-  Worktree isolation and historical `seance` consultation remain on the ordinary
-  delegation path.
+  captured at startup. Pools support Unix and Windows with `isolation: "none"`
+  or `"worktree"`; isolated members preserve their worktrees with keep-only
+  disposition. A launch-time `outputSchema` or schema-bearing definition applies
+  one strict output contract to every member and turn, without corrective retries.
+  Historical `seance` consultation remains on the ordinary delegation path.
 - Every native operation checks the current owning session and cancellation
   state. An eval request also passes its active Agent's current tool, approval,
   plan and extension policy. Captured IDs grant no permission in another

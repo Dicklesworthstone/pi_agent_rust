@@ -60,6 +60,7 @@ pub(super) struct ChildRunner {
     cost_budget: Option<crate::cost::CostBudget>,
     worker_model_selection: Option<super::model_selection::Selection>,
     worker_fallback_policy: Option<String>,
+    worker_isolation: Option<Arc<super::worker::isolation::Capture>>,
     hub_kind: ChildKind,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
@@ -86,6 +87,7 @@ impl ChildRunner {
             cost_budget: None,
             worker_model_selection: None,
             worker_fallback_policy: None,
+            worker_isolation: None,
             hub_kind,
             deadline,
             revival: None,
@@ -151,6 +153,14 @@ impl ChildRunner {
 
     pub(super) fn with_worker_fallback_policy(mut self, policy: String) -> Self {
         self.worker_fallback_policy = Some(policy);
+        self
+    }
+
+    pub(super) fn with_worker_isolation(
+        mut self,
+        capture: Option<Arc<super::worker::isolation::Capture>>,
+    ) -> Self {
+        self.worker_isolation = capture;
         self
     }
 

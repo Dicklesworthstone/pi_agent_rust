@@ -115,6 +115,7 @@ struct Actor {
     request_sequence: u64,
     failure: Option<String>,
     output_contract: Option<crate::subagents::worker::output_contract::OutputContract>,
+    isolation: Option<crate::worktree_iso::IsoHandle>,
 }
 
 #[cfg(any(unix, windows))]
@@ -144,6 +145,7 @@ impl Actor {
             request_sequence: 0,
             failure: Some(CANCELLED.to_string()),
             output_contract: None,
+            isolation: None,
         }
     }
 
@@ -190,7 +192,9 @@ impl Actor {
                 "PI_SUBAGENT_PERMISSION: warm workers require I/O, spawn and timer capabilities",
             ));
         }
-        if !self.runner.cwd.is_dir() {
+        // Isolated launch depends on its frozen snapshot, not continued
+        // existence of the parent's original directory while it was queued.
+        if self.runner.worker_isolation.is_none() && !self.runner.cwd.is_dir() {
             return Err(Error::tool(
                 "subagent",
                 "PI_SUBAGENT_WORKER_CWD: launch directory is unavailable",
@@ -205,6 +209,22 @@ impl Actor {
         self.lifecycle.hub_id = Some(entry.id.clone());
         crate::subagents::worker::bind_hub(&self.state, &entry.id)?;
         self.check()?;
+        if let Some(capture) = self.runner.worker_isolation.take() {
+            // Materialize the pre-admission snapshot, never recapture a later
+            // parent state. Keep ownership and recovery identity even if the
+            // requested nested directory is absent or process startup fails.
+            let handle = capture.materialize(&entry.id)?;
+            self.isolation = Some(handle);
+            let handle = self
+                .isolation
+                .as_ref()
+                .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+            let descriptor = capture.descriptor(handle)?;
+            crate::subagents::worker::bind_workspace(&self.state, descriptor)?;
+            self.runner.cwd = capture.working_directory(handle)?;
+            self.lifecycle.cwd.clone_from(&self.runner.cwd);
+            self.check()?;
+        }
         let messaging = self.lifecycle.tools.iter().any(|tool| tool == "hub");
         let channel = if messaging || self.runner.cost_budget.is_some() {
             Some(
@@ -517,6 +537,17 @@ impl Actor {
             // compaction reaches validation. Failure settles this turn without
             // repeating its effects or discarding the reusable conversation.
             contract.validate(&mut result);
+        }
+        if let Some(handle) = &self.isolation {
+            match crate::subagents::worker::isolation::outcome(handle) {
+                Ok(outcome) => result.iso = Some(outcome),
+                Err(error) => result.fail(format!(
+                    "Failed to collect cumulative worktree diff; files are preserved: {error}"
+                )),
+            }
+            // Snapshot collection consumes the original job budget. A late
+            // snapshot cannot publish success after cancellation or expiry.
+            self.check()?;
         }
         let mut output = result_output(&[result], "worker", false);
         if let Some(details) = output.details.as_mut() {
@@ -869,6 +900,191 @@ while IFS= read -r line; do
     esac
 done
 "#;
+
+    fn isolation_git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=worker fixture",
+                "-c",
+                "user.email=worker@example.test",
+            ])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("real Git fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("Git fixture output")
+    }
+
+    fn prepare_isolated_fixture(fixture: &Fixture) {
+        let root = fixture.root.path();
+        isolation_git(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/global/\n/child.sh\n/launches\n/first-running\n/release\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/tracked.txt"), "committed source\n").unwrap();
+        isolation_git(root, &["add", ".gitignore", "nested/tracked.txt"]);
+        isolation_git(root, &["commit", "-qm", "baseline"]);
+        std::fs::write(root.join("nested/tracked.txt"), "staged source\n").unwrap();
+        isolation_git(root, &["add", "nested/tracked.txt"]);
+        std::fs::write(root.join("nested/tracked.txt"), "dirty source\n").unwrap();
+        std::fs::write(root.join("nested/untracked.txt"), "source note\n").unwrap();
+    }
+
+    const ISOLATED_RPC_CHILD: &str = r#"
+set -eu
+control_root=$(dirname "$0")
+printf '%s\n' "$$" >> "$control_root/launches"
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    case "$line" in
+        *'"type":"get_state"'*)
+            printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}}\n' "$id"
+            ;;
+        *'"type":"prompt"'*)
+            printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+            printf '%s\n' '{"type":"agent_start"}'
+            test "$(cat tracked.txt)" = 'dirty source'
+            test "$(cat untracked.txt)" = 'source note'
+            if [ -f worker.txt ]; then
+                test "$(cat worker.txt)" = 'first'
+                printf 'second\n' >> worker.txt
+                answer=second
+            else
+                printf 'first\n' > worker.txt
+                answer=first
+            fi
+            case "$line" in
+                *'Task: hold'*)
+                    printf ready > "$control_root/first-running"
+                    while [ ! -f "$control_root/release" ]; do sleep 0.02; done
+                    ;;
+            esac
+            printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"%s"}]}]}\n' "$answer"
+            ;;
+    esac
+done
+"#;
+
+    fn retained_handle(fixture: &Fixture, descriptor: &Value) -> crate::worktree_iso::IsoHandle {
+        crate::worktree_iso::IsoHandle {
+            id: field(descriptor, "branch"),
+            branch: field(descriptor, "branch"),
+            path: std::path::PathBuf::from(field(descriptor, "worktreePath")),
+            repo_root: fixture.root.path().to_path_buf(),
+            baseline: field(descriptor, "baseline"),
+        }
+    }
+
+    #[test]
+    fn isolated_worker_reuses_dirty_launch_state_and_retains_cumulative_edits() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(ISOLATED_RPC_CHILD);
+        prepare_isolated_fixture(&fixture);
+        let before_head = isolation_git(fixture.root.path(), &["rev-parse", "HEAD"]);
+        let before_index = std::fs::read(fixture.root.path().join(".git/index")).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({
+                "operation":"worker_start", "agent":"worker", "task":"hold",
+                "cwd":"nested", "isolation":"worktree", "isoApply":"keep"
+            })).await;
+            let worker = field(&started, "workerId");
+            fixture.await_file("first-running").await;
+            let live = fixture.call(json!({"operation":"worker_status", "workerId":worker})).await;
+            let descriptor = live["workspace"].clone();
+            let handle = retained_handle(&fixture, &descriptor);
+            assert_eq!(descriptor["schema"], "pi.subagent.worker.workspace.v1");
+            assert_eq!(descriptor["applyMode"], "keep");
+            assert_eq!(descriptor["applied"], false);
+            assert_eq!(
+                descriptor["cwd"].as_str(),
+                handle.path.join("nested").to_str()
+            );
+            std::fs::write(fixture.root.path().join("nested/tracked.txt"), "later parent\n").unwrap();
+            fixture.call(json!({"operation":"worker_send", "workerId":worker, "task":"continue"})).await;
+            std::fs::write(fixture.root.path().join("release"), "continue").unwrap();
+            let first = fixture.wait(&worker, 1).await;
+            let second = fixture.wait(&worker, 2).await;
+            assert_eq!(native_result(&first)["pid"], native_result(&second)["pid"]);
+            assert_eq!(native_result(&first)["output"], "first");
+            assert_eq!(native_result(&second)["output"], "second");
+            let first_patch = native_result(&first)["iso"]["patch"].as_str().unwrap();
+            let second_patch = native_result(&second)["iso"]["patch"].as_str().unwrap();
+            assert!(first_patch.contains("+first\n"));
+            assert!(!first_patch.contains("+second\n"));
+            assert!(second_patch.contains("+first\n+second\n"));
+            assert!(!second_patch.contains("tracked.txt"));
+            assert!(!second_patch.contains("untracked.txt"));
+            let pid = native_result(&second)["pid"]
+                .as_i64()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .and_then(rustix::process::Pid::from_raw)
+                .unwrap();
+            let closed = fixture.call(json!({"operation":"worker_close", "workerId":worker})).await;
+            assert_eq!(closed["workspace"], descriptor);
+            assert!(rustix::process::test_kill_process(pid).is_err());
+            assert_eq!(
+                std::fs::read_to_string(handle.path.join("nested/worker.txt")).unwrap(),
+                "first\nsecond\n"
+            );
+            assert!(!fixture.root.path().join("nested/worker.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.path().join("nested/tracked.txt")).unwrap(),
+                "later parent\n"
+            );
+            assert_eq!(isolation_git(fixture.root.path(), &["rev-parse", "HEAD"]), before_head);
+            assert_eq!(std::fs::read(fixture.root.path().join(".git/index")).unwrap(), before_index);
+            crate::worktree_iso::drop_worktree(&handle).expect("retire asserted test fixture");
+        });
+    }
+
+    #[test]
+    fn cancelled_isolated_worker_keeps_partial_edits_and_recovery_identity() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(ISOLATED_RPC_CHILD);
+        prepare_isolated_fixture(&fixture);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({
+                "operation":"worker_start", "agent":"worker", "task":"hold",
+                "cwd":"nested", "isolation":"worktree"
+            })).await;
+            let worker = field(&started, "workerId");
+            fixture.await_file("first-running").await;
+            let live = fixture.call(json!({"operation":"worker_status", "workerId":worker})).await;
+            let descriptor = live["workspace"].clone();
+            let handle = retained_handle(&fixture, &descriptor);
+            let closed = fixture.call(json!({"operation":"worker_close", "workerId":worker})).await;
+            assert_eq!(closed["workspace"], descriptor);
+            assert_eq!(closed["turn"]["status"], "cancelled");
+            assert_eq!(
+                std::fs::read_to_string(handle.path.join("nested/worker.txt")).unwrap(),
+                "first\n"
+            );
+            assert!(!fixture.root.path().join("nested/worker.txt").exists());
+            crate::worktree_iso::drop_worktree(&handle).expect("retire asserted test fixture");
+        });
+    }
 
     #[test]
     fn queued_turns_reuse_one_process_and_wait_for_post_turn_compaction() {

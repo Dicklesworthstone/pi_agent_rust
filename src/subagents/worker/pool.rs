@@ -159,6 +159,7 @@ fn worker(owner: &str, agent: &str, deadline: Deadline) -> Shared {
         result_bytes: 0,
         context_tokens: None,
         context_window: None,
+        workspace: None,
     }))
 }
 
@@ -180,6 +181,7 @@ async fn start(
             "scope",
             "timeoutSeconds",
             "isolation",
+            "isoApply",
             "outputSchema",
             "schemaMode",
         ],
@@ -197,21 +199,15 @@ async fn start(
             "historical consultation cannot become a reusable pool",
         ));
     }
-    // Pool tasks are strings governed by one frozen workspace. The ordinary
+    // Pool tasks are strings governed by one frozen workspace policy. The ordinary
     // batch validator instead expects workspace controls on each task object.
     let mut workspace_controls = serde_json::Map::new();
-    for field in ["cwd", "isolation"] {
+    for field in ["cwd", "isolation", "isoApply"] {
         if let Some(value) = input.get(field) {
             workspace_controls.insert(field.to_string(), value.clone());
         }
     }
     workspace::validate_request(&Value::Object(workspace_controls))?;
-    if input
-        .get("isolation")
-        .is_some_and(|value| value.as_str() != Some("none"))
-    {
-        return Err(invalid("pools currently require isolation none"));
-    }
     let concurrency =
         usize::try_from(optional_integer(&input, "concurrency", 1, MAX_CHILDREN)?.unwrap_or(4))
             .map_err(|_| invalid("concurrency must be from 1 to 8"))?;
@@ -266,6 +262,11 @@ async fn start(
     let (model_selection, fallback_policy) =
         crate::subagents::model_selection::prepare_worker(tool, &input, &agent, &cwd, deadline)?;
     recheck_owner(tool, &owner, &owner_id, deadline).await?;
+    // One immutable dirty-parent snapshot belongs to the entire launch. Each
+    // actor materializes a separate worktree from it; later parent edits or a
+    // sibling's first turn cannot become another member's launch baseline.
+    let isolation = super::isolation::Capture::prepare(&input, &cwd, &privacy)?;
+    recheck_owner(tool, &owner, &owner_id, deadline).await?;
     let workers: Vec<_> = (0..concurrency)
         .map(|_| worker(&owner_id, &name, deadline))
         .collect();
@@ -301,7 +302,8 @@ async fn start(
                 .with_parent_model(parent_model.clone())
                 .with_cost_budget(cost_budget.clone())
                 .with_worker_model_selection(model_selection.clone())
-                .with_worker_fallback_policy(fallback_policy.clone()),
+                .with_worker_fallback_policy(fallback_policy.clone())
+                .with_worker_isolation(isolation.clone()),
                 agent.clone(),
             )
         })
@@ -468,8 +470,8 @@ fn prepare_batch(
             .get_mut("items")
             .and_then(Value::as_array_mut)
             .ok_or_else(stopped)?;
-        for id in &ids {
-            items.push(json!({"id":id, "status":"queued", "summary":"", "resultRef":{"poolId":state.id,"itemId":id}}));
+        for (id, (worker, _)) in ids.iter().zip(&placements) {
+            items.push(json!({"id":id, "workerIndex":worker + 1, "status":"queued", "summary":"", "resultRef":{"poolId":state.id,"itemId":id}}));
         }
         let fields = value.as_object_mut().ok_or_else(stopped)?;
         let queued = fields
@@ -872,7 +874,7 @@ fn drain_snapshot(
                 unseen += 1;
                 if items.len() < request.max_items {
                     let result = turn.result.as_ref().ok_or_else(stopped)?;
-                    items.push(json!({"id":id,"status":turn.status,"result":result}));
+                    items.push(json!({"id":id,"workerIndex":item.worker + 1,"status":turn.status,"result":result}));
                     next.push(id);
                 }
             }
@@ -888,6 +890,9 @@ fn drain_snapshot(
             "nextCursor":drain_cursor(&state.id,&next),
             "hasMore":unseen > items.len(),"done":done,
             "timedOut":expired && items.is_empty() && !done,"items":items,
+            "workerWorkspaces":workers.iter().enumerate().map(|(index, worker)| json!({
+                "workerIndex":index + 1, "workspace":worker.workspace, "closed":worker.closed,
+            })).collect::<Vec<_>>(),
         });
         (value, state.privacy.clone())
     };
@@ -910,6 +915,7 @@ fn drain_snapshot(
         "hasMore",
         "done",
         "timedOut",
+        "workerWorkspaces",
     ]
     .iter()
     .all(|key| value.get(key) == details.get(key));
@@ -921,11 +927,13 @@ fn drain_snapshot(
             before.len() == after.len()
                 && before.iter().zip(after).all(|(before, after)| {
                     before.get("id") == after.get("id")
+                        && before.get("workerIndex") == after.get("workerIndex")
                         && before.get("status") == after.get("status")
                         && before.pointer("/result/isError") == after.pointer("/result/isError")
                         && before.get("result").zip(after.get("result")).is_some_and(
                             |(before, after)| {
                                 super::output_contract::preserves_typed_result(before, after)
+                                    && super::isolation::preserves_result(before, after)
                             },
                         )
                         && after.get("result").is_some_and(|result| {
@@ -1116,9 +1124,9 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
             "completed" => completed += 1,
             _ => failed += 1,
         }
-        items.push(json!({"id":id, "status":turn.status, "summary":summary(turn.result.as_ref()), "resultRef":{"poolId":state.id,"itemId":id}}));
+        items.push(json!({"id":id, "workerIndex":item.worker + 1, "status":turn.status, "summary":summary(turn.result.as_ref()), "resultRef":{"poolId":state.id,"itemId":id}}));
         if selected == Some(id) {
-            selected_item = Some(json!({"id":id, "status":turn.status, "result":turn.result}));
+            selected_item = Some(json!({"id":id, "workerIndex":item.worker + 1, "status":turn.status, "result":turn.result}));
         }
     }
     let mut value = json!({
@@ -1129,6 +1137,9 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
         "remainingMs":u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
         "workerContexts":workers.iter().enumerate().map(|(index, worker)| json!({
             "workerIndex":index + 1, "tokens":worker.context_tokens, "window":worker.context_window,
+        })).collect::<Vec<_>>(),
+        "workerWorkspaces":workers.iter().enumerate().map(|(index, worker)| json!({
+            "workerIndex":index + 1, "workspace":worker.workspace, "closed":worker.closed,
         })).collect::<Vec<_>>(),
     });
     if let Some(id) = selected {
@@ -1177,6 +1188,7 @@ fn projected_snapshot_with(
         "itemId",
         "admittedItemIds",
         "workerContexts",
+        "workerWorkspaces",
     ]
     .iter()
     .all(|key| value.get(key) == details.get(key));
@@ -1187,7 +1199,7 @@ fn projected_snapshot_with(
         .is_some_and(|(before, after)| {
             before.len() == after.len()
                 && before.iter().zip(after).all(|(before, after)| {
-                    ["id", "status", "resultRef"]
+                    ["id", "workerIndex", "status", "resultRef"]
                         .iter()
                         .all(|key| before.get(key) == after.get(key))
                         && after.get("summary").is_some_and(Value::is_string)
@@ -1196,11 +1208,15 @@ fn projected_snapshot_with(
     if !unchanged
         || !items_preserved
         || value.pointer("/item/id") != details.pointer("/item/id")
+        || value.pointer("/item/workerIndex") != details.pointer("/item/workerIndex")
         || value.pointer("/item/status") != details.pointer("/item/status")
         || value.pointer("/item/result").is_some_and(|before| {
             details
                 .pointer("/item/result")
-                .is_none_or(|after| !super::output_contract::preserves_typed_result(before, after))
+                .is_none_or(|after| {
+                    !super::output_contract::preserves_typed_result(before, after)
+                        || !super::isolation::preserves_result(before, after)
+                })
         })
     {
         return Err(Error::tool(
@@ -1567,6 +1583,367 @@ while IFS= read -r line; do
     esac
 done
 "#;
+
+    type IsolationTestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    fn isolation_git(
+        root: &std::path::Path,
+        args: &[&str],
+    ) -> std::result::Result<String, Box<dyn std::error::Error>> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "Git fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn init_dirty_workspace(fixture: &Fixture) -> IsolationTestResult {
+        let root = fixture.root.path();
+        isolation_git(root, &["init", "-q"])?;
+        isolation_git(root, &["config", "user.name", "pool fixture"])?;
+        isolation_git(root, &["config", "user.email", "pool@example.test"])?;
+        std::fs::write(
+            root.join(".gitignore"),
+            "/global/\n/child.sh\n/launches\n/*-running\n/release\n",
+        )?;
+        std::fs::create_dir(root.join("nested"))?;
+        std::fs::write(root.join("nested/base.txt"), "committed\n")?;
+        isolation_git(root, &["add", ".gitignore", "nested/base.txt"])?;
+        isolation_git(root, &["commit", "-qm", "pool fixture baseline"])?;
+        std::fs::write(root.join("nested/base.txt"), "staged parent\n")?;
+        isolation_git(root, &["add", "nested/base.txt"])?;
+        std::fs::write(root.join("nested/base.txt"), "dirty parent\n")?;
+        std::fs::write(root.join("nested/untracked.txt"), "untracked parent\n")?;
+        Ok(())
+    }
+
+    fn cleanup_test_workspaces(fixture: &Fixture, manifest: &Value) -> IsolationTestResult {
+        // These exact paths belong to this fixture and have already been
+        // verified to survive retirement. Only remove them after that assertion
+        // so the test leaves no worktrees pointing at its expired TempDir.
+        for row in manifest["workerWorkspaces"].as_array().expect("workspaces") {
+            let workspace = &row["workspace"];
+            let branch = field(workspace, "branch");
+            crate::worktree_iso::drop_worktree(&crate::worktree_iso::IsoHandle {
+                id: branch.clone(),
+                branch,
+                path: std::path::PathBuf::from(field(workspace, "worktreePath")),
+                repo_root: fixture.root.path().to_path_buf(),
+                baseline: field(workspace, "baseline"),
+            })?;
+        }
+        Ok(())
+    }
+
+    const ISOLATED_RPC_CHILD: &str = r#"
+set -eu
+control_root=${0%/*}
+printf '%s\n' "$$" >> "$control_root/launches"
+memory=empty
+while IFS= read -r line; do
+    id=${line#*\"id\":\"}
+    id=${id%%\"*}
+    case "$line" in
+        *'"type":"get_state"'*)
+            printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}}\n' "$id"
+            ;;
+        *'"type":"prompt"'*)
+            printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+            printf '%s\n' '{"type":"agent_start"}'
+            test "$(cat base.txt)" = 'dirty parent'
+            test "$(cat untracked.txt)" = 'untracked parent'
+            case "$line" in
+                *'Task: remember silver'*) memory=silver ;;
+                *'Task: remember gold'*) memory=gold ;;
+                *'Task: hold'*) memory=partial ;;
+                *'Task: extend'*) memory="$memory-next" ;;
+            esac
+            printf '%s\n' "$memory" > worker.txt
+            case "$line" in
+                *'Task: remember '*|*'Task: hold'*)
+                    printf ready > "$control_root/$memory-running"
+                    while [ ! -f "$control_root/release" ]; do sleep 0.02; done
+                    ;;
+            esac
+            printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"%s"}]}]}\n' "$memory"
+            ;;
+    esac
+done
+"#;
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn isolated_pool_members_share_one_dirty_baseline_and_reuse_distinct_workspaces()
+    -> IsolationTestResult {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(ISOLATED_RPC_CHILD);
+        init_dirty_workspace(&fixture)?;
+        let head = isolation_git(fixture.root.path(), &["rev-parse", "HEAD"])?;
+        let index = std::fs::read(fixture.root.path().join(".git/index"))?;
+        runtime().block_on(async {
+            let started = fixture
+                .call(json!({
+                    "operation":"pool_start", "agent":"worker", "concurrency":2,
+                    "tasks":["remember silver","remember gold"], "cwd":"nested",
+                    "isolation":"worktree", "isoApply":"keep"
+                }))
+                .await;
+            let pool = field(&started, "poolId");
+            assert_eq!(started["items"][0]["workerIndex"], 1);
+            assert_eq!(started["items"][1]["workerIndex"], 2);
+            // Acknowledgment owns one snapshot even if a member has yet to
+            // materialize it. Subsequent source edits must not leak into it.
+            std::fs::write(fixture.root.path().join("nested/base.txt"), "later parent\n")?;
+            std::fs::write(
+                fixture.root.path().join("nested/untracked.txt"),
+                "later untracked\n",
+            )?;
+            fixture.await_file("silver-running").await;
+            fixture.await_file("gold-running").await;
+            let running = fixture
+                .call(json!({"operation":"pool_status","poolId":pool}))
+                .await;
+            let workspaces = running["workerWorkspaces"].as_array().expect("member workspaces");
+            assert_eq!(workspaces.len(), 2);
+            assert_ne!(
+                workspaces[0]["workspace"]["worktreePath"],
+                workspaces[1]["workspace"]["worktreePath"]
+            );
+            assert_eq!(
+                workspaces[0]["workspace"]["baseline"],
+                workspaces[1]["workspace"]["baseline"]
+            );
+            for (index, row) in workspaces.iter().enumerate() {
+                let workspace = &row["workspace"];
+                assert_eq!(row["workerIndex"], index + 1);
+                assert_eq!(row["closed"], false);
+                assert_eq!(workspace["schema"], "pi.subagent.worker.workspace.v1");
+                assert_eq!(workspace["mode"], "worktree");
+                assert_eq!(workspace["applyMode"], "keep");
+                assert_eq!(workspace["applied"], false);
+                let path = std::path::PathBuf::from(field(workspace, "worktreePath"));
+                assert_eq!(workspace["cwd"], json!(path.join("nested").to_string_lossy()));
+                assert_eq!(
+                    std::fs::read_to_string(path.join("nested/base.txt"))?,
+                    "dirty parent\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(path.join("nested/untracked.txt"))?,
+                    "untracked parent\n"
+                );
+            }
+            let pushed = fixture
+                .call(json!({"operation":"pool_push","poolId":pool,"tasks":["extend","extend"]}))
+                .await;
+            assert_eq!(pushed["items"][2]["workerIndex"], 1);
+            assert_eq!(pushed["items"][3]["workerIndex"], 2);
+            fixture.release();
+            fixture
+                .call(json!({"operation":"pool_wait","poolId":pool,"itemId":4,"timeoutMs":5000}))
+                .await;
+            fixture
+                .call(json!({"operation":"pool_finish","poolId":pool}))
+                .await;
+            let completed = fixture
+                .call(json!({"operation":"pool_wait","poolId":pool,"timeoutMs":5000}))
+                .await;
+            assert_eq!(completed["status"], "completed");
+            fixture.assert_reaped();
+            let mut pids = Vec::new();
+            for (item, expected, worker_index) in [
+                (1_u64, "silver", 1_usize),
+                (2, "gold", 2),
+                (3, "silver-next", 1),
+                (4, "gold-next", 2),
+            ] {
+                let result = fixture
+                    .call(json!({"operation":"pool_result","poolId":pool,"itemId":item}))
+                    .await;
+                assert_eq!(result["item"]["workerIndex"], worker_index);
+                let native = native_result(&result);
+                pids.push(native["pid"].as_u64().expect("real child PID"));
+                assert_eq!(native["output"], expected);
+                let workspace = &workspaces[worker_index - 1]["workspace"];
+                assert_eq!(native["iso"]["worktreePath"], workspace["worktreePath"]);
+                assert_eq!(native["iso"]["applyMode"], "keep");
+                assert_eq!(native["iso"]["applied"], false);
+                let patch = native["iso"]["patch"].as_str().expect("cumulative worker diff");
+                assert!(patch.contains("nested/worker.txt"));
+                assert!(patch.contains(&format!("+{expected}\n")));
+                assert!(!patch.contains("nested/base.txt"));
+                assert!(!patch.contains("nested/untracked.txt"));
+            }
+            assert_ne!(pids[0], pids[1]);
+            assert_eq!(pids[0], pids[2]);
+            assert_eq!(pids[1], pids[3]);
+            for (index, row) in completed["workerWorkspaces"]
+                .as_array()
+                .expect("retired workspaces")
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(row["workspace"], workspaces[index]["workspace"]);
+                assert_eq!(row["closed"], true);
+                assert!(
+                    std::path::Path::new(&field(&row["workspace"], "worktreePath")).is_dir()
+                );
+            }
+            let page = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool}))
+                .await;
+            assert_eq!(page["workerWorkspaces"], completed["workerWorkspaces"]);
+            assert_eq!(page["items"][2]["workerIndex"], 1);
+            assert_eq!(page["items"][3]["workerIndex"], 2);
+            let hidden_identity = execute(
+                &fixture.tool,
+                json!({"operation":"pool_status","poolId":pool}),
+                private_projection("pi-iso-"),
+            )
+            .await
+            .expect_err("redacted workspace paths cannot remain actionable identities");
+            assert!(hidden_identity.to_string().contains("PI_SUBAGENT_POOL_PRIVACY"));
+            let hidden_patch = execute(
+                &fixture.tool,
+                json!({"operation":"pool_drain","poolId":pool}),
+                private_projection("worker\\.txt"),
+            )
+            .await
+            .expect_err("redacted bytes cannot retain an actionable patch contract");
+            assert!(hidden_patch.to_string().contains("PI_SUBAGENT_POOL_PRIVACY"));
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.path().join("nested/base.txt"))?,
+                "later parent\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.path().join("nested/untracked.txt"))?,
+                "later untracked\n"
+            );
+            assert!(!fixture.root.path().join("nested/worker.txt").exists());
+            assert_eq!(isolation_git(fixture.root.path(), &["rev-parse", "HEAD"])?, head);
+            assert_eq!(
+                std::fs::read(fixture.root.path().join(".git/index"))?,
+                index
+            );
+            cleanup_test_workspaces(&fixture, &completed)?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cancelled_isolated_pool_preserves_partial_work_and_its_descriptor_after_reap()
+    -> IsolationTestResult {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(ISOLATED_RPC_CHILD);
+        init_dirty_workspace(&fixture)?;
+        runtime().block_on(async {
+            let started = fixture
+                .call(json!({
+                    "operation":"pool_start", "agent":"worker", "concurrency":1,
+                    "tasks":["hold"], "cwd":"nested", "isolation":"worktree"
+                }))
+                .await;
+            let pool = field(&started, "poolId");
+            fixture.await_file("partial-running").await;
+            let running = fixture
+                .call(json!({"operation":"pool_status","poolId":pool}))
+                .await;
+            let workspace = running["workerWorkspaces"][0]["workspace"].clone();
+            let cancelled = fixture
+                .call(json!({"operation":"pool_close","poolId":pool}))
+                .await;
+            assert_eq!(cancelled["status"], "cancelled");
+            fixture.assert_reaped();
+            assert_eq!(cancelled["workerWorkspaces"][0]["workspace"], workspace);
+            assert_eq!(cancelled["workerWorkspaces"][0]["closed"], true);
+            let path = std::path::PathBuf::from(field(&workspace, "worktreePath"));
+            assert_eq!(
+                std::fs::read_to_string(path.join("nested/worker.txt"))?,
+                "partial\n"
+            );
+            assert!(!fixture.root.path().join("nested/worker.txt").exists());
+            let repeated = fixture
+                .call(json!({"operation":"pool_close","poolId":pool}))
+                .await;
+            assert_eq!(repeated["workerWorkspaces"], cancelled["workerWorkspaces"]);
+            cleanup_test_workspaces(&fixture, &cancelled)?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn pool_isolation_refuses_non_git_and_destructive_dispositions_before_launch()
+    -> IsolationTestResult {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(ISOLATED_RPC_CHILD);
+        runtime().block_on(async {
+            let non_git = fixture
+                .tool
+                .execute(
+                    "non-git-pool-isolation",
+                    json!({
+                        "operation":"pool_start", "agent":"worker", "concurrency":1,
+                        "tasks":["must not execute"], "isolation":"worktree"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("an isolated pool needs a real Git source");
+            assert!(non_git.to_string().contains("PI_ISO_NOT_GIT"));
+            assert!(!fixture.root.path().join("launches").exists());
+            assert!(crate::jobs::list(&fixture.owner)?.is_empty());
+            // All subsequent refusal cases have a valid Git source, so a
+            // missing repository cannot mask an ignored disposition.
+            init_dirty_workspace(&fixture)?;
+            let original = isolation_git(
+                fixture.root.path(),
+                &["worktree", "list", "--porcelain"],
+            )?;
+            for controls in [
+                json!({"isolation":"worktree","isoApply":"apply"}),
+                json!({"isolation":"worktree","isoApply":"drop"}),
+                json!({"isolation":"none","isoApply":"keep"}),
+                json!({"isolation":"worktree","isoApply":null}),
+                json!({"isolation":"copy"}),
+                json!({"isolation":"worktree","outputSchema":{"type":"invalid-fixture-type"}}),
+            ] {
+                let mut input = json!({
+                    "operation":"pool_start", "agent":"worker", "concurrency":1,
+                    "tasks":["must not execute"], "cwd":"nested"
+                });
+                input
+                    .as_object_mut()
+                    .expect("request")
+                    .extend(controls.as_object().expect("controls").clone());
+                assert!(
+                    fixture
+                        .tool
+                        .execute("refused-pool-isolation", input, None)
+                        .await
+                        .is_err()
+                );
+                assert!(!fixture.root.path().join("launches").exists());
+                assert!(crate::jobs::list(&fixture.owner)?.is_empty());
+                assert_eq!(
+                    isolation_git(fixture.root.path(), &["worktree", "list", "--porcelain"])?,
+                    original
+                );
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn pool_drains_dynamic_batches_in_order_with_one_carrier_and_one_notice() {
