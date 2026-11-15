@@ -138,8 +138,8 @@ const fn is_exact_bpe_split(prev: u8, next: u8) -> bool {
 #[cfg(feature = "bpe-tokens")]
 #[inline]
 fn hash_bpe_chunk(chunk: &str, table: TokenTable) -> u64 {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = rustc_hash::FxHasher::default();
+    use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+    let mut hasher = DefaultHasher::new();
     table.as_str().hash(&mut hasher);
     chunk.hash(&mut hasher);
     hasher.finish()

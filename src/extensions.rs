@@ -17735,7 +17735,7 @@ async fn await_js_provider_start_task(
             Ok(Some(value)) => return JsCancellableTaskOutcome::Finished(Ok(value)),
             Err(err) => return JsCancellableTaskOutcome::Finished(Err(err)),
             Ok(None) => {
-                if let Err(err) = pump_active_runtime_shard(shard, host).await {
+                if let Err(err) = pump_active_runtime_shard(shard, host, None).await {
                     return JsCancellableTaskOutcome::Fault(err);
                 }
                 extension_wait_cooperate(deadline).await;
@@ -17994,6 +17994,7 @@ async fn next_extension_provider_stream_simple_sharded(
                     &task_id,
                     &route.control.cancelled,
                     deadline,
+                    None,
                 )
                 .await
             }
@@ -18154,6 +18155,7 @@ async fn cancel_extension_provider_stream_simple_sharded(
             &task_id,
             &cleanup_cancelled,
             deadline,
+            None,
         )
         .await;
         if matches!(
@@ -18194,6 +18196,7 @@ async fn cancel_extension_provider_stream_simple_sharded(
                 &pending_next,
                 &cleanup_cancelled,
                 deadline,
+                None,
             )
             .await
             {

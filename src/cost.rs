@@ -1368,11 +1368,13 @@ fn recorded_billing_unavailable(session: &Session) -> bool {
                 }
                 match &usage.billing {
                     Some(crate::model::BillingUsage::Unavailable { .. }) => true,
-                    Some(crate::model::BillingUsage::ReportedTotal { total })
-                    | Some(crate::model::BillingUsage::Tokens {
-                        reported_total: Some(total),
-                        ..
-                    }) => {
+                    Some(
+                        crate::model::BillingUsage::ReportedTotal { total }
+                        | crate::model::BillingUsage::Tokens {
+                            reported_total: Some(total),
+                            ..
+                        },
+                    ) => {
                         // Live pricing copies an authoritative bill into the
                         // stored total. Resume cannot guess which side of a
                         // contradictory receipt was included in a checkpoint.
@@ -4936,11 +4938,13 @@ mod tests {
             if let SessionMessage::Assistant { message } = &mut free {
                 let authoritative = matches!(
                     &billing,
-                    Some(crate::model::BillingUsage::ReportedTotal { .. })
-                        | Some(crate::model::BillingUsage::Tokens {
-                            reported_total: Some(_),
-                            ..
-                        })
+                    Some(
+                        crate::model::BillingUsage::ReportedTotal { .. }
+                            | crate::model::BillingUsage::Tokens {
+                                reported_total: Some(_),
+                                ..
+                            }
+                    )
                 );
                 message.usage.billing = billing;
                 if authoritative {
