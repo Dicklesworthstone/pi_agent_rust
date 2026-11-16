@@ -18,7 +18,10 @@
 
 mod common;
 
-use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+use pi::extensions::{
+    ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    resolve_conformance_extension_specs,
+};
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::tools::ToolRegistry;
 use serde_json::Value;
@@ -1064,10 +1067,10 @@ fn run_conformance_test(ext_id: &str) {
             ctx.push(("tier".into(), entry.conformance_tier.to_string()));
         });
 
-    // Create the load spec.
-    let spec = JsExtensionLoadSpec::from_entry_path(&entry_file).unwrap_or_else(|e| {
+    // Resolve the package/co-entry load specs.
+    let specs = resolve_conformance_extension_specs(&entry_file).unwrap_or_else(|e| {
         unreachable!(
-            "Failed to create JsExtensionLoadSpec for '{ext_id}' at {}: {e}",
+            "Failed to resolve JsExtensionLoadSpec set for '{ext_id}' at {}: {e}",
             entry_file.display()
         )
     });
@@ -1098,7 +1101,7 @@ fn run_conformance_test(ext_id: &str) {
         let manager = manager.clone();
         async move {
             manager
-                .load_js_extensions(vec![spec])
+                .load_js_extensions(specs)
                 .await
                 .unwrap_or_else(|e| unreachable!("Failed to load extension '{ext_id_owned}': {e}"));
         }
@@ -1389,9 +1392,9 @@ fn load_extension_runtime_for_journey(
         entry_file.display()
     );
 
-    let spec = JsExtensionLoadSpec::from_entry_path(&entry_file).unwrap_or_else(|e| {
+    let specs = resolve_conformance_extension_specs(&entry_file).unwrap_or_else(|e| {
         panic!(
-            "Failed to create JsExtensionLoadSpec for '{ext_id}' at {}: {e}",
+            "Failed to resolve JsExtensionLoadSpec set for '{ext_id}' at {}: {e}",
             entry_file.display()
         )
     });
@@ -1421,7 +1424,7 @@ fn load_extension_runtime_for_journey(
         let manager = manager.clone();
         async move {
             manager
-                .load_js_extensions(vec![spec])
+                .load_js_extensions(specs)
                 .await
                 .unwrap_or_else(|e| panic!("Failed to load extension '{ext_id_owned}': {e}"));
         }
@@ -1896,7 +1899,7 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
         };
     }
 
-    let spec = match JsExtensionLoadSpec::from_entry_path(&entry_file) {
+    let specs = match resolve_conformance_extension_specs(&entry_file) {
         Ok(s) => s,
         Err(e) => {
             return ExtensionConformanceResult {
@@ -1969,7 +1972,7 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
 
     let load_err = common::run_async({
         let manager = manager.clone();
-        async move { manager.load_js_extensions(vec![spec]).await }
+        async move { manager.load_js_extensions(specs).await }
     });
     if let Err(e) = load_err {
         return ExtensionConformanceResult {
@@ -1984,44 +1987,6 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
             providers_registered: 0,
             duration_ms: start.elapsed().as_millis() as u64,
         };
-    }
-
-    // Multi-file extension directories (bd-sog97.29): production discovers
-    // each top-level .ts file as its own extension, so a vendored directory
-    // delivers the UNION of its modules' registrations, and the manifest
-    // records that directory-level capability set. Load every sibling module
-    // into the same manager before observing so the comparison is faithful;
-    // individual sibling failures are logged and never mask the entry
-    // module's own result (a directory registering nothing still fails any
-    // expected-identity validation).
-    let mut sibling_load_notes: Vec<String> = Vec::new();
-    if let Some(dir) = entry_file.parent() {
-        let mut siblings: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ts"))
-                    && p.as_path() != entry_file
-            })
-            .collect();
-        siblings.sort();
-        for sibling in siblings {
-            let Ok(sibling_spec) = JsExtensionLoadSpec::from_entry_path(&sibling) else {
-                sibling_load_notes.push(format!("{}: load spec error", sibling.display()));
-                continue;
-            };
-            let res = common::run_async({
-                let manager = manager.clone();
-                async move { manager.load_js_extensions(vec![sibling_spec]).await }
-            });
-            if let Err(e) = res {
-                sibling_load_notes.push(format!("{}: {e}", sibling.display()));
-            }
-        }
-    }
-    for note in &sibling_load_notes {
-        eprintln!("    [sibling-load] {note}");
     }
 
     // Validate both capability presence and exact identity equality with the
@@ -3046,7 +3011,7 @@ fn try_conformance_detailed(
         );
     }
 
-    let spec = match JsExtensionLoadSpec::from_entry_path(&entry_file) {
+    let specs = match resolve_conformance_extension_specs(&entry_file) {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -3105,7 +3070,7 @@ fn try_conformance_detailed(
 
     let load_err = common::run_async({
         let manager = manager.clone();
-        async move { manager.load_js_extensions(vec![spec]).await }
+        async move { manager.load_js_extensions(specs).await }
     });
     if let Err(e) = load_err {
         return (
@@ -4576,7 +4541,7 @@ fn try_conformance_with_env(
         };
     }
 
-    let spec = match JsExtensionLoadSpec::from_entry_path(&entry_file) {
+    let specs = match resolve_conformance_extension_specs(&entry_file) {
         Ok(s) => s,
         Err(e) => {
             return ExtensionConformanceResult {
@@ -4638,7 +4603,7 @@ fn try_conformance_with_env(
 
     let load_err = common::run_async({
         let manager = manager.clone();
-        async move { manager.load_js_extensions(vec![spec]).await }
+        async move { manager.load_js_extensions(specs).await }
     });
     if let Err(e) = load_err {
         return ExtensionConformanceResult {
@@ -5270,7 +5235,7 @@ fn run_category_journey(
     prepare_extension_fixture(ext_id, &cwd);
 
     let entry_file = artifacts_dir().join(&entry.entry_path);
-    let spec = match JsExtensionLoadSpec::from_entry_path(&entry_file) {
+    let specs = match resolve_conformance_extension_specs(&entry_file) {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -5312,7 +5277,7 @@ fn run_category_journey(
 
     if let Err(e) = common::run_async({
         let manager = manager.clone();
-        async move { manager.load_js_extensions(vec![spec]).await }
+        async move { manager.load_js_extensions(specs).await }
     }) {
         return (
             Some(("load_extension".to_string(), format!("Load error: {e}"))),
@@ -6945,3 +6910,236 @@ conformance_test!(
     ext_third_party_kcosr_pi_extensions,
     "third-party/kcosr-pi-extensions"
 );
+
+#[cfg(test)]
+mod multi_entry_conformance_loading_tests {
+    use super::*;
+
+    fn load_specs_hermetically(
+        specs: Vec<JsExtensionLoadSpec>,
+        cwd: &Path,
+    ) -> Result<ExtensionManager, String> {
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], cwd, None));
+        let js_config = PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: hermetic_conformance_env(cwd),
+            deny_env: false,
+            ..Default::default()
+        };
+        let runtime = common::run_async({
+            let manager = manager.clone();
+            let tools = Arc::clone(&tools);
+            async move {
+                JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+        })?;
+        manager.set_js_runtime(runtime);
+        common::run_async({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .load_js_extensions(specs)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+        })?;
+        Ok(manager)
+    }
+
+    #[test]
+    fn prateekmedia_lsp_resolves_union_without_helper_or_ownership_collision() {
+        let entry = artifacts_dir().join("community/prateekmedia-lsp/lsp-tool.ts");
+        let specs = resolve_conformance_extension_specs(&entry).expect("resolve prateekmedia-lsp");
+        let rel_names: Vec<String> = specs
+            .iter()
+            .filter_map(|s| {
+                s.entry_path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(rel_names, vec!["lsp-tool.ts", "lsp.ts"]);
+        assert_eq!(specs[0].extension_id, specs[1].extension_id);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manager = load_specs_hermetically(specs, temp.path()).expect("load prateekmedia-lsp");
+        let obs = observe_registrations(&manager).expect("observe registrations");
+        assert_eq!(obs.tools, vec!["lsp"]);
+        assert_eq!(obs.commands, vec!["lsp"]);
+    }
+
+    #[test]
+    fn multi_entry_union_excludes_flat_helpers_and_preserves_all_registrations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pkg = temp.path().join("pkg");
+        std::fs::create_dir_all(&pkg).expect("create pkg");
+        std::fs::write(
+            pkg.join("helper.ts"),
+            r#"export function explodeIfTreatedAsInitializer() { throw new Error("helper invoked as extension initializer"); }
+export const SHARED_PREFIX = "ok";
+"#,
+        )
+        .expect("write helper");
+        let primary = pkg.join("alpha-tool.ts");
+        std::fs::write(
+            &primary,
+            r#"import { SHARED_PREFIX } from "./helper";
+export default function (pi: any) {
+  pi.registerTool({
+    name: `${SHARED_PREFIX}_tool`,
+    description: "alpha",
+    parameters: { type: "object", properties: {} },
+    async execute() { return { content: [{ type: "text", text: "ok" }] }; },
+  });
+}
+"#,
+        )
+        .expect("write primary");
+        std::fs::write(
+            pkg.join("zeta-cmd.mjs"),
+            r#"export default function (pi) {
+  pi.registerCommand("zeta-cmd", { description: "zeta", async handler() {} });
+}
+"#,
+        )
+        .expect("write co-entry");
+
+        let specs = resolve_conformance_extension_specs(&primary).expect("resolve specs");
+        assert_eq!(specs.len(), 2);
+        let manager = load_specs_hermetically(specs, temp.path()).expect("atomic load succeeds");
+        let obs = observe_registrations(&manager).expect("observe");
+        assert_eq!(obs.tools, vec!["ok_tool"]);
+        assert_eq!(obs.commands, vec!["zeta-cmd"]);
+    }
+
+    #[test]
+    fn index_package_and_independent_extensions_root_do_not_absorb_siblings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // `index.ts` package ignores sibling `model.ts` even if it exports functions.
+        let index_pkg = temp.path().join("ask-pkg");
+        std::fs::create_dir_all(&index_pkg).expect("create index_pkg");
+        let index_entry = index_pkg.join("index.ts");
+        std::fs::write(
+            &index_entry,
+            r#"export default function (pi: any) {
+  pi.registerCommand("ask-only", { description: "ask", async handler() {} });
+}
+"#,
+        )
+        .expect("write index.ts");
+        std::fs::write(
+            index_pkg.join("model.ts"),
+            r#"export default function (pi: any) {
+  pi.registerCommand("unexpected-sibling", { description: "bad", async handler() {} });
+}
+"#,
+        )
+        .expect("write model.ts");
+        let index_specs = resolve_conformance_extension_specs(&index_entry).expect("resolve index");
+        assert_eq!(index_specs.len(), 1);
+
+        // `extensions/` directory treats direct files as independent extensions.
+        let ext_root = temp.path().join(".pi/extensions");
+        std::fs::create_dir_all(&ext_root).expect("create extensions root");
+        let alpha = ext_root.join("alpha.ts");
+        std::fs::write(
+            &alpha,
+            r#"export default function (pi: any) {
+  pi.registerCommand("alpha", { description: "a", async handler() {} });
+}
+"#,
+        )
+        .expect("write alpha");
+        std::fs::write(
+            ext_root.join("beta.ts"),
+            r#"export default function (pi: any) {
+  pi.registerCommand("beta", { description: "b", async handler() {} });
+}
+"#,
+        )
+        .expect("write beta");
+        let indep_specs = resolve_conformance_extension_specs(&alpha).expect("resolve independent");
+        assert_eq!(indep_specs.len(), 1);
+    }
+
+    #[test]
+    fn cross_dir_manifest_bundle_loads_and_malformed_or_broken_sibling_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // Cross-directory `package.json#pi.extensions` bundle.
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("src")).expect("create src");
+        std::fs::create_dir_all(bundle.join("tools")).expect("create tools");
+        std::fs::write(
+            bundle.join("package.json"),
+            r#"{"name":"cross-bundle","pi":{"extensions":["./src/a.ts","./tools/b.mjs"]}}"#,
+        )
+        .expect("write package.json");
+        let entry_a = bundle.join("src/a.ts");
+        std::fs::write(
+            &entry_a,
+            r#"export default function (pi: any) {
+  pi.registerCommand("cmd-a", { description: "a", async handler() {} });
+}
+"#,
+        )
+        .expect("write a.ts");
+        std::fs::write(
+            bundle.join("tools/b.mjs"),
+            r#"export default function (pi) {
+  pi.registerTool({
+    name: "tool_b",
+    description: "b",
+    parameters: { type: "object", properties: {} },
+    async execute() { return { content: [{ type: "text", text: "b" }] }; },
+  });
+}
+"#,
+        )
+        .expect("write b.mjs");
+        let bundle_specs = resolve_conformance_extension_specs(&entry_a).expect("resolve bundle");
+        assert_eq!(bundle_specs.len(), 2);
+        let manager = load_specs_hermetically(bundle_specs, temp.path()).expect("load bundle");
+        let obs = observe_registrations(&manager).expect("observe bundle");
+        assert_eq!(obs.commands, vec!["cmd-a"]);
+        assert_eq!(obs.tools, vec!["tool_b"]);
+
+        // Malformed `package.json` fails closed during spec resolution.
+        let bad_manifest = temp.path().join("bad-manifest");
+        std::fs::create_dir_all(&bad_manifest).expect("create bad-manifest");
+        std::fs::write(bad_manifest.join("package.json"), "{not-valid-json")
+            .expect("write bad pkg");
+        let bad_entry = bad_manifest.join("entry.ts");
+        std::fs::write(&bad_entry, "export default function () {}\n").expect("write entry");
+        assert!(resolve_conformance_extension_specs(&bad_entry).is_err());
+
+        // Throwing co-entrypoint fails closed during `load_js_extensions`.
+        let broken = temp.path().join("broken-co-entry");
+        std::fs::create_dir_all(&broken).expect("create broken dir");
+        let ok_entry = broken.join("a-ok.ts");
+        std::fs::write(
+            &ok_entry,
+            r#"export default function (pi: any) {
+  pi.registerCommand("ok", { description: "ok", async handler() {} });
+}
+"#,
+        )
+        .expect("write a-ok.ts");
+        std::fs::write(
+            broken.join("b-broken.ts"),
+            r#"export default function () {
+  throw new Error("boom in co-entry");
+}
+"#,
+        )
+        .expect("write b-broken.ts");
+        let broken_specs = resolve_conformance_extension_specs(&ok_entry).expect("resolve broken");
+        assert_eq!(broken_specs.len(), 2);
+        assert!(load_specs_hermetically(broken_specs, temp.path()).is_err());
+    }
+}

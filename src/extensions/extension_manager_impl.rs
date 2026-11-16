@@ -3228,164 +3228,172 @@ impl ExtensionManager {
 
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub async fn load_js_extensions(&self, specs: Vec<JsExtensionLoadSpec>) -> Result<()> {
-        let runtime = self
-            .runtime()
-            .ok_or_else(|| Error::extension("Extension runtime not configured"))?;
+        box_send_future(async move {
+            let runtime = self
+                .runtime()
+                .ok_or_else(|| Error::extension("Extension runtime not configured"))?;
 
-        let entry_paths = specs
-            .iter()
-            .map(|spec| spec.entry_path.clone())
-            .collect::<Vec<_>>();
-        let extension_roots = collect_extension_roots_from_paths(&entry_paths);
-
-        let compat_hints_by_extension = if runtime.compat_scan_mode() {
-            Some(build_compat_registration_hints(&specs))
-        } else {
-            None
-        };
-
-        let provider_generation = Uuid::new_v4();
-        let snapshots = runtime
-            .load_js_extensions_snapshots(specs, provider_generation)
-            .await?;
-
-        let mut payloads = Vec::new();
-        let mut extension_ids = Vec::new();
-        let mut extension_versions = HashMap::new();
-        let mut active_tools: Option<Vec<String>> = None;
-        let mut all_providers = Vec::new();
-        let mut all_mcp_servers = Vec::new();
-        let mut all_flags = Vec::new();
-        for snapshot in snapshots {
-            let JsExtensionSnapshot {
-                id,
-                name,
-                version,
-                api_version,
-                mut tools,
-                tool_revisions: _,
-                mut slash_commands,
-                providers,
-                mcp_servers,
-                shortcuts,
-                message_renderers: _,
-                flags,
-                event_hooks,
-                active_tools: ext_active_tools,
-            } = snapshot;
-            if let Some(hints_by_extension) = compat_hints_by_extension.as_ref()
-                && let Some(hints) = hints_by_extension.get(&id)
-            {
-                apply_compat_registration_hints(
-                    &id,
-                    if name.is_empty() { &id } else { &name },
-                    &mut tools,
-                    &mut slash_commands,
-                    hints,
-                );
-            }
-            all_providers.extend(providers.into_iter().map(|mut provider| {
-                if let Some(obj) = provider.as_object_mut() {
-                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
-                }
-                provider
-            }));
-            all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
-                // The owning id is part of the MCP trust identity, so it is
-                // always stamped from the snapshot and never taken from the
-                // spec: a descriptor claiming another extension's id would
-                // otherwise inherit that extension's acknowledgement.
-                if let Some(obj) = server.as_object_mut() {
-                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
-                }
-                server
-            }));
-            let extension_name = if name.is_empty() {
-                id.clone()
-            } else {
-                name.clone()
-            };
-            Self::record_extension_version(&mut extension_versions, &id, &extension_name, &version);
-            all_flags.extend(flags.iter().cloned().map(|mut flag| {
-                if let Some(obj) = flag.as_object_mut() {
-                    obj.entry("extension_id".to_string())
-                        .or_insert_with(|| Value::String(id.clone()));
-                }
-                flag
-            }));
-            if let Some(list) = ext_active_tools {
-                active_tools = Some(list);
-            }
-            extension_ids.push(id);
-            payloads.push(RegisterPayload {
-                name: extension_name,
-                version,
-                api_version: if api_version.is_empty() {
-                    PROTOCOL_VERSION.to_string()
-                } else {
-                    api_version
-                },
-                capabilities: Vec::new(),
-                capability_manifest: None,
-                tools,
-                slash_commands,
-                shortcuts,
-                flags,
-                event_hooks,
-            });
-        }
-
-        Self::validate_extension_identity_table(&payloads, &extension_ids, "QuickJS load")?;
-        {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.js_provider_generation != Some(provider_generation)
-                || !matches!((&guard.runtime, &runtime),
-                    (Some(ExtensionRuntimeHandle::Js(current)), ExtensionRuntimeHandle::Js(loaded))
-                        if Weak::ptr_eq(&current.actor_lifecycle, &loaded.actor_lifecycle)
-                            && loaded.actor_lifecycle.upgrade().is_some_and(|actor| !actor.is_stopped()))
-            {
-                return Err(Error::extension(
-                    "JS extension load was superseded before catalog installation",
-                ));
-            }
-            guard.extensions = payloads;
-            guard.extension_ids = extension_ids;
-            guard.extension_roots = extension_roots;
-            guard.extension_versions = extension_versions;
-            guard.active_tools = active_tools;
-            guard.providers = all_providers;
-            guard.provider_revision = guard.provider_revision.wrapping_add(1);
-            guard.js_provider_catalog_ready = true;
-            guard.mcp_servers = all_mcp_servers;
-            guard.flags = all_flags;
-            // Rebuild hook_bitmap from the freshly-loaded extensions so that
-            // dispatch_tool_result / dispatch_event can find registered hooks.
-            guard.hook_bitmap.clear();
-            let hooks: Vec<String> = guard
-                .extensions
+            let entry_paths = specs
                 .iter()
-                .flat_map(|ext| ext.event_hooks.iter().cloned())
-                .collect();
-            for hook in hooks {
-                guard.hook_bitmap.insert(hook);
+                .map(|spec| spec.entry_path.clone())
+                .collect::<Vec<_>>();
+            let extension_roots = collect_extension_roots_from_paths(&entry_paths);
+
+            let compat_hints_by_extension = if runtime.compat_scan_mode() {
+                Some(build_compat_registration_hints(&specs))
+            } else {
+                None
+            };
+
+            let provider_generation = Uuid::new_v4();
+            let snapshots = runtime
+                .load_js_extensions_snapshots(specs, provider_generation)
+                .await?;
+
+            let mut payloads = Vec::new();
+            let mut extension_ids = Vec::new();
+            let mut extension_versions = HashMap::new();
+            let mut active_tools: Option<Vec<String>> = None;
+            let mut all_providers = Vec::new();
+            let mut all_mcp_servers = Vec::new();
+            let mut all_flags = Vec::new();
+            for snapshot in snapshots {
+                let JsExtensionSnapshot {
+                    id,
+                    name,
+                    version,
+                    api_version,
+                    mut tools,
+                    tool_revisions: _,
+                    mut slash_commands,
+                    providers,
+                    mcp_servers,
+                    shortcuts,
+                    message_renderers: _,
+                    flags,
+                    event_hooks,
+                    active_tools: ext_active_tools,
+                } = snapshot;
+                if let Some(hints_by_extension) = compat_hints_by_extension.as_ref()
+                    && let Some(hints) = hints_by_extension.get(&id)
+                {
+                    apply_compat_registration_hints(
+                        &id,
+                        if name.is_empty() { &id } else { &name },
+                        &mut tools,
+                        &mut slash_commands,
+                        hints,
+                    );
+                }
+                all_providers.extend(providers.into_iter().map(|mut provider| {
+                    if let Some(obj) = provider.as_object_mut() {
+                        obj.insert("extension_id".to_string(), Value::String(id.clone()));
+                    }
+                    provider
+                }));
+                all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
+                    // The owning id is part of the MCP trust identity, so it is
+                    // always stamped from the snapshot and never taken from the
+                    // spec: a descriptor claiming another extension's id would
+                    // otherwise inherit that extension's acknowledgement.
+                    if let Some(obj) = server.as_object_mut() {
+                        obj.insert("extension_id".to_string(), Value::String(id.clone()));
+                    }
+                    server
+                }));
+                let extension_name = if name.is_empty() {
+                    id.clone()
+                } else {
+                    name.clone()
+                };
+                Self::record_extension_version(
+                    &mut extension_versions,
+                    &id,
+                    &extension_name,
+                    &version,
+                );
+                all_flags.extend(flags.iter().cloned().map(|mut flag| {
+                    if let Some(obj) = flag.as_object_mut() {
+                        obj.entry("extension_id".to_string())
+                            .or_insert_with(|| Value::String(id.clone()));
+                    }
+                    flag
+                }));
+                if let Some(list) = ext_active_tools {
+                    active_tools = Some(list);
+                }
+                extension_ids.push(id);
+                payloads.push(RegisterPayload {
+                    name: extension_name,
+                    version,
+                    api_version: if api_version.is_empty() {
+                        PROTOCOL_VERSION.to_string()
+                    } else {
+                        api_version
+                    },
+                    capabilities: Vec::new(),
+                    capability_manifest: None,
+                    tools,
+                    slash_commands,
+                    shortcuts,
+                    flags,
+                    event_hooks,
+                });
             }
-            let active_extension_ids = guard
-                .extension_versions
-                .keys()
-                .cloned()
-                .collect::<HashSet<_>>();
-            guard
-                .runtime_risk_states
-                .retain(|ext_id, _| active_extension_ids.contains(ext_id));
-            self.refresh_snapshot_with_guard_release(guard);
-        }
-        // Release the accepted generation's queued background work and
-        // reconcile its provider snapshot before the load is reported ready.
-        runtime.pump_once().await?;
-        Ok(())
+
+            Self::validate_extension_identity_table(&payloads, &extension_ids, "QuickJS load")?;
+            {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.js_provider_generation != Some(provider_generation)
+                    || !matches!((&guard.runtime, &runtime),
+                        (Some(ExtensionRuntimeHandle::Js(current)), ExtensionRuntimeHandle::Js(loaded))
+                            if Weak::ptr_eq(&current.actor_lifecycle, &loaded.actor_lifecycle)
+                                && loaded.actor_lifecycle.upgrade().is_some_and(|actor| !actor.is_stopped()))
+                {
+                    return Err(Error::extension(
+                        "JS extension load was superseded before catalog installation",
+                    ));
+                }
+                guard.extensions = payloads;
+                guard.extension_ids = extension_ids;
+                guard.extension_roots = extension_roots;
+                guard.extension_versions = extension_versions;
+                guard.active_tools = active_tools;
+                guard.providers = all_providers;
+                guard.provider_revision = guard.provider_revision.wrapping_add(1);
+                guard.js_provider_catalog_ready = true;
+                guard.mcp_servers = all_mcp_servers;
+                guard.flags = all_flags;
+                // Rebuild hook_bitmap from the freshly-loaded extensions so that
+                // dispatch_tool_result / dispatch_event can find registered hooks.
+                guard.hook_bitmap.clear();
+                let hooks: Vec<String> = guard
+                    .extensions
+                    .iter()
+                    .flat_map(|ext| ext.event_hooks.iter().cloned())
+                    .collect();
+                for hook in hooks {
+                    guard.hook_bitmap.insert(hook);
+                }
+                let active_extension_ids = guard
+                    .extension_versions
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                guard
+                    .runtime_risk_states
+                    .retain(|ext_id, _| active_extension_ids.contains(ext_id));
+                self.refresh_snapshot_with_guard_release(guard);
+            }
+            // Release the accepted generation's queued background work and
+            // reconcile its provider snapshot before the load is reported ready.
+            runtime.pump_once().await?;
+            Ok(())
+        })
+        .await
     }
 
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
@@ -3527,95 +3535,102 @@ impl ExtensionManager {
         specs: Vec<WasmExtensionLoadSpec>,
         tools: crate::tools::SharedToolRegistry,
     ) -> Result<()> {
-        let entry_paths = specs
-            .iter()
-            .map(|spec| spec.entry_path.clone())
-            .collect::<Vec<_>>();
-        let extension_roots = collect_extension_roots_from_paths(&entry_paths);
-
-        let mut wasm_handles = Vec::new();
-        let mut registrations = Vec::new();
-        let mut registration_ids = Vec::new();
-
-        for spec in specs {
-            let extension_id = spec.manifest.extension_id.clone();
-            let extension = host.load_from_path(&spec.entry_path)?;
-            let mut instance = host
-                .instantiate_with(
-                    &extension,
-                    tools.clone(),
-                    Some(self.handle()),
-                    &extension_id,
-                )
-                .await?;
-
-            let registration_json = instance.init(&spec.manifest_json).await?;
-            let mut registration: RegisterPayload = serde_json::from_str(&registration_json)
-                .map_err(|err| {
-                    Error::extension(format!(
-                        "WASM init returned invalid registration payload: {err}"
-                    ))
-                })?;
-            if registration.capability_manifest.is_none() {
-                registration
-                    .capability_manifest
-                    .clone_from(&spec.manifest.capability_manifest);
-            }
-            validate_register(&registration)?;
-
-            wasm_handles.push(WasmExtensionHandle::new(instance, registration.clone()));
-            registrations.push(registration);
-            registration_ids.push(extension_id);
-        }
-
-        Self::validate_extension_identity_table(&registrations, &registration_ids, "WASM load")?;
-        {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self::validate_extension_identity_table(
-                &guard.extensions,
-                &guard.extension_ids,
-                "existing manager state",
-            )?;
-            if registration_ids
+        box_send_future(async move {
+            let entry_paths = specs
                 .iter()
-                .any(|extension_id| guard.extension_ids.contains(extension_id))
-            {
-                return Err(Error::extension(
-                    "WASM load would duplicate an authoritative extension id",
-                ));
-            }
-            if !extension_roots.is_empty() {
-                let mut seen = HashSet::new();
-                for root in &guard.extension_roots {
-                    seen.insert(safe_canonicalize(root));
+                .map(|spec| spec.entry_path.clone())
+                .collect::<Vec<_>>();
+            let extension_roots = collect_extension_roots_from_paths(&entry_paths);
+
+            let mut wasm_handles = Vec::new();
+            let mut registrations = Vec::new();
+            let mut registration_ids = Vec::new();
+
+            for spec in specs {
+                let extension_id = spec.manifest.extension_id.clone();
+                let extension = host.load_from_path(&spec.entry_path)?;
+                let mut instance = host
+                    .instantiate_with(
+                        &extension,
+                        tools.clone(),
+                        Some(self.handle()),
+                        &extension_id,
+                    )
+                    .await?;
+
+                let registration_json = instance.init(&spec.manifest_json).await?;
+                let mut registration: RegisterPayload = serde_json::from_str(&registration_json)
+                    .map_err(|err| {
+                        Error::extension(format!(
+                            "WASM init returned invalid registration payload: {err}"
+                        ))
+                    })?;
+                if registration.capability_manifest.is_none() {
+                    registration
+                        .capability_manifest
+                        .clone_from(&spec.manifest.capability_manifest);
                 }
-                for root in extension_roots {
-                    let key = safe_canonicalize(&root);
-                    if seen.insert(key) {
-                        guard.extension_roots.push(root);
+                validate_register(&registration)?;
+
+                wasm_handles.push(WasmExtensionHandle::new(instance, registration.clone()));
+                registrations.push(registration);
+                registration_ids.push(extension_id);
+            }
+
+            Self::validate_extension_identity_table(
+                &registrations,
+                &registration_ids,
+                "WASM load",
+            )?;
+            {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::validate_extension_identity_table(
+                    &guard.extensions,
+                    &guard.extension_ids,
+                    "existing manager state",
+                )?;
+                if registration_ids
+                    .iter()
+                    .any(|extension_id| guard.extension_ids.contains(extension_id))
+                {
+                    return Err(Error::extension(
+                        "WASM load would duplicate an authoritative extension id",
+                    ));
+                }
+                if !extension_roots.is_empty() {
+                    let mut seen = HashSet::new();
+                    for root in &guard.extension_roots {
+                        seen.insert(safe_canonicalize(root));
+                    }
+                    for root in extension_roots {
+                        let key = safe_canonicalize(&root);
+                        if seen.insert(key) {
+                            guard.extension_roots.push(root);
+                        }
                     }
                 }
-            }
-            for (registration, extension_id) in registrations.iter().zip(&registration_ids) {
-                Self::record_extension_version(
-                    &mut guard.extension_versions,
-                    extension_id,
-                    &registration.name,
-                    &registration.version,
-                );
-                for hook in &registration.event_hooks {
-                    guard.hook_bitmap.insert(hook.clone());
+                for (registration, extension_id) in registrations.iter().zip(&registration_ids) {
+                    Self::record_extension_version(
+                        &mut guard.extension_versions,
+                        extension_id,
+                        &registration.name,
+                        &registration.version,
+                    );
+                    for hook in &registration.event_hooks {
+                        guard.hook_bitmap.insert(hook.clone());
+                    }
                 }
+                guard.extensions.extend(registrations);
+                guard.extension_ids.extend(registration_ids);
+                guard.wasm_extensions.extend(wasm_handles);
+                self.refresh_snapshot_with_guard_release(guard);
             }
-            guard.extensions.extend(registrations);
-            guard.extension_ids.extend(registration_ids);
-            guard.wasm_extensions.extend(wasm_handles);
-            self.refresh_snapshot_with_guard_release(guard);
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     #[cfg(feature = "wasm-host")]
@@ -5216,136 +5231,139 @@ impl ExtensionManager {
         timeout_ms: u64,
         context_usage: Option<ExtensionContextUsage>,
     ) -> Result<Option<Value>> {
-        let started_at = Instant::now();
-        let timeout_ms = self.effective_timeout(timeout_ms);
-        let event_name = event.to_string();
+        box_send_future(async move {
+            let started_at = Instant::now();
+            let timeout_ms = self.effective_timeout(timeout_ms);
+            let event_name = event.to_string();
 
-        // --- Fast path: O(1) hook bitmap check via snapshot (no mutex) ---
-        let snap = self.read_snapshot();
-        let has_hook = snap.hook_bitmap.contains(&event_name);
-        drop(snap);
-        let runtime = if has_hook {
-            let guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.runtime.clone()
-        } else {
-            None
-        };
+            // --- Fast path: O(1) hook bitmap check via snapshot (no mutex) ---
+            let snap = self.read_snapshot();
+            let has_hook = snap.hook_bitmap.contains(&event_name);
+            drop(snap);
+            let runtime = if has_hook {
+                let guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.runtime.clone()
+            } else {
+                None
+            };
 
-        #[cfg(feature = "wasm-host")]
-        let (wasm_extensions, has_hook_wasm) = {
-            let guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let has_hook_wasm = guard
-                .wasm_extensions
-                .iter()
-                .any(|ext| ext.event_hooks().iter().any(|hook| hook == &event_name));
-            (guard.wasm_extensions.clone(), has_hook_wasm)
-        };
-
-        let has_any_hook = {
             #[cfg(feature = "wasm-host")]
+            let (wasm_extensions, has_hook_wasm) = {
+                let guard = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let has_hook_wasm = guard
+                    .wasm_extensions
+                    .iter()
+                    .any(|ext| ext.event_hooks().iter().any(|hook| hook == &event_name));
+                (guard.wasm_extensions.clone(), has_hook_wasm)
+            };
+
+            let has_any_hook = {
+                #[cfg(feature = "wasm-host")]
+                {
+                    has_hook || has_hook_wasm
+                }
+                #[cfg(not(feature = "wasm-host"))]
+                {
+                    has_hook
+                }
+            };
+
+            if !has_any_hook {
+                return Ok(None);
+            }
+
+            tracing::info!(
+                event = "ext.event.start",
+                event_name = %event_name,
+                timeout_ms,
+                "Extension event dispatch start"
+            );
+
+            // --- Use cached context when generation hasn't changed ---
+            let mut ctx_payload = self.get_or_build_ctx_payload().await?;
+            if let Some(usage) = context_usage {
+                // This request's estimate must never enter the generation-cached
+                // base context: messages can advance without registry mutations,
+                // and other events must not inherit another request's usage.
+                if let Some(ctx) = Arc::make_mut(&mut ctx_payload).as_object_mut() {
+                    ctx.insert("contextUsage".into(), json!(usage));
+                }
+            }
+
+            let event_payload = match data {
+                None => json!({ "type": event_name }),
+                Some(Value::Object(mut map)) => {
+                    map.insert("type".into(), Value::String(event_name.clone()));
+                    Value::Object(map)
+                }
+                Some(other) => json!({ "type": event_name, "data": other }),
+            };
+
+            let response = if let Some(runtime) = runtime
+                && has_hook
             {
-                has_hook || has_hook_wasm
-            }
-            #[cfg(not(feature = "wasm-host"))]
-            {
-                has_hook
-            }
-        };
+                #[cfg(feature = "wasm-host")]
+                let runtime_event_payload = event_payload.clone();
+                #[cfg(not(feature = "wasm-host"))]
+                let runtime_event_payload = event_payload;
 
-        if !has_any_hook {
-            return Ok(None);
-        }
+                let js_response = runtime
+                    .dispatch_event(
+                        event_name.clone(),
+                        runtime_event_payload,
+                        Arc::clone(&ctx_payload),
+                        timeout_ms,
+                    )
+                    .await?;
+                Some(js_response)
+            } else {
+                None
+            };
 
-        tracing::info!(
-            event = "ext.event.start",
-            event_name = %event_name,
-            timeout_ms,
-            "Extension event dispatch start"
-        );
-
-        // --- Use cached context when generation hasn't changed ---
-        let mut ctx_payload = self.get_or_build_ctx_payload().await?;
-        if let Some(usage) = context_usage {
-            // This request's estimate must never enter the generation-cached
-            // base context: messages can advance without registry mutations,
-            // and other events must not inherit another request's usage.
-            if let Some(ctx) = Arc::make_mut(&mut ctx_payload).as_object_mut() {
-                ctx.insert("contextUsage".into(), json!(usage));
-            }
-        }
-
-        let event_payload = match data {
-            None => json!({ "type": event_name }),
-            Some(Value::Object(mut map)) => {
-                map.insert("type".into(), Value::String(event_name.clone()));
-                Value::Object(map)
-            }
-            Some(other) => json!({ "type": event_name, "data": other }),
-        };
-
-        let response = if let Some(runtime) = runtime
-            && has_hook
-        {
             #[cfg(feature = "wasm-host")]
-            let runtime_event_payload = event_payload.clone();
-            #[cfg(not(feature = "wasm-host"))]
-            let runtime_event_payload = event_payload;
-
-            let js_response = runtime
-                .dispatch_event(
-                    event_name.clone(),
-                    runtime_event_payload,
-                    Arc::clone(&ctx_payload),
+            let response = if has_hook_wasm
+                && (event != ExtensionEventName::UserBash
+                    || response.as_ref().is_none_or(Value::is_null))
+            {
+                let timeout_ms = if event == ExtensionEventName::UserBash {
+                    user_bash_remaining_timeout(timeout_ms, started_at)?
+                } else {
+                    timeout_ms
+                };
+                let mut wasm_payload = event_payload;
+                if let Value::Object(map) = &mut wasm_payload {
+                    map.insert("ctx".into(), (*ctx_payload).clone());
+                }
+                Self::dispatch_wasm_event_value(
+                    &wasm_extensions,
+                    &event_name,
+                    &wasm_payload,
                     timeout_ms,
                 )
-                .await?;
-            Some(js_response)
-        } else {
-            None
-        };
-
-        #[cfg(feature = "wasm-host")]
-        let response = if has_hook_wasm
-            && (event != ExtensionEventName::UserBash
-                || response.as_ref().is_none_or(Value::is_null))
-        {
-            let timeout_ms = if event == ExtensionEventName::UserBash {
-                user_bash_remaining_timeout(timeout_ms, started_at)?
+                .await?
+                .or(response)
             } else {
-                timeout_ms
+                response
             };
-            let mut wasm_payload = event_payload;
-            if let Value::Object(map) = &mut wasm_payload {
-                map.insert("ctx".into(), (*ctx_payload).clone());
-            }
-            Self::dispatch_wasm_event_value(
-                &wasm_extensions,
-                &event_name,
-                &wasm_payload,
-                timeout_ms,
-            )
-            .await?
-            .or(response)
-        } else {
-            response
-        };
 
-        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        tracing::info!(
-            event = "ext.event.end",
-            event_name = %event_name,
-            duration_ms,
-            has_response = response.is_some(),
-            "Extension event dispatch end"
-        );
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::info!(
+                event = "ext.event.end",
+                event_name = %event_name,
+                duration_ms,
+                has_response = response.is_some(),
+                "Extension event dispatch end"
+            );
 
-        Ok(response)
+            Ok(response)
+        })
+        .await
     }
 
     #[cfg(feature = "wasm-host")]
