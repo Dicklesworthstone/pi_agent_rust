@@ -2375,7 +2375,7 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
-| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). FrankenTUI only, added after the published `v0.8.0` release |
+| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). Added after the published `v0.8.0` release |
 | `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
 | `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |

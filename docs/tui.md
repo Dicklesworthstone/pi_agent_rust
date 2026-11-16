@@ -14,9 +14,8 @@ responses, and managing sessions.
 | `pi --classic` | charmed_rust / bubbletea (`src/interactive.rs`) | Previous stack, kept until removal; aliases `--classic-tui`, `--charmed`, `--bubbletea` |
 
 The stacks share the agent-event vocabulary (`PiMsg`), keybinding catalog,
-autocomplete infrastructure, and session persistence. Command availability can
-differ: `/goal` runs only in FrankenTUI builds that include the feature.
-It was added after the published `v0.8.0` release. See
+autocomplete infrastructure, and session persistence. Both interactive stacks
+support `/goal` (added after the published `v0.8.0` release). See
 [goal availability](goal-mode.md#availability) before trying the examples.
 
 ## Layout
@@ -87,7 +86,7 @@ check the full `pi --version` output, including the commit hash.
 | Command | Description |
 |---------|-------------|
 | `/help` (`/h`, `/?`) | Show help text and shortcut tips. |
-| `/goal [status]` | Inspect an objective and its review receipt. **FrankenTUI only; added after published v0.8.0.** See the [goal quick start](goal-mode.md#terminal-quick-start) for create, step, run, pause, and complete. |
+| `/goal [status]` | Inspect an objective and its review receipt. **Added after published v0.8.0.** See the [goal quick start](goal-mode.md#terminal-quick-start) for create, step, run, pause, and complete. |
 | `/login [provider]` | Login/setup credentials (OAuth for built-ins; API key prompts for supported providers). Run without args to see status table. |
 | `/logout [provider]` | Remove stored OAuth credentials. |
 | `/clear` (`/cls`) | Clear conversation view/history. |
