@@ -245,7 +245,7 @@ the amount. Accounting failures remain recorded when the session is resumed.
 
 The Chat transport validates native payloads before dispatch, including provider
 request hooks: at most 10 MiB decoded per audio block, 32 audio blocks, and 64 MiB
-decoded audio per request. The configured ingress limit (5 MiB per media item by
+decoded audio per request. The configured ingress limit (64 MiB per media item by
 default) still applies. Video and unsupported audio formats retain omission
 placeholders; OpenAI Responses and Codex do not use this Chat audio path.
 

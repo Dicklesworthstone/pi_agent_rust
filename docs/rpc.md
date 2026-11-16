@@ -110,7 +110,7 @@ attachment reference as described below. `name` is
 an optional source label, sanitized and bounded before entering session state.
 URLs, file paths, and session-local blob references are not accepted as payloads.
 Malformed media is rejected before acknowledgment, queue mutation, or session
-recovery. The decoded per-file cap is `media.maxBytes` (5 MiB by default); RPC
+recovery. The decoded per-file cap is `media.maxBytes` (64 MiB by default); RPC
 also limits a command to 32 media items and 64 MiB of decoded media in total.
 
 Both input forms work with `steer`, `follow_up`, and a streaming `prompt`

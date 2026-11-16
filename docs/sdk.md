@@ -176,7 +176,7 @@ over either backend. `RpcTransportClient::prompt_with_content(content)` and
 the ordered RPC `content` array. The subprocess path validates before assigning
 a request ID or writing input, including a 256-block limit, at most 32 audio/video
 blocks, and a 64 MiB serialized content limit that counts JSON escaping and
-metadata. The server also enforces its configured per-media limit (5 MiB by
+metadata. The server also enforces its configured per-media limit (64 MiB by
 default). RPC native text is literal; use the ordinary text API when you want
 server-side template, extension-command, or magic-keyword processing.
 

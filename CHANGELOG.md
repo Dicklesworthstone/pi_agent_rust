@@ -37,6 +37,8 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   Internal root modules in `src/lib.rs` now carry `#[doc(hidden)]`, keeping `pi::Error`, `pi::PiResult`, and `pi::sdk` as the sole documented SemVer contract; `main.rs` consumes `SdkStartupBootstrap` directly for interactive FTUI handoff without double session initialization.
 - **Distinct cost-cap exit code (`EXIT_CODE_COST_CAP = 5`).**
   Print/JSON runs halted by `Error::CostCap` now exit with status `5`, preserving status `3` exclusively for non-interactive approval unavailability.
+- **64 MiB default audio/video attachment cap (`media.maxBytes`) and sidecar/Gemini Files staging.**
+  Now that session persistence stores binary attachments in content-addressed `.blobs/<sha256>` sidecars and stages oversized payloads via the Gemini Files API, `DEFAULT_MEDIA_MAX_BYTES` defaults to `64 MiB` (`67_108_864` bytes) across CLI `@file`, `read_media`, RPC, SDK, and interactive frontends ([#225](https://github.com/Dicklesworthstone/pi_agent_rust/issues/225)).
 - **Honest Node compatibility shims and real `npm:zod` validation.**
   Replaced silent fake-success stubs in `node:zlib`, `node:http2`, `node:tls`, `node:net`, `node:dgram`, `node:vm`, `node:worker_threads`, `node:cluster`, `node:inspector`, and `node:dns` with fail-closed `ERR_PI_SHIM_UNSUPPORTED_OPERATION` errors, and replaced the permissive `npm:zod` stub with recursive runtime validation (`safeParse`/`parse` rejecting invalid inputs with structured `ZodError.issues`).
 

@@ -486,7 +486,7 @@ remains reachable. The tier table and default enabled list live in
 | `browser` | Headless Chromium automation over CDP (navigate, snapshot, click, type, screenshot) with a domain allowlist; settings-gated |
 | `computer` | Desktop automation (displays, windows, screenshots, mouse/keyboard, clipboard); mutating actions require approval; settings-gated |
 | `inspect_image` / `generate_image` / `tts` | Vision analysis of local images, image generation/editing, and text-to-speech through provider adapters; settings-gated |
-| `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Gemini, Gemini CLI, and Vertex Gemini models receive it natively as `inline_data`; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 5 MiB per file (`media.maxBytes`); settings-gated |
+| `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as a native media block (stored in session blob sidecars and staged via the Gemini Files API when large). Gemini, Gemini CLI, and Vertex Gemini models receive it natively; OpenAI audio-capable Chat models consume WAV/MP3; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 64 MiB per file (`media.maxBytes`); settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
 ### Project memory learning
@@ -924,7 +924,7 @@ blocks the fork until the source is ready.
 `audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
 work. Gemini-family providers receive native media; other transports show an
 explicit omission label while the complete attachment stays in session history
-and editor replay. Audio/video admission honors `media.maxBytes` (5 MiB by
+and editor replay. Audio/video admission honors `media.maxBytes` (64 MiB by
 default), with a 10 MiB transport ceiling per attachment and at most 32 media
 attachments per prompt. See [ACP audio and video prompts](docs/tools/media_tools.md#acp-audio-and-video-prompts)
 for the editor wire format and aggregate limits.
@@ -1367,7 +1367,7 @@ pi -p "Quick question"          # Print mode (no session)
 Interactive file references:
 
 - Type `@relative/path` in the editor to attach a file’s contents (autocomplete inserts the `@` form).
-- Images and supported audio/video files become native attachments in file-argument order. Audio/video extensions are `.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, and `.m4a` (case-insensitive), with a 5 MiB per-file limit. Oversized files produce a visible notice and empty files are skipped.
+- Images and supported audio/video files become native attachments in file-argument order. Audio/video extensions are `.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, and `.m4a` (case-insensitive), with a 64 MiB per-file limit (`media.maxBytes`). Oversized files produce a visible notice and empty files are skipped.
 - File arguments use the current workspace roots, including roots added with `--add-dir` or `/add-dir`; `/remove-dir` revokes subsequent attachment reads. CLI startup files and messages are submitted by both terminal frontends, and FTUI `/retry` retains the original attachment bytes.
 - Gemini-family providers receive native audio/video. Providers without that transport receive a visible media-omission label; session history retains the attachment. See [native RPC content](docs/rpc.md#chat) and [SDK native prompts](docs/sdk.md#native-image-audio-and-video-prompts).
 

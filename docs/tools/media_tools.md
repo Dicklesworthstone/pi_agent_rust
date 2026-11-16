@@ -20,7 +20,7 @@ Configure the existing opt-in flags in the application's settings:
     "enableGenerateImage": true,
     "enableTts": true,
     "enableReadMedia": true,
-    "maxBytes": 5242880
+    "maxBytes": 67108864
   }
 }
 ```
@@ -382,7 +382,7 @@ The result contains a short text note and an inline `media` content block:
 {"type":"media","data":"<base64>","mimeType":"video/mp4","name":"clip.mp4"}
 ```
 
-The default cap is 5 MiB (`media.maxBytes` overrides it). It is checked both
+The default cap is 64 MiB (`media.maxBytes` overrides it). It is checked both
 before opening and while reading, so concurrent file growth cannot cause an
 unbounded whole-file allocation. Empty inputs are rejected. In memory the block
 contains the original base64 bytes. Session storage moves large image/media
@@ -427,8 +427,8 @@ payloads reject the whole prompt before a turn starts. These are MIME/base64
 checks, not audio/video codec validation; the selected provider must support
 the submitted format.
 
-The decoded limit is `media.maxBytes`, defaulting to 5 MiB, with a hard 10 MiB
-ceiling for each attachment. A prompt accepts at most 32 audio/video blocks and
+The decoded limit is `media.maxBytes`, defaulting to 64 MiB, with a hard 10 MiB
+ACP transport ceiling for each attachment. A prompt accepts at most 32 audio/video blocks and
 1024 total ACP blocks. Text, URI/MIME metadata, and encoded binary payloads
 share a 32 MiB prompt budget. `_session/steering` uses the same media admission
 rules plus its existing smaller queue and serialized-request limits.
