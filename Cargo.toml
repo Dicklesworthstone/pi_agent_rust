@@ -31,6 +31,8 @@ include = [
     "/Cargo.toml",
     "/LICENSE",
     "/README.md",
+    # Trust root embedded by the native self-updater.
+    "/minisign.pub",
     # Compressed by build.rs and embedded by src/embedded_assets.rs; without it
     # the `cargo publish --dry-run` verify step cannot build the packaged tarball.
     "/CHANGELOG.md",
@@ -351,6 +353,7 @@ uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
 signal-hook = "0.4.4"
 base64 = "0.23"
+blake2 = "=0.11.0"
 flate2 = "1.1.9"
 toml = "1.0.3"
 sha2 = "0.11"

@@ -251,8 +251,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// The server for the redirect tests: tag `v9.9.9` carries a good binary,
-/// `v8.8.8` a binary whose bytes do not match its `SHA256SUMS` line, and
+/// The server for the redirect tests: tag `v9.9.9` carries checksum-matching
+/// bytes without release signatures, `v8.8.8` has a checksum mismatch, and
 /// `vloop` redirects `SHA256SUMS` to itself forever.
 fn release_server(asset: &str, payload: &'static [u8]) -> RedirectingReleaseServer {
     let asset = asset.to_string();
@@ -279,7 +279,7 @@ fn release_server(asset: &str, payload: &'static [u8]) -> RedirectingReleaseServ
 }
 
 #[test]
-fn self_update_follows_release_asset_redirects_and_still_verifies_checksums() {
+fn self_update_follows_redirects_and_refuses_unsigned_or_mismatched_assets() {
     let Some(platform) = PlatformInfo::current() else {
         eprintln!("Skipping: unsupported platform for self-update");
         return;
@@ -292,32 +292,42 @@ fn self_update_follows_release_asset_redirects_and_still_verifies_checksums() {
     let payload: &'static [u8] = b"pretend this is pi 9.9.9";
     let server = release_server(&asset, payload);
     let base = server.base();
+    let sums = ChecksumMap::parse(&format!("{}  {asset}\n", sha256_hex(payload)));
+    let bad_sums = ChecksumMap::parse(&format!(
+        "{}  {asset}\n",
+        sha256_hex(b"what the checksum promised")
+    ));
 
-    let (name, bytes, bad) = common::run_async(async move {
+    let (unsigned_manifest, unsigned_binary, mismatch) = common::run_async(async move {
         let updater = SelfUpdater::new();
-        let sums = updater
-            .fetch_checksums("9.9.9", Some(&base))
-            .await
-            .expect("SHA256SUMS behind a 302 must be fetched");
-        let (name, bytes) = updater
+        let unsigned_manifest = updater.fetch_checksums("9.9.9", Some(&base)).await;
+        // Even a caller supplying its own checksum map cannot bypass the
+        // pinned signature requirement on the redirected binary.
+        let unsigned_binary = updater
             .download_and_verify(&platform, "9.9.9", &sums, Some(&base))
-            .await
-            .expect("binary behind two redirects must download and verify");
-
-        let bad_sums = updater
-            .fetch_checksums("8.8.8", Some(&base))
-            .await
-            .expect("mismatching SHA256SUMS is still fetched");
-        let bad = updater
+            .await;
+        let mismatch = updater
             .download_and_verify(&platform, "8.8.8", &bad_sums, Some(&base))
-            .await
-            .map(|(name, _)| name);
-        (name, bytes, bad)
+            .await;
+        (unsigned_manifest, unsigned_binary, mismatch)
     });
 
-    assert_eq!(name, asset);
-    assert_eq!(bytes, payload);
-    let err = bad.expect_err("a redirected binary that fails its checksum must be rejected");
+    let manifest_error = unsigned_manifest
+        .expect_err("an unsigned redirected SHA256SUMS must be rejected")
+        .to_string();
+    assert!(
+        manifest_error.contains("SHA256SUMS.minisig"),
+        "unexpected error: {manifest_error}"
+    );
+    let binary_error = unsigned_binary
+        .expect_err("checksum-matching bytes without a release signature must be rejected")
+        .to_string();
+    assert!(
+        binary_error.contains(".minisig"),
+        "unexpected error: {binary_error}"
+    );
+    assert!(!binary_error.contains("No compatible binary"));
+    let err = mismatch.expect_err("a redirected binary that fails its checksum must be rejected");
     assert!(
         err.to_string().to_ascii_lowercase().contains("checksum")
             || err.to_string().to_ascii_lowercase().contains("mismatch"),
@@ -328,9 +338,11 @@ fn self_update_follows_release_asset_redirects_and_still_verifies_checksums() {
     for expected in [
         "/download/v9.9.9/SHA256SUMS".to_string(),
         "/objects/good-sums?sig=a%2Fb&se=1".to_string(),
+        "/download/v9.9.9/SHA256SUMS.minisig".to_string(),
         format!("/download/v9.9.9/{asset}"),
         "/objects/hop".to_string(),
         "/objects/binary?sig=d".to_string(),
+        format!("/download/v9.9.9/{asset}.minisig"),
     ] {
         assert!(
             requests.contains(&expected),

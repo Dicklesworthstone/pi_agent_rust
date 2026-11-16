@@ -2,7 +2,8 @@
 //!
 //! Provides `pi self-update [--version <tag>] [--check]` with:
 //! - Package manager detection (Homebrew, APT, Pacman, Nix, Cargo) with refusal & remediation
-//! - SHA-256 checksum verification against `SHA256SUMS` (fail-closed)
+//! - Pinned Minisign authentication of `SHA256SUMS` and the selected binary
+//! - SHA-256 verification against the authenticated manifest (fail-closed)
 //! - Multi-lane artifact resolution (DSR bare-binary naming and release archives)
 //! - Atomic swap with rollback on failed post-update smoke test
 //! - Idempotent no-op when already on the target version
@@ -17,6 +18,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use blake2::Blake2b512;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -40,6 +45,130 @@ const MAX_REDIRECTS: usize = 5;
 /// refused the Linux x86_64, macOS Intel and Windows ones, so `pi self-update`
 /// could not install them.
 const MAX_RELEASE_BINARY_BYTES: usize = 256 * 1024 * 1024;
+
+const MAX_RELEASE_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
+const MAX_SIGNATURE_BYTES: usize = 16 * 1024;
+const RELEASE_PUBLIC_KEY: &str = include_str!("../minisign.pub");
+
+fn decode_minisign_field<const N: usize>(encoded: &str, field: &str) -> Result<[u8; N]> {
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| Error::Validation(format!("Invalid Minisign {field} encoding (fail-closed)")))?
+        .try_into()
+        .map_err(|_| Error::Validation(format!("Invalid Minisign {field} length (fail-closed)")))
+}
+
+/// Verify the modern Minisign format with established cryptographic primitives.
+/// Format authority: <https://jedisct1.github.io/minisign/#signature-format>.
+/// ED signs BLAKE2b-512(message), then a second Ed25519 signature authenticates
+/// the raw 64-byte signature and the exact trusted comment without its prefix.
+/// Legacy non-prehashed signatures are deliberately refused, as by minisign -H.
+fn verify_minisign(bytes: &[u8], signature: &[u8], public_key: &str) -> Result<String> {
+    if signature.len() > MAX_SIGNATURE_BYTES {
+        return Err(Error::Validation(
+            "Minisign signature exceeds size limit (fail-closed)".to_string(),
+        ));
+    }
+    let mut key_lines = public_key.lines();
+    if !key_lines
+        .next()
+        .is_some_and(|line| line.starts_with("untrusted comment: "))
+    {
+        return Err(Error::Validation(
+            "Invalid pinned Minisign public key (fail-closed)".to_string(),
+        ));
+    }
+    let key = decode_minisign_field::<42>(key_lines.next().unwrap_or_default(), "public key")?;
+    if key_lines.next().is_some() || &key[..2] != b"Ed" {
+        return Err(Error::Validation(
+            "Invalid pinned Minisign public key (fail-closed)".to_string(),
+        ));
+    }
+    let signature = std::str::from_utf8(signature).map_err(|_| {
+        Error::Validation("Minisign signature is not UTF-8 (fail-closed)".to_string())
+    })?;
+    let mut lines = signature.lines();
+    if !lines
+        .next()
+        .is_some_and(|line| line.starts_with("untrusted comment: "))
+    {
+        return Err(Error::Validation(
+            "Missing Minisign untrusted comment (fail-closed)".to_string(),
+        ));
+    }
+    let packet = decode_minisign_field::<74>(lines.next().unwrap_or_default(), "signature")?;
+    if &packet[..2] != b"ED" {
+        return Err(Error::Validation(
+            "Minisign signature must use prehashed ED format (fail-closed)".to_string(),
+        ));
+    }
+    if packet[2..10] != key[2..10] {
+        return Err(Error::Validation(
+            "Minisign signature does not match the pinned release key (fail-closed)".to_string(),
+        ));
+    }
+    let comment = lines
+        .next()
+        .and_then(|line| line.strip_prefix("trusted comment: "))
+        .ok_or_else(|| {
+            Error::Validation("Missing Minisign trusted comment (fail-closed)".to_string())
+        })?;
+    if comment.contains(['\r', '\0']) {
+        return Err(Error::Validation(
+            "Invalid Minisign trusted comment (fail-closed)".to_string(),
+        ));
+    }
+    let global =
+        decode_minisign_field::<64>(lines.next().unwrap_or_default(), "comment signature")?;
+    if lines.next().is_some() {
+        return Err(Error::Validation(
+            "Unexpected trailing Minisign data (fail-closed)".to_string(),
+        ));
+    }
+    let verifier = UnparsedPublicKey::new(&ED25519, &key[10..]);
+    verifier
+        .verify(Blake2b512::digest(bytes).as_slice(), &packet[10..])
+        .map_err(|_| {
+            Error::Validation(
+                "Minisign release signature verification failed (fail-closed)".to_string(),
+            )
+        })?;
+    let mut authenticated_comment = Vec::with_capacity(64 + comment.len());
+    authenticated_comment.extend_from_slice(&packet[10..]);
+    authenticated_comment.extend_from_slice(comment.as_bytes());
+    verifier
+        .verify(&authenticated_comment, &global)
+        .map_err(|_| {
+            Error::Validation(
+                "Minisign trusted comment signature verification failed (fail-closed)".to_string(),
+            )
+        })?;
+    Ok(comment.to_string())
+}
+
+/// DSR signs this exact context for aggregate checksums and additional raw
+/// binaries. Bind the requested tag and artifact role as well as its bytes so
+/// an older authentic release cannot be relabeled as the requested version.
+/// Producer contract: `doodlestein_self_releaser/dsr` at commit
+/// `fd7e39d809ef413bf6ec3b55dc0a3d2ee13313d9`, strict release signing path.
+fn verify_release_signature(
+    bytes: &[u8],
+    signature: &[u8],
+    public_key: &str,
+    tag: &str,
+    role: &str,
+) -> Result<()> {
+    let comment = verify_minisign(bytes, signature, public_key)?;
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(bytes));
+    let expected = format!("dsr strict release pi_agent_rust {tag} {role} {digest}");
+    if comment != expected {
+        return Err(Error::Validation(format!(
+            "Minisign signature is not for pi_agent_rust release {tag} ({role}) (fail-closed)"
+        )));
+    }
+    Ok(())
+}
 
 /// True when the response declares a `Content-Length` above `limit`, so an
 /// oversized binary is refused before any of it is read.
@@ -281,6 +410,47 @@ impl ChecksumMap {
         Self { entries }
     }
 
+    /// Parse an authenticated release manifest without ambiguous duplicate rows.
+    fn parse_release(content: &[u8]) -> Result<Self> {
+        let content = std::str::from_utf8(content).map_err(|_| {
+            Error::Validation("Authenticated SHA256SUMS is not UTF-8".to_string())
+        })?;
+        let mut entries = HashMap::new();
+        for line in content.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let hash = fields.next().unwrap_or_default();
+            let filename = fields.next().unwrap_or_default().trim_start_matches('*');
+            if hash.len() != 64
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || filename.is_empty()
+                || filename.contains(['/', '\\', '\0'])
+                || matches!(filename, "." | "..")
+                || fields.next().is_some()
+            {
+                return Err(Error::Validation(
+                    "Invalid SHA256SUMS entry (fail-closed)".to_string(),
+                ));
+            }
+            if entries
+                .insert(filename.to_string(), hash.to_ascii_lowercase())
+                .is_some()
+            {
+                return Err(Error::Validation(format!(
+                    "Duplicate SHA256SUMS entry for {filename} (fail-closed)"
+                )));
+            }
+        }
+        if entries.is_empty() {
+            return Err(Error::Validation(
+                "SHA256SUMS contains no release checksums (fail-closed)".to_string(),
+            ));
+        }
+        Ok(Self { entries })
+    }
+
     /// Look up expected checksum for a candidate asset.
     pub fn get_hash(&self, asset_name: &str) -> Option<&str> {
         self.entries.get(asset_name).map(String::as_str)
@@ -340,6 +510,10 @@ pub enum SelfUpdateStatus {
 /// In-place self-updater engine.
 pub struct SelfUpdater {
     client: Client,
+    // Only unit tests may supply a signing fixture. Production always embeds
+    // the repository key; download URLs never control signature authority.
+    #[cfg(test)]
+    test_public_key: Option<String>,
 }
 
 impl Default for SelfUpdater {
@@ -352,7 +526,17 @@ impl SelfUpdater {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
+            #[cfg(test)]
+            test_public_key: None,
         }
+    }
+
+    fn release_public_key(&self) -> &str {
+        #[cfg(test)]
+        if let Some(key) = &self.test_public_key {
+            return key;
+        }
+        RELEASE_PUBLIC_KEY
     }
 
     /// GET `url`, following up to [`MAX_REDIRECTS`] redirects.
@@ -391,6 +575,32 @@ impl SelfUpdater {
         )))
     }
 
+    /// Required release metadata never falls back after an absent, oversized,
+    /// truncated, or unsuccessful response. Bound decoded bodies as well as
+    /// declared lengths, including chunked responses without Content-Length.
+    async fn fetch_required_bytes(&self, url: &str, label: &str, limit: usize) -> Result<Vec<u8>> {
+        let response = self
+            .get_following_redirects(url, None)
+            .await?
+            .map_err(|error| {
+                Error::Validation(format!("Failed to fetch {label}: {error} (fail-closed)"))
+            })?;
+        if !(200..300).contains(&response.status()) {
+            return Err(Error::Validation(format!(
+                "{label} download failed with HTTP status {} (fail-closed)",
+                response.status()
+            )));
+        }
+        if declared_length_exceeds(response.headers(), limit) {
+            return Err(Error::Validation(format!(
+                "{label} exceeds its {limit}-byte size limit (fail-closed)"
+            )));
+        }
+        response.bytes_limited(limit).await.map_err(|error| {
+            Error::Validation(format!("Failed to read bounded {label}: {error} (fail-closed)"))
+        })
+    }
+
     /// Fetch latest release tag name from GitHub.
     pub async fn fetch_latest_version(&self, manifest_url: Option<&str>) -> Result<String> {
         let url = manifest_url.unwrap_or(RELEASES_API_BASE);
@@ -412,12 +622,17 @@ impl SelfUpdater {
             )));
         }
 
+        if declared_length_exceeds(response.headers(), MAX_RELEASE_MANIFEST_BYTES) {
+            return Err(Error::Validation(
+                "Release manifest exceeds its size limit".to_string(),
+            ));
+        }
         let body = response
-            .text()
+            .bytes_limited(MAX_RELEASE_MANIFEST_BYTES)
             .await
             .map_err(|e| Error::Validation(format!("Failed to read release manifest body: {e}")))?;
 
-        let val: serde_json::Value = serde_json::from_str(&body)
+        let val: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| Error::Validation(format!("Invalid release JSON response: {e}")))?;
 
         let tag = val
@@ -428,7 +643,7 @@ impl SelfUpdater {
         Ok(tag.trim_start_matches('v').to_string())
     }
 
-    /// Fetch `SHA256SUMS` from the release assets.
+    /// Authenticate `SHA256SUMS` with the embedded release key before parsing it.
     pub async fn fetch_checksums(
         &self,
         version: &str,
@@ -442,26 +657,24 @@ impl SelfUpdater {
         };
         let sums_url = format!("{base}/{tag}/SHA256SUMS");
 
-        let response = self
-            .get_following_redirects(&sums_url, None)
-            .await?
-            .map_err(|e| {
-                Error::Validation(format!("Failed to fetch SHA256SUMS from {sums_url}: {e}"))
-            })?;
-
-        if !(200..300).contains(&response.status()) {
-            return Err(Error::Validation(format!(
-                "SHA256SUMS download failed with HTTP status {}",
-                response.status()
-            )));
-        }
-
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::Validation(format!("Failed to read SHA256SUMS: {e}")))?;
-
-        Ok(ChecksumMap::parse(&body))
+        let body = self
+            .fetch_required_bytes(&sums_url, "SHA256SUMS", MAX_CHECKSUM_BYTES)
+            .await?;
+        let signature = self
+            .fetch_required_bytes(
+                &format!("{sums_url}.minisig"),
+                "SHA256SUMS.minisig",
+                MAX_SIGNATURE_BYTES,
+            )
+            .await?;
+        verify_release_signature(
+            &body,
+            &signature,
+            self.release_public_key(),
+            &tag,
+            "aggregate",
+        )?;
+        ChecksumMap::parse_release(&body)
     }
 
     async fn try_download_candidate(
@@ -489,10 +702,25 @@ impl SelfUpdater {
         };
 
         checksums.verify_bytes(candidate, &bytes)?;
+        let signature = self
+            .fetch_required_bytes(
+                &format!("{url}.minisig"),
+                &format!("{candidate}.minisig"),
+                MAX_SIGNATURE_BYTES,
+            )
+            .await?;
+        verify_release_signature(
+            &bytes,
+            &signature,
+            self.release_public_key(),
+            tag,
+            "additional",
+        )?;
         Ok(Some(bytes))
     }
 
-    /// Download and verify binary artifact bytes.
+    /// Download a binary and verify both its SHA-256 and pinned Minisign signature.
+    /// A present candidate with a missing or invalid signature is a hard refusal.
     pub async fn download_and_verify(
         &self,
         platform: &PlatformInfo,
@@ -636,7 +864,12 @@ impl SelfUpdater {
             });
         }
 
-        if current_ver == target_version {
+        // The latest-release API is discovery metadata, not a signed freshness
+        // guarantee. Replayed metadata must not downgrade an automatic update;
+        // an explicit --version remains an intentional version selection.
+        if current_ver == target_version
+            || (options.version.is_none() && !is_newer(current_ver, &target_version))
+        {
             return Ok(SelfUpdateStatus::AlreadyUpToDate {
                 current_version: current_ver.to_string(),
             });
@@ -676,6 +909,68 @@ impl SelfUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
+    fn signing_key() -> Ed25519KeyPair {
+        // This key is solely a deterministic test fixture, never a release key.
+        Ed25519KeyPair::from_seed_unchecked(&[0x41; 32]).unwrap()
+    }
+
+    fn test_public_key() -> String {
+        let mut packet = b"Edtest-key".to_vec();
+        packet.extend_from_slice(signing_key().public_key().as_ref());
+        format!(
+            "untrusted comment: test fixture\n{}\n",
+            BASE64_STANDARD.encode(packet)
+        )
+    }
+
+    fn sign_fixture(bytes: &[u8], comment: &str) -> Vec<u8> {
+        let key = signing_key();
+        let signature = key.sign(Blake2b512::digest(bytes).as_slice());
+        let mut packet = b"EDtest-key".to_vec();
+        packet.extend_from_slice(signature.as_ref());
+        let mut authenticated_comment = signature.as_ref().to_vec();
+        authenticated_comment.extend_from_slice(comment.as_bytes());
+        format!(
+            "untrusted comment: test fixture\n{}\ntrusted comment: {comment}\n{}\n",
+            BASE64_STANDARD.encode(packet),
+            BASE64_STANDARD.encode(key.sign(&authenticated_comment).as_ref())
+        )
+        .into_bytes()
+    }
+
+    fn sign_release(bytes: &[u8], tag: &str, role: &str) -> Vec<u8> {
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(bytes));
+        sign_fixture(
+            bytes,
+            &format!("dsr strict release pi_agent_rust {tag} {role} {digest}"),
+        )
+    }
+
+    fn test_updater() -> SelfUpdater {
+        SelfUpdater {
+            client: Client::new(),
+            test_public_key: Some(test_public_key()),
+        }
+    }
+
+    fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn response(body: Vec<u8>) -> (String, std::sync::Arc<Vec<u8>>) {
+        (
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close",
+                body.len()
+            ),
+            std::sync::Arc::new(body),
+        )
+    }
 
     #[test]
     fn test_checksum_map_parser_and_verifier() {
@@ -770,23 +1065,49 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
         head: String,
         body: std::sync::Arc<Vec<u8>>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        serve_responses(vec![(head, body)])
+    }
+
+    fn serve_responses(
+        responses: Vec<(String, std::sync::Arc<Vec<u8>>)>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let thread = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                if std::io::Read::read(&mut socket, &mut byte).unwrap_or(0) == 0 {
-                    return;
+            for (head, body) in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "timed out waiting for an expected updater request"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept updater request: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if std::io::Read::read(&mut socket, &mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    request.push(byte[0]);
                 }
-                request.push(byte[0]);
+                let _ = socket.write_all(format!("{head}\r\n\r\n").as_bytes());
+                let _ = socket.write_all(&body);
             }
-            let _ = socket.write_all(format!("{head}\r\n\r\n").as_bytes());
-            let _ = socket.write_all(&body);
         });
         (address, thread)
     }
@@ -799,7 +1120,7 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
             .build()
             .unwrap();
         runtime.block_on(async {
-            SelfUpdater::new()
+            test_updater()
                 .try_download_candidate(
                     &format!("http://{address}"),
                     "v9.9.9",
@@ -809,6 +1130,326 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
                 .await
                 .unwrap()
         })
+    }
+
+    #[test]
+    fn minisign_accepts_the_independent_upstream_prehashed_vector() {
+        // From jedisct1/rust-minisign src/tests.rs::verify_prehashed_det,
+        // source blob da7ede626f4b3c963544cf02319dc6ba90fb6326.
+        // No test signer in this crate generated this compatibility vector.
+        let key = concat!(
+            "untrusted comment: upstream test key\n",
+            "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3\n"
+        );
+        let signature = concat!(
+            "untrusted comment: signature from minisign secret key\n",
+            "RUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/",
+            "z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\n",
+            "trusted comment: timestamp:1556193335\tfile:test\n",
+            "y/rUw2y8/hOUYjZU71eHp/Wo1KZ40fGy2VJEDl34XMJM+TX48Ss/17u3IvIfbVR1FkZZSNCisQbuQY+bHwhEBg==\n"
+        );
+        assert!(verify_minisign(b"test", signature.as_bytes(), key).is_ok());
+        assert!(verify_minisign(b"changed", signature.as_bytes(), key).is_err());
+        assert!(verify_minisign(b"test", signature.as_bytes(), RELEASE_PUBLIC_KEY).is_err());
+    }
+
+    #[test]
+    fn minisign_requires_the_message_key_and_trusted_comment_signatures() {
+        let bytes = b"signed binary";
+        let public_key = test_public_key();
+        let signature = sign_fixture(bytes, "release v9.9.9");
+        assert!(verify_minisign(bytes, &signature, &public_key).is_ok());
+        assert!(verify_minisign(b"changed binary", &signature, &public_key).is_err());
+        assert!(verify_minisign(bytes, &signature, RELEASE_PUBLIC_KEY).is_err());
+
+        let signature_text = String::from_utf8(signature.clone()).unwrap();
+        let crlf = signature_text.replace('\n', "\r\n");
+        assert!(verify_minisign(bytes, crlf.as_bytes(), &public_key).is_ok());
+        let altered_comment = signature_text.replace("release v9.9.9", "release v8.8.8");
+        assert!(verify_minisign(bytes, altered_comment.as_bytes(), &public_key).is_err());
+
+        let mut lines: Vec<String> = signature_text.lines().map(str::to_string).collect();
+        let mut packet = BASE64_STANDARD.decode(&lines[1]).unwrap();
+        packet[2] ^= 1;
+        lines[1] = BASE64_STANDARD.encode(&packet);
+        assert!(verify_minisign(bytes, lines.join("\n").as_bytes(), &public_key).is_err());
+
+        packet[2] ^= 1;
+        packet[1] = b'd';
+        lines[1] = BASE64_STANDARD.encode(&packet);
+        let legacy = verify_minisign(bytes, lines.join("\n").as_bytes(), &public_key).unwrap_err();
+        assert!(legacy.to_string().contains("prehashed ED"));
+
+        let other = sign_fixture(b"different binary", "release v9.9.9");
+        let other = String::from_utf8(other).unwrap();
+        let mut lines: Vec<&str> = signature_text.lines().collect();
+        lines[3] = other.lines().nth(3).unwrap();
+        assert!(verify_minisign(bytes, lines.join("\n").as_bytes(), &public_key).is_err());
+        assert!(verify_minisign(bytes, lines[..3].join("\n").as_bytes(), &public_key).is_err());
+        assert!(verify_minisign(bytes, b"", &public_key).is_err());
+        assert!(
+            verify_minisign(bytes, b"untrusted comment: missing\nnot-base64\n", &public_key)
+                .is_err()
+        );
+        assert!(
+            verify_minisign(
+                bytes,
+                format!("{signature_text}extra\n").as_bytes(),
+                &public_key,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_minisign(bytes, &vec![b'a'; MAX_SIGNATURE_BYTES + 1], &public_key).is_err()
+        );
+
+        // Matching the public key identifier cannot substitute a different key.
+        let mut key_packet = BASE64_STANDARD
+            .decode(public_key.lines().nth(1).unwrap())
+            .unwrap();
+        key_packet[10] ^= 1;
+        let other_key = format!(
+            "untrusted comment: different key, same id\n{}\n",
+            BASE64_STANDARD.encode(key_packet)
+        );
+        assert!(verify_minisign(bytes, &signature, &other_key).is_err());
+    }
+
+    #[test]
+    fn release_signatures_bind_the_requested_tool_tag_role_and_hash() {
+        let bytes = b"release binary";
+        let public_key = test_public_key();
+        let signature = sign_release(bytes, "v9.9.9", "additional");
+        assert!(
+            verify_release_signature(bytes, &signature, &public_key, "v9.9.9", "additional")
+                .is_ok()
+        );
+        assert!(
+            verify_release_signature(bytes, &signature, &public_key, "v9.9.10", "additional")
+                .is_err()
+        );
+        assert!(
+            verify_release_signature(bytes, &signature, &public_key, "v9.9.9", "aggregate")
+                .is_err()
+        );
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(bytes));
+        for comment in [
+            format!("dsr strict release another_tool v9.9.9 additional {digest}"),
+            format!(
+                "dsr strict release pi_agent_rust v9.9.9 additional {}",
+                "0".repeat(64)
+            ),
+            format!("dsr strict release pi_agent_rust v9.9.9 additional {digest} extra"),
+        ] {
+            let signature = sign_fixture(bytes, &comment);
+            assert!(
+                verify_release_signature(bytes, &signature, &public_key, "v9.9.9", "additional")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn signed_checksum_parser_rejects_ambiguous_or_invalid_entries() {
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(b"binary"));
+        let valid = format!("{digest}  pi_linux_amd64\n");
+        let checksums = ChecksumMap::parse_release(valid.as_bytes()).unwrap();
+        assert!(checksums.verify_bytes("pi_linux_amd64", b"binary").is_ok());
+        for invalid in [
+            format!("{valid}{valid}"),
+            format!("{digest}  ../pi_linux_amd64\n"),
+            format!("{digest}  pi_linux_amd64 extra\n"),
+            "not-a-hash  pi_linux_amd64\n".to_string(),
+            "# no entries\n".to_string(),
+        ] {
+            assert!(ChecksumMap::parse_release(invalid.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_release_download_follows_redirects_and_authenticates_both_files() {
+        let bytes = b"release binary".to_vec();
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(&bytes));
+        let sums = format!("{digest}  pi_linux_amd64\n").into_bytes();
+        let sums_signature = sign_release(&sums, "v9.9.9", "aggregate");
+        let binary_signature = sign_release(&bytes, "v9.9.9", "additional");
+        let redirect = |location: &str| {
+            (
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close"
+                ),
+                std::sync::Arc::new(Vec::new()),
+            )
+        };
+        let (address, server) = serve_responses(vec![
+            redirect("/objects/SHA256SUMS?sig=a%2Fb"),
+            response(sums),
+            redirect("/objects/SHA256SUMS.minisig?sig=c"),
+            response(sums_signature),
+            redirect("/objects/binary-hop"),
+            redirect("/objects/binary?sig=d"),
+            response(bytes.clone()),
+            redirect("/objects/binary.minisig?sig=e"),
+            response(binary_signature),
+        ]);
+        let platform = PlatformInfo {
+            os: "linux",
+            arch: "x86_64",
+            asset_platform: "linux-amd64",
+            target_triple: "x86_64-unknown-linux-gnu",
+            exe_ext: "",
+        };
+        let (name, downloaded) = run_async(async {
+            let updater = test_updater();
+            let base = format!("http://{address}");
+            let checksums = updater.fetch_checksums("9.9.9", Some(&base)).await.unwrap();
+            updater
+                .download_and_verify(&platform, "v9.9.9", &checksums, Some(&base))
+                .await
+                .unwrap()
+        });
+        server.join().unwrap();
+        assert_eq!(name, "pi_linux_amd64");
+        assert_eq!(downloaded, bytes);
+    }
+
+    #[test]
+    fn missing_or_mismatched_binary_signatures_are_hard_refusals() {
+        let bytes = b"release binary".to_vec();
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(&bytes));
+        let checksums = ChecksumMap::parse(&format!("{digest}  pi_linux_amd64\n"));
+        let platform = PlatformInfo {
+            os: "linux",
+            arch: "x86_64",
+            asset_platform: "linux-amd64",
+            target_triple: "x86_64-unknown-linux-gnu",
+            exe_ext: "",
+        };
+        for signature_response in [
+            (
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close".to_string(),
+                std::sync::Arc::new(Vec::new()),
+            ),
+            response(sign_release(b"different binary", "v9.9.9", "additional")),
+            response(sign_release(&bytes, "v8.8.8", "additional")),
+            response(sign_release(&bytes, "v9.9.9", "aggregate")),
+        ] {
+            let (address, server) =
+                serve_responses(vec![response(bytes.clone()), signature_response]);
+            let result = run_async(test_updater().download_and_verify(
+                &platform,
+                "9.9.9",
+                &checksums,
+                Some(&format!("http://{address}")),
+            ));
+            server.join().unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("minisig") || error.contains("Minisign"), "{error}");
+            assert!(!error.contains("No compatible binary"), "{error}");
+        }
+    }
+
+    #[test]
+    fn checksum_download_authenticates_before_parsing_and_never_skips_signatures() {
+        for signature_response in [
+            (
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close".to_string(),
+                std::sync::Arc::new(Vec::new()),
+            ),
+            response(sign_release(b"different checksum file", "v9.9.9", "aggregate")),
+            response(sign_release(
+                b"this is also an invalid checksum file",
+                "v8.8.8",
+                "aggregate",
+            )),
+        ] {
+            let (address, server) = serve_responses(vec![
+                response(b"this is also an invalid checksum file".to_vec()),
+                signature_response,
+            ]);
+            let result = run_async(test_updater().fetch_checksums(
+                "9.9.9",
+                Some(&format!("http://{address}")),
+            ));
+            server.join().unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("minisig") || error.contains("Minisign"), "{error}");
+            assert!(!error.contains("Invalid SHA256SUMS entry"), "{error}");
+        }
+    }
+
+    #[test]
+    fn automatic_update_never_downgrades_from_replayed_latest_metadata() {
+        assert!(is_newer("0.0.0", CURRENT_VERSION));
+        let (head, body) = response(br#"{"tag_name":"v0.0.0"}"#.to_vec());
+        let (address, server) = serve_once(head, body);
+        let options = SelfUpdateOptions {
+            custom_manifest_url: Some(format!("http://{address}/releases/latest")),
+            custom_download_base: Some(format!("http://{address}/download")),
+            ..SelfUpdateOptions::default()
+        };
+        let status = run_async(SelfUpdater::new().run(&options)).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            status,
+            SelfUpdateStatus::AlreadyUpToDate {
+                current_version: CURRENT_VERSION.trim_start_matches('v').to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_older_version_still_attempts_authenticated_download() {
+        // Unsupported platforms are refused before any release download.
+        if PlatformInfo::current().is_none() {
+            return;
+        }
+        let (address, server) = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close".to_string(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let options = SelfUpdateOptions {
+            version: Some("0.0.0".to_string()),
+            custom_download_base: Some(format!("http://{address}/download")),
+            ..SelfUpdateOptions::default()
+        };
+        let error = run_async(SelfUpdater::new().run(&options))
+            .expect_err("an explicit older version must still request its signed release")
+            .to_string();
+        server.join().unwrap();
+        assert!(error.contains("SHA256SUMS"), "{error}");
+    }
+
+    #[test]
+    fn release_metadata_bounds_declared_and_streamed_responses() {
+        for (label, limit) in [
+            ("SHA256SUMS", MAX_CHECKSUM_BYTES),
+            ("SHA256SUMS.minisig", MAX_SIGNATURE_BYTES),
+        ] {
+            for declared in [false, true] {
+                let head = if declared {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close",
+                        limit + 1
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nConnection: close".to_string()
+                };
+                let body = if declared {
+                    Vec::new()
+                } else {
+                    vec![b'x'; limit + 1]
+                };
+                let (address, server) = serve_once(head, std::sync::Arc::new(body));
+                let result = run_async(test_updater().fetch_required_bytes(
+                    &format!("http://{address}/{label}"),
+                    label,
+                    limit,
+                ));
+                server.join().unwrap();
+                assert!(result.is_err(), "{label}, declared={declared}");
+            }
+        }
     }
 
     #[test]
@@ -828,7 +1469,11 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close",
             body.len()
         );
-        let (address, server) = serve_once(head, std::sync::Arc::clone(&body));
+        let signature = sign_release(body.as_slice(), "v9.9.9", "additional");
+        let (address, server) = serve_responses(vec![
+            (head, std::sync::Arc::clone(&body)),
+            response(signature),
+        ]);
         let downloaded = download_candidate(address, &checksums);
         server.join().unwrap();
         assert_eq!(downloaded.map(|bytes| bytes.len()), Some(body.len()));
