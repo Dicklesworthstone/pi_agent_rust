@@ -1787,6 +1787,24 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
 }
 
 #[test]
+fn agents_md_rule_0_5_is_self_contained_across_hosts() {
+    let agents = require_text("AGENTS.md");
+    assert!(
+        agents.contains("### Named Reward-Hacking Patterns (ALL FORBIDDEN)"),
+        "AGENTS.md must inline Named Reward-Hacking Patterns for Darwin/isolated hosts (bd-8pcrt)"
+    );
+    assert!(
+        agents.contains("### Work-Graph Discipline"),
+        "AGENTS.md must inline Work-Graph Discipline for Darwin/isolated hosts (bd-8pcrt)"
+    );
+    assert!(
+        !agents.contains("SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md")
+            && !agents.contains("are NOT duplicated below"),
+        "AGENTS.md Rule 0.5 must not depend on an unreachable external /data/projects/AGENTS.md"
+    );
+}
+
+#[test]
 fn phase1_matrix_validation_artifact_is_present_and_parseable() {
     let (artifact, matrix) = require_phase1_matrix_validation();
     let schema = matrix.get("schema").and_then(Value::as_str).unwrap_or("");

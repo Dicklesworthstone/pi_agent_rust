@@ -10,25 +10,43 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
-## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+## RULE 0.5 - SUITE-WIDE INTEGRITY, PERF, AND WORK-GRAPH RULES
 
-The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
-are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+The suite-wide integrity, performance, and work-graph rules below are **self-contained and
+canonical in this file** so every agent on macOS, Linux, isolated checkouts, and remote RCH
+workers has immediate, identical access to them. (If a host-level `../AGENTS.md` — such as
+`/Users/jemanuel/projects/AGENTS.md` on macOS or `/data/projects/AGENTS.md` on Linux/RCH workers —
+is present on disk, read it as supplemental host/tooling context; never assume `/data/projects/AGENTS.md`
+exists.)
 
-- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
-  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
-  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
-  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
-  conformance metastasis, dependency smuggling, bench-path hardcoding.
-- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
-  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
-  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+### Named Reward-Hacking Patterns (ALL FORBIDDEN)
+
+1. **Gate self-weakening (RH-1)**: Editing validator, conformance, certifier, or test-gate code so a failing check passes. Gate code is a separate single-owner lane; never bundle a gate relaxation into a feature fix. If a gate is genuinely defective, cite the observed defect, meet the evidence standard, and publish the exact win/lose split of what the fix admits.
+2. **Proof-class inflation (RH-2)**: Presenting fixtures, retained captures, mocks, or synthetic DB rows as live proof. Keep an explicit proof hierarchy (`static` → `unit/planted-red` → `capture/replay` → `live` → `field`); live proof requires real runtime execution.
+3. **Golden regeneration reflex (RH-3)**: Regenerating goldens or pinned snapshots to match broken output instead of fixing the root cause.
+4. **Commit-stream pumping (RH-4)**: Trivial or artificially split commits, or placeholder scaffolds (`todo!()` / `unimplemented!()`) that pass a syntax gate.
+5. **Tautological tests (RH-5)**: Tests that assert the code does whatever the code currently does, or omit negative/adversarial controls that a naive wrong implementation would fail.
+6. **Easy-lever cherry-picking (RH-6)**: Repeatedly claiming low-risk leaves while critical-path architectural or blocker work starves.
+7. **Close-pump abuse (RH-7)**: Closing beads without verified, executed evidence in `HEAD` to inflate progress or prematurely unblock dependents.
+8. **Scope-splitting / follow-up laundering (RH-8)**: Splitting one unit of work into types/impl/tests mini-closures or punting an unmet acceptance criterion to a follow-up bead to close the original. Code and its tests ship together.
+9. **Spec-editing as progress (RH-9)**: Rewriting specifications, contracts, READMEs, or architectural promises downward to match deficient code instead of fixing the code.
+10. **Conformance metastasis (RH-10)**: Adding speculative meta-tests or ceremony matrices that cite no observed defect class while leaving real functional bugs unaddressed.
+11. **Dependency smuggling (RH-11)**: Vendoring, shimming, or aliasing around banned dependencies or toolchain policies.
+12. **Bench-path hardcoding (RH-12)**: Special-casing benchmark inputs, fixture identities, or hardcoded paths so a benchmark or happy path passes.
 
 The three that most often decide whether a number here is real: a **self-speedup is
 MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
 weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
 standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
 success** — one line, revert, next lever, no retraction narrative.
+
+### Work-Graph Discipline
+
+- **JSONL is truth and `beads.db` is disposable**: `.beads/issues.jsonl` is authoritative; always run `br sync --import-only` after every pull.
+- **Single-writer on graph structure**: Coordinate concurrent graph mutations so parent/dep edits never race.
+- **Closure on cited evidence**: Close work items ONLY with concrete, cited build/test/benchmark execution evidence verified on `HEAD`.
+- **Blocker beads gated on their named probe**: A blocker closes only when its named reproduction/verification probe passes.
+- **DAG acyclicity**: `br dep cycles` must stay empty at all times.
 
 ---
 
