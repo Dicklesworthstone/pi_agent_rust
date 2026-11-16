@@ -2005,6 +2005,17 @@ fn append_jsonl_entries_with_v2_blocking(
                 entries.push(JsonlPersistedEntry::Hydrated(Box::new(entry)));
             }
         }
+        // Another writer can rewrite the canonical rows without changing their
+        // count while this handle still considers its V2 sidecar current. Check
+        // that prefix under the persistence lock, before the dirty marker below
+        // erases its source fingerprint. An unverified prefix requires a rebuild
+        // after the canonical commit, never an incremental append.
+        // The read-only probe also avoids reacquiring this lock for legacy stores.
+        let v2_prefix_verified = sync_v2_sidecar
+            && matches!(
+                is_v2_sidecar_stale_read_only(path, &session_store_v2::v2_sidecar_path(path)),
+                Ok(false)
+            );
         let index_generation = if serialized_entries.is_empty() {
             None
         } else {
@@ -2040,7 +2051,9 @@ fn append_jsonl_entries_with_v2_blocking(
             "jsonl_append_after_sync",
             Some("append_sync_completed=true"),
         )?;
-        let synced_v2_root = if sync_v2_sidecar {
+        let synced_v2_root = if !sync_v2_sidecar {
+            None
+        } else if v2_prefix_verified {
             sync_v2_sidecar_incremental_best_effort_locked(
                 path,
                 &header,
@@ -2048,7 +2061,7 @@ fn append_jsonl_entries_with_v2_blocking(
                 &encoded_entry_lines,
             )
         } else {
-            None
+            sync_v2_sidecar_full_rewrite_best_effort_locked(path)
         };
         enqueue_session_index_snapshot_update(
             sessions_root,

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::future::Future;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -4785,6 +4785,10 @@ fn live_migrated_session_appends_50_turns_without_staling_v2_and_catches_crc_tam
         session.is_v2_live_sync_enabled(),
         "opening a migrated V2 session must enable live V2 sidecar synchronization"
     );
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let segment_path = v2_root.join("segments/0000000000000001.seg");
+    let mut original_segment = fs::File::open(&segment_path)?;
+    let initial_segment_len = original_segment.metadata()?.len();
 
     for turn in 1..=50 {
         session.append_message(pi::session::SessionMessage::User {
@@ -4793,6 +4797,14 @@ fn live_migrated_session_appends_50_turns_without_staling_v2_and_catches_crc_tam
         });
         run_async(async { session.save().await })?;
     }
+
+    // A clean prefix stays on the append path. Rebuilding into a replacement
+    // sidecar would leave this original descriptor on the obsolete seed file.
+    let mut original_segment_bytes = Vec::new();
+    original_segment.read_to_end(&mut original_segment_bytes)?;
+    assert!(original_segment.metadata()?.len() > initial_segment_len);
+    assert_eq!(original_segment_bytes, fs::read(&segment_path)?);
+    drop(original_segment);
 
     let trace = run_async(async { Session::cold_start_trace_bundle(&jsonl, dir.path()).await })?;
     assert!(trace.storage.v2_sidecar_present);
@@ -4803,7 +4815,6 @@ fn live_migrated_session_appends_50_turns_without_staling_v2_and_catches_crc_tam
     assert_eq!(trace.storage.selected_backend, "v2_sidecar");
     assert_eq!(trace.storage.opened_backend, "v2_sidecar");
 
-    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
     let store = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
     store.validate_integrity()?;
     let verification = pi::session::verify_v2_against_jsonl(&jsonl, &store)?;
@@ -4846,6 +4857,129 @@ fn live_migrated_session_appends_50_turns_without_staling_v2_and_catches_crc_tam
     assert_eq!(v2_messages, jsonl_messages);
 
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One retained-handle fixture checks canonical, V2, and resume state.
+fn assert_retained_v2_save_repairs_rewritten_prefix(
+    dirty_source_state: bool,
+    replay_saved_append: bool,
+) -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("seed", None, "alpha")]);
+    // Keep a JSONL-only writer from before migration as well as the live V2
+    // writer. Its ordinary full rewrite must invalidate the shared sidecar.
+    let mut jsonl_writer =
+        run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    assert!(!jsonl_writer.is_v2_live_sync_enabled());
+    pi::session::migrate_jsonl_to_v2(&jsonl, "retained-prefix-rewrite")?;
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let mut retained =
+        run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    assert!(retained.is_v2_live_sync_enabled());
+
+    let appended_id = retained.append_message(make_user_session_message("pending turn", 42));
+    if replay_saved_append {
+        // The durable write can finish without its receipt reaching this
+        // handle. Persist the identical pending row through a second handle
+        // so retained.save() must deduplicate it rather than append bytes.
+        let mut other_writer = retained.clone();
+        run_async(async { other_writer.save().await })?;
+        let store = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+        assert_eq!(store.read_index()?.len(), 2);
+        assert_eq!(fs::read_to_string(&jsonl)?.lines().count(), 3);
+    }
+    if dirty_source_state {
+        jsonl_writer.set_model_header(Some("updated-provider".to_string()), None, None);
+        run_async(async { jsonl_writer.save().await })?;
+        let source_state: Value =
+            serde_json::from_slice(&fs::read(v2_root.join("source-state.json"))?)?;
+        assert_eq!(source_state["state"], "dirty");
+    }
+
+    // Preserve both the row count and ordinary metadata. Neither entry count
+    // nor size/mtime can establish that the sidecar still contains this prefix.
+    let original_mtime = fs::metadata(&jsonl)?.modified()?;
+    let before_rewrite = fs::read_to_string(&jsonl)?;
+    let rewritten = before_rewrite.replacen("alpha", "bravo", 1);
+    assert_ne!(rewritten, before_rewrite);
+    assert_eq!(rewritten.len(), before_rewrite.len());
+    fs::write(&jsonl, rewritten.as_bytes())?;
+    filetime::set_file_mtime(
+        &jsonl,
+        filetime::FileTime::from_system_time(original_mtime),
+    )?;
+    assert_eq!(fs::metadata(&jsonl)?.modified()?, original_mtime);
+
+    // Do not reopen before this save: reopening would repair the sidecar and
+    // conceal the stale state held by the session that was already running.
+    run_async(async { retained.save().await })?;
+    let canonical = fs::read_to_string(&jsonl)?;
+    if replay_saved_append {
+        assert_eq!(
+            canonical, rewritten,
+            "a retried save must not append a duplicate JSONL row"
+        );
+    }
+    let canonical_entries = canonical
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<SessionEntry>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(canonical_entries.len(), 2);
+    assert_eq!(canonical_entries[1].base_id(), Some(&appended_id));
+    assert!(matches!(
+        &canonical_entries[0],
+        SessionEntry::Message(entry)
+            if matches!(&entry.message,
+                pi::session::SessionMessage::User {
+                    content: pi::model::UserContent::Text(text), ..
+                } if text == "bravo")
+    ));
+    assert_eq!(
+        serde_json::to_value(&retained.entries)?,
+        serde_json::to_value(&canonical_entries)?,
+        "the live writer must adopt the authoritative rewritten prefix"
+    );
+
+    // Verify before Session::open has any opportunity to repair a bad store.
+    // An internally valid alpha+pending sidecar still fails transcript parity.
+    let store = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    store.validate_integrity()?;
+    let verification = pi::session::verify_v2_against_jsonl(&jsonl, &store)?;
+    assert!(verification.entry_count_match);
+    assert!(
+        verification.hash_chain_match,
+        "a matching row count must never re-bless an obsolete V2 prefix"
+    );
+    assert!(verification.index_consistent);
+    assert_eq!(store.read_index()?.len(), 2);
+    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Migrated);
+
+    let reopened =
+        run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    assert!(reopened.is_v2_live_sync_enabled());
+    assert_eq!(
+        serde_json::to_value(reopened.to_messages_for_current_path())?,
+        serde_json::to_value(retained.to_messages_for_current_path())?,
+        "V2 resume must retain the same authoritative transcript as the live writer"
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_v2_session_rebuilds_same_count_same_mtime_rewritten_prefix() -> PiResult<()> {
+    assert_retained_v2_save_repairs_rewritten_prefix(false, false)
+}
+
+#[test]
+fn retained_v2_session_rebuilds_dirty_same_count_prefix_before_append() -> PiResult<()> {
+    assert_retained_v2_save_repairs_rewritten_prefix(true, false)
+}
+
+#[test]
+fn retained_v2_session_rebuilds_rewritten_prefix_when_append_is_deduplicated() -> PiResult<()> {
+    assert_retained_v2_save_repairs_rewritten_prefix(false, true)
 }
 
 /// Opting into `session.store = "v2"` builds and maintains the V2 sidecar across
