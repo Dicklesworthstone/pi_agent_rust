@@ -2571,7 +2571,10 @@ async fn run(
                 launch_cwd: cwd.clone(),
             }),
             workspace_trust_guard: Some(workspace_trust_guard.clone()),
-            launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
+            launch: pi::acp::AcpLaunchOptions {
+                extension_flags: extension_flags.clone(),
+                ..pi::acp::AcpLaunchOptions::from_cli(&cli)
+            },
             available_models,
             model_registry: model_registry.clone(),
             auth: auth.clone(),

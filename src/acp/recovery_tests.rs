@@ -2952,6 +2952,18 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
     std::fs::write(
         ext_dir.join("acp_probe.mjs"),
         r#"export default function (pi) {
+            pi.registerFlag("acp-probe-tag", {
+                type: "string",
+                default: "extension-default"
+            });
+            let startupTag = "startup-not-run";
+            let sessionTag = "session-start-not-run";
+            pi.on("startup", () => {
+                startupTag = pi.getFlag("acp-probe-tag");
+            });
+            pi.on("session_start", () => {
+                sessionTag = pi.getFlag("acp-probe-tag");
+            });
             pi.registerTool({
                 name: "acp_ext_probe",
                 label: "ACP Extension Probe",
@@ -2965,7 +2977,7 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
                 },
                 async execute(_toolCallId, params) {
                     return {
-                        content: [{ type: "text", text: `EXT_OK:${params.tag}` }]
+                        content: [{ type: "text", text: `EXT_OK:${params.tag}:${startupTag}:${sessionTag}` }]
                     };
                 }
             });
@@ -3035,6 +3047,10 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
         trusted_opts.launch.tools = Some("current_time".to_string());
         trusted_opts.launch.no_mcp = true;
         trusted_opts.launch.no_context_files = true;
+        trusted_opts.launch.extension_flags = vec![crate::cli::ExtensionCliFlag {
+            name: "acp-probe-tag".to_string(),
+            value: Some("host-startup-value".to_string()),
+        }];
         trusted_opts.settings_source = Some(AcpSettingsSource {
             global_dir: global_dir.clone(),
             config_override: None,
@@ -3088,8 +3104,8 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
 
     let wire_log = serde_json::to_string(&prompt_updates).unwrap();
     assert!(
-        wire_log.contains("EXT_OK:zed-turn-1"),
-        "extension tool output must stream to ACP client: {wire_log}"
+        wire_log.contains("EXT_OK:zed-turn-1:host-startup-value:host-startup-value"),
+        "extension flags must reach startup and session_start before ACP tool execution: {wire_log}"
     );
 
     // 3. Restart ACP server and verify `session/load` replays persisted transcript + re-boots extension!

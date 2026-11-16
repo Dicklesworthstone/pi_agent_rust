@@ -655,6 +655,8 @@ pub struct AcpLaunchOptions {
     /// Host-level refusal of all client-supplied MCP servers.
     pub no_mcp: bool,
     pub extensions: Vec<String>,
+    /// Parsed extension flags, applied before startup/session_start hooks.
+    pub extension_flags: Vec<crate::cli::ExtensionCliFlag>,
     pub no_extensions: bool,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
@@ -691,6 +693,7 @@ impl AcpLaunchOptions {
             no_implicit_tools: cli.no_implicit_tools,
             no_mcp: cli.no_mcp,
             extensions: cli.extension.clone(),
+            extension_flags: Vec::new(),
             no_extensions: cli.no_extensions,
             extension_policy: cli.extension_policy.clone(),
             repair_policy: cli.repair_policy.clone(),
@@ -2762,7 +2765,7 @@ async fn boot_acp_extensions(state: &mut AcpSessionState, options: &AcpOptions) 
                 crate::agent::ExtensionHostConfiguration {
                     ui_handler: None,
                     persist_permission_decisions: true,
-                    cli_flags: Vec::new(),
+                    cli_flags: workspace_options.launch.extension_flags.clone(),
                 },
             )
             .await?;
