@@ -51,6 +51,34 @@ pub use model_fetch::{
     refresh_provider_model_catalog, refresh_provider_models, static_registry_models,
 };
 
+/// Return the static [`crate::provider::ProviderCapabilities`] declared by a built-in
+/// or preset provider ID without requiring live credentials or provider instantiation.
+#[must_use]
+pub fn provider_capabilities_for_id(provider_id: &str) -> crate::provider::ProviderCapabilities {
+    let canonical = canonical_provider_id(provider_id).unwrap_or_else(|| provider_id.trim());
+    if canonical.eq_ignore_ascii_case("gitlab") {
+        crate::provider::ProviderCapabilities {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: false,
+            streaming: false,
+            vision: false,
+            authoritative_usage: false,
+        }
+    } else if canonical.eq_ignore_ascii_case("cursor") {
+        crate::provider::ProviderCapabilities {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: false,
+            streaming: true,
+            vision: false,
+            authoritative_usage: true,
+        }
+    } else {
+        crate::provider::ProviderCapabilities::default()
+    }
+}
+
 /// Offer a fully built request body to the `before_provider_request`
 /// extension hook (gh #167 / bd-1q31s core, bd-dzddo breadth).
 ///
@@ -4198,5 +4226,44 @@ export default function init(pi) {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn provider_capabilities_for_id_matches_all_native_provider_traits() {
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(anthropic::AnthropicProvider::new("claude-sonnet-4-5")),
+            Box::new(openai::OpenAIProvider::new("gpt-4o")),
+            Box::new(openai_responses::OpenAIResponsesProvider::new("gpt-4o")),
+            Box::new(gemini::GeminiProvider::new("gemini-2.5-pro")),
+            Box::new(cohere::CohereProvider::new("command-r-plus")),
+            Box::new(azure::AzureOpenAIProvider::new("res", "dep")),
+            Box::new(bedrock::BedrockProvider::new(
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            )),
+            Box::new(vertex::VertexProvider::new("gemini-2.0-flash")),
+            Box::new(copilot::CopilotProvider::new("gpt-4o", "ghu_test_token")),
+            Box::new(gitlab::GitLabProvider::new("duo-chat")),
+            Box::new(cursor::CursorProvider::new("cursor-fast")),
+        ];
+        for provider in &providers {
+            assert_eq!(
+                provider.capabilities(),
+                provider_capabilities_for_id(provider.name()),
+                "static capabilities drifted from Provider::capabilities() for {}",
+                provider.name()
+            );
+        }
+        assert_eq!(
+            provider_capabilities_for_id("gitlab-duo").summary(),
+            "multi_turn, tool_use"
+        );
+        assert_eq!(
+            provider_capabilities_for_id("cursor-agent").summary(),
+            "multi_turn, tool_use, streaming"
+        );
+        assert_eq!(
+            provider_capabilities_for_id("anthropic").summary(),
+            "multi_turn, tool_use, streaming, vision"
+        );
     }
 }

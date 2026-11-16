@@ -53,6 +53,44 @@ impl Default for ProviderCapabilities {
     }
 }
 
+impl ProviderCapabilities {
+    /// Human-readable summary of core agentic capabilities (`multi_turn`, `tool_use`, `streaming`, `vision`).
+    #[must_use]
+    pub fn summary(self) -> String {
+        let mut caps = Vec::with_capacity(4);
+        if self.multi_turn {
+            caps.push("multi_turn");
+        }
+        if self.tool_use {
+            caps.push("tool_use");
+        }
+        if self.streaming {
+            caps.push("streaming");
+        }
+        if self.vision {
+            caps.push("vision");
+        }
+        if caps.is_empty() {
+            "none".to_string()
+        } else {
+            caps.join(", ")
+        }
+    }
+
+    /// Serialize this capability descriptor as a JSON object for machine-readable surfaces.
+    #[must_use]
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "multi_turn": self.multi_turn,
+            "tool_use": self.tool_use,
+            "native_tool_wire": self.native_tool_wire,
+            "streaming": self.streaming,
+            "vision": self.vision,
+            "authoritative_usage": self.authoritative_usage,
+        })
+    }
+}
+
 /// An LLM backend capable of streaming assistant output (and tool calls).
 ///
 /// A `Provider` is typically configured for a specific API + model and is used by the agent loop
