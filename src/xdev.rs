@@ -181,6 +181,12 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "tts",
 ];
 
+/// Bounds of the discovery region owned by an automatically generated prompt.
+/// The Agent removes these markers before dispatch; ordinary headings in custom
+/// prompts do not opt those prompts into live catalog synchronization.
+pub(crate) const DISCOVERABLE_PROMPT_START: &str = "<!-- pi:discoverable-tools:start -->";
+pub(crate) const DISCOVERABLE_PROMPT_END: &str = "<!-- pi:discoverable-tools:end -->";
+
 pub const DISCOVERABLE_PROMPT_HEADER: &str =
     "\n\nAdditional tools are available via the `xdev` dispatcher (not in your schema):\n";
 pub const DISCOVERABLE_PROMPT_FOOTER: &str =
@@ -377,24 +383,30 @@ pub fn format_discoverable_section(index: &[(String, String)]) -> String {
     out
 }
 
-/// Replace an existing discoverable-tools prompt block with the live registry
-/// snapshot's unpromoted index (including dynamically mounted MCP/extension
-/// discoverable tools, or removing promoted tools after `xdev promote`).
+/// Mark an automatically generated prompt as owning live discovery even when
+/// startup has no discoverable built-ins. Custom system prompts do not call this.
+#[must_use]
+pub(crate) fn format_managed_discoverable_section(index: &[(String, String)]) -> String {
+    let mut section = String::from(DISCOVERABLE_PROMPT_START);
+    section.push_str(&format_discoverable_section(index));
+    section.push_str(DISCOVERABLE_PROMPT_END);
+    section
+}
+
+/// Replace an automatic prompt's managed discovery region with the live
+/// registry's unpromoted index. The stored base prompt keeps its markers so
+/// tools mounted after an empty request can appear on a later request.
+/// Unmarked custom prompts remain entirely host-controlled, even when they use
+/// the same human-readable discovery heading.
 #[must_use]
 pub fn sync_discoverable_prompt_section(
     system_prompt: &str,
     live_index: &[(String, String)],
 ) -> Option<String> {
-    let (prefix, after_header) = system_prompt.split_once(DISCOVERABLE_PROMPT_HEADER)?;
-    let (body, suffix) = after_header.split_once(DISCOVERABLE_PROMPT_FOOTER)?;
+    let (prefix, after_start) = system_prompt.split_once(DISCOVERABLE_PROMPT_START)?;
+    let (_, suffix) = after_start.split_once(DISCOVERABLE_PROMPT_END)?;
     let replacement = format_discoverable_section(live_index);
-    let expected_body = replacement
-        .strip_prefix(DISCOVERABLE_PROMPT_HEADER)
-        .and_then(|s| s.strip_suffix(DISCOVERABLE_PROMPT_FOOTER));
-    if expected_body == Some(body) {
-        return None;
-    }
-    let mut updated = String::with_capacity(system_prompt.len() + replacement.len());
+    let mut updated = String::with_capacity(prefix.len() + replacement.len() + suffix.len());
     updated.push_str(prefix);
     updated.push_str(&replacement);
     updated.push_str(suffix);
@@ -982,6 +994,34 @@ mod tests {
                 one_liner(tool.description()),
                 "one-liner table drifted from live description for {name}"
             );
+        }
+    }
+
+    #[test]
+    fn managed_discovery_region_handles_empty_catalogs_and_preserves_host_prompts() {
+        let live = vec![(
+            "mcp__project__search".to_string(),
+            "Search project documents".to_string(),
+        )];
+        let rendered = format!("Before Ω{}After λ", format_discoverable_section(&live));
+        for initial in [&[][..], live.as_slice()] {
+            let base = format!(
+                "Before Ω{}After λ",
+                format_managed_discoverable_section(initial)
+            );
+            assert_eq!(
+                sync_discoverable_prompt_section(&base, &[]).as_deref(),
+                Some("Before ΩAfter λ")
+            );
+            let populated = sync_discoverable_prompt_section(&base, &live)
+                .expect("late discovery must fill the managed insertion point");
+            assert_eq!(populated, rendered);
+            assert!(!populated.contains(DISCOVERABLE_PROMPT_START));
+            assert!(!populated.contains(DISCOVERABLE_PROMPT_END));
+        }
+        for custom in ["", "Host-owned instructions", rendered.as_str()] {
+            assert!(sync_discoverable_prompt_section(custom, &live).is_none());
+            assert!(sync_discoverable_prompt_section(custom, &[]).is_none());
         }
     }
 

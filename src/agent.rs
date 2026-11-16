@@ -3361,7 +3361,7 @@ impl Agent {
         );
 
         let live_synced_prompt = self.config.system_prompt.as_deref().and_then(|base| {
-            if !base.contains(crate::xdev::DISCOVERABLE_PROMPT_HEADER) {
+            if !base.contains(crate::xdev::DISCOVERABLE_PROMPT_START) {
                 return None;
             }
             let registry = self.tools.snapshot();
@@ -11136,6 +11136,192 @@ mod extensions_integration_tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn managed_discovery_reaches_late_extensions_after_empty_provider_contexts() {
+        use clap::Parser as _;
+
+        fn assert_context(
+            agent: &mut Agent,
+            available: bool,
+            promoted: bool,
+            custom_prompt: Option<&str>,
+        ) {
+            let context = agent.request_context_json();
+            let prompt = context["systemPrompt"].as_str().expect("system prompt");
+            let tools = context["tools"].as_array().expect("provider tool schemas");
+            assert!(!prompt.contains(crate::xdev::DISCOVERABLE_PROMPT_START));
+            assert!(!prompt.contains(crate::xdev::DISCOVERABLE_PROMPT_END));
+            assert_eq!(
+                prompt.contains("- late_lookup: Late project search\n"),
+                available && !promoted && custom_prompt.is_none()
+            );
+            if let Some(custom_prompt) = custom_prompt {
+                assert_eq!(prompt, custom_prompt, "host instructions must stay untouched");
+            } else {
+                assert_eq!(
+                    prompt.contains(crate::xdev::DISCOVERABLE_PROMPT_HEADER),
+                    available && !promoted
+                );
+            }
+            if !promoted {
+                assert_eq!(tools.iter().any(|tool| tool["name"] == "xdev"), available);
+            }
+            assert_eq!(
+                tools.iter().any(|tool| tool["name"] == "late_lookup"),
+                available && promoted
+            );
+            assert!(tools.iter().any(|tool| tool["name"] == "read"));
+        }
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let custom_catalog = format!(
+                "Host-owned instructions{}- host_lookup: Keep this catalog\n{}",
+                crate::xdev::DISCOVERABLE_PROMPT_HEADER,
+                crate::xdev::DISCOVERABLE_PROMPT_FOOTER,
+            );
+            for custom in [
+                None,
+                Some("Keep the host's prompt."),
+                Some(""),
+                Some(custom_catalog.as_str()),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let config: crate::config::Config = serde_json::from_value(json!({
+                    "tools": { "loadMode": { "late_lookup": "discoverable" } }
+                }))
+                .expect("tool mode config");
+                let mut cli = crate::cli::Cli::parse_from([
+                    "pi",
+                    "--tools",
+                    "read",
+                    "--no-implicit-tools",
+                    "--no-context-files",
+                ]);
+                cli.system_prompt = custom.map(str::to_string);
+                let enabled = cli.enabled_tools(&config);
+                let prompt = crate::app::build_system_prompt(
+                    &cli,
+                    temp.path(),
+                    &enabled,
+                    None,
+                    temp.path(),
+                    temp.path(),
+                    true,
+                    false,
+                    None,
+                    &config,
+                )
+                .expect("native system prompt");
+                assert_eq!(
+                    prompt.contains(crate::xdev::DISCOVERABLE_PROMPT_START),
+                    custom.is_none()
+                );
+                let custom_prompt = custom.map(|_| prompt.as_str());
+                let tools = ToolRegistry::with_builtin_tool_policy(
+                    &enabled,
+                    temp.path(),
+                    Some(&config),
+                    None,
+                    None,
+                    true,
+                    None,
+                    false,
+                );
+                assert!(tools.discoverable_index().is_empty());
+                let mut agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    tools,
+                    AgentConfig {
+                        system_prompt: Some(prompt.clone()),
+                        ..AgentConfig::default()
+                    },
+                );
+                assert_context(&mut agent, false, false, custom_prompt);
+
+                let entry = temp.path().join("late-discovery.mjs");
+                std::fs::write(
+                    &entry,
+                    r"
+                    export default function(pi) {
+                        pi.registerTool({
+                            name: 'late_lookup',
+                            label: 'Late lookup',
+                            description: 'Late project search.',
+                            parameters: {
+                                type: 'object',
+                                properties: { query: { type: 'string' } },
+                                required: ['query']
+                            },
+                            async execute(_id, input) {
+                                return { content: [{ type: 'text', text: 'found:' + input.query }] };
+                            }
+                        });
+                    }
+                ",
+                )
+                .expect("real extension fixture");
+                let mut session = AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                session
+                    .enable_extensions(&enabled, temp.path(), Some(&config), &[entry])
+                    .await
+                    .expect("mount extension after the initial empty context");
+                assert_context(&mut session.agent, true, false, custom_prompt);
+
+                // A native registry update can withdraw the last discovery
+                // target, then restore it without changing the base prompt.
+                session.agent.tools.update(|registry| {
+                    registry.set_active_extension_tools(&[]);
+                });
+                assert_context(&mut session.agent, false, false, custom_prompt);
+                session.agent.tools.update(|registry| {
+                    registry.set_active_extension_tools(&["late_lookup".to_string()]);
+                });
+                assert_context(&mut session.agent, true, false, custom_prompt);
+
+                let call = ToolCall {
+                    id: "late-discovery-run".to_string(),
+                    name: "xdev".to_string(),
+                    arguments: json!({
+                        "action": "run", "name": "late_lookup", "args": { "query": "needle" }
+                    }),
+                    thought_signature: None,
+                };
+                let result = session
+                    .agent
+                    .dispatch_xdev(&call, Arc::new(|_| {}))
+                    .await
+                    .expect("native xdev execution");
+                assert!(!result.is_error);
+                assert!(matches!(
+                    result.content.as_slice(),
+                    [ContentBlock::Text(text)] if text.text == "found:needle"
+                ));
+                let promote = ToolCall {
+                    id: "late-discovery-promote".to_string(),
+                    arguments: json!({ "action": "promote", "name": "late_lookup" }),
+                    ..call
+                };
+                let result = session
+                    .agent
+                    .dispatch_xdev(&promote, Arc::new(|_| {}))
+                    .await
+                    .expect("native xdev promotion");
+                assert!(!result.is_error);
+                assert_context(&mut session.agent, true, true, custom_prompt);
+                assert_eq!(session.agent.system_prompt(), Some(prompt.as_str()));
+                let manager = session.extensions.as_ref().expect("extensions").manager();
+                assert!(manager.shutdown(Duration::from_secs(5)).await);
+            }
+        });
     }
 
     #[test]

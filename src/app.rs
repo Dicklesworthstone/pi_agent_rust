@@ -223,12 +223,14 @@ pub fn build_system_prompt(
     let mut prompt =
         custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
 
-    // Discoverable-tool index (bd-cv653.1.6 / bd-xdev-registry-tool-discovery-17sy3):
-    // a compact name + one-liner listing so the model knows xdev exists and what
-    // it can reach, including implicit settings-gated built-ins when `--tools` is unset.
-    let discoverable_index = crate::xdev::prompt_index_for_cli(cli, enabled_tools, Some(config));
-    if !discoverable_index.is_empty() && !has_custom_prompt {
-        prompt.push_str(&crate::xdev::format_discoverable_section(
+    // Keep an insertion point even when startup has no discoverable built-ins:
+    // MCP/extension tools can mount later. The Agent replaces this managed
+    // section with the live registry before each request. Custom prompts retain
+    // their host's discovery policy.
+    if !has_custom_prompt {
+        let discoverable_index =
+            crate::xdev::prompt_index_for_cli(cli, enabled_tools, Some(config));
+        prompt.push_str(&crate::xdev::format_managed_discoverable_section(
             &discoverable_index,
         ));
     }
