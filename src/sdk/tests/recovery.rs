@@ -2339,6 +2339,58 @@ fn event_log() -> (Arc<Mutex<Vec<Value>>>, EventSubscriber) {
     (events, callback)
 }
 
+fn steer_after_failed_response(
+    handle: &mut AgentSessionHandle,
+    callback: EventSubscriber,
+) -> EventSubscriber {
+    let pending = Arc::new(Mutex::new(Vec::<crate::agent::QueuedAgentMessage>::new()));
+    let fetched = Arc::clone(&pending);
+    handle.session.agent.register_message_fetchers(
+        Some(Arc::new(move || {
+            let fetched = Arc::clone(&fetched);
+            Box::pin(async move { std::mem::take(&mut *fetched.lock().unwrap()) })
+        })),
+        None,
+    );
+    let failures = AtomicUsize::new(0);
+    Arc::new(move |event| {
+        if matches!(
+            &event,
+            AgentEvent::MessageEnd { message: Message::Assistant(message) }
+                if message.stop_reason == StopReason::Error
+        ) {
+            // The next native drain accepts this input after the failed
+            // assistant in the attempt's AgentEnd, before recovery starts.
+            let failure = failures.fetch_add(1, Ordering::SeqCst) + 1;
+            pending
+                .lock()
+                .unwrap()
+                .push(crate::agent::QueuedAgentMessage::from_authored_message(
+                    Message::User(UserMessage {
+                        content: UserContent::Text(format!(
+                            "correction after failed request {failure}"
+                        )),
+                        timestamp: 0,
+                    }),
+                ));
+        }
+        callback(event);
+    })
+}
+
+fn failure_steering_inputs(messages: &[Message]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text.starts_with("correction after failed request ") => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn lifecycle_names(events: &[Value]) -> Vec<String> {
     events
         .iter()
@@ -2397,6 +2449,151 @@ fn every_logical_turn_has_one_terminal_event_after_all_recovery_events() {
             "terminal payload retains completed work, not reverted error attempts"
         );
         assert_eq!(events[0]["sessionId"], terminal["sessionId"]);
+    }
+}
+
+#[test]
+fn recovered_terminal_messages_match_saved_history_with_steering_after_errors() {
+    for entrypoint in ENTRYPOINTS {
+        let dir = tempdir().unwrap();
+        let (mut handle, calls, observations) = saving_native_content_handle(dir.path(), 2);
+        handle = handle.with_retry(Some(fast_retry_policy(2)));
+        let (events, callback) = event_log();
+        let callback = steer_after_failed_response(&mut handle, callback);
+
+        let result = run_async(invoke(&mut handle, entrypoint, callback)).unwrap();
+
+        assert_eq!(result.stop_reason, StopReason::Stop);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "{entrypoint:?}");
+        let messages = run_async(handle.messages()).unwrap();
+        assert_eq!(
+            failure_steering_inputs(&messages),
+            [
+                "correction after failed request 1",
+                "correction after failed request 2",
+            ],
+            "each accepted correction survives exactly once"
+        );
+        let expected = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            serde_json::to_value(handle.session.agent.messages()).unwrap(),
+            expected,
+            "live context matches the committed recovered history"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            lifecycle_names(&events),
+            [
+                "agent_start",
+                "retry_start:1",
+                "retry_end:1:false",
+                "retry_start:2",
+                "retry_end:2:true",
+                "agent_end",
+            ]
+        );
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["type"], "agent_end");
+        assert!(terminal.get("error").is_none());
+        assert_eq!(terminal["messages"], expected, "{entrypoint:?}");
+        let path = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .path
+            .clone()
+            .unwrap();
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+            expected
+        );
+        let observed = observations.lock().unwrap();
+        assert_eq!(observed.messages.len(), 3);
+        for (attempt, context) in observed.messages.iter().enumerate() {
+            let expected = (1..=attempt)
+                .map(|failure| format!("correction after failed request {failure}"))
+                .collect::<Vec<_>>();
+            assert_eq!(failure_steering_inputs(context), expected);
+            assert!(context.iter().all(|message| !matches!(
+                message,
+                Message::Assistant(message)
+                    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+            )));
+        }
+    }
+}
+
+#[test]
+fn cancelled_rewind_keeps_failed_response_and_accepted_steering() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls, _) = saving_native_content_handle(dir.path(), 1);
+    let (abort, signal) = AbortHandle::new();
+    let (events, callback) = event_log();
+    let callback = steer_after_failed_response(&mut handle, callback);
+
+    let result = run_async(
+        handle.prompt_with_abort("one user input", signal, move |event| {
+            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                abort.abort();
+            }
+            callback(event);
+        }),
+    );
+
+    assert!(matches!(result, Err(Error::Aborted)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let events = events.lock().unwrap();
+    assert_eq!(
+        lifecycle_names(&events),
+        [
+            "agent_start",
+            "retry_start:1",
+            "retry_end:1:false",
+            "agent_end",
+        ]
+    );
+    let terminal = events.last().unwrap();
+    assert!(
+        terminal["error"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("abort")
+    );
+    let terminal_messages: Vec<Message> =
+        serde_json::from_value(terminal["messages"].clone()).unwrap();
+    let saved_messages = run_async(handle.messages()).unwrap();
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    for messages in [
+        terminal_messages,
+        saved_messages,
+        handle.session.agent.messages().to_vec(),
+        reopened.to_messages_for_current_path(),
+    ] {
+        assert_eq!(messages.len(), 3, "input, failed response, and steering");
+        assert_eq!(
+            failure_steering_inputs(&messages),
+            ["correction after failed request 1"]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    Message::Assistant(message) if message.stop_reason == StopReason::Error
+                ))
+                .count(),
+            1,
+            "an uncommitted rewind must not hide the original failed response"
+        );
     }
 }
 

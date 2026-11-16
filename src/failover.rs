@@ -71,14 +71,27 @@ impl LogicalTurnEventState {
     pub fn restored_tail(&mut self) {
         use crate::model::{Message, StopReason};
 
-        while self.messages.last().is_some_and(|message| {
-            matches!(
-                message,
+        // The agent emits accepted steering after a failed response, while
+        // persistence places that response last so it can be rewound without
+        // losing the steering. Mirror that rewind in the buffered event log
+        // without reordering streamed events or discarding accepted input.
+        let mut index = self.messages.len();
+        while index > 0 {
+            index -= 1;
+            match &self.messages[index] {
+                Message::User(_) | Message::Custom(_) => {}
                 Message::Assistant(assistant)
-                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
-            )
-        }) {
-            let _ = self.messages.pop();
+                    if matches!(
+                        assistant.stop_reason,
+                        StopReason::Error | StopReason::Aborted
+                    ) =>
+                {
+                    self.messages.remove(index);
+                }
+                // Completed responses and tool results are retained work,
+                // never part of an incomplete response being rewound.
+                Message::Assistant(_) | Message::ToolResult(_) => break,
+            }
         }
     }
 
@@ -1986,8 +1999,8 @@ mod logical_turn_event_tests {
     use super::LogicalTurnEventState;
     use crate::agent::AgentEvent;
     use crate::model::{
-        AssistantMessage, ContentBlock, Message, StopReason, TextContent, ToolResultMessage,
-        UserContent, UserMessage,
+        AssistantMessage, ContentBlock, CustomMessage, Message, StopReason, TextContent,
+        ToolResultMessage, UserContent, UserMessage,
     };
     use std::sync::Arc;
 
@@ -2012,6 +2025,33 @@ mod logical_turn_event_tests {
         }
     }
 
+    fn steering() -> Vec<Message> {
+        vec![
+            Message::User(UserMessage {
+                content: UserContent::Text("preserve this correction".to_string()),
+                timestamp: 1,
+            }),
+            Message::Custom(CustomMessage {
+                content: "preserve this extension message".to_string(),
+                custom_type: "steering".to_string(),
+                display: false,
+                details: None,
+                timestamp: 2,
+            }),
+        ]
+    }
+
+    fn completed_tool_result() -> Message {
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "completed-call".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("already written"))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
     #[test]
     fn recovered_turn_retains_input_and_completed_tools_without_failed_tails() {
         let user = Message::User(UserMessage {
@@ -2030,6 +2070,7 @@ mod logical_turn_event_tests {
         let completed = vec![user, call, result];
         let mut attempt = completed.clone();
         attempt.push(assistant(StopReason::Error));
+        attempt.extend(steering());
         let mut state = LogicalTurnEventState::default();
         assert!(matches!(
             state.observe(start()),
@@ -2051,6 +2092,7 @@ mod logical_turn_event_tests {
             panic!("one final logical end");
         };
         let mut expected = completed;
+        expected.extend(steering());
         expected.push(reply.clone());
         assert_eq!(
             serde_json::to_value(messages).unwrap(),
@@ -2066,6 +2108,39 @@ mod logical_turn_event_tests {
     }
 
     #[test]
+    fn rewind_preserves_steering_and_stops_at_completed_work() {
+        for reason in [StopReason::Error, StopReason::Aborted] {
+            for barrier in [
+                assistant(StopReason::Stop),
+                assistant(StopReason::ToolUse),
+                completed_tool_result(),
+            ] {
+                let retained = vec![assistant(StopReason::Error), barrier];
+                // ubs:ignore[rust.collections.clone-in-loop] Independent expected state for each test case.
+                let mut attempt = retained.clone();
+                attempt.push(assistant(reason));
+                attempt.extend(steering());
+                let mut state = LogicalTurnEventState::default();
+                let _ = state.observe(start());
+                let _ = state.observe(end(attempt));
+                state.restored_tail();
+                // Repeated acknowledgement cannot consume any completed
+                // response, tool result, or the input preceding it.
+                state.restored_tail();
+                let Some(AgentEvent::AgentEnd { messages, .. }) = state.finish(None) else {
+                    panic!("one logical end");
+                };
+                let mut expected = retained;
+                expected.extend(steering());
+                assert_eq!(
+                    serde_json::to_value(messages).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rejected_rewind_keeps_failed_output_and_reports_the_later_failure() {
         for final_error in [
             "Retry aborted",
@@ -2075,7 +2150,10 @@ mod logical_turn_event_tests {
             let mut state = LogicalTurnEventState::default();
             let _ = state.observe(start());
             let failed = assistant(StopReason::Error);
-            let _ = state.observe(end(vec![failed.clone()]));
+            let mut expected = vec![failed];
+            expected.extend(steering());
+            // ubs:ignore[rust.collections.clone-in-loop] Snapshot must survive the consuming event API.
+            let _ = state.observe(end(expected.clone()));
             // No successful restoration occurred, so the failed tail is still
             // part of the current conversation and must not disappear.
             let Some(AgentEvent::AgentEnd {
@@ -2087,7 +2165,7 @@ mod logical_turn_event_tests {
             assert_eq!(error.as_deref(), Some(final_error));
             assert_eq!(
                 serde_json::to_value(messages).unwrap(),
-                serde_json::to_value(vec![failed]).unwrap()
+                serde_json::to_value(expected).unwrap()
             );
         }
     }
