@@ -2629,8 +2629,10 @@ try:
 except UnicodeDecodeError as error:
     raise SystemExit(f"retrieved PiJS JSONL is not UTF-8: {error}") from error
 lines = artifact_text.splitlines()
-if len(lines) != 2 or any(not line.strip() for line in lines):
-    raise SystemExit("retrieved PiJS JSONL must contain exactly two nonempty records")
+if len(lines) not in {2, 3} or any(not line.strip() for line in lines):
+    raise SystemExit(
+        "retrieved PiJS JSONL must contain two regression-gate records (plus optional full_e2e_long_session)"
+    )
 try:
     records = [json.loads(line) for line in lines]
 except json.JSONDecodeError as error:
@@ -2641,14 +2643,16 @@ expected_features = [
     "image",
     "image-resize",
     "sqlite-sessions",
-    "tui",
     "wasm-host",
 ]
 observed_tool_calls = set()
+observed_full_e2e = 0
 claimed_binaries = set()
 for index, record in enumerate(records, start=1):
     if not isinstance(record, dict):
         raise SystemExit(f"retrieved PiJS record {index} is not an object")
+    scenario = record.get("scenario")
+    is_full_e2e = scenario == "full_e2e_long_session"
     expected = {
         "schema": "pi.perf.workload.v1",
         "run_id": expected_correlation,
@@ -2656,7 +2660,7 @@ for index, record in enumerate(records, start=1):
         "source_commit": expected_commit,
         "source_dirty": False,
         "tool": "pijs_workload",
-        "scenario": "tool_call_roundtrip",
+        "scenario": "full_e2e_long_session" if is_full_e2e else "tool_call_roundtrip",
         "iterations": 2000,
         "build_profile": "perf",
         "build_profile_verified": True,
@@ -2672,7 +2676,7 @@ for index, record in enumerate(records, start=1):
         "runtime_engine": "quickjs",
         "evidence_class": "measured",
         "confidence": "high",
-        "eligible_for_regression_gate": True,
+        "eligible_for_regression_gate": not is_full_e2e,
         "measurement_method": "wall_clock_observation",
         "measurement_boundary": "production_extension_manager",
         "measurement_contract_version": "production_extension_manager.v1",
@@ -2683,6 +2687,18 @@ for index, record in enumerate(records, start=1):
         "allocator_effective": "system",
         "allocator_fallback_reason": None,
     }
+    if is_full_e2e:
+        expected.update(
+            {
+                "comparison_scenario": "full_e2e_long_session",
+                "session_turns": 2000,
+                "extension_loads_per_iteration": 2,
+                "tool_calls_per_iteration": 10,
+                "event_hooks_per_iteration": 1,
+                "tool_executions": 20000,
+                "event_executions": 2000,
+            }
+        )
     mismatches = {
         field: {"expected": value, "observed": record.get(field)}
         for field, value in expected.items()
@@ -2690,11 +2706,38 @@ for index, record in enumerate(records, start=1):
     }
     if mismatches:
         raise SystemExit(f"retrieved PiJS record {index} mismatch: {mismatches}")
-    tool_calls = record.get("tool_calls_per_iteration")
-    if type(tool_calls) is not int or tool_calls not in {1, 10}:
-        raise SystemExit(f"retrieved PiJS record {index} has invalid tool-call count")
-    if record.get("total_calls") != 2000 * tool_calls:
-        raise SystemExit(f"retrieved PiJS record {index} has invalid total_calls")
+    if is_full_e2e:
+        contract = record.get("comparison_contract")
+        if (
+            not isinstance(contract, dict)
+            or contract.get("schema") != "pi.perf.cross_runtime_comparison.v1"
+            or contract.get("claim_scope") != "full_e2e_long_session"
+            or contract.get("measurement_boundary") != "matched_full_session_workflow"
+            or contract.get("release_claim_eligible") is not True
+            or not isinstance(contract.get("host_fingerprint_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", contract["host_fingerprint_sha256"]) is None
+            or contract.get("workload_shape")
+            != {
+                "session_turns": 2000,
+                "extension_loads_per_iteration": 2,
+                "tool_calls_per_iteration": 10,
+                "event_hooks_per_iteration": 1,
+                "statistic": "elapsed",
+            }
+        ):
+            raise SystemExit(
+                f"retrieved PiJS record {index} has invalid comparison_contract"
+            )
+        if record.get("total_calls") != 20000:
+            raise SystemExit(f"retrieved PiJS record {index} has invalid total_calls")
+        observed_full_e2e += 1
+    else:
+        tool_calls = record.get("tool_calls_per_iteration")
+        if type(tool_calls) is not int or tool_calls not in {1, 10}:
+            raise SystemExit(f"retrieved PiJS record {index} has invalid tool-call count")
+        if record.get("total_calls") != 2000 * tool_calls:
+            raise SystemExit(f"retrieved PiJS record {index} has invalid total_calls")
+        observed_tool_calls.add(tool_calls)
     elapsed_us = record.get("elapsed_us")
     if type(elapsed_us) is not int or elapsed_us <= 0:
         raise SystemExit(f"retrieved PiJS record {index} has invalid elapsed_us")
@@ -2715,15 +2758,17 @@ for index, record in enumerate(records, start=1):
         or re.fullmatch(r"[0-9a-f]{64}", config_hash) is None
     ):
         raise SystemExit(f"retrieved PiJS record {index} has invalid binary provenance")
-    observed_tool_calls.add(tool_calls)
     claimed_binaries.add((claimed_path, claimed_sha256))
 
-if observed_tool_calls != {1, 10} or len(claimed_binaries) != 1:
-    raise SystemExit("retrieved PiJS records do not form one exact same-binary 2000x1/2000x10 pair")
+expected_full_e2e = len(records) - 2
+if observed_tool_calls != {1, 10} or observed_full_e2e != expected_full_e2e or len(claimed_binaries) != 1:
+    raise SystemExit(
+        "retrieved PiJS records do not form one exact same-binary 2000x1/2000x10 (+ full_e2e_long_session) set"
+    )
 _, claimed_sha256 = claimed_binaries.pop()
 if claimed_sha256 != binary_sha256:
     raise SystemExit(
-        "retrieved PiJS executable digest does not match the two measurement records"
+        "retrieved PiJS executable digest does not match the measurement records"
     )
 PY
 }
@@ -4030,7 +4075,16 @@ if not per_call_samples_us:
             per_call_samples_us.append(per_call_us)
 
 full_e2e_samples_ms: list[float] = []
+has_explicit_full_e2e = any(
+    record.get("comparison_scenario") == "full_e2e_long_session"
+    for record in workload_records
+)
 for record in workload_records:
+    if (
+        has_explicit_full_e2e
+        and record.get("comparison_scenario") != "full_e2e_long_session"
+    ):
+        continue
     if record.get("iterations") != 2000 or record.get("tool_calls_per_iteration") != 10:
         continue
     elapsed_ms = parse_float(record.get("elapsed_ms"))

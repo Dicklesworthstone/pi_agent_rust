@@ -949,6 +949,76 @@ fn shared_scenario_records() -> &'static [Value] {
     }
 }
 
+fn cached_host_fingerprint_sha256() -> Option<&'static str> {
+    static HOST_FP: OnceLock<Option<String>> = OnceLock::new();
+    HOST_FP
+        .get_or_init(|| {
+            if let Ok(raw) = std::env::var("PI_COMPARISON_HOST_FINGERPRINT_SHA256") {
+                let trimmed = raw.trim().to_owned();
+                if is_lower_hex_sha256(&trimmed) {
+                    return Some(trimmed);
+                }
+            }
+            let perf_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/perf");
+            let output = Command::new("python3")
+                .args(["-I", "-B", "-c"])
+                .arg(
+                    "import hashlib, json, sys; \
+                     sys.path.insert(0, sys.argv[1]); \
+                     from preflight_budget_inputs import current_host_fingerprint; \
+                     payload = json.dumps(current_host_fingerprint(), sort_keys=True, separators=(',', ':')).encode('utf-8'); \
+                     print(hashlib.sha256(payload).hexdigest())",
+                )
+                .arg(&perf_dir)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let digest = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            is_lower_hex_sha256(&digest).then_some(digest)
+        })
+        .as_deref()
+}
+
+fn build_scenario_comparison_contract(
+    extension: &str,
+    scenario: &str,
+    release_claim_eligible: bool,
+) -> Option<Value> {
+    if extension != "hello" {
+        return None;
+    }
+    let host_fingerprint_sha256 = cached_host_fingerprint_sha256()?;
+    let (claim_scope, boundary, operation, statistic) = match scenario {
+        "cold_start" => (
+            "cold_load_init",
+            "matched_extension_cold_load",
+            "cold_load_init",
+            "p95",
+        ),
+        "tool_call" => (
+            "per_call_dispatch_micro",
+            "matched_extension_tool_dispatch",
+            "tool_call",
+            "mean",
+        ),
+        _ => return None,
+    };
+    Some(json!({
+        "schema": "pi.perf.cross_runtime_comparison.v1",
+        "claim_scope": claim_scope,
+        "measurement_boundary": boundary,
+        "release_claim_eligible": release_claim_eligible,
+        "host_fingerprint_sha256": host_fingerprint_sha256,
+        "workload_shape": {
+            "extension": "hello",
+            "operation": operation,
+            "statistic": statistic,
+        },
+    }))
+}
+
 // Keeping the protocol projection in one place makes omissions visible during review.
 #[allow(clippy::too_many_lines)]
 fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> Value {
@@ -1148,6 +1218,24 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             "orchestration_correlation_id".to_string(),
             Value::String(orchestration_correlation_id),
         );
+        let has_canonical_orchestration_id = std::env::var("CI_CORRELATION_ID")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        let comparison_release_eligible = env.as_object().is_some_and(|env_obj| {
+            has_canonical_orchestration_id
+                && env_obj.get("build_profile").and_then(Value::as_str) == Some("perf")
+                && env_obj.get("debug_assertions").and_then(Value::as_bool) == Some(false)
+                && env_obj
+                    .get("build_profile_verified")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && provenance_identity_is_verified(env_obj)
+        });
+        if let Some(comparison_contract) =
+            build_scenario_comparison_contract(&extension, &scenario, comparison_release_eligible)
+        {
+            map.insert("comparison_contract".to_string(), comparison_contract);
+        }
         map.insert(
             "scenario_metadata".to_string(),
             Value::Object(scenario_metadata),

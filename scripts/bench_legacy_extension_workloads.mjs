@@ -9,6 +9,7 @@
 //
 // Output is JSONL so callers can append/aggregate deterministically.
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,10 +20,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_KIND = process.versions.bun ? "bun" : "node";
-const RUNTIME_LABEL = `portable_${RUNTIME_KIND}_extension_api`;
+const PORTABLE_RUNTIME_LABEL = `portable_${RUNTIME_KIND}_extension_api`;
 const CORRELATION_ID = process.env.CI_CORRELATION_ID?.trim() || null;
 const SOURCE_COMMIT = process.env.VERGEN_GIT_SHA?.trim() || null;
 const SOURCE_DIRTY = process.env.VERGEN_GIT_DIRTY !== "false";
+const REQUIRE_LEGACY_PI_MONO = process.env.PI_REQUIRE_LEGACY_PI_MONO === "1";
 const GENERATED_AT = new Date().toISOString();
 const EVIDENCE_PROVENANCE = Object.freeze({
   timestamp: GENERATED_AT,
@@ -30,6 +32,12 @@ const EVIDENCE_PROVENANCE = Object.freeze({
   correlation_id: CORRELATION_ID,
   source_commit: SOURCE_COMMIT,
   source_dirty: SOURCE_DIRTY,
+});
+const COMPARISON_CONTRACT_SCHEMA = "pi.perf.cross_runtime_comparison.v1";
+const COMPARISON_BOUNDARIES = Object.freeze({
+  cold_load_init: "matched_extension_cold_load",
+  per_call_dispatch_micro: "matched_extension_tool_dispatch",
+  full_e2e_long_session: "matched_full_session_workflow",
 });
 const COMPILED_MODULES = new Map();
 const COMPILED_SOURCES = new Map();
@@ -209,7 +217,222 @@ function createNoopContext(cwd) {
   };
 }
 
+let cachedHostFingerprintSha256;
+function resolveHostFingerprintSha256() {
+  if (cachedHostFingerprintSha256 !== undefined) {
+    return cachedHostFingerprintSha256;
+  }
+  const envHash = process.env.PI_COMPARISON_HOST_FINGERPRINT_SHA256?.trim();
+  if (envHash && /^[0-9a-f]{64}$/.test(envHash) && !/^0+$/.test(envHash)) {
+    cachedHostFingerprintSha256 = envHash;
+    return cachedHostFingerprintSha256;
+  }
+  const perfDir = path.join(ROOT, "scripts", "perf");
+  const stdout = execFileSync(
+    "python3",
+    [
+      "-I",
+      "-B",
+      "-c",
+      "import hashlib, json, sys; " +
+        "sys.path.insert(0, sys.argv[1]); " +
+        "from preflight_budget_inputs import current_host_fingerprint; " +
+        "payload = json.dumps(current_host_fingerprint(), sort_keys=True, separators=(',', ':')).encode('utf-8'); " +
+        "print(hashlib.sha256(payload).hexdigest())",
+      perfDir,
+    ],
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+  ).trim();
+  if (!/^[0-9a-f]{64}$/.test(stdout) || /^0+$/.test(stdout)) {
+    throw new Error(`Invalid host_fingerprint_sha256 from preflight_budget_inputs.py: ${stdout}`);
+  }
+  cachedHostFingerprintSha256 = stdout;
+  return cachedHostFingerprintSha256;
+}
+
+function isCanonicalLineage() {
+  return (
+    typeof CORRELATION_ID === "string" &&
+    CORRELATION_ID.length > 0 &&
+    typeof SOURCE_COMMIT === "string" &&
+    /^[0-9a-fA-F]{40}$/.test(SOURCE_COMMIT) &&
+    !/^0+$/.test(SOURCE_COMMIT) &&
+    SOURCE_DIRTY === false
+  );
+}
+
+function buildComparisonContract(claimScope, workloadShape, releaseClaimEligible) {
+  return {
+    schema: COMPARISON_CONTRACT_SCHEMA,
+    claim_scope: claimScope,
+    measurement_boundary: COMPARISON_BOUNDARIES[claimScope],
+    release_claim_eligible: Boolean(releaseClaimEligible),
+    host_fingerprint_sha256: resolveHostFingerprintSha256(),
+    workload_shape: workloadShape,
+  };
+}
+
+let cachedLegacyPiMonoPromise;
+let sessionTempRoot;
+function ensureSessionTempRoot() {
+  if (!sessionTempRoot) {
+    sessionTempRoot = mkdirTemp("pi-legacy-bench-session-");
+  }
+  return sessionTempRoot;
+}
+
+async function loadLegacyPiMonoModules() {
+  if (process.env.PI_FORCE_PORTABLE_SHIM === "1") {
+    return null;
+  }
+  if (!cachedLegacyPiMonoPromise) {
+    cachedLegacyPiMonoPromise = (async () => {
+      const distCore = path.join(
+        ROOT,
+        "legacy_pi_mono_code",
+        "pi-mono",
+        "packages",
+        "coding-agent",
+        "dist",
+        "core",
+      );
+      const loaderFile = path.join(distCore, "extensions", "loader.js");
+      if (!fs.existsSync(loaderFile)) {
+        return null;
+      }
+      try {
+        const [loaderMod, runnerMod, wrapperMod, authMod, modelMod, sessionMod] = await Promise.all([
+          import(pathToFileURL(loaderFile).href),
+          import(pathToFileURL(path.join(distCore, "extensions", "runner.js")).href),
+          import(pathToFileURL(path.join(distCore, "extensions", "wrapper.js")).href),
+          import(pathToFileURL(path.join(distCore, "auth-storage.js")).href),
+          import(pathToFileURL(path.join(distCore, "model-registry.js")).href),
+          import(pathToFileURL(path.join(distCore, "session-manager.js")).href),
+        ]);
+        return {
+          discoverAndLoadExtensions: loaderMod.discoverAndLoadExtensions,
+          ExtensionRunner: runnerMod.ExtensionRunner,
+          wrapRegisteredTools: wrapperMod.wrapRegisteredTools,
+          AuthStorage: authMod.AuthStorage,
+          ModelRegistry: modelMod.ModelRegistry,
+          SessionManager: sessionMod.SessionManager,
+        };
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return cachedLegacyPiMonoPromise;
+}
+
+function noopLegacyBindings() {
+  return {
+    actions: {
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      appendEntry: () => {},
+      setSessionName: () => {},
+      getSessionName: () => undefined,
+      setLabel: () => {},
+      getActiveTools: () => [],
+      getAllTools: () => [],
+      setActiveTools: () => {},
+      setModel: async () => {},
+      getThinkingLevel: () => "off",
+      setThinkingLevel: async () => {},
+    },
+    contextActions: {
+      getModel: () => undefined,
+      isIdle: () => true,
+      abort: () => {},
+      hasPendingMessages: () => false,
+      shutdown: () => {},
+      getContextUsage: () => undefined,
+      compact: () => {},
+      getSystemPrompt: () => "",
+    },
+  };
+}
+
+function runtimeIdentityFields(legacyExecuted) {
+  if (legacyExecuted) {
+    return {
+      runtime: "legacy_pi_mono",
+      runtime_kind: RUNTIME_KIND,
+      runtime_family: "legacy_pi_mono_extension_loader",
+      legacy_pi_mono_executed: true,
+    };
+  }
+  return {
+    runtime: PORTABLE_RUNTIME_LABEL,
+    runtime_kind: RUNTIME_KIND,
+    runtime_family: "portable_extension_api",
+    legacy_pi_mono_executed: false,
+  };
+}
+
+async function loadLegacyPiMonoRunner(mods, entryPath, cwd, nonce) {
+  const rootDir = ensureSessionTempRoot();
+  const safeNonce = sanitizeNonce(nonce);
+  const agentDir = path.join(rootDir, `agent-${safeNonce}`);
+  fs.mkdirSync(agentDir, { recursive: true });
+  const extCopy = path.join(
+    agentDir,
+    `${path.basename(entryPath, path.extname(entryPath))}-${safeNonce}${path.extname(entryPath)}`,
+  );
+  fs.copyFileSync(entryPath, extCopy);
+
+  const result = await mods.discoverAndLoadExtensions([extCopy], cwd, agentDir);
+  if (Array.isArray(result.errors) && result.errors.length > 0) {
+    throw new Error(`legacy_pi_mono failed to load ${entryPath}: ${JSON.stringify(result.errors)}`);
+  }
+  const sessionManager = mods.SessionManager.inMemory();
+  const authStorage = new mods.AuthStorage(path.join(agentDir, "auth.json"));
+  const modelRegistry = new mods.ModelRegistry(authStorage);
+  const runner = new mods.ExtensionRunner(
+    result.extensions,
+    result.runtime,
+    cwd,
+    sessionManager,
+    modelRegistry,
+  );
+  const { actions, contextActions } = noopLegacyBindings();
+  runner.bindCore(actions, contextActions);
+  runner.bindCommandContext();
+
+  const wrappedTools = mods.wrapRegisteredTools(runner.getAllRegisteredTools(), runner);
+  const tools = new Map(wrappedTools.map((tool) => [tool.name, tool]));
+  const commands = new Map(runner.getRegisteredCommands().map((cmd) => [cmd.name, cmd]));
+  const handlers = new Map();
+  for (const ext of result.extensions) {
+    for (const [eventName, list] of ext.handlers.entries()) {
+      const existing = handlers.get(eventName) ?? [];
+      existing.push(...list);
+      handlers.set(eventName, existing);
+    }
+  }
+  return {
+    legacyExecuted: true,
+    tools,
+    commands,
+    handlers,
+    createContext: () => createNoopContext(cwd),
+    hasHandlers: (eventName) => runner.hasHandlers(eventName),
+    emit: (event) => runner.emit(event),
+  };
+}
+
 async function loadRunner(entryPath, cwd, nonce = `${Date.now()}-${Math.random()}`) {
+  const legacyMods = await loadLegacyPiMonoModules();
+  if (legacyMods) {
+    return loadLegacyPiMonoRunner(legacyMods, entryPath, cwd, nonce);
+  }
+  if (REQUIRE_LEGACY_PI_MONO || globalThis.__PI_REQUIRE_LEGACY_PI_MONO) {
+    throw new Error(
+      "legacy_pi_mono_code/pi-mono/packages/coding-agent/dist is unavailable while --require-legacy-pi-mono is active",
+    );
+  }
+
   const tools = new Map();
   const commands = new Map();
   const handlers = new Map();
@@ -265,6 +488,7 @@ async function loadRunner(entryPath, cwd, nonce = `${Date.now()}-${Math.random()
   await factory(api);
 
   return {
+    legacyExecuted: false,
     tools,
     commands,
     handlers,
@@ -286,10 +510,12 @@ async function loadRunner(entryPath, cwd, nonce = `${Date.now()}-${Math.random()
 
 async function scenarioLoadInitCold(extName, entryPath, { cwd, runs }) {
   const timingsNs = [];
+  let legacyExecuted = true;
 
   for (let i = 0; i < runs; i++) {
     const start = nowNs();
     const runner = await loadRunner(entryPath, cwd, `cold-${extName}-${RUNTIME_KIND}-${i}`);
+    legacyExecuted = legacyExecuted && runner.legacyExecuted;
     // Touch the registries so "load+init" includes basic access/validation.
     if (runner.tools.size === 0 && runner.commands.size === 0 && runner.handlers.size === 0) {
       throw new Error(`Extension registered no tools, commands, or handlers: ${entryPath}`);
@@ -298,12 +524,11 @@ async function scenarioLoadInitCold(extName, entryPath, { cwd, runs }) {
     timingsNs.push(end - start);
   }
 
-  return {
+  const releaseEligible = legacyExecuted && isCanonicalLineage() && runs >= 10;
+  const row = {
     schema: "pi.ext.legacy_bench.v1",
     ...EVIDENCE_PROVENANCE,
-    runtime: RUNTIME_LABEL,
-    runtime_kind: RUNTIME_KIND,
-    runtime_family: "portable_extension_api",
+    ...runtimeIdentityFields(legacyExecuted),
     scenario: "ext_load_init/load_init_cold",
     extension: extName,
     runs,
@@ -315,6 +540,14 @@ async function scenarioLoadInitCold(extName, entryPath, { cwd, runs }) {
     },
     runtime_metadata: runtimeMetadata(),
   };
+  if (extName === "hello") {
+    row.comparison_contract = buildComparisonContract(
+      "cold_load_init",
+      { extension: "hello", operation: "cold_load_init", statistic: "p95" },
+      releaseEligible,
+    );
+  }
+  return row;
 }
 
 async function scenarioToolCall(extName, entryPath, toolName, toolInput, { cwd, iterations }) {
@@ -335,11 +568,13 @@ async function scenarioToolCall(extName, entryPath, toolName, toolInput, { cwd, 
 
   const perCallUs = nsToUs(elapsedNs) / iterations;
   const callsPerSec = (iterations * 1_000_000) / nsToUs(elapsedNs);
+  const releaseEligible =
+    runner.legacyExecuted && isCanonicalLineage() && iterations === 2000;
 
-  return {
+  const row = {
     schema: "pi.ext.legacy_bench.v1",
     ...EVIDENCE_PROVENANCE,
-    runtime: "legacy_pi_mono",
+    ...runtimeIdentityFields(runner.legacyExecuted),
     scenario: `ext_tool_call/${toolName}`,
     extension: extName,
     iterations,
@@ -351,11 +586,16 @@ async function scenarioToolCall(extName, entryPath, toolName, toolInput, { cwd, 
       platform: process.platform,
       arch: process.arch,
     },
-    runtime: RUNTIME_LABEL,
-    runtime_kind: RUNTIME_KIND,
-    runtime_family: "portable_extension_api",
     runtime_metadata: runtimeMetadata(),
   };
+  if (extName === "hello" && toolName === "hello") {
+    row.comparison_contract = buildComparisonContract(
+      "per_call_dispatch_micro",
+      { extension: "hello", operation: "tool_call", statistic: "mean" },
+      releaseEligible,
+    );
+  }
+  return row;
 }
 
 async function scenarioEventHook(extName, entryPath, { cwd, iterations }) {
@@ -389,7 +629,7 @@ async function scenarioEventHook(extName, entryPath, { cwd, iterations }) {
   return {
     schema: "pi.ext.legacy_bench.v1",
     ...EVIDENCE_PROVENANCE,
-    runtime: "legacy_pi_mono",
+    ...runtimeIdentityFields(runner.legacyExecuted),
     scenario: "ext_event_hook/before_agent_start",
     extension: extName,
     iterations,
@@ -401,9 +641,6 @@ async function scenarioEventHook(extName, entryPath, { cwd, iterations }) {
       platform: process.platform,
       arch: process.arch,
     },
-    runtime: RUNTIME_LABEL,
-    runtime_kind: RUNTIME_KIND,
-    runtime_family: "portable_extension_api",
     runtime_metadata: runtimeMetadata(),
   };
 }
@@ -413,9 +650,11 @@ async function scenarioFullE2ELongSession(helloEntry, pirateEntry, { cwd, iterat
   const start = nowNs();
   let toolExecutions = 0;
   let eventExecutions = 0;
+  let legacyExecuted = true;
 
   for (let i = 0; i < sessionTurns; i++) {
     const helloRunner = await loadRunner(helloEntry, cwd, `full-hello-${RUNTIME_KIND}-${i}`);
+    legacyExecuted = legacyExecuted && helloRunner.legacyExecuted;
     const helloTool = helloRunner.tools.get("hello");
     if (!helloTool) {
       throw new Error("Tool not found during full E2E workload: hello");
@@ -433,6 +672,7 @@ async function scenarioFullE2ELongSession(helloEntry, pirateEntry, { cwd, iterat
     }
 
     const pirateRunner = await loadRunner(pirateEntry, cwd, `full-pirate-${RUNTIME_KIND}-${i}`);
+    legacyExecuted = legacyExecuted && pirateRunner.legacyExecuted;
     const command = pirateRunner.commands.get("pirate");
     if (command?.handler) {
       // eslint-disable-next-line no-await-in-loop
@@ -456,13 +696,16 @@ async function scenarioFullE2ELongSession(helloEntry, pirateEntry, { cwd, iterat
 
   const elapsedNs = nowNs() - start;
   const elapsedMs = nsToMs(elapsedNs);
+  const releaseEligible =
+    legacyExecuted &&
+    isCanonicalLineage() &&
+    sessionTurns === 2000 &&
+    toolCalls === 10;
 
   return {
     schema: "pi.ext.legacy_bench.v1",
     ...EVIDENCE_PROVENANCE,
-    runtime: RUNTIME_LABEL,
-    runtime_kind: RUNTIME_KIND,
-    runtime_family: "portable_extension_api",
+    ...runtimeIdentityFields(legacyExecuted),
     scenario: "full_e2e_long_session",
     extension: "hello+pirate",
     iterations: sessionTurns,
@@ -479,6 +722,17 @@ async function scenarioFullE2ELongSession(helloEntry, pirateEntry, { cwd, iterat
       tool_calls_per_iteration: toolCalls,
       event_hooks_per_iteration: 1,
     },
+    comparison_contract: buildComparisonContract(
+      "full_e2e_long_session",
+      {
+        session_turns: sessionTurns,
+        extension_loads_per_iteration: 2,
+        tool_calls_per_iteration: toolCalls,
+        event_hooks_per_iteration: 1,
+        statistic: "elapsed",
+      },
+      releaseEligible,
+    ),
     node: {
       version: process.version,
       platform: process.platform,
@@ -496,6 +750,7 @@ function parseArgs(argv) {
     toolCalls: Number(process.env.TOOL_CALLS ?? "10"),
     out: process.env.JSONL_OUT ?? null,
     append: false,
+    requireLegacyPiMono: REQUIRE_LEGACY_PI_MONO,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -520,6 +775,10 @@ function parseArgs(argv) {
       args.append = true;
       continue;
     }
+    if (token === "--require-legacy-pi-mono") {
+      args.requireLegacyPiMono = true;
+      continue;
+    }
     if (token === "--help" || token === "-h") {
       args.help = true;
       continue;
@@ -542,13 +801,15 @@ function parseArgs(argv) {
 
 function usage() {
   return `Usage:
-  node scripts/bench_legacy_extension_workloads.mjs [--load-runs N] [--iterations N] [--tool-calls N] [--out PATH] [--append]
+  node scripts/bench_legacy_extension_workloads.mjs [--load-runs N] [--iterations N] [--tool-calls N] [--out PATH] [--append] [--require-legacy-pi-mono]
 
 Env:
   LOAD_RUNS     default 5
   ITERATIONS    default 2000
   TOOL_CALLS    default 10
   JSONL_OUT     if set, writes JSONL to this file (overwrites)
+  PI_REQUIRE_LEGACY_PI_MONO=1  fail closed if legacy_pi_mono dist is unavailable
+  PI_FORCE_PORTABLE_SHIM=1     force portable shim instead of legacy_pi_mono dist
 
 Example:
   /home/ubuntu/.nvm/versions/node/v22.2.0/bin/node scripts/bench_legacy_extension_workloads.mjs --iterations 5000 --out target/perf/legacy_extension_workloads.jsonl
@@ -580,6 +841,7 @@ async function main() {
   }
 
   globalThis.__PI_LEGACY_BENCH_APPEND = args.append;
+  globalThis.__PI_REQUIRE_LEGACY_PI_MONO = Boolean(args.requireLegacyPiMono);
   const out = openOut(args.out);
 
   const helloEntry = path.join(ROOT, "tests", "ext_conformance", "artifacts", "hello", "hello.ts");
