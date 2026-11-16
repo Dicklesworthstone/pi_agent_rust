@@ -10866,7 +10866,9 @@ async fn run_controlled_turn_with_admission(
     // Only the SDK handoff grants permission to consume prepared input.
     // Quarantine/startup refusals, as well as cancellation before handoff,
     // retain the exact payload. A delivered input must never be replayed.
-    let initial_restore = if !control.initial_input_handed_off() {
+    let initial_restore = if control.initial_input_handed_off() {
+        None
+    } else {
         if initial_source.is_some() {
             handle
                 .session_mut()
@@ -10874,8 +10876,6 @@ async fn run_controlled_turn_with_admission(
                 .set_magic_keyword_scan_override(None);
         }
         initial_prepared
-    } else {
-        None
     };
     // The SDK result is the durability boundary. A successful cap must stop
     // the outer continuation loop just like an abort or terminal failure.

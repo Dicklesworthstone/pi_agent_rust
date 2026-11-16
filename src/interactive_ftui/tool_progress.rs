@@ -350,7 +350,6 @@ impl Bridge {
         Self { shared }
     }
 
-    #[must_use]
     pub fn callback(&self) -> impl Fn(AgentEvent) + Send + Sync + 'static + use<> {
         let shared = Arc::clone(&self.shared);
         move |event| shared.observe(&event)

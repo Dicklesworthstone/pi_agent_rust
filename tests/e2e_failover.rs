@@ -2766,8 +2766,8 @@ fn e2e_failover_transition_persistence_failure_closes_open_lifecycles() {
         );
 
         let session_path = harness.temp_path(format!("{mode}-transition.jsonl"));
-        let lock_path = std::path::PathBuf::from(format!("{}.lock", session_path.display()));
-        let moved_lock_path =
+        let lock_for_thread = std::path::PathBuf::from(format!("{}.lock", session_path.display()));
+        let moved_for_thread =
             std::path::PathBuf::from(format!("{}.lock.moved", session_path.display()));
 
         // Custom backup HTTP responder: serves two 503s and poisons `<session>.lock`
@@ -2777,8 +2777,6 @@ fn e2e_failover_transition_persistence_failure_closes_open_lifecycles() {
         let backup_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind backup responder");
         let backup_addr = backup_listener.local_addr().expect("backup addr");
-        let lock_for_thread = lock_path.clone();
-        let moved_for_thread = moved_lock_path.clone();
         let backup_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hits_for_thread = std::sync::Arc::clone(&backup_hits);
         let backup_thread = std::thread::spawn(move || {

@@ -14756,7 +14756,7 @@ export default function(pi) {
         assert!(text.contains("cursor (multi_turn, tool_use, streaming)"));
         assert!(text.contains("anthropic (multi_turn, tool_use, streaming, vision)"));
 
-        let json_str = report.render_json().expect("render doctor json");
+        let json_str = report.to_json().expect("render doctor json");
         let json_val: serde_json::Value =
             serde_json::from_str(&json_str).expect("parse doctor json");
         let data = json_val["findings"]
