@@ -10,15 +10,13 @@
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder, Response};
-use crate::models::CompatConfig;
-use crate::provider::StreamOptions;
 use asupersync::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use asupersync::types::Time;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
@@ -66,42 +64,15 @@ pub(super) struct UploadAuth {
 }
 
 impl UploadAuth {
-    pub(super) fn for_request(
-        options: &StreamOptions,
-        compat: Option<&CompatConfig>,
-        fallback_api_key: Option<&str>,
-    ) -> Self {
-        let mut headers = Vec::new();
-        let key_override = super::google_api_key_override(options, compat);
-        let bearer_override = super::authorization_override(options, compat);
-        let fallback = if key_override.is_none() && bearer_override.is_none() {
-            fallback_api_key.map(str::to_owned)
-        } else {
-            None
-        };
-        if let Some(key) = key_override.or(fallback) {
-            headers.push(("x-goog-api-key".to_string(), key));
-        }
-        if let Some(bearer) = bearer_override {
-            headers.push(("authorization".to_string(), bearer));
-        }
-        let quota_project = super::super::first_non_empty_header_value_case_insensitive(
-            &options.headers,
-            &["x-goog-user-project"],
-        )
-        .or_else(|| {
-            compat
-                .and_then(|value| value.custom_headers.as_ref())
-                .and_then(|headers| {
-                    super::super::first_non_empty_header_value_case_insensitive(
-                        headers,
-                        &["x-goog-user-project"],
-                    )
-                })
-        });
-        if let Some(project) = quota_project {
-            headers.push(("x-goog-user-project".to_string(), project));
-        }
+    pub(super) fn from_resolved_headers(resolved: &HashMap<String, String>) -> Self {
+        let headers = ["x-goog-api-key", "authorization", "x-goog-user-project"]
+            .into_iter()
+            .filter_map(|name| {
+                resolved
+                    .get(name)
+                    .map(|value| (name.to_string(), value.clone()))
+            })
+            .collect();
         Self { headers }
     }
 
@@ -1194,7 +1165,8 @@ mod tests {
     use crate::model::{
         ContentBlock, MediaContent, Message, StreamEvent, TextContent, UserContent, UserMessage,
     };
-    use crate::provider::{BeforeProviderRequestHook, Context, Provider};
+    use crate::models::CompatConfig;
+    use crate::provider::{BeforeProviderRequestHook, Context, Provider, StreamOptions};
     use crate::tools::Tool as _;
     use asupersync::runtime::RuntimeBuilder;
     use futures::StreamExt;
@@ -2557,32 +2529,218 @@ mod tests {
 
     #[test]
     fn request_auth_overrides_do_not_reintroduce_a_fallback_key() {
-        let mut options = StreamOptions::default();
-        options
-            .headers
-            .insert("Authorization".into(), "Bearer caller".into());
-        options
-            .headers
-            .insert("X-Goog-User-Project".into(), "quota-project".into());
-        let auth = UploadAuth::for_request(&options, None, Some("must-not-leak"));
-        assert!(!auth.headers.iter().any(|(key, _)| key == "x-goog-api-key"));
-        assert!(
-            auth.headers
-                .contains(&("authorization".into(), "Bearer caller".into()))
-        );
-        assert!(
-            auth.headers
-                .contains(&("x-goog-user-project".into(), "quota-project".into()))
-        );
-        options
-            .headers
-            .insert("X-Goog-Api-Key".into(), "override".into());
-        let auth = UploadAuth::for_request(&options, None, Some("fallback"));
-        assert!(
-            auth.headers
-                .contains(&("x-goog-api-key".into(), "override".into()))
-        );
-        assert!(!auth.headers.iter().any(|(_, value)| value == "fallback"));
+        for with_key in [false, true] {
+            let server = Server::start(|endpoint| {
+                vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "auth", "ACTIVE", 3)})),
+                    Reply::sse("authenticated recording"),
+                ]
+            });
+            let provider = fixture_provider(&server).with_compat(None);
+            let mut options = StreamOptions {
+                api_key: Some("must-not-leak".into()),
+                headers: HashMap::from([
+                    ("Authorization".into(), "Bearer caller".into()),
+                    ("X-Goog-User-Project".into(), "quota-project".into()),
+                ]),
+                ..StreamOptions::default()
+            };
+            if with_key {
+                options
+                    .headers
+                    .insert("X-Goog-Api-Key".into(), "override".into());
+            }
+            run_async(fixture_events(&provider, &fixture_context(), &options))
+                .expect("provider completed");
+            let requests = server.finish();
+            assert_eq!(requests.len(), 3);
+            for index in [0, 2] {
+                assert_eq!(
+                    requests[index]
+                        .headers
+                        .get("authorization")
+                        .map(String::as_str),
+                    Some("Bearer caller")
+                );
+                assert_eq!(
+                    requests[index]
+                        .headers
+                        .get("x-goog-user-project")
+                        .map(String::as_str),
+                    Some("quota-project")
+                );
+                assert_eq!(
+                    requests[index]
+                        .headers
+                        .get("x-goog-api-key")
+                        .map(String::as_str),
+                    with_key.then_some("override")
+                );
+                assert!(
+                    !requests[index]
+                        .headers
+                        .values()
+                        .any(|value| value == "must-not-leak")
+                );
+            }
+            assert!(!requests[1].headers.contains_key("authorization"));
+            assert!(!requests[1].headers.contains_key("x-goog-api-key"));
+            assert!(!requests[1].headers.contains_key("x-goog-user-project"));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn provider_header_layers_share_credentials_and_quota_through_file_recovery() {
+        for quota_project in ["", "request-project"] {
+            let server = Server::start(|endpoint| {
+                vec![
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                    Reply::generation_error(404, "NOT_FOUND", "file disappeared"),
+                    Reply::status(404),
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
+                    Reply::sse("recovered with one identity"),
+                ]
+            });
+            let provider = fixture_provider(&server);
+            let model_compat = CompatConfig {
+                custom_headers: Some(HashMap::from([
+                    ("X-Goog-Api-Key".into(), "model-key".into()),
+                    ("Authorization".into(), "Bearer model".into()),
+                    ("X-Goog-User-Project".into(), "model-project".into()),
+                ])),
+                ..CompatConfig::default()
+            };
+            let compat =
+                crate::models::merge_compat(provider.compat.as_ref(), Some(&model_compat));
+            let provider = provider.with_compat(compat);
+            let options = StreamOptions {
+                api_key: Some("must-not-leak".into()),
+                headers: HashMap::from([
+                    // A blank auth override retains the model-level value.
+                    ("x-GOOG-api-key".into(), "  ".into()),
+                    ("Authorization".into(), "Bearer request".into()),
+                    // Identical same-layer aliases are harmless and collapse.
+                    ("AUTHORIZATION".into(), "Bearer request".into()),
+                    // Unlike blank auth, a blank quota project is explicit.
+                    ("x-GOOG-user-project".into(), quota_project.into()),
+                    ("X-Pi-Recovery-Marker".into(), "retained".into()),
+                ]),
+                ..StreamOptions::default()
+            };
+            let events = run_async(fixture_events(&provider, &fixture_context(), &options))
+                .expect("recovered provider turn");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                    .count(),
+                1
+            );
+            let requests = server.finish();
+            assert_eq!(requests.len(), 7);
+            for index in [0, 2, 3, 4, 6] {
+                for (name, expected) in [
+                    ("x-goog-api-key", "model-key"),
+                    ("authorization", "Bearer request"),
+                    ("x-goog-user-project", quota_project),
+                ] {
+                    assert_eq!(
+                        requests[index].headers.get(name).map(String::as_str),
+                        Some(expected),
+                        "request {index}: {name}"
+                    );
+                }
+                assert!(
+                    !requests[index]
+                        .headers
+                        .values()
+                        .any(|value| value == "must-not-leak")
+                );
+            }
+            for index in [1, 5] {
+                assert_eq!(requests[index].body, b"abc");
+                for name in ["x-goog-api-key", "authorization", "x-goog-user-project"] {
+                    assert!(!requests[index].headers.contains_key(name));
+                }
+            }
+            for index in [2, 6] {
+                assert_eq!(
+                    requests[index]
+                        .headers
+                        .get("x-pi-recovery-marker")
+                        .map(String::as_str),
+                    Some("retained")
+                );
+            }
+            let first: Value = serde_json::from_slice(&requests[2].body).unwrap();
+            let retry: Value = serde_json::from_slice(&requests[6].body).unwrap();
+            assert_ne!(
+                first["contents"][0]["parts"][1]["fileData"]["fileUri"],
+                retry["contents"][0]["parts"][1]["fileData"]["fileUri"]
+            );
+        }
+    }
+
+    #[test]
+    fn provider_rejects_conflicting_header_aliases_before_upload() {
+        for (name, alias) in [
+            ("x-goog-api-key", "X-Goog-Api-Key"),
+            ("authorization", "Authorization"),
+            ("x-goog-user-project", "X-Goog-User-Project"),
+            ("x-route", "X-Route"),
+        ] {
+            for in_compat in [false, true] {
+                let server = Server::start(|_| vec![Reply::status(418)]);
+                let mut provider = fixture_provider(&server);
+                let mut options = fixture_options();
+                let conflicting = HashMap::from([
+                    (name.into(), "private-header-one".into()),
+                    (alias.into(), "private-header-two".into()),
+                ]);
+                if in_compat {
+                    provider.compat = Some(CompatConfig {
+                        custom_headers: Some(conflicting),
+                        ..CompatConfig::default()
+                    });
+                } else {
+                    options.headers = conflicting;
+                }
+                let error = run_async(fixture_events(&provider, &fixture_context(), &options))
+                    .expect_err("ambiguous request identity must be refused");
+                assert!(matches!(&error, Error::Config(_)), "{error}");
+                let message = error.to_string();
+                assert!(message.contains(name), "{message}");
+                assert!(!message.contains("private-header-one"));
+                assert!(!message.contains("private-header-two"));
+                assert!(
+                    server.finish().is_empty(),
+                    "no upload or generation on ambiguity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_reserves_json_header_budget_before_upload() {
+        let server = Server::start(|_| vec![Reply::status(418)]);
+        let provider = fixture_provider(&server).with_compat(None);
+        let options = StreamOptions {
+            api_key: Some("test-key".into()),
+            // 98 custom headers plus the key and Accept would fit the
+            // client's 100-header budget, leaving no room for Content-Type.
+            headers: (0..98)
+                .map(|index| (format!("x-budget-{index}"), "value".to_string()))
+                .collect(),
+            ..StreamOptions::default()
+        };
+        let error = run_async(fixture_events(&provider, &fixture_context(), &options))
+            .expect_err("generation envelope exceeds the request header budget");
+        assert!(error.to_string().contains("header limit"), "{error}");
+        assert!(server.finish().is_empty(), "reject before uploading media");
     }
 
     #[test]
@@ -3958,7 +4116,16 @@ mod tests {
         let provider = fixture_provider(&server);
         let options = fixture_options();
         let context = fixture_context();
-        let auth = UploadAuth::for_request(&options, provider.compat.as_ref(), None);
+        let headers = crate::providers::resolve_request_headers(
+            provider
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref()),
+            &options.headers,
+            &["authorization", "x-goog-api-key"],
+        )
+        .expect("resolved request headers");
+        let auth = UploadAuth::from_resolved_headers(&headers);
         let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
         run_async(async {
             let owner = AgentCx::for_current_or_request();

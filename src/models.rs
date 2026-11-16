@@ -4252,11 +4252,7 @@ pub(crate) fn merge_compat(
                 (None, None) => None,
                 (Some(headers), None) | (None, Some(headers)) => Some(headers.clone()),
                 (Some(provider_headers), Some(model_headers)) => {
-                    let mut merged = provider_headers.clone();
-                    for (key, value) in model_headers {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                    Some(merged)
+                    Some(merge_headers(provider_headers, model_headers.clone()))
                 }
             };
 
@@ -4336,10 +4332,18 @@ fn merge_headers(
     base: &HashMap<String, String>,
     override_headers: HashMap<String, String>,
 ) -> HashMap<String, String> {
+    // HTTP header names are case-insensitive. Remove every lower-layer
+    // spelling before retaining the complete higher layer, so model overrides
+    // cannot leave an old credential alongside its replacement. Keep aliases
+    // within one layer together: request admission can then reject conflicting
+    // values instead of this merge choosing an identity by HashMap order.
+    let overridden_names = override_headers
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let mut merged = base.clone();
-    for (k, v) in override_headers {
-        merged.insert(k, v);
-    }
+    merged.retain(|name, _| !overridden_names.contains(&name.to_ascii_lowercase()));
+    merged.extend(override_headers);
     merged
 }
 
@@ -6691,6 +6695,83 @@ mod tests {
             openrouter_before + 1,
             "overrides must not drop or duplicate bundled models"
         );
+    }
+
+    #[test]
+    fn configured_header_overrides_replace_case_aliases_through_all_layers() {
+        let (_directory, auth) = test_auth_storage();
+        let config: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "custom-google": {
+                    "api": "google-generative-ai",
+                    "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+                    "headers": {
+                        "X-Goog-Api-Key": "provider-key",
+                        "X-Route": "provider-route",
+                        "X-Keep": "retained"
+                    },
+                    "compat": {"customHeaders": {
+                        "Authorization": "Bearer provider",
+                        "X-Goog-User-Project": "provider-project"
+                    }},
+                    "models": [
+                        {
+                            "id": "model",
+                            "headers": {"x-goog-api-key": "model-key", "x-route": "model-route"},
+                            "compat": {"customHeaders": {
+                                "authorization": "Bearer model",
+                                "x-goog-user-project": "model-project"
+                            }}
+                        },
+                        {
+                            "id": "patched",
+                            "headers": {"x-goog-api-key": "model-key", "x-route": "model-route"},
+                            "compat": {"customHeaders": {
+                                "authorization": "Bearer model",
+                                "x-goog-user-project": "model-project"
+                            }}
+                        }
+                    ],
+                    "modelOverrides": {"patched": {
+                        "headers": {"X-GOOG-API-KEY": "patch-key", "X-ROUTE": "patch-route"},
+                        "compat": {"customHeaders": {
+                            "AUTHORIZATION": "Bearer patch",
+                            "X-GOOG-USER-PROJECT": "patch-project"
+                        }}
+                    }}
+                }
+            }
+        }))
+        .expect("model configuration");
+        let mut models = Vec::new();
+        apply_custom_models(&auth, &mut models, &config, None);
+        assert_eq!(models.len(), 2);
+        for (id, prefix) in [("model", "model"), ("patched", "patch")] {
+            let entry = models.iter().find(|entry| entry.model.id == id).unwrap();
+            let compat_headers = entry
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .expect("merged compatibility headers");
+            for (headers, name, expected) in [
+                (&entry.headers, "x-goog-api-key", format!("{prefix}-key")),
+                (&entry.headers, "x-route", format!("{prefix}-route")),
+                (&entry.headers, "x-keep", "retained".to_string()),
+                (compat_headers, "authorization", format!("Bearer {prefix}")),
+                (
+                    compat_headers,
+                    "x-goog-user-project",
+                    format!("{prefix}-project"),
+                ),
+            ] {
+                let selected = headers
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(selected, vec![expected.as_str()], "{id}: {name}");
+            }
+        }
     }
 
     /// gh #220: overrides compose with a custom `models` list (patch wins per
@@ -11860,13 +11941,18 @@ mod tests {
                 assert_eq!(merged.get(&key).unwrap(), &v2);
             }
 
-            /// `merge_headers` preserves non-overlapping keys.
+            /// Distinct names coexist, but case aliases are the same header.
             #[test]
-            fn merge_headers_preserves_both(k1 in "[a-z]{1,5}", k2 in "[A-Z]{1,5}", v1 in "[a-z]{1,5}", v2 in "[a-z]{1,5}") {
+            fn merge_headers_preserves_distinct_names(k1 in "[a-z]{1,5}", k2 in "[A-Z]{1,5}", v1 in "[a-z]{1,5}", v2 in "[a-z]{1,5}") {
                 let base = HashMap::from([(k1.clone(), v1.clone())]);
                 let over = HashMap::from([(k2.clone(), v2.clone())]);
                 let merged = merge_headers(&base, over);
-                assert_eq!(merged.get(&k1), Some(&v1));
+                if k1.eq_ignore_ascii_case(&k2) {
+                    assert_eq!(merged.len(), 1);
+                    assert!(!merged.contains_key(&k1));
+                } else {
+                    assert_eq!(merged.get(&k1), Some(&v1));
+                }
                 assert_eq!(merged.get(&k2), Some(&v2));
             }
 

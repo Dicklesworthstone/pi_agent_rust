@@ -35,40 +35,6 @@ const MAX_GENERATION_ERROR_BYTES: usize = 64 * 1024;
 const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
-fn authorization_override(
-    options: &StreamOptions,
-    compat: Option<&CompatConfig>,
-) -> Option<String> {
-    super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
-        .or_else(|| {
-            compat
-                .and_then(|compat| compat.custom_headers.as_ref())
-                .and_then(|headers| {
-                    super::first_non_empty_header_value_case_insensitive(
-                        headers,
-                        &["authorization"],
-                    )
-                })
-        })
-}
-
-fn google_api_key_override(
-    options: &StreamOptions,
-    compat: Option<&CompatConfig>,
-) -> Option<String> {
-    super::first_non_empty_header_value_case_insensitive(&options.headers, &["x-goog-api-key"])
-        .or_else(|| {
-            compat
-                .and_then(|compat| compat.custom_headers.as_ref())
-                .and_then(|headers| {
-                    super::first_non_empty_header_value_case_insensitive(
-                        headers,
-                        &["x-goog-api-key"],
-                    )
-                })
-        })
-}
-
 // ============================================================================
 // Gemini Provider
 // ============================================================================
@@ -148,27 +114,17 @@ impl GeminiProvider {
     fn developer_request(
         &self,
         url: &str,
-        options: &StreamOptions,
-        fallback_api_key: Option<&str>,
-    ) -> RequestBuilder<'_> {
-        let mut request = self.client.post(url).header("Accept", "text/event-stream");
-        if let Some(key) = fallback_api_key {
-            request = request.header("x-goog-api-key", key);
+        headers: &HashMap<String, String>,
+    ) -> Result<RequestBuilder<'_>> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Accept", "text/event-stream")
+            .header("Content-Type", "application/json");
+        for (name, value) in headers {
+            request = request.try_header(name, value)?;
         }
-        if let Some(compat) = &self.compat
-            && let Some(custom_headers) = &compat.custom_headers
-        {
-            request = super::apply_headers_ignoring_blank_auth_overrides(
-                request,
-                custom_headers,
-                &["authorization", "x-goog-api-key"],
-            );
-        }
-        super::apply_headers_ignoring_blank_auth_overrides(
-            request,
-            &options.headers,
-            &["authorization", "x-goog-api-key"],
-        )
+        Ok(request)
     }
 
     /// Build the streaming URL.
@@ -326,6 +282,13 @@ impl Provider for GeminiProvider {
         let request_body = self.build_request(context, options);
         let request_body = reasoning::prepare_request(&self.model, options, &request_body)?;
         let url = self.streaming_url();
+        let mut headers = super::resolve_request_headers(
+            self.compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref()),
+            &options.headers,
+            &["authorization", "x-goog-api-key"],
+        )?;
 
         if self.google_cli_mode {
             // Content-Type is set by .json() below.
@@ -371,23 +334,11 @@ impl Provider for GeminiProvider {
                 request = request.header("User-Agent", crate::platform::pi_user_agent());
             }
 
-            // Apply provider-specific custom headers from compat config.
-            if let Some(compat) = &self.compat
-                && let Some(custom_headers) = &compat.custom_headers
-            {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization", "x-goog-api-key"],
-                );
+            // The captured request layer already overrides compatibility
+            // headers and refuses conflicting same-layer aliases.
+            for (name, value) in &headers {
+                request = request.try_header(name, value)?;
             }
-
-            // Per-request headers from StreamOptions (highest priority).
-            request = super::apply_headers_ignoring_blank_auth_overrides(
-                request,
-                &options.headers,
-                &["authorization", "x-goog-api-key"],
-            );
 
             // Offer the inner Gemini request (not the CloudCodeAssist
             // wrapper) to the rewrite hook: the wrapper is transport detail
@@ -437,28 +388,26 @@ impl Provider for GeminiProvider {
             return Ok(Box::pin(stream));
         }
 
-        let has_auth_override = google_api_key_override(options, self.compat.as_ref()).is_some()
-            || authorization_override(options, self.compat.as_ref()).is_some();
-        let auth_value = if has_auth_override {
-            None
-        } else {
-            Some(
-                options
-                    .api_key
-                    .clone()
-                    .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
-                    .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-                    .ok_or_else(|| {
-                        Error::provider(
-                            self.name(),
-                            "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
-                        )
-                    })?,
-            )
-        };
-
-        let upload_auth =
-            files::UploadAuth::for_request(options, self.compat.as_ref(), auth_value.as_deref());
+        if !headers.contains_key("x-goog-api-key") && !headers.contains_key("authorization") {
+            let key = options
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .ok_or_else(|| {
+                    Error::provider(
+                        self.name(),
+                        "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
+                    )
+                })?;
+            headers.insert("x-goog-api-key".to_string(), key);
+        }
+        // Uploads, authenticated metadata lookups and every generation attempt
+        // share this exact snapshot, including an explicitly blank quota
+        // project. Never resolve the same raw header layer a second time.
+        let upload_auth = files::UploadAuth::from_resolved_headers(&headers);
+        // Reject invalid/over-budget request headers before uploading media.
+        let _ = self.developer_request(&url, &headers)?;
 
         let rewritten_body = super::offer_before_provider_request(
             options,
@@ -482,9 +431,7 @@ impl Provider for GeminiProvider {
             )
             .await?;
         let response = loop {
-            let request = self
-                .developer_request(&url, options, auth_value.as_deref())
-                .json(&body)?;
+            let request = self.developer_request(&url, &headers)?.json(&body)?;
             let response = Box::pin(request.send()).await?;
             let status = response.status();
             if (200..300).contains(&status) {

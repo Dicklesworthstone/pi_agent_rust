@@ -161,6 +161,39 @@ pub(super) fn apply_headers_ignoring_blank_auth_overrides<'a>(
     request
 }
 
+/// Capture one case-insensitive header snapshot for a multi-request provider
+/// operation. The request layer overrides compatibility headers; blank auth
+/// overrides retain the lower layer. Conflicting aliases within one layer
+/// have no declared precedence and must not choose credentials by map order.
+pub(super) fn resolve_request_headers(
+    compatibility: Option<&HashMap<String, String>>,
+    request: &HashMap<String, String>,
+    auth_names: &[&str],
+) -> Result<HashMap<String, String>> {
+    let mut resolved = HashMap::new();
+    for headers in compatibility.into_iter().chain(std::iter::once(request)) {
+        let mut layer = HashMap::new();
+        for (name, value) in headers {
+            if auth_names.iter().any(|auth| name.eq_ignore_ascii_case(auth))
+                && value.trim().is_empty()
+            {
+                continue;
+            }
+            let name = name.to_ascii_lowercase();
+            if layer.get(&name).is_some_and(|previous| previous != value) {
+                // Values may contain credentials; even this admission error
+                // must identify only the conflicting header name.
+                return Err(Error::config(format!(
+                    "Conflicting values for case-insensitive request header {name:?}"
+                )));
+            }
+            layer.insert(name, value.clone());
+        }
+        resolved.extend(layer);
+    }
+    Ok(resolved)
+}
+
 fn base_url_targets_loopback(base_url: &str) -> bool {
     let Ok(url) = Url::parse(base_url) else {
         return false;
