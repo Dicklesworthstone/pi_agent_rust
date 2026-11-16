@@ -862,8 +862,10 @@ and limits (`src/web_remote/`, `src/interactive_ftui.rs`).
 **Interactive queued input.** In the default terminal interface, messages
 accepted as a turn finishes continue in their original order, with each
 message's prepared file contents preserved. They keep separate message
-boundaries and their own authored instructions. Aborts, failures, and run-time
-caps return unsent authored text to the editor for review before resubmission.
+boundaries and their own authored instructions. Ordinary steering and follow-up
+input can include images and audio/video. Aborts, failures, and run-time caps
+preserve unclaimed prepared input for review, including captured attachment
+bytes. Resubmitting an unchanged recovered draft reuses those bytes.
 
 **ACP workspace settings.** Sessions created by `pi --acp` resolve global
 settings and trusted settings from the requested workspace when creating,

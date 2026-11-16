@@ -183,8 +183,9 @@ Later input waits behind compaction and then resumes with its prepared
 attachments and ordering intact. The command itself is never sent as a prompt.
 
 Only one compaction can be queued at a time. Before it starts, `Alt+Up` recalls
-the command together with queued text in its original order. Cancelling or
-failing the active turn returns unclaimed input to the owning session's editor
+unclaimed input for review, retaining captured attachment bytes and keeping
+the compaction command separate from model messages. Cancelling or failing
+the active turn returns unclaimed input to the owning session's editor
 instead of starting maintenance. Once compaction starts, the normal interrupt
 key cancels generation; an already admitted durable save finishes its
 reconciliation before control returns. A completed compaction is not replayed

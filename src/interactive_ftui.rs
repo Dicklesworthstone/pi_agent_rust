@@ -76,6 +76,7 @@ mod textarea;
 pub mod tool_progress;
 mod workspace_commands;
 
+pub use goal_control::RestoredInput;
 pub use queued_compaction::QueuedCompaction;
 pub use settings::{SettingsKey, SettingsSnapshot};
 use textarea::TextArea;
@@ -2432,6 +2433,7 @@ pub struct PiFtuiModel {
     pending_input_restores: VecDeque<PendingInputRestore>,
     pending_goal_inputs: VecDeque<goal_control::RestoredInput>,
     goal_draft: Option<goal_control::Draft>,
+    replaying_input: Option<RestoredInput>,
     goal_rx: Option<goal_control::EventReceiver>,
     /// Private local pairing and approval UI, never part of the transcript.
     browser: Option<browser::CompanionUi>,
@@ -2983,6 +2985,7 @@ impl PiFtuiModel {
             pending_input_restores: VecDeque::new(),
             pending_goal_inputs: VecDeque::new(),
             goal_draft: None,
+            replaying_input: None,
             goal_rx: None,
             browser: None,
             pending_image_pastes: VecDeque::new(),
@@ -4200,6 +4203,13 @@ impl PiFtuiModel {
         {
             self.queued_compaction = None;
         }
+        if let PiMsg::PreparedInputFinished { request_id } = msg {
+            if self.replaying_input.as_ref().map(RestoredInput::id) == Some(request_id) {
+                self.replaying_input = None;
+                self.busy = None;
+            }
+            return Cmd::none();
+        }
         if let PiMsg::BashFinished { request_id } = msg {
             if self
                 .bash_request
@@ -4297,6 +4307,7 @@ impl PiFtuiModel {
         if self.mcp_auth_request.is_none()
             && self.bash_request.is_none()
             && self.compaction_request.is_none()
+            && self.replaying_input.is_none()
             && !self.browser_request_active()
             && self.busy.as_ref().is_some_and(|op| op.handoff.is_none())
             && !matches!(
@@ -4321,6 +4332,7 @@ impl PiFtuiModel {
             | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
             | PiMsg::GoalFinished { .. }
+            | PiMsg::PreparedInputFinished { .. }
             | PiMsg::BashFinished { .. }
             | PiMsg::FtuiToolProgress(_) => return Cmd::none(),
             PiMsg::AgentError(message)
@@ -4814,6 +4826,11 @@ impl PiFtuiModel {
             {
                 self.set_prompt_editor_text(&text);
             }
+            PiMsg::RestorePreparedInput(request) => {
+                // Keep prepared input parked for its original session. The
+                // shared native composer protects newer and private drafts.
+                self.pending_goal_inputs.push_back(request);
+            }
             PiMsg::RestorePendingInput {
                 owner_session_id,
                 text,
@@ -4940,6 +4957,13 @@ impl PiFtuiModel {
     /// Commands wait for the turn to end; text the lane cannot take yet (the
     /// turn is starting or ending) becomes the next prompt instead.
     fn submit_mid_turn(&mut self, follow_up: bool) {
+        if self.replaying_input.is_some() && self.live_turn_control().is_none() {
+            self.push_entry(
+                EntryRole::Error,
+                "Recovered input is still being admitted; press Escape to cancel it.".to_string(),
+            );
+            return;
+        }
         if self.login_pending.is_some() {
             return;
         }
@@ -5036,6 +5060,18 @@ impl PiFtuiModel {
             );
             return;
         }
+        let control = self.live_turn_control();
+        if goal.is_none() && control.is_none() {
+            // No native mailbox accepted this input. Let the sequential
+            // driver prepare it once, after the previous turn has settled.
+            self.record_history(&clean);
+            self.input.set_text("");
+            self.autocomplete.close();
+            self.scroll_from_tail = 0;
+            self.push_entry(EntryRole::User, clean.clone());
+            self.send_command(UiCommand::Prompt(clean));
+            return;
+        }
         // `@file` references are read in here, as the driver does for idle
         // prompts; they used to reach the model as literal `@path` text.
         let file_arguments = self
@@ -5050,35 +5086,25 @@ impl PiFtuiModel {
             file_arguments.workspace.as_ref(),
             file_arguments.options,
         ) {
-            Ok((_, images)) if !images.is_empty() && goal.is_none() => {
-                // The text stays in the editor for after the turn.
-                self.push_entry(
-                    EntryRole::Error,
-                    String::from(
-                        "Attachments send once the agent finishes; the message is kept in the editor.",
-                    ),
-                );
-                return;
-            }
             Ok(prepared) => prepared,
             Err(err) => {
                 self.push_entry(EntryRole::Error, format!("Not sent: {err}"));
                 return;
             }
         };
+        let content = if attachments.is_empty() {
+            crate::model::UserContent::Text(steer_text)
+        } else {
+            let mut blocks = Vec::with_capacity(attachments.len() + 1);
+            if !steer_text.is_empty() {
+                blocks.push(crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(steer_text),
+                ));
+            }
+            blocks.extend(attachments);
+            crate::model::UserContent::Blocks(blocks)
+        };
         if let Some(goal) = goal {
-            let content = if attachments.is_empty() {
-                crate::model::UserContent::Text(steer_text)
-            } else {
-                let mut blocks = Vec::with_capacity(attachments.len() + 1);
-                if !steer_text.is_empty() {
-                    blocks.push(crate::model::ContentBlock::Text(
-                        crate::model::TextContent::new(steer_text),
-                    ));
-                }
-                blocks.extend(attachments);
-                crate::model::UserContent::Blocks(blocks)
-            };
             self.submit_goal_content(&goal, content, &clean, follow_up);
             return;
         }
@@ -5086,14 +5112,9 @@ impl PiFtuiModel {
         self.input.set_text("");
         self.autocomplete.close();
         self.scroll_from_tail = 0;
-        let Some(control) = self.live_turn_control() else {
-            self.push_entry(EntryRole::User, clean.clone());
-            self.send_command(UiCommand::Prompt(clean));
-            return;
-        };
+        let control = control.expect("live native input mailbox");
         // The authored text is what Alt+Up restores and keywords scan, not
         // the file contents read into the message.
-        let content = crate::model::UserContent::Text(steer_text);
         let queued = if follow_up {
             control.follow_up_with_content(&content, &clean)
         } else {
@@ -5223,10 +5244,20 @@ impl PiFtuiModel {
         true
     }
 
-    /// alt+up: pull steering and follow-up messages the running turn has not
-    /// picked up yet back into the editor, in the order they were sent, ahead
-    /// of anything already typed. Messages the agent already received cannot
-    /// be recalled; the lane guarantees each one is either here or there.
+    fn live_input_branch_anchor(&self, owner_session_id: &str) -> Option<String> {
+        self.turn_control
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current_origin
+            .as_ref()
+            .filter(|(owner, _)| owner == owner_session_id)
+            .and_then(|(_, branch)| branch.clone())
+    }
+
+    /// Alt+Up retains unsent steering and follow-ups in their native order.
+    /// A newer draft stays in the editor; frozen input waits for explicit
+    /// review. The mailbox transfers each message exactly once.
     fn restore_queued_input(&mut self) {
         // These messages belong to the prompt editor, never to an Ask,
         // extension, or login reply. Draining them into another input flow
@@ -5238,20 +5269,27 @@ impl PiFtuiModel {
         {
             return;
         }
+        if self.replaying_input.is_some() {
+            self.push_entry(
+                EntryRole::System,
+                "Press Escape to return recovered input before recalling its queue.".to_string(),
+            );
+            return;
+        }
         if self.recall_goal_input() {
             return;
         }
-        let pending = if let Some(pending) = self.take_queued_compaction_text() {
-            pending
-        } else if let Some(control) = self.live_turn_control() {
-            control
-                .take_pending()
-                .into_iter()
-                .map(|input| input.text)
-                .collect()
-        } else {
+        if let Some(request) = self.take_queued_compaction() {
+            self.restore_native_input(request);
+            return;
+        }
+        let Some(owner_session_id) = self.displayed_session_id.clone() else {
             return;
         };
+        let Some(control) = self.live_turn_control() else {
+            return;
+        };
+        let pending = control.take_pending();
         if pending.is_empty() {
             self.push_entry(
                 EntryRole::System,
@@ -5259,18 +5297,12 @@ impl PiFtuiModel {
             );
             return;
         }
-        let count = pending.len();
-        let mut text = pending.join("\n\n");
-        let typed = self.input.text();
-        if !typed.is_empty() {
-            text.push_str("\n\n");
-            text.push_str(&typed);
-        }
-        self.input.set_text(&text);
-        self.push_entry(
-            EntryRole::System,
-            format!("Restored {count} queued message(s) to the editor."),
-        );
+        let branch_anchor = self.live_input_branch_anchor(&owner_session_id);
+        self.restore_native_input(RestoredInput::for_turn(
+            owner_session_id,
+            branch_anchor,
+            pending,
+        ));
     }
 
     /// Return a batch to the prompt only after its current input owner has
@@ -5337,6 +5369,13 @@ impl PiFtuiModel {
     }
 
     fn submit_owned_input(&mut self) {
+        if self.replaying_input.is_some() && self.state != AgentUiState::Working {
+            self.push_entry(
+                EntryRole::Error,
+                "Recovered input is still running; press Escape to cancel it.".to_string(),
+            );
+            return;
+        }
         if self.submit_browser_command() {
             return;
         }
@@ -6852,6 +6891,7 @@ impl PiFtuiModel {
                     .as_ref()
                     .map(|request| request.abort.clone())
             })
+            .or_else(|| self.replaying_input.as_ref().map(RestoredInput::abort_handle))
             .or_else(|| {
                 self.turn_abort.as_ref().and_then(|slot| {
                     slot.lock()
@@ -6901,6 +6941,9 @@ impl PiFtuiModel {
         }
         if let Some(request) = &self.compaction_request {
             request.abort.abort();
+        }
+        if let Some(request) = &self.replaying_input {
+            request.abort_handle().abort();
         }
         abort_driver_work(self.turn_abort.as_ref(), self.turn_control.as_ref());
     }
@@ -10218,6 +10261,7 @@ type TurnControlSlot = Arc<Mutex<TurnControlState>>;
 #[derive(Default)]
 pub struct TurnControlState {
     current: Option<crate::session_control::SessionControlHandle>,
+    current_origin: Option<(String, Option<String>)>,
     goal: Option<goal_control::Invocation>,
     last_goal: Option<uuid::Uuid>,
     closed: bool,
@@ -10232,6 +10276,7 @@ impl TurnControlState {
         // Scoped goal events may still be crossing their subscription when
         // the next ordinary prompt starts. They no longer own this display.
         self.last_goal = None;
+        self.current_origin = None;
         if self.closed {
             control.abort();
         } else {
@@ -10245,10 +10290,12 @@ impl TurnControlState {
     #[doc(hidden)]
     pub fn retire(&mut self) {
         self.current = None;
+        self.current_origin = None;
     }
 
     fn close(&mut self) -> Option<goal_control::Invocation> {
         self.closed = true;
+        self.current_origin = None;
         if let Some(control) = self.current.take() {
             control.abort();
         }
@@ -10508,19 +10555,20 @@ async fn finish_prompt_sequence(
         if result.stopped {
             // A cap is a pause too: starting a new turn here would reset its
             // timer and immediately resume work the user asked us to stop.
-            let text = result.into_restore_texts().join("\n\n");
-            if let Ok(owner_session_id) = handle
-                .with_session(|session| session.header.id.clone())
-                .await
-            {
-                let _ = agent_tx.send(PiMsg::RestorePendingInput {
-                    owner_session_id,
-                    text,
-                });
-                let _ = agent_tx.send(PiMsg::System(format!(
-                    "Restored {count} unsent message(s) to the editor."
-                )));
-            }
+            // Keep the original owner even if the store is now unavailable.
+            let (owner_session_id, branch_anchor) = result
+                .origin
+                .take()
+                .expect("accepted pending input has a captured session origin");
+            let pending = result.into_restored_inputs();
+            let _ = agent_tx.send(PiMsg::RestorePreparedInput(RestoredInput::for_turn(
+                owner_session_id,
+                branch_anchor,
+                pending,
+            )));
+            let _ = agent_tx.send(PiMsg::System(format!(
+                "Retained {count} unsent message(s) with their original attachments for review."
+            )));
             return;
         }
         let _ = agent_tx.send(PiMsg::System(format!(
@@ -10529,36 +10577,49 @@ async fn finish_prompt_sequence(
         // These inputs were already expanded and admitted by the old turn.
         // Keep their frozen content, order and authored keyword authority;
         // joining their text would discard file bodies and merge messages.
+        let origin = result.origin;
         let mut pending = result.pending.into_iter();
         let Some(first) = pending.next() else {
             return;
         };
         result = run_controlled_turn_with_pending(
             handle,
-            first.content,
-            Some(first.text),
+            first.content.clone(),
+            Some(first),
             pending.collect(),
             inherited_abort.clone(),
             agent_tx,
             turn_control,
         )
         .await;
+        // Cancellation or a failed store read can refuse the next turn
+        // before it captures origin; its input still belongs to this batch.
+        result.origin = result.origin.or(origin);
     }
 }
 
 /// Unclaimed native inputs remain prepared until the driver either admits
-/// them to another turn or explicitly returns their authored text for review.
+/// them to another turn or explicitly returns their frozen content for review.
 struct ControlledTurnResult {
+    origin: Option<(String, Option<String>)>,
     pending: Vec<crate::session_control::PendingInput>,
-    initial_restore: Option<String>,
+    initial_restore: Option<crate::session_control::PendingInput>,
     stopped: bool,
 }
 
 impl ControlledTurnResult {
-    fn into_restore_texts(self) -> Vec<String> {
+    fn into_restored_inputs(self) -> Vec<crate::session_control::PendingInput> {
         self.initial_restore
             .into_iter()
-            .chain(self.pending.into_iter().map(|input| input.text))
+            .chain(self.pending)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn into_restore_texts(self) -> Vec<String> {
+        self.into_restored_inputs()
+            .into_iter()
+            .map(|input| input.text)
             .collect()
     }
 }
@@ -10603,7 +10664,7 @@ async fn run_controlled_turn(
 async fn run_controlled_turn_with_pending(
     handle: &mut crate::sdk::AgentSessionHandle,
     content: crate::model::UserContent,
-    initial_source: Option<String>,
+    initial_prepared: Option<crate::session_control::PendingInput>,
     pending: Vec<crate::session_control::PendingInput>,
     inherited_abort: Option<crate::agent::AbortSignal>,
     agent_tx: &Sender<PiMsg>,
@@ -10612,7 +10673,7 @@ async fn run_controlled_turn_with_pending(
     run_controlled_turn_with_admission(
         handle,
         content,
-        initial_source,
+        initial_prepared,
         pending,
         inherited_abort,
         agent_tx,
@@ -10630,13 +10691,14 @@ async fn run_controlled_turn_with_pending(
 async fn run_controlled_turn_with_admission(
     handle: &mut crate::sdk::AgentSessionHandle,
     content: crate::model::UserContent,
-    initial_source: Option<String>,
+    initial_prepared: Option<crate::session_control::PendingInput>,
     mut pending: Vec<crate::session_control::PendingInput>,
     inherited_abort: Option<crate::agent::AbortSignal>,
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
     remote_admission: Option<(&WebRemoteBridge, &str, u64)>,
 ) -> ControlledTurnResult {
+    let initial_source = initial_prepared.as_ref().map(|input| input.text.clone());
     let origin = {
         let read = handle.with_session(|session| {
             (
@@ -10651,8 +10713,9 @@ async fn run_controlled_turn_with_admission(
                 futures::future::Either::Left(_) => {
                     report_turn_result(Err(crate::error::Error::Aborted), agent_tx);
                     return ControlledTurnResult {
+                        origin: None,
                         pending,
-                        initial_restore: initial_source,
+                        initial_restore: initial_prepared,
                         stopped: true,
                     };
                 }
@@ -10660,14 +10723,26 @@ async fn run_controlled_turn_with_admission(
                 futures::future::Either::Right((Err(error), _)) => {
                     report_turn_result(Err(error), agent_tx);
                     return ControlledTurnResult {
+                        origin: None,
                         pending,
-                        initial_restore: initial_source,
+                        initial_restore: initial_prepared,
                         stopped: true,
                     };
                 }
             }
         } else {
-            read.await.ok()
+            match read.await {
+                Ok(origin) => Some(origin),
+                Err(error) => {
+                    report_turn_result(Err(error), agent_tx);
+                    return ControlledTurnResult {
+                        origin: None,
+                        pending,
+                        initial_restore: initial_prepared,
+                        stopped: true,
+                    };
+                }
+            }
         }
     };
     if remote_admission.is_some_and(|(bridge, client_id, epoch)| {
@@ -10677,8 +10752,9 @@ async fn run_controlled_turn_with_admission(
             "Browser prompt was not sent: its control permission has ended",
         )));
         return ControlledTurnResult {
+            origin,
             pending,
-            initial_restore: initial_source,
+            initial_restore: initial_prepared,
             stopped: true,
         };
     }
@@ -10708,15 +10784,21 @@ async fn run_controlled_turn_with_admission(
         }
         report_turn_result(Err(error), agent_tx);
         return ControlledTurnResult {
+            origin,
             pending,
-            initial_restore: initial_source,
+            initial_restore: initial_prepared,
             stopped: true,
         };
     }
-    turn_control
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .publish(control.clone());
+    {
+        let mut slot = turn_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.publish(control.clone());
+        if slot.current.is_some() {
+            slot.current_origin = origin.clone();
+        }
+    }
     let result = if let Some(abort) = &inherited_abort {
         let cancelled = abort.wait();
         futures::pin_mut!(turn, cancelled);
@@ -10736,7 +10818,7 @@ async fn run_controlled_turn_with_admission(
     turn_control
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .current = None;
+        .retire();
     let pending = if control.has_yield_barrier() {
         let same_branch = handle
             .with_session(|session| {
@@ -10761,17 +10843,17 @@ async fn run_controlled_turn_with_admission(
     } else {
         control.take_pending()
     };
-    // OwnedTurn guarantees this particular refusal dispatched no prompt.
-    // Other failures may have delivered the first input and must not replay it.
-    let initial_restore = if matches!(&result, Err(crate::error::Error::Validation(message))
-        if message.starts_with("[SESSION_CONTROL_CANCELLED] turn cancelled before execution;"))
-        && let Some(source) = initial_source
-    {
-        handle
-            .session_mut()
-            .agent
-            .set_magic_keyword_scan_override(None);
-        Some(source)
+    // Only the SDK handoff grants permission to consume prepared input.
+    // Quarantine/startup refusals, as well as cancellation before handoff,
+    // retain the exact payload. A delivered input must never be replayed.
+    let initial_restore = if !control.initial_input_handed_off() {
+        if initial_source.is_some() {
+            handle
+                .session_mut()
+                .agent
+                .set_magic_keyword_scan_override(None);
+        }
+        initial_prepared
     } else {
         None
     };
@@ -10788,6 +10870,7 @@ async fn run_controlled_turn_with_admission(
     };
     report_turn_result(result, agent_tx);
     ControlledTurnResult {
+        origin,
         pending,
         initial_restore,
         stopped,
@@ -11958,7 +12041,33 @@ async fn run_compact_command(
     agent_tx: &Sender<PiMsg>,
     turn_control: &TurnControlSlot,
     turn_abort: &TurnAbortSlot,
-) {
+) -> bool {
+    run_compact_command_with_receipt(
+        handle,
+        shake,
+        instructions,
+        request,
+        agent_tx,
+        turn_control,
+        turn_abort,
+        || {},
+    )
+    .await
+}
+
+/// A completed maintenance transaction must be acknowledged before a
+/// fallible display refresh can suspend or lose the driver's future.
+#[allow(clippy::too_many_arguments)]
+async fn run_compact_command_with_receipt(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    shake: bool,
+    instructions: Option<&str>,
+    request: CompactionRequest,
+    agent_tx: &Sender<PiMsg>,
+    turn_control: &TurnControlSlot,
+    turn_abort: &TurnAbortSlot,
+    on_completed: impl FnOnce(),
+) -> bool {
     let _operation_abort =
         queued_compaction::OperationAbort::publish(turn_abort, turn_control, &request.abort);
     let signal = request.abort.signal();
@@ -11976,7 +12085,7 @@ async fn run_compact_command(
             futures::future::Either::Right((result, _)) => result,
         }
     };
-    let event = match owner {
+    let (event, completed) = match owner {
         Ok(owner) if owner == request.owner_session_id => {
             // ubs:ignore Sender clone per command — the callback owns its sender
             let tx = agent_tx.clone();
@@ -11995,24 +12104,39 @@ async fn run_compact_command(
             match result {
                 // Once installation commits, refresh the durable result even
                 // if Escape arrives late; never report it as uninstalled.
-                Ok(true) => conversation_reset_message(handle, done).await,
-                Ok(false) => PiMsg::System(format!(
-                    "Nothing to {label}: there is too little history since the last compaction"
-                )),
-                Err(crate::error::Error::Aborted) => PiMsg::System(format!("{label} cancelled")),
-                Err(err) => PiMsg::AgentError(format!("{label}: {err}")),
+                Ok(true) => {
+                    on_completed();
+                    (conversation_reset_message(handle, done).await, true)
+                }
+                Ok(false) => {
+                    on_completed();
+                    (
+                        PiMsg::System(format!(
+                            "Nothing to {label}: there is too little history since the last compaction"
+                        )),
+                        true,
+                    )
+                }
+                Err(crate::error::Error::Aborted) => {
+                    (PiMsg::System(format!("{label} cancelled")), false)
+                }
+                Err(err) => (PiMsg::AgentError(format!("{label}: {err}")), false),
             }
         }
-        Ok(_) => PiMsg::AgentError(format!(
-            "{label} cancelled: the session changed before it started"
-        )),
-        Err(crate::error::Error::Aborted) => PiMsg::System(format!("{label} cancelled")),
-        Err(error) => PiMsg::AgentError(format!("{label} unavailable: {error}")),
+        Ok(_) => (
+            PiMsg::AgentError(format!(
+                "{label} cancelled: the session changed before it started"
+            )),
+            false,
+        ),
+        Err(crate::error::Error::Aborted) => (PiMsg::System(format!("{label} cancelled")), false),
+        Err(error) => (PiMsg::AgentError(format!("{label} unavailable: {error}")), false),
     };
     let _ = agent_tx.send(PiMsg::CompactionFinished {
         request_id: request.id,
         event: Box::new(event),
     });
+    completed
 }
 
 fn report_replacement_shutdown_failure(
@@ -14542,6 +14666,7 @@ pub fn run(
                         Ok(UiCommand::RestoredGoalInput(request)) => {
                             Box::pin(goal_control::run_restored(
                                 &mut handle, request, &agent_tx, &goal_tx, &driver_turn_control,
+                                Arc::clone(&driver_turn_abort),
                             )).await;
                         }
                         Ok(UiCommand::InitialPrompt) => {
@@ -19196,8 +19321,8 @@ mod tests {
     /// aborts, and alt+up restores unsent messages. Everything goes through
     /// the turn's real control lane.
     /// A steered message's `@file` is read in before it joins the turn (it
-    /// used to arrive as literal `@path`), and an image mid-turn keeps the
-    /// draft instead of being dropped.
+    /// used to arrive as literal `@path`), and images keep their native
+    /// attachment blocks through the same controlled input mailbox.
     #[test]
     fn mid_turn_steering_reads_file_references() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -19253,8 +19378,13 @@ mod tests {
 
         type_str(&mut sim, "also check @shot.png");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(sim.model().input.text(), "also check @shot.png");
-        assert_eq!(control.snapshot().pending_steering, 0, "nothing queued");
+        assert!(sim.model().input.is_empty());
+        let image = control.take_pending();
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].text, "also check @shot.png");
+        assert!(matches!(&image[0].content, crate::model::UserContent::Blocks(blocks)
+            if blocks.iter().any(|block| matches!(block, crate::model::ContentBlock::Image(image)
+                if image.mime_type == "image/png" && !image.data.is_empty()))));
 
         sim.model_mut().input.set_text("");
         type_str(&mut sim, "use @notes.txt");
@@ -19372,6 +19502,7 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.model_mut().displayed_session_id = Some("queued-input-owner".into());
 
         type_str(&mut sim, "focus on tests");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
@@ -19419,13 +19550,16 @@ mod tests {
             "the abort is acknowledged"
         );
 
-        // alt+up pulls the unsent messages back, in order, ahead of what is
-        // still in the editor; the lane is empty afterwards.
+        // Recall transfers native ownership without overwriting a newer draft.
         sim.inject_event(key(KeyCode::Up, Modifiers::ALT));
-        assert_eq!(
-            sim.model().input.text(),
-            "focus on tests\n\nthen summarize\n\n/model"
-        );
+        assert_eq!(sim.model().input.text(), "/model");
+        assert_eq!(sim.model().pending_goal_inputs.len(), 1);
+        sim.model_mut().input.set_text("");
+        sim.model_mut().state = AgentUiState::Ready;
+        sim.model_mut().apply_goal_input_restores();
+        assert_eq!(sim.model().input.text(), "focus on tests\n\nthen summarize");
+        assert!(sim.model().goal_draft.is_some());
+        assert!(submit_rx.try_recv().is_err(), "recall never submits input");
         let snapshot = control.snapshot();
         assert_eq!(
             (snapshot.pending_steering, snapshot.pending_follow_up),
@@ -19486,6 +19620,7 @@ mod tests {
             let mut sim = ProgramSimulator::new(model);
             sim.init();
             sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+            sim.model_mut().displayed_session_id = Some("queued-input-owner".into());
             sim.inject_event(Event::Paste(ftui::PasteEvent::new("saved\ndraft", true)));
             if extension {
                 sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
@@ -19515,10 +19650,13 @@ mod tests {
             assert_eq!(sim.model().input.text(), "saved\ndraft");
             assert_eq!(control.snapshot(), pending);
             sim.inject_event(key(code, modifiers));
-            assert_eq!(
-                sim.model().input.text(),
-                "steer\nfirst\n\nfollow\nsecond\n\nsaved\ndraft"
-            );
+            assert_eq!(sim.model().input.text(), "saved\ndraft");
+            assert_eq!(sim.model().pending_goal_inputs.len(), 1);
+            sim.model_mut().input.set_text("");
+            sim.model_mut().state = AgentUiState::Ready;
+            sim.model_mut().apply_goal_input_restores();
+            assert_eq!(sim.model().input.text(), "steer\nfirst\n\nfollow\nsecond");
+            assert!(sim.model().goal_draft.is_some());
             let pending = control.snapshot();
             assert_eq!(
                 (pending.pending_steering, pending.pending_follow_up),
@@ -19540,6 +19678,7 @@ mod tests {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model.with_turn_control(slot));
         sim.init();
+        sim.model_mut().displayed_session_id = Some("queued-input-owner".into());
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         sim.send(PiFtuiMsg::Agent(PiMsg::LoginPending {
             provider: Some(String::from("openai")),
@@ -19558,8 +19697,13 @@ mod tests {
         sim.inject_event(key(KeyCode::Char('c'), Modifiers::CTRL));
         sim.inject_event(Event::Paste(ftui::PasteEvent::new(" \n\t\n", true)));
         sim.inject_event(key(KeyCode::Up, Modifiers::ALT));
-        assert_eq!(sim.model().input.text(), "queued\nmessage\n\n \n\t\n");
+        assert_eq!(sim.model().input.text(), " \n\t\n");
+        assert_eq!(sim.model().pending_goal_inputs.len(), 1);
         assert_eq!(control.snapshot().pending_follow_up, 0);
+        sim.model_mut().input.set_text("");
+        sim.model_mut().state = AgentUiState::Ready;
+        sim.model_mut().apply_goal_input_restores();
+        assert_eq!(sim.model().input.text(), "queued\nmessage");
         drop(turn);
     }
 
@@ -31552,7 +31696,7 @@ mod tests {
             let result = run_controlled_turn_with_pending(
                 &mut handle,
                 first.clone(),
-                Some("A @already-prepared.txt".into()),
+                detached_follow_ups(&[(first.clone(), "A @already-prepared.txt")]).pop(),
                 pending,
                 Some(abort),
                 &tx,
@@ -31625,7 +31769,11 @@ mod tests {
                 let mut turn = Box::pin(run_controlled_turn_with_pending(
                     &mut handle,
                     UserContent::Text("prepared A".into()),
-                    Some("authored A".into()),
+                    detached_follow_ups(&[(
+                        UserContent::Text("prepared A".into()),
+                        "authored A",
+                    )])
+                    .pop(),
                     pending,
                     Some(signal),
                     &tx,
@@ -31673,7 +31821,11 @@ mod tests {
             let mut turn = Box::pin(run_controlled_turn_with_pending(
                 &mut handle,
                 UserContent::Text("prepared A".into()),
-                Some("authored A".into()),
+                detached_follow_ups(&[(
+                    UserContent::Text("prepared A".into()),
+                    "authored A",
+                )])
+                .pop(),
                 pending,
                 Some(signal),
                 &tx,
@@ -32107,8 +32259,8 @@ mod tests {
             assert!(aborts.lock().unwrap().is_none());
             assert_eq!(provider.calls.lock().unwrap().len(), 1);
             assert!(rx.try_iter().any(|event| matches!(event,
-                PiMsg::RestorePendingInput { text, .. }
-                if text == "/compact keep decisions\n\nheld authored input"
+                PiMsg::RestorePreparedInput(request)
+                if request.text() == "/compact keep decisions"
             )));
         });
     }
@@ -32441,10 +32593,9 @@ mod tests {
                 let restored = lifecycle
                     .iter()
                     .filter_map(|event| match event {
-                        PiMsg::RestorePendingInput {
-                            owner_session_id,
-                            text,
-                        } => Some((owner_session_id.as_str(), text.as_str())),
+                        PiMsg::RestorePreparedInput(request) => {
+                            Some((request.owner_session_id().to_string(), request.text()))
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -32452,7 +32603,7 @@ mod tests {
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     restored,
-                    vec![(owner_session_id.as_str(), pending_text)]
+                    vec![(owner_session_id.clone(), pending_text.to_string())]
                 );
 
                 let saved = crate::session::Session::open(&path.display().to_string()) // ubs:ignore[rust.ownership.unwrap-expect] -- The accepted input must remain durably readable.
@@ -32493,8 +32644,9 @@ mod tests {
                 let (_unused, model) = new_model();
                 let mut sim = ProgramSimulator::new(model);
                 sim.init();
+                sim.model_mut().displayed_session_id = Some(owner_session_id.clone());
                 for event in events {
-                    if matches!(&event, PiMsg::RestorePendingInput { .. }) {
+                    if matches!(&event, PiMsg::RestorePreparedInput(_)) {
                         // The user may start another draft after completion
                         // but before the pending controls reach the editor.
                         type_str(&mut sim, "new unsent draft");
@@ -32504,8 +32656,13 @@ mod tests {
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     sim.model().input.text(),
-                    format!("{pending_text}\n\nnew unsent draft")
+                    "new unsent draft"
                 );
+                assert_eq!(sim.model().pending_goal_inputs.len(), 1);
+                sim.model_mut().input.set_text("");
+                sim.model_mut().apply_goal_input_restores();
+                assert_eq!(sim.model().input.text(), pending_text);
+                assert!(sim.model().goal_draft.is_some());
                 assert_eq!(
                     // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
                     sim.model().state,

@@ -6,12 +6,15 @@
 
 use super::{
     AgentUiState, Cmd, EntryRole, PiFtuiModel, PiFtuiMsg, PiMsg, Receiver, RecvTimeoutError,
-    Sender, StopSignal, SubId, Subscription, SubscriptionSender, TurnControlSlot, UiCommand,
+    Sender, StopSignal, SubId, Subscription, SubscriptionSender, TurnAbortSlot, TurnControlSlot,
+    UiCommand,
 };
 use crate::error::{Error, Result};
 use crate::goal::GoalControl;
 use crate::model::UserContent;
 use crate::session_control::{PendingInput, SessionControlHandle};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SUB_ID: SubId = 0x5049_474f; // "PIGO"
@@ -284,11 +287,23 @@ pub struct RestoredInput {
     owner_session_id: String,
     branch_anchor: Option<String>,
     pending: Arc<Mutex<Vec<PendingInput>>>,
+    compaction: Option<RestoredCompaction>,
+    following: Arc<Mutex<VecDeque<Self>>>,
+    claimed: Arc<AtomicBool>,
+    abort: crate::agent::AbortHandle,
+}
+
+#[derive(Clone)]
+struct RestoredCompaction {
+    command: String,
+    instructions: Option<String>,
+    shake: bool,
+    request: super::CompactionRequest,
 }
 
 impl std::fmt::Debug for RestoredInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RestoredGoalInput")
+        f.debug_struct("RestoredInput")
             .field("id", &self.id)
             .finish_non_exhaustive()
     }
@@ -314,10 +329,75 @@ impl RestoredInput {
             owner_session_id: owner,
             branch_anchor: branch,
             pending: Arc::new(Mutex::new(pending)),
+            compaction: None,
+            following: Arc::default(),
+            claimed: Arc::default(),
+            abort: crate::agent::AbortHandle::new().0,
         }
     }
 
-    fn text(&self) -> String {
+    pub(super) fn for_turn(
+        owner: String,
+        branch: Option<String>,
+        pending: Vec<PendingInput>,
+    ) -> Self {
+        Self::new(uuid::Uuid::new_v4(), owner, branch, pending)
+    }
+
+    /// Keep a maintenance command between its original native batches.
+    /// Each step is reviewed and explicitly submitted; the command is never
+    /// converted into provider-visible text or automatically replayed.
+    pub(super) fn for_compaction(
+        owner: String,
+        branch: Option<String>,
+        before: Vec<PendingInput>,
+        command: String,
+        instructions: Option<String>,
+        shake: bool,
+        after: Vec<PendingInput>,
+    ) -> Self {
+        let mut steps = VecDeque::new();
+        if !before.is_empty() {
+            steps.push_back(Self::for_turn(owner.clone(), branch.clone(), before));
+        }
+        let mut maintenance = Self::for_turn(owner.clone(), branch.clone(), Vec::new());
+        maintenance.compaction = Some(RestoredCompaction {
+            command,
+            instructions,
+            shake,
+            request: super::CompactionRequest::new(owner.clone()),
+        });
+        steps.push_back(maintenance);
+        if !after.is_empty() {
+            steps.push_back(Self::for_turn(owner, branch, after));
+        }
+        let first = steps.pop_front().expect("compaction recovery has a command");
+        *first
+            .following
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = steps;
+        first
+    }
+
+    pub(super) fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+
+    pub(super) fn abort_handle(&self) -> crate::agent::AbortHandle {
+        self.compaction
+            .as_ref()
+            .map_or_else(|| self.abort.clone(), |step| step.request.abort.clone())
+    }
+
+    #[cfg(test)]
+    pub(super) fn owner_session_id(&self) -> &str {
+        &self.owner_session_id
+    }
+
+    pub(super) fn text(&self) -> String {
+        if let Some(compaction) = &self.compaction {
+            return compaction.command.clone();
+        }
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -397,6 +477,7 @@ impl PiFtuiModel {
 
     fn goal_composer_available(&self) -> bool {
         self.input_active()
+            && !self.browser_panel_open()
             && self.active_ask.is_none()
             && self.active_ext.is_none()
             && self.ext_queue.is_empty()
@@ -413,6 +494,7 @@ impl PiFtuiModel {
             || !self.goal_composer_available()
             || self.state != AgentUiState::Ready
             || self.busy.is_some()
+            || self.replaying_input.is_some()
             || self.live_goal().is_some()
         {
             return;
@@ -427,7 +509,26 @@ impl PiFtuiModel {
         }
     }
 
+    pub(super) fn restore_native_input(&mut self, request: RestoredInput) {
+        if self.goal_draft.is_none()
+            && self.input.is_empty()
+            && self.goal_composer_available()
+            && self.displayed_session_id.as_deref()
+                == Some(request.owner_session_id.as_str())
+            && self.replaying_input.is_none()
+        {
+            self.show_goal_draft(request);
+        } else {
+            self.pending_goal_inputs.push_back(request);
+            self.push_entry(
+                EntryRole::System,
+                "Unsent input is retained. Send or clear the current draft to review it.".to_string(),
+            );
+        }
+    }
+
     fn show_goal_draft(&mut self, request: RestoredInput) {
+        let maintenance = request.compaction.is_some();
         let text = request.text();
         self.input.set_text(&text);
         self.goal_draft = Some(Draft { request, text });
@@ -435,7 +536,12 @@ impl PiFtuiModel {
         self.autocomplete.close();
         self.push_entry(
             EntryRole::System,
-            "Restored unsent goal input with its original attachments. Review before sending; Ctrl+C clears it.".to_string(),
+            if maintenance {
+                "Restored queued compaction. Review before running; later input remains retained. Ctrl+C clears this recovery."
+            } else {
+                "Restored unsent input with its original attachments. Review before sending; Ctrl+C clears this recovery."
+            }
+            .to_string(),
         );
     }
 
@@ -500,17 +606,32 @@ impl PiFtuiModel {
             return true;
         }
         let request = draft.request.clone();
+        let replaying = request.clone();
+        let maintenance = request.compaction.as_ref().map(|step| step.request.clone());
+        let driver_submission = self.live_goal().is_none() && self.state != AgentUiState::Working;
         let result = if let Some(goal) = self.live_goal() {
-            if goal.id == request.source_invocation {
+            if goal.id == request.source_invocation
+                && request.compaction.is_none()
+                && request
+                    .following
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            {
                 goal.accepting_control().and_then(|control| {
-                    control
-                        .restore_pending(
-                            &mut request
-                                .pending
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        )
-                        .map(|_| ())
+                    if request.claimed.load(Ordering::Acquire) {
+                        return Err(Error::validation(
+                            "This recovered input was already submitted",
+                        ));
+                    }
+                    control.restore_pending(
+                        &mut request
+                            .pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    )?;
+                    request.claimed.store(true, Ordering::Release);
+                    Ok(())
                 })
             } else {
                 Err(Error::validation(
@@ -543,6 +664,11 @@ impl PiFtuiModel {
                 self.push_entry(EntryRole::User, text);
                 self.input.set_text("");
                 self.autocomplete.close();
+                if driver_submission {
+                    self.compaction_request = maintenance;
+                    self.replaying_input = Some(replaying);
+                    self.begin_busy("Sending retained input (Escape to cancel) ...");
+                }
             }
             Err(error) => self.push_entry(EntryRole::Error, error.to_string()),
         }
@@ -592,8 +718,10 @@ impl PiFtuiModel {
 struct ReplayRecovery<'a> {
     request: RestoredInput,
     events: &'a Sender<Event>,
+    agent_tx: &'a Sender<PiMsg>,
     first: Option<PendingInput>,
     control: Option<SessionControlHandle>,
+    compaction: Option<RestoredCompaction>,
 }
 
 impl Drop for ReplayRecovery<'_> {
@@ -621,16 +749,44 @@ impl Drop for ReplayRecovery<'_> {
             // because its hook, provider or final save later failed.
             pending.insert(0, first);
         }
-        if !pending.is_empty() {
-            // Never refill a consumed command: a stale command clone must
-            // not acquire new authority over its recovered tail.
-            let _ = self.events.send(Event::Pending(RestoredInput::new(
+        let mut following = std::mem::take(
+            &mut *self
+                .request
+                .following
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let next = if !pending.is_empty() || self.compaction.is_some() {
+            let mut next = RestoredInput::new(
                 self.request.source_invocation,
                 self.request.owner_session_id.clone(),
                 self.request.branch_anchor.clone(),
                 pending,
-            )));
+            );
+            next.compaction = self.compaction.take().map(|mut step| {
+                // A reviewed retry gets a fresh cancellation identity. An
+                // old completion or Escape clone cannot control the next try.
+                step.request = super::CompactionRequest::new(next.owner_session_id.clone());
+                step
+            });
+            Some(next)
+        } else {
+            following.pop_front()
+        };
+        if let Some(next) = next {
+            next.following
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(following);
+            // Never refill a consumed command: a stale command clone must
+            // not acquire authority over a recovered tail or maintenance step.
+            let _ = self.events.send(Event::Pending(next));
         }
+        // Completion follows every native lifecycle event on the same FIFO.
+        // The separate recovery channel may arrive first and is parked by UI.
+        let _ = self.agent_tx.send(PiMsg::PreparedInputFinished {
+            request_id: self.request.id,
+        });
     }
 }
 
@@ -643,33 +799,91 @@ pub(super) async fn run_restored(
     agent_tx: &Sender<PiMsg>,
     events: &Sender<Event>,
     controls: &TurnControlSlot,
+    aborts: TurnAbortSlot,
 ) {
+    if request.claimed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let compaction = request.compaction.clone();
     let mut recovery = ReplayRecovery {
         request,
         events,
+        agent_tx,
         first: None,
         control: None,
+        compaction,
     };
-    let owner = handle
-        .with_session(|session| {
-            session.header.id == recovery.request.owner_session_id
-                && recovery
-                    .request
-                    .branch_anchor
-                    .as_deref()
-                    .is_none_or(|anchor| {
-                        session
-                            .entries_for_current_path()
-                            .iter()
-                            .any(|entry| entry.base().id.as_deref() == Some(anchor))
-                    })
-        })
+    let abort = recovery.request.abort_handle();
+    // The UI owns this same token before driver admission. Escape therefore
+    // remains effective while session ownership or provider startup waits.
+    let _operation =
+        super::queued_compaction::OperationAbort::publish(&aborts, controls, &abort);
+    let signal = abort.signal();
+    let origin = {
+        let read = handle.with_session(|session| {
+            let same_branch = recovery
+                .request
+                .branch_anchor
+                .as_deref()
+                .is_none_or(|anchor| {
+                    session
+                        .entries_for_current_path()
+                        .iter()
+                        .any(|entry| entry.base().id.as_deref() == Some(anchor))
+                });
+            (session.header.id == recovery.request.owner_session_id && same_branch)
+                .then(|| {
+                    (
+                        session.header.id.clone(),
+                        session.leaf_id().map(str::to_string),
+                    )
+                })
+        });
+        let cancelled = signal.wait();
+        futures::pin_mut!(read, cancelled);
+        match futures::future::select(cancelled, read).await {
+            futures::future::Either::Left(_) => Err(Error::Aborted),
+            futures::future::Either::Right((result, _)) => result,
+        }
+    };
+    let origin = match origin {
+        Ok(Some(origin)) => origin,
+        refused => {
+            let event = if matches!(refused, Err(Error::Aborted)) {
+                PiMsg::AgentError(
+                    "Recovered input cancelled; unsent content remains retained.".to_string(),
+                )
+            } else {
+                PiMsg::AgentError(
+                    "Recovered input belongs to a different session or branch; nothing was sent."
+                        .to_string(),
+                )
+            };
+            let event = recovery.compaction.as_ref().map_or_else(
+                || event.clone(),
+                |step| PiMsg::CompactionFinished {
+                    request_id: step.request.id.clone(),
+                    event: Box::new(event.clone()),
+                },
+            );
+            let _ = agent_tx.send(event);
+            return;
+        }
+    };
+    if let Some(compaction) = recovery.compaction.clone() {
+        super::run_compact_command_with_receipt(
+            handle,
+            compaction.shake,
+            compaction.instructions.as_deref(),
+            compaction.request,
+            agent_tx,
+            controls,
+            &aborts,
+            || recovery.compaction = None,
+        )
         .await;
-    if !matches!(owner, Ok(true)) {
-        let _ = agent_tx.send(PiMsg::AgentError(
-            "Recovered goal input belongs to a different session or branch; nothing was sent."
-                .to_string(),
-        ));
+        // The following native batch returns for a separate explicit review.
+        // A failed command stays ahead of it in ReplayRecovery.
         return;
     }
     let mut pending = std::mem::take(
@@ -708,16 +922,29 @@ pub(super) async fn run_restored(
         super::report_turn_result(Err(error), agent_tx);
         return;
     }
-    controls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .publish(control.clone());
-    let result = turn.await;
+    {
+        let mut slot = controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.publish(control.clone());
+        if slot.current.is_some() {
+            slot.current_origin = Some(origin);
+        }
+    }
+    let cancelled = signal.wait();
+    futures::pin_mut!(turn, cancelled);
+    let result = match futures::future::select(cancelled, turn).await {
+        futures::future::Either::Left(((), turn)) => {
+            control.abort();
+            turn.await
+        }
+        futures::future::Either::Right((result, _)) => result,
+    };
     drop(progress);
     controls
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .current = None;
+        .retire();
     super::report_turn_result(result, agent_tx);
 }
 

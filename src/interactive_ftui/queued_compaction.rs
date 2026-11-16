@@ -4,7 +4,7 @@
 //! actual compaction. A command never enters provider history as a user prompt.
 
 use super::{
-    EntryRole, PiFtuiModel, PiMsg, Sender, TurnAbortSlot, TurnControlSlot, UiCommand,
+    EntryRole, PiFtuiModel, PiMsg, RestoredInput, Sender, TurnAbortSlot, TurnControlSlot, UiCommand,
     run_controlled_turn_with_pending, send_conversation_reset, strip_command,
 };
 use crate::agent::AbortHandle;
@@ -14,6 +14,7 @@ use crate::session_control::{PendingInput, SessionControlHandle, YieldBarrierId}
 #[derive(Clone)]
 pub struct QueuedCompaction {
     owner_session_id: String,
+    branch_anchor: Option<String>,
     control: SessionControlHandle,
     barrier: YieldBarrierId,
     command: String,
@@ -45,13 +46,16 @@ impl QueuedCompaction {
         self.control.has_yield_barrier()
     }
 
-    fn restore_text(&self, before: Vec<PendingInput>, after: Vec<PendingInput>) -> Vec<String> {
-        before
-            .into_iter()
-            .map(|input| input.text)
-            .chain(std::iter::once(self.command.clone()))
-            .chain(after.into_iter().map(|input| input.text))
-            .collect()
+    fn restoration(&self, before: Vec<PendingInput>, after: Vec<PendingInput>) -> RestoredInput {
+        RestoredInput::for_compaction(
+            self.owner_session_id.clone(),
+            self.branch_anchor.clone(),
+            before,
+            self.command.clone(),
+            self.instructions.clone(),
+            self.shake,
+            after,
+        )
     }
 }
 
@@ -66,6 +70,14 @@ impl PiFtuiModel {
         } else {
             return false;
         };
+        if self.replaying_input.is_some() {
+            self.push_entry(
+                EntryRole::Error,
+                "Finish or cancel recovered input before compacting; this command stays in the editor."
+                    .to_string(),
+            );
+            return true;
+        }
         if self.live_goal().is_some() {
             self.push_entry(
                 EntryRole::Error,
@@ -109,6 +121,7 @@ impl PiFtuiModel {
             }
         };
         let request = QueuedCompaction {
+            branch_anchor: self.live_input_branch_anchor(&owner_session_id),
             owner_session_id,
             control,
             barrier,
@@ -146,11 +159,11 @@ impl PiFtuiModel {
 
     /// Taking a barrier is atomic with the driver's claim. If it already
     /// started, a stale UI copy cannot recall or duplicate its inputs.
-    pub(super) fn take_queued_compaction_text(&mut self) -> Option<Vec<String>> {
+    pub(super) fn take_queued_compaction(&mut self) -> Option<RestoredInput> {
         let request = self.queued_compaction.take()?;
         let (before, after) = request.control.take_pending_at_barrier(request.barrier)?;
         request.abort.abort();
-        Some(request.restore_text(before, after))
+        Some(request.restoration(before, after))
     }
 
     pub(super) fn restore_cancelled_compaction(&mut self) {
@@ -158,25 +171,33 @@ impl PiFtuiModel {
             return;
         };
         request.abort.abort();
-        let owner_session_id = request.owner_session_id.clone();
-        let Some(text) = self.take_queued_compaction_text() else {
+        let Some(restored) = self.take_queued_compaction() else {
             return;
         };
-        // Use the ordinary delayed restoration path: modal answers and login
-        // editors must never receive the returned command or follow-ups.
-        let _ = self.handle_agent(PiMsg::RestorePendingInput {
-            owner_session_id,
-            text: text.join("\n\n"),
-        });
+        self.restore_native_input(restored);
     }
 }
 
-fn restore(request: &QueuedCompaction, text: Vec<String>, agent_tx: &Sender<PiMsg>) {
-    if !text.is_empty() {
-        let _ = agent_tx.send(PiMsg::RestorePendingInput {
-            owner_session_id: request.owner_session_id.clone(),
-            text: text.join("\n\n"),
-        });
+fn restore_command(
+    request: &QueuedCompaction,
+    before: Vec<PendingInput>,
+    after: Vec<PendingInput>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let _ = agent_tx.send(PiMsg::RestorePreparedInput(request.restoration(before, after)));
+}
+
+fn restore_inputs(
+    request: &QueuedCompaction,
+    pending: Vec<PendingInput>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    if !pending.is_empty() {
+        let _ = agent_tx.send(PiMsg::RestorePreparedInput(RestoredInput::for_turn(
+            request.owner_session_id.clone(),
+            request.branch_anchor.clone(),
+            pending,
+        )));
     }
 }
 
@@ -228,7 +249,7 @@ pub(super) async fn run(
         // Obsolete/refused commands need no driver authority or async work.
         // In particular, a stale command must not mask a newer request's Esc.
         if let Some((before, after)) = request.control.take_pending_at_barrier(request.barrier) {
-            restore(&request, request.restore_text(before, after), agent_tx);
+            restore_command(&request, before, after, agent_tx);
         }
         return;
     }
@@ -247,7 +268,7 @@ pub(super) async fn run(
         }
     };
     if !same_session || signal.is_aborted() {
-        restore(&request, request.restore_text(before, after), agent_tx);
+        restore_command(&request, before, after, agent_tx);
         return;
     }
 
@@ -285,7 +306,7 @@ pub(super) async fn run(
         }
         Err(error) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("Queued compaction: {error}")));
-            restore(&request, request.restore_text(before, after), agent_tx);
+            restore_command(&request, before, after, agent_tx);
             return;
         }
     }
@@ -296,11 +317,7 @@ pub(super) async fn run(
     });
     if signal.is_aborted() {
         // A completed transaction is never replayed after a late cancellation.
-        restore(
-            &request,
-            after.into_iter().map(|input| input.text).collect(),
-            agent_tx,
-        );
+        restore_inputs(&request, after, agent_tx);
         return;
     }
 
@@ -311,8 +328,8 @@ pub(super) async fn run(
     if let Some(input) = after.next() {
         let result = run_controlled_turn_with_pending(
             handle,
-            input.content,
-            Some(input.text),
+            input.content.clone(),
+            Some(input),
             after.collect(),
             Some(signal),
             agent_tx,
@@ -321,6 +338,6 @@ pub(super) async fn run(
         .await;
         // Stops/caps and arrivals at the final boundary are returned intact
         // instead of resetting the completed turn's timer or merging content.
-        restore(&request, result.into_restore_texts(), agent_tx);
+        restore_inputs(&request, result.into_restored_inputs(), agent_tx);
     }
 }

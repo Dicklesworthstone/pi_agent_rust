@@ -2479,6 +2479,12 @@ pub enum PiMsg {
         owner_session_id: String,
         text: String,
     },
+    /// Retain prepared FTUI input for explicit review without re-reading files.
+    #[cfg(feature = "ftui")]
+    RestorePreparedInput(crate::interactive_ftui::RestoredInput),
+    /// Retire only the recovered input whose native lifecycle has settled.
+    #[cfg(feature = "ftui")]
+    PreparedInputFinished { request_id: uuid::Uuid },
     /// Return unclaimed turn input without replacing a newer editor draft.
     RestorePendingInput {
         owner_session_id: String,
