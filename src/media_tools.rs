@@ -151,8 +151,8 @@ impl MediaAuthScope {
 
 pub const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_TTS_TEXT_CHARS: usize = 4096;
-/// Default decoded-byte cap for an inline video/audio block (`media.maxBytes`).
-pub const DEFAULT_MEDIA_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Default decoded-byte cap for an audio/video attachment (`media.maxBytes`: 64 MiB).
+pub const DEFAULT_MEDIA_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 // Deterministic test fixtures, reachable only in explicit mock mode or tests.
 // Native adapters never substitute these for a missing provider response.

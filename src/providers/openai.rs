@@ -44,7 +44,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 // Local transport bounds, independent of the upstream service's limits.
-// Ingress still applies media.maxBytes (5 MiB by default) before session edits.
+// Ingress still applies media.maxBytes (64 MiB by default) before session edits.
 const MAX_AUDIO_BLOCK_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_AUDIO_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_AUDIO_BLOCKS: usize = 32;

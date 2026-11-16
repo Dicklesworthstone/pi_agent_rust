@@ -1245,7 +1245,7 @@ printf '{"type":"agent_end","sessionId":"native-rpc","messages":[]}\n'
     fn ordinary_media_echoes_fit_response_and_pre_ack_bounds() {
         use base64::Engine as _;
 
-        // Both clips fit the default 5 MiB per-file policy. Their combined
+        // Both clips fit within the default 64 MiB per-file policy. Their combined
         // encoded prompt exceeds the old 8 MiB response-line bound and the old
         // 4 MiB pre-ACK budget; testing it does not allocate near the new caps.
         let audio = base64::engine::general_purpose::STANDARD.encode(vec![0_u8; 5 * 1024 * 1024]);
