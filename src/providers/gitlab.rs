@@ -87,8 +87,12 @@ struct GitLabReportedToolCall {
     #[serde(default)]
     id: Option<String>,
     name: String,
-    #[serde(default)]
+    #[serde(default = "empty_tool_arguments")]
     arguments: serde_json::Value,
+}
+
+fn empty_tool_arguments() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// GitLab Chat response wrapper used by some self-hosted / AI Gateway versions.
@@ -151,23 +155,30 @@ fn parse_gitlab_payload(
             let mut reported_tool_calls = Vec::new();
             for (idx, tc) in parsed.tool_calls.into_iter().enumerate() {
                 let trimmed_name = tc.name.trim();
-                if trimmed_name.is_empty()
-                    || (!allowed_tools.is_empty() && !allowed_tools.contains(trimmed_name))
-                {
+                if trimmed_name.is_empty() || !allowed_tools.contains(trimmed_name) {
                     continue;
                 }
+                let invalid_arguments = || {
+                    Error::provider(
+                        "gitlab",
+                        format!(
+                            "PI_TOOL_CALL_PROTOCOL: invalid GitLab tool arguments at index {idx}: arguments must be a JSON object; local tool batch withheld"
+                        ),
+                    )
+                };
                 let args = match tc.arguments {
                     val @ serde_json::Value::Object(_) => val,
                     serde_json::Value::String(raw) => serde_json::from_str(&raw)
                         .ok()
                         .filter(serde_json::Value::is_object)
-                        .unwrap_or_else(|| serde_json::json!({})),
-                    _ => serde_json::json!({}),
+                        .ok_or_else(invalid_arguments)?,
+                    _ => return Err(invalid_arguments()),
                 };
                 reported_tool_calls.push(crate::model::ToolCall {
                     id: tc
                         .id
-                        .filter(|id| !id.trim().is_empty())
+                        .map(|id| id.trim().to_string())
+                        .filter(|id| !id.is_empty())
                         .unwrap_or_else(|| format!("gitlab_call_{}", idx + 1)),
                     name: trimmed_name.to_string(),
                     arguments: args,
@@ -204,6 +215,39 @@ fn parse_gitlab_payload(
             "Unsupported GitLab Chat success response shape",
         )),
     }
+}
+
+/// Some gateways repeat native calls inside the textual bridge. One call ID
+/// names one invocation: accept an exact repeat once, but never guess which
+/// payload a conflicting ID meant. Validate the whole batch before emitting
+/// any events so a later malformed peer cannot authorize earlier tool work.
+fn merge_tool_calls(
+    reported: Vec<crate::model::ToolCall>,
+    prompt: Vec<crate::model::ToolCall>,
+) -> Result<Vec<crate::model::ToolCall>> {
+    let mut calls: Vec<crate::model::ToolCall> = Vec::new();
+    let mut call_indices: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (index, call) in reported.into_iter().chain(prompt).enumerate() {
+        match call_indices.entry(call.id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let previous = &calls[*entry.get()];
+                if previous.name != call.name || previous.arguments != call.arguments {
+                    return Err(Error::provider(
+                        "gitlab",
+                        format!(
+                            "PI_TOOL_CALL_PROTOCOL: conflicting GitLab tool call ID at index {index}; local tool batch withheld"
+                        ),
+                    ));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(calls.len());
+                calls.push(call);
+            }
+        }
+    }
+    Ok(calls)
 }
 
 #[cfg(test)]
@@ -825,8 +869,7 @@ impl GitLabProvider {
         let (cleaned_text, prompt_tool_calls) =
             crate::provider::extract_prompt_tool_calls(&parsed.text, &allowed_tools);
 
-        let mut tool_calls = parsed.reported_tool_calls;
-        tool_calls.extend(prompt_tool_calls);
+        let tool_calls = merge_tool_calls(parsed.reported_tool_calls, prompt_tool_calls)?;
 
         let mut content_blocks = Vec::new();
         if tool_calls.is_empty() {
@@ -983,7 +1026,7 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("set nonblocking listener");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + FIXTURE_BUDGET;
         let (mut socket, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -1010,7 +1053,82 @@ mod tests {
             }
             request.extend_from_slice(&chunk[..read]);
         }
+        // Consume the body before closing the connection after our response.
+        // Otherwise a split request can leave unread bytes and reset the
+        // socket, hiding the provider behavior this fixture should exercise.
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("complete request headers");
+        let body_len = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or_default();
+        while request.len() < header_end + 4 + body_len {
+            let read = read_with_deadline(&mut socket, &mut chunk, deadline, "request body");
+            assert!(read > 0, "request body ended early");
+            request.extend_from_slice(&chunk[..read]);
+        }
         socket
+    }
+
+    fn stream_tool_response(
+        response: serde_json::Value,
+        tools: Vec<ToolDef>,
+    ) -> Result<Vec<StreamEvent>> {
+        use futures::TryStreamExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind GitLab fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let body = response.to_string();
+        let server = std::thread::spawn(move || {
+            let mut socket = accept_test_request(listener);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write GitLab response");
+        });
+        let provider = GitLabProvider::new("gitlab-duo-chat")
+            .with_base_url(format!("http://{address}"));
+        let context = Context::owned(
+            None,
+            vec![Message::User(UserMessage {
+                content: UserContent::Text("Use the available tools.".to_string()),
+                timestamp: 1,
+            })],
+            tools,
+        );
+        let options = StreamOptions {
+            api_key: Some("glpat-fixture".to_string()),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("fixture runtime");
+        let result = runtime.block_on(async {
+            provider
+                .stream(&context, &options)
+                .await?
+                .try_collect()
+                .await
+        });
+        server.join().expect("GitLab fixture completed");
+        result
+    }
+
+    fn tool_definition(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: "Test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
     }
 
     fn run_stream_bounded(
@@ -1658,6 +1776,183 @@ mod tests {
             p.chat_url(),
             "https://gitlab.example.com/api/v4/chat/completions"
         );
+    }
+
+    #[test]
+    fn test_gitlab_native_calls_require_an_advertised_tool() {
+        for tools in [Vec::new(), vec![tool_definition("other")]] {
+            let events = stream_tool_response(
+                serde_json::json!({
+                    "response": "Ordinary answer.",
+                    "tool_calls": [{
+                        "id": "unrequested", "name": "echo", "arguments": {"text": "hello"}
+                    }]
+                }),
+                tools,
+            )
+            .expect("text remains available without admitting an unadvertised tool");
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. }
+            )));
+            assert!(matches!(
+                events.last(),
+                Some(StreamEvent::Done { reason: StopReason::Stop, message })
+                    if matches!(message.content.as_slice(), [ContentBlock::Text(text)]
+                        if text.text == "Ordinary answer.")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_gitlab_malformed_native_arguments_withhold_the_entire_batch() {
+        for arguments in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(12),
+            serde_json::json!([]),
+            serde_json::json!("[1, 2]"),
+            serde_json::json!("null"),
+            serde_json::json!("{\"text\":\"private-argument-token\""),
+        ] {
+            let error = stream_tool_response(
+                serde_json::json!({
+                    "response": "Run these tools.",
+                    "tool_calls": [
+                        {"id": "valid-peer", "name": "echo", "arguments": {}},
+                        {"id": "private-call-token", "name": "echo", "arguments": arguments}
+                    ]
+                }),
+                vec![tool_definition("echo")],
+            )
+            .expect_err("invalid peer must fail before any tool event is emitted")
+            .to_string();
+            assert!(error.contains("PI_TOOL_CALL_PROTOCOL"), "{error}");
+            assert!(error.contains("index 1"), "{error}");
+            assert!(!error.contains("private-"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_gitlab_native_arguments_accept_objects_and_omitted_empty_input() {
+        for (arguments, expected) in [
+            (None, serde_json::json!({})),
+            (Some(serde_json::json!({})), serde_json::json!({})),
+            (
+                Some(serde_json::json!({"text": "hello"})),
+                serde_json::json!({"text": "hello"}),
+            ),
+            (
+                Some(serde_json::json!("{\"text\":\"hello\"}")),
+                serde_json::json!({"text": "hello"}),
+            ),
+        ] {
+            let mut call = serde_json::json!({"id": " call-1 ", "name": "echo"});
+            if let Some(arguments) = arguments {
+                call["arguments"] = arguments;
+            }
+            let events = stream_tool_response(
+                serde_json::json!({"tool_calls": [call]}),
+                vec![tool_definition("echo")],
+            )
+            .expect("valid native arguments");
+            assert!(matches!(
+                events.last(),
+                Some(StreamEvent::Done { reason: StopReason::ToolUse, message })
+                    if matches!(message.content.as_slice(), [ContentBlock::ToolCall(call)]
+                        if call.id == "call-1" && call.arguments == expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_gitlab_repeated_native_and_prompt_call_is_one_invocation() {
+        let call = serde_json::json!({
+            "id": "call-1", "name": "echo", "arguments": {"text": "hello"}
+        });
+        let events = stream_tool_response(
+            serde_json::json!({
+                "response": format!("Checking. <pi_tool_call>{call}</pi_tool_call>"),
+                "tool_calls": [call.clone(), call]
+            }),
+            vec![tool_definition("echo")],
+        )
+        .expect("matching native and textual representations identify one invocation");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { reason: StopReason::ToolUse, message })
+                if matches!(message.content.as_slice(), [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                    if text.text == "Checking." && call.id == "call-1")
+        ));
+    }
+
+    #[test]
+    fn test_gitlab_conflicting_tool_id_withholds_native_and_prompt_batches() {
+        let original = serde_json::json!({
+            "id": "private-call-token", "name": "echo", "arguments": {"text": "original"}
+        });
+        for conflicting in [
+            serde_json::json!({
+                "id": "private-call-token", "name": "echo", "arguments": {"text": "private-argument-token"}
+            }),
+            serde_json::json!({
+                "id": "private-call-token", "name": "other", "arguments": {"text": "original"}
+            }),
+        ] {
+            for native_conflict in [false, true] {
+                let response = if native_conflict {
+                    serde_json::json!({"tool_calls": [original.clone(), conflicting.clone()]})
+                } else {
+                    serde_json::json!({
+                        "response": format!("<pi_tool_call>{conflicting}</pi_tool_call>"),
+                        "tool_calls": [original.clone()]
+                    })
+                };
+                let error = stream_tool_response(
+                    response,
+                    vec![tool_definition("echo"), tool_definition("other")],
+                )
+                .expect_err("one ID cannot authorize different tool invocations")
+                .to_string();
+                assert!(error.contains("PI_TOOL_CALL_PROTOCOL"), "{error}");
+                assert!(error.contains("conflicting"), "{error}");
+                assert!(!error.contains("private-"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_gitlab_distinct_tool_ids_preserve_repeated_intent() {
+        let events = stream_tool_response(
+            serde_json::json!({
+                "response": "<pi_tool_call>{\"id\":\"call-2\",\"name\":\"echo\",\"arguments\":{}}</pi_tool_call>",
+                "tool_calls": [{"id": "call-1", "name": "echo", "arguments": {}}]
+            }),
+            vec![tool_definition("echo")],
+        )
+        .expect("different IDs remain separate invocations");
+        let ids = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["call-1", "call-2"]);
     }
 
     #[test]
