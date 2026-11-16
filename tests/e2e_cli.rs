@@ -1144,16 +1144,20 @@ fn e2e_cli_extension_compat_ledger_keeps_cli_extensions_with_no_extensions() {
     .expect("write ext.ts");
 
     let ext_arg = ext_path.display().to_string();
-    let result = harness.run(&[
-        "--list-models",
-        "--no-extensions",
-        "--extension",
-        ext_arg.as_str(),
-    ]);
+    for mode in ["text", "json"] {
+        let result = harness.run(&[
+            "--mode",
+            mode,
+            "--list-models",
+            "--no-extensions",
+            "--extension",
+            ext_arg.as_str(),
+        ]);
 
-    assert_exit_code(&harness.harness, &result, 0);
-    let combined = format!("{}\n{}", result.stdout, result.stderr);
-    assert_contains(&harness.harness, &combined, "pi.ext.compat_ledger.v1");
+        assert_exit_code(&harness.harness, &result, 0);
+        let combined = format!("{}\n{}", result.stdout, result.stderr);
+        assert_contains(&harness.harness, &combined, "pi.ext.compat_ledger.v1");
+    }
 
     let log_path = harness.harness.temp_path("extension-cli-log.jsonl");
     harness
@@ -5130,35 +5134,146 @@ fn e2e_cli_json_mode_stdin_emits_header_and_events() {
 }
 
 #[test]
-fn e2e_cli_json_mode_no_input_emits_header_and_exits_zero() {
-    let harness = CliTestHarness::new("e2e_cli_json_mode_no_input_emits_header_and_exits_zero");
+fn e2e_cli_print_without_input_is_a_usage_error_in_both_modes() {
+    let harness =
+        CliTestHarness::new("e2e_cli_print_without_input_is_a_usage_error_in_both_modes");
 
-    let mut args: Vec<&str> = vec![
-        "--mode",
-        "json",
-        "--provider",
-        "anthropic",
-        "--model",
-        "claude-sonnet-4-5",
-        "--api-key",
-        "test-vcr-key",
-    ];
-    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    for mode in ["text", "json"] {
+        for stdin in [None, Some(b"".as_slice()), Some(b" \n".as_slice())] {
+            // No credentials are needed to diagnose missing input. This also
+            // exercises EOF and whitespace from a piped producer.
+            let mut args = vec!["--print", "--mode", mode];
+            args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+            let result = harness.run_with_stdin(&args, stdin);
+            assert_exit_code(&harness.harness, &result, 2);
+            assert_contains(&harness.harness, &result.stderr, "No input provided");
+            if mode == "json" {
+                let record =
+                    assert_single_fatal_error_record(&harness.harness, &result, "startup");
+                assert_eq!(record["code"], "usage", "{record}");
+            } else {
+                assert!(result.stdout.is_empty(), "{}", result.stdout);
+            }
+        }
+    }
+}
 
-    let result = harness.run(&args);
-    assert_exit_code(&harness.harness, &result, 0);
+/// A successful HTTP exchange may finish with an error AssistantMessage.
+/// Scripts need a failure status after the full lifecycle, and no later prompt
+/// may run. Exercise both the ordinary and attachment input paths, including
+/// retry exhaustion; a second success response makes continued work observable.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_cli_print_terminal_provider_error_stops_the_invocation() {
+    for (mode, attached, retries) in [
+        ("text", false, 0),
+        ("json", false, 0),
+        ("json", true, 0),
+        ("json", false, 1),
+    ] {
+        let harness = CliTestHarness::new(&format!(
+            "e2e_cli_print_terminal_provider_error_{mode}_{attached}_{retries}"
+        ));
+        let server = harness.harness.start_mock_http_server();
+        let prefix = json!({"choices": [{
+            "index": 0, "delta": {"content": "Partial answer"}, "finish_reason": null
+        }]});
+        let failure = json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+            "error": {"message": "HTTP 503: fixture unavailable"}
+        });
+        let mut responses = (0..=retries)
+            .map(|_| MockHttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+                body: format!(
+                    "data: {prefix}\n\ndata: {failure}\n\ndata: [DONE]\n\n"
+                )
+                .into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let success = json!({"choices": [{
+            "index": 0, "delta": {"content": "The second prompt must never run"},
+            "finish_reason": "stop"
+        }]});
+        responses.push(MockHttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body: format!("data: {success}\n\ndata: [DONE]\n\n").into_bytes(),
+        });
+        server.add_route_queue("POST", "/v1/chat/completions", responses);
+        let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+        fs::create_dir_all(&agent_dir).expect("create isolated agent directory");
+        fs::write(agent_dir.join("auth.json"), b"{}").expect("write isolated auth");
+        fs::write(
+            agent_dir.join("models.json"),
+            json!({"providers": {"print-outcome-fixture": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/v1", server.base_url()),
+                "apiKey": "offline-fixture", "authHeader": true,
+                "models": [{"id": "offline", "reasoning": false,
+                    "contextWindow": 32_000, "maxTokens": 128}]
+            }}})
+            .to_string(),
+        )
+        .expect("write loopback provider");
+        fs::write(
+            &harness.env["PI_CONFIG_PATH"],
+            json!({
+                "compaction": {"enabled": false}, "checkForUpdates": false,
+                "retry": {"enabled": retries > 0, "maxRetries": retries,
+                    "baseDelayMs": 0, "maxDelayMs": 0}
+            })
+            .to_string(),
+        )
+        .expect("write isolated settings");
+        let attachment = harness.harness.create_file("context.txt", b"Attachment context");
+        let file_arg = format!("@{}", attachment.display());
+        let mut args = vec![
+            "--print", "--mode", mode, "--no-session", "--no-mcp",
+            "--provider", "print-outcome-fixture", "--model", "offline",
+            "--system-prompt", "Exercise terminal provider errors.",
+        ];
+        args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+        if attached {
+            args.push(&file_arg);
+        }
+        args.extend(["first prompt", "second prompt must not run"]);
 
-    let lines = parse_json_mode_stdout_lines(&result.stdout);
-    assert_eq!(
-        lines.len(),
-        1,
-        "no-input JSON mode should emit only session header, got {} lines",
-        lines.len()
-    );
-    assert_eq!(
-        lines[0]["type"], "session",
-        "first line must be session header"
-    );
+        let result = harness.run(&args);
+        assert_exit_code(&harness.harness, &result, 1);
+        assert_eq!(
+            server.requests().len(),
+            retries + 1,
+            "only the first prompt and its retries may reach the provider"
+        );
+        assert_contains(&harness.harness, &result.stderr, "fixture unavailable");
+        assert!(!result.stdout.contains("The second prompt must never run"));
+        if mode == "json" {
+            let records = parse_json_mode_stdout_lines(&result.stdout);
+            assert_eq!(records[0]["type"], "session");
+            for kind in ["agent_start", "agent_end"] {
+                assert_eq!(
+                    records.iter().filter(|record| record["type"] == kind).count(),
+                    1,
+                    "{kind} belongs to one logical failed prompt"
+                );
+            }
+            assert_eq!(
+                records.iter().filter(|record| record["type"] == "auto_retry_start").count(),
+                retries
+            );
+            let terminal = records.len().checked_sub(2).expect("terminal and diagnostic");
+            assert_eq!(records[terminal]["type"], "agent_end");
+            assert!(records[terminal]["error"].is_string());
+            let diagnostic = records.last().expect("failure diagnostic");
+            assert_eq!(diagnostic["type"], "error");
+            assert_eq!(diagnostic["phase"], "run");
+            assert_eq!(diagnostic["exit_code"], 1);
+        } else {
+            assert_contains(&harness.harness, &result.stdout, "Partial answer");
+        }
+    }
 }
 
 #[test]

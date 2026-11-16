@@ -1151,7 +1151,8 @@ fn main_impl() -> Result<()> {
     }
     if cli.command.is_none()
         && cli.fetch_models.is_none()
-        && early_mode.eq("text")
+        && cli.list_models.is_none()
+        && matches!(early_mode.as_str(), "text" | "json")
         && cli.export.is_none()
         && piped_stdin.is_none()
         && cli.file_args().is_empty()
@@ -1160,7 +1161,7 @@ fn main_impl() -> Result<()> {
             .iter()
             .all(|message| message.trim().is_empty())
     {
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+        return Err(print_input_required());
     }
 
     // Initialize logging (skip for ultra-fast paths like --version).
@@ -2623,8 +2624,8 @@ async fn run(
     // Persistence was decided before resolving --continue/--resume into an
     // exact path, including the no-candidate case that creates a new session.
     debug_assert!(!is_print_mode || requested_session || cli.no_session);
-    if mode.eq("text") && initial.is_none() && messages.is_empty() {
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+    if is_print_mode && initial.is_none() && messages.is_empty() {
+        return Err(print_input_required());
     }
 
     // Path-scoped model sets + disabled providers (bd-cv653.3.2): the most
@@ -10047,17 +10048,24 @@ fn validate_print_attachment_command(initial: &InitialMessage, first_is_piped: b
     Ok(())
 }
 
+fn print_input_required() -> anyhow::Error {
+    pi::error::Error::validation(
+        "No input provided. Use: pi -p \"your message\" or pipe input via stdin",
+    )
+    .into()
+}
+
+/// A completed event stream can still describe a failed or cancelled turn.
+/// Every print surface must reject that outcome before admitting another prompt.
 fn ensure_print_command_response(message: &AssistantMessage) -> Result<()> {
-    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-        bail!(
+    match message.stop_reason {
+        StopReason::Aborted => Err(pi::error::Error::Aborted.into()),
+        StopReason::Error => bail!(
             "{}",
-            message
-                .error_message
-                .as_deref()
-                .unwrap_or("Retried turn failed")
-        );
+            message.error_message.as_deref().unwrap_or("Request error")
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -10321,11 +10329,7 @@ async fn run_print_mode_inner(
         note_machine_stream_opened();
     }
     if initial.is_none() && messages.is_empty() {
-        if mode.eq("json") {
-            flush_stdout()?;
-            return Ok(());
-        }
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+        return Err(print_input_required());
     }
 
     let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
@@ -10384,11 +10388,7 @@ async fn run_print_mode_inner(
     }
 
     if initial.is_none() && messages.is_empty() {
-        if mode.eq("json") {
-            flush_stdout()?;
-            return Ok(());
-        }
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+        return Err(print_input_required());
     }
 
     let retry_enabled = config.retry_enabled();
@@ -10447,9 +10447,7 @@ async fn run_print_mode_inner(
                 config,
             )?;
         }
-        if owner_session_id.is_some() {
-            ensure_print_command_response(&message)?;
-        }
+        ensure_print_command_response(&message)?;
     }
 
     for request in messages {
@@ -10548,13 +10546,8 @@ async fn run_print_mode_inner(
                 config,
             )?;
         }
-        if owner_session_id.is_some() {
-            ensure_print_command_response(&response)?;
-        }
+        ensure_print_command_response(&response)?;
         if retry_command {
-            // JSON prompts historically report a provider error in-band.
-            // A requested command must also fail the process for scripts.
-            ensure_print_command_response(&response)?;
             if is_json {
                 write_print_line(&serde_json::to_string(&serde_json::json!({
                     "type": "command_result", "command": "retry", "success": true
@@ -10564,11 +10557,7 @@ async fn run_print_mode_inner(
     }
 
     if sent_prompts.eq(&0) {
-        if mode.eq("json") {
-            flush_stdout()?;
-            return Ok(());
-        }
-        bail!("No messages were sent");
+        return Err(pi::error::Error::validation("No messages were sent").into());
     }
 
     if let Some(owner_session_id) = owner_session_id
@@ -10764,11 +10753,7 @@ fn finish_print_text_response(
 ) -> Result<()> {
     if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
         emit_trailing_print_newline(stream_state)?;
-        let error_message = message
-            .error_message
-            .clone()
-            .unwrap_or_else(|| "Request error".to_string());
-        bail!(error_message);
+        return ensure_print_command_response(message);
     }
 
     if stream_state.should_render_final_message() {
@@ -13669,6 +13654,27 @@ mod tests {
             !append_file_fingerprint(&mut hasher, &path),
             "non-regular or symlinked cache inputs must disable the fast-path cache"
         );
+    }
+
+    #[test]
+    fn print_terminal_response_errors_keep_their_exit_classification() {
+        for reason in [StopReason::Error, StopReason::Aborted] {
+            for message in [None, Some("terminal fixture error".to_string())] {
+                let response = AssistantMessage {
+                    stop_reason: reason,
+                    error_message: message,
+                    ..AssistantMessage::default()
+                };
+                let error = ensure_print_command_response(&response).unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+                assert!(!error.to_string().is_empty());
+                if reason == StopReason::Aborted {
+                    assert_eq!(fatal_error_code(&error), "aborted");
+                }
+            }
+        }
+        assert_eq!(exit_code_for_error(&print_input_required()), EXIT_CODE_USAGE);
+        assert_eq!(fatal_error_code(&print_input_required()), "usage");
     }
 
     #[test]

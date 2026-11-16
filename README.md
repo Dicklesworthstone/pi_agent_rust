@@ -993,7 +993,15 @@ credential, or extension dialogs. Complete sources are screened before clipping,
 and local drafts, in-flight response text, and truncated tool cards stay local.
 Headless, WASM, and QR pairing remain unimplemented.
 
-**Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
+**Print mode** sends one or more messages, streams each response to stdout, and exits. Useful for shell scripts and one-off queries.
+
+Text and JSON print modes use the same success contract: a terminal provider
+failure or cancellation exits **1** and stops before any remaining prompt.
+Retries and configured failover finish before Pi decides the final outcome.
+JSON output retains the completed agent lifecycle, followed by one
+`{"type":"error","phase":"run",...,"exit_code":1}` diagnostic. Missing or
+whitespace-only input is a usage error (**2**); JSON mode reports it before
+opening a session stream. A successfully recovered request still exits **0**.
 
 **Print mode and tool approval.** The approval mode defaults to `always-ask` on
 every surface, including `-p`. The absence of a terminal is not treated as
