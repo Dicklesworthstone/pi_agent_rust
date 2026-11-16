@@ -4,8 +4,8 @@
 //! actual compaction. A command never enters provider history as a user prompt.
 
 use super::{
-    EntryRole, PiFtuiModel, PiMsg, RestoredInput, Sender, TurnAbortSlot, TurnControlSlot, UiCommand,
-    run_controlled_turn_with_pending, send_conversation_reset, strip_command,
+    EntryRole, PiFtuiModel, PiMsg, RestoredInput, Sender, TurnAbortSlot, TurnControlSlot,
+    UiCommand, run_controlled_turn_with_pending, send_conversation_reset, strip_command,
 };
 use crate::agent::AbortHandle;
 use crate::session_control::{PendingInput, SessionControlHandle, YieldBarrierId};
@@ -184,7 +184,9 @@ fn restore_command(
     after: Vec<PendingInput>,
     agent_tx: &Sender<PiMsg>,
 ) {
-    let _ = agent_tx.send(PiMsg::RestorePreparedInput(request.restoration(before, after)));
+    let _ = agent_tx.send(PiMsg::RestorePreparedInput(
+        request.restoration(before, after),
+    ));
 }
 
 fn restore_inputs(

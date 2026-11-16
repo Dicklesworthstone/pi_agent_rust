@@ -32671,7 +32671,7 @@ mod tests {
                 let (_unused, model) = new_model();
                 let mut sim = ProgramSimulator::new(model);
                 sim.init();
-                sim.model_mut().displayed_session_id = Some(owner_session_id.clone());
+                sim.model_mut().displayed_session_id = Some(owner_session_id);
                 for event in events {
                     if matches!(&event, PiMsg::RestorePreparedInput(_)) {
                         // The user may start another draft after completion

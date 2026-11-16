@@ -345,9 +345,10 @@ pub fn prompt_index_for(enabled: &[&str], config: Option<&Config>) -> Vec<(Strin
 }
 
 /// System-prompt discoverable index accounting for CLI selection policy:
-/// explicit `--tools` restricts discovery to the named slice, whereas default
-/// implicit selection also advertises settings-enabled built-in tools
-/// (`manage_skill`, memory bank, media tools, `browser`, `computer`).
+/// explicit `--tools` entries are promoted to the `Essential` schema tier and
+/// omitted from the discoverable index, while implicit settings-enabled
+/// built-in tools (`manage_skill`, memory bank, media tools, `browser`,
+/// `computer`) remain advertised as discoverable.
 #[must_use]
 pub fn prompt_index_for_cli(
     cli: &crate::cli::Cli,
@@ -360,9 +361,14 @@ pub fn prompt_index_for_cli(
     if cli.no_implicit_tools {
         return prompt_index_for(enabled, config);
     }
-    let mut combined: Vec<&str> = enabled.to_vec();
+    let explicit = cli.explicit_tools();
+    let mut combined: Vec<&str> = enabled
+        .iter()
+        .copied()
+        .filter(|name| !explicit.contains(name))
+        .collect();
     for implicit in implicit_enabled_tools(config) {
-        if !combined.contains(&implicit) {
+        if !explicit.contains(&implicit) && !combined.contains(&implicit) {
             combined.push(implicit);
         }
     }
@@ -750,7 +756,7 @@ mod tests {
         let registry = if cli.builtin_tools_disabled() {
             crate::tools::ToolRegistry::without_builtins(Some(config))
         } else {
-            crate::tools::ToolRegistry::with_builtin_tool_policy(
+            let mut registry = crate::tools::ToolRegistry::with_builtin_tool_policy(
                 &enabled,
                 cwd,
                 Some(config),
@@ -759,7 +765,9 @@ mod tests {
                 true,
                 None,
                 !cli.no_implicit_tools,
-            )
+            );
+            registry.promote_tools(&cli.explicit_tools());
+            registry
         };
         let prompt = crate::app::build_system_prompt(
             cli, cwd, &enabled, None, cwd, cwd, true, false, None, config,
@@ -915,7 +923,10 @@ mod tests {
             for (_, name) in OPTIONAL_TOOL_SETTINGS {
                 assert!(registry.get(name).is_some(), "{name} remains selected");
             }
-            assert!(registry.is_discoverable("eval"));
+            assert_eq!(
+                registry.is_discoverable("eval"),
+                cli.explicit_tools().is_empty()
+            );
             assert!(registry.get("xdev").is_none());
             assert!(prompt_index_for(&cli.enabled_tools(&config), Some(&config)).is_empty());
             assert!(!prompt.contains("Additional tools are available via the `xdev` dispatcher"));
@@ -1096,5 +1107,61 @@ mod tests {
         let synced = sync_discoverable_prompt_section(&prompt, &live).expect("prompt updated");
         assert!(synced.contains("- mcp__demo__search: Search demo catalog\n"));
         assert!(!synced.contains("- retain:"));
+    }
+
+    #[test]
+    fn explicit_cli_tools_are_promoted_to_essential_while_implicit_stay_discoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config: Config = serde_json::from_value(json!({
+            "memory": { "backend": "local" }
+        }))
+        .expect("memory config");
+
+        let cli = crate::cli::Cli::parse_from(["pi", "--tools", "jobs,read"]);
+        assert_eq!(cli.explicit_tools(), vec!["jobs", "read"]);
+        let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+        assert!(
+            registry.get("jobs").is_some() && !registry.is_discoverable("jobs"),
+            "explicit --tools entry `jobs` must be promoted into the live Essential schema"
+        );
+        assert!(
+            registry.get("read").is_some() && !registry.is_discoverable("read"),
+            "explicit --tools entry `read` stays Essential"
+        );
+        assert!(
+            registry.get("manage_skill").is_some() && registry.is_discoverable("manage_skill"),
+            "implicit default `manage_skill` must remain Discoverable"
+        );
+        assert!(
+            registry.get("recall").is_some() && registry.is_discoverable("recall"),
+            "implicit settings-gated `recall` must remain Discoverable"
+        );
+        let synced = sync_discoverable_prompt_section(&prompt, &registry.discoverable_index())
+            .expect("managed discoverable section");
+        let (available_part, discoverable_part) = synced
+            .split_once("Additional tools are available via the `xdev` dispatcher")
+            .expect("prompt splits into primary tools and discoverable index");
+        assert!(
+            available_part.contains("- jobs:"),
+            "promoted `jobs` must appear in Available tools: {available_part}"
+        );
+        assert!(
+            !discoverable_part.contains("- jobs:"),
+            "promoted `jobs` must not remain in discoverable index: {discoverable_part}"
+        );
+        assert!(
+            discoverable_part.contains("- manage_skill:")
+                && discoverable_part.contains("- recall:"),
+            "implicit tools must remain in discoverable index: {discoverable_part}"
+        );
+
+        let ceiling =
+            crate::cli::Cli::parse_from(["pi", "--no-implicit-tools", "--tools", "jobs,read"]);
+        assert!(ceiling.explicit_tools().is_empty());
+        let (ceiling_reg, _) = selected_registry_and_prompt(&ceiling, &config, temp.path());
+        assert!(
+            ceiling_reg.is_discoverable("jobs"),
+            "--no-implicit-tools child ceiling must not promote discoverable tools"
+        );
     }
 }

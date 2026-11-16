@@ -493,7 +493,15 @@ fn rejected_recovered_input_keeps_its_first_payload_and_fifo_tail() {
         let controls: TurnControlSlot = Arc::default();
         let (events, received) = mpsc::channel();
         let (tx, _rx) = mpsc::channel();
-        run_restored(&mut session, request, &tx, &events, &controls, Arc::default()).await;
+        run_restored(
+            &mut session,
+            request,
+            &tx,
+            &events,
+            &controls,
+            Arc::default(),
+        )
+        .await;
 
         assert!(provider.requests.lock().unwrap().is_empty());
         assert!(session.session().agent.messages().is_empty());
@@ -525,7 +533,15 @@ fn rejected_recovered_input_keeps_its_first_payload_and_fifo_tail() {
 
         // Recovery has a new one-use identity. A retained UI command cannot
         // reacquire or duplicate any part of the returned input batch.
-        run_restored(&mut session, old_command, &tx, &events, &controls, Arc::default()).await;
+        run_restored(
+            &mut session,
+            old_command,
+            &tx,
+            &events,
+            &controls,
+            Arc::default(),
+        )
+        .await;
         assert!(received.try_recv().is_err());
         assert!(provider.requests.lock().unwrap().is_empty());
     });
@@ -662,7 +678,15 @@ fn input_hook_refusal_does_not_replay_first_input_even_without_provider_events()
         let controls: TurnControlSlot = Arc::default();
         let (events, received) = mpsc::channel();
         let (tx, _rx) = mpsc::channel();
-        run_restored(&mut session, request, &tx, &events, &controls, Arc::default()).await;
+        run_restored(
+            &mut session,
+            request,
+            &tx,
+            &events,
+            &controls,
+            Arc::default(),
+        )
+        .await;
 
         assert_eq!(
             manager
@@ -712,7 +736,15 @@ fn native_failure_after_handoff_does_not_restore_the_dispatched_first_input() {
         let controls: TurnControlSlot = Arc::default();
         let (events, received) = mpsc::channel();
         let (tx, _rx) = mpsc::channel();
-        run_restored(&mut session, request, &tx, &events, &controls, Arc::default()).await;
+        run_restored(
+            &mut session,
+            request,
+            &tx,
+            &events,
+            &controls,
+            Arc::default(),
+        )
+        .await;
 
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
         let Event::Pending(returned) = received.try_recv().unwrap() else {
@@ -840,7 +872,6 @@ fn shutdown_before_goal_publication_dispatches_no_provider_work() {
     });
 }
 
-
 #[test]
 fn ordinary_recovery_keeps_native_boundaries_and_never_rereads_file_sources() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -884,7 +915,10 @@ fn ordinary_recovery_keeps_native_boundaries_and_never_rereads_file_sources() {
         let original = model.input.text();
         model.input.set_text("edited recovery");
         model.submit_input();
-        assert!(submitted.try_recv().is_err(), "edits cannot rebuild captured files");
+        assert!(
+            submitted.try_recv().is_err(),
+            "edits cannot rebuild captured files"
+        );
         assert!(model.recall_goal_input());
         assert_eq!(model.input.text(), original);
         model.submit_input();
@@ -904,7 +938,11 @@ fn ordinary_recovery_keeps_native_boundaries_and_never_rereads_file_sources() {
         .await;
         assert!(returned.try_recv().is_err());
         let requests = provider.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "two native messages, not one joined draft");
+        assert_eq!(
+            requests.len(),
+            2,
+            "two native messages, not one joined draft"
+        );
         let users = requests
             .last()
             .unwrap()
@@ -916,7 +954,10 @@ fn ordinary_recovery_keeps_native_boundaries_and_never_rereads_file_sources() {
             .collect::<Vec<_>>();
         assert_eq!(users.len(), 2);
         same_payload(users[0], &payload());
-        same_payload(users[1], &UserContent::Text("captured second file body".into()));
+        same_payload(
+            users[1],
+            &UserContent::Text("captured second file body".into()),
+        );
         drop(requests);
         let lifecycle = received.try_iter().collect::<Vec<_>>();
         assert!(matches!(lifecycle.last(),
@@ -937,7 +978,10 @@ fn ordinary_recovery_keeps_native_boundaries_and_never_rereads_file_sources() {
         )
         .await;
         assert_eq!(provider.requests.lock().unwrap().len(), 2);
-        assert!(returned.try_recv().is_err(), "a stale command cannot acquire another batch");
+        assert!(
+            returned.try_recv().is_err(),
+            "a stale command cannot acquire another batch"
+        );
     });
 }
 
@@ -959,15 +1003,8 @@ fn compaction_recovery_requires_separate_review_of_before_command_and_after() {
             "before @old.txt",
         );
         let after = detached(&mut session, &payload(), "after @old.png");
-        let request = RestoredInput::for_compaction(
-            owner,
-            None,
-            before,
-            "/shake".into(),
-            None,
-            true,
-            after,
-        );
+        let request =
+            RestoredInput::for_compaction(owner, None, before, "/shake".into(), None, true, after);
         let stale = request.clone();
         let controls: TurnControlSlot = Arc::default();
         let (tx, _rx) = mpsc::channel();
@@ -989,16 +1026,11 @@ fn compaction_recovery_requires_separate_review_of_before_command_and_after() {
         assert!(command.pending.lock().unwrap().is_empty());
         assert_eq!(command.following.lock().unwrap().len(), 1);
         assert!(received.try_recv().is_err());
-        run_restored(
-            &mut session,
-            stale,
-            &tx,
-            &events,
-            &controls,
-            Arc::default(),
-        )
-        .await;
-        assert!(received.try_recv().is_err(), "old before-step cannot replay maintenance");
+        run_restored(&mut session, stale, &tx, &events, &controls, Arc::default()).await;
+        assert!(
+            received.try_recv().is_err(),
+            "old before-step cannot replay maintenance"
+        );
         run_restored(
             &mut session,
             command,
@@ -1008,28 +1040,26 @@ fn compaction_recovery_requires_separate_review_of_before_command_and_after() {
             Arc::default(),
         )
         .await;
-        assert_eq!(provider.requests.lock().unwrap().len(), 1, "shake is not a model prompt");
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            1,
+            "shake is not a model prompt"
+        );
         let Event::Pending(after) = received.try_recv().unwrap() else {
             panic!("after-input requires its own explicit review");
         };
         assert_eq!(after.text(), "after @old.png");
         same_payload(&after.pending.lock().unwrap()[0].content, &payload());
         assert!(received.try_recv().is_err());
-        run_restored(
-            &mut session,
-            after,
-            &tx,
-            &events,
-            &controls,
-            Arc::default(),
-        )
-        .await;
+        run_restored(&mut session, after, &tx, &events, &controls, Arc::default()).await;
         assert_eq!(provider.requests.lock().unwrap().len(), 2);
         assert!(received.try_recv().is_err());
         assert!(provider.requests.lock().unwrap().iter().all(|messages| {
-            messages.iter().all(|message| !matches!(message,
+            messages.iter().all(|message| {
+                !matches!(message,
                 Message::User(user) if matches!(&user.content,
-                    UserContent::Text(text) if text == "/shake")))
+                    UserContent::Text(text) if text == "/shake"))
+            })
         }));
     });
 }
@@ -1078,11 +1108,17 @@ fn native_and_maintenance_recovery_keep_escape_before_dequeue_and_during_admissi
                 let signal = request.abort_handle().signal();
                 model.input.set_text("newer unsent draft");
                 model.submit_input();
-                assert!(submitted.try_recv().is_err(), "a queued recovery keeps UI ownership");
+                assert!(
+                    submitted.try_recv().is_err(),
+                    "a queued recovery keeps UI ownership"
+                );
                 let _ = model.update(PiFtuiMsg::Agent(PiMsg::PreparedInputFinished {
                     request_id: uuid::Uuid::new_v4(),
                 }));
-                assert!(model.replaying_input.is_some(), "stale completion has no authority");
+                assert!(
+                    model.replaying_input.is_some(),
+                    "stale completion has no authority"
+                );
 
                 let store = session.session_store();
                 let held = (phase == "session_admission").then(|| store.try_lock().unwrap());
@@ -1133,15 +1169,7 @@ fn native_and_maintenance_recovery_keep_escape_before_dequeue_and_during_admissi
                 model.input.set_text("");
                 model.apply_goal_input_restores();
                 assert!(model.goal_draft.is_some());
-                run_restored(
-                    &mut session,
-                    stale,
-                    &tx,
-                    &events,
-                    &controls,
-                    Arc::default(),
-                )
-                .await;
+                run_restored(&mut session, stale, &tx, &events, &controls, Arc::default()).await;
                 assert!(received.try_recv().is_err());
                 assert!(provider.requests.lock().unwrap().is_empty());
             });
@@ -1246,7 +1274,10 @@ fn stopped_native_recovery_does_not_need_a_second_session_store_read() {
         let mut session = handle(Arc::default());
         let origin = session
             .with_session(|session| {
-                (session.header.id.clone(), session.leaf_id().map(str::to_string))
+                (
+                    session.header.id.clone(),
+                    session.leaf_id().map(str::to_string),
+                )
             })
             .await
             .unwrap();
@@ -1281,7 +1312,6 @@ fn stopped_native_recovery_does_not_need_a_second_session_store_read() {
     });
 }
 
-
 #[test]
 fn dropping_compaction_display_refresh_never_replays_an_installed_command() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -1297,7 +1327,9 @@ fn dropping_compaction_display_refresh_never_replays_an_installed_command() {
             });
             stored.append_message(crate::session::SessionMessage::Assistant {
                 message: AssistantMessage {
-                    content: vec![ContentBlock::Text(TextContent::new(format!("answer {index}")))],
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "answer {index}"
+                    )))],
                     stop_reason: StopReason::Stop,
                     ..Default::default()
                 },
@@ -1342,11 +1374,14 @@ fn dropping_compaction_display_refresh_never_replays_an_installed_command() {
         let held_on_end = Arc::clone(&held);
         let store_on_end = Arc::clone(&store);
         session.subscribe(move |event| {
-            if matches!(event, AgentEvent::ManualCompactionEnd {
-                result: Some(_),
-                aborted: false,
-                ..
-            }) {
+            if matches!(
+                event,
+                AgentEvent::ManualCompactionEnd {
+                    result: Some(_),
+                    aborted: false,
+                    ..
+                }
+            ) {
                 *held_on_end.lock().unwrap() =
                     Some(Arc::clone(&store_on_end).try_lock_owned().unwrap());
             }
@@ -1364,7 +1399,10 @@ fn dropping_compaction_display_refresh_never_replays_an_installed_command() {
             Arc::clone(&aborts),
         ));
         assert!(futures::poll!(replay.as_mut()).is_pending());
-        assert!(held.lock().unwrap().is_some(), "installation completed before display waits");
+        assert!(
+            held.lock().unwrap().is_some(),
+            "installation completed before display waits"
+        );
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
         drop(replay);
         assert!(aborts.lock().unwrap().is_none());
@@ -1376,18 +1414,15 @@ fn dropping_compaction_display_refresh_never_replays_an_installed_command() {
         assert!(returned.following.lock().unwrap().is_empty());
         same_payload(&returned.pending.lock().unwrap()[0].content, &payload());
         drop(held.lock().unwrap().take());
-        assert!(store.try_lock().unwrap().entries.iter().any(|entry| {
-            matches!(entry, crate::session::SessionEntry::Compaction(_))
-        }));
-        run_restored(
-            &mut session,
-            stale,
-            &tx,
-            &events,
-            &controls,
-            Arc::default(),
-        )
-        .await;
+        assert!(
+            store
+                .try_lock()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| { matches!(entry, crate::session::SessionEntry::Compaction(_)) })
+        );
+        run_restored(&mut session, stale, &tx, &events, &controls, Arc::default()).await;
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
         assert!(received.try_recv().is_err());
     });

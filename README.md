@@ -993,7 +993,7 @@ one-use links and grants or revokes remote control. Host input reclaims control;
 the remote composer preserves local drafts and cannot operate local approval,
 credential, or extension dialogs. Complete sources are screened before clipping,
 and local drafts, in-flight response text, and truncated tool cards stay local.
-Headless, WASM, and QR pairing remain unimplemented.
+Headless and WASM operation remain unimplemented.
 
 **Print mode** sends one or more messages, streams each response to stdout, and exits. Useful for shell scripts and one-off queries.
 
@@ -1003,7 +1003,10 @@ Retries and configured failover finish before Pi decides the final outcome.
 JSON output retains the completed agent lifecycle, followed by one
 `{"type":"error","phase":"run",...,"exit_code":1}` diagnostic. Missing or
 whitespace-only input is a usage error (**2**); JSON mode reports it before
-opening a session stream. A successfully recovered request still exits **0**.
+opening a session stream. Headless denied tool approvals exit **3**, configured
+or explicit resource load failures (`--skill`, `--prompt-template`,
+`--theme-path`) exit **4**, and reaching a session cost cap (`maxCost`) exits
+**5**. A successfully recovered request still exits **0**.
 
 **Print mode and tool approval.** The approval mode defaults to `always-ask` on
 every surface, including `-p`. The absence of a terminal is not treated as

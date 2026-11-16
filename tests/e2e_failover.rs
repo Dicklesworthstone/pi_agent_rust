@@ -2534,3 +2534,427 @@ fn e2e_failover_reopen_stays_on_fallback_while_cooldown_holds() {
         "process 2 must successfully complete turn on fallback: {stdout2}\n{stderr2}"
     );
 }
+
+/// bd-2vmu6: print JSON counterpart to the RPC abort-at-the-boundary test.
+/// Primary exhausts its retry budget on 429s, `failover_start` is emitted, and
+/// `SIGINT` arrives while the backup listener holds the connection open without
+/// answering. Both recovery lifecycles (`auto_retry_*` and `failover_*`) must
+/// close cleanly before `agent_end`, and the process must exit non-zero.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_failover_json_mode_abort_at_the_boundary_still_closes_both_lifecycles() {
+    let harness = TestHarness::new(
+        "e2e_failover_json_mode_abort_at_the_boundary_still_closes_both_lifecycles",
+    );
+    harness.log().info(
+        "setup",
+        "primary 429s; backup listener never answers; SIGINT fires on failover_start",
+    );
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"primary exhausted"}}"#,
+        ),
+    );
+    let stalled_backup =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalled backup listener");
+    let stalled_addr = stalled_backup.local_addr().expect("stalled addr");
+    let stalled_base = format!("http://{stalled_addr}/backup/v1");
+
+    let env = PiEnv::new(&harness);
+    env.write_models_split(&format!("{}/primary/v1", server.base_url()), &stalled_base);
+    std::fs::write(
+        env.root.join("settings.json"),
+        r#"{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":1,"maxDelayMs":1,"fallbackChains":{"default":["e2ebackup/backup-model"]}},"checkForUpdates":false}"#,
+    )
+    .expect("write fast retry settings");
+
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    command.args([
+        "--print",
+        "--mode",
+        "json",
+        "--no-session",
+        "--no-extensions",
+        "--provider",
+        "e2eprimary",
+        "--model",
+        "primary-model",
+        "ping",
+    ]);
+    let mut child = command.spawn().expect("spawn pi --print --mode json");
+    let child_pid = child.id().to_string();
+    let stdout = child.stdout.take().expect("pi stdout piped");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let pump = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut lines: Vec<String> = Vec::new();
+    let mut signaled = false;
+    loop {
+        let Ok(line) = rx.recv_timeout(Duration::from_millis(250)) else {
+            assert!(
+                Instant::now() < deadline,
+                "pi --print --mode json never reached terminal frame: {lines:?}"
+            );
+            continue;
+        };
+        let kind = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|ev| {
+                ev.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        lines.push(line);
+        match kind.as_deref() {
+            Some("failover_start") if !signaled => {
+                let status = Command::new("kill")
+                    .args(["-s", "INT", &child_pid])
+                    .status()
+                    .expect("send SIGINT to pi --print");
+                assert!(status.success(), "kill -s INT failed: {status}");
+                signaled = true;
+            }
+            Some("agent_end") if signaled => break,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi --print --mode json timed out after SIGINT: {lines:?}"
+        );
+    }
+
+    let exit_code = run_to_exit(&mut child, 60);
+    let _ = pump.join();
+    while let Ok(rem) = rx.try_recv() {
+        lines.push(rem);
+    }
+    drop(stalled_backup);
+
+    let mut stderr = String::new();
+    if let Some(mut handle) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = handle.read_to_string(&mut stderr);
+    }
+
+    let raw_stdout = lines.join("\n");
+    let events = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    assert_ne!(
+        exit_code,
+        Some(0),
+        "aborted print JSON turn must exit non-zero\n{raw_stdout}\n{stderr}"
+    );
+    assert_eq!(events[0]["type"], "session");
+    assert_eq!(
+        print_turn_lifecycle(&events),
+        vec![
+            "agent_start",
+            "auto_retry_start",
+            "auto_retry_end",
+            "failover_start",
+            "failover_end",
+            "agent_end",
+        ],
+        "SIGINT at failover boundary must close both retry and failover lifecycles\n{raw_stdout}\n{stderr}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| ev["type"] == "auto_retry_start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| ev["type"] == "auto_retry_end")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| ev["type"] == "failover_start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|ev| ev["type"] == "failover_end")
+            .count(),
+        1
+    );
+    let failover_end = events
+        .iter()
+        .rfind(|ev| ev["type"] == "failover_end")
+        .expect("terminal failover_end");
+    assert_eq!(failover_end["success"], false);
+    assert_eq!(failover_end["restoredPrimary"], false);
+    assert_eq!(failover_end["provider"], "e2ebackup");
+    assert_eq!(failover_end["model"], "backup-model");
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|req| req.path == "/primary/v1/chat/completions")
+            .count(),
+        2,
+        "primary must serve initial attempt + 1 retry before failover"
+    );
+
+    let log_path = harness.temp_path("print-abort-boundary.jsonl");
+    harness
+        .write_jsonl_logs(&log_path)
+        .expect("write jsonl logs");
+    let raw = std::fs::read_to_string(&log_path).expect("read jsonl logs");
+    let violations = validate_jsonl_v2_only(&raw);
+    assert!(
+        violations.is_empty(),
+        "JSONL v2 log violations: {violations:?}"
+    );
+    harness.record_artifact("print-abort-boundary.jsonl", &log_path);
+}
+
+/// bd-2vmu6: Hop 2 failover transition persistence failure (poisoning
+/// `<session>.lock` into a directory right before `e2ebackup`'s retry 503
+/// returns) must close both `e2ebackup`'s open retry lifecycle and Hop 1's
+/// open failover lifecycle before `agent_end` on both print JSON and RPC,
+/// without contacting the third provider.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_failover_transition_persistence_failure_closes_open_lifecycles() {
+    use serde_json::json;
+    use std::io::{Read as _, Write as _};
+
+    for mode in ["print", "rpc"] {
+        let harness = TestHarness::new(format!(
+            "e2e_failover_transition_persistence_failure_{mode}"
+        ));
+        let server = harness.start_mock_http_server();
+        server.add_route(
+            "POST",
+            "/primary/v1/chat/completions",
+            error_response(
+                429,
+                r#"{"error":{"type":"rate_limit_error","message":"primary rate limited"}}"#,
+            ),
+        );
+        server.add_route(
+            "POST",
+            "/final/v1/chat/completions",
+            sse_response(text_sse_body("unreachable final provider")),
+        );
+
+        let session_path = harness.temp_path(format!("{mode}-transition.jsonl"));
+        let lock_path = std::path::PathBuf::from(format!("{}.lock", session_path.display()));
+        let moved_lock_path =
+            std::path::PathBuf::from(format!("{}.lock.moved", session_path.display()));
+
+        // Custom backup HTTP responder: serves two 503s and poisons `<session>.lock`
+        // into a directory right before answering the second 503 so Hop 2's
+        // `commit_failover_swap_admitted` -> `candidate.save()` fails inside the
+        // outer failover-transition error arm on both print and RPC.
+        let backup_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind backup responder");
+        let backup_addr = backup_listener.local_addr().expect("backup addr");
+        let lock_for_thread = lock_path.clone();
+        let moved_for_thread = moved_lock_path.clone();
+        let backup_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_for_thread = std::sync::Arc::clone(&backup_hits);
+        let backup_thread = std::thread::spawn(move || {
+            for attempt in 1..=2 {
+                let (mut stream, _) = backup_listener.accept().expect("accept backup request");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = [0_u8; 8192];
+                let mut req = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                hits_for_thread.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 2 {
+                    if lock_for_thread.exists() {
+                        std::fs::rename(&lock_for_thread, &moved_for_thread)
+                            .expect("move existing session lock file aside");
+                    }
+                    std::fs::create_dir(&lock_for_thread)
+                        .expect("poison session lock path with directory");
+                }
+                let body =
+                    r#"{"error":{"type":"service_unavailable","message":"backup overloaded"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let env = PiEnv::new(&harness);
+        env.write_models_split(
+            &format!("{}/primary/v1", server.base_url()),
+            &format!("http://{backup_addr}/backup/v1"),
+        );
+        let models_path = env.root.join("agent/models.json");
+        let mut models: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&models_path).expect("read models"))
+                .expect("parse models");
+        models["providers"]["e2efinal"] = json!({
+            "api": "openai-completions",
+            "baseUrl": format!("{}/final/v1", server.base_url()),
+            "apiKey": "final-key",
+            "models": [{"id": "final-model", "contextWindow": 128_000}]
+        });
+        std::fs::write(
+            &models_path,
+            serde_json::to_vec(&models).expect("encode models"),
+        )
+        .expect("write three-provider models.json");
+        std::fs::write(
+            env.root.join("settings.json"),
+            serde_json::to_vec(&json!({
+                "retry": {
+                    "enabled": true,
+                    "maxRetries": 1,
+                    "baseDelayMs": 1,
+                    "maxDelayMs": 1,
+                    "maxFailoversPerTurn": 2,
+                    "fallbackChains": {
+                        "default": ["e2ebackup/backup-model", "e2efinal/final-model"]
+                    }
+                },
+                "checkForUpdates": false
+            }))
+            .expect("encode settings"),
+        )
+        .expect("write settings.json");
+
+        let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+        let mut command = env.command(&binary);
+        command
+            .args([
+                "--provider",
+                "e2eprimary",
+                "--model",
+                "primary-model",
+                "--no-extensions",
+                "--session",
+            ])
+            .arg(&session_path);
+        if mode == "print" {
+            command.args(["--print", "--mode", "json", "ping"]);
+        } else {
+            command.arg("--rpc").stdin(Stdio::piped());
+        }
+        let mut child = command.spawn().expect("spawn pi process");
+        if mode == "rpc" {
+            let mut stdin = child.stdin.take().expect("rpc stdin");
+            writeln!(stdin, r#"{{"type":"prompt","id":"p1","message":"ping"}}"#)
+                .expect("write rpc prompt");
+            stdin.flush().expect("flush rpc prompt");
+        }
+        let (stdout, stderr) = run_and_collect(child, 60);
+        backup_thread.join().expect("backup responder thread");
+
+        let events = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            print_turn_lifecycle(&events),
+            vec![
+                "agent_start",
+                "auto_retry_start",
+                "auto_retry_end",
+                "failover_start",
+                "auto_retry_start",
+                "auto_retry_end",
+                "failover_end",
+                "agent_end",
+            ],
+            "{mode}: Hop 2 transition persistence failure must close both open retry and Hop 1 failover lifecycles before agent_end\n{stdout}\n{stderr}"
+        );
+        let failover_end = events
+            .iter()
+            .rfind(|ev| ev["type"] == "failover_end")
+            .expect("terminal failover_end");
+        assert_eq!(failover_end["success"], false);
+        assert_eq!(failover_end["restoredPrimary"], false);
+        assert_eq!(failover_end["provider"], "e2ebackup");
+        assert_eq!(failover_end["model"], "backup-model");
+
+        let terminal = events
+            .iter()
+            .rfind(|ev| ev["type"] == "agent_end")
+            .expect("terminal agent_end");
+        let terminal_err = terminal["error"].as_str().unwrap_or_default();
+        assert!(
+            terminal_err.contains("session persistence lock must be a regular file")
+                || stderr.contains("failover transition failed before provider re-entry"),
+            "{mode}: expected outer failover transition persistence error, got terminal={terminal_err:?} stderr={stderr:?}"
+        );
+        if mode == "print" {
+            let fatal = events.last().expect("fatal error record");
+            assert_eq!(fatal["type"], "error", "{fatal}");
+            assert!(
+                fatal["message"].as_str().is_some_and(
+                    |m| m.contains("failover transition failed before provider re-entry")
+                ),
+                "print JSON fatal record must report transition failure: {fatal}"
+            );
+        }
+        assert_eq!(
+            backup_hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "{mode}: backup must serve initial + 1 retry before Hop 2 transition fails"
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|req| req.path == "/final/v1/chat/completions")
+                .count(),
+            0,
+            "{mode}: third provider must never be contacted after Hop 2 persistence failure"
+        );
+        let log_path = harness.temp_path(format!("{mode}-transition-fail.jsonl"));
+        harness
+            .write_jsonl_logs(&log_path)
+            .expect("write jsonl logs");
+        let raw = std::fs::read_to_string(&log_path).expect("read jsonl logs");
+        let violations = validate_jsonl_v2_only(&raw);
+        assert!(
+            violations.is_empty(),
+            "{mode}: JSONL v2 log violations: {violations:?}"
+        );
+        harness.record_artifact(format!("{mode}-transition-fail.jsonl"), &log_path);
+    }
+}

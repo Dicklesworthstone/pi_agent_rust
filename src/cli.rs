@@ -3672,4 +3672,26 @@ impl Cli {
         });
         enabled
     }
+
+    /// Tools explicitly named via `--tools` by the operator.
+    ///
+    /// Returns an empty list when `--tools` was not supplied, when `--no-tools`
+    /// or `--tools ""` disables built-ins, or when `--no-implicit-tools` marks
+    /// an internal child-agent ceiling.
+    #[must_use]
+    pub fn explicit_tools(&self) -> Vec<&str> {
+        if self.builtin_tools_disabled() || self.no_implicit_tools {
+            return Vec::new();
+        }
+        let Some(tools) = &self.tools else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for name in tools.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
 }

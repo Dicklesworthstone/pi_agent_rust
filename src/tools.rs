@@ -6795,6 +6795,36 @@ impl ToolRegistry {
         }
     }
 
+    /// Promote operator-selected `--tools` entries into the initial `Essential`
+    /// schema tier so they are immediately callable without an `xdev` hop,
+    /// while leaving unselected/implicit tools in their configured tier.
+    pub fn promote_tools(&mut self, names: &[&str]) {
+        if names.is_empty() {
+            return;
+        }
+        let policy = Arc::make_mut(&mut self.load_policy);
+        let mut changed = false;
+        for &raw in names {
+            let name = raw.trim();
+            if name.is_empty() || name == "xdev" {
+                continue;
+            }
+            if policy
+                .modes
+                .insert(name.to_string(), crate::xdev::LoadMode::Essential)
+                != Some(crate::xdev::LoadMode::Essential)
+            {
+                changed = true;
+            }
+            if self.discoverable.remove(name) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_discovery();
+        }
+    }
+
     pub(crate) fn reuse_generated_dispatcher_from(&mut self, other: &Self) {
         if let (Some(self_gen), Some(other_gen)) = (
             self.generated_dispatcher.as_ref(),

@@ -36,9 +36,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 - **Crate-root SemVer surface sealing (`pi::sdk`).**
   Internal root modules in `src/lib.rs` now carry `#[doc(hidden)]`, keeping `pi::Error`, `pi::PiResult`, and `pi::sdk` as the sole documented SemVer contract; `main.rs` consumes `SdkStartupBootstrap` directly for interactive FTUI handoff without double session initialization.
 - **Distinct cost-cap exit code (`EXIT_CODE_COST_CAP = 5`).**
-  Print/JSON runs halted by `Error::CostCap` now exit with status `5`, preserving status `3` exclusively for non-interactive approval unavailability.
+  Print/JSON runs halted by `Error::CostCap` now exit with status `5`, preserving status `3` exclusively for non-interactive approval unavailability, and explicit `--skill` / `--prompt-template` / `--theme-path` load failures exit with status `4`.
 - **64 MiB default audio/video attachment cap (`media.maxBytes`) and sidecar/Gemini Files staging.**
   Now that session persistence stores binary attachments in content-addressed `.blobs/<sha256>` sidecars and stages oversized payloads via the Gemini Files API, `DEFAULT_MEDIA_MAX_BYTES` defaults to `64 MiB` (`67_108_864` bytes) across CLI `@file`, `read_media`, RPC, SDK, and interactive frontends ([#225](https://github.com/Dicklesworthstone/pi_agent_rust/issues/225)).
+- **Explicit `--tools` initial-schema promotion and `pi --list-providers` / `pi doctor` capability reporting.**
+  Tools explicitly selected via `--tools` are promoted to `LoadMode::Essential` in the initial schema without requiring an `xdev` hop, and `pi --list-providers` plus `pi doctor` now report per-provider `ProviderCapabilities` (`multi_turn`, `tool_use`, `streaming`, `vision`).
+- **Type-erased extension futures (`WasmExtensionHandle` + `JsExtensionRuntimeHandle`).**
+  Type-erased WASM component instances and extension runtime `TimeoutFuture` boundaries so downstream SDK/test crates compile cleanly under `--features wasm-host` at `rustc`'s default `recursion_limit = 128`.
 - **Honest Node compatibility shims and real `npm:zod` validation.**
   Replaced silent fake-success stubs in `node:zlib`, `node:http2`, `node:tls`, `node:net`, `node:dgram`, `node:vm`, `node:worker_threads`, `node:cluster`, `node:inspector`, and `node:dns` with fail-closed `ERR_PI_SHIM_UNSUPPORTED_OPERATION` errors, and replaced the permissive `npm:zod` stub with recursive runtime validation (`safeParse`/`parse` rejecting invalid inputs with structured `ZodError.issues`).
 

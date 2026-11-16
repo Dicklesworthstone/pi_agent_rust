@@ -937,39 +937,55 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
         } else {
             for provider in &providers {
                 let status = auth.credential_status(provider);
+                let caps = crate::providers::provider_capabilities_for_id(provider);
+                let caps_detail = format!("Capabilities: {}", caps.summary());
+                let caps_data = serde_json::json!({
+                    "provider": provider,
+                    "capabilities": caps.to_json(),
+                });
                 match status {
                     CredentialStatus::ApiKey => {
-                        findings.push(Finding::pass(
-                            cat,
-                            format!("{provider}: API key configured"),
-                        ));
+                        findings.push(
+                            Finding::pass(cat, format!("{provider}: API key configured"))
+                                .with_detail(caps_detail)
+                                .with_data(caps_data),
+                        );
                     }
                     CredentialStatus::OAuthValid { .. } => {
-                        findings.push(Finding::pass(cat, format!("{provider}: OAuth token valid")));
+                        findings.push(
+                            Finding::pass(cat, format!("{provider}: OAuth token valid"))
+                                .with_detail(caps_detail)
+                                .with_data(caps_data),
+                        );
                     }
                     CredentialStatus::OAuthExpired { .. } => {
                         findings.push(
                             Finding::warn(cat, format!("{provider}: OAuth token expired"))
+                                .with_detail(caps_detail)
+                                .with_data(caps_data)
                                 .with_remediation(format!("Run `pi /login {provider}` to refresh")),
                         );
                     }
                     CredentialStatus::BearerToken => {
-                        findings.push(Finding::pass(
-                            cat,
-                            format!("{provider}: bearer token configured"),
-                        ));
+                        findings.push(
+                            Finding::pass(cat, format!("{provider}: bearer token configured"))
+                                .with_detail(caps_detail)
+                                .with_data(caps_data),
+                        );
                     }
                     CredentialStatus::AwsCredentials => {
-                        findings.push(Finding::pass(
-                            cat,
-                            format!("{provider}: AWS credentials configured"),
-                        ));
+                        findings.push(
+                            Finding::pass(cat, format!("{provider}: AWS credentials configured"))
+                                .with_detail(caps_detail)
+                                .with_data(caps_data),
+                        );
                     }
                     CredentialStatus::ServiceKey => {
-                        findings.push(Finding::pass(
-                            cat,
-                            format!("{provider}: service key configured"),
-                        ));
+                        findings.push(
+                            Finding::pass(cat, format!("{provider}: service key configured"))
+                                .with_detail(caps_detail)
+                                .with_data(caps_data),
+                        );
                     }
                     CredentialStatus::Missing => {
                         // Shouldn't happen since we're iterating stored providers
@@ -981,6 +997,35 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
     }
 
     check_auth_env_vars(cat, findings);
+    append_native_provider_capabilities_finding(cat, findings);
+}
+
+const NATIVE_CAPABILITY_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "cohere",
+    "azure-openai",
+    "amazon-bedrock",
+    "google-vertex",
+    "github-copilot",
+    "gitlab",
+    "cursor",
+];
+
+fn append_native_provider_capabilities_finding(cat: CheckCategory, findings: &mut Vec<Finding>) {
+    let mut matrix = serde_json::Map::new();
+    let mut summary_parts = Vec::with_capacity(NATIVE_CAPABILITY_PROVIDERS.len());
+    for &provider_id in NATIVE_CAPABILITY_PROVIDERS {
+        let caps = crate::providers::provider_capabilities_for_id(provider_id);
+        summary_parts.push(format!("{provider_id} ({})", caps.summary()));
+        matrix.insert(provider_id.to_string(), caps.to_json());
+    }
+    findings.push(
+        Finding::info(cat, "Native provider agentic capabilities")
+            .with_detail(summary_parts.join("; "))
+            .with_data(serde_json::Value::Object(matrix)),
+    );
 }
 
 /// Check common auth-related environment variables.
@@ -995,10 +1040,15 @@ fn check_auth_env_vars(cat: CheckCategory, findings: &mut Vec<Finding>) {
         let env_keys = provider_auth_env_keys(provider);
         let has_env = env_keys.iter().any(|k| std::env::var(k).is_ok());
         if has_env {
-            findings.push(Finding::pass(
-                cat,
-                format!("{provider}: env var set ({env_key})"),
-            ));
+            let caps = crate::providers::provider_capabilities_for_id(provider);
+            findings.push(
+                Finding::pass(cat, format!("{provider}: env var set ({env_key})"))
+                    .with_detail(format!("Capabilities: {}", caps.summary()))
+                    .with_data(serde_json::json!({
+                        "provider": provider,
+                        "capabilities": caps.to_json(),
+                    })),
+            );
         } else {
             findings.push(
                 Finding::info(cat, format!("{provider}: no env var"))
@@ -14679,6 +14729,50 @@ export default function(pi) {
             !report.findings.iter().any(|f| f.title.contains("exec")),
             "permissive override should suppress safe-only exec denial findings"
         );
+    }
+
+    #[test]
+    fn run_doctor_auth_category_surfaces_native_provider_capabilities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut only = HashSet::new();
+        only.insert(CheckCategory::Auth);
+        let opts = DoctorOptions {
+            cwd: dir.path(),
+            extension_path: None,
+            policy_override: None,
+            fix: false,
+            only: Some(only),
+        };
+        let report = run_doctor(&opts).expect("doctor auth report");
+        let cap_finding = report
+            .findings
+            .iter()
+            .find(|f| f.title == "Native provider agentic capabilities")
+            .expect("native provider capabilities finding");
+        assert_eq!(cap_finding.severity, Severity::Info);
+        let text = report.render_text();
+        assert!(text.contains("Native provider agentic capabilities"));
+        assert!(text.contains("gitlab (multi_turn, tool_use)"));
+        assert!(text.contains("cursor (multi_turn, tool_use, streaming)"));
+        assert!(text.contains("anthropic (multi_turn, tool_use, streaming, vision)"));
+
+        let json_str = report.render_json().expect("render doctor json");
+        let json_val: serde_json::Value =
+            serde_json::from_str(&json_str).expect("parse doctor json");
+        let data = json_val["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .find(|f| f["title"] == "Native provider agentic capabilities")
+            .and_then(|f| f.get("data"))
+            .expect("capabilities data payload");
+        assert_eq!(data["gitlab"]["multi_turn"], true);
+        assert_eq!(data["gitlab"]["tool_use"], true);
+        assert_eq!(data["gitlab"]["streaming"], false);
+        assert_eq!(data["gitlab"]["vision"], false);
+        assert_eq!(data["cursor"]["streaming"], true);
+        assert_eq!(data["cursor"]["vision"], false);
+        assert_eq!(data["anthropic"]["vision"], true);
     }
 
     mod proptest_doctor {

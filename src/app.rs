@@ -220,8 +220,10 @@ pub fn build_system_prompt(
         load_project_context_files(cwd, global_dir)
     };
 
-    let mut prompt =
-        custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
+    let explicit_tools = cli.explicit_tools();
+    let mut prompt = custom_prompt.unwrap_or_else(|| {
+        default_system_prompt_with_explicit_tools(enabled_tools, &explicit_tools, package_dir)
+    });
 
     // Keep an insertion point even when startup has no discoverable built-ins:
     // MCP/extension tools can mount later. The Agent replaces this managed
@@ -326,7 +328,16 @@ fn resolve_prompt_input(
     }
 }
 
-fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
+#[must_use]
+pub fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
+    default_system_prompt_with_explicit_tools(enabled_tools, &[], package_dir)
+}
+
+fn default_system_prompt_with_explicit_tools(
+    enabled_tools: &[&str],
+    explicit_tools: &[&str],
+    package_dir: &Path,
+) -> String {
     let tool_descriptions = [
         ("read", "Read file contents"),
         ("bash", "Execute bash commands (ls, grep, find, etc.)"),
@@ -358,6 +369,10 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let mut tools = Vec::new();
     for tool in enabled_tools {
         if let Some((_, description)) = tool_descriptions.iter().find(|(name, _)| name == tool) {
+            tools.push(format!("- {tool}: {description}"));
+        } else if explicit_tools.contains(tool)
+            && let Some(description) = crate::xdev::builtin_one_liner(tool)
+        {
             tools.push(format!("- {tool}: {description}"));
         }
     }

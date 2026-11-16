@@ -371,7 +371,9 @@ impl RestoredInput {
         if !after.is_empty() {
             steps.push_back(Self::for_turn(owner, branch, after));
         }
-        let first = steps.pop_front().expect("compaction recovery has a command");
+        let first = steps
+            .pop_front()
+            .expect("compaction recovery has a command");
         *first
             .following
             .lock()
@@ -513,8 +515,7 @@ impl PiFtuiModel {
         if self.goal_draft.is_none()
             && self.input.is_empty()
             && self.goal_composer_available()
-            && self.displayed_session_id.as_deref()
-                == Some(request.owner_session_id.as_str())
+            && self.displayed_session_id.as_deref() == Some(request.owner_session_id.as_str())
             && self.replaying_input.is_none()
         {
             self.show_goal_draft(request);
@@ -522,7 +523,8 @@ impl PiFtuiModel {
             self.pending_goal_inputs.push_back(request);
             self.push_entry(
                 EntryRole::System,
-                "Unsent input is retained. Send or clear the current draft to review it.".to_string(),
+                "Unsent input is retained. Send or clear the current draft to review it."
+                    .to_string(),
             );
         }
     }
@@ -816,8 +818,7 @@ pub(super) async fn run_restored(
     let abort = recovery.request.abort_handle();
     // The UI owns this same token before driver admission. Escape therefore
     // remains effective while session ownership or provider startup waits.
-    let _operation =
-        super::queued_compaction::OperationAbort::publish(&aborts, controls, &abort);
+    let _operation = super::queued_compaction::OperationAbort::publish(&aborts, controls, &abort);
     let signal = abort.signal();
     let origin = {
         let read = handle.with_session(|session| {
@@ -831,13 +832,12 @@ pub(super) async fn run_restored(
                         .iter()
                         .any(|entry| entry.base().id.as_deref() == Some(anchor))
                 });
-            (session.header.id == recovery.request.owner_session_id && same_branch)
-                .then(|| {
-                    (
-                        session.header.id.clone(),
-                        session.leaf_id().map(str::to_string),
-                    )
-                })
+            (session.header.id == recovery.request.owner_session_id && same_branch).then(|| {
+                (
+                    session.header.id.clone(),
+                    session.leaf_id().map(str::to_string),
+                )
+            })
         });
         let cancelled = signal.wait();
         futures::pin_mut!(read, cancelled);
@@ -859,13 +859,14 @@ pub(super) async fn run_restored(
                         .to_string(),
                 )
             };
-            let event = recovery.compaction.as_ref().map_or_else(
-                || event.clone(),
-                |step| PiMsg::CompactionFinished {
+            let event = if let Some(step) = &recovery.compaction {
+                PiMsg::CompactionFinished {
                     request_id: step.request.id.clone(),
-                    event: Box::new(event.clone()),
-                },
-            );
+                    event: Box::new(event),
+                }
+            } else {
+                event
+            };
             let _ = agent_tx.send(event);
             return;
         }

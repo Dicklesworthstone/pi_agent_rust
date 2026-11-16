@@ -4873,8 +4873,7 @@ fn assert_retained_v2_save_repairs_rewritten_prefix(
     assert!(!jsonl_writer.is_v2_live_sync_enabled());
     pi::session::migrate_jsonl_to_v2(&jsonl, "retained-prefix-rewrite")?;
     let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
-    let mut retained =
-        run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    let mut retained = run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
     assert!(retained.is_v2_live_sync_enabled());
 
     let appended_id = retained.append_message(make_user_session_message("pending turn", 42));
@@ -4904,10 +4903,7 @@ fn assert_retained_v2_save_repairs_rewritten_prefix(
     assert_ne!(rewritten, before_rewrite);
     assert_eq!(rewritten.len(), before_rewrite.len());
     fs::write(&jsonl, rewritten.as_bytes())?;
-    filetime::set_file_mtime(
-        &jsonl,
-        filetime::FileTime::from_system_time(original_mtime),
-    )?;
+    filetime::set_file_mtime(&jsonl, filetime::FileTime::from_system_time(original_mtime))?;
     assert_eq!(fs::metadata(&jsonl)?.modified()?, original_mtime);
 
     // Do not reopen before this save: reopening would repair the sidecar and
@@ -4954,10 +4950,12 @@ fn assert_retained_v2_save_repairs_rewritten_prefix(
     );
     assert!(verification.index_consistent);
     assert_eq!(store.read_index()?.len(), 2);
-    assert_eq!(pi::session::migration_status(&jsonl), MigrationState::Migrated);
+    assert_eq!(
+        pi::session::migration_status(&jsonl),
+        MigrationState::Migrated
+    );
 
-    let reopened =
-        run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
+    let reopened = run_async(async { Session::open(jsonl.to_string_lossy().as_ref()).await })?;
     assert!(reopened.is_v2_live_sync_enabled());
     assert_eq!(
         serde_json::to_value(reopened.to_messages_for_current_path())?,

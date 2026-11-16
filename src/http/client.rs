@@ -1018,18 +1018,18 @@ async fn connect_transport_once(
             retryable_not_connected: is_retryable_not_connected(&e),
             error: Error::from(e),
         })?;
-    let mut transport = if let Some(proxy) = proxy.filter(|proxy| !proxy.is_http()) {
-        let tcp = proxy
+    let tcp = if let Some(proxy) = proxy.filter(|proxy| !proxy.is_http()) {
+        proxy
             .connect_socks5(tcp, &parsed.host, parsed.port)
             .await
             .map_err(|error| ConnectAttemptError {
                 retryable_not_connected: is_retryable_not_connected(&error),
                 error: Error::from(error),
-            })?;
-        Transport::Tcp(tcp)
+            })?
     } else {
-        Transport::Tcp(tcp)
+        tcp
     };
+    let mut transport = Transport::Tcp(tcp);
     if let Some(proxy) = proxy.filter(|proxy| proxy.is_http()) {
         if proxy.uses_tls() {
             // Authenticate the proxy before transmitting any credentials or

@@ -932,3 +932,32 @@ fn media_registry_shares_live_additional_roots_for_explicit_and_configured_tools
         });
     }
 }
+
+#[test]
+fn test_read_media_default_cap_admits_large_clip_above_legacy_5mib() {
+    let harness = TestHarness::new("read_media_above_5mib");
+    let clip_path = harness.temp_dir().join("clip.wav");
+    // 6 MiB RIFF/WAVE payload: rejected under the legacy 5 MiB inline-era cap,
+    // admitted under the 64 MiB blob-sidecar + Gemini Files default.
+    let pcm_len: u32 = 6 * 1024 * 1024;
+    let riff_size: u32 = 36 + pcm_len;
+    let mut payload = Vec::with_capacity(44 + pcm_len as usize);
+    payload.extend_from_slice(b"RIFF");
+    payload.extend_from_slice(&riff_size.to_le_bytes());
+    payload.extend_from_slice(&WAV_BYTES[8..36]);
+    payload.extend_from_slice(b"data");
+    payload.extend_from_slice(&pcm_len.to_le_bytes());
+    payload.resize(44 + pcm_len as usize, 0);
+    fs::write(&clip_path, &payload).expect("write 6 MiB wav clip");
+
+    let tool = ReadMediaTool::new(harness.temp_dir());
+    asupersync::test_utils::run_test(|| async {
+        let out = tool
+            .execute("call-6mib", json!({ "path": "clip.wav" }), None)
+            .await
+            .expect("6 MiB wav clip must succeed under 64 MiB default cap");
+        assert!(!out.is_error);
+        assert!(matches!(out.content.get(1), Some(ContentBlock::Media(_))));
+    });
+    finish_case(&harness, "read_media_above_5mib");
+}

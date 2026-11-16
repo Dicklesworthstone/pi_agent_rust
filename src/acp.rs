@@ -2471,7 +2471,7 @@ fn build_acp_session_with_budget(
     let tools = if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&options.config))
     } else {
-        ToolRegistry::with_builtin_tool_policy(
+        let mut registry = ToolRegistry::with_builtin_tool_policy(
             &enabled_tools,
             &cwd,
             Some(&options.config),
@@ -2483,7 +2483,9 @@ fn build_acp_session_with_budget(
                 .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted),
             options.workspace_trust_guard.as_ref(),
             !cli.no_implicit_tools,
-        )
+        );
+        registry.promote_tools(&cli.explicit_tools());
+        registry
     };
     client_files::bind(
         &tools,

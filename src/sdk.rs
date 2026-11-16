@@ -4881,7 +4881,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             if cli.builtin_tools_disabled() {
                 return ToolRegistry::without_builtins(Some(&config));
             }
-            ToolRegistry::with_workspace_trust(
+            let mut registry = ToolRegistry::with_workspace_trust(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
@@ -4889,7 +4889,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 workspace.as_ref(),
                 workspace_trusted,
                 options.workspace_trust_guard.as_ref(),
-            )
+            );
+            registry.promote_tools(&cli.explicit_tools());
+            registry
         },
         |factory| {
             factory.create_tool_registry_with_context(
@@ -7238,7 +7240,11 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         };
         let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
             (200, "text/event-stream", response("experiment completed")),
-            (200, "text/event-stream", response("preserved experiment summary")),
+            (
+                200,
+                "text/event-stream",
+                response("preserved experiment summary"),
+            ),
         ]);
         let provider = Arc::new(
             crate::providers::openai::OpenAIProvider::new("rewind-model")
@@ -7286,7 +7292,10 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
 
         let requests = peer.join().expect("native provider HTTP peer");
         assert_eq!(requests.len(), 2);
-        for (request, key) in requests.iter().zip(["rewind-key-before", "rewind-key-after"]) {
+        for (request, key) in requests
+            .iter()
+            .zip(["rewind-key-before", "rewind-key-after"])
+        {
             let expected = format!("Authorization: Bearer {key}");
             assert!(
                 request
@@ -7296,7 +7305,12 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
                 "each provider request must use the credential current at dispatch"
             );
         }
-        assert!(requests[1].body.to_string().contains("experiment to summarize"));
+        assert!(
+            requests[1]
+                .body
+                .to_string()
+                .contains("experiment to summarize")
+        );
         let live_context = checkpoint_context_value(handle.session.agent.messages());
         let store = handle.session_store();
         let path = {
