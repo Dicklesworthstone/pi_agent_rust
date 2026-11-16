@@ -2,7 +2,7 @@
   "schema": "pi.golden_corpus.v1",
   "scenario": "json_mode_no_input_header_only",
   "surface": "json_mode",
-  "description": "JSON mode with no message input: should emit only session header line and exit 0",
+  "description": "JSON mode with no message input: should emit one startup usage error record and exit 2",
   "cli_args": [
     "--mode",
     "json",
@@ -24,12 +24,13 @@
   "env_overrides": {},
   "cassette": null,
   "expected": {
-    "exit_code": 0,
+    "exit_code": 2,
     "stdout_contains": [],
     "stdout_not_contains": [],
-    "stderr_not_contains": ["error", "panic"],
+    "stderr_not_contains": ["panic"],
     "no_session_files": true,
     "json_line_count": 1,
-    "json_session_header": true
+    "json_session_header": false,
+    "json_event_sequence": ["error"]
   }
 }
