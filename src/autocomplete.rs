@@ -936,7 +936,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "goal",
-            description: "Manage goals (FrankenTUI only; /goal status)",
+            description: "Manage goals (/goal status)",
         },
         BuiltinSlashCommand {
             name: "prewalk",

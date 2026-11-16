@@ -5092,6 +5092,15 @@ impl PiFtuiModel {
                 return;
             }
         };
+        let attachment_badges: Vec<String> = attachments
+            .iter()
+            .filter_map(|block| match block {
+                crate::model::ContentBlock::Image(image) => Some(
+                    crate::terminal_images::tui_attachment_badge(&image.data, &image.mime_type),
+                ),
+                _ => None,
+            })
+            .collect();
         let content = if attachments.is_empty() {
             crate::model::UserContent::Text(steer_text)
         } else {
@@ -5123,7 +5132,14 @@ impl PiFtuiModel {
         match queued {
             Ok(_) => {
                 let label = if follow_up { "follow-up" } else { "steer" };
-                self.push_entry(EntryRole::User, format!("({label}) {clean}"));
+                let mut transcript_content = format!("({label}) {clean}");
+                for badge in attachment_badges {
+                    if !transcript_content.ends_with('\n') {
+                        transcript_content.push('\n');
+                    }
+                    transcript_content.push_str(&badge);
+                }
+                self.push_entry(EntryRole::User, transcript_content);
             }
             Err(err) => {
                 // Put the text back; nothing was queued.
@@ -6891,7 +6907,11 @@ impl PiFtuiModel {
                     .as_ref()
                     .map(|request| request.abort.clone())
             })
-            .or_else(|| self.replaying_input.as_ref().map(RestoredInput::abort_handle))
+            .or_else(|| {
+                self.replaying_input
+                    .as_ref()
+                    .map(RestoredInput::abort_handle)
+            })
             .or_else(|| {
                 self.turn_abort.as_ref().and_then(|slot| {
                     slot.lock()
@@ -11228,7 +11248,10 @@ fn prompt_display(text: &str, attachments: &[crate::model::ContentBlock]) -> Str
     for block in attachments {
         match block {
             ContentBlock::Text(text) => parts.push(text.text.clone()),
-            ContentBlock::Image(image) => parts.push(format!("[Image: {}]", image.mime_type)),
+            ContentBlock::Image(image) => parts.push(crate::terminal_images::tui_attachment_badge(
+                &image.data,
+                &image.mime_type,
+            )),
             ContentBlock::Media(media) => parts.push(format!(
                 "[Media: {}, {}, {}]",
                 media.name.as_deref().unwrap_or("unnamed"),
@@ -12130,7 +12153,10 @@ async fn run_compact_command_with_receipt(
             false,
         ),
         Err(crate::error::Error::Aborted) => (PiMsg::System(format!("{label} cancelled")), false),
-        Err(error) => (PiMsg::AgentError(format!("{label} unavailable: {error}")), false),
+        Err(error) => (
+            PiMsg::AgentError(format!("{label} unavailable: {error}")),
+            false,
+        ),
     };
     let _ = agent_tx.send(PiMsg::CompactionFinished {
         request_id: request.id,
@@ -12504,7 +12530,14 @@ fn transcript_text(messages: &[crate::model::Message]) -> String {
                     let _ = writeln!(out, "[tool call] {} {}", call.name, call.arguments);
                 }
                 ContentBlock::Image(image) => {
-                    let _ = writeln!(out, "[image {}]", image.mime_type);
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        crate::terminal_images::placeholder_for_base64(
+                            &image.data,
+                            &image.mime_type,
+                        )
+                    );
                 }
                 ContentBlock::Media(_) => out.push_str("[media]\n"),
                 ContentBlock::RedactedThinking(_) => out.push_str("[redacted thinking]\n"),
@@ -19382,9 +19415,11 @@ mod tests {
         let image = control.take_pending();
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].text, "also check @shot.png");
-        assert!(matches!(&image[0].content, crate::model::UserContent::Blocks(blocks)
+        assert!(
+            matches!(&image[0].content, crate::model::UserContent::Blocks(blocks)
             if blocks.iter().any(|block| matches!(block, crate::model::ContentBlock::Image(image)
-                if image.mime_type == "image/png" && !image.data.is_empty()))));
+                if image.mime_type == "image/png" && !image.data.is_empty())))
+        );
 
         sim.model_mut().input.set_text("");
         type_str(&mut sim, "use @notes.txt");
@@ -28965,11 +29000,9 @@ mod tests {
         let item = &sim.model().autocomplete.items[0];
         assert_eq!(item.insert, "/goal");
         assert_eq!(item.kind, AutocompleteItemKind::SlashCommand);
-        assert!(
-            item.description
-                .as_deref()
-                .is_some_and(|description| description.contains("FrankenTUI only"))
-        );
+        assert!(item.description.as_deref().is_some_and(|description| {
+            description.contains("/goal status") && !description.contains("FrankenTUI only")
+        }));
         sim.inject_event(key(KeyCode::Tab, Modifiers::empty()));
         assert_eq!(sim.model().input.text(), "/goal");
         assert!(
@@ -31769,11 +31802,8 @@ mod tests {
                 let mut turn = Box::pin(run_controlled_turn_with_pending(
                     &mut handle,
                     UserContent::Text("prepared A".into()),
-                    detached_follow_ups(&[(
-                        UserContent::Text("prepared A".into()),
-                        "authored A",
-                    )])
-                    .pop(),
+                    detached_follow_ups(&[(UserContent::Text("prepared A".into()), "authored A")])
+                        .pop(),
                     pending,
                     Some(signal),
                     &tx,
@@ -31821,11 +31851,8 @@ mod tests {
             let mut turn = Box::pin(run_controlled_turn_with_pending(
                 &mut handle,
                 UserContent::Text("prepared A".into()),
-                detached_follow_ups(&[(
-                    UserContent::Text("prepared A".into()),
-                    "authored A",
-                )])
-                .pop(),
+                detached_follow_ups(&[(UserContent::Text("prepared A".into()), "authored A")])
+                    .pop(),
                 pending,
                 Some(signal),
                 &tx,
@@ -33104,6 +33131,87 @@ mod tests {
             assert_eq!(sim.model().state, AgentUiState::Ready);
         });
         assert_eq!(messages, vec!["remaining CLI turn".to_string()]);
+    }
+
+    #[test]
+    fn prompt_display_and_live_submission_render_decoded_image_dimensions_without_control_chars() {
+        use crate::model::{ContentBlock, ImageContent, Message, UserContent, UserMessage};
+        use base64::Engine as _;
+
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .expect("decode 1x1 png");
+        let image_block = ContentBlock::Image(ImageContent {
+            data: png_b64.to_string(),
+            mime_type: "image/png".to_string(),
+        });
+
+        let single_badge = prompt_display("", std::slice::from_ref(&image_block));
+        assert!(
+            single_badge.contains("[image: image/png, 1x1]"),
+            "{single_badge}"
+        );
+        assert!(!single_badge.contains(&png_b64[..16]), "{single_badge}");
+        assert!(
+            !single_badge.chars().any(char::is_control),
+            "{single_badge:?}"
+        );
+
+        let with_text = prompt_display("inspect screenshot", std::slice::from_ref(&image_block));
+        assert!(with_text.contains("inspect screenshot"), "{with_text}");
+        assert!(with_text.contains("[image: image/png, 1x1]"), "{with_text}");
+        assert!(!with_text.contains(&png_b64[..16]), "{with_text}");
+        assert!(
+            with_text
+                .lines()
+                .all(|line| !line.chars().any(char::is_control)),
+            "{with_text:?}"
+        );
+
+        let dumped = transcript_text(&[Message::User(UserMessage {
+            content: UserContent::Blocks(vec![image_block]),
+            timestamp: 0,
+        })]);
+        assert!(dumped.contains("[image: image/png, 1x1]"), "{dumped}");
+        assert!(!dumped.contains("inline)"), "{dumped}");
+        assert!(!dumped.contains(&png_b64[..16]), "{dumped}");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("shot.png"), &png_bytes).expect("write png");
+        let mut handle = native_prompt_handle(Arc::new(NativePromptProbe::default()));
+        let turn = handle.prompt_controlled(String::from("start"), |_| {});
+        let control = turn.control();
+        let (_tx, rx) = mpsc::channel();
+        let mut model = PiFtuiModel::new(rx)
+            .with_turn_control(published_turn_control(control))
+            .with_autocomplete(AutocompleteLaunch {
+                catalog: AutocompleteCatalog::default(),
+                cwd: dir.path().to_path_buf(),
+                max_visible: 5,
+                resources: None,
+                resource_source: None,
+            });
+        model.state = AgentUiState::Working;
+        model.input.set_text("check @shot.png");
+        model.submit_mid_turn(false);
+        let entry = model.transcript.last().expect("user transcript entry");
+        assert_eq!(entry.role, EntryRole::User);
+        assert!(
+            entry.text.contains("[image: image/png, 1x1]"),
+            "{}",
+            entry.text
+        );
+        assert!(!entry.text.contains(&png_b64[..16]), "{}", entry.text);
+        assert!(
+            entry
+                .text
+                .lines()
+                .all(|line| !line.chars().any(char::is_control)),
+            "{:?}",
+            entry.text
+        );
+        drop(turn);
     }
 
     #[test]

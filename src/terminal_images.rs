@@ -377,6 +377,40 @@ fn render_inline_bytes(
     }
 }
 
+/// Render a cell-grid-safe single-line badge for `TUI`/`FTUI` transcripts.
+///
+/// Differential `TUI` cell buffers must never receive raw APC/OSC graphics
+/// escape sequences (`\x1b_G...` / `\x1b]1337;...`), which corrupt column
+/// widths. This helper decodes dimensions and validates MIME magic bytes via
+/// the same pipeline as print mode, annotating verified `Kitty`/`iTerm2`
+/// capability without emitting control characters.
+#[must_use]
+pub fn tui_attachment_badge(image_b64: &str, mime_type: &str) -> String {
+    tui_attachment_badge_for_protocol(image_b64, mime_type, detect_protocol())
+}
+
+/// Render a cell-grid-safe single-line badge for an explicit [`ImageProtocol`].
+#[must_use]
+pub fn tui_attachment_badge_for_protocol(
+    image_b64: &str,
+    mime_type: &str,
+    protocol: ImageProtocol,
+) -> String {
+    let Some(bytes) = decode_base64_bounded(image_b64.trim(), MAX_INLINE_IMAGE_BYTES) else {
+        return placeholder(mime_type, None, None);
+    };
+    let dims = image_dimensions(&bytes);
+    let base = placeholder(mime_type, dims.map(|(w, _)| w), dims.map(|(_, h)| h));
+    if !image_bytes_match_mime(&bytes, mime_type) {
+        return base;
+    }
+    match protocol {
+        ImageProtocol::Kitty if is_png(&bytes) => format!("{base} (kitty inline)"),
+        ImageProtocol::Kitty | ImageProtocol::Unsupported => base,
+        ImageProtocol::Iterm2 => format!("{base} (iterm2 inline)"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -771,6 +805,53 @@ mod tests {
     #[test]
     fn iterm2_rejects_unrecognized_image_bytes() {
         assert!(encode_iterm2(b"not-an-image", 40).is_empty());
+    }
+
+    #[test]
+    fn tui_attachment_badge_for_protocol_handles_protocols_mime_mismatch_and_corrupt_b64() {
+        let png = png_with_payload(33);
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let kitty = tui_attachment_badge_for_protocol(&png_b64, "image/png", ImageProtocol::Kitty);
+        assert_eq!(kitty, "[image: image/png, 100x50] (kitty inline)");
+        assert!(!kitty.chars().any(char::is_control));
+
+        let iterm2 =
+            tui_attachment_badge_for_protocol(&png_b64, "image/png", ImageProtocol::Iterm2);
+        assert_eq!(iterm2, "[image: image/png, 100x50] (iterm2 inline)");
+        assert!(!iterm2.chars().any(char::is_control));
+
+        let unsupported =
+            tui_attachment_badge_for_protocol(&png_b64, "image/png", ImageProtocol::Unsupported);
+        assert_eq!(unsupported, "[image: image/png, 100x50]");
+        assert!(!unsupported.chars().any(char::is_control));
+
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0 marker
+            0x00, 0x11, // segment length
+            0x08, // precision
+            0x00, 0x32, // height = 50
+            0x00, 0x64, // width = 100
+            0x03, // component count
+            0x01, 0x11, 0x00, // Y
+            0x02, 0x11, 0x00, // Cb
+            0x03, 0x11, 0x00, // Cr
+        ];
+        let jpeg_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+        let mismatch =
+            tui_attachment_badge_for_protocol(&jpeg_b64, "image/png", ImageProtocol::Kitty);
+        assert_eq!(mismatch, "[image: image/png, 100x50]");
+        assert!(!mismatch.contains("(kitty inline)"));
+        assert!(!mismatch.chars().any(char::is_control));
+
+        let corrupt = tui_attachment_badge_for_protocol(
+            "%%%corrupt-base64%%%",
+            "image/png\x1b[2J\u{202e}evil",
+            ImageProtocol::Kitty,
+        );
+        assert_eq!(corrupt, "[image: image/png]");
+        assert!(!corrupt.chars().any(char::is_control));
     }
 
     #[test]

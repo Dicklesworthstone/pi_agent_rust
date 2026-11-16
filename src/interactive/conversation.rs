@@ -20,6 +20,10 @@ pub(super) fn assistant_content_to_text(content: &[ContentBlock]) -> (String, Op
     for block in content {
         match block {
             ContentBlock::Text(t) => push_line(&mut text, &t.text),
+            ContentBlock::Image(img) => push_line(
+                &mut text,
+                &crate::terminal_images::tui_attachment_badge(&img.data, &img.mime_type),
+            ),
             ContentBlock::Thinking(t) => push_line(&mut thinking, &t.thinking),
             _ => {}
         }
@@ -45,7 +49,7 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
                 // structured image blocks remain available to model input.
                 push_line(
                     &mut output,
-                    &crate::terminal_images::placeholder_for_base64(&image.data, &image.mime_type),
+                    &crate::terminal_images::tui_attachment_badge(&image.data, &image.mime_type),
                 );
             }
             // Media blocks are never rendered inline; the sanitized
@@ -75,7 +79,7 @@ pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: 
                 if show_images {
                     push_line(
                         &mut output,
-                        &crate::terminal_images::placeholder_for_base64(
+                        &crate::terminal_images::tui_attachment_badge(
                             &image.data,
                             &image.mime_type,
                         ),
