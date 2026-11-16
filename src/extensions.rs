@@ -57,6 +57,15 @@ use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
+type BoxedExtensionFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+fn box_send_future<'a, T>(
+    fut: impl std::future::Future<Output = T> + Send + 'a,
+) -> BoxedExtensionFuture<'a, T> {
+    Box::pin(fut)
+}
+
 fn parse_cli_bool_flag_value(flag_name: &str, raw: &str) -> Result<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -11088,9 +11097,57 @@ impl JsExtensionSnapshot {
 }
 
 #[cfg(feature = "wasm-host")]
+trait ErasedWasmInstance: Send {
+    fn handle_tool<'a>(
+        &'a mut self,
+        name: &'a str,
+        input_json: &'a str,
+    ) -> BoxedExtensionFuture<'a, Result<String>>;
+
+    fn handle_slash<'a>(
+        &'a mut self,
+        command: &'a str,
+        args: &'a [String],
+        input_json: &'a str,
+    ) -> BoxedExtensionFuture<'a, Result<String>>;
+
+    fn handle_event<'a>(
+        &'a mut self,
+        event_json: &'a str,
+    ) -> BoxedExtensionFuture<'a, Result<String>>;
+}
+
+#[cfg(feature = "wasm-host")]
+impl ErasedWasmInstance for wasm_host::Instance {
+    fn handle_tool<'a>(
+        &'a mut self,
+        name: &'a str,
+        input_json: &'a str,
+    ) -> BoxedExtensionFuture<'a, Result<String>> {
+        box_send_future(Self::handle_tool(self, name, input_json))
+    }
+
+    fn handle_slash<'a>(
+        &'a mut self,
+        command: &'a str,
+        args: &'a [String],
+        input_json: &'a str,
+    ) -> BoxedExtensionFuture<'a, Result<String>> {
+        box_send_future(Self::handle_slash(self, command, args, input_json))
+    }
+
+    fn handle_event<'a>(
+        &'a mut self,
+        event_json: &'a str,
+    ) -> BoxedExtensionFuture<'a, Result<String>> {
+        box_send_future(Self::handle_event(self, event_json))
+    }
+}
+
+#[cfg(feature = "wasm-host")]
 #[derive(Clone)]
 pub struct WasmExtensionHandle {
-    instance: Arc<AsyncMutex<wasm_host::Instance>>,
+    instance: Arc<AsyncMutex<Box<dyn ErasedWasmInstance>>>,
     registration: RegisterPayload,
     tool_defs: Vec<ExtensionToolDef>,
 }
@@ -11099,8 +11156,9 @@ pub struct WasmExtensionHandle {
 impl WasmExtensionHandle {
     fn new(instance: wasm_host::Instance, registration: RegisterPayload) -> Self {
         let tool_defs = parse_extension_tool_defs(&registration.tools);
+        let erased: Box<dyn ErasedWasmInstance> = Box::new(instance);
         Self {
-            instance: Arc::new(AsyncMutex::new(instance)),
+            instance: Arc::new(AsyncMutex::new(erased)),
             registration,
             tool_defs,
         }
@@ -11151,15 +11209,15 @@ impl WasmExtensionHandle {
         let event_json = serde_json::to_string(event)
             .map_err(|err| Error::extension(format!("Serialize event: {err}")))?;
         let cx = Cx::for_request();
-        let fut = async {
+        let fut = box_send_future(async {
             let mut instance = OwnedMutexGuard::lock(Arc::clone(&self.instance), &cx)
                 .await
                 .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
             instance.handle_event(&event_json).await
-        };
+        });
 
         let response_json = if timeout_ms > 0 {
-            match timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut)).await {
+            match timeout(wall_now(), Duration::from_millis(timeout_ms), fut).await {
                 Ok(value) => value?,
                 Err(_) => {
                     return Err(Error::extension(format!(
@@ -13483,13 +13541,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime load timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            Duration::from_millis(timeout_ms),
+            box_send_future(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime load timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
@@ -13521,13 +13583,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime tools query timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            Duration::from_millis(timeout_ms),
+            box_send_future(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime tools query timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn pump_once(&self) -> Result<bool> {
@@ -13553,7 +13619,7 @@ impl JsExtensionRuntimeHandle {
         timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await
         .unwrap_or_else(|_| {
@@ -13599,7 +13665,7 @@ impl JsExtensionRuntimeHandle {
         timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await
         .unwrap_or_else(|_| {
@@ -13647,7 +13713,7 @@ impl JsExtensionRuntimeHandle {
         timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await
         .unwrap_or_else(|_| {
@@ -13762,7 +13828,7 @@ impl JsExtensionRuntimeHandle {
         timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await
         .unwrap_or_else(|_| {
@@ -13859,7 +13925,7 @@ impl JsExtensionRuntimeHandle {
         let completion = timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline).saturating_add(Duration::from_millis(150)),
-            Box::pin(completion),
+            box_send_future(completion),
         )
         .await;
         if let Ok(Some(result)) = completion {
@@ -13948,13 +14014,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime flag update timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            Duration::from_millis(timeout_ms),
+            box_send_future(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime flag update timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     pub async fn register_mcp_server(
@@ -13985,13 +14055,17 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Error::extension(format!(
-                    "JS extension runtime MCP registration timed out after {timeout_ms}ms"
-                )))
-            })
+        timeout(
+            wall_now(),
+            Duration::from_millis(timeout_ms),
+            box_send_future(fut),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::extension(format!(
+                "JS extension runtime MCP registration timed out after {timeout_ms}ms"
+            )))
+        })
     }
 
     /// Drain all accumulated auto-repair events from the JS runtime.
@@ -14120,7 +14194,7 @@ impl JsExtensionRuntimeHandle {
         timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await
         .unwrap_or_else(|_| {
@@ -14199,7 +14273,7 @@ impl JsExtensionRuntimeHandle {
         let response = timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await;
         if response.is_ok()
@@ -14248,7 +14322,7 @@ impl JsExtensionRuntimeHandle {
         let response = timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            box_send_future(fut),
         )
         .await;
         if response.is_ok() {
@@ -15944,6 +16018,220 @@ fn resolve_extension_load_entry_paths(
         });
     }
     Ok(entry_paths)
+}
+
+fn strip_js_comments_and_strings(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '/' && chars.peek() == Some(&'/') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+            out.push(' ');
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            let _ = chars.next();
+            while let Some(next) = chars.next() {
+                if next == '\n' {
+                    out.push('\n');
+                } else if next == '*' && chars.peek() == Some(&'/') {
+                    let _ = chars.next();
+                    break;
+                }
+            }
+            out.push(' ');
+        } else if matches!(ch, '\'' | '"' | '`') {
+            let quote = ch;
+            while let Some(next) = chars.next() {
+                if next == '\\' {
+                    if chars.next() == Some('\n') {
+                        out.push('\n');
+                    }
+                    continue;
+                }
+                if next == '\n' {
+                    out.push('\n');
+                }
+                if next == quote {
+                    break;
+                }
+            }
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn conformance_initializer_regex() -> Result<&'static Regex> {
+    static INIT_RE: OnceLock<Option<Regex>> = OnceLock::new();
+    INIT_RE
+        .get_or_init(|| {
+            Regex::new(concat!(
+                r"(?:\bexport\s+default\b",
+                r"|\bexport\s*\{[^}]*\bas\s+default\b",
+                r"|\bexports\.default\s*=",
+                r"|\bmodule\.exports\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][A-Za-z0-9_$]*\s*=>)",
+                r"|\bmodule\.exports\s*=\s*\{[^}]*\b(?:default|activate|init|initialize|setup|register|plugin|main)\s*(?::|\()",
+                r"|\bexport\s+(?:async\s+)?function\s+(?:activate|init|initialize|setup|register|plugin|main)\b",
+                r"|\bexport\s+(?:const|let|var)\s+(?:activate|init|initialize|setup|register|plugin|main)\s*=)",
+            ))
+            .ok()
+        })
+        .as_ref()
+        .ok_or_else(|| Error::extension("Failed to compile conformance initializer regex"))
+}
+
+fn is_declaration_or_test_module(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
+        return true;
+    };
+    let stem_ext = Path::new(stem)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str);
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("ts")
+                || ext.eq_ignore_ascii_case("mts")
+                || ext.eq_ignore_ascii_case("cts")
+        })
+        && (stem.eq_ignore_ascii_case(".d")
+            || stem_ext.is_some_and(|ext| ext.eq_ignore_ascii_case("d")))
+    {
+        return true;
+    }
+    if stem.eq_ignore_ascii_case(".test")
+        || stem.eq_ignore_ascii_case(".spec")
+        || stem_ext
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("test") || ext.eq_ignore_ascii_case("spec"))
+    {
+        return true;
+    }
+    let lower_stem = stem.to_ascii_lowercase();
+    lower_stem.ends_with("_test") || lower_stem.ends_with("_spec")
+}
+
+fn has_explicit_extension_initializer(path: &Path) -> Result<bool> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        Error::extension(format!(
+            "Failed to read extension candidate {}: {err}",
+            path.display()
+        ))
+    })?;
+    let cleaned = strip_js_comments_and_strings(&raw);
+    Ok(conformance_initializer_regex()?.is_match(&cleaned))
+}
+
+/// Resolve an extension entry path into the ordered `JsExtensionLoadSpec` slice
+/// to load in one atomic `ExtensionManager::load_js_extensions` transaction for
+/// conformance harnesses.
+///
+/// Honors `package.json` (`pi.extensions` and package boundaries),
+/// `extension.json`, `index.native.json`, `index.*` conventions, and
+/// `extensions/` independent-entry roots, while discovering explicit
+/// co-entrypoints in unmanifested multi-entry extension directories (such as
+/// `lsp-tool.ts` + `lsp.ts` alongside helper `lsp-core.ts`). Fails closed on
+/// missing files, malformed manifests, directory-read errors, or unreadable
+/// candidate modules.
+#[doc(hidden)]
+pub fn resolve_conformance_extension_specs(entry_path: &Path) -> Result<Vec<JsExtensionLoadSpec>> {
+    let primary_spec = JsExtensionLoadSpec::from_entry_path(entry_path)?;
+    let mut package_entries = JsPackageEntryCache::new();
+    let mut resolved_entries = discover_related_extension_entries_with_cache(
+        &primary_spec.entry_path,
+        &mut package_entries,
+    )?;
+    let primary_provenance =
+        js_extension_provenance(&primary_spec.entry_path, &mut package_entries)?;
+
+    if let JsExtensionProvenance::Directory(ref dir) = primary_provenance {
+        let has_ext_manifest = load_extension_manifest(dir)?.is_some();
+        let dir_package_json = dir.join("package.json");
+        let has_package_boundary = if dir_package_json.is_file() {
+            cached_package_extension_entries(&dir_package_json, &mut package_entries)?
+                .establishes_boundary
+        } else {
+            false
+        };
+        let has_native_descriptor = dir.join("index.native.json").is_file();
+        let primary_is_index = primary_spec
+            .entry_path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("index"));
+        let has_index_entry = primary_is_index
+            || JS_EXTENSION_ENTRY_EXTS
+                .iter()
+                .any(|ext| dir.join(format!("index.{ext}")).is_file());
+
+        if !has_ext_manifest && !has_package_boundary && !has_native_descriptor && !has_index_entry
+        {
+            let mut seen = resolved_entries.iter().cloned().collect::<BTreeSet<_>>();
+            let mut sibling_entries = Vec::new();
+            let dir_iter = fs::read_dir(dir).map_err(|err| {
+                Error::extension(format!(
+                    "Failed to enumerate extension directory {}: {err}",
+                    dir.display()
+                ))
+            })?;
+            for dir_entry in dir_iter {
+                let dir_entry = dir_entry.map_err(|err| {
+                    Error::extension(format!(
+                        "Failed to read entry in extension directory {}: {err}",
+                        dir.display()
+                    ))
+                })?;
+                let candidate = dir_entry.path();
+                let file_type = dir_entry.file_type().map_err(|err| {
+                    Error::extension(format!(
+                        "Failed to inspect extension candidate {}: {err}",
+                        candidate.display()
+                    ))
+                })?;
+                if file_type.is_dir() {
+                    continue;
+                }
+                if !candidate.is_file()
+                    || !is_supported_js_extension_entry(&candidate)
+                    || is_declaration_or_test_module(&candidate)
+                {
+                    continue;
+                }
+                let canonical = safe_canonicalize(&candidate);
+                if seen.contains(&canonical) {
+                    continue;
+                }
+                if has_explicit_extension_initializer(&canonical)? && seen.insert(canonical.clone())
+                {
+                    sibling_entries.push(canonical);
+                }
+            }
+            sibling_entries.sort();
+            resolved_entries.extend(sibling_entries);
+        }
+    }
+
+    let mut specs = Vec::with_capacity(resolved_entries.len());
+    specs.push(primary_spec.clone());
+    for co_entry in resolved_entries.into_iter().skip(1) {
+        let mut co_spec = JsExtensionLoadSpec::from_entry_path(&co_entry)?;
+        let co_provenance = js_extension_provenance(&co_spec.entry_path, &mut package_entries)?;
+        if co_provenance == primary_provenance {
+            co_spec.extension_id.clone_from(&primary_spec.extension_id);
+            co_spec.name.clone_from(&primary_spec.name);
+            co_spec.version.clone_from(&primary_spec.version);
+            co_spec.api_version.clone_from(&primary_spec.api_version);
+        }
+        specs.push(co_spec);
+    }
+    Ok(specs)
 }
 
 #[allow(clippy::future_not_send)]
