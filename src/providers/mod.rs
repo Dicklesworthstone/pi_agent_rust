@@ -895,6 +895,32 @@ where
     })
 }
 
+fn create_copilot_provider(
+    entry: &ModelEntry,
+    auth: Option<&crate::auth::AuthStorage>,
+    client: crate::http::client::Client,
+) -> Result<copilot::CopilotProvider> {
+    let github_token = resolve_copilot_token(entry)?;
+    let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
+        .with_provider_name(&entry.model.provider)
+        .with_compat(entry.compat.clone())
+        .with_reasoning(entry.model.reasoning)
+        .with_input_types(&entry.model.input)
+        .with_model_cost(entry.model.cost.clone())
+        .with_client(client);
+    if let Some(auth) = auth {
+        provider = provider
+            .with_auth_storage(auth)?
+            .with_catalog_api_key_fallback(entry.configured_api_key_fallback());
+    }
+    if !entry.model.base_url.is_empty() {
+        // The catalog base_url is a chat endpoint, never the GitHub REST API
+        // exchange host. Enterprise deployments set PI_COPILOT_GITHUB_API_BASE.
+        provider = provider.with_chat_completions_endpoint(&entry.model.base_url);
+    }
+    Ok(provider)
+}
+
 impl ExtensionStreamSimpleProvider {
     const NEXT_TIMEOUT_MS: u64 = 600_000;
 
@@ -1446,27 +1472,7 @@ fn create_transport_provider(
             ))
         }
         ProviderRouteKind::NativeCopilot => {
-            let github_token = resolve_copilot_token(entry)?;
-            let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
-                .with_provider_name(&entry.model.provider)
-                .with_compat(entry.compat.clone())
-                .with_reasoning(entry.model.reasoning)
-                .with_input_types(&entry.model.input)
-                .with_model_cost(entry.model.cost.clone())
-                .with_client(client);
-            if let Some(auth) = auth {
-                provider = provider.with_auth_storage(auth)?;
-            }
-            if !entry.model.base_url.is_empty() {
-                // The catalog `base_url` is a chat-completions endpoint hint
-                // (as for every other provider), never the GitHub REST API
-                // host. Routing it into `with_github_api_base` sent the
-                // OAuth `copilot_internal/v2/token` exchange to the chat
-                // endpoint (gh #191). GHE / data-residency deployments move
-                // the exchange host via `PI_COPILOT_GITHUB_API_BASE`.
-                provider = provider.with_chat_completions_endpoint(&entry.model.base_url);
-            }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(create_copilot_provider(entry, auth, client)?))
         }
         ProviderRouteKind::NativeGitlab => Ok(Arc::new(
             gitlab::GitLabProvider::new(&entry.model.id)

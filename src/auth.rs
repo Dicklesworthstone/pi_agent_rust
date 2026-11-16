@@ -1374,17 +1374,24 @@ fn parse_auth_entries(path: &Path, read: &GuardedAuthRead) -> HashMap<String, Au
                     false
                 }
             };
+            // Serde errors can quote credential-bearing values (for example an
+            // invalid enum tag). Report useful location metadata without ever
+            // copying those diagnostics into logs.
             if backup_succeeded {
                 tracing::warn!(
                     event = "pi.auth.parse_error",
-                    error = %error,
+                    category = ?error.classify(),
+                    line = error.line(),
+                    column = error.column(),
                     backup = %backup_path.display(),
                     "auth.json is corrupted; backed up and starting with empty credentials"
                 );
             } else {
                 tracing::warn!(
                     event = "pi.auth.parse_error",
-                    error = %error,
+                    category = ?error.classify(),
+                    line = error.line(),
+                    column = error.column(),
                     backup = %backup_path.display(),
                     "auth.json is corrupted; backup failed; starting with empty credentials"
                 );
@@ -10180,6 +10187,52 @@ mod tests {
             corrupt_content,
             "the backup must contain the exact bounded bytes that were parsed"
         );
+    }
+
+    #[test]
+    fn corrupted_auth_diagnostics_never_log_credential_values() {
+        const SECRET: &str = "ghp_secret_in_malformed_credential";
+        // Unknown credential types are preserved intentionally. A top-level
+        // string is invalid for AuthFile and makes serde quote its value.
+        let content = serde_json::to_string(SECRET).expect("malformed auth fixture");
+        let parse_error = serde_json::from_str::<AuthFile>(&content)
+            .err()
+            .expect("malformed credential");
+        assert!(
+            parse_error.to_string().contains(SECRET),
+            "fixture must exercise serde's value-bearing diagnostic"
+        );
+        for block_backup in [false, true] {
+            let directory = tempfile::tempdir().expect("auth diagnostics");
+            let path = directory.path().join("auth.json");
+            fs::write(&path, &content).expect("write malformed credential");
+            let backup_lock = block_backup.then(|| {
+                crate::file_lock::DirLock::acquire_for(
+                    &path.with_extension("json.corrupt"),
+                    Duration::from_secs(1),
+                )
+                .expect("hold diagnostic backup lock")
+            });
+            let log_path = directory.path().join("diagnostics.log");
+            let log = fs::File::create(&log_path).expect("diagnostic capture");
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || log.try_clone().expect("clone diagnostic capture"))
+                .finish();
+            let auth = tracing::subscriber::with_default(subscriber, || {
+                AuthStorage::load(path).expect("recover malformed auth")
+            });
+            assert!(auth.entries.is_empty());
+            drop(backup_lock);
+            let output = fs::read_to_string(log_path).expect("read diagnostic capture");
+            assert!(output.contains("pi.auth.parse_error"));
+            assert!(output.contains("category=Data"));
+            assert!(output.contains("line=1"));
+            assert!(output.contains("column="));
+            assert!(!output.contains(SECRET));
+        }
     }
 
     #[test]
