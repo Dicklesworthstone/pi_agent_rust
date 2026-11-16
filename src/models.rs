@@ -1767,7 +1767,6 @@ pub(crate) fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
 ///
 /// Precedence: CLI `--api-key` > stored auth credentials > the entry's
 /// inline key. Lifted to the public surface for the print-mode failover.
-#[must_use]
 pub fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &crate::auth::AuthStorage,
