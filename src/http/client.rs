@@ -676,7 +676,7 @@ async fn send_parts(
             .await;
     }
     // The same resolved endpoint governs connection establishment and HTTP
-    // serialization. SOCKS5 tunnels both schemes; only a plain HTTP proxy
+    // serialization. SOCKS5 tunnels both schemes; only an HTTP(S) proxy
     // uses absolute-form requests and Proxy-Authorization on the HTTP hop.
     let proxy_config = crate::http::proxy::active();
     let proxy = proxy_config.endpoint_for(
@@ -1018,42 +1018,60 @@ async fn connect_transport_once(
             retryable_not_connected: is_retryable_not_connected(&e),
             error: Error::from(e),
         })?;
-    let tcp =
-        match (proxy, parsed.scheme) {
-            (Some(proxy), _) if !proxy.is_http() => proxy
-                .connect_socks5(tcp, &parsed.host, parsed.port)
-                .await
-                .map_err(|error| ConnectAttemptError {
-                    retryable_not_connected: is_retryable_not_connected(&error),
-                    error: Error::from(error),
-                })?,
-            // Plain-HTTP origin through an HTTP proxy: no tunnel, absolute form.
-            (Some(_), Scheme::Http) | (None, _) => tcp,
-            (Some(proxy), Scheme::Https) => proxy_connect_tunnel(tcp, parsed, proxy)
+    let mut transport = if let Some(proxy) = proxy.filter(|proxy| !proxy.is_http()) {
+        let tcp = proxy
+            .connect_socks5(tcp, &parsed.host, parsed.port)
+            .await
+            .map_err(|error| ConnectAttemptError {
+                retryable_not_connected: is_retryable_not_connected(&error),
+                error: Error::from(error),
+            })?;
+        Transport::Tcp(tcp)
+    } else {
+        Transport::Tcp(tcp)
+    };
+    if let Some(proxy) = proxy.filter(|proxy| proxy.is_http()) {
+        if proxy.uses_tls() {
+            // Authenticate the proxy before transmitting any credentials or
+            // origin metadata. A failed first hop never retries in plaintext.
+            transport = connect_tls(client, &proxy.host, transport, "proxy").await?;
+        }
+        if matches!(parsed.scheme, Scheme::Https) {
+            transport = proxy_connect_tunnel(transport, parsed, proxy)
                 .await
                 .map_err(|error| ConnectAttemptError {
                     error,
                     retryable_not_connected: false,
-                })?,
-        };
-    match parsed.scheme {
-        Scheme::Http => Ok(Transport::Tcp(tcp)),
-        Scheme::Https => {
-            let tls = client.tls.as_ref().map_err(|e| ConnectAttemptError {
-                error: Error::api(format!("TLS configuration error: {e}")),
-                retryable_not_connected: false,
-            })?;
-            let tls_stream =
-                tls.clone()
-                    .connect(&parsed.host, tcp)
-                    .await
-                    .map_err(|e| ConnectAttemptError {
-                        retryable_not_connected: is_retryable_not_connected_tls(&e),
-                        error: Error::api(format!("TLS connect failed: {e}")),
-                    })?;
-            Ok(Transport::Tls(Box::new(tls_stream)))
+                })?;
         }
     }
+    match parsed.scheme {
+        Scheme::Http => Ok(transport),
+        // This handshake authenticates the origin independently, even when
+        // the CONNECT tunnel already rides inside a proxy TLS connection.
+        Scheme::Https => connect_tls(client, &parsed.host, transport, "origin").await,
+    }
+}
+
+async fn connect_tls(
+    client: &Client,
+    host: &str,
+    transport: Transport,
+    peer: &str,
+) -> std::result::Result<Transport, ConnectAttemptError> {
+    let tls = client.tls.as_ref().map_err(|error| ConnectAttemptError {
+        error: Error::api(format!("TLS configuration error: {error}")),
+        retryable_not_connected: false,
+    })?;
+    let stream = tls
+        .clone()
+        .connect(host, transport)
+        .await
+        .map_err(|error| ConnectAttemptError {
+            retryable_not_connected: is_retryable_not_connected_tls(&error),
+            error: Error::api(format!("TLS connect failed ({peer}): {error}")),
+        })?;
+    Ok(Transport::Tls(Box::new(stream)))
 }
 
 async fn connect_transport(
@@ -1149,14 +1167,14 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 
 /// Establish a CONNECT tunnel to `parsed`'s origin through `proxy` (#210).
 ///
-/// Consumes the freshly connected TCP stream and hands it back once the proxy
+/// Consumes the connected proxy transport and hands it back once the proxy
 /// answers 2xx, at which point the caller layers TLS to the *origin* over it —
 /// so end-to-end TLS is preserved and the proxy never sees plaintext.
 async fn proxy_connect_tunnel(
-    tcp: TcpStream,
+    mut transport: Transport,
     parsed: &ParsedUrl,
     proxy: &ProxyEndpoint,
-) -> Result<TcpStream> {
+) -> Result<Transport> {
     let authority = origin_authority(parsed);
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(credentials) = proxy.authorization.as_deref() {
@@ -1170,9 +1188,6 @@ async fn proxy_connect_tunnel(
     }
     request.push_str("Proxy-Connection: keep-alive\r\n\r\n");
 
-    // `read_response_head` works on a `Transport`; wrap the socket, run the
-    // handshake, then unwrap it again for the TLS layer.
-    let mut transport = Transport::Tcp(tcp);
     write_all_with_retry(&mut transport, request.as_bytes()).await?;
     transport.flush().await?;
     let (status, _headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
@@ -1193,12 +1208,7 @@ async fn proxy_connect_tunnel(
             leftover.len()
         )));
     }
-    match transport {
-        Transport::Tcp(tcp) => Ok(tcp),
-        Transport::Tls(_) => Err(Error::api(
-            "internal error: CONNECT handshake transport changed type",
-        )),
-    }
+    Ok(transport)
 }
 
 /// `host:port` for the request's origin, always including the port (CONNECT
@@ -1748,10 +1758,24 @@ async fn read_some<R: AsyncRead + Unpin>(reader: &mut R, dst: &mut [u8]) -> std:
 #[derive(Debug)]
 enum Transport {
     Tcp(TcpStream),
-    Tls(Box<asupersync::tls::TlsStream<TcpStream>>),
+    // The boxed layer permits origin TLS over proxy TLS without copying
+    // streaming payloads or weakening either connection's trust checks.
+    Tls(Box<asupersync::tls::TlsStream<Self>>),
 }
 
 impl Unpin for Transport {}
+
+fn poll_read_after_flush<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<std::io::Result<()>> {
+    match Pin::new(&mut *stream).poll_flush(cx) {
+        Poll::Ready(Ok(())) => Pin::new(stream).poll_read(cx, buf),
+        Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        Poll::Pending => Poll::Pending,
+    }
+}
 
 impl AsyncRead for Transport {
     fn poll_read(
@@ -1761,7 +1785,13 @@ impl AsyncRead for Transport {
     ) -> Poll<std::io::Result<()>> {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
+            Self::Tls(stream) => {
+                // The next TLS layer may have queued its ClientHello in this
+                // layer while the socket was backpressured. Drive that write
+                // before waiting for the peer's reply: asupersync TLS reads
+                // do not themselves flush previously buffered application data.
+                poll_read_after_flush(&mut **stream, cx, buf)
+            }
         }
     }
 }
@@ -1796,6 +1826,8 @@ impl AsyncWrite for Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::net::tcp::listener::TcpListener;
+    use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor};
     use serde_json::json;
     use std::collections::VecDeque;
 
@@ -3745,5 +3777,456 @@ mod tests {
                 .to_string()
                 .contains("TLS connect failed")
         );
+    }
+
+    // Public fixture material, generated solely for these loopback tests.
+    // The CA is trusted only by the test client; peer certificates have distinct
+    // SANs (proxy: 127.0.0.1/localhost, origin: origin.invalid), valid to 2120.
+    const PROXY_TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBazCCARKgAwIBAgIUONfP+xRBpumeEy9yl/ZbkS5YOK4wCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWUGkgSFRUUFMgcHJveHkgdGVzdCBDQTAgFw0yMDAxMDEwMDAw
+MDBaGA8yMTIwMDEwMTAwMDAwMFowITEfMB0GA1UEAwwWUGkgSFRUUFMgcHJveHkg
+dGVzdCBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJcLo9R2EZyn07ZCG0f5
+EbpG+EAvAbogHcrSjakINpIYDdo4D3zqYXy7ewUW3SYiNP/owGEdCqtWOl2VcVmf
+yrqjJjAkMBIGA1UdEwEB/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgGGMAoGCCqG
+SM49BAMCA0cAMEQCIAMT+j/72jD3Tc4UegCTI4yS3Srd2+BpVtzoIiaRJCqtAiAl
+NCxWsz/pX9ZVbuP3xI4iCPqPupthVvRPLsiANVFKyA==
+-----END CERTIFICATE-----";
+    const PROXY_TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBgzCCASmgAwIBAgIUZI9yj6eNk37ik2CtZ1slRKb2wHMwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWUGkgSFRUUFMgcHJveHkgdGVzdCBDQTAgFw0yMDAxMDEwMDAw
+MDBaGA8yMTIwMDEwMTAwMDAwMFowHTEbMBkGA1UEAwwSUGkgcHJveHkgdGVzdCBw
+ZWVyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElwuj1HYRnKfTtkIbR/kRukb4
+QC8BuiAdytKNqQg2khgN2jgPfOphfLt7BRbdJiI0/+jAYR0Kq1Y6XZVxWZ/KuqNB
+MD8wDAYDVR0TAQH/BAIwADAaBgNVHREEEzARhwR/AAABgglsb2NhbGhvc3QwEwYD
+VR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSAAwRQIhANX79eEut8EqNzVx
+9D0YwbYml94uDliFPIzGet3EhaCBAiBPKRjRBBxQFnJtkoYYCaTycXwUHGVHfelQ
+n6+NhtA4OQ==
+-----END CERTIFICATE-----";
+    const ORIGIN_TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBhDCCASmgAwIBAgIUD8AsWS79cRbzB69A/3jV+JYLdUgwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWUGkgSFRUUFMgcHJveHkgdGVzdCBDQTAgFw0yMDAxMDEwMDAw
+MDBaGA8yMTIwMDEwMTAwMDAwMFowHjEcMBoGA1UEAwwTUGkgb3JpZ2luIHRlc3Qg
+cGVlcjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJcLo9R2EZyn07ZCG0f5EbpG
++EAvAbogHcrSjakINpIYDdo4D3zqYXy7ewUW3SYiNP/owGEdCqtWOl2VcVmfyrqj
+QDA+MAwGA1UdEwEB/wQCMAAwGQYDVR0RBBIwEIIOb3JpZ2luLmludmFsaWQwEwYD
+VR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSQAwRgIhAOGhnSKyz3PVQsNq
+fFw2y5Lku89+4cvPLVCCKVZyhQw5AiEA/w/U0cbhAZKGpEDmMe6N3Y/s97viZziu
+uMpFxVamNIo=
+-----END CERTIFICATE-----";
+    const PROXY_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg6Wax7YOyew8ywvHm
+MEc1pqhKgVLVCgFfWaqw7d2dXsChRANCAASXC6PUdhGcp9O2QhtH+RG6RvhALwG6
+IB3K0o2pCDaSGA3aOA986mF8u3sFFt0mIjT/6MBhHQqrVjpdlXFZn8q6
+-----END PRIVATE KEY-----";
+
+    fn tls_proxy_test_client(trust_fixture: bool) -> Client {
+        let builder = TlsConnectorBuilder::new();
+        let builder = if trust_fixture {
+            builder.add_root_certificates(Certificate::from_pem(PROXY_TEST_CA.as_bytes()).unwrap())
+        } else {
+            builder.with_webpki_roots()
+        };
+        Client {
+            tls: Ok(builder
+                .alpn_protocols(vec![b"http/1.1".to_vec()])
+                .build()
+                .unwrap()),
+            ..Client::new()
+        }
+    }
+
+    fn tls_proxy_test_acceptor(certificate: &str) -> TlsAcceptor {
+        TlsAcceptor::builder(
+            CertificateChain::from_pem(certificate.as_bytes()).unwrap(),
+            PrivateKey::from_pem(PROXY_TEST_KEY.as_bytes()).unwrap(),
+        )
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .build()
+        .unwrap()
+    }
+
+    fn run_tls_proxy_fixture(future: impl std::future::Future<Output = ()>) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            crate::text_completion::with_timeout(std::time::Duration::from_secs(10), future)
+                .await
+                .expect("TLS proxy fixture timed out");
+        });
+    }
+
+    async fn tls_fixture_head(transport: &mut Transport) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            assert!(bytes.len() < MAX_HEADER_BYTES, "oversized fixture request");
+            let mut byte = [0];
+            assert_eq!(read_some(transport, &mut byte).await.unwrap(), 1);
+            bytes.push(byte[0]);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn tls_fixture_prompt(transport: &mut Transport) {
+        let mut received = [0; 6];
+        let mut offset = 0;
+        while offset < received.len() {
+            let count = read_some(transport, &mut received[offset..]).await.unwrap();
+            assert!(count > 0, "fixture request body ended early");
+            offset += count;
+        }
+        assert_eq!(&received, b"prompt");
+    }
+
+    async fn tls_fixture_send(transport: &mut Transport, bytes: &[u8]) {
+        write_all_with_retry(transport, bytes).await.unwrap();
+        transport.flush().await.unwrap();
+    }
+
+    async fn tls_fixture_sse(transport: &mut Transport) {
+        tls_fixture_send(
+            transport,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n6\r\ndata: \r\n",
+        )
+        .await;
+        tls_fixture_send(transport, b"7\r\nready\n\n\r\n0\r\n\r\n").await;
+        let _ = transport.shutdown().await;
+    }
+
+    async fn tls_proxy_request(
+        client: &Client,
+        url: &str,
+        proxy: &ProxyEndpoint,
+    ) -> Result<Vec<u8>> {
+        let parsed = ParsedUrl::parse(url).unwrap();
+        let (status, headers, stream) = send_parts_with_proxy(
+            client,
+            Method::Post,
+            &parsed,
+            &[
+                (
+                    "Authorization".to_string(),
+                    "Bearer origin-token".to_string(),
+                ),
+                (
+                    "Proxy-Authorization".to_string(),
+                    "caller-proxy-secret".to_string(),
+                ),
+            ],
+            b"prompt",
+            Some(proxy),
+        )
+        .await?;
+        assert_eq!(status, 200);
+        Response {
+            status,
+            headers,
+            stream,
+            timeout_info: None,
+        }
+        .bytes_limited(1024)
+        .await
+    }
+
+    fn assert_no_proxy_retry_or_direct_fallback(
+        proxy: &TcpListener,
+        origin: &std::net::TcpListener,
+    ) {
+        assert_eq!(
+            origin.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            proxy.poll_accept(&mut cx).is_pending(),
+            "proxy connection retried"
+        );
+    }
+
+    #[test]
+    fn https_proxy_secures_http_absolute_form_and_streaming_response() {
+        run_tls_proxy_fixture(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = test_proxy(&format!(
+                "https://user:pass@{}",
+                listener.local_addr().unwrap()
+            ));
+            let server = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = tls_proxy_test_acceptor(PROXY_TEST_CERT)
+                    .accept(Transport::Tcp(tcp))
+                    .await
+                    .unwrap();
+                let mut transport = Transport::Tls(Box::new(tls));
+                let head = tls_fixture_head(&mut transport).await;
+                assert!(head.starts_with(
+                    "POST http://unresolvable.invalid:8080/v1?stream=true HTTP/1.1\r\n"
+                ));
+                assert!(head.contains("Host: unresolvable.invalid:8080\r\n"));
+                assert!(head.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+                assert_eq!(head.matches("Proxy-Authorization:").count(), 1);
+                assert!(head.contains("Authorization: Bearer origin-token\r\n"));
+                assert!(!head.contains("caller-proxy-secret"));
+                tls_fixture_prompt(&mut transport).await;
+                tls_fixture_sse(&mut transport).await;
+            };
+            let client = tls_proxy_test_client(true);
+            let (_, response) = futures::join!(
+                server,
+                tls_proxy_request(
+                    &client,
+                    "http://unresolvable.invalid:8080/v1?stream=true",
+                    &proxy,
+                )
+            );
+            assert_eq!(response.unwrap(), b"data: ready\n\n");
+        });
+    }
+
+    #[test]
+    fn https_proxy_connect_keeps_origin_tls_and_credentials_independent() {
+        run_tls_proxy_fixture(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = test_proxy(&format!(
+                "https://user:pass@{}",
+                listener.local_addr().unwrap()
+            ));
+            let server = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = tls_proxy_test_acceptor(PROXY_TEST_CERT)
+                    .accept(Transport::Tcp(tcp))
+                    .await
+                    .unwrap();
+                let mut hop = Transport::Tls(Box::new(tls));
+                let connect = tls_fixture_head(&mut hop).await;
+                assert!(connect.starts_with("CONNECT origin.invalid:443 HTTP/1.1\r\n"));
+                assert!(connect.contains("Host: origin.invalid:443\r\n"));
+                assert!(connect.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+                assert!(!connect.contains("origin-token"));
+                assert!(!connect.contains("caller-proxy-secret"));
+                tls_fixture_send(&mut hop, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+
+                let tls = tls_proxy_test_acceptor(ORIGIN_TEST_CERT)
+                    .accept(hop)
+                    .await
+                    .unwrap();
+                let mut origin = Transport::Tls(Box::new(tls));
+                let head = tls_fixture_head(&mut origin).await;
+                assert!(head.starts_with("POST /v1?stream=true HTTP/1.1\r\n"));
+                assert!(head.contains("Host: origin.invalid\r\n"));
+                assert!(head.contains("Authorization: Bearer origin-token\r\n"));
+                assert!(!head.to_ascii_lowercase().contains("proxy-authorization"));
+                assert!(!head.contains("dXNlcjpwYXNz"));
+                assert!(!head.contains("caller-proxy-secret"));
+                tls_fixture_prompt(&mut origin).await;
+                tls_fixture_sse(&mut origin).await;
+            };
+            let client = tls_proxy_test_client(true);
+            let (_, response) = futures::join!(
+                server,
+                tls_proxy_request(&client, "https://origin.invalid/v1?stream=true", &proxy)
+            );
+            assert_eq!(response.unwrap(), b"data: ready\n\n");
+        });
+    }
+
+    #[test]
+    fn https_proxy_rejects_wrong_hostname_and_untrusted_ca_without_fallback() {
+        for (certificate, trusted_ca) in [(ORIGIN_TEST_CERT, true), (PROXY_TEST_CERT, false)] {
+            run_tls_proxy_fixture(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                origin.set_nonblocking(true).unwrap();
+                let proxy = test_proxy(&format!(
+                    "https://user:pass@{}",
+                    listener.local_addr().unwrap()
+                ));
+                let url = format!("https://{}/must-not-send", origin.local_addr().unwrap());
+                let server = async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    tls_proxy_test_acceptor(certificate)
+                        .accept(Transport::Tcp(tcp))
+                        .await
+                };
+                let client = tls_proxy_test_client(trusted_ca);
+                let (accepted, response) =
+                    futures::join!(server, tls_proxy_request(&client, &url, &proxy));
+                assert!(accepted.is_err(), "unverified proxy handshake completed");
+                let error = response.unwrap_err().to_string();
+                assert!(error.contains("TLS connect failed (proxy)"), "{error}");
+                assert!(!error.contains("dXNlcjpwYXNz"));
+                assert!(!error.contains("origin-token"));
+                assert_no_proxy_retry_or_direct_fallback(&listener, &origin);
+            });
+        }
+    }
+
+    #[test]
+    fn https_proxy_still_rejects_wrong_origin_hostname_inside_verified_tunnel() {
+        run_tls_proxy_fixture(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let direct_origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            direct_origin.set_nonblocking(true).unwrap();
+            let authority = direct_origin.local_addr().unwrap().to_string();
+            let proxy = test_proxy(&format!(
+                "https://user:pass@{}",
+                listener.local_addr().unwrap()
+            ));
+            let server = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = tls_proxy_test_acceptor(PROXY_TEST_CERT)
+                    .accept(Transport::Tcp(tcp))
+                    .await
+                    .unwrap();
+                let mut hop = Transport::Tls(Box::new(tls));
+                let head = tls_fixture_head(&mut hop).await;
+                assert!(head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")));
+                assert!(!head.contains("origin-token"));
+                tls_fixture_send(&mut hop, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                // The CA is trusted, but this certificate covers origin.invalid,
+                // not the requested IP. Proxy verification must not replace it.
+                tls_proxy_test_acceptor(ORIGIN_TEST_CERT).accept(hop).await
+            };
+            let client = tls_proxy_test_client(true);
+            let url = format!("https://{authority}/must-not-send");
+            let (accepted, response) =
+                futures::join!(server, tls_proxy_request(&client, &url, &proxy));
+            assert!(accepted.is_err(), "unverified origin handshake completed");
+            let error = response.unwrap_err().to_string();
+            assert!(error.contains("TLS connect failed (origin)"), "{error}");
+            assert!(!error.contains("origin-token"));
+            assert_no_proxy_retry_or_direct_fallback(&listener, &direct_origin);
+        });
+    }
+
+    #[test]
+    fn https_proxy_connect_refusal_never_sends_origin_request_or_falls_back() {
+        run_tls_proxy_fixture(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            origin.set_nonblocking(true).unwrap();
+            let authority = origin.local_addr().unwrap().to_string();
+            let proxy = test_proxy(&format!(
+                "https://user:pass@{}",
+                listener.local_addr().unwrap()
+            ));
+            let server = async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = tls_proxy_test_acceptor(PROXY_TEST_CERT)
+                    .accept(Transport::Tcp(tcp))
+                    .await
+                    .unwrap();
+                let mut hop = Transport::Tls(Box::new(tls));
+                let head = tls_fixture_head(&mut hop).await;
+                assert!(head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")));
+                assert!(head.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+                assert!(!head.contains("origin-token"));
+                tls_fixture_send(
+                    &mut hop,
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+                let mut extra = [0; 32];
+                match read_some(&mut hop, &mut extra).await {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) => {}
+                    other => panic!("client sent traffic after refused CONNECT: {other:?}"),
+                }
+            };
+            let client = tls_proxy_test_client(true);
+            let url = format!("https://{authority}/must-not-send");
+            let (_, response) = futures::join!(server, tls_proxy_request(&client, &url, &proxy));
+            let error = response.unwrap_err().to_string();
+            assert!(error.contains("refused CONNECT"), "{error}");
+            assert!(error.contains("407"), "{error}");
+            assert!(!error.contains("dXNlcjpwYXNz"));
+            assert_no_proxy_retry_or_direct_fallback(&listener, &origin);
+        });
+    }
+
+    #[test]
+    fn tls_read_flushes_buffered_handshake_output_after_backpressure() {
+        #[derive(Default)]
+        struct BufferedPeer {
+            queued: Vec<u8>,
+            transmitted: Vec<u8>,
+            blocked_once: bool,
+            reads: usize,
+        }
+
+        impl AsyncWrite for BufferedPeer {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                self.queued.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if !self.blocked_once {
+                    self.blocked_once = true;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                let queued = std::mem::take(&mut self.queued);
+                self.transmitted.extend_from_slice(&queued);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.poll_flush(cx)
+            }
+        }
+
+        impl AsyncRead for BufferedPeer {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.reads += 1;
+                if self.transmitted != b"client-hello" {
+                    // The peer cannot answer bytes still buffered locally.
+                    return Poll::Pending;
+                }
+                buf.put_slice(b"server-reply");
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut peer = BufferedPeer::default();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut peer).poll_write(&mut cx, b"client-hello"),
+            Poll::Ready(Ok(12))
+        ));
+        let mut bytes = [0; 32];
+        let mut read_buf = ReadBuf::new(&mut bytes);
+        assert!(poll_read_after_flush(&mut peer, &mut cx, &mut read_buf).is_pending());
+        assert!(peer.transmitted.is_empty());
+        assert_eq!(peer.reads, 0);
+        assert!(matches!(
+            poll_read_after_flush(&mut peer, &mut cx, &mut read_buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(read_buf.filled(), b"server-reply");
+        assert_eq!(peer.transmitted, b"client-hello");
+        assert!(peer.queued.is_empty());
+        assert_eq!(peer.reads, 1);
     }
 }

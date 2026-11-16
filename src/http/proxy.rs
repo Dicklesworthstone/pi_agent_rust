@@ -3,6 +3,8 @@
 //! Pi's HTTP client is hand-rolled, so proxy support has to be explicit: this
 //! module owns *which* proxy a given request URL should go through. HTTP proxies
 //! use CONNECT for HTTPS origins and absolute-form requests for HTTP origins.
+//! An HTTPS proxy secures that first hop with its own verified TLS session;
+//! HTTPS origins then get a separate TLS session inside the CONNECT tunnel.
 //! SOCKS5 proxies use CONNECT for both, with origin TLS layered over the tunnel.
 //!
 //! # Precedence
@@ -40,9 +42,9 @@ mod socks5;
 
 /// A resolved proxy endpoint for one request.
 ///
-/// The hop to the proxy is plain TCP; HTTPS origin TLS remains end-to-end
-/// inside the HTTP or SOCKS5 tunnel. A `https://` proxy URL is rejected rather
-/// than silently downgraded.
+/// HTTPS origin TLS remains end-to-end inside the HTTP or SOCKS5 tunnel.
+/// An HTTPS proxy also encrypts the hop to the proxy, including credentials
+/// and CONNECT metadata, with independent hostname and certificate checks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyEndpoint {
     /// Proxy host (no brackets for IPv6 — ready for `TcpStream::connect`).
@@ -51,6 +53,7 @@ pub struct ProxyEndpoint {
     pub port: u16,
     /// HTTP `Proxy-Authorization` value; always absent for SOCKS5 endpoints.
     pub authorization: Option<String>,
+    tls: bool,
     socks5: Option<socks5::Socks5Config>,
 }
 
@@ -59,6 +62,7 @@ impl fmt::Debug for ProxyEndpoint {
         f.debug_struct("ProxyEndpoint")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("tls", &self.tls)
             .field(
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
@@ -85,13 +89,19 @@ impl ProxyEndpoint {
         self.socks5.is_none()
     }
 
+    /// Whether the connection to this HTTP proxy itself requires TLS.
+    #[must_use]
+    pub const fn uses_tls(&self) -> bool {
+        self.tls
+    }
+
     /// The proxy URL with any credentials removed — safe to log.
     #[must_use]
     pub fn redacted_url(&self) -> String {
-        let scheme = self
-            .socks5
-            .as_ref()
-            .map_or("http", socks5::Socks5Config::scheme);
+        let scheme = self.socks5.as_ref().map_or(
+            if self.tls { "https" } else { "http" },
+            socks5::Socks5Config::scheme,
+        );
         format!("{scheme}://{}", self.authority())
     }
 
@@ -555,11 +565,14 @@ impl ProxyConfig {
     }
 }
 
-/// Parse an HTTP, SOCKS5 (local DNS), or SOCKS5h (proxy DNS) endpoint.
+/// Parse an HTTP(S), SOCKS5 (local DNS), or SOCKS5h (proxy DNS) endpoint.
 ///
-/// `host:port` shorthand still means `http://`, and HTTP defaults to port 80;
-/// both SOCKS5 forms default to 1080. Username/password SOCKS5 authentication
-/// requires 1..=255 octets in each field and is not encrypted on the proxy hop.
+/// `host:port` shorthand still means `http://`. HTTP defaults to port 80,
+/// HTTPS to 443, and both SOCKS5 forms to 1080. Username/password SOCKS5
+/// authentication requires 1..=255 octets in each field and is not encrypted
+/// on the proxy hop.
+/// HTTPS proxies authenticate and encrypt the proxy hop before HTTP negotiation;
+/// HTTPS destinations receive independent TLS inside the CONNECT tunnel.
 ///
 /// Note that `HTTPS_PROXY=http://…` is the normal spelling: the variable names
 /// the traffic being proxied, not the hop to the proxy.
@@ -567,7 +580,7 @@ impl ProxyConfig {
 /// # Errors
 ///
 /// Rejects unsupported schemes, malformed authorities, invalid ports, and
-/// invalid credentials. HTTPS proxy hops still require unsupported TLS-in-TLS.
+/// invalid credentials.
 /// Error messages never include input values, which may contain secrets even
 /// when the URL is malformed.
 #[allow(clippy::too_many_lines)] // one linear parse: scheme, authority, host, port, credentials
@@ -579,18 +592,18 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
     if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         return Err("proxy URL contains unescaped whitespace or control characters".to_string());
     }
-    let (rest, remote_dns) = match raw.split_once("://") {
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => (rest, None),
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5") => (rest, Some(false)),
-        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5h") => (rest, Some(true)),
+    let (rest, remote_dns, tls) = match raw.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => (rest, None, false),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => (rest, None, true),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5") => (rest, Some(false), false),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5h") => (rest, Some(true), false),
         Some(_) => {
             return Err(
-                "unsupported proxy scheme (supported endpoints: http://, socks5://, socks5h://; \
-                 https:// proxy endpoints are not supported)"
+                "unsupported proxy scheme (supported endpoints: http://, https://, socks5://, socks5h://)"
                     .to_string(),
             );
         }
-        None => (raw, None),
+        None => (raw, None, false),
     };
     // Drop any path/query the value carries; a proxy is an authority.
     let authority = rest
@@ -639,7 +652,13 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
         return Err("invalid proxy host".to_string());
     }
 
-    let default_port = if remote_dns.is_some() { 1080 } else { 80 };
+    let default_port = if remote_dns.is_some() {
+        1080
+    } else if tls {
+        443
+    } else {
+        80
+    };
     let port = port.unwrap_or(default_port);
     let (authorization, socks5) = if let Some(remote_dns) = remote_dns {
         let credentials = userinfo.map(|info| {
@@ -680,6 +699,7 @@ pub fn parse_proxy_url(raw: &str) -> std::result::Result<ProxyEndpoint, String> 
         host,
         port,
         authorization,
+        tls,
         socks5,
     })
 }
@@ -1008,15 +1028,53 @@ mod tests {
         assert_eq!(parse_proxy_url("http://p.example").expect("http").port, 80);
     }
 
-    /// A TLS hop to the proxy would need TLS-in-TLS; reject it where the value
-    /// is read rather than at request time.
     #[test]
-    fn https_proxy_endpoints_are_rejected_at_parse_time() {
-        let err = parse_proxy_url("https://proxy:8443").expect_err("https hop unsupported");
-        assert!(
-            err.contains("https:// proxy endpoints are not supported"),
-            "{err}"
+    fn https_proxy_preserves_tls_authentication_and_default_port() {
+        let endpoint = parse_proxy_url("HTTPS://user:p%40ss@proxy.corp").expect("TLS proxy");
+        assert!(endpoint.is_http());
+        assert!(endpoint.uses_tls());
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(
+            endpoint.authorization.as_deref(),
+            Some("Basic dXNlcjpwQHNz")
         );
+        assert_eq!(endpoint.redacted_url(), "https://proxy.corp:443");
+        assert!(!format!("{endpoint:?}").contains("dXNlcjpwQHNz"));
+        let explicit = parse_proxy_url("https://[::1]:8443").expect("TLS IPv6 proxy");
+        assert_eq!(explicit.redacted_url(), "https://[::1]:8443");
+        for url in [
+            "proxy.corp",
+            "http://proxy.corp",
+            "socks5://proxy.corp",
+            "socks5h://proxy.corp",
+        ] {
+            assert!(!parse_proxy_url(url).unwrap().uses_tls(), "{url}");
+        }
+    }
+
+    #[test]
+    fn https_proxy_resolution_and_child_environment_keep_the_encrypted_scheme() {
+        let settings = HttpSettings {
+            proxy: Some("https://user:secret@proxy.corp:8443".into()),
+            ignore_env_proxy: Some(true),
+            ..HttpSettings::default()
+        };
+        let (config, warnings) = ProxyConfig::resolve(Some(&settings), &|_| None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for https in [false, true] {
+            let endpoint = config.endpoint_for(https, "origin.invalid", 443).unwrap();
+            assert!(endpoint.uses_tls());
+            assert_eq!(endpoint.redacted_url(), "https://proxy.corp:8443");
+        }
+        let environment = child_process_env_for(&config);
+        for name in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+            assert!(
+                environment
+                    .iter()
+                    .any(|(key, value)| { key == name && value == "https://proxy.corp:8443" })
+            );
+        }
+        assert!(!format!("{environment:?}").contains("secret"));
     }
 
     #[test]

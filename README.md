@@ -1529,9 +1529,15 @@ Ambient proxy variables are honored by default, the same as `git` and `curl`.
 Where they are set for some other tool — a capture proxy, a stale VPN helper —
 turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
 `PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
-endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
-proxy), with optional username/password authentication; SOCKS credentials are
-not encrypted on the hop to the proxy. Requests to `localhost` (case-insensitive,
+endpoints may be `http://`, `https://`, `socks5://` (local DNS) or `socks5h://`
+(DNS on the proxy), with optional username/password authentication. An
+`https://` proxy encrypts and authenticates the hop to the proxy before sending
+credentials or CONNECT metadata. HTTPS destinations receive an independent
+TLS connection inside that tunnel; both peer certificates and hostnames must
+verify against Pi's configured trust store. A failed handshake or refused
+CONNECT never falls back to plaintext or a direct connection. HTTP and SOCKS
+proxy credentials are not encrypted on the hop to the proxy.
+Requests to `localhost` (case-insensitive,
 with an optional trailing dot), literal IPv4 addresses in `127.0.0.0/8`, and
 IPv6 `::1` or IPv4-mapped loopback addresses go directly to the local server.
 This keeps Ollama and LM Studio reachable when a global proxy is configured.
@@ -1541,10 +1547,10 @@ hostnames retain the configured proxy routing.
 To intentionally send loopback destinations through the proxy, such as to reach
 a service on the proxy host or capture local traffic, set
 `"http": { "proxyLoopback": true }`. Explicit `NO_PROXY` / `http.noProxy`
-matches still take precedence. An unusable ambient value (e.g. an `https://`
-or `socks4://` endpoint) is skipped with a warning rather than failing requests.
+matches still take precedence. An unusable ambient value (e.g. a `socks4://`
+endpoint) is skipped with a warning rather than failing requests.
 
-The `bash` tool's child environment overrides advertise only HTTP proxy
+The `bash` tool's child environment overrides advertise only HTTP(S) proxy
 endpoints (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase
 spellings). Credentials are deliberately omitted from that per-child copy,
 so authenticated HTTP proxies need their own configuration in those tools
