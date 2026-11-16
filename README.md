@@ -27,6 +27,7 @@
 </p>
 
 ```bash
+# Requires Minisign: brew install minisign (macOS), sudo apt install minisign (Debian/Ubuntu)
 # Install latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
 ```
@@ -288,6 +289,9 @@ The terminal UI uses rich_rust for all output formatting, providing the same vis
 ## Quick Start
 
 ### 1. Install
+
+Install Minisign first (`brew install minisign` on macOS, or `sudo apt install minisign`
+on Debian/Ubuntu). The installer uses it to authenticate project releases.
 
 ```bash
 # Install latest release binary
@@ -1189,6 +1193,28 @@ ship separately from binary releases: the installer on `main` includes fixes for
 stock macOS tar/xz support and older awk versions that are absent from the
 installer at the v0.8.0 tag.
 
+The current installer requires the **Minisign CLI** for official release binaries.
+Install it with `brew install minisign` on macOS or `sudo apt install minisign` on
+Debian/Ubuntu. It verifies both the artifact's `.minisig` and the signed
+`SHA256SUMS` manifest with the public key pinned in this repository's
+[`minisign.pub`](minisign.pub), before extracting or running the downloaded binary.
+The authenticated metadata must match the requested project, release, platform,
+filename, and digest. Missing or invalid signatures stop installation; a checksum
+override does not bypass this requirement for official release URLs.
+
+Use versioned `/releases/download/<tag>/<asset>` URLs for explicit official
+artifacts; the unversioned `/releases/latest/download/` alias is rejected. Old
+releases without the required signatures are also rejected. Custom and offline
+artifacts retain caller-supplied checksum verification; use `--minisign-url` to
+require a detached signature for those artifacts too. The signature must use the
+same pinned project key.
+
+The native `pi self-update` implementation on `main` verifies signatures internally
+and does not require the Minisign CLI. It authenticates the manifest and raw binary
+before replacement, and automatic latest-version updates cannot downgrade an
+installed version. An explicit `--version` still permits an intentional older
+signed release.
+
 ```bash
 # Latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
@@ -1221,6 +1247,7 @@ Notable installer flags:
 - `--offline [TARBALL]`: enforce offline mode; optional local artifact path (`.tar.gz`, `.tar.xz`, `.zip`, or raw binary)
 - `--artifact-url`: force a specific release artifact URL
 - `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
+- `--minisign-url`: supply a required detached Minisign signature for a custom or offline artifact, verified with the pinned project key
 - `--sigstore-bundle-url`: override the optional Sigstore bundle URL used by
   `cosign verify-blob`; set both `COSIGN_IDENTITY_RE` and
   `COSIGN_OIDC_ISSUER` to the trusted signer policy (there is deliberately no

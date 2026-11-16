@@ -68,10 +68,14 @@ checkout lives elsewhere must re-point **both** of them in one edit
 registry). `host_paths` is the separate per-host map naming each SSH build
 host's checkout and does not need editing.
 
-`release_contract.minisign_public_key_file` is deliberately absent until
-bd-yj126 provisions a real repo-owned public key; a placeholder there would
-let the fail-closed contract pass against key material the project does not
-pin.
+The repository-owned release verification key is checked in as `minisign.pub`.
+The installer pins the same key and requires the Minisign CLI; the native
+`pi self-update` verifier embeds it and does not invoke an external verifier.
+Both consumer paths require signatures on the artifact and `SHA256SUMS`, including
+authenticated DSR comments binding the project, release tag, artifact role, and
+SHA-256 digest. The manifest also binds the selected filename to its digest.
+Keep the published files and their signatures together: unsigned or mismatched
+release metadata is a terminal installation or update failure.
 
 Two gates run before per-target planning and are expected to fail outside a
 release: the strict contract requires a completely clean tree (tracked **and**

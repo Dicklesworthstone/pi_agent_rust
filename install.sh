@@ -7,7 +7,7 @@
 #
 # Highlights:
 # - Installs latest (or requested) GitHub release binary for your platform
-# - Verifies each release artifact via its exact `.sha256` sidecar
+# - Verifies release checksums and mandatory Minisign signatures with the pinned key
 # - Detects existing TypeScript pi and can migrate to Rust canonical `pi`
 # - Creates `legacy-pi` alias for the preserved TypeScript CLI when migrated
 # - Writes installer state for idempotent re-runs and clean uninstall
@@ -46,6 +46,11 @@ SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-}"
 COSIGN_BIN="${PI_INSTALLER_COSIGN_BIN:-cosign}"
+MINISIGN_URL="${MINISIGN_URL:-}"
+MINISIGN_BIN="${PI_INSTALLER_MINISIGN_BIN:-minisign}"
+# Keep this project-owned trust root identical to minisign.pub. Never accept an
+# ambient public key or download a replacement alongside the artifact.
+readonly MINISIGN_PUBLIC_KEY="RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70"
 COMPLETIONS_MODE="${COMPLETIONS_MODE:-auto}"
 
 PROXY_ARGS=()
@@ -102,6 +107,7 @@ INSTALL_COMMITTED=0
 INSTALL_SOURCE="release"
 CHECKSUM_STATUS="pending"
 SIGSTORE_STATUS="pending"
+MINISIGN_STATUS="pending"
 COMPLETIONS_STATUS="pending"
 
 HAS_GUM=0
@@ -893,6 +899,7 @@ Options:
   --artifact-url URL     Install from explicit release artifact URL
   --checksum HEX         Expected SHA256 for explicit artifact
   --checksum-url URL     URL to checksum file or manifest
+  --minisign-url URL     Detached Minisign signature for a custom/offline artifact
   --sigstore-bundle-url URL
                           URL to Sigstore bundle (.sigstore.json)
   --from-source          Build from source instead of downloading release binary
@@ -975,6 +982,15 @@ while [ $# -gt 0 ]; do
         exit 1
       fi
       CHECKSUM_URL="$2"
+      shift 2
+      ;;
+    --minisign-url)
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
+        err "Option --minisign-url requires a value"
+        usage
+        exit 1
+      fi
+      MINISIGN_URL="$2"
       shift 2
       ;;
     --sigstore-bundle-url)
@@ -1474,7 +1490,7 @@ validate_options() {
     warn "--artifact-url is ignored with --from-source"
   fi
 
-  if [ "$NO_VERIFY" -eq 1 ] && { [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ] || [ -n "$SIGSTORE_BUNDLE_URL" ]; }; then
+  if [ "$NO_VERIFY" -eq 1 ] && { [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ] || [ -n "$SIGSTORE_BUNDLE_URL" ] || [ -n "$MINISIGN_URL" ]; }; then
     warn "--no-verify set; checksum/signature override flags are ignored"
   fi
 
@@ -1494,6 +1510,11 @@ validate_options() {
 
   if [ "$OFFLINE" -eq 1 ] && [ -n "$CHECKSUM_URL" ] && ! is_local_resource_ref "$CHECKSUM_URL"; then
     err "Offline mode requires a local --checksum-url path"
+    exit 1
+  fi
+
+  if [ "$OFFLINE" -eq 1 ] && [ -n "$MINISIGN_URL" ] && ! is_local_resource_ref "$MINISIGN_URL"; then
+    err "Offline mode requires a local --minisign-url path"
     exit 1
   fi
 
@@ -1546,7 +1567,8 @@ check_dependencies() {
     local needs_curl=1
     if [ -n "$ARTIFACT_URL" ] && is_local_resource_ref "$ARTIFACT_URL" \
       && { [ -z "$CHECKSUM_URL" ] || is_local_resource_ref "$CHECKSUM_URL"; } \
-      && { [ -z "$SIGSTORE_BUNDLE_URL" ] || is_local_resource_ref "$SIGSTORE_BUNDLE_URL"; }; then
+      && { [ -z "$SIGSTORE_BUNDLE_URL" ] || is_local_resource_ref "$SIGSTORE_BUNDLE_URL"; } \
+      && { [ -z "$MINISIGN_URL" ] || is_local_resource_ref "$MINISIGN_URL"; }; then
       needs_curl=0
     fi
 
@@ -1928,6 +1950,191 @@ verify_download_checksum() {
   fi
 }
 
+# Classify the original artifact URL, before redirects. An explicit checksum
+# must not turn a normal project release into an unsigned custom installation.
+is_official_release_artifact() {
+  local artifact_url
+  artifact_url="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$artifact_url" in
+    https://github.com/dicklesworthstone/pi_agent_rust/releases/download/*/*|\
+    https://github.com:443/dicklesworthstone/pi_agent_rust/releases/download/*/*|\
+    http://github.com/dicklesworthstone/pi_agent_rust/releases/download/*/*|\
+    http://github.com:80/dicklesworthstone/pi_agent_rust/releases/download/*/*|\
+    https://github.com/dicklesworthstone/pi_agent_rust/releases/latest/download/*|\
+    https://github.com:443/dicklesworthstone/pi_agent_rust/releases/latest/download/*|\
+    http://github.com/dicklesworthstone/pi_agent_rust/releases/latest/download/*|\
+    http://github.com:80/dicklesworthstone/pi_agent_rust/releases/latest/download/*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Read a bounded metadata body, including when the server omits Content-Length.
+# pipefail preserves transport failures; the sentinel byte detects oversize.
+fetch_signed_release_metadata() {
+  local url="$1" output_path="$2" max_bytes="$3"
+  if ! ensure_network_allowed "$url" "signed release metadata"; then
+    return 1
+  fi
+  if is_local_resource_ref "$url"; then
+    local local_path
+    local_path="$(resource_to_local_path "$url")" || return 1
+    if [ ! -f "$local_path" ]; then
+      err "Local signed release metadata not found: $local_path"
+      return 1
+    fi
+    head -c "$((max_bytes + 1))" "$local_path" > "$output_path" || return 1
+  else
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+      --user-agent "pi_agent_rust-installer (+https://github.com/Dicklesworthstone/pi_agent_rust)" \
+      --connect-timeout "${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}" \
+      --max-time "${PI_INSTALLER_META_MAX_TIME:-20}" \
+      --retry "${PI_INSTALLER_META_RETRIES:-2}" \
+      --retry-delay "${PI_INSTALLER_RETRY_DELAY:-1}" \
+      --retry-connrefused \
+      "$url" | head -c "$((max_bytes + 1))" > "$output_path"; then
+      return 1
+    fi
+  fi
+  local size
+  size="$(wc -c < "$output_path")" || return 1
+  if [ "$size" -eq 0 ] || [ "$size" -gt "$max_bytes" ]; then
+    err "Signed release metadata is empty or exceeds $max_bytes bytes"
+    return 1
+  fi
+}
+
+verify_minisign_file() {
+  local artifact_file="$1" signature_file="$2" verification_log="$3"
+  # -H rejects legacy signatures. -P ignores ambient key files. -Q returns
+  # only the comment after BOTH the artifact and comment signatures pass.
+  "$MINISIGN_BIN" -V -H -Q -m "$artifact_file" -x "$signature_file" \
+    -P "$MINISIGN_PUBLIC_KEY" 2> "$verification_log"
+}
+
+verify_minisign_signature() {
+  local artifact_file="$1" artifact_url="$2" asset_name="$3"
+
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    MINISIGN_STATUS="skipped (--no-verify)"
+    return 0
+  fi
+
+  local official=0
+  if [ -z "$ARTIFACT_URL" ] || is_official_release_artifact "$artifact_url"; then
+    official=1
+  fi
+  local signature_url="$MINISIGN_URL"
+  if [ -z "$signature_url" ] && [ "$official" -eq 0 ]; then
+    MINISIGN_STATUS="not requested (custom artifact)"
+    return 0
+  fi
+
+  if [ "$official" -eq 1 ]; then
+    local normalized_url
+    normalized_url="$(printf '%s' "$artifact_url" | tr '[:upper:]' '[:lower:]')"
+    case "$normalized_url" in
+      */releases/latest/download/*)
+        MINISIGN_STATUS="failed (unversioned release URL)"
+        err "Use a canonical /releases/download/<tag>/<asset> URL for authenticated releases"
+        return 1
+        ;;
+    esac
+  fi
+
+  if ! command -v "$MINISIGN_BIN" >/dev/null 2>&1; then
+    MINISIGN_STATUS="failed (minisign not found)"
+    err "Release authentication requires minisign; install minisign and retry"
+    err "For example: brew install minisign, or sudo apt install minisign"
+    return 1
+  fi
+
+  local artifact_base="${artifact_url%%\?*}"
+  artifact_base="${artifact_base%%#*}"
+  if [ -z "$signature_url" ]; then
+    signature_url="${artifact_base}.minisig"
+  fi
+  # Keep proofs separate from the downloaded artifact, including custom names.
+  local verification_dir
+  verification_dir="$(mktemp -d "$TMP/release-verification.XXXXXXXX")" || return 1
+  local signature_file="$verification_dir/artifact.minisig" comment
+  local verification_log="$verification_dir/minisign.log"
+  if ! fetch_signed_release_metadata "$signature_url" "$signature_file" 65536; then
+    MINISIGN_STATUS="failed (signature unavailable)"
+    err "Unable to fetch required release signature: $signature_url"
+    return 1
+  fi
+  if ! comment="$(verify_minisign_file "$artifact_file" "$signature_file" "$verification_log")"; then
+    MINISIGN_STATUS="failed (signature rejected)"
+    err "Minisign rejected the release signature for $asset_name"
+    return 1
+  fi
+
+  if [ "$official" -eq 1 ]; then
+    local release_base="${artifact_base%/*}"
+    local release_tag="${release_base##*/}"
+    if [ "$VERSION" != "custom-artifact" ] && [ "$release_tag" != "$VERSION" ]; then
+      MINISIGN_STATUS="failed (release tag mismatch)"
+      err "Artifact URL release $release_tag does not match requested $VERSION"
+      return 1
+    fi
+    local artifact_hash role="additional"
+    artifact_hash="$(compute_sha256 "$artifact_file")" || return 1
+    case "$asset_name" in
+      *.tar.xz|*.tar.gz|*.tgz|*.zip) role="${ASSET_PLATFORM/-//}" ;;
+    esac
+    if [ "$comment" != "dsr strict release pi_agent_rust $release_tag $role $artifact_hash" ]; then
+      MINISIGN_STATUS="failed (signed release identity mismatch)"
+      err "Signed artifact identity does not match the requested project, release, and platform"
+      return 1
+    fi
+
+    # Authenticate the filename-to-hash mapping too: a valid signature for some
+    # other platform's artifact must not satisfy this platform's installation.
+    local manifest_file="$verification_dir/SHA256SUMS"
+    local manifest_signature="$verification_dir/SHA256SUMS.minisig"
+    local manifest_comment manifest_hash expected
+    if ! fetch_signed_release_metadata "$release_base/SHA256SUMS" "$manifest_file" 1048576 \
+      || ! fetch_signed_release_metadata "$release_base/SHA256SUMS.minisig" "$manifest_signature" 65536; then
+      MINISIGN_STATUS="failed (signed manifest unavailable)"
+      err "Unable to fetch required signed release checksum manifest"
+      return 1
+    fi
+    if ! manifest_comment="$(verify_minisign_file "$manifest_file" "$manifest_signature" "$verification_log")"; then
+      MINISIGN_STATUS="failed (manifest signature rejected)"
+      err "Minisign rejected the release checksum manifest"
+      return 1
+    fi
+    manifest_hash="$(compute_sha256 "$manifest_file")" || return 1
+    if [ "$manifest_comment" != "dsr strict release pi_agent_rust $release_tag aggregate $manifest_hash" ]; then
+      MINISIGN_STATUS="failed (signed manifest identity mismatch)"
+      err "Signed checksum manifest does not match the requested project and release"
+      return 1
+    fi
+    expected="$(awk -v name="$asset_name" '
+      length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ && NF == 2 {
+        file=$2
+        sub(/^\*/, "", file)
+        if (file == name) { value=tolower($1); count += 1 }
+      }
+      END { if (count == 1) print value; else exit 1 }
+    ' "$manifest_file")" || {
+      MINISIGN_STATUS="failed (signed manifest entry missing or ambiguous)"
+      err "Signed release manifest must contain exactly one checksum for $asset_name"
+      return 1
+    }
+    if [ "$expected" != "$artifact_hash" ]; then
+      MINISIGN_STATUS="failed (signed manifest checksum mismatch)"
+      err "Signed release checksum does not match $asset_name"
+      return 1
+    fi
+  fi
+
+  MINISIGN_STATUS="verified (pinned Minisign key)"
+  ok "Release signature verified (pinned Minisign key)"
+}
+
 verify_sigstore_bundle() {
   local artifact_file="$1"
   local artifact_url="$2"
@@ -2139,14 +2346,15 @@ download_release_binary() {
     else
       checksum_rc=$?
       if [ "$checksum_rc" -eq 2 ]; then
-        if [ -n "$ARTIFACT_URL" ] || [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ]; then
-          err "No checksum entry found for $candidate"
-          return "$checksum_rc"
-        fi
-        warn "No checksum entry for $candidate in SHA256SUMS; trying next candidate"
-        continue
+        # A present artifact with incomplete metadata is not a missing asset.
+        # Do not bypass authentication by falling through to a source build.
+        err "No checksum entry found for $candidate"
       fi
       return "$checksum_rc"
+    fi
+
+    if ! verify_minisign_signature "$artifact_file" "$candidate_url" "$candidate"; then
+      return 5
     fi
 
     if ! verify_sigstore_bundle "$artifact_file" "$candidate_url"; then
@@ -3753,6 +3961,7 @@ print_summary() {
   lines+=("Version:   $VERSION")
   lines+=("Source:    $INSTALL_SOURCE")
   lines+=("Checksum:  $CHECKSUM_STATUS")
+  lines+=("Minisign:  $MINISIGN_STATUS")
   lines+=("Signature: $SIGSTORE_STATUS")
   lines+=("Shell:     $COMPLETIONS_STATUS")
   if [ -n "$PROXY_SOURCE" ]; then
@@ -3831,6 +4040,7 @@ main() {
     INSTALL_SOURCE="existing (no reinstall)"
     CHECKSUM_STATUS="not run (already installed)"
     SIGSTORE_STATUS="not run (already installed)"
+    MINISIGN_STATUS="not run (already installed)"
     ok "pi ${VERSION} already installed at $INSTALL_BIN_PATH"
     if [ "$ADOPT_TS" -eq 1 ]; then
       local refresh_legacy=0
@@ -3865,6 +4075,7 @@ main() {
     INSTALL_SOURCE="source"
     CHECKSUM_STATUS="not applicable (source build)"
     SIGSTORE_STATUS="not applicable (source build)"
+    MINISIGN_STATUS="not applicable (source build)"
     run_with_spinner "Building pi from source" build_from_source > "$TMP/source_bin_path"
     source_bin=$(cat "$TMP/source_bin_path")
   else
@@ -3911,6 +4122,7 @@ main() {
         INSTALL_SOURCE="source (release binary needs newer glibc)"
         CHECKSUM_STATUS="not applicable (source fallback)"
         SIGSTORE_STATUS="not applicable (source fallback)"
+        MINISIGN_STATUS="not applicable (source fallback)"
         check_dependencies
         run_with_spinner "Building pi from source" build_from_source > "$TMP/source_bin_path"
         source_bin=$(cat "$TMP/source_bin_path")
@@ -3947,6 +4159,7 @@ main() {
       INSTALL_SOURCE="source (release fallback)"
       CHECKSUM_STATUS="not applicable (source fallback)"
       SIGSTORE_STATUS="not applicable (source fallback)"
+      MINISIGN_STATUS="not applicable (source fallback)"
       check_dependencies
       run_with_spinner "Building pi from source" build_from_source > "$TMP/source_bin_path"
       source_bin=$(cat "$TMP/source_bin_path")

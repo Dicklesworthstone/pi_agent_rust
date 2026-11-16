@@ -139,6 +139,68 @@ EOF
   chmod +x "${dir}/fakebin/cosign"
 }
 
+# This adapter fixture exercises the real installer control flow and the
+# verifier's exact arguments. Cryptographic interoperability is covered by the
+# independent upstream Minisign vector in src/self_update.rs.
+write_minisign_stub() {
+  local dir="$1"
+  cat > "${dir}/fakebin/minisign" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+artifact="" signature="" key="" verify=0 hashed=0 comment_only=0
+if [ -n "${MINISIGN_LOG_PATH:-}" ]; then
+  printf '%s\n' "$*" >> "$MINISIGN_LOG_PATH"
+fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -V) verify=1; shift ;;
+    -H) hashed=1; shift ;;
+    -Q) comment_only=1; shift ;;
+    -m) artifact="$2"; shift 2 ;;
+    -x) signature="$2"; shift 2 ;;
+    -P) key="$2"; shift 2 ;;
+    *) echo "unexpected verifier argument: $1" >&2; exit 1 ;;
+  esac
+done
+if [ "$verify" -ne 1 ] || [ "$hashed" -ne 1 ] || [ "$comment_only" -ne 1 ]; then
+  exit 1
+fi
+[ "$key" = "RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70" ]
+[ -f "$artifact" ] || exit 1
+[ -f "$signature" ] || exit 1
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$artifact" | awk '{print $1}')"
+else
+  actual="$(shasum -a 256 "$artifact" | awk '{print $1}')"
+fi
+[ "$(sed -n '1p' "$signature")" = "$actual" ]
+[ "$(sed -n '2p' "$signature")" = "$key" ]
+comment="$(sed -n '3p' "$signature")"
+[ -n "$comment" ]
+printf '%s\n' "$comment"
+STUB
+  chmod +x "${dir}/fakebin/minisign"
+}
+
+write_minisign_fixture() {
+  local artifact="$1" signature="$2" comment="$3"
+  local key="${4:-RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70}"
+  printf '%s\n%s\n%s\n' "$(sha256_file "$artifact")" "$key" "$comment" > "$signature"
+}
+
+write_signed_release_fixture() {
+  local dir="$1" artifact="$2" asset_name="$3"
+  local role="${4:-linux/amd64}" tag="${5:-v9.9.9}" digest manifest
+  write_minisign_stub "$dir"
+  digest="$(sha256_file "$artifact")"
+  write_minisign_fixture "$artifact" "${dir}/fixtures/release-artifact.minisig" \
+    "dsr strict release pi_agent_rust $tag $role $digest"
+  manifest="${dir}/fixtures/signed-SHA256SUMS"
+  printf '%s  %s\n' "$digest" "$asset_name" > "$manifest"
+  write_minisign_fixture "$manifest" "${dir}/fixtures/signed-SHA256SUMS.minisig" \
+    "dsr strict release pi_agent_rust $tag aggregate $(sha256_file "$manifest")"
+}
+
 write_cp_fail_stub() {
   local dir="$1"
   cat > "${dir}/fakebin/cp" <<'STUB'
@@ -262,13 +324,31 @@ url="${args[${#args[@]}-1]}"
 if [[ "$url" == *.sigstore.json ]]; then
   exit 22
 fi
+# Serve metadata either to curl's output file or to its stdout stream. The
+# signed-metadata downloader intentionally pipes through a bounded reader.
+emit_fixture() {
+  local fixture="$1"
+  if [ ! -f "$fixture" ]; then
+    if [ "$write_out" -eq 1 ]; then printf '404'; fi
+    return 22
+  fi
+  if [ -n "$output" ]; then cp "$fixture" "$output"; else cat "$fixture"; fi
+  if [ "$write_out" -eq 1 ]; then printf '200'; fi
+}
+
+if [[ "$url" == */SHA256SUMS.minisig ]]; then
+  emit_fixture "${STUB_MANIFEST_MINISIGN_SOURCE:-${0%/*}/../fixtures/signed-SHA256SUMS.minisig}"
+  exit $?
+fi
+if [[ "$url" == *.minisig ]]; then
+  emit_fixture "${STUB_MINISIGN_SOURCE:-${0%/*}/../fixtures/release-artifact.minisig}"
+  exit $?
+fi
 if [[ "$url" == */SHA256SUMS ]]; then
-  if [ -n "${STUB_SHA256SUMS_SOURCE:-}" ]; then
-    cp "${STUB_SHA256SUMS_SOURCE}" "$output"
-    if [ "$write_out" -eq 1 ]; then
-      printf '200'
-    fi
-    exit 0
+  manifest_source="${STUB_SHA256SUMS_SOURCE:-${0%/*}/../fixtures/signed-SHA256SUMS}"
+  if [ -f "$manifest_source" ]; then
+    emit_fixture "$manifest_source"
+    exit $?
   fi
   if [ "$write_out" -eq 1 ]; then
     printf '%s' "${STUB_SHA256SUMS_HTTP_STATUS:-404}"
@@ -588,6 +668,8 @@ run_installer() {
     SHELL="/bin/bash" \
     PI_INSTALLER_LOCK_DIR="${PI_INSTALLER_TEST_LOCK_DIR:-${dir}/installer.lock.d}" \
     PI_INSTALLER_RETAIN_TEMP="${PI_INSTALLER_TEST_RETAIN_TEMP:-0}" \
+    MINISIGN_URL="${PI_INSTALLER_TEST_MINISIGN_URL:-}" \
+    PI_INSTALLER_MINISIGN_BIN="${PI_INSTALLER_TEST_MINISIGN_BIN:-${dir}/fakebin/minisign}" \
     env -u CODEX_HOME bash "${INSTALLER}" "$@" >"${out}" 2>&1
     echo "$?" > "${rc_file}"
   )
@@ -735,6 +817,7 @@ test_help_lists_installer_flags() {
   assert_exit_code "$dir" 0
   assert_output_contains "$dir" "--artifact-url URL"
   assert_output_contains "$dir" "--checksum HEX"
+  assert_output_contains "$dir" "--minisign-url URL"
   assert_output_contains "$dir" "--sigstore-bundle-url URL"
   assert_output_contains "$dir" "--completions SHELL"
   assert_output_contains "$dir" "--no-agent-skills"
@@ -1148,6 +1231,8 @@ test_linux_target_uses_supported_linux_artifact_naming() {
   checksum="$(sha256_file "$artifact")"
   curl_log="${dir}/curl.log"
 
+  write_signed_release_fixture "$dir" "$artifact" "pi_linux_amd64" "additional"
+
   # The fixture is a bare binary, so it must be served for the bare-binary
   # candidate only: the canonical `pi-linux-amd64.tar.xz` candidate is tried
   # first and a checksum-verified but unextractable archive aborts the install
@@ -1183,6 +1268,8 @@ test_rosetta_prefers_arm64_artifact_naming() {
   write_artifact_binary "$artifact" "unsupported"
   checksum="$(sha256_file "$artifact")"
   curl_log="${dir}/curl.log"
+
+  write_signed_release_fixture "$dir" "$artifact" "pi_darwin_arm64" "additional"
 
   # Bare-binary fixture: serve it only for the bare `pi_darwin_arm64`
   # candidate so the canonical `.tar.xz` candidate 404s instead of failing
@@ -2037,7 +2124,7 @@ test_local_checksum_copy_failure_fails_closed() {
   fi
 }
 
-test_release_install_uses_dsr_asset_sidecar_when_manifest_absent() {
+test_release_install_uses_dsr_sidecar_and_signed_manifest() {
   local dir artifact archive sidecar checksum curl_log installed
   dir="$(case_dir "checksum-dsr-sidecar")"
   write_existing_pi_stub "$dir"
@@ -2050,6 +2137,7 @@ test_release_install_uses_dsr_asset_sidecar_when_manifest_absent() {
   curl_log="${dir}/curl.log"
   write_artifact_binary "$artifact" "unsupported"
   tar -cJf "$archive" -C "${dir}/fixtures" pi
+  write_signed_release_fixture "$dir" "$archive" "pi-linux-amd64.tar.xz"
   checksum="$(sha256_file "$archive" | tr '[:lower:]' '[:upper:]')"
   printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
 
@@ -2067,10 +2155,9 @@ test_release_install_uses_dsr_asset_sidecar_when_manifest_absent() {
   assert_exit_code "$dir" 0
   assert_output_contains "$dir" "Checksum:  verified (artifact .sha256)"
   grep -Fq -- "/pi-linux-amd64.tar.xz.sha256" "$curl_log"
-  if grep -Fq -- "/SHA256SUMS" "$curl_log"; then
-    echo "canonical DSR sidecar success unnecessarily probed legacy SHA256SUMS" >&2
-    return 1
-  fi
+  assert_output_contains "$dir" "Minisign:  verified (pinned Minisign key)"
+  grep -Fq -- "/pi-linux-amd64.tar.xz.minisig" "$curl_log"
+  grep -Fq -- "/SHA256SUMS.minisig" "$curl_log"
   installed="${dir}/dest/pi"
   [ -x "$installed" ] || { echo "expected installed binary at ${installed}" >&2; return 1; }
 }
@@ -2095,6 +2182,7 @@ test_release_install_extracts_tar_xz_without_an_xz_program() {
   sidecar="${archive}.sha256"
   write_artifact_binary "$artifact" "unsupported"
   tar -cJf "$archive" -C "${dir}/fixtures" pi
+  write_signed_release_fixture "$dir" "$archive" "pi-linux-amd64.tar.xz"
   checksum="$(sha256_file "$archive")"
   printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
 
@@ -2110,6 +2198,7 @@ test_release_install_extracts_tar_xz_without_an_xz_program() {
 
   assert_exit_code "$dir" 0
   assert_output_not_contains "$dir" "xz is not available"
+  assert_output_contains "$dir" "Minisign:  verified (pinned Minisign key)"
   installed="${dir}/dest/pi"
   [ -x "$installed" ] || { echo "expected installed binary at ${installed}" >&2; return 1; }
 }
@@ -2127,6 +2216,7 @@ test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent() {
   curl_log="${dir}/curl.log"
   write_artifact_binary "$artifact" "unsupported"
   tar -cJf "$archive" -C "${dir}/fixtures" pi
+  write_signed_release_fixture "$dir" "$archive" "pi-linux-amd64.tar.xz"
   checksum="$(sha256_file "$archive")"
   printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$manifest"
 
@@ -2417,6 +2507,7 @@ test_release_install_rejects_checksum_verified_broken_canonical_archive() {
   curl_log="${dir}/curl.log"
   installed="${dir}/dest/pi"
   printf 'not-an-xz-archive\n' > "$archive"
+  write_signed_release_fixture "$dir" "$archive" "pi-linux-amd64.tar.xz"
   checksum="$(sha256_file "$archive")"
   printf '%s  %s\n' "$checksum" "pi-linux-amd64.tar.xz" > "$sidecar"
   printf 'existing-destination-sentinel\n' > "$installed"
@@ -2451,6 +2542,194 @@ test_release_install_rejects_checksum_verified_broken_canonical_archive() {
     echo "broken canonical archive replaced the existing installation" >&2
     return 1
   fi
+}
+
+test_release_install_missing_checksum_entry_does_not_source_fallback() {
+  local dir artifact manifest digest
+  dir="$(case_dir "release-missing-checksum-entry")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  write_curl_artifact_stub "$dir"
+  artifact="${dir}/fixtures/pi"
+  manifest="${dir}/fixtures/SHA256SUMS"
+  write_artifact_binary "$artifact" "unsupported"
+  digest="$(sha256_file "$artifact")"
+  printf '%s  pi_windows_amd64.exe\n' "$digest" > "$manifest"
+  printf 'existing-destination-sentinel\n' > "${dir}/dest/pi"
+  chmod +x "${dir}/dest/pi"
+
+  STUB_ARTIFACT_SOURCE="$artifact" \
+  STUB_ARTIFACT_URL_SUFFIX="/pi_linux_amd64" \
+  STUB_SHA256_SIDECAR_SOURCE="${dir}/missing.sha256" \
+  STUB_SHA256SUMS_SOURCE="$manifest" \
+  CURL_LOG_PATH="${dir}/curl.log" \
+  run_installer "$dir" --yes --no-gum --version v9.9.9 --dest "${dir}/dest" \
+    --no-completions --no-agent-skills
+
+  assert_exit_code "$dir" 1 || return 1
+  assert_output_contains "$dir" "No checksum entry found for pi_linux_amd64" || return 1
+  assert_output_contains "$dir" "Release checksum verification failed; aborting install" || return 1
+  assert_output_not_contains "$dir" "falling back to source build" || return 1
+  [ "$(cat "${dir}/dest/pi")" = "existing-destination-sentinel" ] || return 1
+  if grep -Eq '/pi(-linux-amd64)?([[:space:]]|$)' "${dir}/curl.log"; then
+    echo "missing release checksum entry triggered another artifact candidate" >&2
+    return 1
+  fi
+}
+
+test_minisign_trust_root_matches_repo() {
+  local key
+  key="$(sed -n '2p' "${ROOT}/minisign.pub")"
+  grep -Fxq "readonly MINISIGN_PUBLIC_KEY=\"$key\"" "$INSTALLER"
+}
+
+test_minisign_official_release_matrix() {
+  local scenario
+  for scenario in valid missing-verifier missing-signature malformed wrong-key swapped modified-payload \
+    old-release wrong-role missing-manifest invalid-manifest wrong-manifest-name duplicate-manifest-name \
+    wrong-manifest-hash oversized explicit-official latest-alias no-verify; do
+    local dir artifact signature manifest manifest_signature digest verifier log marker
+    dir="$(case_dir "minisign-$scenario")"
+    write_existing_pi_stub "$dir"
+    write_uname_stub "$dir" "Linux" "x86_64"
+    write_curl_artifact_stub "$dir"
+    artifact="${dir}/fixtures/pi"
+    marker="${dir}/executed"
+    cat > "$artifact" <<'ARTIFACT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${INSTALLER_PROBE_MARKER:-}" ]; then
+  printf 'executed\n' > "$INSTALLER_PROBE_MARKER"
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf 'pi 9.9.9 (signed installer fixture)\n'
+  exit 0
+fi
+exit 1
+ARTIFACT
+    chmod +x "$artifact"
+    write_signed_release_fixture "$dir" "$artifact" "pi_linux_amd64" "additional"
+    signature="${dir}/fixtures/release-artifact.minisig"
+    manifest="${dir}/fixtures/signed-SHA256SUMS"
+    manifest_signature="${dir}/fixtures/signed-SHA256SUMS.minisig"
+    verifier="${dir}/fakebin/minisign"
+    log="${dir}/minisign.log"
+    printf 'existing-destination-sentinel\n' > "${dir}/dest/pi"
+    chmod +x "${dir}/dest/pi"
+    local extra_args=()
+    case "$scenario" in
+      missing-verifier) verifier="${dir}/missing-minisign" ;;
+      missing-signature) signature="${dir}/missing.minisig" ;;
+      malformed) printf 'not a signature\n' > "$signature" ;;
+      wrong-key)
+        write_minisign_fixture "$artifact" "$signature" \
+          "dsr strict release pi_agent_rust v9.9.9 additional $(sha256_file "$artifact")" "untrusted-key"
+        ;;
+      swapped)
+        printf 'other release payload\n' > "${dir}/fixtures/other"
+        write_minisign_fixture "${dir}/fixtures/other" "$signature" \
+          "dsr strict release pi_agent_rust v9.9.9 additional $(sha256_file "${dir}/fixtures/other")"
+        ;;
+      modified-payload) printf '# modified after signing\n' >> "$artifact" ;;
+      old-release) write_signed_release_fixture "$dir" "$artifact" "pi_linux_amd64" "additional" "v1.0.0" ;;
+      wrong-role) write_signed_release_fixture "$dir" "$artifact" "pi_linux_amd64" "darwin/amd64" ;;
+      missing-manifest) manifest="${dir}/missing-SHA256SUMS" ;;
+      invalid-manifest) printf 'not a signature\n' > "$manifest_signature" ;;
+      wrong-manifest-name|duplicate-manifest-name|wrong-manifest-hash)
+        digest="$(sha256_file "$artifact")"
+        case "$scenario" in
+          wrong-manifest-name) printf '%s  pi_windows_amd64.exe\n' "$digest" > "$manifest" ;;
+          duplicate-manifest-name) printf '%s  pi_linux_amd64\n%s  pi_linux_amd64\n' "$digest" "$digest" > "$manifest" ;;
+          wrong-manifest-hash) printf '%064d  pi_linux_amd64\n' 0 > "$manifest" ;;
+        esac
+        write_minisign_fixture "$manifest" "$manifest_signature" \
+          "dsr strict release pi_agent_rust v9.9.9 aggregate $(sha256_file "$manifest")"
+        ;;
+      oversized) head -c 65537 /dev/zero > "$signature" ;;
+      explicit-official)
+        signature="${dir}/missing.minisig"
+        extra_args=(--artifact-url "https://GitHub.com/DICKLESWORTHSTONE/PI_AGENT_RUST/releases/download/v9.9.9/pi_linux_amd64")
+        ;;
+      latest-alias)
+        extra_args=(--artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/latest/download/pi_linux_amd64")
+        ;;
+      no-verify)
+        signature="${dir}/missing.minisig"
+        extra_args=(--no-verify)
+        ;;
+    esac
+    # Recompute the unsigned checksum after tampering: the signature, not the
+    # checksum, must be the guard that rejects a modified payload here.
+    digest="$(sha256_file "$artifact")"
+    STUB_ARTIFACT_SOURCE="$artifact" \
+    STUB_ARTIFACT_URL_SUFFIX="/pi_linux_amd64" \
+    STUB_MINISIGN_SOURCE="$signature" \
+    STUB_SHA256SUMS_SOURCE="$manifest" \
+    STUB_MANIFEST_MINISIGN_SOURCE="$manifest_signature" \
+    PI_INSTALLER_TEST_MINISIGN_BIN="$verifier" \
+    MINISIGN_LOG_PATH="$log" \
+    INSTALLER_PROBE_MARKER="$marker" \
+    CURL_LOG_PATH="${dir}/curl.log" \
+    run_installer "$dir" --yes --no-gum --version v9.9.9 --dest "${dir}/dest" \
+      --checksum "$digest" --no-completions --no-agent-skills ${extra_args[@]+"${extra_args[@]}"}
+
+    if [ "$scenario" = valid ] || [ "$scenario" = no-verify ]; then
+      assert_exit_code "$dir" 0 || return 1
+      [ -f "$marker" ] || { echo "$scenario never reached the authenticated executable" >&2; return 1; }
+      cmp -s "$artifact" "${dir}/dest/pi" || return 1
+      if [ "$scenario" = valid ]; then
+        assert_output_contains "$dir" "Minisign:  verified (pinned Minisign key)" || return 1
+        [ "$(wc -l < "$log")" -eq 2 ] || { echo "artifact and manifest must both be verified" >&2; return 1; }
+      else
+        [ ! -e "$log" ] || { echo "explicit verification opt-out still invoked verifier" >&2; return 1; }
+      fi
+    else
+      assert_exit_code "$dir" 1 || return 1
+      assert_output_contains "$dir" "Release signature verification failed; aborting install" || return 1
+      assert_output_not_contains "$dir" "falling back to source build" || return 1
+      if [ "$scenario" = oversized ] && [ -e "$log" ]; then
+        echo "oversized signature reached the verifier before its size check" >&2
+        return 1
+      fi
+      [ ! -e "$marker" ] || { echo "$scenario executed an unauthenticated artifact" >&2; return 1; }
+      [ "$(cat "${dir}/dest/pi")" = "existing-destination-sentinel" ] || {
+        echo "$scenario replaced the existing installation" >&2; return 1;
+      }
+      if grep -Eq '/pi(-linux-amd64)?([[:space:]]|$)' "${dir}/curl.log"; then
+        echo "$scenario downgraded to a different artifact candidate" >&2
+        return 1
+      fi
+    fi
+  done
+}
+
+test_minisign_custom_offline_signature_is_explicit_and_pinned() {
+  local dir artifact digest signature
+  dir="$(case_dir "minisign-custom-offline")"
+  write_existing_pi_stub "$dir"
+  write_uname_stub "$dir" "Linux" "x86_64"
+  # Regression: an artifact named like verification metadata must remain intact.
+  artifact="${dir}/fixtures/release-artifact.minisig"
+  write_artifact_binary "$artifact" "unsupported"
+  write_minisign_stub "$dir"
+  digest="$(sha256_file "$artifact")"
+  signature="${dir}/fixtures/detached.minisig"
+  write_minisign_fixture "$artifact" "$signature" "custom artifact fixture"
+
+  run_installer "$dir" --yes --no-gum --offline --version v9.9.9 --dest "${dir}/dest" \
+    --artifact-url "file://$artifact" --checksum "$digest" --minisign-url "file://$signature" \
+    --no-completions --no-agent-skills
+  assert_exit_code "$dir" 0 || return 1
+  assert_output_contains "$dir" "Minisign:  verified (pinned Minisign key)" || return 1
+  cmp -s "$artifact" "${dir}/dest/pi" || return 1
+
+  # A caller-provided signature URL is mandatory even for a local artifact.
+  run_installer "$dir" --yes --no-gum --force --offline --version v9.9.9 --dest "${dir}/dest" \
+    --artifact-url "file://$artifact" --checksum "$digest" \
+    --minisign-url "file://${dir}/missing.minisig" --no-completions --no-agent-skills
+  assert_exit_code "$dir" 1 || return 1
+  assert_output_contains "$dir" "Release signature verification failed; aborting install" || return 1
+  cmp -s "$artifact" "${dir}/dest/pi"
 }
 
 test_sigstore_bundle_unavailable_soft_skip() {
@@ -3158,7 +3437,7 @@ main() {
   run_test test_checksum_mismatch_fails_hard
   run_test test_checksum_missing_manifest_entry_fails_hard
   run_test test_local_checksum_copy_failure_fails_closed
-  run_test test_release_install_uses_dsr_asset_sidecar_when_manifest_absent
+  run_test test_release_install_uses_dsr_sidecar_and_signed_manifest
   run_test test_release_install_extracts_tar_xz_without_an_xz_program
   run_test test_release_install_falls_back_to_legacy_manifest_when_sidecar_absent
   run_test test_release_install_without_any_checksum_fails_closed
@@ -3168,6 +3447,10 @@ main() {
   run_test test_release_install_does_not_downgrade_on_artifact_transport_failure
   run_test test_release_install_distinguishes_manifest_transport_failure_from_absence
   run_test test_release_install_rejects_checksum_verified_broken_canonical_archive
+  run_test test_release_install_missing_checksum_entry_does_not_source_fallback
+  run_test test_minisign_trust_root_matches_repo
+  run_test test_minisign_official_release_matrix
+  run_test test_minisign_custom_offline_signature_is_explicit_and_pinned
   run_test test_sigstore_bundle_unavailable_soft_skip
   run_test test_explicit_sigstore_bundle_without_cosign_fails_closed
   run_test test_explicit_sigstore_bundle_fetch_failure_fails_closed
