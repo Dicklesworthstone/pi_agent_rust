@@ -530,6 +530,7 @@ impl SelfUpdater {
         }
     }
 
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn release_public_key(&self) -> &str {
         #[cfg(test)]
         if let Some(key) = &self.test_public_key {
