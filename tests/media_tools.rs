@@ -561,7 +561,7 @@ fn test_read_media_schema_and_default_cap() {
     assert_eq!(tool.label(), "Read Media");
     assert!(tool.description().contains("mp4"));
     assert_eq!(tool.max_bytes(), DEFAULT_MEDIA_MAX_BYTES);
-    assert_eq!(DEFAULT_MEDIA_MAX_BYTES, 5 * 1024 * 1024);
+    assert_eq!(DEFAULT_MEDIA_MAX_BYTES, 64 * 1024 * 1024);
 
     let params = tool.parameters();
     assert_eq!(params["type"], "object");
