@@ -691,6 +691,14 @@ enum BlockKind {
     Thinking,
 }
 
+/// Content decoded from a complete provider frame, held until its real block
+/// count has been admitted. Tool envelopes can expand a single text delta into
+/// many blocks; none of that frame's previews or usage may escape on refusal.
+enum PreparedEvent {
+    Provider(ServerEvent),
+    ToolCall(crate::model::ToolCall),
+}
+
 /// Per-request streaming state: buffers Connect frames from the HTTP body and
 /// turns decoded `AgentServerMessage`s into pi [`StreamEvent`]s.
 struct StreamState {
@@ -710,7 +718,7 @@ struct StreamState {
     diagnostic_token: Option<String>,
     error_message: Option<String>,
     allowed_tools: std::collections::HashSet<String>,
-    tool_tag_buffer: String,
+    tool_tag_parser: crate::provider::PromptToolCallParser,
     tool_call_count: usize,
     started: bool,
     finalized: bool,
@@ -737,7 +745,7 @@ impl StreamState {
             diagnostic_token: None,
             error_message: None,
             allowed_tools: std::collections::HashSet::new(),
-            tool_tag_buffer: String::new(),
+            tool_tag_parser: crate::provider::PromptToolCallParser::default(),
             tool_call_count: 0,
             started: false,
             finalized: false,
@@ -812,6 +820,7 @@ impl StreamState {
         self.done = true;
         self.source = Box::pin(stream::empty());
         self.frames = FrameBuffer::default();
+        self.tool_tag_parser = crate::provider::PromptToolCallParser::default();
         self.diagnostic_token = None;
     }
 
@@ -921,83 +930,96 @@ impl StreamState {
         self.tool_call_count = self.tool_call_count.saturating_add(1);
     }
 
-    fn drain_tool_tag_buffer(&mut self, flush_incomplete: bool) {
-        const OPEN: &str = crate::provider::PI_TOOL_CALL_OPEN;
-        const CLOSE: &str = crate::provider::PI_TOOL_CALL_CLOSE;
+    fn stage_event(
+        event: PreparedEvent,
+        budget: &mut stream_limits::Budget,
+        open_kind: &mut Option<BlockKind>,
+        prepared: &mut Vec<PreparedEvent>,
+    ) -> Result<()> {
+        let next_kind = match &event {
+            PreparedEvent::Provider(ServerEvent::TextDelta(text)) if !text.is_empty() => {
+                Some(BlockKind::Text)
+            }
+            PreparedEvent::Provider(ServerEvent::ThinkingDelta(text)) if !text.is_empty() => {
+                Some(BlockKind::Thinking)
+            }
+            PreparedEvent::ToolCall(_) => {
+                budget.admit_blocks(1)?;
+                *open_kind = None;
+                prepared.push(event);
+                return Ok(());
+            }
+            _ => None,
+        };
+        if let Some(kind) = next_kind {
+            if *open_kind != Some(kind) {
+                budget.admit_blocks(1)?;
+            }
+            *open_kind = Some(kind);
+        }
+        prepared.push(event);
+        Ok(())
+    }
 
-        loop {
-            if self.tool_tag_buffer.is_empty() {
-                break;
-            }
-            if let Some(open_pos) = self.tool_tag_buffer.find(OPEN) {
-                if open_pos > 0 {
-                    let prefix = self.tool_tag_buffer[..open_pos].to_string();
-                    self.tool_tag_buffer.drain(..open_pos);
-                    self.emit_raw_text_delta(prefix);
+    fn stage_prompt_parts(
+        &mut self,
+        flush_incomplete: bool,
+        budget: &mut stream_limits::Budget,
+        open_kind: &mut Option<BlockKind>,
+        prepared: &mut Vec<PreparedEvent>,
+    ) -> Result<()> {
+        while let Some(part) = self
+            .tool_tag_parser
+            .next(&self.allowed_tools, flush_incomplete)
+        {
+            let event = match part {
+                crate::provider::PromptToolCallPart::Text(text) => {
+                    PreparedEvent::Provider(ServerEvent::TextDelta(text))
                 }
-                let after_open = &self.tool_tag_buffer[OPEN.len()..];
-                if let Some(close_rel) = after_open.find(CLOSE) {
-                    let raw_json = after_open[..close_rel].to_string();
-                    let consumed = OPEN.len() + close_rel + CLOSE.len();
-                    let raw_segment = self.tool_tag_buffer[..consumed].to_string();
-                    self.tool_tag_buffer.drain(..consumed);
-                    if let Some(call) = crate::provider::parse_prompt_tool_call_json(
-                        &raw_json,
-                        &self.allowed_tools,
-                        self.tool_call_count + 1,
-                    ) {
-                        self.emit_tool_call(call);
-                    } else {
-                        self.emit_raw_text_delta(raw_segment);
-                    }
-                    continue;
-                }
-                if flush_incomplete {
-                    let leftover = std::mem::take(&mut self.tool_tag_buffer);
-                    self.emit_raw_text_delta(leftover);
-                }
-                break;
-            }
+                crate::provider::PromptToolCallPart::ToolCall(call) => PreparedEvent::ToolCall(call),
+            };
+            Self::stage_event(event, budget, open_kind, prepared)?;
+        }
+        Ok(())
+    }
 
-            if flush_incomplete {
-                let leftover = std::mem::take(&mut self.tool_tag_buffer);
-                self.emit_raw_text_delta(leftover);
-                break;
-            }
-
-            // Hold back only a trailing suffix that could still complete `<pi_tool_call>`.
-            let mut hold_from = self.tool_tag_buffer.len();
-            let max_suffix = OPEN.len().saturating_sub(1).min(self.tool_tag_buffer.len());
-            for suffix_len in (1..=max_suffix).rev() {
-                let candidate_start = self.tool_tag_buffer.len() - suffix_len;
-                if self.tool_tag_buffer.is_char_boundary(candidate_start)
-                    && OPEN.starts_with(&self.tool_tag_buffer[candidate_start..])
-                {
-                    hold_from = candidate_start;
-                    break;
+    fn prepare_events(&mut self, events: Vec<ServerEvent>) -> Result<Vec<PreparedEvent>> {
+        let mut budget = self.budget.clone();
+        // Refuse raw bytes/events before allocating parsed tool calls. The
+        // lightweight budget is speculative; the large parser buffer is not
+        // cloned. Any later failure permanently terminates this stream.
+        budget.admit_with_blocks(&events, 0)?;
+        let mut open_kind = self.open_block.map(|(_, kind)| kind);
+        let mut prepared = Vec::new();
+        for event in events {
+            match event {
+                ServerEvent::TextDelta(delta) if !self.allowed_tools.is_empty() => {
+                    self.tool_tag_parser.push(&delta);
+                    self.stage_prompt_parts(false, &mut budget, &mut open_kind, &mut prepared)?;
                 }
+                event => Self::stage_event(
+                    PreparedEvent::Provider(event),
+                    &mut budget,
+                    &mut open_kind,
+                    &mut prepared,
+                )?,
             }
-            if hold_from > 0 {
-                let ready = self.tool_tag_buffer[..hold_from].to_string();
-                self.tool_tag_buffer.drain(..hold_from);
-                self.emit_raw_text_delta(ready);
-            }
-            break;
+        }
+        self.budget = budget;
+        Ok(prepared)
+    }
+
+    fn apply_prepared(&mut self, event: PreparedEvent) {
+        match event {
+            PreparedEvent::Provider(event) => self.apply(event),
+            PreparedEvent::ToolCall(call) => self.emit_tool_call(call),
         }
     }
 
     fn apply(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::TextDelta(delta) => {
-                if delta.is_empty() {
-                    return;
-                }
-                if self.allowed_tools.is_empty() {
-                    self.emit_raw_text_delta(delta);
-                } else {
-                    self.tool_tag_buffer.push_str(&delta);
-                    self.drain_tool_tag_buffer(false);
-                }
+                self.emit_raw_text_delta(delta);
             }
             ServerEvent::ThinkingDelta(delta) => {
                 if delta.is_empty() {
@@ -1064,16 +1086,15 @@ impl StreamState {
             return Ok(());
         }
         let events = decode_server_message(&payload)?;
-        self.budget
-            .admit(&events, self.open_block.map(|(_, kind)| kind))?;
         let has_usage = events.iter().any(|event| {
             matches!(
                 event,
                 ServerEvent::TokenDelta(_) | ServerEvent::UsedTokens(_)
             )
         });
-        for event in events {
-            self.apply(event);
+        let prepared = self.prepare_events(events)?;
+        for event in prepared {
+            self.apply_prepared(event);
         }
         if has_usage {
             // An accepted frame can report usage without producing a public
@@ -1089,13 +1110,18 @@ impl StreamState {
         if self.finalized {
             return Ok(());
         }
+        let mut budget = self.budget.clone();
+        let mut open_kind = self.open_block.map(|(_, kind)| kind);
+        let mut prepared = Vec::new();
+        self.stage_prompt_parts(true, &mut budget, &mut open_kind, &mut prepared)?;
+        self.budget = budget;
         // The validated Connect terminator makes the latest counters final.
         // Publish that correction before buffered Start/*End events permit
         // the caller to drop the stream without consuming Done or Error.
         self.record_usage(true)?;
         self.finalized = true;
-        if !self.tool_tag_buffer.is_empty() {
-            self.drain_tool_tag_buffer(true);
+        for event in prepared {
+            self.apply_prepared(event);
         }
         self.ensure_started();
         self.close_open_block();
@@ -1792,6 +1818,62 @@ mod tests {
         assert_eq!(provider.model_id(), "claude-4.5-sonnet");
         let caps = provider.capabilities();
         assert!(caps.multi_turn && caps.tool_use && !caps.native_tool_wire && caps.streaming);
+    }
+
+    #[test]
+    fn cursor_streamed_tool_arguments_can_contain_protocol_tags_and_escaped_quotes() {
+        let arguments = serde_json::json!({
+            "path": "src/例.rs",
+            "content": "write </pi_tool_call> then <pi_tool_call> and a quote: \"; slash: \\; 🦀",
+            "nested": [{"value": "\\\"</pi_tool_call>"}]
+        });
+        let envelope = format!(
+            "{}{}{}",
+            crate::provider::PI_TOOL_CALL_OPEN,
+            serde_json::json!({"name": "write", "arguments": arguments}),
+            crate::provider::PI_TOOL_CALL_CLOSE,
+        );
+        let mut state = StreamState::new(
+            Box::pin(stream::empty()),
+            AssistantMessage::default(),
+        )
+        .with_allowed_tools(std::collections::HashSet::from(["write".to_string()]));
+        let chars: Vec<char> = envelope.chars().collect();
+        for (index, character) in chars.iter().enumerate() {
+            state
+                .process_frame(&ConnectFrame {
+                    end_stream: false,
+                    compressed: false,
+                    payload: interaction_update(1, &character.to_string()),
+                })
+                .expect("one-character data frame");
+            if index + 1 < chars.len() {
+                assert!(
+                    state.partial.content.is_empty(),
+                    "a JSON string's delimiter cannot finish the call early"
+                );
+            }
+        }
+        state
+            .process_frame(&ConnectFrame {
+                end_stream: true,
+                compressed: false,
+                payload: b"{}".to_vec(),
+            })
+            .expect("terminal frame");
+        let Some(StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message,
+        }) = state.pending.back()
+        else {
+            panic!("expected a complete tool-call turn");
+        };
+        assert_eq!(message.content.len(), 1);
+        let ContentBlock::ToolCall(call) = &message.content[0] else {
+            panic!("expected write call");
+        };
+        assert_eq!(call.name, "write");
+        assert_eq!(call.arguments, arguments);
     }
 
     #[test]

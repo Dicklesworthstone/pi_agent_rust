@@ -956,34 +956,150 @@ pub(crate) fn extract_prompt_tool_calls(
     raw: &str,
     allowed_tools: &std::collections::HashSet<String>,
 ) -> (String, Vec<crate::model::ToolCall>) {
-    if allowed_tools.is_empty() || !raw.contains(PI_TOOL_CALL_OPEN) {
-        return (raw.to_string(), Vec::new());
-    }
+    let mut parser = PromptToolCallParser::default();
+    parser.push(raw);
     let mut prose = String::with_capacity(raw.len());
     let mut calls = Vec::new();
-    let mut rest = raw;
-
-    while let Some(open_idx) = rest.find(PI_TOOL_CALL_OPEN) {
-        prose.push_str(&rest[..open_idx]);
-        let after_open = &rest[open_idx + PI_TOOL_CALL_OPEN.len()..];
-        let Some(close_idx) = after_open.find(PI_TOOL_CALL_CLOSE) else {
-            prose.push_str(&rest[open_idx..]);
-            rest = "";
-            break;
-        };
-        let inner = &after_open[..close_idx];
-        if let Some(call) = parse_prompt_tool_call_json(inner, allowed_tools, calls.len() + 1) {
-            calls.push(call);
-        } else {
-            prose.push_str(
-                &rest[open_idx
-                    ..open_idx + PI_TOOL_CALL_OPEN.len() + close_idx + PI_TOOL_CALL_CLOSE.len()],
-            );
+    while let Some(part) = parser.next(allowed_tools, true) {
+        match part {
+            PromptToolCallPart::Text(text) => prose.push_str(&text),
+            PromptToolCallPart::ToolCall(call) => calls.push(call),
         }
-        rest = &after_open[close_idx + PI_TOOL_CALL_CLOSE.len()..];
     }
-    prose.push_str(rest);
     (prose, calls)
+}
+
+pub(crate) enum PromptToolCallPart {
+    Text(String),
+    ToolCall(crate::model::ToolCall),
+}
+
+/// Decode the prompt bridge incrementally, sharing the same framing rules for
+/// batch and streaming providers. A closing tag inside a JSON string is data,
+/// including when a quote, escape, or tag is split across provider deltas.
+///
+/// Scan each envelope byte once. Consumed prefixes are compacted once per push,
+/// not once per call, so a large argument or many calls in one delta cannot
+/// cause repeated scans or shifts of the entire pending response.
+#[derive(Default)]
+pub(crate) struct PromptToolCallParser {
+    buffer: String,
+    consumed: usize,
+    scanned: usize,
+    in_envelope: bool,
+    in_string: bool,
+    escaped: bool,
+    calls: usize,
+}
+
+impl PromptToolCallParser {
+    pub(crate) fn push(&mut self, delta: &str) {
+        if self.consumed > 0 {
+            self.buffer.drain(..self.consumed);
+            self.scanned = self.scanned.saturating_sub(self.consumed);
+            self.consumed = 0;
+        }
+        self.buffer.push_str(delta);
+    }
+
+    fn consume(&mut self, end: usize) {
+        self.consumed = end;
+        self.scanned = end;
+        self.in_envelope = false;
+        self.in_string = false;
+        self.escaped = false;
+        if end == self.buffer.len() {
+            self.buffer.clear();
+            self.consumed = 0;
+            self.scanned = 0;
+        }
+    }
+
+    fn text_until(&mut self, end: usize) -> Option<PromptToolCallPart> {
+        if end == self.consumed {
+            return None;
+        }
+        let text = self.buffer[self.consumed..end].to_string();
+        self.consume(end);
+        Some(PromptToolCallPart::Text(text))
+    }
+
+    pub(crate) fn next(
+        &mut self,
+        allowed_tools: &std::collections::HashSet<String>,
+        flush_incomplete: bool,
+    ) -> Option<PromptToolCallPart> {
+        if allowed_tools.is_empty() {
+            return self.text_until(self.buffer.len());
+        }
+        if !self.in_envelope {
+            let pending = &self.buffer[self.consumed..];
+            if let Some(open) = pending.find(PI_TOOL_CALL_OPEN) {
+                if open > 0 {
+                    return self.text_until(self.consumed + open);
+                }
+                self.in_envelope = true;
+                self.scanned = self.consumed + PI_TOOL_CALL_OPEN.len();
+            } else {
+                // Retain only a possible opening-tag suffix. Tags are ASCII,
+                // so any matching suffix starts on a UTF-8 boundary.
+                let held = if flush_incomplete {
+                    0
+                } else {
+                    (1..PI_TOOL_CALL_OPEN.len())
+                        .rev()
+                        .find(|&len| {
+                            pending
+                                .as_bytes()
+                                .ends_with(&PI_TOOL_CALL_OPEN.as_bytes()[..len])
+                        })
+                        .unwrap_or(0)
+                };
+                return self.text_until(self.buffer.len() - held);
+            }
+        }
+
+        while self.scanned < self.buffer.len() {
+            let byte = self.buffer.as_bytes()[self.scanned];
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+            } else if byte == b'"' {
+                self.in_string = true;
+            } else if byte == b'<' {
+                let remaining = &self.buffer.as_bytes()[self.scanned..];
+                if remaining.starts_with(PI_TOOL_CALL_CLOSE.as_bytes()) {
+                    let end = self.scanned + PI_TOOL_CALL_CLOSE.len();
+                    let payload =
+                        &self.buffer[self.consumed + PI_TOOL_CALL_OPEN.len()..self.scanned];
+                    if let Some(call) = parse_prompt_tool_call_json(
+                        payload,
+                        allowed_tools,
+                        self.calls.saturating_add(1),
+                    ) {
+                        self.calls = self.calls.saturating_add(1);
+                        self.consume(end);
+                        return Some(PromptToolCallPart::ToolCall(call));
+                    }
+                    return self.text_until(end);
+                }
+                if !flush_incomplete && PI_TOOL_CALL_CLOSE.as_bytes().starts_with(remaining) {
+                    return None;
+                }
+            }
+            self.scanned += 1;
+        }
+        if flush_incomplete {
+            self.text_until(self.buffer.len())
+        } else {
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -1730,6 +1846,74 @@ impl std::str::FromStr for KnownProvider {
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+
+    #[test]
+    fn prompt_tool_tags_in_arguments_survive_every_stream_boundary() {
+        let allowed = std::collections::HashSet::from(["write".to_string()]);
+        let arguments = serde_json::json!({
+            "path": "src/例.rs",
+            "content": "literal </pi_tool_call> and <pi_tool_call>; quote: \"; slash: \\; 雪 🦀",
+            "nested": [{"value": "\\\"</pi_tool_call>"}]
+        });
+        let first = serde_json::json!({"name": "write", "arguments": arguments});
+        let second = serde_json::json!({
+            "name": "write",
+            "arguments": serde_json::to_string(&arguments).expect("encoded arguments")
+        });
+        let raw = format!(
+            "Before 雪 {PI_TOOL_CALL_OPEN}{first}{PI_TOOL_CALL_CLOSE} between \
+             {PI_TOOL_CALL_OPEN}{second}{PI_TOOL_CALL_CLOSE} after 🦀"
+        );
+        let (batch_prose, batch_calls) = extract_prompt_tool_calls(&raw, &allowed);
+        assert_eq!(batch_prose, "Before 雪  between  after 🦀");
+        assert_eq!(batch_calls.len(), 2);
+        assert_eq!(batch_calls[0].arguments, arguments);
+        assert_eq!(batch_calls[1].arguments, arguments);
+
+        for split in (0..=raw.len()).filter(|&index| raw.is_char_boundary(index)) {
+            let mut parser = PromptToolCallParser::default();
+            let mut prose = String::new();
+            let mut calls = Vec::new();
+            for (chunk, flush) in [(&raw[..split], false), (&raw[split..], false), ("", true)] {
+                parser.push(chunk);
+                while let Some(part) = parser.next(&allowed, flush) {
+                    match part {
+                        PromptToolCallPart::Text(text) => prose.push_str(&text),
+                        PromptToolCallPart::ToolCall(call) => calls.push(call),
+                    }
+                }
+            }
+            assert_eq!(prose, batch_prose, "split {split}");
+            assert_eq!(calls.len(), 2, "split {split}");
+            for (index, call) in calls.iter().enumerate() {
+                assert_eq!(call.id, format!("pi_call_{}", index + 1));
+                assert_eq!(call.name, "write");
+                assert_eq!(call.arguments, arguments, "split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_tool_invalid_and_unfinished_envelopes_remain_text() {
+        let allowed = std::collections::HashSet::from(["write".to_string()]);
+        for raw in [
+            "<pi_tool_",
+            "<pi_tool_call>{\"name\":\"write\",\"arguments\":{}}",
+            "<pi_tool_call>{\"name\":\"write\",\"arguments\":{\"text\":\"unfinished </pi_tool_call>",
+            "<pi_tool_call>{\"name\":\"write\",\"arguments\":[]}</pi_tool_call>",
+            "<pi_tool_call>{\"name\":\"unknown\",\"arguments\":{}}</pi_tool_call>",
+            "<pi_tool_call>not JSON</pi_tool_call>",
+            "plain text </pi_tool_call> 雪",
+        ] {
+            let (prose, calls) = extract_prompt_tool_calls(raw, &allowed);
+            assert_eq!(prose, raw);
+            assert!(calls.is_empty());
+        }
+        let valid = "<pi_tool_call>{\"name\":\"write\",\"arguments\":{}}</pi_tool_call>";
+        let (prose, calls) = extract_prompt_tool_calls(valid, &std::collections::HashSet::new());
+        assert_eq!(prose, valid);
+        assert!(calls.is_empty(), "unadvertised calls stay inert");
+    }
 
     #[test]
     fn service_tier_wire_policy_requires_supported_transport_and_explicit_relay_metadata() {

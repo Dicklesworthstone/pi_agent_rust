@@ -4,7 +4,7 @@
 //! Preview publication is transactional per frame: a rejected batch cannot
 //! publish its valid prefix, mutate usage, or open a new content block.
 
-use super::{BlockKind, Error, Result, ServerEvent};
+use super::{Error, Result, ServerEvent};
 
 const MAX_ENCODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
@@ -91,33 +91,35 @@ impl Budget {
         charge(&mut self.decoded, bytes)
     }
 
-    /// Preview the whole batch before committing its consumption. Empty
-    /// deltas consume event work but never allocate a content block. The last
-    /// block kind comes from the same StreamState that will apply the batch.
-    pub(super) fn admit(
+    /// Charge the entire wire batch and its staged content before publication.
+    /// A text delta can contain many prompt-protocol tool calls, so raw event
+    /// kinds cannot predict how many content blocks the renderer will open.
+    /// `additional_blocks` comes from those staged emissions, including text
+    /// reopened after a tool call. Terminal buffered text is admitted separately.
+    pub(super) fn admit_with_blocks(
         &mut self,
         events: &[ServerEvent],
-        mut open_kind: Option<BlockKind>,
+        additional_blocks: usize,
     ) -> Result<()> {
         let mut candidate = self.clone();
         charge(&mut candidate.events, events.len())?;
         for event in events {
-            let (kind, text) = match event {
-                ServerEvent::TextDelta(text) => (BlockKind::Text, text),
-                ServerEvent::ThinkingDelta(text) => (BlockKind::Thinking, text),
+            let text = match event {
+                ServerEvent::TextDelta(text) | ServerEvent::ThinkingDelta(text) => text,
                 _ => continue,
             };
-            if text.is_empty() {
-                continue;
-            }
             charge(&mut candidate.output, text.len())?;
-            if open_kind != Some(kind) {
-                charge(&mut candidate.blocks, 1)?;
-                open_kind = Some(kind);
-            }
         }
+        candidate.admit_blocks(additional_blocks)?;
         *self = candidate;
         Ok(())
+    }
+
+    /// The terminator can flush incomplete prompt markup into a new text
+    /// block. Its bytes were already charged when received; only the actual
+    /// newly emitted blocks remain to be admitted before usage or completion.
+    pub(super) fn admit_blocks(&mut self, additional_blocks: usize) -> Result<()> {
+        charge(&mut self.blocks, additional_blocks)
     }
 }
 
@@ -270,12 +272,12 @@ mod tests {
         budget.frame().unwrap();
         assert!(budget.frame().is_err());
         budget
-            .admit(
+            .admit_with_blocks(
                 &[ServerEvent::TokenDelta(0), ServerEvent::UsedTokens(0)],
-                None,
+                0,
             )
             .unwrap();
-        assert!(budget.admit(&[ServerEvent::TurnEnded], None).is_err());
+        assert!(budget.admit_with_blocks(&[ServerEvent::TurnEnded], 0).is_err());
     }
 
     #[test]
@@ -284,32 +286,25 @@ mod tests {
             output: 6,
             ..Budget::default()
         };
-        budget.admit(&[text("é"), thinking("🦀")], None).unwrap();
-        assert!(
-            budget
-                .admit(&[thinking("x")], Some(BlockKind::Thinking))
-                .is_err()
-        );
+        budget
+            .admit_with_blocks(&[text("é"), thinking("🦀")], 2)
+            .unwrap();
+        assert!(budget.admit_with_blocks(&[thinking("x")], 0).is_err());
     }
 
     #[test]
-    fn block_changes_span_batches_but_empty_deltas_do_not_open_blocks() {
+    fn content_blocks_are_charged_independently_of_wire_event_count() {
         let mut budget = Budget {
-            blocks: 2,
+            blocks: 3,
             ..Budget::default()
         };
-        budget.admit(&[text("a")], None).unwrap();
         budget
-            .admit(&[thinking(""), text("b")], Some(BlockKind::Text))
+            .admit_with_blocks(&[text("multiple rendered blocks")], 3)
             .unwrap();
         budget
-            .admit(&[thinking("c"), thinking("d")], Some(BlockKind::Text))
+            .admit_with_blocks(&[thinking(""), text("continuation")], 0)
             .unwrap();
-        assert!(
-            budget
-                .admit(&[text("e")], Some(BlockKind::Thinking))
-                .is_err()
-        );
+        assert!(budget.admit_with_blocks(&[text("new block")], 1).is_err());
     }
 
     #[test]
@@ -320,8 +315,30 @@ mod tests {
             events: 2,
             ..Budget::default()
         };
-        assert!(budget.admit(&[text("a"), thinking("b")], None).is_err());
-        budget.admit(&[text("a"), text("b")], None).unwrap();
+        assert!(
+            budget
+                .admit_with_blocks(&[text("a"), thinking("b")], 2)
+                .is_err()
+        );
+        budget
+            .admit_with_blocks(&[text("a"), text("b")], 1)
+            .unwrap();
+        assert_eq!(budget.output, 0);
+        assert_eq!(budget.blocks, 0);
+        assert_eq!(budget.events, 0);
+    }
+
+    #[test]
+    fn final_flush_only_charges_blocks_and_rejects_without_consumption() {
+        let mut budget = Budget {
+            events: 0,
+            output: 0,
+            blocks: 2,
+            ..Budget::default()
+        };
+        assert!(budget.admit_blocks(usize::MAX).is_err());
+        budget.admit_blocks(2).unwrap();
+        assert!(budget.admit_blocks(1).is_err());
         assert_eq!(budget.output, 0);
         assert_eq!(budget.blocks, 0);
         assert_eq!(budget.events, 0);
@@ -382,6 +399,164 @@ mod tests {
         assert_eq!(state.partial.content.len(), 1);
         assert!(matches!(&state.partial.content[0], ContentBlock::Text(text) if text.text == "ab"));
         assert!(state.pending.is_empty());
+    }
+
+    const TOOL_CALL: &str =
+        r#"<pi_tool_call>{"name":"read","arguments":{"path":"file.txt"}}</pi_tool_call>"#;
+
+    #[test]
+    fn one_text_delta_cannot_expand_past_the_actual_tool_block_budget() {
+        let mut rejected = state(Budget::default())
+            .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        let mut oversized = frame(&[(1, &TOOL_CALL.repeat(MAX_BLOCKS + 1))]);
+        let mut update = Vec::new();
+        pb::write_len_delim(&mut update, 8, &[0x08, 7]);
+        pb::write_len_delim(&mut oversized.payload, 1, &update);
+        let mut checkpoint = Vec::new();
+        pb::write_len_delim(&mut checkpoint, 5, &[0x08, 9]);
+        pb::write_len_delim(&mut oversized.payload, 3, &checkpoint);
+
+        let error = rejected.process_frame(&oversized).unwrap_err();
+        assert!(error.to_string().contains("PI_CURSOR_STREAM_LIMIT"));
+        assert!(rejected.partial.content.is_empty());
+        assert!(rejected.pending.is_empty());
+        assert!(!rejected.started);
+        assert_eq!(rejected.tool_call_count, 0);
+        assert_eq!(rejected.output_tokens, 0);
+        assert_eq!(rejected.used_tokens, None);
+        assert_eq!(rejected.partial.usage.total_tokens, 0);
+        assert_eq!(rejected.budget.blocks, MAX_BLOCKS);
+        assert_eq!(rejected.budget.output, MAX_OUTPUT_BYTES);
+        assert_eq!(rejected.budget.events, MAX_EVENTS);
+        assert!(rejected.done);
+        assert!(rejected.process_frame(&terminal()).is_err());
+
+        let mut exact = state(Budget::default())
+            .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        exact
+            .process_frame(&frame(&[(1, &TOOL_CALL.repeat(MAX_BLOCKS))]))
+            .unwrap();
+        exact.process_frame(&terminal()).unwrap();
+        assert_eq!(exact.budget.blocks, 0);
+        assert_eq!(exact.partial.content.len(), MAX_BLOCKS);
+        assert!(
+            exact
+                .partial
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::ToolCall(_)))
+        );
+        assert!(matches!(
+            exact.pending.back(),
+            Some(StreamEvent::Done {
+                reason: super::super::StopReason::ToolUse,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn text_reopened_after_a_tool_counts_before_any_frame_prefix_is_published() {
+        let content = format!("before{TOOL_CALL}after");
+        let mut rejected = state(Budget {
+            blocks: 2,
+            ..Budget::default()
+        })
+        .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        assert!(rejected.process_frame(&frame(&[(1, &content)])).is_err());
+        assert!(rejected.partial.content.is_empty());
+        assert!(rejected.pending.is_empty());
+        assert_eq!(rejected.budget.blocks, 2);
+
+        let mut exact = state(Budget {
+            blocks: 3,
+            ..Budget::default()
+        })
+        .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        exact.process_frame(&frame(&[(1, &content)])).unwrap();
+        exact
+            .process_frame(&frame(&[(4, ""), (1, " continued")]))
+            .unwrap();
+        exact.process_frame(&terminal()).unwrap();
+        assert_eq!(exact.budget.blocks, 0);
+        assert_eq!(exact.partial.content.len(), 3);
+        assert!(
+            matches!(&exact.partial.content[0], ContentBlock::Text(text) if text.text == "before")
+        );
+        assert!(matches!(&exact.partial.content[1], ContentBlock::ToolCall(_)));
+        assert!(
+            matches!(&exact.partial.content[2], ContentBlock::Text(text) if text.text == "after continued")
+        );
+    }
+
+    #[test]
+    fn fragmented_tool_completion_cannot_spend_uncharged_blocks() {
+        let mut state = state(Budget {
+            blocks: 2,
+            ..Budget::default()
+        })
+        .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        state
+            .process_frame(&frame(&[(1, "before<pi_tool_call>")]))
+            .unwrap();
+        state.pending.clear();
+        let output_before = state.budget.output;
+        let events_before = state.budget.events;
+        let error = state
+            .process_frame(&frame(&[(
+                1,
+                r#"{"name":"read","arguments":{"path":"file.txt"}}</pi_tool_call>after"#,
+            )]))
+            .unwrap_err();
+        assert!(error.to_string().contains("PI_CURSOR_STREAM_LIMIT"));
+        assert_eq!(state.partial.content.len(), 1);
+        assert!(
+            matches!(&state.partial.content[0], ContentBlock::Text(text) if text.text == "before")
+        );
+        assert!(state.pending.is_empty());
+        assert_eq!(state.tool_call_count, 0);
+        assert_eq!(state.budget.blocks, 1);
+        assert_eq!(state.budget.output, output_before);
+        assert_eq!(state.budget.events, events_before);
+    }
+
+    #[test]
+    fn final_tool_markup_flush_is_admitted_before_success_or_usage_finalization() {
+        let mut rejected = state(Budget {
+            blocks: 1,
+            ..Budget::default()
+        })
+        .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        rejected.process_frame(&frame(&[(4, "reasoning")])).unwrap();
+        rejected.pending.clear();
+        rejected
+            .process_frame(&frame(&[(1, "<pi_tool_call>")]))
+            .unwrap();
+        assert!(rejected.pending.is_empty());
+        let error = rejected.process_frame(&terminal()).unwrap_err();
+        assert!(error.to_string().contains("PI_CURSOR_STREAM_LIMIT"));
+        assert!(!rejected.finalized);
+        assert_eq!(rejected.partial.content.len(), 1);
+        assert!(rejected.pending.is_empty());
+        assert!(rejected.done);
+
+        let content = "before<pi_tool_call>";
+        let mut exact = state(Budget {
+            blocks: 1,
+            output: content.len(),
+            events: 1,
+            ..Budget::default()
+        })
+        .with_allowed_tools(std::collections::HashSet::from(["read".to_string()]));
+        exact.process_frame(&frame(&[(1, content)])).unwrap();
+        exact.process_frame(&terminal()).unwrap();
+        assert_eq!(exact.partial.content.len(), 1);
+        assert!(
+            matches!(&exact.partial.content[0], ContentBlock::Text(text) if text.text == content)
+        );
+        assert_eq!(exact.budget.blocks, 0);
+        assert_eq!(exact.budget.output, 0);
+        assert_eq!(exact.budget.events, 0);
     }
 
     #[test]
