@@ -1547,3 +1547,122 @@ fn sdk_extension_methods_without_extensions() {
         ctx.push(("has_extensions".to_string(), "false".to_string()));
     });
 }
+
+// ============================================================================
+// 12. AgentSession Raw-Loop Reachability Guard (bd-bnzse)
+// ============================================================================
+
+fn strip_line_comments_and_strings(source: &str) -> String {
+    let strip_re = regex::Regex::new(r#""(?:[^"\\]|\\.)*"|//.*$"#).expect("valid strip regex");
+    let mut out = String::with_capacity(source.len());
+    for line in source.lines() {
+        out.push_str(&strip_re.replace_all(line, ""));
+        out.push('\n');
+    }
+    out
+}
+
+fn scan_agent_field_raw_loop_calls(source: &str) -> Vec<String> {
+    let raw_loop_re = regex::Regex::new(
+        r"\.\s*agent\s*\.\s*(run|run_with_abort|run_with_content|run_with_content_with_abort|run_with_message_with_abort|run_with_messages_with_abort|run_continue_with_abort|run_continue_with_follow_up_with_abort|run_continue_with_follow_up_on_ready_with_abort|run_loop|run_loop_inner)\s*\(",
+    )
+    .expect("valid raw-loop regex");
+    let cleaned = strip_line_comments_and_strings(source);
+    raw_loop_re
+        .captures_iter(&cleaned)
+        .map(|cap| cap[1].to_string())
+        .collect()
+}
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn agent_session_inner_agent_raw_loop_call_sites_are_bounded() {
+    // Negative control (RH-5): multiline `.agent.run_*(` bypass must be detected.
+    assert_eq!(
+        scan_agent_field_raw_loop_calls(
+            "let _ = session\n    .agent\n    // comment\n    .run_continue_with_abort(None, |_| {}).await;"
+        ),
+        vec!["run_continue_with_abort".to_string()]
+    );
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["src", "tests", "examples", "benches"] {
+        collect_rs_files(&root.join(dir), &mut files);
+    }
+
+    let mut outside_agent_rs: Vec<(String, String)> = Vec::new();
+    let deref_loop_re = regex::Regex::new(
+        r"\.\s*(run_with_abort|run_with_content|run_with_content_with_abort|run_with_message_with_abort|run_with_messages_with_abort|run_continue_with_abort|run_continue_with_follow_up_with_abort|run_continue_with_follow_up_on_ready_with_abort)\s*\(",
+    )
+    .expect("valid deref-loop regex");
+
+    for file in files {
+        let rel = file
+            .strip_prefix(root)
+            .expect("under repo root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content = std::fs::read_to_string(&file).expect("read rust source");
+
+        if rel != "src/agent.rs" {
+            for method in scan_agent_field_raw_loop_calls(&content) {
+                outside_agent_rs.push((rel.clone(), method));
+            }
+        }
+
+        // Also guard `InteractiveAgent`'s `DerefMut<Target = Agent>` so classic TUI
+        // cannot drive raw `Agent` loops without naming `.agent`.
+        if rel == "src/interactive.rs" || rel.starts_with("src/interactive/") {
+            let cleaned = strip_line_comments_and_strings(&content);
+            assert!(
+                !deref_loop_re.is_match(&cleaned),
+                "{rel} must route turns through AgentSessionHandle, not raw Agent::run_* via DerefMut"
+            );
+        }
+    }
+
+    // Documented intentional raw-loop fault-injection test harnesses ONLY;
+    // zero production call sites outside `src/agent.rs` are permitted.
+    let allowed = vec![
+        // Simulates an unpersisted in-memory turn crash for `terminal_rpc_recovery_plan`.
+        (
+            "src/rpc.rs".to_string(),
+            "run_with_message_with_abort".to_string(),
+        ),
+        // Fault-injection harnesses exercising bare `Agent` continuation (`bd-1f42.5.2`).
+        (
+            "tests/agent_loop_reliability.rs".to_string(),
+            "run_continue_with_abort".to_string(),
+        ),
+        (
+            "tests/agent_loop_reliability.rs".to_string(),
+            "run_continue_with_abort".to_string(),
+        ),
+        (
+            "tests/agent_loop_reliability.rs".to_string(),
+            "run_continue_with_abort".to_string(),
+        ),
+    ];
+    assert_eq!(
+        outside_agent_rs, allowed,
+        "Unexpected `.agent.run*` call site outside `src/agent.rs` (bypasses AgentSession persistence and ProviderAdmissionGate; see bd-bnzse)"
+    );
+}

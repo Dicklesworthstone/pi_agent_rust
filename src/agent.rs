@@ -7885,6 +7885,12 @@ impl MaxTokensOverride {
 }
 
 pub struct AgentSession {
+    /// Underlying `Agent` for read-only inspection and pre-turn configuration.
+    ///
+    /// Never drive turns via `session.agent.run*` outside `AgentSession`'s own
+    /// turn methods: doing so bypasses compaction, session rehydration, durable
+    /// pre-provider user-message flush, turn-artifact persistence, and
+    /// `ProviderAdmissionGate` quarantine (`bd-agentsession-inner-agent-reachability-bnzse`).
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
@@ -11159,7 +11165,10 @@ mod extensions_integration_tests {
                 available && !promoted && custom_prompt.is_none()
             );
             if let Some(custom_prompt) = custom_prompt {
-                assert_eq!(prompt, custom_prompt, "host instructions must stay untouched");
+                assert_eq!(
+                    prompt, custom_prompt,
+                    "host instructions must stay untouched"
+                );
             } else {
                 assert_eq!(
                     prompt.contains(crate::xdev::DISCOVERABLE_PROMPT_HEADER),

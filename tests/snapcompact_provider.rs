@@ -114,17 +114,19 @@ fn run_capture_with_settings(
             ToolRegistry::new(&[], std::path::Path::new("."), None),
             config,
         );
-        agent.add_message(message);
         // Empty stream ends the loop; the captured context is what matters.
         if let Some(settings) = settings {
+            let mut backing_session = pi::session::Session::in_memory();
+            backing_session.append_model_message(message);
             let mut session = pi::agent::AgentSession::new(
                 agent,
-                Arc::new(asupersync::sync::Mutex::new(pi::session::Session::create())),
+                Arc::new(asupersync::sync::Mutex::new(backing_session)),
                 false,
                 settings,
             );
-            let _ = session.agent.run("ping", |_| {}).await;
+            let _ = session.run_text("ping".to_string(), |_| {}).await;
         } else {
+            agent.add_message(message);
             let _ = agent.run("ping", |_| {}).await;
         }
         let guard = captured.lock().expect("context mutex");
@@ -338,6 +340,7 @@ fn omitted_middle_is_still_screened_before_text_reading_is_budgeted() {
         },
         source_archive(&source),
         Some(pi::compaction::ResolvedCompactionSettings {
+            enabled: false,
             context_window_tokens: 1_024,
             reserve_tokens: 512,
             ..pi::compaction::ResolvedCompactionSettings::default()
