@@ -10195,9 +10195,8 @@ mod tests {
         // Unknown credential types are preserved intentionally. A top-level
         // string is invalid for AuthFile and makes serde quote its value.
         let content = serde_json::to_string(SECRET).expect("malformed auth fixture");
-        let parse_error = serde_json::from_str::<AuthFile>(&content)
-            .err()
-            .expect("malformed credential");
+        let parse_error =
+            serde_json::from_str::<AuthFile>(&content).expect_err("malformed credential");
         assert!(
             parse_error.to_string().contains(SECRET),
             "fixture must exercise serde's value-bearing diagnostic"

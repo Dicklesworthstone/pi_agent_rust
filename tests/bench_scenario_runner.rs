@@ -1218,9 +1218,8 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             "orchestration_correlation_id".to_string(),
             Value::String(orchestration_correlation_id),
         );
-        let has_canonical_orchestration_id = std::env::var("CI_CORRELATION_ID")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty());
+        let has_canonical_orchestration_id =
+            std::env::var("CI_CORRELATION_ID").is_ok_and(|value| !value.trim().is_empty());
         let comparison_release_eligible = env.as_object().is_some_and(|env_obj| {
             has_canonical_orchestration_id
                 && env_obj.get("build_profile").and_then(Value::as_str) == Some("perf")

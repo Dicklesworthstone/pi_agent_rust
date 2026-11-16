@@ -863,8 +863,9 @@ fn check_auth(fix: bool, findings: &mut Vec<Finding>) {
                 .with_detail("No credentials stored yet")
                 .with_remediation("Run `pi` and follow the login prompt, or set ANTHROPIC_API_KEY"),
         );
-        // Still check env vars
+        // Still check env vars and native provider capabilities
         check_auth_env_vars(cat, findings);
+        append_native_provider_capabilities_finding(cat, findings);
         return;
     }
 

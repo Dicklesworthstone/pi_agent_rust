@@ -19473,18 +19473,20 @@ mod tests {
                 if text.contains("shared work notes") && text.contains("Max allowed is 3 bytes"))));
         assert!(model.input.text().is_empty());
 
-        // The same admitted media is an attachment at the inclusive cap.
-        // Live steering keeps that draft for idle rather than dropping bytes.
+        // The same admitted media is an attachment at the inclusive cap and
+        // queues natively on the follow-up lane with its authored text intact.
         context.lock().unwrap().options.max_media_bytes = 4;
         model.input.set_text("use @../additional/audio.wav");
         model.submit_mid_turn(true);
-        assert_eq!(model.input.text(), "use @../additional/audio.wav");
-        assert!(control.take_pending().is_empty());
+        assert!(model.input.text().is_empty());
+        let media = control.take_pending();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].kind, crate::session_control::InputKind::FollowUp);
+        assert_eq!(media[0].text, "use @../additional/audio.wav");
         assert!(
-            model
-                .transcript
-                .iter()
-                .any(|entry| entry.text.contains("Attachments send once"))
+            matches!(&media[0].content, crate::model::UserContent::Blocks(blocks)
+                if blocks.iter().any(|block| matches!(block, crate::model::ContentBlock::Media(audio)
+                    if audio.mime_type == "audio/wav" && !audio.data.is_empty())))
         );
 
         assert!(workspace.remove_root(&additional));

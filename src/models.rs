@@ -5641,7 +5641,12 @@ where
         });
     }
 
-    let defaults = ad_hoc_provider_defaults(provider)?;
+    let defaults = ad_hoc_provider_defaults(provider).or_else(|| {
+        let canonical = canonical_provider_id(provider)?;
+        native_adapter_seed_defaults(canonical).filter(|seed| {
+            !seed.base_url.is_empty() || provider_self_routes_without_base_url(canonical)
+        })
+    })?;
     let normalized_model_id = canonicalize_model_id_for_provider(provider, model_id);
     if normalized_model_id.is_empty() {
         return None;

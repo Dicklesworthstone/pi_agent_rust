@@ -941,10 +941,10 @@ fn run_full_e2e_long_session_measurement(args: &Args) -> Result<serde_json::Valu
 
     let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let hello_spec = JsExtensionLoadSpec::from_entry_path(
-        &cwd.join("tests/ext_conformance/artifacts/hello/hello.ts"),
+        cwd.join("tests/ext_conformance/artifacts/hello/hello.ts"),
     )?;
     let pirate_spec = JsExtensionLoadSpec::from_entry_path(
-        &cwd.join("tests/ext_conformance/artifacts/pirate/pirate.ts"),
+        cwd.join("tests/ext_conformance/artifacts/pirate/pirate.ts"),
     )?;
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));

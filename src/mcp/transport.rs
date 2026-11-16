@@ -7400,7 +7400,7 @@ for line in sys.stdin:
                 .request(
                     "tools/call",
                     serde_json::json!({"name": "slow", "arguments": {}}),
-                    Duration::from_millis(50),
+                    Duration::from_millis(250),
                 )
                 .await
                 .expect_err("absolute timeout must fail the request");

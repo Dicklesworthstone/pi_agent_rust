@@ -4112,21 +4112,21 @@ mod tests {
 
     #[test]
     fn conflicting_aliases_or_requirements_drop_duplicate_model_metadata() {
-        for (left, right) in [
-            (
+        for pair in [
+            [
                 serde_json::json!({"reasoning_effort_map":{"medium":"high"}}),
                 serde_json::json!({"reasoning_effort_map":{"medium":"low"}}),
-            ),
-            (
+            ],
+            [
                 serde_json::json!({"reasoning_required":true}),
                 serde_json::json!({"reasoning_required":false}),
-            ),
-            (
+            ],
+            [
                 serde_json::json!({"reasoning_required":false}),
                 serde_json::json!({}),
-            ),
+            ],
         ] {
-            let rows = [left, right].map(|fields| {
+            let rows = pair.map(|fields| {
                 let mut row =
                     serde_json::json!({"id":"model","supported_reasoning_levels":["low","high"]});
                 row.as_object_mut()

@@ -1324,7 +1324,6 @@ compiled_features = [
     "image",
     "image-resize",
     "sqlite-sessions",
-    "tui",
     "wasm-host",
 ]
 provenance = {

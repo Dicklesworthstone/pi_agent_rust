@@ -937,28 +937,29 @@ fn ordinary_recovery_keeps_native_boundaries_and_never_rereads_file_sources() {
         )
         .await;
         assert!(returned.try_recv().is_err());
-        let requests = provider.requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            2,
-            "two native messages, not one joined draft"
-        );
-        let users = requests
-            .last()
-            .unwrap()
-            .iter()
-            .filter_map(|message| match message {
-                Message::User(user) => Some(&user.content),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(users.len(), 2);
-        same_payload(users[0], &payload());
-        same_payload(
-            users[1],
-            &UserContent::Text("captured second file body".into()),
-        );
-        drop(requests);
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "two native messages, not one joined draft"
+            );
+            let users = requests
+                .last()
+                .unwrap()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(&user.content),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 2);
+            same_payload(users[0], &payload());
+            same_payload(
+                users[1],
+                &UserContent::Text("captured second file body".into()),
+            );
+        }
         let lifecycle = received.try_iter().collect::<Vec<_>>();
         assert!(matches!(lifecycle.last(),
             Some(PiMsg::PreparedInputFinished { request_id }) if *request_id == request.id));
