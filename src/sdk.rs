@@ -3619,10 +3619,13 @@ impl AgentSessionHandle {
             enabled: true,
             ..Default::default()
         };
+        let mut stream_options = agent.stream_options().clone();
+        self.session
+            .refresh_compaction_credential(&mut stream_options)?;
         let summary = crate::checkpoint::summarize_span(
             &span,
             agent.provider(),
-            agent.stream_options(),
+            &stream_options,
             &settings,
             &privacy,
         )
@@ -7196,6 +7199,120 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
                 .remove("timestamp");
         }
         value
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checkpoint_rewind_refreshes_command_credentials_after_previous_turn() {
+        let dir = tempdir().expect("tempdir");
+        let credential_path = dir.path().join("credential.txt");
+        std::fs::write(&credential_path, "rewind-key-before").expect("initial credential");
+        let provider_name = "rewind-command-credential";
+        let mut auth = AuthStorage::empty_at(dir.path().join("auth.json"));
+        auth.set_command_working_directory(dir.path())
+            .expect("credential command workspace");
+        auth.set(
+            provider_name,
+            crate::auth::AuthCredential::ApiKey {
+                key: "$CMD:cat credential.txt".to_string(),
+            },
+        );
+        let initial_key = auth.api_key(provider_name).expect("initial resolved key");
+        let response = |text: &str| {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "id": "sdk-rewind",
+                    "object": "chat.completion.chunk",
+                    "model": "rewind-model",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }),
+            )
+            .into_bytes()
+        };
+        let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
+            (200, "text/event-stream", response("experiment completed")),
+            (200, "text/event-stream", response("preserved experiment summary")),
+        ]);
+        let provider = Arc::new(
+            crate::providers::openai::OpenAIProvider::new("rewind-model")
+                .with_provider_name(provider_name)
+                .with_base_url(format!("{endpoint}chat/completions")),
+        );
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], dir.path(), None),
+            AgentConfig::default(),
+        );
+        agent.stream_options_mut().api_key = Some(initial_key);
+        let mut session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(Session::create_with_dir(Some(
+                dir.path().to_path_buf(),
+            )))),
+            true,
+            ResolvedCompactionSettings::default(),
+        );
+        session.set_auth_storage(auth);
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
+        run_async(async {
+            handle
+                .mark_checkpoint("before-experiment", None)
+                .await
+                .expect("checkpoint");
+            handle
+                .prompt("experiment to summarize", |_| {})
+                .await
+                .expect("prior turn");
+        });
+
+        std::fs::write(&credential_path, "rewind-key-after").expect("rotate credential");
+        assert_eq!(
+            handle.session.agent.stream_options().api_key.as_deref(),
+            Some("rewind-key-before"),
+            "rewind must resolve the credential source instead of reusing the prior turn's key"
+        );
+        let outcome = run_async(handle.rewind_to_checkpoint(Some("before-experiment")))
+            .expect("rewind with rotated credential");
+        assert_eq!(outcome.collapsed_messages, 2);
+        assert_eq!(outcome.summary, "preserved experiment summary");
+
+        let requests = peer.join().expect("native provider HTTP peer");
+        assert_eq!(requests.len(), 2);
+        for (request, key) in requests.iter().zip(["rewind-key-before", "rewind-key-after"]) {
+            let expected = format!("Authorization: Bearer {key}");
+            assert!(
+                request
+                    .headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(&expected)),
+                "each provider request must use the credential current at dispatch"
+            );
+        }
+        assert!(requests[1].body.to_string().contains("experiment to summarize"));
+        let live_context = checkpoint_context_value(handle.session.agent.messages());
+        let store = handle.session_store();
+        let path = {
+            let guard = store.try_lock().expect("session");
+            assert_eq!(
+                checkpoint_context_value(&guard.to_messages_for_current_path()),
+                live_context
+            );
+            guard.path.clone().expect("saved session")
+        };
+        let reopened =
+            run_async(Session::open(&path.display().to_string())).expect("reopen rewind");
+        assert_eq!(
+            checkpoint_context_value(&reopened.to_messages_for_current_path()),
+            live_context
+        );
     }
 
     #[test]
