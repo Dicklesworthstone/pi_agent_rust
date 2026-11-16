@@ -3272,8 +3272,8 @@ pub struct Session {
     /// save reconciles entry IDs under the persistence lock before appending.
     persisted_entry_count: Arc<AtomicUsize>,
     /// True when open recovered around malformed rows or missing parents.
-    /// Read-only replay and diagnostics remain available, but in-place save is
-    /// blocked so a later append/checkpoint cannot erase authoritative bytes.
+    /// Read-only replay and diagnostics remain available, but ordinary save,
+    /// export, share and fork cannot silently discard the integrity failure.
     source_integrity_failed: bool,
     /// True when header was modified since last save (forces full rewrite).
     header_dirty: bool,
@@ -5554,11 +5554,7 @@ impl Session {
     /// Save the session to disk.
     #[allow(clippy::too_many_lines)]
     async fn save_inner(&mut self) -> Result<()> {
-        if self.source_integrity_failed {
-            return Err(Error::session(
-                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to persist a session opened with skipped rows or missing parents",
-            ));
-        }
+        self.ensure_source_integrity("persist")?;
         self.ensure_entry_ids();
 
         if let Some(path) = self.path.clone() {
@@ -6397,7 +6393,7 @@ impl Session {
     /// export instead of producing an apparently complete, truncated document.
     /// For rendering outside the session lock, use `export_snapshot()?.to_html()`.
     pub fn to_html(&self) -> Result<String> {
-        self.ensure_export_integrity()?;
+        self.ensure_source_integrity("export")?;
         if self.v2_partial_hydration {
             return self.export_snapshot().map(|snapshot| snapshot.to_html());
         }
@@ -6408,11 +6404,20 @@ impl Session {
     ///
     /// Unlike a local HTML export, a shared transcript excludes abandoned
     /// sibling branches and local filesystem metadata such as the session cwd.
+    /// A partial V2 view is hydrated privately so the selected branch includes
+    /// its complete ancestry without changing the live session or source files.
     ///
     /// # Errors
     /// Returns a session error when the selected branch exceeds the bounded
-    /// share-input or rendered-HTML limits, or cannot be measured safely.
+    /// share-input or rendered-HTML limits, cannot be measured safely, or its
+    /// source history is incomplete or corrupt.
     pub fn to_share_html(&self) -> Result<String> {
+        self.ensure_source_integrity("share")?;
+        if self.v2_partial_hydration {
+            let mut complete = self.clone();
+            complete.ensure_full_v2_hydration(false)?;
+            return complete.to_share_html();
+        }
         let entries = self.entries_for_current_path();
         validate_share_entries_size(entries.iter().copied())?;
         let redacted_entries = redact_share_entries(entries, &self.header.cwd)?;
@@ -6534,7 +6539,7 @@ impl Session {
     /// hydrated on a private clone first; an already complete view copies only
     /// the header, entries, and path needed by the renderer.
     pub fn export_snapshot(&self) -> Result<ExportSnapshot> {
-        self.ensure_export_integrity()?;
+        self.ensure_source_integrity("export")?;
         if self.v2_partial_hydration {
             let mut complete = self.clone();
             complete.ensure_full_v2_hydration(false)?;
@@ -6551,11 +6556,11 @@ impl Session {
         })
     }
 
-    fn ensure_export_integrity(&self) -> Result<()> {
+    fn ensure_source_integrity(&self, operation: &str) -> Result<()> {
         if self.source_integrity_failed {
-            return Err(Error::session(
-                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to export a session opened with skipped rows or missing parents",
-            ));
+            return Err(Error::session(format!(
+                "PI_SESSION_SOURCE_INTEGRITY_FAILED: refusing to {operation} a session opened with skipped rows or missing parents"
+            )));
         }
         Ok(())
     }
@@ -6565,6 +6570,7 @@ impl Session {
     /// Returns the entries to copy into a new session (path to the parent of the selected
     /// user message), the new leaf id, and the selected user message text for editor pre-fill.
     pub fn plan_fork_from_user_message(&self, entry_id: &str) -> Result<ForkPlan> {
+        self.ensure_source_integrity("fork")?;
         if self.v2_partial_hydration {
             // A tail/active-path view can omit both the selected message's
             // ancestry and the latest session-wide workspace attachment.
@@ -6603,6 +6609,7 @@ impl Session {
     /// source, and includes its latest session-wide workspace attachment even
     /// when that metadata lives outside the selected conversation path.
     pub fn plan_fork_current_context(&self) -> Result<ForkPlan> {
+        self.ensure_source_integrity("fork")?;
         if self.v2_partial_hydration {
             let mut complete = self.clone();
             complete.ensure_full_v2_hydration_before_save()?;
@@ -15219,6 +15226,131 @@ mod tests {
         assert!(local_html.contains("cwd:"));
     }
 
+    fn partial_share_fixture(root: &Path) -> (Session, SessionStoreV2) {
+        let path = root.join("partial-share.jsonl");
+        let mut seed = Session::create_with_dir(Some(root.to_path_buf()));
+        seed.path = Some(path.clone());
+        seed.header.cwd = "/private/share-workspace".to_string();
+        let ancestor = seed.append_message(make_test_message("share-ancestor-sentinel"));
+        seed.append_message(make_test_message("unselected-private-branch"));
+        assert!(seed.create_branch_from(&ancestor));
+        seed.append_message(make_test_message("selected-prefix-sentinel"));
+        seed.append_message(make_test_message(
+            "selected-tip /private/share-workspace ghp_abcdefghijklmnopqrstuvwxyz",
+        ));
+        run_async(seed.save()).expect("save branching source");
+        let store = create_v2_sidecar_from_jsonl(&path).expect("create V2 store");
+        let (mut partial, diagnostics) =
+            Session::open_from_v2(&store, seed.header, V2OpenMode::Tail(1))
+                .expect("open bounded tail");
+        partial.path = Some(path);
+        assert_eq!(partial.v2_resume_mode, Some(V2OpenMode::Tail(1)));
+        assert!(partial.v2_partial_hydration);
+        assert_eq!(partial.entries.len(), 1);
+        assert!(partial.get_entry(&ancestor).is_none());
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert!(diagnostics.orphaned_parent_links.is_empty());
+        (partial, store)
+    }
+
+    #[test]
+    fn share_html_rehydrates_tail_without_mutating_live_or_persisted_state() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (mut partial, store) = partial_share_fixture(root.path());
+        partial.append_message(make_test_message("pending-local-sentinel"));
+        let before = serde_json::to_value((
+            &partial.header,
+            &partial.entries,
+            &partial.leaf_id,
+            partial.persisted_entry_count.load(Ordering::SeqCst),
+        ))
+        .expect("live snapshot");
+        let autosave_before = format!("{:?}", partial.autosave_metrics());
+        let source_bytes: Vec<_> = [
+            partial.path.clone().expect("JSONL source"),
+            store.index_file_path(),
+            store.segment_file_path(1),
+            store.root_dir().join("manifest.json"),
+            v2_source_state_path(store.root_dir()),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("source artifact");
+            (path, bytes)
+        })
+        .collect();
+
+        let html = partial.to_share_html().expect("complete selected branch");
+        for retained in [
+            "share-ancestor-sentinel",
+            "selected-prefix-sentinel",
+            "selected-tip",
+            "pending-local-sentinel",
+            "[REDACTED_CWD]",
+            "[REDACTED_GITHUB_PAT]",
+        ] {
+            assert!(html.contains(retained), "missing {retained}");
+        }
+        for excluded in [
+            "unselected-private-branch",
+            "/private/share-workspace",
+            "ghp_abcdefghijklmnopqrstuvwxyz",
+        ] {
+            assert!(!html.contains(excluded), "shared {excluded}");
+        }
+        assert_eq!(
+            serde_json::to_value((
+                &partial.header,
+                &partial.entries,
+                &partial.leaf_id,
+                partial.persisted_entry_count.load(Ordering::SeqCst),
+            ))
+            .unwrap(),
+            before
+        );
+        assert_eq!(format!("{:?}", partial.autosave_metrics()), autosave_before);
+        assert!(partial.v2_partial_hydration);
+        assert_eq!(partial.v2_resume_mode, Some(V2OpenMode::Tail(1)));
+
+        partial.reset_leaf();
+        let empty = partial.to_share_html().expect("explicit root selection");
+        assert!(!empty.contains("share-ancestor-sentinel"));
+        assert!(!empty.contains("selected-tip"));
+        assert!(!empty.contains("pending-local-sentinel"));
+        for (path, bytes) in source_bytes {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn share_html_rejects_corruption_discovered_beyond_its_loaded_tail() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (partial, store) = partial_share_fixture(root.path());
+        let path = partial.path.as_ref().expect("JSONL source");
+        let mut corrupt = std::fs::read(path).expect("source bytes");
+        corrupt.extend_from_slice(b"BROKEN_UNLOADED_ROW\n");
+        std::fs::write(path, &corrupt).expect("external source corruption");
+        let source_state = v2_source_state_path(store.root_dir());
+        let state_before = std::fs::read(&source_state).expect("V2 source state");
+        let view_before =
+            serde_json::to_value((&partial.header, &partial.entries, &partial.leaf_id)).unwrap();
+
+        let error = partial
+            .to_share_html()
+            .expect_err("a clean tail must not conceal corrupt source history");
+        assert!(
+            error.to_string().contains("V2 rehydration failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+        assert_eq!(std::fs::read(source_state).unwrap(), state_before);
+        assert_eq!(
+            serde_json::to_value((&partial.header, &partial.entries, &partial.leaf_id)).unwrap(),
+            view_before
+        );
+        assert!(partial.v2_partial_hydration);
+    }
+
     #[test]
     fn share_html_preflight_rejects_oversized_branch_before_rendering() {
         let mut session = Session::in_memory();
@@ -19641,6 +19773,77 @@ mod tests {
                 .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED")
         );
         assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
+    }
+
+    #[test]
+    fn crash_corrupt_off_branch_cannot_be_hidden_by_fork_or_share() {
+        for malformed_row in [true, false] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let path = root.path().join("corrupt-off-branch.jsonl");
+            let mut source = Session::create_with_dir(Some(root.path().to_path_buf()));
+            source.path = Some(path.clone());
+            source.append_message(make_test_message("valid selected ancestor"));
+            let selected = source.append_message(make_test_message("valid selected question"));
+            source.reset_leaf();
+            source.append_message(make_test_message("corrupt unselected branch"));
+            assert!(source.navigate_to(&selected));
+            run_async(source.save()).expect("save valid branch fixture");
+
+            let content = std::fs::read_to_string(&path).expect("source text");
+            let mut rows: Vec<String> = content.lines().map(String::from).collect();
+            let off_branch = rows.last_mut().expect("off-branch row");
+            if malformed_row {
+                *off_branch = "BROKEN_UNSELECTED_ROW".to_string();
+            } else {
+                let mut entry: Value = serde_json::from_str(off_branch).unwrap();
+                entry["parentId"] = Value::String("missing-off-branch-parent".to_string());
+                *off_branch = serde_json::to_string(&entry).unwrap();
+            }
+            let corrupt_bytes = format!("{}\n", rows.join("\n")).into_bytes();
+            std::fs::write(&path, &corrupt_bytes).expect("corrupt off-branch row");
+
+            let (recovered, diagnostics) = run_async(Session::open_jsonl_with_diagnostics(&path))
+                .expect("read-only recovery view");
+            assert_eq!(
+                diagnostics.skipped_entries.len(),
+                usize::from(malformed_row)
+            );
+            assert_eq!(
+                diagnostics.orphaned_parent_links.len(),
+                usize::from(!malformed_row)
+            );
+            assert!(recovered.source_integrity_failed);
+            assert_eq!(recovered.leaf_id(), Some(selected.as_str()));
+            assert_eq!(recovered.entries_for_current_path().len(), 2);
+            let before =
+                serde_json::to_value((&recovered.header, &recovered.entries, &recovered.leaf_id))
+                    .unwrap();
+
+            for error in [
+                recovered
+                    .plan_fork_from_user_message(&selected)
+                    .expect_err("a valid selected user must not conceal skipped source history"),
+                recovered
+                    .plan_fork_current_context()
+                    .expect_err("a valid selected path must not conceal skipped source history"),
+                recovered
+                    .to_share_html()
+                    .expect_err("sharing must not conceal skipped source history"),
+            ] {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("PI_SESSION_SOURCE_INTEGRITY_FAILED"),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value((&recovered.header, &recovered.entries, &recovered.leaf_id))
+                    .unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), corrupt_bytes);
+        }
     }
 
     #[test]
