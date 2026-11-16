@@ -174,7 +174,9 @@ pub(super) fn resolve_request_headers(
     for headers in compatibility.into_iter().chain(std::iter::once(request)) {
         let mut layer = HashMap::new();
         for (name, value) in headers {
-            if auth_names.iter().any(|auth| name.eq_ignore_ascii_case(auth))
+            if auth_names
+                .iter()
+                .any(|auth| name.eq_ignore_ascii_case(auth))
                 && value.trim().is_empty()
             {
                 continue;

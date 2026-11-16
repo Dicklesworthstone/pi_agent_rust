@@ -15797,6 +15797,12 @@ async fn scrub_and_drop_runtime_shards(
     let mut errors = Vec::new();
     for shard in &mut shards.shards {
         shard.cancel_idle_dispatch();
+        if shard.pump_fault.is_some() {
+            // Quarantined shards have already retired their native resources
+            // (intentionally poisoning SQLite against warm reuse); cold drop
+            // below owns final teardown.
+            continue;
+        }
         match shard.runtime.scrub_for_cold_drop().await {
             Ok(report) if report.inventoried_state_cleared => {
                 warm_pool.record_reset();

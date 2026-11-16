@@ -272,12 +272,13 @@ mod tests {
         budget.frame().unwrap();
         assert!(budget.frame().is_err());
         budget
-            .admit_with_blocks(
-                &[ServerEvent::TokenDelta(0), ServerEvent::UsedTokens(0)],
-                0,
-            )
+            .admit_with_blocks(&[ServerEvent::TokenDelta(0), ServerEvent::UsedTokens(0)], 0)
             .unwrap();
-        assert!(budget.admit_with_blocks(&[ServerEvent::TurnEnded], 0).is_err());
+        assert!(
+            budget
+                .admit_with_blocks(&[ServerEvent::TurnEnded], 0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -483,7 +484,10 @@ mod tests {
         assert!(
             matches!(&exact.partial.content[0], ContentBlock::Text(text) if text.text == "before")
         );
-        assert!(matches!(&exact.partial.content[1], ContentBlock::ToolCall(_)));
+        assert!(matches!(
+            &exact.partial.content[1],
+            ContentBlock::ToolCall(_)
+        ));
         assert!(
             matches!(&exact.partial.content[2], ContentBlock::Text(text) if text.text == "after continued")
         );

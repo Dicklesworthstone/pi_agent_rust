@@ -1095,8 +1095,8 @@ mod tests {
             )
             .expect("write GitLab response");
         });
-        let provider = GitLabProvider::new("gitlab-duo-chat")
-            .with_base_url(format!("http://{address}"));
+        let provider =
+            GitLabProvider::new("gitlab-duo-chat").with_base_url(format!("http://{address}"));
         let context = Context::owned(
             None,
             vec![Message::User(UserMessage {

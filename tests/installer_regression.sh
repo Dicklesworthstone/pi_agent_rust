@@ -356,7 +356,7 @@ if [[ "$url" == */SHA256SUMS ]]; then
   exit "${STUB_SHA256SUMS_CURL_RC:-22}"
 fi
 if [[ "$url" == *.sha256 ]]; then
-  if [ -n "${STUB_SHA256_SIDECAR_SOURCE:-}" ]; then
+  if [ -n "${STUB_SHA256_SIDECAR_SOURCE:-}" ] && [ -f "${STUB_SHA256_SIDECAR_SOURCE}" ]; then
     cp "${STUB_SHA256_SIDECAR_SOURCE}" "$output"
     if [ "$write_out" -eq 1 ]; then
       printf '200'

@@ -412,9 +412,8 @@ impl ChecksumMap {
 
     /// Parse an authenticated release manifest without ambiguous duplicate rows.
     fn parse_release(content: &[u8]) -> Result<Self> {
-        let content = std::str::from_utf8(content).map_err(|_| {
-            Error::Validation("Authenticated SHA256SUMS is not UTF-8".to_string())
-        })?;
+        let content = std::str::from_utf8(content)
+            .map_err(|_| Error::Validation("Authenticated SHA256SUMS is not UTF-8".to_string()))?;
         let mut entries = HashMap::new();
         for line in content.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
@@ -597,7 +596,9 @@ impl SelfUpdater {
             )));
         }
         response.bytes_limited(limit).await.map_err(|error| {
-            Error::Validation(format!("Failed to read bounded {label}: {error} (fail-closed)"))
+            Error::Validation(format!(
+                "Failed to read bounded {label}: {error} (fail-closed)"
+            ))
         })
     }
 
@@ -1188,8 +1189,12 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
         assert!(verify_minisign(bytes, lines[..3].join("\n").as_bytes(), &public_key).is_err());
         assert!(verify_minisign(bytes, b"", &public_key).is_err());
         assert!(
-            verify_minisign(bytes, b"untrusted comment: missing\nnot-base64\n", &public_key)
-                .is_err()
+            verify_minisign(
+                bytes,
+                b"untrusted comment: missing\nnot-base64\n",
+                &public_key
+            )
+            .is_err()
         );
         assert!(
             verify_minisign(
@@ -1199,9 +1204,7 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
             )
             .is_err()
         );
-        assert!(
-            verify_minisign(bytes, &vec![b'a'; MAX_SIGNATURE_BYTES + 1], &public_key).is_err()
-        );
+        assert!(verify_minisign(bytes, &vec![b'a'; MAX_SIGNATURE_BYTES + 1], &public_key).is_err());
 
         // Matching the public key identifier cannot substitute a different key.
         let mut key_packet = BASE64_STANDARD
@@ -1344,7 +1347,10 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
             ));
             server.join().unwrap();
             let error = result.unwrap_err().to_string();
-            assert!(error.contains("minisig") || error.contains("Minisign"), "{error}");
+            assert!(
+                error.contains("minisig") || error.contains("Minisign"),
+                "{error}"
+            );
             assert!(!error.contains("No compatible binary"), "{error}");
         }
     }
@@ -1356,7 +1362,11 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close".to_string(),
                 std::sync::Arc::new(Vec::new()),
             ),
-            response(sign_release(b"different checksum file", "v9.9.9", "aggregate")),
+            response(sign_release(
+                b"different checksum file",
+                "v9.9.9",
+                "aggregate",
+            )),
             response(sign_release(
                 b"this is also an invalid checksum file",
                 "v8.8.8",
@@ -1367,13 +1377,15 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
                 response(b"this is also an invalid checksum file".to_vec()),
                 signature_response,
             ]);
-            let result = run_async(test_updater().fetch_checksums(
-                "9.9.9",
-                Some(&format!("http://{address}")),
-            ));
+            let result = run_async(
+                test_updater().fetch_checksums("9.9.9", Some(&format!("http://{address}"))),
+            );
             server.join().unwrap();
             let error = result.unwrap_err().to_string();
-            assert!(error.contains("minisig") || error.contains("Minisign"), "{error}");
+            assert!(
+                error.contains("minisig") || error.contains("Minisign"),
+                "{error}"
+            );
             assert!(!error.contains("Invalid SHA256SUMS entry"), "{error}");
         }
     }

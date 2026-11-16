@@ -2614,8 +2614,7 @@ mod tests {
                 ])),
                 ..CompatConfig::default()
             };
-            let compat =
-                crate::models::merge_compat(provider.compat.as_ref(), Some(&model_compat));
+            let compat = crate::models::merge_compat(provider.compat.as_ref(), Some(&model_compat));
             let provider = provider.with_compat(compat);
             let options = StreamOptions {
                 api_key: Some("must-not-leak".into()),

@@ -1315,11 +1315,11 @@ impl ServiceMonitorResources {
             persist_detached_state(&reg);
             writer
         };
-        release_service_input(writer);
-        drop(self.master.take());
         if let Some(mut output) = self.output.take() {
             output.drain_and_join();
         }
+        release_service_input(writer);
+        drop(self.master.take());
         {
             let mut reg = registry()
                 .lock()

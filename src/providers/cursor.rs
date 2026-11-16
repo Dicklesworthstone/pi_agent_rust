@@ -976,7 +976,9 @@ impl StreamState {
                 crate::provider::PromptToolCallPart::Text(text) => {
                     PreparedEvent::Provider(ServerEvent::TextDelta(text))
                 }
-                crate::provider::PromptToolCallPart::ToolCall(call) => PreparedEvent::ToolCall(call),
+                crate::provider::PromptToolCallPart::ToolCall(call) => {
+                    PreparedEvent::ToolCall(call)
+                }
             };
             Self::stage_event(event, budget, open_kind, prepared)?;
         }
@@ -1833,11 +1835,8 @@ mod tests {
             serde_json::json!({"name": "write", "arguments": arguments}),
             crate::provider::PI_TOOL_CALL_CLOSE,
         );
-        let mut state = StreamState::new(
-            Box::pin(stream::empty()),
-            AssistantMessage::default(),
-        )
-        .with_allowed_tools(std::collections::HashSet::from(["write".to_string()]));
+        let mut state = StreamState::new(Box::pin(stream::empty()), AssistantMessage::default())
+            .with_allowed_tools(std::collections::HashSet::from(["write".to_string()]));
         let chars: Vec<char> = envelope.chars().collect();
         for (index, character) in chars.iter().enumerate() {
             state
