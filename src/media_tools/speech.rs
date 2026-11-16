@@ -632,6 +632,8 @@ fn aac_has_frame(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::super::transport::tests::peer;
     use super::*;
 
@@ -650,10 +652,10 @@ mod tests {
                 "type":"speech.audio.delta",
                 "audio":base64::engine::general_purpose::STANDARD.encode(chunk)
             });
-            wire.push_str(&format!("data: {delta}\n\n"));
+            let _ = write!(wire, "data: {delta}\n\n");
         }
         let done = json!({"type":"speech.audio.done","usage":usage});
-        wire.push_str(&format!("data: {done}\n\n"));
+        let _ = write!(wire, "data: {done}\n\n");
         wire.into_bytes()
     }
 

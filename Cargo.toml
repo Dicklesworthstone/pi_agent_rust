@@ -750,12 +750,6 @@ assigning_clones = "allow"
 useless_let_if_seq = "allow"
 # 2 sites. Naming the variant changes how a new variant would match.
 match_wildcard_for_single_variants = "allow"
-# 1 site. Dropping the redundant #[must_use] is style only.
-double_must_use = "allow"
-# 1 site. Using From for this tuple/array conversion is style only.
-tuple_array_conversions = "allow"
-# 1 site. Rewriting format!-then-push_str with write! is a style refactor.
-format_push_string = "allow"
 # 1 site. Dropping this collect changes when the iterator runs; decided per site.
 needless_collect = "allow"
 # 1 site. Folding this field assignment into the literal is style only.

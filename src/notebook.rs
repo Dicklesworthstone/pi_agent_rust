@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
@@ -210,7 +211,7 @@ impl Notebook {
             if index > 0 {
                 text.push('\n');
             }
-            text.push_str(&format!("# %% [{kind}] cell:{index}"));
+            let _ = write!(text, "# %% [{kind}] cell:{index}");
             let source = escaped_source(&source_text(cell, &self.display)?);
             if !source.is_empty() {
                 text.push('\n');

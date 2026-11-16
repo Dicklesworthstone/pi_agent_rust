@@ -12,6 +12,7 @@ use super::{
 use crate::agent::AbortHandle;
 use crate::web_remote::{CompanionHandle, PromptProposal, TokenKind};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, mpsc};
 
 const SUB_ID: SubId = 0x5049_5742; // "PIWB"
@@ -90,11 +91,12 @@ impl CompanionUi {
         );
         if !self.view_only {
             let steer = self.handle.pairing_url(TokenKind::Steer)?;
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 "\nPROPOSE A PROMPT\n{steer}\n\n\
                  Every browser prompt needs F8 approval here.\n\
                  Tool approvals and login input stay on this terminal.\n"
-            ));
+            );
         }
         text.push_str(
             "\nThe browser shows completed messages and activity status.\n\

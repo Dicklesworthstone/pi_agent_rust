@@ -9,6 +9,8 @@
 //! Blocks not addressed to the assistant remain in client details. These are
 //! routing hints, not a grant of authority or trust in the server's content.
 
+use std::fmt::Write as _;
+
 use base64::Engine as _;
 use serde_json::{Value, json};
 
@@ -457,10 +459,11 @@ fn bound_tool_output_with_limits(
     let mut remaining = preview.output_bytes;
     let mut preview_and_notice = preview.content;
     let notice_start = preview_and_notice.len();
-    preview_and_notice.push_str(&format!(
+    let _ = write!(
+        preview_and_notice,
         "\n\n[MCP text preview truncated: {} of {total_bytes} bytes, {} of {total_lines} lines. Text spillover excludes native media and client-only metadata; native media remains in the result.]",
         preview.output_bytes, preview.output_lines,
-    ));
+    );
     crate::tools::attach_truncated_text_artifact(
         artifact_root,
         &mut preview_and_notice,

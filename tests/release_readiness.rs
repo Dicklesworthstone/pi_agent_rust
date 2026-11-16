@@ -396,11 +396,7 @@ fn validate_must_pass_gate_metadata(v: &V) -> Vec<String> {
             }
         }
         counts => {
-            errors.extend(
-                [counts.0, counts.1, counts.2, counts.3, counts.4]
-                    .into_iter()
-                    .filter_map(Result::err),
-            );
+            errors.extend(<[_; 5]>::from(counts).into_iter().filter_map(Result::err));
         }
     }
 
@@ -2344,7 +2340,7 @@ fn current_conformance_counts(v: &V) -> Result<(u64, u64, u64, u64, u64), String
             Ok((total, tested, passed, failed, not_applicable))
         }
         counts => {
-            let errors = [counts.0, counts.1, counts.2, counts.3, counts.4]
+            let errors = <[_; 5]>::from(counts)
                 .into_iter()
                 .filter_map(Result::err)
                 .collect::<Vec<_>>();
