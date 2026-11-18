@@ -250,6 +250,7 @@ pub mod handoff;
 pub mod hostcall_amac;
 #[doc(hidden)]
 pub mod hostcall_egraph;
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[doc(hidden)]
 pub mod hostcall_io_uring_lane;
 #[doc(hidden)]
@@ -437,6 +438,7 @@ pub mod worktree_iso;
 pub mod xdev;
 
 pub use error::{Error, Result as PiResult};
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[doc(hidden)]
 pub use extension_dispatcher::ExtensionDispatcher;
 

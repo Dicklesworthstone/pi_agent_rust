@@ -24,6 +24,7 @@
 //! ```
 
 use crate::error::{Error, Result};
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::hostcall_io_uring_lane::{
     HostcallCapabilityClass, HostcallIoHint, IoUringLaneDecisionInput,
 };
@@ -339,11 +340,13 @@ impl HostcallRequest {
         }
     }
 
+    #[cfg(any(test, feature = "experimental-controllers"))]
     #[must_use]
     pub fn io_uring_capability_class(&self) -> HostcallCapabilityClass {
         HostcallCapabilityClass::from_capability(self.required_capability())
     }
 
+    #[cfg(any(test, feature = "experimental-controllers"))]
     #[must_use]
     pub fn io_uring_io_hint(&self) -> HostcallIoHint {
         match &self.kind {
@@ -372,6 +375,7 @@ impl HostcallRequest {
         }
     }
 
+    #[cfg(any(test, feature = "experimental-controllers"))]
     #[must_use]
     pub fn io_uring_lane_input(
         &self,
@@ -1031,6 +1035,7 @@ pub struct ExtensionRepairEvent {
 // ---------------------------------------------------------------------------
 
 /// A static repair rule with deterministic ordering and versioning.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct RepairRule {
     /// Unique identifier for the rule (e.g. `"dist_to_src_v1"`).
@@ -1043,6 +1048,7 @@ pub struct RepairRule {
     pub description: &'static str,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RepairRule {
     /// Risk tier inherited from the pattern.
     pub const fn risk(&self) -> RepairRisk {
@@ -1060,6 +1066,7 @@ impl RepairRule {
 /// Rules are evaluated **in array order** — the first applicable rule wins.
 /// New rules MUST be appended; existing order must never change to preserve
 /// determinism across versions.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub static REPAIR_RULES: &[RepairRule] = &[
     RepairRule {
         id: "dist_to_src_v1",
@@ -1108,6 +1115,7 @@ pub static REPAIR_RULES: &[RepairRule] = &[
 ];
 
 /// Find all rules applicable under the given mode, in registry order.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn applicable_rules(mode: RepairMode) -> Vec<&'static RepairRule> {
     REPAIR_RULES
         .iter()
@@ -1116,11 +1124,13 @@ pub fn applicable_rules(mode: RepairMode) -> Vec<&'static RepairRule> {
 }
 
 /// Look up a rule by its ID.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn rule_by_id(id: &str) -> Option<&'static RepairRule> {
     REPAIR_RULES.iter().find(|r| r.id == id)
 }
 
 /// The registry version: bumped whenever rules are added or modified.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub const REPAIR_REGISTRY_VERSION: &str = "1.1.0";
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1142,7 @@ pub const REPAIR_REGISTRY_VERSION: &str = "1.1.0";
 /// Each variant represents a constrained, validatable operation. The union of
 /// all variants defines the complete vocabulary available to the model repair
 /// adapter — anything outside this enum is rejected at the schema level.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchOp {
     /// Replace a module import path with a different path.
@@ -1161,6 +1172,7 @@ pub enum PatchOp {
     },
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl PatchOp {
     /// The risk tier of this operation.
     pub const fn risk(&self) -> RepairRisk {
@@ -1191,6 +1203,7 @@ impl PatchOp {
 /// Contains one or more `PatchOp`s plus metadata for audit. Proposals are
 /// validated against the current `RepairMode` and monotonicity checker before
 /// any operations are applied.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct PatchProposal {
     /// Which rule triggered this proposal.
@@ -1203,6 +1216,7 @@ pub struct PatchProposal {
     pub confidence: Option<f64>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl PatchProposal {
     /// The highest risk across all ops in the proposal.
     pub fn max_risk(&self) -> RepairRisk {
@@ -1236,6 +1250,7 @@ impl PatchProposal {
 // ---------------------------------------------------------------------------
 
 /// Outcome of conflict detection between two proposals.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictKind {
     /// No conflict: the proposals touch different files/paths.
@@ -1246,6 +1261,7 @@ pub enum ConflictKind {
     SameVirtualPath(String),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl ConflictKind {
     /// True if there is no conflict.
     pub const fn is_clear(&self) -> bool {
@@ -1258,6 +1274,7 @@ impl ConflictKind {
 /// Two proposals conflict if they modify the same module path or inject
 /// stubs at the same virtual path. This is a conservative check — any
 /// overlap is treated as a conflict.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn detect_conflict(a: &PatchProposal, b: &PatchProposal) -> ConflictKind {
     for op_a in &a.ops {
         for op_b in &b.ops {
@@ -1270,6 +1287,7 @@ pub fn detect_conflict(a: &PatchProposal, b: &PatchProposal) -> ConflictKind {
 }
 
 /// Check if two individual ops conflict.
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn ops_conflict(a: &PatchOp, b: &PatchOp) -> Option<ConflictKind> {
     match (a, b) {
         (
@@ -1331,6 +1349,7 @@ fn ops_conflict(a: &PatchOp, b: &PatchOp) -> Option<ConflictKind> {
 ///
 /// Only candidates allowed by the given `RepairMode` are considered.
 /// Returns `None` if no candidate is allowed.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn select_best_candidate(
     candidates: &[PatchProposal],
     mode: RepairMode,
@@ -1342,6 +1361,7 @@ pub fn select_best_candidate(
 }
 
 /// Compare two proposals for selection ordering.
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn compare_proposals(a: &PatchProposal, b: &PatchProposal) -> std::cmp::Ordering {
     // 1. Lower risk wins.
     let risk_ord = risk_rank(a.max_risk()).cmp(&risk_rank(b.max_risk()));
@@ -1371,6 +1391,7 @@ fn compare_proposals(a: &PatchProposal, b: &PatchProposal) -> std::cmp::Ordering
 }
 
 /// Map `RepairRisk` to a numeric rank for ordering.
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn risk_rank(risk: RepairRisk) -> u8 {
     match risk {
         RepairRisk::Safe => 0,
@@ -1382,6 +1403,7 @@ const fn risk_rank(risk: RepairRisk) -> u8 {
 ///
 /// When two proposals conflict, the lower-ranked one (by
 /// `compare_proposals`) is dropped. Returns a conflict-free subset.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn resolve_conflicts(proposals: &[PatchProposal]) -> Vec<&PatchProposal> {
     if proposals.is_empty() {
         return vec![];
@@ -1413,6 +1435,7 @@ pub fn resolve_conflicts(proposals: &[PatchProposal]) -> Vec<&PatchProposal> {
 /// This struct is the *only* information the model sees. It deliberately
 /// excludes secrets, full file contents, and anything outside the extension's
 /// scope. The model can only produce proposals using the allowed primitives.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct RepairContext {
     /// Extension identity.
@@ -1431,6 +1454,7 @@ pub struct RepairContext {
     pub allowed_op_tags: Vec<&'static str>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RepairContext {
     /// Build a repair context from constituent parts.
     pub fn new(
@@ -1455,6 +1479,7 @@ impl RepairContext {
 }
 
 /// Return the `PatchOp` tags allowed under the given repair mode.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn allowed_op_tags_for_mode(mode: RepairMode) -> Vec<&'static str> {
     let mut tags = Vec::new();
     if mode.should_apply() {
@@ -1473,6 +1498,7 @@ pub fn allowed_op_tags_for_mode(mode: RepairMode) -> Vec<&'static str> {
 // ---------------------------------------------------------------------------
 
 /// Validation error for a model-generated proposal.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposalValidationError {
     /// Proposal contains zero operations.
@@ -1487,6 +1513,7 @@ pub enum ProposalValidationError {
     MonotonicityViolation { path: String },
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for ProposalValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1511,6 +1538,7 @@ impl std::fmt::Display for ProposalValidationError {
 /// 3. Overall risk does not exceed mode permissions.
 /// 4. The rule_id references a known rule (if non-empty).
 /// 5. Module paths stay within the extension root (monotonicity).
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn validate_proposal(
     proposal: &PatchProposal,
     mode: RepairMode,
@@ -1576,6 +1604,7 @@ pub fn validate_proposal(
 }
 
 /// Extract the target path from a `PatchOp`.
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn op_target_path(op: &PatchOp) -> String {
     match op {
         PatchOp::ReplaceModulePath { to, .. } => to.clone(),
@@ -1587,6 +1616,7 @@ fn op_target_path(op: &PatchOp) -> String {
 }
 
 /// Result of applying a validated proposal.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ApplicationResult {
     /// Whether the application succeeded.
@@ -1602,6 +1632,7 @@ pub struct ApplicationResult {
 /// In the current implementation, actual file modifications are deferred
 /// to the module loader. This function validates and produces an audit
 /// record of what would be applied.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn apply_proposal(
     proposal: &PatchProposal,
     mode: RepairMode,
@@ -1628,6 +1659,7 @@ pub fn apply_proposal(
 // ---------------------------------------------------------------------------
 
 /// Whether a proposal requires human approval before application.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApprovalRequirement {
     /// No approval needed — proposal can be applied automatically.
@@ -1636,6 +1668,7 @@ pub enum ApprovalRequirement {
     RequiresApproval,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl ApprovalRequirement {
     /// True if human review is required.
     pub const fn needs_approval(&self) -> bool {
@@ -1643,6 +1676,7 @@ impl ApprovalRequirement {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for ApprovalRequirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1653,6 +1687,7 @@ impl std::fmt::Display for ApprovalRequirement {
 }
 
 /// An approval request presented to the human reviewer.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     /// Extension being repaired.
@@ -1670,6 +1705,7 @@ pub struct ApprovalRequest {
 }
 
 /// Human response to an approval request.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalResponse {
     /// Approved: apply the proposal.
@@ -1685,6 +1721,7 @@ pub enum ApprovalResponse {
 /// - It contains any Aggressive-risk operations, OR
 /// - The confidence score is below the repairable threshold (0.5), OR
 /// - The mode is `AutoStrict` and the proposal touches 3+ operations.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn check_approval_requirement(
     proposal: &PatchProposal,
     confidence_score: f64,
@@ -1702,6 +1739,7 @@ pub fn check_approval_requirement(
 }
 
 /// Build an approval request for human review.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn build_approval_request(
     extension_id: &str,
     proposal: &PatchProposal,
@@ -1855,6 +1893,7 @@ fn validate_json_parse(path: &Path, source: &str) -> StructuralVerdict {
 // ---------------------------------------------------------------------------
 
 /// A construct in the source that reduces repair confidence.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AmbiguitySignal {
     /// Source contains `eval(...)` — arbitrary code execution.
@@ -1875,6 +1914,7 @@ pub enum AmbiguitySignal {
     RecoverableParseErrors { count: usize },
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl AmbiguitySignal {
     /// Severity weight (0.0–1.0) for confidence scoring.
     pub fn weight(&self) -> f64 {
@@ -1905,6 +1945,7 @@ impl AmbiguitySignal {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for AmbiguitySignal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1917,6 +1958,7 @@ impl std::fmt::Display for AmbiguitySignal {
 }
 
 /// Result of tolerant parsing: partial analysis even when source has errors.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct TolerantParseResult {
     /// Whether the source parsed without fatal errors.
@@ -1929,6 +1971,7 @@ pub struct TolerantParseResult {
     pub ambiguities: Vec<AmbiguitySignal>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl TolerantParseResult {
     /// Overall ambiguity score (0.0 = fully legible, 1.0 = fully opaque).
     pub fn ambiguity_score(&self) -> f64 {
@@ -1954,6 +1997,7 @@ impl TolerantParseResult {
 /// and imports. For all supported extensions, scans source text
 /// for ambiguity patterns. Returns partial results even on parse
 /// failure.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn tolerant_parse(source: &str, filename: &str) -> TolerantParseResult {
     let ext = Path::new(filename)
         .extension()
@@ -1986,6 +2030,7 @@ pub fn tolerant_parse(source: &str, filename: &str) -> TolerantParseResult {
 }
 
 /// Attempt SWC parse and return (ok, stmts, imports, error_count).
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn try_swc_parse(source: &str, filename: &str, ext: &str) -> (bool, usize, usize, usize) {
     use swc_common::{FileName, GLOBALS, Globals};
     use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
@@ -2041,6 +2086,7 @@ fn try_swc_parse(source: &str, filename: &str, ext: &str) -> (bool, usize, usize
 }
 
 /// Detect ambiguity patterns in source text.
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn detect_ambiguity_patterns(source: &str) -> Vec<AmbiguitySignal> {
     use std::sync::OnceLock;
 
@@ -2097,6 +2143,7 @@ fn detect_ambiguity_patterns(source: &str) -> Vec<AmbiguitySignal> {
 // ---------------------------------------------------------------------------
 
 /// A normalized intent signal extracted from an extension.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IntentSignal {
     /// The extension registers a tool with the given name.
@@ -2117,6 +2164,7 @@ pub enum IntentSignal {
     RegistersRenderer(String),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl IntentSignal {
     /// Category tag for logging and grouping.
     pub const fn category(&self) -> &'static str {
@@ -2147,6 +2195,7 @@ impl IntentSignal {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for IntentSignal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.category(), self.name())
@@ -2158,6 +2207,7 @@ impl std::fmt::Display for IntentSignal {
 /// Captures every registration and capability declaration the extension makes,
 /// providing a complete picture of what the extension *intends* to do. Used by
 /// the confidence scoring model to decide whether automated repair is safe.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Default)]
 pub struct IntentGraph {
     /// Extension identity.
@@ -2166,6 +2216,7 @@ pub struct IntentGraph {
     pub signals: Vec<IntentSignal>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl IntentGraph {
     /// Build an intent graph from a `RegisterPayload` and capability list.
     pub fn from_register_payload(
@@ -2269,6 +2320,7 @@ impl IntentGraph {
 // ---------------------------------------------------------------------------
 
 /// An individual reason contributing to the confidence score.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ConfidenceReason {
     /// Short machine-readable code (e.g., "parsed_ok", "has_tools").
@@ -2280,6 +2332,7 @@ pub struct ConfidenceReason {
 }
 
 /// Result of confidence scoring: a score plus explainable reasons.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ConfidenceReport {
     /// Overall confidence (0.0–1.0). Higher = more legible / safer to repair.
@@ -2288,6 +2341,7 @@ pub struct ConfidenceReport {
     pub reasons: Vec<ConfidenceReason>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl ConfidenceReport {
     /// True if the confidence is high enough for automated repair.
     pub fn is_repairable(&self) -> bool {
@@ -2315,6 +2369,7 @@ impl ConfidenceReport {
 /// - Ambiguity detected (weighted by severity)
 /// - No registrations (opaque extension)
 /// - Zero statements recovered
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::too_many_lines)]
 pub fn compute_confidence(intent: &IntentGraph, parse: &TolerantParseResult) -> ConfidenceReport {
     let mut score: f64 = 0.5;
@@ -2431,6 +2486,7 @@ pub fn compute_confidence(intent: &IntentGraph, parse: &TolerantParseResult) -> 
 // ---------------------------------------------------------------------------
 
 /// The repair gating decision: what action the system should take.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatingDecision {
     /// Extension is legible and safe for automated repair.
@@ -2441,6 +2497,7 @@ pub enum GatingDecision {
     Deny,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl GatingDecision {
     /// Short label for structured logging.
     pub const fn label(&self) -> &'static str {
@@ -2452,6 +2509,7 @@ impl GatingDecision {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for GatingDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
@@ -2459,6 +2517,7 @@ impl std::fmt::Display for GatingDecision {
 }
 
 /// A structured reason code explaining why a gating decision was made.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatingReasonCode {
     /// Machine-readable code (e.g., "low_confidence", "parse_failed").
@@ -2468,6 +2527,7 @@ pub struct GatingReasonCode {
 }
 
 /// Full gating verdict: decision + confidence + reason codes.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct GatingVerdict {
     /// The decision: allow / suggest / deny.
@@ -2478,6 +2538,7 @@ pub struct GatingVerdict {
     pub reason_codes: Vec<GatingReasonCode>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl GatingVerdict {
     /// Whether the verdict permits automated repair.
     pub fn allows_repair(&self) -> bool {
@@ -2502,6 +2563,7 @@ impl GatingVerdict {
 ///
 /// Reason codes are generated for Suggest and Deny decisions to guide
 /// the user on what needs to change for the extension to become repairable.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn compute_gating_verdict(intent: &IntentGraph, parse: &TolerantParseResult) -> GatingVerdict {
     let confidence = compute_confidence(intent, parse);
     let decision = if confidence.is_repairable() {
@@ -2526,6 +2588,7 @@ pub fn compute_gating_verdict(intent: &IntentGraph, parse: &TolerantParseResult)
 }
 
 /// Generate structured reason codes with remediation guidance.
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn build_reason_codes(
     confidence: &ConfidenceReport,
     parse: &TolerantParseResult,
@@ -2766,6 +2829,7 @@ pub fn verify_repair_monotonicity(
 // ---------------------------------------------------------------------------
 
 /// A single capability change between before and after `IntentGraph`s.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityDelta {
     /// A signal present in both before and after — no change.
@@ -2776,6 +2840,7 @@ pub enum CapabilityDelta {
     Added(IntentSignal),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl CapabilityDelta {
     /// True when this delta represents a privilege escalation.
     pub const fn is_escalation(&self) -> bool {
@@ -2809,6 +2874,7 @@ impl CapabilityDelta {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for CapabilityDelta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.label(), self.signal())
@@ -2816,6 +2882,7 @@ impl std::fmt::Display for CapabilityDelta {
 }
 
 /// Proof verdict for capability monotonicity.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CapabilityMonotonicityVerdict {
     /// No capabilities were added — repair is monotonic (safe).
@@ -2824,6 +2891,7 @@ pub enum CapabilityMonotonicityVerdict {
     Escalation,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl CapabilityMonotonicityVerdict {
     /// True when the repair passed monotonicity (no escalation).
     pub const fn is_safe(&self) -> bool {
@@ -2831,6 +2899,7 @@ impl CapabilityMonotonicityVerdict {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for CapabilityMonotonicityVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2845,6 +2914,7 @@ impl std::fmt::Display for CapabilityMonotonicityVerdict {
 /// Compares the before-repair and after-repair `IntentGraph`s signal by
 /// signal. A repair is monotonic if and only if it introduces no new
 /// capabilities — it may remove or retain existing ones, but never add.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct CapabilityProofReport {
     /// Extension identity.
@@ -2861,6 +2931,7 @@ pub struct CapabilityProofReport {
     pub added_count: usize,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl CapabilityProofReport {
     /// True when the proof passed (no escalation).
     pub const fn is_safe(&self) -> bool {
@@ -2880,6 +2951,7 @@ impl CapabilityProofReport {
 ///
 /// A repair is *monotonic* (safe) if and only if `after` introduces no
 /// signals that were absent from `before`. Removals are allowed.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn compute_capability_proof(
     before: &IntentGraph,
     after: &IntentGraph,
@@ -2932,6 +3004,7 @@ pub fn compute_capability_proof(
 // ---------------------------------------------------------------------------
 
 /// Categories of hostcall surface that an extension can exercise.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HostcallCategory {
     /// `pi.events(op, ...)` — lifecycle event dispatch.
@@ -2946,6 +3019,7 @@ pub enum HostcallCategory {
     ModuleResolution(String),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl HostcallCategory {
     /// Short tag for logging.
     pub fn tag(&self) -> String {
@@ -2959,6 +3033,7 @@ impl HostcallCategory {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for HostcallCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.tag())
@@ -2966,6 +3041,7 @@ impl std::fmt::Display for HostcallCategory {
 }
 
 /// A delta between before/after hostcall surfaces.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostcallDelta {
     /// Hostcall present in both before and after.
@@ -2976,6 +3052,7 @@ pub enum HostcallDelta {
     Added(HostcallCategory),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl HostcallDelta {
     /// True when this delta introduces new hostcall surface.
     pub const fn is_expansion(&self) -> bool {
@@ -2999,6 +3076,7 @@ impl HostcallDelta {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for HostcallDelta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.label(), self.category())
@@ -3006,6 +3084,7 @@ impl std::fmt::Display for HostcallDelta {
 }
 
 /// Semantic drift severity classification.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SemanticDriftSeverity {
     /// No meaningful behavioral change detected.
@@ -3018,6 +3097,7 @@ pub enum SemanticDriftSeverity {
     High,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl SemanticDriftSeverity {
     /// True if drift is within acceptable bounds.
     pub const fn is_acceptable(&self) -> bool {
@@ -3025,6 +3105,7 @@ impl SemanticDriftSeverity {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for SemanticDriftSeverity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3037,6 +3118,7 @@ impl std::fmt::Display for SemanticDriftSeverity {
 }
 
 /// Overall verdict for hostcall parity and semantic delta proof.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticParityVerdict {
     /// Repair preserves hostcall surface and semantic behavior.
@@ -3047,6 +3129,7 @@ pub enum SemanticParityVerdict {
     Divergent,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl SemanticParityVerdict {
     /// True if the repair passes semantic parity.
     pub const fn is_safe(&self) -> bool {
@@ -3054,6 +3137,7 @@ impl SemanticParityVerdict {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for SemanticParityVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3065,6 +3149,7 @@ impl std::fmt::Display for SemanticParityVerdict {
 }
 
 /// Full hostcall parity and semantic delta proof report.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct SemanticParityReport {
     /// Extension identity.
@@ -3085,6 +3170,7 @@ pub struct SemanticParityReport {
     pub notes: Vec<String>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl SemanticParityReport {
     /// True if the proof passed (repair is safe).
     pub const fn is_safe(&self) -> bool {
@@ -3104,6 +3190,7 @@ impl SemanticParityReport {
 ///
 /// Maps `IntentSignal`s to the hostcall categories they exercise at runtime.
 /// This provides a static approximation of the extension's hostcall surface.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn extract_hostcall_surface(
     intent: &IntentGraph,
 ) -> std::collections::HashSet<HostcallCategory> {
@@ -3140,6 +3227,7 @@ pub fn extract_hostcall_surface(
 /// Compares the before-repair and after-repair hostcall surfaces and
 /// assesses semantic drift. A repair passes if it does not expand the
 /// hostcall surface beyond the declared fix scope.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn compute_semantic_parity(
     before: &IntentGraph,
     after: &IntentGraph,
@@ -3211,6 +3299,7 @@ pub fn compute_semantic_parity(
 }
 
 /// Assess semantic drift severity from patch operations and hostcall changes.
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn assess_drift(
     patch_ops: &[PatchOp],
     expanded_hostcalls: usize,
@@ -3257,9 +3346,11 @@ fn assess_drift(
 // ---------------------------------------------------------------------------
 
 /// SHA-256 checksum of an artifact (hex-encoded, lowercase).
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub type ArtifactChecksum = String;
 
 /// Compute a SHA-256 checksum for the given byte content.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn compute_artifact_checksum(content: &[u8]) -> ArtifactChecksum {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(content);
@@ -3267,6 +3358,7 @@ pub fn compute_artifact_checksum(content: &[u8]) -> ArtifactChecksum {
 }
 
 /// A single artifact entry in a golden checksum manifest.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksumEntry {
     /// Relative path of the artifact within the extension root.
@@ -3278,6 +3370,7 @@ pub struct ChecksumEntry {
 }
 
 /// Overall verdict of a conformance replay check.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConformanceReplayVerdict {
     /// All replayed fixtures matched expected behavior.
@@ -3288,6 +3381,7 @@ pub enum ConformanceReplayVerdict {
     NoFixtures,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl ConformanceReplayVerdict {
     /// True if the replay passed or had no fixtures.
     pub const fn is_acceptable(&self) -> bool {
@@ -3295,6 +3389,7 @@ impl ConformanceReplayVerdict {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for ConformanceReplayVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3306,6 +3401,7 @@ impl std::fmt::Display for ConformanceReplayVerdict {
 }
 
 /// A single conformance fixture for replay.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ConformanceFixture {
     /// Descriptive name of the fixture.
@@ -3319,6 +3415,7 @@ pub struct ConformanceFixture {
 }
 
 /// Result of replaying conformance fixtures.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ConformanceReplayReport {
     /// Extension identity.
@@ -3333,6 +3430,7 @@ pub struct ConformanceReplayReport {
     pub total_count: usize,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl ConformanceReplayReport {
     /// True if the replay is acceptable.
     pub const fn is_acceptable(&self) -> bool {
@@ -3345,6 +3443,7 @@ impl ConformanceReplayReport {
 /// Each fixture is checked: if `actual` is provided and matches `expected`,
 /// the fixture passes. If no fixtures are provided, the verdict is
 /// `NoFixtures` (vacuously safe — conformance cannot be disproven).
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn replay_conformance_fixtures(
     extension_id: &str,
     fixtures: &[ConformanceFixture],
@@ -3381,6 +3480,7 @@ pub fn replay_conformance_fixtures(
 /// Records the checksums of all repaired artifacts at the time of repair.
 /// This provides tamper-evident proof that the artifacts were not modified
 /// after the repair pipeline produced them.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct GoldenChecksumManifest {
     /// Extension identity.
@@ -3391,6 +3491,7 @@ pub struct GoldenChecksumManifest {
     pub generated_at_ms: u64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl GoldenChecksumManifest {
     /// Number of artifacts in the manifest.
     pub const fn artifact_count(&self) -> usize {
@@ -3410,6 +3511,7 @@ impl GoldenChecksumManifest {
 ///
 /// Takes an extension_id, a list of (relative_path, content) tuples, and a
 /// timestamp. Computes SHA-256 for each artifact.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn build_golden_manifest(
     extension_id: &str,
     artifacts: &[(&str, &[u8])],
@@ -3443,6 +3545,7 @@ pub fn build_golden_manifest(
 /// Collects all proof artifacts from LISR-5 into a single bundle that
 /// serves as the activation gate. A repair candidate cannot be activated
 /// unless ALL proofs pass.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct VerificationBundle {
     /// Extension identity.
@@ -3459,6 +3562,7 @@ pub struct VerificationBundle {
     pub checksum_manifest: GoldenChecksumManifest,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl VerificationBundle {
     /// True if ALL proofs pass — the activation gate.
     pub const fn is_verified(&self) -> bool {
@@ -3503,6 +3607,7 @@ impl VerificationBundle {
 // ---------------------------------------------------------------------------
 
 /// Lifecycle state of an overlay artifact.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverlayState {
     /// Just created, not yet deployed.
@@ -3517,6 +3622,7 @@ pub enum OverlayState {
     Superseded,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl OverlayState {
     /// True if the overlay is currently serving traffic.
     pub const fn is_active(&self) -> bool {
@@ -3529,6 +3635,7 @@ impl OverlayState {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for OverlayState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3545,6 +3652,7 @@ impl std::fmt::Display for OverlayState {
 ///
 /// Contains the repaired payload, original artifact hash, proof metadata,
 /// policy decisions, and full lineage for auditability.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct OverlayArtifact {
     /// Unique identifier for this overlay.
@@ -3571,6 +3679,7 @@ pub struct OverlayArtifact {
     pub updated_at_ms: u64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl OverlayArtifact {
     /// True if the overlay is currently serving.
     pub const fn is_active(&self) -> bool {
@@ -3579,6 +3688,7 @@ impl OverlayArtifact {
 }
 
 /// State transition error.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayTransitionError {
     /// Attempted transition is not valid from the current state.
@@ -3590,6 +3700,7 @@ pub enum OverlayTransitionError {
     VerificationRequired,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for OverlayTransitionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3612,6 +3723,7 @@ impl std::fmt::Display for OverlayTransitionError {
 /// - Stable → `RolledBack`
 /// - Stable → Superseded
 /// - Staged → `RolledBack`
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn transition_overlay(
     artifact: &mut OverlayArtifact,
     target: OverlayState,
@@ -3653,6 +3765,7 @@ pub fn transition_overlay(
 // ---------------------------------------------------------------------------
 
 /// Canary routing decision for a specific request.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CanaryRoute {
     /// Use the original (unrepaired) artifact.
@@ -3661,6 +3774,7 @@ pub enum CanaryRoute {
     Overlay,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for CanaryRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3671,6 +3785,7 @@ impl std::fmt::Display for CanaryRoute {
 }
 
 /// Canary configuration for a specific extension/version pair.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct CanaryConfig {
     /// Extension identity.
@@ -3683,6 +3798,7 @@ pub struct CanaryConfig {
     pub enabled: bool,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl CanaryConfig {
     /// Route a request using a deterministic hash value (0–99).
     pub const fn route(&self, hash_bucket: u8) -> CanaryRoute {
@@ -3700,6 +3816,7 @@ impl CanaryConfig {
 }
 
 /// Compute a deterministic hash bucket (0–99) from extension ID and environment.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn compute_canary_bucket(extension_id: &str, environment: &str) -> u8 {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -3717,6 +3834,7 @@ pub fn compute_canary_bucket(extension_id: &str, environment: &str) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// A health signal observed during canary.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct HealthSignal {
     /// Signal name (e.g., "load_success", "hostcall_error_rate").
@@ -3727,6 +3845,7 @@ pub struct HealthSignal {
     pub threshold: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl HealthSignal {
     /// True if the signal is within SLO bounds.
     pub fn is_healthy(&self) -> bool {
@@ -3735,6 +3854,7 @@ impl HealthSignal {
 }
 
 /// SLO verdict for a canary window.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SloVerdict {
     /// All signals within thresholds.
@@ -3743,6 +3863,7 @@ pub enum SloVerdict {
     Violated,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl SloVerdict {
     /// True if the canary is healthy.
     pub const fn is_healthy(&self) -> bool {
@@ -3750,6 +3871,7 @@ impl SloVerdict {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for SloVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3760,6 +3882,7 @@ impl std::fmt::Display for SloVerdict {
 }
 
 /// Health assessment report for a canary window.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct HealthReport {
     /// Extension identity.
@@ -3772,6 +3895,7 @@ pub struct HealthReport {
     pub violations: Vec<String>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl HealthReport {
     /// True if the canary is healthy.
     pub const fn is_healthy(&self) -> bool {
@@ -3780,6 +3904,7 @@ impl HealthReport {
 }
 
 /// Evaluate health signals against SLO thresholds.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn evaluate_health(extension_id: &str, signals: &[HealthSignal]) -> HealthReport {
     let violations: Vec<String> = signals
         .iter()
@@ -3802,6 +3927,7 @@ pub fn evaluate_health(extension_id: &str, signals: &[HealthSignal]) -> HealthRe
 }
 
 /// Automatic rollback trigger: should the canary be rolled back?
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub const fn should_auto_rollback(health: &HealthReport) -> bool {
     !health.is_healthy()
 }
@@ -3811,6 +3937,7 @@ pub const fn should_auto_rollback(health: &HealthReport) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Promotion decision for a canary overlay.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PromotionDecision {
     /// Promote to stable — canary window passed.
@@ -3821,6 +3948,7 @@ pub enum PromotionDecision {
     Rollback,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for PromotionDecision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3837,6 +3965,7 @@ impl std::fmt::Display for PromotionDecision {
 /// - If health is violated → Rollback.
 /// - If canary duration has exceeded the window → Promote.
 /// - Otherwise → Hold.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub const fn decide_promotion(
     health: &HealthReport,
     canary_start_ms: u64,
@@ -3853,6 +3982,7 @@ pub const fn decide_promotion(
 }
 
 /// Execute a promotion: transitions overlay to Stable.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn execute_promotion(
     artifact: &mut OverlayArtifact,
     now_ms: u64,
@@ -3861,6 +3991,7 @@ pub fn execute_promotion(
 }
 
 /// Execute a rollback: transitions overlay to `RolledBack`.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn execute_rollback(
     artifact: &mut OverlayArtifact,
     now_ms: u64,
@@ -3873,6 +4004,7 @@ pub fn execute_rollback(
 // ---------------------------------------------------------------------------
 
 /// Kind of audit ledger entry.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuditEntryKind {
     /// Analysis phase: intent extraction and confidence scoring.
@@ -3899,6 +4031,7 @@ pub enum AuditEntryKind {
     Superseded,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for AuditEntryKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3918,6 +4051,7 @@ impl std::fmt::Display for AuditEntryKind {
 }
 
 /// A single entry in the repair audit ledger.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     /// Monotonically increasing sequence number.
@@ -3938,12 +4072,14 @@ pub struct AuditEntry {
 ///
 /// Entries are ordered by sequence number and cannot be mutated or deleted.
 /// This provides tamper-evident evidence for incident forensics.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Default)]
 pub struct AuditLedger {
     entries: Vec<AuditEntry>,
     next_sequence: u64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl AuditLedger {
     /// Create an empty ledger.
     pub const fn new() -> Self {
@@ -4014,6 +4150,7 @@ impl AuditLedger {
 // ---------------------------------------------------------------------------
 
 /// Telemetry event kind for repair lifecycle metrics.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TelemetryMetric {
     /// A repair was attempted.
@@ -4032,6 +4169,7 @@ pub enum TelemetryMetric {
     ApprovalLatencyMs,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl std::fmt::Display for TelemetryMetric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4047,6 +4185,7 @@ impl std::fmt::Display for TelemetryMetric {
 }
 
 /// A single telemetry data point.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct TelemetryPoint {
     /// Metric name.
@@ -4060,11 +4199,13 @@ pub struct TelemetryPoint {
 }
 
 /// Telemetry collector for repair lifecycle metrics.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryCollector {
     points: Vec<TelemetryPoint>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl TelemetryCollector {
     /// Create an empty collector.
     pub const fn new() -> Self {
@@ -4132,6 +4273,7 @@ impl TelemetryCollector {
 // ---------------------------------------------------------------------------
 
 /// A formatted inspection record for operator review.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct InspectionRecord {
     /// Extension identity.
@@ -4147,6 +4289,7 @@ pub struct InspectionRecord {
 }
 
 /// Build an inspection record from audit ledger and current state.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn build_inspection(
     extension_id: &str,
     ledger: &AuditLedger,
@@ -4184,6 +4327,7 @@ pub fn build_inspection(
 }
 
 /// Explain a gating decision in human-readable format.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn explain_gating(verdict: &GatingVerdict) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -4203,6 +4347,7 @@ pub fn explain_gating(verdict: &GatingVerdict) -> Vec<String> {
 }
 
 /// Format a patch proposal diff for operator review.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn format_proposal_diff(proposal: &PatchProposal) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -4233,6 +4378,7 @@ pub fn format_proposal_diff(proposal: &PatchProposal) -> Vec<String> {
 ///
 /// Contains everything needed to understand what happened during a repair:
 /// the artifacts, proofs, audit trail, telemetry snapshot, and health signals.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct ForensicBundle {
     /// Extension identity.
@@ -4253,6 +4399,7 @@ pub struct ForensicBundle {
     pub exported_at_ms: u64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl ForensicBundle {
     /// Number of audit entries in this bundle.
     pub const fn audit_count(&self) -> usize {
@@ -4271,6 +4418,7 @@ impl ForensicBundle {
 }
 
 /// Build a forensic bundle from available state.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::too_many_arguments)]
 pub fn build_forensic_bundle(
     extension_id: &str,
@@ -4320,8 +4468,10 @@ pub fn build_forensic_bundle(
 /// Records why LISR exists, what threats it addresses, and why fail-closed
 /// constraints were chosen. This is embedded in code to prevent drift from
 /// the original safety intent.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub struct LisrAdr;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl LisrAdr {
     /// ADR identifier.
     pub const ID: &'static str = "ADR-LISR-001";
@@ -4383,8 +4533,10 @@ repair applied) is catastrophic.";
 // ---------------------------------------------------------------------------
 
 /// Operational procedure for repair mode selection.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub struct OperatorPlaybook;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl OperatorPlaybook {
     /// Available repair modes and when to use each.
     pub const MODE_GUIDANCE: &'static [(&'static str, &'static str)] = &[
@@ -4434,8 +4586,10 @@ impl OperatorPlaybook {
 // ---------------------------------------------------------------------------
 
 /// Developer guide for contributing new repair rules.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub struct DeveloperGuide;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl DeveloperGuide {
     /// Steps to add a new deterministic repair rule.
     pub const ADD_RULE_CHECKLIST: &'static [&'static str] = &[
@@ -4492,6 +4646,7 @@ impl DeveloperGuide {
 // ---------------------------------------------------------------------------
 
 /// A single governance check item.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct GovernanceCheck {
     /// Check identifier.
@@ -4505,6 +4660,7 @@ pub struct GovernanceCheck {
 }
 
 /// Result of running the governance checklist.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 pub struct GovernanceReport {
     /// Individual check results.
@@ -4515,6 +4671,7 @@ pub struct GovernanceReport {
     pub total_count: usize,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl GovernanceReport {
     /// True if all governance checks passed.
     pub const fn all_passed(&self) -> bool {
@@ -4536,6 +4693,7 @@ impl GovernanceReport {
 /// 4. Audit ledger is available (can be constructed).
 /// 5. Telemetry collector is available (can be constructed).
 /// 6. `VerificationBundle` checks all four proof layers.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn run_governance_checklist() -> GovernanceReport {
     let mut checks = Vec::new();
 
@@ -4639,6 +4797,9 @@ pub struct PiJsRuntimeConfig {
     /// restarts. Defaults to `~/.pi/agent/cache/modules/` (overridden by
     /// `PIJS_MODULE_CACHE_DIR`). Set to `None` to disable.
     pub disk_cache_dir: Option<PathBuf>,
+    /// Hydrate the `pi` bridge prelude and built-in virtual module shims from
+    /// precompiled QuickJS bytecode instead of parsing JS source per realm.
+    pub use_prebaked_bytecode: bool,
 }
 
 impl PiJsRuntimeConfig {
@@ -4702,6 +4863,7 @@ impl Default for PiJsRuntimeConfig {
             allow_unsafe_sync_exec: false,
             deny_env: true,
             disk_cache_dir: runtime_disk_cache_dir(),
+            use_prebaked_bytecode: true,
         }
     }
 }
@@ -5071,6 +5233,8 @@ struct PiJsModuleState {
     compiled_source_lru: VecDeque<String>,
     /// Hard cap for retained in-memory compiled source bytes.
     compiled_cache_limit_bytes: Option<usize>,
+    /// Whether built-in virtual modules should load from prebaked QuickJS bytecode.
+    use_prebaked_bytecode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5117,6 +5281,7 @@ impl PiJsModuleState {
             compiled_sources_bytes: 0,
             compiled_source_lru: VecDeque::new(),
             compiled_cache_limit_bytes: Some(DEFAULT_MODULE_CACHE_LIMIT_BYTES),
+            use_prebaked_bytecode: true,
         }
     }
 
@@ -5145,6 +5310,11 @@ impl PiJsModuleState {
 
     const fn with_compiled_cache_limit_bytes(mut self, limit: Option<usize>) -> Self {
         self.compiled_cache_limit_bytes = limit;
+        self
+    }
+
+    const fn with_prebaked_bytecode(mut self, enabled: bool) -> Self {
+        self.use_prebaked_bytecode = enabled;
         self
     }
 }
@@ -6293,6 +6463,33 @@ impl JsModuleLoader for PiJsLoader {
         name: &str,
         _attributes: Option<JsImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, JsModuleDeclared>> {
+        let prebaked = {
+            let mut state = self.state.borrow_mut();
+            if state.use_prebaked_bytecode
+                && !state.dynamic_virtual_modules.contains_key(name)
+                && Arc::ptr_eq(
+                    &state.static_virtual_modules,
+                    &default_virtual_modules_shared(),
+                )
+                && let Ok(bundle_set) = prebaked_js_bundle()
+                && let Some(bundle) = bundle_set.virtual_modules.get(name).copied()
+            {
+                state.module_cache_counters.hits =
+                    state.module_cache_counters.hits.saturating_add(1);
+                Some(bundle)
+            } else {
+                None
+            }
+        };
+        if let Some(mut bundle) = prebaked {
+            return <rquickjs::loader::Bundle as JsModuleLoader>::load(
+                &mut bundle,
+                ctx,
+                name,
+                None,
+            );
+        }
+
         let source = {
             let mut state = self.state.borrow_mut();
             load_compiled_module_source(&mut state, name)?
@@ -19912,6 +20109,114 @@ fn default_virtual_modules_shared() -> Arc<HashMap<String, String>> {
     Arc::clone(DEFAULT_VIRTUAL_MODULES.get_or_init(|| Arc::new(default_virtual_modules())))
 }
 
+const PREBAKED_BRIDGE_MODULE_NAME: &str = "__pi_bridge_prelude__";
+
+struct PrebakedJsBundle {
+    bridge_prelude: rquickjs::loader::Bundle,
+    virtual_modules: HashMap<String, rquickjs::loader::Bundle>,
+}
+
+static PREBAKED_JS_BUNDLE: std::sync::OnceLock<std::result::Result<PrebakedJsBundle, String>> =
+    std::sync::OnceLock::new();
+
+fn make_single_module_bundle(name: &str, bytecode: Vec<u8>) -> rquickjs::loader::Bundle {
+    let leaked_name: &'static str = Box::leak(Box::<str>::from(name));
+    let leaked_bc: &'static [u8] = Box::leak(bytecode.into_boxed_slice());
+    let leaked_entries: &'static [(&'static str, &'static [u8])] =
+        Box::leak(Box::new([(leaked_name, leaked_bc)]));
+    rquickjs::loader::bundle::Bundle(leaked_entries)
+}
+
+struct PrecompileResolver;
+
+impl JsModuleResolver for PrecompileResolver {
+    fn resolve<'js>(
+        &mut self,
+        _ctx: &Ctx<'js>,
+        base: &str,
+        name: &str,
+        _attributes: Option<JsImportAttributes<'js>>,
+    ) -> rquickjs::Result<String> {
+        let canonical = canonical_virtual_module_specifier(name.trim());
+        if default_virtual_modules_shared().contains_key(canonical) {
+            Ok(canonical.to_string())
+        } else {
+            Err(rquickjs::Error::new_resolving(base, name))
+        }
+    }
+}
+
+struct PrecompileLoader;
+
+impl JsModuleLoader for PrecompileLoader {
+    fn load<'js>(
+        &mut self,
+        ctx: &Ctx<'js>,
+        name: &str,
+        _attributes: Option<JsImportAttributes<'js>>,
+    ) -> rquickjs::Result<Module<'js, JsModuleDeclared>> {
+        let modules = default_virtual_modules_shared();
+        let Some(source) = modules.get(name) else {
+            return Err(rquickjs::Error::new_loading(name));
+        };
+        let prepared_source = prefix_import_meta_url(name, source);
+        Module::declare(ctx.clone(), name, prepared_source)
+    }
+}
+
+fn build_prebaked_js_bundle() -> std::result::Result<PrebakedJsBundle, String> {
+    let compiler_rt = rquickjs::Runtime::new().map_err(|err| err.to_string())?;
+    compiler_rt.set_loader(PrecompileResolver, PrecompileLoader);
+
+    let bridge_ctx = rquickjs::Context::full(&compiler_rt).map_err(|err| err.to_string())?;
+    let bridge_bytecode = bridge_ctx.with(|ctx| {
+        Module::declare(ctx.clone(), PREBAKED_BRIDGE_MODULE_NAME, pi_bridge_js())
+            .and_then(|module| module.write(rquickjs::WriteOptions::default()))
+            .map_err(|err| {
+                if matches!(err, rquickjs::Error::Exception) {
+                    format!(
+                        "{PREBAKED_BRIDGE_MODULE_NAME}: {}",
+                        format_quickjs_exception(&ctx, ctx.catch())
+                    )
+                } else {
+                    format!("{PREBAKED_BRIDGE_MODULE_NAME}: {err}")
+                }
+            })
+    })?;
+    let bridge_prelude = make_single_module_bundle(PREBAKED_BRIDGE_MODULE_NAME, bridge_bytecode);
+
+    let shared_modules = default_virtual_modules_shared();
+    let mut virtual_modules = HashMap::with_capacity(shared_modules.len());
+    for (name, source) in shared_modules.iter() {
+        let module_ctx = rquickjs::Context::full(&compiler_rt).map_err(|err| err.to_string())?;
+        let prepared_source = prefix_import_meta_url(name, source);
+        let bytecode = module_ctx.with(|ctx| {
+            Module::declare(ctx.clone(), name.as_str(), prepared_source)
+                .and_then(|module| module.write(rquickjs::WriteOptions::default()))
+                .map_err(|err| {
+                    if matches!(err, rquickjs::Error::Exception) {
+                        format!("{name}: {}", format_quickjs_exception(&ctx, ctx.catch()))
+                    } else {
+                        format!("{name}: {err}")
+                    }
+                })
+        })?;
+        virtual_modules.insert(name.clone(), make_single_module_bundle(name, bytecode));
+    }
+
+    Ok(PrebakedJsBundle {
+        bridge_prelude,
+        virtual_modules,
+    })
+}
+
+fn prebaked_js_bundle() -> std::result::Result<&'static PrebakedJsBundle, &'static str> {
+    PREBAKED_JS_BUNDLE
+        .get_or_init(build_prebaked_js_bundle)
+        .as_ref()
+        .map_err(String::as_str)
+}
+
 /// Returns the set of all module specifiers available as virtual modules.
 ///
 /// Used by the preflight analyzer to determine whether an extension's
@@ -20286,7 +20591,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .with_compat_scan_mode(compat_scan_mode)
                 .with_repair_events(Arc::clone(&repair_events))
                 .with_disk_cache_dir(config.disk_cache_dir.clone())
-                .with_compiled_cache_limit_bytes(compiled_cache_limit_bytes),
+                .with_compiled_cache_limit_bytes(compiled_cache_limit_bytes)
+                .with_prebaked_bytecode(config.use_prebaked_bytecode),
         ));
         module_state
             .borrow_mut()
@@ -21786,6 +22092,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let repair_mode = self.config.repair_mode;
         let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
+        let use_prebaked_bytecode = self.config.use_prebaked_bytecode;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
         let module_state = Rc::clone(&self.module_state);
         let policy = self.policy.clone();
@@ -23733,7 +24040,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 }
 
                 // Install the JS bridge that creates Promises and wraps the native functions
-                match ctx.eval::<(), _>(pi_bridge_js()) {
+                let bridge_eval_result = if use_prebaked_bytecode
+                    && let Ok(bundle_set) = prebaked_js_bundle()
+                {
+                    let mut bundle = bundle_set.bridge_prelude;
+                    <rquickjs::loader::Bundle as JsModuleLoader>::load(
+                        &mut bundle,
+                        &ctx,
+                        PREBAKED_BRIDGE_MODULE_NAME,
+                        None,
+                    )
+                    .and_then(|module| module.eval())
+                    .and_then(|(_evaluated, promise)| promise.finish::<()>())
+                } else {
+                    ctx.eval::<(), _>(pi_bridge_js())
+                };
+                match bridge_eval_result {
                     Ok(()) => {}
                     Err(rquickjs::Error::Exception) => {
                         let detail = format_quickjs_exception(&ctx, ctx.catch());
@@ -36188,6 +36510,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 allow_unsafe_sync_exec: false,
                 deny_env: false,
                 disk_cache_dir: None,
+                use_prebaked_bytecode: true,
             };
             let runtime =
                 PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
@@ -36248,6 +36571,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 allow_unsafe_sync_exec: false,
                 deny_env: false,
                 disk_cache_dir: None,
+                use_prebaked_bytecode: true,
             };
             let runtime =
                 PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
@@ -41363,6 +41687,7 @@ globalThis.__spawn_abort_result = result;
                 allow_unsafe_sync_exec: false,
                 deny_env: false,
                 disk_cache_dir: None,
+                use_prebaked_bytecode: true,
             };
             let runtime =
                 PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
@@ -41472,6 +41797,7 @@ globalThis.__spawn_abort_result = result;
                 allow_unsafe_sync_exec: false,
                 deny_env: false,
                 disk_cache_dir: None,
+                use_prebaked_bytecode: true,
             };
             let runtime =
                 PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
@@ -46323,5 +46649,161 @@ globalThis.__spawn_abort_result = result;
             // base64 round-trip
             assert_eq!(r["base64Round"], serde_json::json!("Hello"));
         });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn prebaked_bytecode_hydrates_bridge_and_virtual_shims_with_parity_and_measured_timing() {
+        let bundle = prebaked_js_bundle().expect("prebaked JS bytecode bundle must compile");
+        assert!(bundle.virtual_modules.contains_key("node:fs"));
+        assert!(bundle.virtual_modules.contains_key("node:https"));
+        assert!(bundle.virtual_modules.contains_key("zod"));
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = temp_dir.path().join("prebaked-ext");
+        std::fs::create_dir_all(&ext_dir).expect("mkdir ext_dir");
+        let entry = ext_dir.join("index.mjs");
+        std::fs::write(
+            &entry,
+            r#"
+import https from "node:https";
+import path from "node:path";
+import { z } from "zod";
+
+const InputSchema = z.object({
+  segment: z.string().min(1),
+});
+
+export default function register(pi) {
+  pi.registerTool({
+    name: "prebaked_probe",
+    label: "Prebaked Probe",
+    description: "Validates prebaked bridge + virtual module parity",
+    parameters: {
+      type: "object",
+      properties: { segment: { type: "string" } },
+      required: ["segment"],
+    },
+    execute: async (_callId, input) => {
+      const parsed = InputSchema.parse(input);
+      return {
+        joined: path.posix.join("alpha", parsed.segment),
+        hasHttpsRequest: typeof https.request === "function",
+        hasGlobalAgent: typeof https.globalAgent === "object",
+      };
+    },
+  });
+}
+"#,
+        )
+        .expect("write extension entry");
+        let entry_spec = format!("file://{}", entry.display());
+
+        let run_probe = |use_prebaked: bool| {
+            let ext_dir = ext_dir.clone();
+            let entry_spec = entry_spec.clone();
+            let cwd = temp_dir.path().display().to_string();
+            futures::executor::block_on(async move {
+                let start = Instant::now();
+                let clock = Arc::new(DeterministicClock::new(0));
+                let config = PiJsRuntimeConfig {
+                    cwd: cwd.clone(),
+                    disk_cache_dir: None,
+                    use_prebaked_bytecode: use_prebaked,
+                    ..PiJsRuntimeConfig::default()
+                };
+                let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                    Arc::clone(&clock),
+                    config,
+                    None,
+                )
+                .await
+                .expect("create PiJsRuntime");
+                runtime.add_extension_root_with_id(ext_dir, Some("ext.prebaked"));
+
+                let script = privileged_test_script(
+                    &runtime,
+                    &format!(
+                        r#"
+                        globalThis.__prebakedOutcome = {{ done: false }};
+                        (async () => {{
+                            await __pi_load_extension(
+                                __pi_test_secret,
+                                "ext.prebaked",
+                                {entry_spec:?},
+                                {{ name: "prebaked-ext" }}
+                            );
+                            const output = await __pi_execute_tool(
+                                __pi_test_secret,
+                                "prebaked_probe",
+                                "call-prebaked-1",
+                                {{ segment: "beta" }},
+                                {{ cwd: {cwd:?}, hasUI: false }},
+                                "inv-prebaked-1"
+                            );
+                            globalThis.__prebakedOutcome = {{ done: true, output }};
+                        }})().catch((err) => {{
+                            globalThis.__prebakedOutcome = {{
+                                done: true,
+                                error: String((err && err.stack) || (err && err.message) || err),
+                            }};
+                        }});
+                        "#
+                    ),
+                );
+                runtime.eval(&script).await.expect("eval load + execute");
+                drain_until_idle(&runtime, &clock).await;
+                let elapsed_us = start.elapsed().as_micros();
+
+                let tools = runtime
+                    .get_registered_tools()
+                    .await
+                    .expect("get_registered_tools");
+                let outcome = get_global_json(&runtime, "__prebakedOutcome").await;
+                let counters = {
+                    let state = runtime.module_state.borrow();
+                    (
+                        state.module_cache_counters.hits,
+                        state.module_cache_counters.misses,
+                    )
+                };
+                (tools, outcome, counters, elapsed_us)
+            })
+        };
+
+        let (incumbent_tools, incumbent_outcome, incumbent_counters, incumbent_us) =
+            run_probe(false);
+        let (prebaked_tools, prebaked_outcome, prebaked_counters, prebaked_us) = run_probe(true);
+
+        tracing::info!(
+            target: "pi.extensions_js.prebaked_benchmark",
+            incumbent_us,
+            prebaked_us,
+            incumbent_hits = incumbent_counters.0,
+            incumbent_misses = incumbent_counters.1,
+            prebaked_hits = prebaked_counters.0,
+            prebaked_misses = prebaked_counters.1,
+            "same-invocation prebaked QuickJS bytecode vs source-eval parity probe"
+        );
+
+        assert_eq!(incumbent_tools, prebaked_tools);
+        assert_eq!(prebaked_tools.len(), 1);
+        assert_eq!(prebaked_tools[0].name, "prebaked_probe");
+
+        let expected_outcome = serde_json::json!({
+            "done": true,
+            "output": {
+                "joined": "alpha/beta",
+                "hasHttpsRequest": true,
+                "hasGlobalAgent": true,
+            }
+        });
+        assert_eq!(incumbent_outcome, expected_outcome);
+        assert_eq!(prebaked_outcome, expected_outcome);
+        assert!(
+            prebaked_counters.0 > 0,
+            "prebaked mode should record virtual module cache hits, got {:?}",
+            prebaked_counters
+        );
     }
 }

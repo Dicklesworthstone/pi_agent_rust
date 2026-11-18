@@ -6,9 +6,13 @@
 
 use pi::extension_scoring::{
     MeanFieldControllerConfig, MeanFieldControllerReport, MeanFieldShardObservation,
-    MeanFieldShardState, OpeEvaluationReport, OpeEvaluatorConfig, OpeGateReason, OpeTraceSample,
-    compute_mean_field_controls, evaluate_off_policy,
+    MeanFieldShardState, compute_mean_field_controls,
 };
+#[cfg(feature = "experimental-controllers")]
+use pi::extension_scoring::{
+    OpeEvaluationReport, OpeEvaluatorConfig, OpeGateReason, OpeTraceSample, evaluate_off_policy,
+};
+#[cfg(feature = "experimental-controllers")]
 use pi::hostcall_io_uring_lane::{
     HostcallCapabilityClass, HostcallDispatchLane, HostcallIoHint, IoUringFallbackReason,
     IoUringLaneDecisionInput, IoUringLanePolicyConfig, IoUringLaneTelemetry,
@@ -20,6 +24,7 @@ use pi::hostcall_s3_fifo::{
 
 // ────────────────────── io_uring lane policy ──────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn io_uring_lane_all_capability_classes_have_deterministic_outcomes() {
     let config = IoUringLanePolicyConfig {
@@ -76,6 +81,7 @@ fn io_uring_lane_all_capability_classes_have_deterministic_outcomes() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn io_uring_lane_telemetry_matches_decision_across_all_branches() {
     let configs = [
@@ -124,6 +130,7 @@ fn io_uring_lane_telemetry_matches_decision_across_all_branches() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn io_uring_lane_queue_depth_boundary_values() {
     let config = IoUringLanePolicyConfig {
@@ -168,6 +175,7 @@ fn io_uring_lane_queue_depth_boundary_values() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn io_uring_lane_telemetry_serialization_roundtrip() {
     let config = IoUringLanePolicyConfig {
@@ -582,6 +590,7 @@ fn mean_field_controller_higher_latency_pressure_reduces_batch_budget() {
 
 // ────────────────────── OPE evaluator ──────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ope_evaluator_passes_gate_with_valid_samples() {
     let samples = vec![
@@ -631,6 +640,7 @@ fn ope_evaluator_passes_gate_with_valid_samples() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ope_evaluator_fails_closed_on_empty_input() {
     let config = OpeEvaluatorConfig {
@@ -646,6 +656,7 @@ fn ope_evaluator_fails_closed_on_empty_input() {
     assert_eq!(report.gate.reason, OpeGateReason::NoValidSamples);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ope_evaluator_detects_extreme_propensity_skew() {
     let samples: Vec<OpeTraceSample> = (0..10)
@@ -676,6 +687,7 @@ fn ope_evaluator_detects_extreme_propensity_skew() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ope_evaluator_ground_truth_equal_probabilities() {
     // When behavior == target, importance weight = 1.0 for all samples
@@ -710,6 +722,7 @@ fn ope_evaluator_ground_truth_equal_probabilities() {
     assert_close(report.ips.estimate, expected_mean, 1e-10);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ope_evaluator_report_serde_roundtrip() {
     let samples = vec![
@@ -751,6 +764,7 @@ fn ope_evaluator_report_serde_roundtrip() {
 
 // ────────────────────── Composed pipeline tests ──────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn composed_io_uring_to_s3fifo_admission_pipeline() {
     // Scenario: hostcall arrives → io_uring lane decides → if IO-heavy,
@@ -816,6 +830,7 @@ fn composed_io_uring_to_s3fifo_admission_pipeline() {
     assert_eq!(*telemetry.owner_live_counts.get("ext-a").unwrap_or(&0), 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn composed_multi_owner_io_uring_s3fifo_fairness() {
     let io_config = IoUringLanePolicyConfig {
@@ -867,6 +882,7 @@ fn composed_multi_owner_io_uring_s3fifo_fairness() {
     assert!(telemetry.live_depth <= 8);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn composed_mean_field_then_ope_evaluation() {
     // Scenario: mean-field controller generates routing weights,

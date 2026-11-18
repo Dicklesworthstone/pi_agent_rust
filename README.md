@@ -1824,7 +1824,7 @@ Pi deliberately uses advanced math where it improves runtime behavior or benchma
 
 ### Regime-Shift Detection (CUSUM + BOCPD)
 
-In the extension dispatcher, Pi combines CUSUM and Bayesian online change-point detection to detect load-regime changes early (for example when hostcall traffic suddenly spikes or stalls).
+In `ExtensionManager` (`RegimeShiftDetectorState` in `src/extensions.rs`), Pi combines CUSUM and Bayesian online change-point detection to detect load-regime changes early (for example when hostcall traffic suddenly spikes or stalls).
 
 $$
 S_t^+ = \max\left(0,\;S_{t-1}^+ + (-z_t - k)\right), \quad
@@ -1838,20 +1838,20 @@ $$
 
 Intuition: CUSUM catches persistent drift; BOCPD catches sudden regime changes without brittle fixed thresholds.
 
-### Conformal Prediction Envelope
+### Conformal Prediction Envelope (Adaptive Conformal Inference)
 
-Pi tracks nonconformity scores (absolute residuals from the running mean) and treats out-of-interval events as anomalies.
+Inside `ExtensionManager` (`SafetyEnvelopeState` in `src/extensions.rs`), Pi tracks nonconformity scores (absolute residuals from the running mean) with Gibbs-Candès Adaptive Conformal Inference (`alpha_t` online miscoverage updates) and treats out-of-interval events as anomalies.
 
 $$
 q = \text{score}_{\lceil (n+1)\cdot \text{confidence} \rceil - 1}, \quad
 \text{anomaly if } |x_t - \mu_t| > q
 $$
 
-Intuition: thresholds adapt from recent behavior instead of hard-coding one static latency cutoff.
+Intuition: thresholds adapt online from recent behavior and realized coverage instead of hard-coding one static latency cutoff.
 
 ### PAC-Bayes Safety Bound
 
-Pi’s safety envelope includes a PAC-Bayes-kl bound over extension outcomes, and can veto aggressive optimization when the bound is too high.
+`SafetyEnvelopeState` in `ExtensionManager` (`src/extensions.rs`) pairs the conformal envelope with a PAC-Bayes-kl bound over extension outcomes, and vetoes aggressive optimization when the bound is too high.
 
 $$
 \mathrm{kl}(\hat q \,\|\, q_{\text{bound}})\;\le\;\frac{\mathrm{KL}(Q\|P)+\ln\!\left(2\sqrt{n}/\delta\right)}{n}
@@ -1859,9 +1859,9 @@ $$
 
 Intuition: this gives an explicit uncertainty-aware ceiling on true error risk before allowing more aggressive runtime behavior.
 
-### Off-Policy Evaluation (IPS/WIS/DR + ESS + Regret Gate)
+### Off-Policy Evaluation (IPS/WIS/DR + ESS + Regret Gate — Opt-In `experimental-controllers`)
 
-Before approving policy moves, Pi evaluates candidate behavior from trace data:
+For offline trace replay and research evaluation (`evaluate_off_policy` in `src/extension_scoring.rs`, gated behind the opt-in `experimental-controllers` Cargo feature and not wired into default production dispatch), Pi evaluates candidate policy moves from trace data:
 
 $$
 w_i=\frac{\pi(a_i\mid x_i)}{\mu(a_i\mid x_i)}, \quad
@@ -1878,11 +1878,11 @@ N_{\text{eff}}=\frac{(\sum_i w_i)^2}{\sum_i w_i^2}, \quad
 \Delta_{\text{regret}}=\bar r_{\text{baseline}}-\hat V_{\text{DR}}
 $$
 
-Intuition: Pi fails closed if sample support is weak, uncertainty is high, or estimated regret is above threshold.
+Intuition: the evaluator fails closed if sample support is weak, uncertainty is high, or estimated regret is above threshold.
 
-### VOI-Driven Experiment Selection
+### VOI-Driven Experiment Selection (Opt-In `experimental-controllers`)
 
-The VOI planner prioritizes probes that provide the most expected learning under a strict overhead budget.
+In `src/extension_scoring.rs` (`plan_voi_candidates`, gated behind the opt-in `experimental-controllers` Cargo feature for offline/experimental probe scheduling rather than default production dispatch), the VOI planner prioritizes probes that provide the most expected learning under a strict overhead budget.
 
 $$
 \text{priority}_i \propto \frac{\text{utility}_i}{\text{overhead}_i}
@@ -1910,7 +1910,7 @@ Intuition: prioritize what dominates real end-to-end latency, not just isolated 
 
 ### Online Convex Control + Regret Tracking
 
-Pi also includes an online tuner path for batch/time-slice controls with explicit rollback behavior:
+`ExtensionManager` (`OcoTunerState` in `src/extensions.rs`) includes a live per-extension online convex tuner for queue/batch/time-slice budgets with explicit guardrail rollback behavior:
 
 $$
 \tau_{t+1}
@@ -1924,13 +1924,13 @@ Intuition: the system adapts continuously, but if instantaneous loss exceeds a r
 
 | Technique | Where in Pi | Why it helps |
 |----------|-------------|--------------|
-| CUSUM + BOCPD | Extension dispatcher regime detector | Detects traffic regime shifts early and robustly |
-| Conformal intervals | Safety envelope | Adaptive anomaly gating without static magic numbers |
-| PAC-Bayes bound | Safety envelope veto path | Fails closed when uncertainty/risk is too high |
-| IPS/WIS/DR + ESS | Off-policy evaluator | Approves policy changes only with adequate support |
-| VOI planning | Experiment scheduler | Uses overhead budget on highest-value probes |
+| CUSUM + BOCPD | `ExtensionManager` (`RegimeShiftDetectorState`, live) | Detects traffic regime shifts early and robustly |
+| Conformal intervals (ACI) | `ExtensionManager` (`SafetyEnvelopeState`, live) | Adaptive anomaly gating without static magic numbers |
+| PAC-Bayes bound | `ExtensionManager` (`SafetyEnvelopeState` veto path, live) | Fails closed when uncertainty/risk is too high |
+| IPS/WIS/DR + ESS | `extension_scoring` OPE (opt-in `experimental-controllers`) | Evaluates candidate policy changes offline with support/regret gates |
+| VOI planning | `extension_scoring` VOI planner (opt-in `experimental-controllers`) | Allocates probe overhead budget to highest-value candidates in evaluation harnesses |
 | Weighted attribution + CI | Phase-1 perf matrix reports | Ranks optimization work by realistic user impact |
-| OCO + regret rollback | Runtime controller | Adapts under load while bounding unsafe drift |
+| OCO + regret rollback | `ExtensionManager` (`OcoTunerState`, live) | Adapts budgets under load while bounding unsafe drift |
 
 ### SSE Streaming Parser
 
@@ -2227,7 +2227,7 @@ Extensions run in an embedded QuickJS runtime (`rquickjs` crate) and communicate
     drain_hostcall_requests()
                          │
                          ▼
-┌─────────────── ExtensionDispatcher ──────────────┐
+┌── JsExtensionRuntimeHandle + ExtensionManager ────┐
 │                                                   │
 │  1. Check capability policy:                      │
 │     read tool → requires "read" capability        │
@@ -2246,6 +2246,8 @@ Extensions run in an embedded QuickJS runtime (`rquickjs` crate) and communicate
 │                                                   │
 └───────────────────────────────────────────────────┘
 ```
+
+Live production hostcalls execute through `JsExtensionRuntimeHandle` + `ExtensionManager` shared dispatch (`src/extensions.rs`); the standalone `ExtensionDispatcher` harness (`src/extension_dispatcher.rs`) is gated behind the opt-in `experimental-controllers` Cargo feature for evaluation and bench isolation.
 
 **Capability mapping**: Each hostcall kind maps to a required capability:
 
@@ -2272,7 +2274,7 @@ Extensions run in an embedded QuickJS runtime (`rquickjs` crate) and communicate
 
 For observability, each call is tagged with a stable lane key (for example `tool|tool.read|filesystem` or `tool|fallback|filesystem`) so latency and failure trends can be grouped consistently.
 
-**Built-in consistency guard (shadow dual execution)**: Pi can sample a small subset of read-only hostcalls, execute them through both lanes, and compare canonical output fingerprints. If divergence crosses a configured budget, Pi automatically backs off the fast lane for a period. This gives performance wins without silently changing behavior.
+**Built-in consistency guard (shadow dual execution, opt-in `experimental-controllers`)**: In the `experimental-controllers` evaluation harness (`ExtensionDispatcher` + `DualExecOracle` in `src/extension_dispatcher.rs`), Pi can sample read-only hostcalls, execute them through both lanes, and compare canonical output fingerprints, automatically backing off the fast lane if divergence crosses a configured budget.
 
 **Adaptive dispatch mode under load**: Pi can switch between:
 
@@ -2283,7 +2285,7 @@ Mode changes are gated by sample coverage and risk checks, so Pi does not switch
 
 **Runtime telemetry for debugging and tuning**: Pi records structured hostcall telemetry (`pi.ext.hostcall_telemetry.v1`) with lane choice, fallback reason, dispatch latency share, marshalling path, and optimization hit/miss fields. This is used by perf reports and reliability diagnostics.
 
-**Auto-repair pipeline**: When an extension fails to load or produces runtime errors, Pi's repair system can automatically fix common issues:
+**Auto-repair pipeline**: When an extension fails to load, Pi's loader repair path (`src/extensions_js.rs`) can automatically remediate common resolution issues within the extension root (while experimental `IntentGraph`/LISR governance, patch-proposal, canary, and forensic overlay modules live behind the opt-in `experimental-controllers` feature):
 
 | Repair Mode | Behavior |
 |-------------|----------|
@@ -2300,13 +2302,11 @@ Mode changes are gated by sample coverage and risk checks, so Pi does not switch
 
 ### Extension Runtime Decision Logic (Plain English)
 
-The extension runtime includes a few small decision engines so behavior stays stable as workload patterns change:
+`ExtensionManager` (`src/extensions.rs`) and `extension_scoring` (`src/extension_scoring.rs`) split runtime decision logic cleanly between live production controllers and opt-in evaluation modules:
 
-- **Value-of-information planner (VOI)**: Ranks candidate probes by "expected learning per millisecond" and picks the best set under a strict overhead budget. Stale or low-value candidates are skipped with explicit reasons.
-- **Shard load controller**: Adjusts routing weights, batch budgets, and backoff/help factors based on queue pressure, latency, and starvation risk. Damping and oscillation guards prevent overreaction.
-- **Policy safety evaluator**: Replays historical samples with multiple estimators and only approves a policy when sample support is strong, uncertainty is low, and predicted regret stays within limit.
-
-These pieces are intentionally conservative: if confidence is weak, Pi holds steady instead of making an aggressive switch.
+- **Live regime, safety, and budget controllers (`ExtensionManager`)**: `RegimeShiftDetectorState` (CUSUM + BOCPD), `SafetyEnvelopeState` (Adaptive Conformal Inference + PAC-Bayes veto bounds), and `OcoTunerState` (online convex budget tuning with guardrail rollback) monitor live hostcall traffic and fail closed toward conservative profiles under anomaly or overload.
+- **Shard load controller (`MeanField`, `src/extension_scoring.rs`)**: Adjusts routing weights, batch budgets, and backoff/help factors based on queue pressure, latency, and starvation risk with damping and oscillation guards.
+- **Opt-in `experimental-controllers` research/evaluation modules**: `VOI` probe planning (`plan_voi_candidates`), off-policy evaluation (`evaluate_off_policy` `IPS/WIS/DR + ESS`), standalone `ExtensionDispatcher` + `DualExecOracle` (`src/extension_dispatcher.rs`), `IntentGraph`/LISR governance overlays (`src/extensions_js.rs`), and `hostcall_io_uring_lane` (`src/hostcall_io_uring_lane.rs`) are compiled for unit tests and explicit `--features experimental-controllers` evaluation builds rather than default production dispatch.
 
 ### Interactive TUI Architecture
 
@@ -2721,11 +2721,11 @@ Concrete engineering work in this codebase includes:
 | Registry/policy lookup | Immutable policy snapshots with O(1) capability checks, plus RCU-style metadata snapshots for extension registry/tool metadata | Removes repeated dynamic lookup overhead in hot authorization/dispatch paths |
 | Queueing + concurrency | Core-pinned SPSC reactor mesh, S3-FIFO-inspired admission with fairness guards, BRAVO-style fallback behavior | Improves tail latency under contention instead of only optimizing median latency |
 | Batched execution | AMAC-style interleaved batch executor with stall-aware toggling | Avoids head-of-line stalls when many independent hostcalls are in flight |
-| IO specialization | io_uring lane policy + telemetry and explicit executor-unavailable fallback | Evaluates IO-heavy calls without presenting the placeholder bridge as real io_uring execution |
-| Runtime startup for extensions | Cold owner-isolated QuickJS realms, bounded in-realm source caches, and versioned persistent transpile caching | Avoids mutable-realm reuse while reducing repeated transpilation work |
+| IO specialization | Opt-in `experimental-controllers` `io_uring` lane policy + telemetry and explicit executor-unavailable fallback | Evaluates IO-heavy call policy in experimental builds without presenting the placeholder bridge as real `io_uring` execution |
+| Runtime startup for extensions | Cold owner-isolated QuickJS realms, prebaked `pi` prelude + `node:*` virtual-module bytecode hydration, bounded in-realm source caches, and versioned persistent transpile caching | Avoids mutable-realm reuse while reducing repeated JS prelude/shim parsing and transpilation work |
 | JS bridge/scheduler path | Pending-job fast-path tuning and bridge-level dispatch cleanup in hot extension loops | Reduces overhead between JS requests and Rust execution |
-| Adaptive control loops | Regime-shift detection (CUSUM/BOCPD), budget controllers, VOI-based experiment planner, mean-field load controller, off-policy evaluation gates | Lets runtime behavior adapt to workload shifts without blind tuning |
-| Fast-path safety | Shadow dual-execution sampling with automatic rollback/backoff on divergence | Prevents speed work from silently changing semantics |
+| Adaptive control loops | Live `ExtensionManager` regime-shift detection (CUSUM/BOCPD), ACI conformal + PAC-Bayes safety envelopes, OCO budget tuner, and mean-field shard controls (plus opt-in `experimental-controllers` VOI planner and OPE gates) | Lets live runtime behavior adapt safely to workload shifts while keeping offline research evaluators opt-in |
+| Fast-path safety | Opt-in `experimental-controllers` shadow dual-execution sampling (`ExtensionDispatcher` + `DualExecOracle`) with automatic rollback/backoff on divergence | Verifies fast-lane vs compatibility-lane parity in evaluation harnesses without silently changing semantics |
 | Trace-level optimization | Hostcall superinstruction compiler + tier-2 trace-JIT path | Fuses repeated opcode traces and lowers repeated dispatch overhead |
 | Tool execution strategy | Effect-compatible tool classification + barrier-aware parallel execution paths | Increases throughput when multiple tool calls can safely run together without reordering mutating tools |
 | Session write path | Write-behind autosave queue, durability modes, incremental append, checkpointed rewrite strategy, single-buffer append serialization | Keeps interaction fast while still supporting stronger durability when needed |
@@ -3688,8 +3688,8 @@ src/
 │   ├── native_runtime.rs   # Active native descriptor runtime
 │   ├── wasm_host.rs        # Feature-gated Wasmtime component host
 │   └── tests/              # Behavior-domain characterization suites
-├── extensions_js.rs        # QuickJS runtime bridge + hostcalls
-├── extension_dispatcher.rs # Hostcall/tool dispatch plumbing
+├── extensions_js.rs        # QuickJS runtime bridge + prebaked bytecode + hostcalls
+├── extension_dispatcher.rs # ExtensionUiHandler trait (+ opt-in experimental-controllers dispatcher)
 ├── extension_preflight.rs  # Extension compatibility scanner
 ├── extension_validation.rs # Extension validation pipeline glue
 ├── resources.rs            # Skills/prompt/theme/extension loading

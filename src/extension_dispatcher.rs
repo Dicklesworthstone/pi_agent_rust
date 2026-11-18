@@ -4,70 +4,97 @@
 //! hostcall requests (tools, HTTP, session, UI, etc.) from the JS runtime to
 //! Rust implementations.
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::cell::RefCell;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::collections::BTreeSet;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::collections::VecDeque;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::path::PathBuf;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::rc::Rc;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::sync::Arc;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::thread;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 use asupersync::Cx;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use serde_json::Value;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use sha2::Digest as _;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::connectors::{Connector, http::HttpConnector};
 use crate::error::Result;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::extensions::{
     DangerousCommandClass, ExecMediationResult, ExtensionBody, ExtensionMessage, ExtensionPolicy,
-    ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, HostCallError, HostCallErrorCode,
-    HostCallPayload, HostResultPayload, HostStreamChunk, PROTOCOL_VERSION, PolicyCheck,
-    PolicyDecision, PolicyProfile, PolicySnapshot, classify_ui_hostcall_error,
-    evaluate_exec_mediation, hash_canonical_json, required_capability_for_host_call_static,
-    ui_response_value_for_op, validate_host_call,
+    ExtensionSession, HostCallError, HostCallErrorCode, HostCallPayload, HostResultPayload,
+    HostStreamChunk, PROTOCOL_VERSION, PolicyCheck, PolicyDecision, PolicyProfile, PolicySnapshot,
+    classify_ui_hostcall_error, evaluate_exec_mediation, hash_canonical_json,
+    required_capability_for_host_call_static, ui_response_value_for_op, validate_host_call,
 };
+use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::hostcall_amac::{AmacBatchExecutor, AmacBatchExecutorConfig};
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::hostcall_io_uring_lane::{
     HostcallCapabilityClass, HostcallDispatchLane, HostcallIoHint, IoUringFallbackReason,
     IoUringLaneDecisionInput, IoUringLanePolicyConfig, decide_io_uring_lane,
     io_uring_executor_available,
 };
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::resource_governor::{
     AdmissionAction, AdmissionDecision, ResourceGovernor, ResourceOperationKind, ResourceRequest,
 };
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
+#[cfg(any(test, feature = "experimental-controllers"))]
 use crate::tools::SharedToolRegistry;
 #[cfg(test)]
 use crate::tools::ToolRegistry;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn extension_wait_now() -> asupersync::types::Time {
     Cx::current()
         .and_then(|cx| cx.timer_driver())
         .map_or_else(wall_now, |driver| driver.now())
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn extension_wait_sleep(duration: Duration) -> asupersync::time::Sleep {
     sleep(extension_wait_now(), duration)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Clone, Copy)]
 enum ExecPipeKind {
     Stdout,
     Stderr,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 enum ExecStreamFrame {
     Stdout(String),
     Stderr(String),
@@ -75,11 +102,13 @@ enum ExecStreamFrame {
     Error(String),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 enum ExecCaptureFrame {
     Chunk { kind: ExecPipeKind, bytes: Vec<u8> },
     Error(String),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn send_exec_stream_text(
     tx: &std::sync::mpsc::SyncSender<ExecStreamFrame>,
     kind: ExecPipeKind,
@@ -96,6 +125,7 @@ fn send_exec_stream_text(
     tx.send(frame).is_ok()
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn pump_exec_stream_text<R: std::io::Read>(
     mut reader: R,
     tx: &std::sync::mpsc::SyncSender<ExecStreamFrame>,
@@ -210,6 +240,7 @@ fn pump_exec_stream_text<R: std::io::Read>(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn pump_exec_capture_bytes<R: std::io::Read>(
     mut reader: R,
     tx: &std::sync::mpsc::SyncSender<ExecCaptureFrame>,
@@ -236,6 +267,7 @@ fn pump_exec_capture_bytes<R: std::io::Read>(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn exec_capture_error_message(
     message: &str,
     stdout_chunks: &VecDeque<Vec<u8>>,
@@ -271,6 +303,7 @@ fn exec_capture_error_message(
     error_message
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn exec_capture_error_section(
     chunks: &VecDeque<Vec<u8>>,
     total_bytes: usize,
@@ -302,6 +335,7 @@ fn exec_capture_error_section(
     ))
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::too_many_arguments)]
 fn ingest_exec_capture_chunk(
     kind: ExecPipeKind,
@@ -338,6 +372,7 @@ fn ingest_exec_capture_chunk(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::too_many_arguments)]
 fn handle_exec_capture_frame(
     frame: ExecCaptureFrame,
@@ -375,6 +410,7 @@ fn handle_exec_capture_frame(
 }
 
 /// Coordinates hostcall dispatch between the JS extension runtime and Rust handlers.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     /// Runtime bridge used by the dispatcher.
     runtime: Rc<dyn ExtensionDispatcherRuntime<C>>,
@@ -411,6 +447,7 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     resource_governor: ResourceGovernor,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(serde::Deserialize)]
 struct ExtensionEventJsTaskError {
     #[serde(default)]
@@ -420,6 +457,7 @@ struct ExtensionEventJsTaskError {
     stack: Option<String>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(serde::Deserialize)]
 struct ExtensionEventJsTaskState {
     status: String,
@@ -429,11 +467,13 @@ struct ExtensionEventJsTaskState {
     error: Option<ExtensionEventJsTaskError>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 enum ExtensionEventTaskProgress {
     Pending,
     Resolved(Value),
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn decode_extension_event_task_state(state_json: Value) -> Result<ExtensionEventTaskProgress> {
     if state_json.is_null() {
         return Err(crate::error::Error::extension(
@@ -473,10 +513,12 @@ fn decode_extension_event_task_state(state_json: Value) -> Result<ExtensionEvent
 }
 
 /// Runtime bridge trait so dispatcher logic is not hardwired to a concrete runtime type.
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub trait ExtensionDispatcherRuntime<C: SchedulerClock>: 'static {
     fn as_js_runtime(&self) -> &PiJsRuntime<C>;
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl<C: SchedulerClock + 'static> ExtensionDispatcherRuntime<C> for PiJsRuntime<C> {
     #[allow(clippy::use_self)]
     fn as_js_runtime(&self) -> &PiJsRuntime<C> {
@@ -484,6 +526,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcherRuntime<C> for PiJsRuntime<
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn protocol_hostcall_op(params: &Value) -> Option<&str> {
     params
         .get("op")
@@ -494,6 +537,7 @@ fn protocol_hostcall_op(params: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtocolHostcallMethod {
     Tool,
@@ -505,6 +549,7 @@ enum ProtocolHostcallMethod {
     Log,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn parse_protocol_hostcall_method(method: &str) -> Option<ProtocolHostcallMethod> {
     let method = method.trim();
     if method.is_empty() {
@@ -530,6 +575,7 @@ fn parse_protocol_hostcall_method(method: &str) -> Option<ProtocolHostcallMethod
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn protocol_normalize_output(value: Value) -> Value {
     if value.is_object() {
         value
@@ -538,6 +584,7 @@ fn protocol_normalize_output(value: Value) -> Value {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn policy_snapshot_version(policy: &ExtensionPolicy) -> String {
     let mut hasher = sha2::Sha256::new();
     match serde_json::to_value(policy) {
@@ -547,6 +594,7 @@ fn policy_snapshot_version(policy: &ExtensionPolicy) -> String {
     crate::package_manager::hex_encode(&hasher.finalize())
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn policy_lookup_path(capability: &str) -> &'static str {
     let capability = capability.trim();
     if capability.eq_ignore_ascii_case("read")
@@ -566,6 +614,7 @@ fn policy_lookup_path(capability: &str) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn protocol_error_code(code: &str) -> HostCallErrorCode {
     let code = code.trim();
     if code.eq_ignore_ascii_case("timeout") {
@@ -581,6 +630,7 @@ fn protocol_error_code(code: &str) -> HostCallErrorCode {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn protocol_error_fallback_reason(method: &str, code: &str) -> &'static str {
     let code = code.trim();
     if code.eq_ignore_ascii_case("denied") {
@@ -600,6 +650,7 @@ fn protocol_error_fallback_reason(method: &str, code: &str) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn protocol_error_details(payload: &HostCallPayload, code: &str, message: &str) -> Value {
     let observed_param_keys = payload
         .params
@@ -638,6 +689,7 @@ fn protocol_error_details(payload: &HostCallPayload, code: &str, message: &str) 
 
 // Kept as the no-trace parity oracle for tests; production dispatch records
 // trace details through `hostcall_outcome_to_protocol_result_with_trace`.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(dead_code)]
 fn hostcall_outcome_to_protocol_result(
     call_id: &str,
@@ -685,6 +737,7 @@ fn hostcall_outcome_to_protocol_result(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn hostcall_outcome_to_protocol_result_with_trace(
     payload: &HostCallPayload,
     outcome: HostcallOutcome,
@@ -734,14 +787,22 @@ fn hostcall_outcome_to_protocol_result_with_trace(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_SAMPLE_MODULUS_PPM: u32 = 1_000_000;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_DEFAULT_SAMPLE_PPM: u32 = 25_000;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_DEFAULT_DIVERGENCE_WINDOW: usize = 64;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_DEFAULT_DIVERGENCE_BUDGET: usize = 3;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_DEFAULT_ROLLBACK_REQUESTS: usize = 128;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_DEFAULT_OVERHEAD_BUDGET_US: u64 = 1_500;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const DUAL_EXEC_DEFAULT_OVERHEAD_BACKOFF_REQUESTS: usize = 32;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy)]
 pub struct DualExecOracleConfig {
     pub sample_ppm: u32,
@@ -752,12 +813,14 @@ pub struct DualExecOracleConfig {
     pub overhead_backoff_requests: usize,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl Default for DualExecOracleConfig {
     fn default() -> Self {
         Self::from_env()
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl DualExecOracleConfig {
     fn from_env() -> Self {
         let sample_ppm = std::env::var("PI_EXT_DUAL_EXEC_SAMPLE_PPM")
@@ -802,6 +865,7 @@ impl DualExecOracleConfig {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Default)]
 pub struct DualExecOracleState {
     sampled_total: u64,
@@ -815,6 +879,7 @@ pub struct DualExecOracleState {
     overhead_backoff_remaining: usize,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl DualExecOracleState {
     pub fn begin_request(&mut self) {
         if self.rollback_remaining > 0 {
@@ -900,6 +965,7 @@ impl DualExecOracleState {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DualExecOutcomeDiff {
     reason: &'static str,
@@ -907,12 +973,14 @@ struct DualExecOutcomeDiff {
     compat_fingerprint: String,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn hostcall_value_fingerprint(value: &Value) -> String {
     let mut hasher = sha2::Sha256::new();
     hash_canonical_json(value, &mut hasher);
     crate::package_manager::hex_encode(&hasher.finalize())
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn hostcall_outcome_fingerprint(outcome: &HostcallOutcome) -> String {
     match outcome {
         HostcallOutcome::Success(output) => {
@@ -941,6 +1009,7 @@ fn hostcall_outcome_fingerprint(outcome: &HostcallOutcome) -> String {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn diff_hostcall_outcomes(
     fast: &HostcallOutcome,
     compat: &HostcallOutcome,
@@ -1027,6 +1096,7 @@ fn diff_hostcall_outcomes(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn should_sample_shadow_dual_exec(request: &HostcallRequest, sample_ppm: u32) -> bool {
     if sample_ppm == 0 {
         return false;
@@ -1038,6 +1108,7 @@ fn should_sample_shadow_dual_exec(request: &HostcallRequest, sample_ppm: u32) ->
     bucket < sample_ppm
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[inline]
 fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
     const FNV1A_PRIME: u64 = 1_099_511_628_211;
@@ -1048,6 +1119,7 @@ fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[inline]
 fn shadow_sampling_bucket(request: &HostcallRequest) -> u32 {
     // Deterministic, allocation-free mixing for high-frequency sampling checks.
@@ -1076,6 +1148,7 @@ fn shadow_sampling_bucket(request: &HostcallRequest) -> u32 {
 
 // Shadow-mode normalization is exercised by parity/property tests even when
 // the live dispatcher takes the canonical-op path.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(dead_code)]
 fn normalized_shadow_op(op: &str) -> String {
     let trimmed = op.trim();
@@ -1088,6 +1161,7 @@ fn normalized_shadow_op(op: &str) -> String {
     normalized
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[inline]
 fn with_folded_ascii_alnum_token<T>(token: &str, f: impl FnOnce(&[u8]) -> T) -> T {
     const INLINE_CAP: usize = 64;
@@ -1122,6 +1196,7 @@ fn with_folded_ascii_alnum_token<T>(token: &str, f: impl FnOnce(&[u8]) -> T) -> 
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn shadow_safe_session_op(op: &str) -> bool {
     with_folded_ascii_alnum_token(op, |folded| {
         matches!(
@@ -1141,6 +1216,7 @@ fn shadow_safe_session_op(op: &str) -> bool {
     })
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn shadow_safe_events_op(op: &str) -> bool {
     with_folded_ascii_alnum_token(op, |folded| {
         matches!(
@@ -1155,6 +1231,7 @@ fn shadow_safe_events_op(op: &str) -> bool {
     })
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn shadow_safe_tool(name: &str) -> bool {
     let name = name.trim();
     name.eq_ignore_ascii_case("read")
@@ -1163,6 +1240,7 @@ fn shadow_safe_tool(name: &str) -> bool {
         || name.eq_ignore_ascii_case("ls")
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn is_shadow_safe_request(request: &HostcallRequest) -> bool {
     match &request.kind {
         HostcallKind::Session { op } => shadow_safe_session_op(op),
@@ -1175,6 +1253,7 @@ fn is_shadow_safe_request(request: &HostcallRequest) -> bool {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn parse_env_bool(name: &str, default: bool) -> bool {
     std::env::var(name).ok().map_or(default, |raw| {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -1185,6 +1264,7 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
     })
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn io_uring_lane_policy_from_env() -> IoUringLanePolicyConfig {
     let default = IoUringLanePolicyConfig::conservative();
     let max_queue_depth = std::env::var("PI_EXT_IO_URING_MAX_QUEUE_DEPTH")
@@ -1205,10 +1285,12 @@ fn io_uring_lane_policy_from_env() -> IoUringLanePolicyConfig {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn io_uring_force_compat_from_env() -> bool {
     parse_env_bool("PI_EXT_IO_URING_FORCE_COMPAT", false)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
     match kind {
         HostcallKind::Http => HostcallIoHint::IoHeavy,
@@ -1248,6 +1330,7 @@ fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn resource_operation_kind(kind: &HostcallKind) -> ResourceOperationKind {
     match kind {
         HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => ResourceOperationKind::Tool,
@@ -1260,6 +1343,7 @@ const fn resource_operation_kind(kind: &HostcallKind) -> ResourceOperationKind {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn estimated_hostcall_output_bytes(request: &HostcallRequest) -> u64 {
     match &request.kind {
         HostcallKind::Exec { .. } => crate::tools::READ_TOOL_MAX_BYTES,
@@ -1286,6 +1370,7 @@ fn estimated_hostcall_output_bytes(request: &HostcallRequest) -> u64 {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn output_limit_from_payload(payload: &Value) -> Option<u64> {
     payload
         .get("max_bytes")
@@ -1295,6 +1380,7 @@ fn output_limit_from_payload(payload: &Value) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn hostcall_io_hint_label(io_hint: HostcallIoHint) -> &'static str {
     match io_hint {
         HostcallIoHint::Unknown => "unknown",
@@ -1303,6 +1389,7 @@ const fn hostcall_io_hint_label(io_hint: HostcallIoHint) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn hostcall_capability_label(capability: HostcallCapabilityClass) -> &'static str {
     match capability {
         HostcallCapabilityClass::Filesystem => "filesystem",
@@ -1318,12 +1405,14 @@ const fn hostcall_capability_label(capability: HostcallCapabilityClass) -> &'sta
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IoUringBridgeState {
     ExecutorUnavailable,
     CancelledBeforeDispatch,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl IoUringBridgeState {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1333,6 +1422,7 @@ impl IoUringBridgeState {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 struct IoUringBridgeDispatch {
     outcome: HostcallOutcome,
@@ -1340,6 +1430,7 @@ struct IoUringBridgeDispatch {
     fallback_reason: Option<&'static str>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn clone_payload_object_without_key(
     map: &serde_json::Map<String, Value>,
     reserved_key: &str,
@@ -1354,6 +1445,7 @@ fn clone_payload_object_without_key(
     out
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn clone_payload_object_without_two_keys(
     map: &serde_json::Map<String, Value>,
     reserved_a: &str,
@@ -1369,6 +1461,7 @@ fn clone_payload_object_without_two_keys(
     out
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn protocol_params_from_request(request: &HostcallRequest) -> Value {
     match &request.kind {
         HostcallKind::BuiltinTool { .. } => request.params_for_hash(),
@@ -1408,6 +1501,7 @@ fn protocol_params_from_request(request: &HostcallRequest) -> Value {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn dual_exec_forensic_bundle(
     request: &HostcallRequest,
     diff: &DualExecOutcomeDiff,
@@ -1440,39 +1534,67 @@ fn dual_exec_forensic_bundle(
     })
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_MIN_SAMPLES: usize = 24;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_CUSUM_DRIFT: f64 = 0.03;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_CUSUM_THRESHOLD: f64 = 1.6;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_BOCPD_HAZARD: f64 = 0.08;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_POSTERIOR_DECAY: f64 = 0.92;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_POSTERIOR_THRESHOLD: f64 = 0.35;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_COOLDOWN_OBSERVATIONS: usize = 32;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_CONFIRMATION_STREAK: usize = 2;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_FALLBACK_QUEUE_DEPTH: f64 = 1.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_FALLBACK_SERVICE_US: f64 = 1_200.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const REGIME_VARIANCE_FLOOR: f64 = 1e-6;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_ALPHA: f64 = 0.05;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_HIGH_STRATUM_QUEUE_MIN: f64 = 8.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_HIGH_STRATUM_SERVICE_US_MIN: f64 = 4_500.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_LOW_STRATUM_QUEUE_MAX: f64 = 2.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_LOW_STRATUM_SERVICE_US_MAX: f64 = 1_800.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_PROMOTE_SCORE_THRESHOLD: f64 = 1.25;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_ROLLBACK_SCORE_THRESHOLD: f64 = 0.70;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_MIN_STRATUM_SAMPLES: usize = 10;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_MIN_TOTAL_SAMPLES: usize = 30;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_LOG_E_CLAMP: f64 = 120.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_LR_NULL: f64 = 0.35;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_LR_ALT: f64 = 0.65;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_FALSE_PROMOTE_LOSS: f64 = 28.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_FALSE_ROLLBACK_LOSS: f64 = 12.0;
+#[cfg(any(test, feature = "experimental-controllers"))]
 const ROLLOUT_HOLD_OPPORTUNITY_LOSS: f64 = 10.0;
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegimeAdaptationMode {
     SequentialFastPath,
     InterleavedBatching,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RegimeAdaptationMode {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1482,12 +1604,14 @@ impl RegimeAdaptationMode {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegimeTransition {
     EnterInterleavedBatching,
     ReturnToSequentialFastPath,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RegimeTransition {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1497,6 +1621,7 @@ impl RegimeTransition {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RolloutGateAction {
     Hold,
@@ -1504,6 +1629,7 @@ enum RolloutGateAction {
     RollbackSequential,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RolloutGateAction {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1514,6 +1640,7 @@ impl RolloutGateAction {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RolloutEvidenceStratum {
     HighContention,
@@ -1521,6 +1648,7 @@ enum RolloutEvidenceStratum {
     Mixed,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RolloutEvidenceStratum {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1531,6 +1659,7 @@ impl RolloutEvidenceStratum {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy)]
 struct RolloutExpectedLoss {
     hold: f64,
@@ -1538,6 +1667,7 @@ struct RolloutExpectedLoss {
     rollback: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy)]
 struct RolloutGateDecision {
     action: RolloutGateAction,
@@ -1555,6 +1685,7 @@ struct RolloutGateDecision {
     blocked_cherry_picked: bool,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 struct RolloutGateState {
     total_samples: usize,
@@ -1568,6 +1699,7 @@ struct RolloutGateState {
     rollback_log_e: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl Default for RolloutGateState {
     fn default() -> Self {
         Self {
@@ -1584,6 +1716,7 @@ impl Default for RolloutGateState {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy)]
 struct RegimeSignal {
     queue_depth: f64,
@@ -1592,6 +1725,7 @@ struct RegimeSignal {
     llc_miss_rate: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RegimeSignal {
     fn composite_score(self) -> f64 {
         let queue_component = (self.queue_depth / 32.0).min(4.0);
@@ -1608,6 +1742,7 @@ impl RegimeSignal {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)]
 #[allow(dead_code)]
@@ -1640,6 +1775,7 @@ struct RegimeObservation {
     rollout_blocked_cherry_picked: bool,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 struct RegimeShiftDetector {
     sample_count: usize,
@@ -1654,6 +1790,7 @@ struct RegimeShiftDetector {
     rollout_gate: RolloutGateState,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl Default for RegimeShiftDetector {
     fn default() -> Self {
         Self {
@@ -1671,6 +1808,7 @@ impl Default for RegimeShiftDetector {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RegimeShiftDetector {
     const fn current_mode(&self) -> RegimeAdaptationMode {
         self.mode
@@ -1839,6 +1977,7 @@ impl RegimeShiftDetector {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl RolloutGateState {
     fn observe(
         &mut self,
@@ -1941,6 +2080,7 @@ impl RolloutGateState {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn rollout_evidence_stratum(signal: RegimeSignal) -> RolloutEvidenceStratum {
     if signal.queue_depth >= ROLLOUT_HIGH_STRATUM_QUEUE_MIN
         || signal.service_time_us >= ROLLOUT_HIGH_STRATUM_SERVICE_US_MIN
@@ -1955,6 +2095,7 @@ fn rollout_evidence_stratum(signal: RegimeSignal) -> RolloutEvidenceStratum {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn bernoulli_log_likelihood_ratio(observed_true: bool, p0: f64, p1: f64) -> f64 {
     let p0 = p0.clamp(1e-6, 1.0 - 1e-6);
     let p1 = p1.clamp(1e-6, 1.0 - 1e-6);
@@ -1965,6 +2106,7 @@ fn bernoulli_log_likelihood_ratio(observed_true: bool, p0: f64, p1: f64) -> f64 
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn rollout_expected_loss(
     mode: RegimeAdaptationMode,
     promote_posterior: f64,
@@ -1994,10 +2136,12 @@ fn rollout_expected_loss(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn usize_to_f64(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn llc_miss_proxy(total_depth: usize, overflow_depth: usize, overflow_rejected_total: u64) -> f64 {
     if total_depth == 0 && overflow_rejected_total == 0 {
         return 0.0;
@@ -2013,6 +2157,7 @@ fn llc_miss_proxy(total_depth: usize, overflow_depth: usize, overflow_rejected_t
     (overflow_ratio + rejected_ratio).clamp(0.0, 1.0)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn hostcall_kind_label(kind: &HostcallKind) -> &'static str {
     match kind {
         HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => "tool",
@@ -2027,6 +2172,7 @@ const fn hostcall_kind_label(kind: &HostcallKind) -> &'static str {
 
 // Entropy scoring is retained for rollout evidence/property checks while the
 // current dispatcher feature vector uses cheaper queue/service indicators.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(dead_code)]
 fn shannon_entropy_bytes(bytes: &[u8]) -> f64 {
     if bytes.is_empty() {
@@ -2047,6 +2193,7 @@ fn shannon_entropy_bytes(bytes: &[u8]) -> f64 {
         .sum()
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn hostcall_opcode_entropy(kind: &HostcallKind, payload: &Value) -> f64 {
     let kind_label = hostcall_kind_label(kind);
     let op = payload
@@ -2105,6 +2252,7 @@ fn hostcall_opcode_entropy(kind: &HostcallKind, payload: &Value) -> f64 {
         .sum()
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     fn js_runtime(&self) -> &PiJsRuntime<C> {
         self.runtime.as_js_runtime()
@@ -4020,6 +4168,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn hostcall_code_to_str(code: crate::connectors::HostCallErrorCode) -> &'static str {
     match code {
         crate::connectors::HostCallErrorCode::Timeout => "timeout",
@@ -4031,6 +4180,7 @@ const fn hostcall_code_to_str(code: crate::connectors::HostCallErrorCode) -> &'s
 }
 
 /// Trait for handling individual hostcall types.
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[async_trait]
 pub trait HostcallHandler: Send + Sync {
     /// Process a hostcall request and return the outcome.

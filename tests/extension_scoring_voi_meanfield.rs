@@ -5,24 +5,31 @@
 //! Covers: disabled config, budget limits, freshness filtering, utility floors,
 //! candidate ordering, empty inputs, and mean-field convergence/oscillation/clipping.
 
+#[cfg(feature = "experimental-controllers")]
 use chrono::{TimeZone, Utc};
 use pi::extension_scoring::{
     MeanFieldControllerConfig, MeanFieldControllerReport, MeanFieldShardObservation,
-    MeanFieldShardState, VoiCandidate, VoiPlan, VoiPlannerConfig, VoiSkipReason,
-    compute_mean_field_controls, plan_voi_candidates,
+    MeanFieldShardState, compute_mean_field_controls,
+};
+#[cfg(feature = "experimental-controllers")]
+use pi::extension_scoring::{
+    VoiCandidate, VoiPlan, VoiPlannerConfig, VoiSkipReason, plan_voi_candidates,
 };
 
+#[cfg(feature = "experimental-controllers")]
 #[path = "algorithms/voi_planner.rs"]
 mod voi_planner;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 fn fixed_now() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 2, 16, 12, 0, 0)
         .single()
         .expect("valid timestamp")
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn fresh_timestamp() -> String {
     // 10 minutes ago — well within default 120-minute freshness window.
     Utc.with_ymd_and_hms(2026, 2, 16, 11, 50, 0)
@@ -31,6 +38,7 @@ fn fresh_timestamp() -> String {
         .to_rfc3339()
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn stale_timestamp() -> String {
     // 3 hours ago — outside default 120-minute freshness window.
     Utc.with_ymd_and_hms(2026, 2, 16, 9, 0, 0)
@@ -39,6 +47,7 @@ fn stale_timestamp() -> String {
         .to_rfc3339()
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn future_timestamp() -> String {
     Utc.with_ymd_and_hms(2026, 2, 16, 12, 10, 0)
         .single()
@@ -46,6 +55,7 @@ fn future_timestamp() -> String {
         .to_rfc3339()
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn barely_stale_timestamp() -> String {
     Utc.with_ymd_and_hms(2026, 2, 16, 11, 58, 59)
         .single()
@@ -53,6 +63,7 @@ fn barely_stale_timestamp() -> String {
         .to_rfc3339()
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn candidate(id: &str, utility: f64, overhead_ms: u32) -> VoiCandidate {
     VoiCandidate {
         id: id.to_string(),
@@ -96,6 +107,7 @@ fn default_shard_state(shard_id: &str) -> MeanFieldShardState {
 //  plan_voi_candidates tests
 // ══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_disabled_config_skips_all_candidates() {
     let config = VoiPlannerConfig {
@@ -119,6 +131,7 @@ fn voi_disabled_config_skips_all_candidates() {
     assert_eq!(plan.remaining_overhead_ms, 1000);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_empty_candidates_returns_empty_plan() {
     let config = VoiPlannerConfig::default();
@@ -129,6 +142,7 @@ fn voi_empty_candidates_returns_empty_plan() {
     assert_eq!(plan.used_overhead_ms, 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_selects_candidates_within_budget() {
     let config = VoiPlannerConfig {
@@ -170,6 +184,7 @@ fn voi_selects_candidates_within_budget() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_respects_max_candidates_limit() {
     let config = VoiPlannerConfig {
@@ -196,6 +211,7 @@ fn voi_respects_max_candidates_limit() {
     assert_eq!(plan.skipped[0].reason, VoiSkipReason::BudgetExceeded);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_skips_stale_candidates() {
     let config = VoiPlannerConfig {
@@ -223,6 +239,7 @@ fn voi_skips_stale_candidates() {
     assert!(has_stale_skipped);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_skips_missing_telemetry() {
     let config = VoiPlannerConfig::default();
@@ -236,6 +253,7 @@ fn voi_skips_missing_telemetry() {
     assert_eq!(plan.skipped[0].reason, VoiSkipReason::MissingTelemetry);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_skips_future_telemetry() {
     let config = VoiPlannerConfig::default();
@@ -249,6 +267,7 @@ fn voi_skips_future_telemetry() {
     assert_eq!(plan.skipped[0].reason, VoiSkipReason::MissingTelemetry);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_uses_exact_staleness_boundary_instead_of_truncated_minutes() {
     let config = VoiPlannerConfig {
@@ -269,6 +288,7 @@ fn voi_uses_exact_staleness_boundary_instead_of_truncated_minutes() {
     }));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_fails_closed_when_staleness_window_is_out_of_range() {
     let config = VoiPlannerConfig {
@@ -284,6 +304,7 @@ fn voi_fails_closed_when_staleness_window_is_out_of_range() {
     assert_eq!(plan.skipped[0].reason, VoiSkipReason::StaleEvidence);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_skips_disabled_candidates() {
     let config = VoiPlannerConfig::default();
@@ -296,6 +317,7 @@ fn voi_skips_disabled_candidates() {
     assert_eq!(plan.skipped[0].reason, VoiSkipReason::Disabled);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_skips_below_utility_floor() {
     let config = VoiPlannerConfig {
@@ -321,6 +343,7 @@ fn voi_skips_below_utility_floor() {
     assert!(has_utility_skipped_low);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_orders_by_utility_per_ms_descending() {
     let config = VoiPlannerConfig {
@@ -345,6 +368,7 @@ fn voi_orders_by_utility_per_ms_descending() {
     assert_eq!(plan.selected[2].id, "c");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_cumulative_overhead_monotonically_increases() {
     let config = VoiPlannerConfig {
@@ -371,6 +395,7 @@ fn voi_cumulative_overhead_monotonically_increases() {
     assert_eq!(plan.used_overhead_ms, prev);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_remaining_overhead_equals_budget_minus_used() {
     let config = VoiPlannerConfig {
@@ -391,6 +416,7 @@ fn voi_remaining_overhead_equals_budget_minus_used() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_negative_utility_treated_as_zero() {
     let config = VoiPlannerConfig {
@@ -847,6 +873,7 @@ fn meanfield_report_serializes_round_trip() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn voi_plan_serializes_round_trip() {
     let config = VoiPlannerConfig::default();

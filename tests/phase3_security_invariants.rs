@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "experimental-controllers")]
 use pi::extension_scoring::{
     OpeEvaluatorConfig, OpeGateReason, OpeTraceSample, evaluate_off_policy,
 };
@@ -15,6 +16,7 @@ use pi::extensions::{
     ALL_CAPABILITIES, Capability, ExecMediationPolicy, ExtensionOverride, ExtensionPolicy,
     ExtensionPolicyMode, PolicyDecision, PolicyProfile, PolicySnapshot, SecretBrokerPolicy,
 };
+#[cfg(feature = "experimental-controllers")]
 use pi::hostcall_io_uring_lane::{
     HostcallCapabilityClass, HostcallDispatchLane, HostcallIoHint, IoUringFallbackReason,
     IoUringLaneDecisionInput, IoUringLanePolicyConfig, decide_io_uring_lane,
@@ -270,6 +272,7 @@ fn invariant_dangerous_caps_classification_stable() {
 // Invariant 4: IoUring lane selection cannot bypass policy
 // ============================================================================
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_lane_decision_independent_of_policy_check() {
     // The io_uring module does NOT perform policy checks — it only selects
@@ -336,6 +339,7 @@ fn invariant_io_uring_lane_decision_independent_of_policy_check() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_kill_switch_always_forces_compat() {
     let config = IoUringLanePolicyConfig {
@@ -362,6 +366,7 @@ fn invariant_io_uring_kill_switch_always_forces_compat() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_disabled_never_routes_to_io_uring() {
     let config = IoUringLanePolicyConfig {
@@ -391,6 +396,7 @@ fn invariant_io_uring_disabled_never_routes_to_io_uring() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_decision_is_deterministic() {
     let config = IoUringLanePolicyConfig {
@@ -415,6 +421,7 @@ fn invariant_io_uring_decision_is_deterministic() {
     assert_eq!(d1.fallback_reason, d2.fallback_reason);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_capability_class_mapping_covers_all_known_caps() {
     let known_caps = [
@@ -726,6 +733,7 @@ fn invariant_all_profiles_deny_dangerous_caps_except_permissive() {
 // Invariant 9: OPE gate cannot approve without sufficient evidence
 // ============================================================================
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_ope_gate_rejects_empty_evidence() {
     let config = OpeEvaluatorConfig::default();
@@ -736,6 +744,7 @@ fn invariant_ope_gate_rejects_empty_evidence() {
     assert_eq!(report.gate.reason, OpeGateReason::NoValidSamples);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_ope_gate_rejects_invalid_propensities() {
     let config = OpeEvaluatorConfig::default();
@@ -765,6 +774,7 @@ fn invariant_ope_gate_rejects_invalid_propensities() {
     assert_eq!(report.diagnostics.valid_samples, 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_ope_gate_requires_minimum_effective_sample_size() {
     let config = OpeEvaluatorConfig {
@@ -794,6 +804,7 @@ fn invariant_ope_gate_requires_minimum_effective_sample_size() {
 // Invariant 10: Cross-module security surface isolation
 // ============================================================================
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_does_not_expose_exec_lane() {
     // Execution capability must NEVER be routed to io_uring
@@ -820,6 +831,7 @@ fn invariant_io_uring_does_not_expose_exec_lane() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_does_not_expose_env_lane() {
     let config = IoUringLanePolicyConfig {
@@ -1074,6 +1086,7 @@ fn invariant_s3fifo_owner_counts_consistent_after_eviction() {
 // Invariant 15: IoUring queue depth budget enforcement
 // ============================================================================
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn invariant_io_uring_queue_depth_budget_cannot_be_exceeded() {
     let config = IoUringLanePolicyConfig {

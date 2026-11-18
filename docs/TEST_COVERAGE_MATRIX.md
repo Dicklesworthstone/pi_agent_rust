@@ -232,7 +232,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/eval/session/tests.rs` | Test suite for `src/eval/session.rs` | Test module (16 tests). |
 | `src/eval/transport.rs` | Bounded Python protocol transport | Unit (17 in-module tests). |
 | `src/extension_conformance_matrix.rs` | Extension matrix | Unit; `tests/ext_conformance_matrix.rs`. |
-| `src/extension_dispatcher.rs` | Extension dispatcher | Unit; `tests/event_dispatch_latency.rs`, `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`; timing ignored test owner `bd-8t27h.11`. |
+| `src/extension_dispatcher.rs` | Extension UI handler trait + opt-in `experimental-controllers` dispatcher | Unit; `ExtensionUiHandler` is unconditional; `ExtensionDispatcher` + `DualExecOracle` are gated behind `experimental-controllers`; `tests/event_dispatch_latency.rs`, `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`; timing ignored test owner `bd-8t27h.11`. |
 | `src/extension_events.rs` | Extension events | Unit; `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`, `tests/extensions_repair_events.rs`. |
 | `src/extension_inclusion.rs` | Extension inclusion list | Unit; `tests/ext_inclusion_list.rs`. |
 | `src/extension_index.rs` | Extension index/search | Unit; `tests/ext_entry_scan.rs`, `tests/extension_code_search.rs`. |
@@ -240,7 +240,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extension_popularity.rs` | Extension popularity scoring | Unit; coverage is mostly artifact/report oriented and should be traced in `bd-8t27h.3`. |
 | `src/extension_preflight.rs` | Extension preflight | Unit; `tests/ext_preflight_analyzer.rs`, `tests/e2e_workflow_preflight.rs`. |
 | `src/extension_replay.rs` | Extension replay | Unit; `tests/e2e_replay_bundle_validation.rs`, `tests/e2e_replay_bundles.rs`. |
-| `src/extension_scoring.rs` | Extension scoring | Unit; `tests/extension_scoring.rs`, `tests/extension_scoring_ope.rs`, `tests/extension_scoring_voi_meanfield.rs`. |
+| `src/extension_scoring.rs` | Extension scoring + mean-field controls (`VOI`/`OPE` gated behind `experimental-controllers`) | Unit; `tests/extension_scoring.rs`, `tests/extension_scoring_voi_meanfield.rs`, `tests/extension_scoring_ope.rs` (`experimental-controllers`). |
 | `src/extension_tools.rs` | Extension tools | Unit; `tests/e2e_extension_registration.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/extension_validation.rs` | Extension validation | Unit; `tests/extension_validation.rs`, `tests/extension_lockfile_provenance.rs`, `tests/ext_provenance_verification.rs`. |
 | `src/extensions.rs` | Extension protocol/runtime | Unit; `tests/extensions_*.rs`, `tests/ext_conformance*.rs`, `tests/e2e_extension_registration.rs`. |
@@ -305,7 +305,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/handoff.rs` | Handoff generation | `tests/handoff_generator.rs`. |
 | `src/hostcall_amac.rs` | Hostcall AMAC | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_egraph.rs` | Equality-saturation rewrite search over hot hostcall execution plans | Unit (43 tests); `tests/hostcall_egraph.rs`. |
-| `src/hostcall_io_uring_lane.rs` | Hostcall io_uring lane | Unit; `tests/streaming_hostcall.rs`. |
+| `src/hostcall_io_uring_lane.rs` | Hostcall io_uring lane policy (opt-in `experimental-controllers`) | Unit (`#[cfg(any(test, feature = "experimental-controllers"))]`); `tests/streaming_hostcall.rs`, `tests/phase3_cross_module_integration.rs` (`experimental-controllers`). |
 | `src/hostcall_queue.rs` | Hostcall queue | Unit; `tests/hostcall_queue_ebr.rs`, `tests/hostcall_queue_loom.rs`; loom opt-in owner `bd-8t27h.6`. |
 | `src/hostcall_rewrite.rs` | Hostcall rewrite | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_s3_fifo.rs` | Hostcall S3 FIFO | Unit; `tests/hostcall_s3_fifo_policy.rs`. |

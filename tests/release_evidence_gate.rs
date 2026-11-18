@@ -8869,3 +8869,46 @@ fn franken_node_claim_contract_fails_closed_on_allowed_forbidden_phrase_overlap(
         "error should explain overlap violation, got: {err}"
     );
 }
+
+#[test]
+fn dsr_contract_sync_script_self_test_and_live_recipe_pass() {
+    let root = repo_root();
+    let script = root.join("scripts/check_dsr_contract_sync.py");
+
+    let self_test = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--self-test")
+        .current_dir(&root)
+        .output()
+        .expect("run check_dsr_contract_sync.py --self-test");
+    assert!(
+        self_test.status.success(),
+        "check_dsr_contract_sync.py --self-test failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&self_test.stdout),
+        String::from_utf8_lossy(&self_test.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&self_test.stdout).contains("SELF-TEST PASS"),
+        "expected SELF-TEST PASS marker"
+    );
+
+    let live = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--repo-root")
+        .arg(&root)
+        .arg("--json")
+        .current_dir(&root)
+        .output()
+        .expect("run check_dsr_contract_sync.py --json");
+    assert!(
+        live.status.success(),
+        "live DSR contract sync failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&live.stdout),
+        String::from_utf8_lossy(&live.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&live.stdout).expect("parse structured DSR contract sync JSON");
+    assert_eq!(report["schema"].as_str(), Some("pi.dsr.contract_sync.v1"));
+    assert_eq!(report["status"].as_str(), Some("pass"));
+    assert_eq!(report["drift_count"].as_u64(), Some(0));
+}

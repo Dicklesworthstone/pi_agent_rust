@@ -12,27 +12,31 @@
 mod common;
 
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+#[cfg(feature = "experimental-controllers")]
 use pi::extensions_js::{
     AmbiguitySignal, ApprovalRequirement, AuditEntryKind, AuditLedger, CanaryConfig, CanaryRoute,
     CapabilityDelta, CapabilityMonotonicityVerdict, ConfidenceReport, ConflictKind,
-    ConformanceFixture, ConformanceReplayVerdict, DeveloperGuide, ExtensionRepairEvent,
-    GatingDecision, HealthSignal, HostcallCategory, HostcallDelta, IntentGraph, IntentSignal,
-    LisrAdr, MonotonicityVerdict, OperatorPlaybook, OverlayArtifact, OverlayState,
-    OverlayTransitionError, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
-    PromotionDecision, ProposalValidationError, REPAIR_REGISTRY_VERSION, REPAIR_RULES, RepairMode,
-    RepairPattern, RepairRisk, SemanticDriftSeverity, SemanticParityVerdict, SloVerdict,
-    StructuralVerdict, TelemetryCollector, TelemetryMetric, TolerantParseResult,
-    VerificationBundle, allowed_op_tags_for_mode, apply_proposal, build_approval_request,
-    build_forensic_bundle, build_golden_manifest, build_inspection, check_approval_requirement,
-    compute_artifact_checksum, compute_canary_bucket, compute_capability_proof, compute_confidence,
-    compute_gating_verdict, compute_semantic_parity, decide_promotion, detect_conflict,
-    evaluate_health, execute_promotion, execute_rollback, explain_gating, extract_hostcall_surface,
-    extract_import_names, format_proposal_diff, generate_monorepo_stub,
-    replay_conformance_fixtures, resolve_conflicts, run_governance_checklist,
-    select_best_candidate, should_auto_rollback, tolerant_parse, transition_overlay,
-    validate_proposal, validate_repaired_artifact,
+    ConformanceFixture, ConformanceReplayVerdict, DeveloperGuide, GatingDecision, HealthSignal,
+    HostcallCategory, HostcallDelta, IntentGraph, IntentSignal, LisrAdr, OperatorPlaybook,
+    OverlayArtifact, OverlayState, OverlayTransitionError, PatchOp, PatchProposal,
+    PromotionDecision, ProposalValidationError, REPAIR_REGISTRY_VERSION, REPAIR_RULES,
+    SemanticDriftSeverity, SemanticParityVerdict, SloVerdict, TelemetryCollector, TelemetryMetric,
+    TolerantParseResult, VerificationBundle, allowed_op_tags_for_mode, applicable_rules,
+    apply_proposal, build_approval_request, build_forensic_bundle, build_golden_manifest,
+    build_inspection, check_approval_requirement, compute_artifact_checksum, compute_canary_bucket,
+    compute_capability_proof, compute_confidence, compute_gating_verdict, compute_semantic_parity,
+    decide_promotion, detect_conflict, evaluate_health, execute_promotion, execute_rollback,
+    explain_gating, extract_hostcall_surface, format_proposal_diff, replay_conformance_fixtures,
+    resolve_conflicts, rule_by_id, run_governance_checklist, select_best_candidate,
+    should_auto_rollback, tolerant_parse, transition_overlay, validate_proposal,
+};
+use pi::extensions_js::{
+    ExtensionRepairEvent, MonotonicityVerdict, PiJsRuntimeConfig, PiJsTickStats, RepairMode,
+    RepairPattern, RepairRisk, StructuralVerdict, extract_import_names, generate_monorepo_stub,
+    validate_repaired_artifact, verify_repair_monotonicity,
 };
 use pi::tools::ToolRegistry;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -607,9 +611,6 @@ fn repair_auto_strict_applies_dist_to_src_fallback() {
 
 // ─── Privilege monotonicity checker (bd-k5q5.9.1.3) ─────────────────────────
 
-use pi::extensions_js::verify_repair_monotonicity;
-use std::path::PathBuf;
-
 #[test]
 fn monotonicity_safe_when_resolved_within_root() {
     let root = PathBuf::from("/extensions/my-ext");
@@ -741,18 +742,19 @@ fn no_patterns_allowed_by_suggest() {
 
 // ─── Deterministic rule registry (bd-k5q5.9.3.1) ────────────────────────────
 
-use pi::extensions_js::{applicable_rules, rule_by_id};
-
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn registry_has_seven_rules() {
     assert_eq!(REPAIR_RULES.len(), 7);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn registry_version_is_set() {
     assert!(!REPAIR_REGISTRY_VERSION.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn all_rules_have_unique_ids() {
     let mut ids: Vec<&str> = REPAIR_RULES.iter().map(|r| r.id).collect();
@@ -761,6 +763,7 @@ fn all_rules_have_unique_ids() {
     assert_eq!(ids.len(), REPAIR_RULES.len(), "duplicate rule IDs detected");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn rule_by_id_finds_existing() {
     let rule = rule_by_id("dist_to_src_v1").expect("should find rule");
@@ -768,11 +771,13 @@ fn rule_by_id_finds_existing() {
     assert_eq!(rule.version, "1.0.0");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn rule_by_id_returns_none_for_unknown() {
     assert!(rule_by_id("nonexistent_rule").is_none());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn applicable_rules_auto_safe_returns_safe_only() {
     let rules = applicable_rules(RepairMode::AutoSafe);
@@ -780,24 +785,28 @@ fn applicable_rules_auto_safe_returns_safe_only() {
     assert_eq!(rules.len(), 3); // DistToSrc + MissingAsset + ManifestNormalization
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn applicable_rules_auto_strict_returns_all() {
     let rules = applicable_rules(RepairMode::AutoStrict);
     assert_eq!(rules.len(), 7);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn applicable_rules_off_returns_empty() {
     let rules = applicable_rules(RepairMode::Off);
     assert!(rules.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn applicable_rules_suggest_returns_empty() {
     let rules = applicable_rules(RepairMode::Suggest);
     assert!(rules.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn registry_order_is_deterministic() {
     let ids: Vec<&str> = REPAIR_RULES.iter().map(|r| r.id).collect();
@@ -817,6 +826,7 @@ fn registry_order_is_deterministic() {
 
 // ─── Model patch primitives (bd-k5q5.9.4.1) ─────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn patch_op_replace_module_path_is_safe() {
     let op = PatchOp::ReplaceModulePath {
@@ -827,6 +837,7 @@ fn patch_op_replace_module_path_is_safe() {
     assert_eq!(op.tag(), "replace_module_path");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn patch_op_inject_stub_is_aggressive() {
     let op = PatchOp::InjectStub {
@@ -837,6 +848,7 @@ fn patch_op_inject_stub_is_aggressive() {
     assert_eq!(op.tag(), "inject_stub");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn patch_op_add_export_is_aggressive() {
     let op = PatchOp::AddExport {
@@ -847,6 +859,7 @@ fn patch_op_add_export_is_aggressive() {
     assert_eq!(op.risk(), RepairRisk::Aggressive);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn patch_op_rewrite_require_is_safe() {
     let op = PatchOp::RewriteRequire {
@@ -857,6 +870,7 @@ fn patch_op_rewrite_require_is_safe() {
     assert_eq!(op.risk(), RepairRisk::Safe);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn proposal_max_risk_safe_when_all_safe() {
     let proposal = PatchProposal {
@@ -872,6 +886,7 @@ fn proposal_max_risk_safe_when_all_safe() {
     assert!(proposal.is_allowed_by(RepairMode::AutoSafe));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn proposal_max_risk_aggressive_when_any_aggressive() {
     let proposal = PatchProposal {
@@ -894,6 +909,7 @@ fn proposal_max_risk_aggressive_when_any_aggressive() {
     assert!(proposal.is_allowed_by(RepairMode::AutoStrict));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn proposal_blocked_by_off_mode() {
     let proposal = PatchProposal {
@@ -908,6 +924,7 @@ fn proposal_blocked_by_off_mode() {
     assert!(!proposal.is_allowed_by(RepairMode::Off));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn empty_proposal_is_safe() {
     let proposal = PatchProposal {
@@ -1127,6 +1144,7 @@ fn repair_succeeds_when_src_has_valid_syntax() {
 
 // ─── Intent graph extractor (bd-k5q5.9.2.1) ─────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 fn sample_register_payload() -> serde_json::Value {
     serde_json::json!({
         "tools": [
@@ -1146,6 +1164,7 @@ fn sample_register_payload() -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extracts_tools() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1155,6 +1174,7 @@ fn intent_graph_extracts_tools() {
     assert_eq!(tools[1].name(), "farewell");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extracts_commands() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1163,6 +1183,7 @@ fn intent_graph_extracts_commands() {
     assert_eq!(cmds[0].name(), "/hello");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extracts_shortcuts() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1171,6 +1192,7 @@ fn intent_graph_extracts_shortcuts() {
     assert_eq!(shortcuts[0].name(), "ctrl+g");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extracts_flags() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1179,6 +1201,7 @@ fn intent_graph_extracts_flags() {
     assert_eq!(flags[0].name(), "verbose");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extracts_event_hooks() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1188,6 +1211,7 @@ fn intent_graph_extracts_event_hooks() {
     assert_eq!(hooks[1].name(), "tool_result");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extracts_capabilities() {
     let caps = vec!["read".to_string(), "exec".to_string()];
@@ -1198,6 +1222,7 @@ fn intent_graph_extracts_capabilities() {
     assert_eq!(cap_signals[1].name(), "exec");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_deduplicates_signals() {
     let payload = serde_json::json!({
@@ -1211,6 +1236,7 @@ fn intent_graph_deduplicates_signals() {
     assert_eq!(tools.len(), 1, "duplicate tools should be deduplicated");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_empty_payload() {
     let graph = IntentGraph::from_register_payload("test-ext", &serde_json::json!({}), &[]);
@@ -1219,6 +1245,7 @@ fn intent_graph_empty_payload() {
     assert_eq!(graph.category_count(), 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_category_count() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1226,6 +1253,7 @@ fn intent_graph_category_count() {
     assert_eq!(graph.category_count(), 5);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_signal_count() {
     let graph = IntentGraph::from_register_payload("test-ext", &sample_register_payload(), &[]);
@@ -1233,6 +1261,7 @@ fn intent_graph_signal_count() {
     assert_eq!(graph.signal_count(), 7);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_signal_display() {
     let sig = IntentSignal::RegistersTool("greet".to_string());
@@ -1242,6 +1271,7 @@ fn intent_signal_display() {
     assert_eq!(sig2.to_string(), "event_hook:tool_call");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn intent_graph_extension_id_preserved() {
     let graph = IntentGraph::from_register_payload("my-ext-123", &serde_json::json!({}), &[]);
@@ -1250,6 +1280,7 @@ fn intent_graph_extension_id_preserved() {
 
 // ─── Tolerant AST recovery and ambiguity detection (bd-k5q5.9.2.2) ──────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_valid_ts() {
     let result = tolerant_parse(
@@ -1263,6 +1294,7 @@ fn tolerant_parse_valid_ts() {
     assert!(result.is_legible());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_broken_ts() {
     let result = tolerant_parse("export function {{{ totally broken", "broken.ts");
@@ -1271,6 +1303,7 @@ fn tolerant_parse_broken_ts() {
     assert!(!result.ambiguities.is_empty()); // Should have RecoverableParseErrors
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_valid_js() {
     let result = tolerant_parse(
@@ -1281,6 +1314,7 @@ fn tolerant_parse_valid_js() {
     assert!(result.statement_count > 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_dynamic_eval() {
     let result = tolerant_parse("const code = 'console.log(1)';\neval(code);\n", "test.js");
@@ -1289,6 +1323,7 @@ fn tolerant_parse_detects_dynamic_eval() {
     assert!(!result.is_legible());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_new_function() {
     let result = tolerant_parse("const fn = new Function('return 1');\n", "test.js");
@@ -1299,12 +1334,14 @@ fn tolerant_parse_detects_new_function() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_dynamic_import() {
     let result = tolerant_parse("const mod = await import('./dynamic.js');\n", "test.mjs");
     assert!(result.ambiguities.contains(&AmbiguitySignal::DynamicImport));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_star_reexport() {
     let result = tolerant_parse("export * from './utils';\n", "test.ts");
@@ -1313,6 +1350,7 @@ fn tolerant_parse_detects_star_reexport() {
     assert!(result.is_legible());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_proxy() {
     let result = tolerant_parse(
@@ -1322,12 +1360,14 @@ fn tolerant_parse_detects_proxy() {
     assert!(result.ambiguities.contains(&AmbiguitySignal::ProxyUsage));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_with_statement() {
     let result = tolerant_parse("with (obj) { foo(); }\n", "test.js");
     assert!(result.ambiguities.contains(&AmbiguitySignal::WithStatement));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_detects_dynamic_require() {
     let result = tolerant_parse(
@@ -1341,6 +1381,7 @@ fn tolerant_parse_detects_dynamic_require() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_static_require_not_flagged() {
     let result = tolerant_parse("const mod = require('./static-path');\n", "test.js");
@@ -1352,6 +1393,7 @@ fn tolerant_parse_static_require_not_flagged() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn tolerant_parse_empty_source() {
     let result = tolerant_parse("", "empty.ts");
@@ -1361,6 +1403,7 @@ fn tolerant_parse_empty_source() {
     assert!(result.is_legible());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ambiguity_signal_weight_ordering() {
     // eval/Function are most dangerous.
@@ -1369,6 +1412,7 @@ fn ambiguity_signal_weight_ordering() {
     assert!(AmbiguitySignal::StarReExport.weight() < AmbiguitySignal::DynamicImport.weight());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ambiguity_signal_display() {
     assert_eq!(AmbiguitySignal::DynamicEval.to_string(), "dynamic_eval");
@@ -1378,18 +1422,21 @@ fn ambiguity_signal_display() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ambiguity_score_zero_for_clean_source() {
     let result = tolerant_parse("export const x = 42;\n", "clean.ts");
     assert!(result.ambiguity_score().abs() < f64::EPSILON);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn ambiguity_score_high_for_eval() {
     let result = tolerant_parse("eval('code');\n", "dangerous.js");
     assert!(result.ambiguity_score() >= 0.9);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn unsupported_extension_returns_not_parsed() {
     let result = tolerant_parse("binary data", "data.wasm");
@@ -1399,6 +1446,7 @@ fn unsupported_extension_returns_not_parsed() {
 
 // ─── Confidence scoring model (bd-k5q5.9.2.3) ───────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 fn well_formed_parse() -> TolerantParseResult {
     tolerant_parse(
         "import { foo } from './bar';\nexport function hello() { return foo; }\n",
@@ -1406,6 +1454,7 @@ fn well_formed_parse() -> TolerantParseResult {
     )
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn rich_intent() -> IntentGraph {
     IntentGraph::from_register_payload(
         "test-ext",
@@ -1414,6 +1463,7 @@ fn rich_intent() -> IntentGraph {
     )
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_high_for_clean_rich_extension() {
     let report = compute_confidence(&rich_intent(), &well_formed_parse());
@@ -1426,6 +1476,7 @@ fn confidence_high_for_clean_rich_extension() {
     assert!(!report.reasons.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_low_for_broken_empty_extension() {
     let parse = tolerant_parse("export function {{{ broken", "broken.ts");
@@ -1439,6 +1490,7 @@ fn confidence_low_for_broken_empty_extension() {
     assert!(!report.is_repairable());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_penalized_by_eval() {
     let parse = tolerant_parse("eval('code');\nexport const x = 1;\n", "test.js");
@@ -1454,6 +1506,7 @@ fn confidence_penalized_by_eval() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_boosted_by_tools() {
     let parse = well_formed_parse();
@@ -1469,6 +1522,7 @@ fn confidence_boosted_by_tools() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_reasons_are_explainable() {
     let report = compute_confidence(&rich_intent(), &well_formed_parse());
@@ -1486,6 +1540,7 @@ fn confidence_reasons_are_explainable() {
     assert!(codes.contains(&"has_tools"), "should have has_tools reason");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_report_is_repairable_threshold() {
     // Score exactly at threshold.
@@ -1502,6 +1557,7 @@ fn confidence_report_is_repairable_threshold() {
     assert!(!report_below.is_repairable());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_report_is_suggestable_threshold() {
     let report = ConfidenceReport {
@@ -1517,6 +1573,7 @@ fn confidence_report_is_suggestable_threshold() {
     assert!(!report_below.is_suggestable());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_clamped_to_unit_range() {
     // Very clean extension with many signals shouldn't exceed 1.0.
@@ -1527,6 +1584,7 @@ fn confidence_clamped_to_unit_range() {
     assert!(report.score >= 0.0, "score should not be negative");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn confidence_deterministic() {
     let parse = well_formed_parse();
@@ -1541,6 +1599,7 @@ fn confidence_deterministic() {
 
 // ─── Gating decision API (bd-k5q5.9.2.4) ────────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_allow_for_clean_extension() {
     let verdict = compute_gating_verdict(&rich_intent(), &well_formed_parse());
@@ -1553,6 +1612,7 @@ fn gating_allow_for_clean_extension() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_deny_for_broken_opaque_extension() {
     let parse = tolerant_parse("export function {{{ broken", "broken.ts");
@@ -1575,6 +1635,7 @@ fn gating_deny_for_broken_opaque_extension() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_suggest_for_ambiguous_but_parseable() {
     // eval + new Function in source with no tool registrations should push
@@ -1596,6 +1657,7 @@ fn gating_suggest_for_ambiguous_but_parseable() {
     assert!(verdict.allows_suggestion());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_decision_display() {
     assert_eq!(GatingDecision::Allow.to_string(), "allow");
@@ -1603,6 +1665,7 @@ fn gating_decision_display() {
     assert_eq!(GatingDecision::Deny.to_string(), "deny");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_reason_codes_have_remediation() {
     let parse = tolerant_parse("export function {{{ broken", "broken.ts");
@@ -1614,6 +1677,7 @@ fn gating_reason_codes_have_remediation() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_high_ambiguity_produces_reason_code() {
     let parse = tolerant_parse("eval('x');\n", "test.js");
@@ -1630,6 +1694,7 @@ fn gating_high_ambiguity_produces_reason_code() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn gating_verdict_confidence_preserved() {
     let verdict = compute_gating_verdict(&rich_intent(), &well_formed_parse());
@@ -1639,6 +1704,7 @@ fn gating_verdict_confidence_preserved() {
 
 // ─── Minimal-diff candidate selector and conflict resolver (bd-k5q5.9.3.4) ──
 
+#[cfg(feature = "experimental-controllers")]
 fn make_safe_proposal(rule_id: &str, from: &str, to: &str) -> PatchProposal {
     PatchProposal {
         rule_id: rule_id.to_string(),
@@ -1651,6 +1717,7 @@ fn make_safe_proposal(rule_id: &str, from: &str, to: &str) -> PatchProposal {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn make_aggressive_proposal(rule_id: &str) -> PatchProposal {
     PatchProposal {
         rule_id: rule_id.to_string(),
@@ -1663,6 +1730,7 @@ fn make_aggressive_proposal(rule_id: &str) -> PatchProposal {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn select_prefers_safe_over_aggressive() {
     let safe = make_safe_proposal("rule_a", "./a.js", "./b.ts");
@@ -1672,6 +1740,7 @@ fn select_prefers_safe_over_aggressive() {
     assert_eq!(best.rule_id, "rule_a", "should prefer safe proposal");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn select_prefers_fewer_ops() {
     let one_op = make_safe_proposal("rule_a", "./a.js", "./b.ts");
@@ -1695,6 +1764,7 @@ fn select_prefers_fewer_ops() {
     assert_eq!(best.rule_id, "rule_a", "should prefer fewer ops");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn select_prefers_higher_confidence() {
     let high_conf = PatchProposal {
@@ -1720,6 +1790,7 @@ fn select_prefers_higher_confidence() {
     assert_eq!(best.rule_id, "rule_a", "should prefer higher confidence");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn select_filters_by_mode() {
     let aggressive = make_aggressive_proposal("rule_a");
@@ -1732,12 +1803,14 @@ fn select_filters_by_mode() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn select_returns_none_for_empty() {
     let result = select_best_candidate(&[], RepairMode::AutoSafe);
     assert!(result.is_none());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn conflict_none_for_different_paths() {
     let a = make_safe_proposal("rule_a", "./a.js", "./b.ts");
@@ -1745,6 +1818,7 @@ fn conflict_none_for_different_paths() {
     assert!(detect_conflict(&a, &b).is_clear());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn conflict_detected_for_same_module_path() {
     let a = make_safe_proposal("rule_a", "./shared.js", "./b.ts");
@@ -1756,6 +1830,7 @@ fn conflict_detected_for_same_module_path() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn conflict_detected_for_same_virtual_path() {
     let a = PatchProposal {
@@ -1780,6 +1855,7 @@ fn conflict_detected_for_same_virtual_path() {
     assert!(matches!(conflict, ConflictKind::SameVirtualPath(_)));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn resolve_conflicts_drops_lower_ranked() {
     let better = make_safe_proposal("rule_a", "./shared.js", "./b.ts");
@@ -1804,6 +1880,7 @@ fn resolve_conflicts_drops_lower_ranked() {
     assert_eq!(accepted[0].rule_id, "rule_a");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn resolve_conflicts_keeps_non_conflicting() {
     let a = make_safe_proposal("rule_a", "./a.js", "./b.ts");
@@ -1813,12 +1890,14 @@ fn resolve_conflicts_keeps_non_conflicting() {
     assert_eq!(accepted.len(), 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn resolve_conflicts_empty_input() {
     let accepted = resolve_conflicts(&[]);
     assert!(accepted.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn conflict_kind_display() {
     assert!(ConflictKind::None.is_clear());
@@ -1828,6 +1907,7 @@ fn conflict_kind_display() {
 
 // ─── Bounded-context model proposer adapter (bd-k5q5.9.4.2) ─────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn allowed_ops_auto_safe_only_safe() {
     let tags = allowed_op_tags_for_mode(RepairMode::AutoSafe);
@@ -1837,6 +1917,7 @@ fn allowed_ops_auto_safe_only_safe() {
     assert!(!tags.contains(&"add_export"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn allowed_ops_auto_strict_includes_aggressive() {
     let tags = allowed_op_tags_for_mode(RepairMode::AutoStrict);
@@ -1846,12 +1927,14 @@ fn allowed_ops_auto_strict_includes_aggressive() {
     assert!(tags.contains(&"remove_import"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn allowed_ops_off_returns_empty() {
     let tags = allowed_op_tags_for_mode(RepairMode::Off);
     assert!(tags.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn allowed_ops_suggest_returns_empty() {
     let tags = allowed_op_tags_for_mode(RepairMode::Suggest);
@@ -1860,6 +1943,7 @@ fn allowed_ops_suggest_returns_empty() {
 
 // ─── Proposal validator and applicator (bd-k5q5.9.4.3) ──────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validate_empty_proposal_rejected() {
     let proposal = PatchProposal {
@@ -1872,6 +1956,7 @@ fn validate_empty_proposal_rejected() {
     assert!(errors.contains(&ProposalValidationError::EmptyProposal));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validate_safe_proposal_in_auto_safe() {
     let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
@@ -1882,6 +1967,7 @@ fn validate_safe_proposal_in_auto_safe() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validate_aggressive_proposal_rejected_in_auto_safe() {
     let proposal = make_aggressive_proposal("monorepo_escape_v1");
@@ -1896,6 +1982,7 @@ fn validate_aggressive_proposal_rejected_in_auto_safe() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validate_aggressive_proposal_passes_in_auto_strict() {
     let proposal = make_aggressive_proposal("monorepo_escape_v1");
@@ -1906,6 +1993,7 @@ fn validate_aggressive_proposal_passes_in_auto_strict() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validate_unknown_rule_rejected() {
     let proposal = PatchProposal {
@@ -1926,6 +2014,7 @@ fn validate_unknown_rule_rejected() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validate_empty_rule_id_accepted() {
     let proposal = PatchProposal {
@@ -1946,6 +2035,7 @@ fn validate_empty_rule_id_accepted() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn apply_valid_proposal_succeeds() {
     let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
@@ -1957,6 +2047,7 @@ fn apply_valid_proposal_succeeds() {
     assert!(app.summary.contains("dist_to_src_v1"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn apply_invalid_proposal_returns_errors() {
     let proposal = PatchProposal {
@@ -1969,6 +2060,7 @@ fn apply_invalid_proposal_returns_errors() {
     assert!(result.is_err());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn validation_error_display() {
     let err = ProposalValidationError::EmptyProposal;
@@ -1982,6 +2074,7 @@ fn validation_error_display() {
 
 // ─── Fail-closed human approval workflow (bd-k5q5.9.4.4) ────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn safe_proposal_auto_approved() {
     let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
@@ -1990,6 +2083,7 @@ fn safe_proposal_auto_approved() {
     assert!(!req.needs_approval());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn aggressive_proposal_requires_approval() {
     let proposal = make_aggressive_proposal("monorepo_escape_v1");
@@ -1998,6 +2092,7 @@ fn aggressive_proposal_requires_approval() {
     assert!(req.needs_approval());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn low_confidence_requires_approval() {
     let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
@@ -2005,6 +2100,7 @@ fn low_confidence_requires_approval() {
     assert_eq!(req, ApprovalRequirement::RequiresApproval);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn many_ops_requires_approval() {
     let proposal = PatchProposal {
@@ -2031,6 +2127,7 @@ fn many_ops_requires_approval() {
     assert_eq!(req, ApprovalRequirement::RequiresApproval);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn approval_request_has_op_summaries() {
     let proposal = make_safe_proposal("dist_to_src_v1", "./a.js", "./b.ts");
@@ -2040,6 +2137,7 @@ fn approval_request_has_op_summaries() {
     assert!(req.op_summaries[0].contains("replace_module_path"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn approval_requirement_display() {
     assert_eq!(
@@ -2052,10 +2150,9 @@ fn approval_requirement_display() {
     );
 }
 
-use std::path::Path;
-
 // ─── Capability monotonicity proof tests (bd-k5q5.9.5.2) ───────────────────
 
+#[cfg(feature = "experimental-controllers")]
 fn graph_with_signals(id: &str, signals: Vec<IntentSignal>) -> IntentGraph {
     IntentGraph {
         extension_id: id.to_string(),
@@ -2063,6 +2160,7 @@ fn graph_with_signals(id: &str, signals: Vec<IntentSignal>) -> IntentGraph {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_identical_is_monotonic() {
     let before = graph_with_signals(
@@ -2081,6 +2179,7 @@ fn cap_proof_identical_is_monotonic() {
     assert_eq!(report.added_count, 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_removed_is_monotonic() {
     let before = graph_with_signals(
@@ -2102,6 +2201,7 @@ fn cap_proof_removed_is_monotonic() {
     assert_eq!(report.added_count, 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_added_is_escalation() {
     let before = graph_with_signals(
@@ -2127,6 +2227,7 @@ fn cap_proof_added_is_escalation() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_empty_to_empty_is_monotonic() {
     let before = graph_with_signals("ext-d", vec![]);
@@ -2138,6 +2239,7 @@ fn cap_proof_empty_to_empty_is_monotonic() {
     assert_eq!(report.added_count, 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_empty_to_nonempty_is_escalation() {
     let before = graph_with_signals("ext-e", vec![]);
@@ -2150,6 +2252,7 @@ fn cap_proof_empty_to_nonempty_is_escalation() {
     assert_eq!(report.added_count, 1);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_nonempty_to_empty_is_monotonic() {
     let before = graph_with_signals(
@@ -2165,6 +2268,7 @@ fn cap_proof_nonempty_to_empty_is_monotonic() {
     assert_eq!(report.removed_count, 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_mixed_add_remove_is_escalation() {
     let before = graph_with_signals(
@@ -2188,6 +2292,7 @@ fn cap_proof_mixed_add_remove_is_escalation() {
     assert_eq!(report.added_count, 1);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_delta_display() {
     let retained = CapabilityDelta::Retained(IntentSignal::RegistersTool("x".to_string()));
@@ -2198,6 +2303,7 @@ fn cap_proof_delta_display() {
     assert_eq!(added.to_string(), "added: flag:z");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_delta_is_methods() {
     let r = CapabilityDelta::Retained(IntentSignal::RegistersTool("a".to_string()));
@@ -2214,6 +2320,7 @@ fn cap_proof_delta_is_methods() {
     assert!(!a.is_retained());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_verdict_display() {
     assert_eq!(
@@ -2226,6 +2333,7 @@ fn cap_proof_verdict_display() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn cap_proof_preserves_extension_id() {
     let before = graph_with_signals("my-extension-123", vec![]);
@@ -2236,6 +2344,7 @@ fn cap_proof_preserves_extension_id() {
 
 // ─── Hostcall parity and semantic delta proof tests (bd-k5q5.9.5.3) ────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_surface_from_tool_registration() {
     let graph = graph_with_signals(
@@ -2250,6 +2359,7 @@ fn hostcall_surface_from_tool_registration() {
     assert_eq!(surface.len(), 1); // Both map to Register
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_surface_from_events() {
     let graph = graph_with_signals(
@@ -2260,6 +2370,7 @@ fn hostcall_surface_from_events() {
     assert!(surface.contains(&HostcallCategory::Events("on_message".to_string())));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_surface_from_session_capability() {
     let graph = graph_with_signals(
@@ -2270,6 +2381,7 @@ fn hostcall_surface_from_session_capability() {
     assert!(surface.contains(&HostcallCategory::Session("*".to_string())));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_surface_from_tool_capability() {
     let graph = graph_with_signals(
@@ -2280,6 +2392,7 @@ fn hostcall_surface_from_tool_capability() {
     assert!(surface.contains(&HostcallCategory::Tool("*".to_string())));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_category_display() {
     assert_eq!(
@@ -2297,6 +2410,7 @@ fn hostcall_category_display() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_equivalent_no_changes() {
     let before = graph_with_signals(
@@ -2314,6 +2428,7 @@ fn semantic_parity_equivalent_no_changes() {
     assert_eq!(report.drift_severity, SemanticDriftSeverity::None);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_acceptable_drift_on_removal() {
     let before = graph_with_signals(
@@ -2336,6 +2451,7 @@ fn semantic_parity_acceptable_drift_on_removal() {
     assert_eq!(report.verdict, SemanticParityVerdict::AcceptableDrift);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_divergent_on_expansion() {
     let before = graph_with_signals(
@@ -2355,6 +2471,7 @@ fn semantic_parity_divergent_on_expansion() {
     assert_eq!(report.expanded_count, 1);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_low_drift_with_aggressive_ops() {
     let before = graph_with_signals("ext-o", vec![IntentSignal::RegistersTool("t".to_string())]);
@@ -2369,6 +2486,7 @@ fn semantic_parity_low_drift_with_aggressive_ops() {
     assert_eq!(report.drift_severity, SemanticDriftSeverity::Low);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_medium_drift_with_many_stubs() {
     let before = graph_with_signals("ext-p", vec![IntentSignal::RegistersTool("t".to_string())]);
@@ -2394,6 +2512,7 @@ fn semantic_parity_medium_drift_with_many_stubs() {
     assert_eq!(report.drift_severity, SemanticDriftSeverity::Medium);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_high_drift_with_expansion() {
     let before = graph_with_signals("ext-q", vec![]);
@@ -2406,6 +2525,7 @@ fn semantic_parity_high_drift_with_expansion() {
     assert_eq!(report.drift_severity, SemanticDriftSeverity::High);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_verdict_display() {
     assert_eq!(SemanticParityVerdict::Equivalent.to_string(), "equivalent");
@@ -2416,6 +2536,7 @@ fn semantic_parity_verdict_display() {
     assert_eq!(SemanticParityVerdict::Divergent.to_string(), "divergent");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_drift_severity_display() {
     assert_eq!(SemanticDriftSeverity::None.to_string(), "none");
@@ -2424,6 +2545,7 @@ fn semantic_drift_severity_display() {
     assert_eq!(SemanticDriftSeverity::High.to_string(), "high");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_drift_severity_is_acceptable() {
     assert!(SemanticDriftSeverity::None.is_acceptable());
@@ -2432,6 +2554,7 @@ fn semantic_drift_severity_is_acceptable() {
     assert!(!SemanticDriftSeverity::High.is_acceptable());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_report_expansions() {
     let before = graph_with_signals("ext-r", vec![IntentSignal::RegistersTool("a".to_string())]);
@@ -2448,6 +2571,7 @@ fn semantic_parity_report_expansions() {
     assert_eq!(expansions.len(), 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_preserves_extension_id() {
     let before = graph_with_signals("my-ext-456", vec![]);
@@ -2456,6 +2580,7 @@ fn semantic_parity_preserves_extension_id() {
     assert_eq!(report.extension_id, "my-ext-456");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn semantic_parity_safe_ops_no_drift() {
     let before = graph_with_signals("ext-s", vec![IntentSignal::RegistersTool("t".to_string())]);
@@ -2476,6 +2601,7 @@ fn semantic_parity_safe_ops_no_drift() {
     assert_eq!(report.drift_severity, SemanticDriftSeverity::None);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_delta_display() {
     let r = HostcallDelta::Retained(HostcallCategory::Register);
@@ -2484,6 +2610,7 @@ fn hostcall_delta_display() {
     assert_eq!(a.to_string(), "added: events:on_start");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn hostcall_delta_is_expansion() {
     let r = HostcallDelta::Retained(HostcallCategory::Register);
@@ -2496,6 +2623,7 @@ fn hostcall_delta_is_expansion() {
 
 // ─── Conformance replay and golden checksum tests (bd-k5q5.9.5.4) ──────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn checksum_deterministic() {
     let content = b"hello world";
@@ -2506,6 +2634,7 @@ fn checksum_deterministic() {
     assert_eq!(a.len(), 64); // 256-bit hex = 64 chars
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn checksum_differs_for_different_content() {
     let a = compute_artifact_checksum(b"alpha");
@@ -2513,6 +2642,7 @@ fn checksum_differs_for_different_content() {
     assert_ne!(a, b);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn golden_manifest_build() {
     let artifacts: &[(&str, &[u8])] = &[
@@ -2538,6 +2668,7 @@ fn golden_manifest_build() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn golden_manifest_order_is_deterministic() {
     let artifacts_a: &[(&str, &[u8])] = &[
@@ -2555,6 +2686,7 @@ fn golden_manifest_order_is_deterministic() {
     assert_eq!(manifest_a.entries, manifest_b.entries);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn golden_manifest_verify_entry_match() {
     let content = b"const x = 42;";
@@ -2562,18 +2694,21 @@ fn golden_manifest_verify_entry_match() {
     assert_eq!(manifest.verify_entry("index.ts", content), Some(true));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn golden_manifest_verify_entry_mismatch() {
     let manifest = build_golden_manifest("ext-c", &[("index.ts", b"original")], 0);
     assert_eq!(manifest.verify_entry("index.ts", b"tampered"), Some(false));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn golden_manifest_verify_entry_not_found() {
     let manifest = build_golden_manifest("ext-d", &[("index.ts", b"code")], 0);
     assert_eq!(manifest.verify_entry("missing.ts", b"code"), None);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn replay_no_fixtures_is_acceptable() {
     let report = replay_conformance_fixtures("ext-e", &[]);
@@ -2582,6 +2717,7 @@ fn replay_no_fixtures_is_acceptable() {
     assert_eq!(report.total_count, 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn replay_all_pass() {
     let fixtures = vec![
@@ -2605,6 +2741,7 @@ fn replay_all_pass() {
     assert_eq!(report.total_count, 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn replay_some_fail() {
     let fixtures = vec![
@@ -2628,6 +2765,7 @@ fn replay_some_fail() {
     assert_eq!(report.total_count, 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn replay_verdict_display() {
     assert_eq!(ConformanceReplayVerdict::Pass.to_string(), "pass");
@@ -2638,6 +2776,7 @@ fn replay_verdict_display() {
     );
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn verification_bundle_all_pass() {
     let intent = graph_with_signals("ext-h", vec![IntentSignal::RegistersTool("t".to_string())]);
@@ -2658,6 +2797,7 @@ fn verification_bundle_all_pass() {
     assert!(bundle.failure_reasons().is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn verification_bundle_structural_fail() {
     let intent = graph_with_signals("ext-i", vec![]);
@@ -2683,6 +2823,7 @@ fn verification_bundle_structural_fail() {
     assert!(reasons[0].contains("structural"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn verification_bundle_capability_escalation() {
     let before = graph_with_signals("ext-j", vec![]);
@@ -2708,6 +2849,7 @@ fn verification_bundle_capability_escalation() {
     assert!(reasons.iter().any(|r| r.contains("capability")));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn verification_bundle_conformance_fail() {
     let intent = graph_with_signals("ext-k", vec![]);
@@ -2735,6 +2877,7 @@ fn verification_bundle_conformance_fail() {
     assert!(reasons.iter().any(|r| r.contains("conformance")));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn verification_bundle_multiple_failures() {
     let before = graph_with_signals("ext-l", vec![]);
@@ -2772,6 +2915,7 @@ fn verification_bundle_multiple_failures() {
 
 // ─── Overlay artifact format and lifecycle tests (bd-k5q5.9.6.1) ───────────
 
+#[cfg(feature = "experimental-controllers")]
 fn make_overlay(state: OverlayState, verified: bool) -> OverlayArtifact {
     OverlayArtifact {
         overlay_id: "ovl-001".to_string(),
@@ -2788,6 +2932,7 @@ fn make_overlay(state: OverlayState, verified: bool) -> OverlayArtifact {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_state_display() {
     assert_eq!(OverlayState::Staged.to_string(), "staged");
@@ -2797,6 +2942,7 @@ fn overlay_state_display() {
     assert_eq!(OverlayState::Superseded.to_string(), "superseded");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_state_is_active() {
     assert!(!OverlayState::Staged.is_active());
@@ -2806,6 +2952,7 @@ fn overlay_state_is_active() {
     assert!(!OverlayState::Superseded.is_active());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_state_is_terminal() {
     assert!(!OverlayState::Staged.is_terminal());
@@ -2815,6 +2962,7 @@ fn overlay_state_is_terminal() {
     assert!(OverlayState::Superseded.is_terminal());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_staged_to_canary() {
     let mut ovl = make_overlay(OverlayState::Staged, true);
@@ -2823,6 +2971,7 @@ fn overlay_transition_staged_to_canary() {
     assert_eq!(ovl.updated_at_ms, 2000);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_staged_to_canary_requires_verification() {
     let mut ovl = make_overlay(OverlayState::Staged, false);
@@ -2830,6 +2979,7 @@ fn overlay_transition_staged_to_canary_requires_verification() {
     assert_eq!(err, OverlayTransitionError::VerificationRequired);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_canary_to_stable() {
     let mut ovl = make_overlay(OverlayState::Canary, true);
@@ -2837,6 +2987,7 @@ fn overlay_transition_canary_to_stable() {
     assert_eq!(ovl.state, OverlayState::Stable);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_canary_to_rollback() {
     let mut ovl = make_overlay(OverlayState::Canary, true);
@@ -2844,6 +2995,7 @@ fn overlay_transition_canary_to_rollback() {
     assert_eq!(ovl.state, OverlayState::RolledBack);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_stable_to_superseded() {
     let mut ovl = make_overlay(OverlayState::Stable, true);
@@ -2851,6 +3003,7 @@ fn overlay_transition_stable_to_superseded() {
     assert_eq!(ovl.state, OverlayState::Superseded);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_invalid() {
     let mut ovl = make_overlay(OverlayState::RolledBack, true);
@@ -2861,6 +3014,7 @@ fn overlay_transition_invalid() {
     ));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn overlay_transition_error_display() {
     let err = OverlayTransitionError::InvalidTransition {
@@ -2874,12 +3028,14 @@ fn overlay_transition_error_display() {
 
 // ─── Canary routing tests (bd-k5q5.9.6.2) ──────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn canary_route_display() {
     assert_eq!(CanaryRoute::Original.to_string(), "original");
     assert_eq!(CanaryRoute::Overlay.to_string(), "overlay");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn canary_config_routes_by_bucket() {
     let config = CanaryConfig {
@@ -2896,6 +3052,7 @@ fn canary_config_routes_by_bucket() {
     assert_eq!(config.route(99), CanaryRoute::Original);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn canary_config_disabled_routes_original() {
     let config = CanaryConfig {
@@ -2907,6 +3064,7 @@ fn canary_config_disabled_routes_original() {
     assert_eq!(config.route(0), CanaryRoute::Original);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn canary_config_full_rollout() {
     let full = CanaryConfig {
@@ -2926,6 +3084,7 @@ fn canary_config_full_rollout() {
     assert!(!partial.is_full_rollout());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn canary_bucket_deterministic() {
     let a = compute_canary_bucket("ext-a", "prod");
@@ -2934,6 +3093,7 @@ fn canary_bucket_deterministic() {
     assert!(a < 100);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn canary_bucket_differs_by_env() {
     let prod = compute_canary_bucket("ext-a", "prod");
@@ -2945,6 +3105,7 @@ fn canary_bucket_differs_by_env() {
 
 // ─── Health/SLO monitor tests (bd-k5q5.9.6.3) ─────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn health_signal_within_threshold() {
     let signal = HealthSignal {
@@ -2955,6 +3116,7 @@ fn health_signal_within_threshold() {
     assert!(signal.is_healthy());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn health_signal_above_threshold() {
     let signal = HealthSignal {
@@ -2965,6 +3127,7 @@ fn health_signal_above_threshold() {
     assert!(!signal.is_healthy());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn health_evaluate_all_healthy() {
     let signals = vec![
@@ -2985,6 +3148,7 @@ fn health_evaluate_all_healthy() {
     assert!(report.violations.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn health_evaluate_with_violation() {
     let signals = vec![
@@ -3006,12 +3170,14 @@ fn health_evaluate_with_violation() {
     assert!(report.violations[0].contains("error_rate"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn slo_verdict_display() {
     assert_eq!(SloVerdict::Healthy.to_string(), "healthy");
     assert_eq!(SloVerdict::Violated.to_string(), "violated");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn auto_rollback_on_violation() {
     let signals = vec![HealthSignal {
@@ -3023,6 +3189,7 @@ fn auto_rollback_on_violation() {
     assert!(should_auto_rollback(&report));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn no_rollback_when_healthy() {
     let signals = vec![HealthSignal {
@@ -3036,6 +3203,7 @@ fn no_rollback_when_healthy() {
 
 // ─── Promotion and rollback workflow tests (bd-k5q5.9.6.4) ─────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn promotion_decision_display() {
     assert_eq!(PromotionDecision::Promote.to_string(), "promote");
@@ -3043,6 +3211,7 @@ fn promotion_decision_display() {
     assert_eq!(PromotionDecision::Rollback.to_string(), "rollback");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn decide_promotion_rollback_on_violation() {
     let signals = vec![HealthSignal {
@@ -3055,6 +3224,7 @@ fn decide_promotion_rollback_on_violation() {
     assert_eq!(decision, PromotionDecision::Rollback);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn decide_promotion_promote_after_window() {
     let health = evaluate_health("ext-b", &[]);
@@ -3062,6 +3232,7 @@ fn decide_promotion_promote_after_window() {
     assert_eq!(decision, PromotionDecision::Promote);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn decide_promotion_hold_during_window() {
     let health = evaluate_health("ext-c", &[]);
@@ -3069,6 +3240,7 @@ fn decide_promotion_hold_during_window() {
     assert_eq!(decision, PromotionDecision::Hold);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn execute_promotion_canary_to_stable() {
     let mut ovl = make_overlay(OverlayState::Canary, true);
@@ -3077,6 +3249,7 @@ fn execute_promotion_canary_to_stable() {
     assert_eq!(ovl.updated_at_ms, 5000);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn execute_rollback_canary_to_rolled_back() {
     let mut ovl = make_overlay(OverlayState::Canary, true);
@@ -3084,6 +3257,7 @@ fn execute_rollback_canary_to_rolled_back() {
     assert_eq!(ovl.state, OverlayState::RolledBack);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn execute_rollback_stable_to_rolled_back() {
     let mut ovl = make_overlay(OverlayState::Stable, true);
@@ -3091,12 +3265,14 @@ fn execute_rollback_stable_to_rolled_back() {
     assert_eq!(ovl.state, OverlayState::RolledBack);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn execute_promotion_from_staged_fails() {
     let mut ovl = make_overlay(OverlayState::Staged, true);
     assert!(execute_promotion(&mut ovl, 8000).is_err());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn full_canary_lifecycle() {
     // staged → canary → stable
@@ -3114,6 +3290,7 @@ fn full_canary_lifecycle() {
 
 // ─── Audit ledger tests (bd-k5q5.9.7.1) ────────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn audit_ledger_starts_empty() {
     let ledger = AuditLedger::new();
@@ -3121,6 +3298,7 @@ fn audit_ledger_starts_empty() {
     assert_eq!(ledger.len(), 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn audit_ledger_append_and_get() {
     let mut ledger = AuditLedger::new();
@@ -3138,6 +3316,7 @@ fn audit_ledger_append_and_get() {
     assert_eq!(entry.kind, AuditEntryKind::Analysis);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn audit_ledger_monotonic_sequence() {
     let mut ledger = AuditLedger::new();
@@ -3167,6 +3346,7 @@ fn audit_ledger_monotonic_sequence() {
     assert_eq!(s3, 2);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn audit_ledger_query_by_extension() {
     let mut ledger = AuditLedger::new();
@@ -3197,6 +3377,7 @@ fn audit_ledger_query_by_extension() {
     assert_eq!(ext_b.len(), 1);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn audit_ledger_query_by_kind() {
     let mut ledger = AuditLedger::new();
@@ -3227,6 +3408,7 @@ fn audit_ledger_query_by_kind() {
     assert_eq!(rollbacks.len(), 1);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn audit_entry_kind_display() {
     assert_eq!(AuditEntryKind::Analysis.to_string(), "analysis");
@@ -3241,6 +3423,7 @@ fn audit_entry_kind_display() {
 
 // ─── Telemetry tests (bd-k5q5.9.7.2) ───────────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn telemetry_collector_starts_empty() {
     let collector = TelemetryCollector::new();
@@ -3248,6 +3431,7 @@ fn telemetry_collector_starts_empty() {
     assert_eq!(collector.len(), 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn telemetry_collector_record_and_count() {
     let mut collector = TelemetryCollector::new();
@@ -3259,6 +3443,7 @@ fn telemetry_collector_record_and_count() {
     assert_eq!(collector.count(TelemetryMetric::OverlayPromoted), 0);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn telemetry_collector_sum() {
     let mut collector = TelemetryCollector::new();
@@ -3268,6 +3453,7 @@ fn telemetry_collector_sum() {
     assert!((total - 400.0).abs() < f64::EPSILON);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn telemetry_metric_display() {
     assert_eq!(
@@ -3286,6 +3472,7 @@ fn telemetry_metric_display() {
 
 // ─── Operator CLI inspect/explain/diff tests (bd-k5q5.9.7.3) ───────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn inspection_record_from_ledger() {
     let mut ledger = AuditLedger::new();
@@ -3311,6 +3498,7 @@ fn inspection_record_from_ledger() {
     assert_eq!(record.verification_summary, "all proofs passed");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn inspection_record_no_gating() {
     let ledger = AuditLedger::new();
@@ -3321,6 +3509,7 @@ fn inspection_record_no_gating() {
     assert_eq!(record.verification_summary, "one or more proofs failed");
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn explain_gating_output() {
     let intent = graph_with_signals("ext-c", vec![IntentSignal::RegistersTool("t".to_string())]);
@@ -3336,6 +3525,7 @@ fn explain_gating_output() {
     assert!(lines[0].contains("Decision:"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn format_proposal_diff_output() {
     let proposal = make_safe_proposal("dist_to_src_v1", "./dist/a.js", "./src/a.ts");
@@ -3346,6 +3536,7 @@ fn format_proposal_diff_output() {
 
 // ─── Forensic bundle tests (bd-k5q5.9.7.4) ─────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn forensic_bundle_basic() {
     let mut ledger = AuditLedger::new();
@@ -3392,6 +3583,7 @@ fn forensic_bundle_basic() {
     assert_eq!(bundle.exported_at_ms, 9000);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn forensic_bundle_with_overlay() {
     let ovl = make_overlay(OverlayState::Canary, true);
@@ -3418,6 +3610,7 @@ fn forensic_bundle_with_overlay() {
     assert!(bundle.has_health_data());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn forensic_bundle_with_verification() {
     let intent = graph_with_signals("ext-a", vec![]);
@@ -3452,18 +3645,21 @@ fn forensic_bundle_with_verification() {
 
 // ─── Architecture ADR tests (bd-k5q5.9.8.1) ────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn adr_has_id_and_title() {
     assert!(!LisrAdr::ID.is_empty());
     assert!(!LisrAdr::TITLE.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn adr_has_context_and_decision() {
     assert!(!LisrAdr::CONTEXT.is_empty());
     assert!(!LisrAdr::DECISION.is_empty());
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn adr_documents_threats() {
     assert!(LisrAdr::THREATS.len() >= 6);
@@ -3472,12 +3668,14 @@ fn adr_documents_threats() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn adr_has_fail_closed_rationale() {
     assert!(!LisrAdr::FAIL_CLOSED_RATIONALE.is_empty());
     assert!(LisrAdr::FAIL_CLOSED_RATIONALE.contains("denial"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn adr_documents_invariants() {
     assert!(LisrAdr::INVARIANTS.len() >= 6);
@@ -3488,6 +3686,7 @@ fn adr_documents_invariants() {
 
 // ─── Operator playbook tests (bd-k5q5.9.8.2) ──────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn playbook_mode_guidance_covers_all_modes() {
     let modes: Vec<&str> = OperatorPlaybook::MODE_GUIDANCE
@@ -3500,11 +3699,13 @@ fn playbook_mode_guidance_covers_all_modes() {
     assert!(modes.contains(&"AutoStrict"));
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn playbook_canary_procedure_has_steps() {
     assert!(OperatorPlaybook::CANARY_PROCEDURE.len() >= 5);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn playbook_incident_response_has_steps() {
     assert!(OperatorPlaybook::INCIDENT_RESPONSE.len() >= 5);
@@ -3513,11 +3714,13 @@ fn playbook_incident_response_has_steps() {
 
 // ─── Developer guide tests (bd-k5q5.9.8.3) ─────────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn developer_guide_add_rule_checklist() {
     assert!(DeveloperGuide::ADD_RULE_CHECKLIST.len() >= 8);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn developer_guide_anti_patterns() {
     assert!(DeveloperGuide::ANTI_PATTERNS.len() >= 4);
@@ -3527,6 +3730,7 @@ fn developer_guide_anti_patterns() {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn developer_guide_testing_expectations() {
     assert!(DeveloperGuide::TESTING_EXPECTATIONS.len() >= 5);
@@ -3534,6 +3738,7 @@ fn developer_guide_testing_expectations() {
 
 // ─── Governance checklist tests (bd-k5q5.9.8.4) ────────────────────────────
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn governance_checklist_all_pass() {
     let report = run_governance_checklist();
@@ -3549,6 +3754,7 @@ fn governance_checklist_all_pass() {
     assert!(report.total_count >= 6);
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[test]
 fn governance_report_has_expected_checks() {
     let report = run_governance_checklist();

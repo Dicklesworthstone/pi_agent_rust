@@ -1283,11 +1283,48 @@ pub(super) fn hostcall_opcode_context_for_params(method: &str, params: &Value) -
 }
 
 pub(super) fn hostcall_io_uring_context_for_request(request: &HostcallRequest) -> Value {
+    let capability = request.required_capability().trim().to_ascii_lowercase();
+    let capability_class = match capability.as_str() {
+        "read" | "write" | "filesystem" | "fs" => "filesystem",
+        "http" | "network" => "network",
+        "exec" | "execution" => "execution",
+        "session" => "session",
+        "events" => "events",
+        "env" | "environment" => "environment",
+        "tool" => "tool",
+        "ui" => "ui",
+        "log" | "telemetry" => "telemetry",
+        _ => "unknown",
+    };
+    let io_hint = match &request.kind {
+        HostcallKind::Http => "io_heavy",
+        HostcallKind::Exec { .. } => "cpu_bound",
+        HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("read")
+                || name.eq_ignore_ascii_case("write")
+                || name.eq_ignore_ascii_case("edit")
+                || name.eq_ignore_ascii_case("grep")
+                || name.eq_ignore_ascii_case("find")
+                || name.eq_ignore_ascii_case("ls")
+            {
+                "io_heavy"
+            } else if name.eq_ignore_ascii_case("bash") {
+                "cpu_bound"
+            } else {
+                "unknown"
+            }
+        }
+        HostcallKind::Session { .. }
+        | HostcallKind::Ui { .. }
+        | HostcallKind::Events { .. }
+        | HostcallKind::Log => "unknown",
+    };
     json!({
         HOSTCALL_IO_URING_CONTEXT_KEY: {
             "schema": HOSTCALL_IO_URING_CONTEXT_SCHEMA_VERSION,
-            "capability_class": request.io_uring_capability_class(),
-            "io_hint": request.io_uring_io_hint(),
+            "capability_class": capability_class,
+            "io_hint": io_hint,
         }
     })
 }

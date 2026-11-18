@@ -92,3 +92,5 @@ tools:
       # pattern then reappeared in two modules written after they were fixed.
       # Seconds to run, and it is the only thing that stops a twelfth.
       - python3 scripts/check_fixture_read_patience.py
+      - python3 scripts/check_readme_evidence_freshness.py --structural-only
+      - python3 scripts/check_dsr_contract_sync.py --check-host-if-present

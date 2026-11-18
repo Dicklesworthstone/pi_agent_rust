@@ -575,6 +575,10 @@ loom-tests = []
 # excluded from default test gates because scheduler-sensitive coverage should
 # use deterministic clocks.
 manual-timing-tests = []
+# Opt-in research and offline evaluation controllers (ExtensionDispatcher,
+# VOI planner, IPS/WIS/DR off-policy evaluator, IntentGraph/LISR, and
+# io_uring lane policy models) that are not wired into the default shipping CLI.
+experimental-controllers = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [[test]]

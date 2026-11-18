@@ -1,3 +1,5 @@
+#![cfg(feature = "experimental-controllers")]
+
 use pi::extension_scoring::{
     OpeEvaluatorConfig, OpeGateReason, OpeTraceSample, evaluate_off_policy,
 };

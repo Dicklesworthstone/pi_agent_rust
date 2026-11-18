@@ -1,4 +1,6 @@
-use chrono::{DateTime, Duration, Utc};
+#[cfg(any(test, feature = "experimental-controllers"))]
+use chrono::Duration;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -767,6 +769,7 @@ fn build_histogram(items: &[ScoredCandidate]) -> Vec<ScoreHistogramBucket> {
         .collect()
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiSkipReason {
@@ -777,6 +780,7 @@ pub enum VoiSkipReason {
     BelowUtilityFloor,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiCandidate {
@@ -789,10 +793,12 @@ pub struct VoiCandidate {
     pub enabled: bool,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn default_voi_candidate_enabled() -> bool {
     true
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiPlannerConfig {
@@ -806,6 +812,7 @@ pub struct VoiPlannerConfig {
     pub min_utility_score: Option<f64>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl Default for VoiPlannerConfig {
     fn default() -> Self {
         Self {
@@ -818,6 +825,7 @@ impl Default for VoiPlannerConfig {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiPlannedCandidate {
@@ -828,6 +836,7 @@ pub struct VoiPlannedCandidate {
     pub cumulative_overhead_ms: u32,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiSkippedCandidate {
@@ -835,6 +844,7 @@ pub struct VoiSkippedCandidate {
     pub reason: VoiSkipReason,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiPlan {
@@ -844,6 +854,7 @@ pub struct VoiPlan {
     pub remaining_overhead_ms: u32,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 pub fn plan_voi_candidates(
     candidates: &[VoiCandidate],
     now: DateTime<Utc>,
@@ -936,6 +947,7 @@ pub fn plan_voi_candidates(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone)]
 struct VoiSelectionState {
     utility_score: f64,
@@ -943,6 +955,7 @@ struct VoiSelectionState {
     selected_indices: Vec<usize>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn select_voi_candidate_indices(
     eligible: &[VoiCandidate],
     overhead_budget_ms: u32,
@@ -1008,6 +1021,7 @@ fn select_voi_candidate_indices(
         .unwrap_or_default()
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn insert_voi_selection_state(
     frontier: &mut BTreeMap<u32, VoiSelectionState>,
     candidate: VoiSelectionState,
@@ -1041,6 +1055,7 @@ fn insert_voi_selection_state(
     frontier.insert(candidate.overhead_ms, candidate);
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn voi_selection_state_dominates(left: &VoiSelectionState, right: &VoiSelectionState) -> bool {
     const EPSILON: f64 = 1.0e-9;
 
@@ -1051,6 +1066,7 @@ fn voi_selection_state_dominates(left: &VoiSelectionState, right: &VoiSelectionS
                     || left.selected_indices <= right.selected_indices)))
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn compare_voi_selection_states(
     left: &VoiSelectionState,
     right: &VoiSelectionState,
@@ -1062,6 +1078,7 @@ fn compare_voi_selection_states(
         .then_with(|| right.selected_indices.cmp(&left.selected_indices))
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn compare_voi_candidates_desc(left: &VoiCandidate, right: &VoiCandidate) -> std::cmp::Ordering {
     utility_per_ms(right)
         .partial_cmp(&utility_per_ms(left))
@@ -1075,6 +1092,7 @@ fn compare_voi_candidates_desc(left: &VoiCandidate, right: &VoiCandidate) -> std
         .then_with(|| left.id.cmp(&right.id))
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn evaluate_candidate_freshness(
     last_seen_at: Option<&str>,
     now: DateTime<Utc>,
@@ -1101,6 +1119,7 @@ fn evaluate_candidate_freshness(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn normalized_utility(value: f64) -> f64 {
     if value.is_finite() {
         value.max(0.0)
@@ -1109,6 +1128,7 @@ const fn normalized_utility(value: f64) -> f64 {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn utility_per_ms(candidate: &VoiCandidate) -> f64 {
     if candidate.estimated_overhead_ms == 0 {
         0.0
@@ -1490,6 +1510,7 @@ fn usize_to_f64(value: usize) -> f64 {
     f64::from(bounded)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpeGateReason {
@@ -1500,6 +1521,7 @@ pub enum OpeGateReason {
     ExcessiveRegret,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpeTraceSample {
@@ -1515,6 +1537,7 @@ pub struct OpeTraceSample {
     pub context_lineage: Option<String>,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpeEvaluatorConfig {
@@ -1525,6 +1548,7 @@ pub struct OpeEvaluatorConfig {
     pub max_regret_delta: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 impl Default for OpeEvaluatorConfig {
     fn default() -> Self {
         Self {
@@ -1537,6 +1561,7 @@ impl Default for OpeEvaluatorConfig {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpeEstimatorSummary {
@@ -1547,6 +1572,7 @@ pub struct OpeEstimatorSummary {
     pub ci_high: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpeDiagnostics {
@@ -1560,6 +1586,7 @@ pub struct OpeDiagnostics {
     pub effective_sample_size: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpeGateDecision {
@@ -1567,6 +1594,7 @@ pub struct OpeGateDecision {
     pub reason: OpeGateReason,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpeEvaluationReport {
@@ -1579,6 +1607,7 @@ pub struct OpeEvaluationReport {
     pub gate: OpeGateDecision,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[derive(Debug, Clone, Copy)]
 struct NormalizedOpeSample {
     importance_weight: f64,
@@ -1587,6 +1616,7 @@ struct NormalizedOpeSample {
     direct_method: f64,
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 pub fn evaluate_off_policy(
     samples: &[OpeTraceSample],
@@ -1725,6 +1755,7 @@ pub fn evaluate_off_policy(
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn normalize_ope_sample(
     sample: &OpeTraceSample,
     max_importance_weight: f64,
@@ -1769,6 +1800,7 @@ fn normalize_ope_sample(
     ))
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::cast_precision_loss)]
 fn summarize_estimator(effects: &[f64], confidence_z: f64) -> OpeEstimatorSummary {
     if effects.is_empty() {
@@ -1841,6 +1873,7 @@ fn summarize_estimator(effects: &[f64], confidence_z: f64) -> OpeEstimatorSummar
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 #[allow(clippy::cast_precision_loss)]
 fn arithmetic_mean(values: &[f64]) -> f64 {
     if values.is_empty() {
@@ -1870,6 +1903,7 @@ const fn finite_or_zero(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn positive_finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() && value > 0.0 {
         value
@@ -1878,6 +1912,7 @@ fn positive_finite_or(value: f64, fallback: f64) -> f64 {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn unbounded_uncertainty_summary(estimate: f64) -> OpeEstimatorSummary {
     OpeEstimatorSummary {
         estimate,
@@ -1888,10 +1923,12 @@ fn unbounded_uncertainty_summary(estimate: f64) -> OpeEstimatorSummary {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn estimator_has_unbounded_uncertainty(summary: &OpeEstimatorSummary) -> bool {
     is_saturated_f64(summary.standard_error)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn saturating_add(left: f64, right: f64) -> f64 {
     let sum = left + right;
     if sum.is_finite() {
@@ -1907,10 +1944,12 @@ fn saturating_add(left: f64, right: f64) -> f64 {
     }
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 fn saturating_difference(left: f64, right: f64) -> f64 {
     saturating_add(left, -right)
 }
 
+#[cfg(any(test, feature = "experimental-controllers"))]
 const fn is_saturated_f64(value: f64) -> bool {
     value >= f64::MAX / 2.0
 }

@@ -1434,6 +1434,59 @@ fn check_swarm_dsr_config(cwd: &Path, findings: &mut Vec<Finding>) {
     findings.push(evaluate_dsr_config_drift(cwd, &host_dir));
 }
 
+fn extract_dsr_tool_checks(yaml_text: &str, tool: &str) -> Vec<String> {
+    let mut in_tools = false;
+    let mut in_target_tool = false;
+    let mut tool_indent = 0usize;
+    let mut in_checks = false;
+    let mut checks_indent = 0usize;
+    let mut checks = Vec::new();
+
+    for raw_line in yaml_text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = raw_line.len() - raw_line.trim_start().len();
+        if indent == 0 {
+            in_tools = trimmed == "tools:";
+            in_target_tool = false;
+            in_checks = false;
+            continue;
+        }
+        if !in_tools {
+            continue;
+        }
+        if !in_target_tool {
+            if trimmed == format!("{tool}:") || trimmed.starts_with(&format!("{tool}: ")) {
+                in_target_tool = true;
+                tool_indent = indent;
+            }
+            continue;
+        }
+        if indent <= tool_indent {
+            break;
+        }
+        if !in_checks {
+            if trimmed == "checks:" {
+                in_checks = true;
+                checks_indent = indent;
+            } else if trimmed == "checks: []" {
+                return Vec::new();
+            }
+            continue;
+        }
+        if indent <= checks_indent {
+            in_checks = false;
+            continue;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            checks.push(item.trim().to_string());
+        }
+    }
+    checks
+}
+
 fn evaluate_dsr_config_drift(cwd: &Path, host_dsr_dir: &Path) -> Finding {
     let repo_registry_path = cwd.join(".dsr/repos.yaml");
     let repo_authority_path = cwd.join(".dsr/repos.d/pi_agent_rust.yaml");
@@ -1455,6 +1508,7 @@ fn evaluate_dsr_config_drift(cwd: &Path, host_dsr_dir: &Path) -> Finding {
     let host_registry_path = host_dsr_dir.join("repos.yaml");
     let host_authority_path = host_dsr_dir.join("repos.d/pi_agent_rust.yaml");
     let mut drift_reasons = Vec::new();
+    let repo_checks = extract_dsr_tool_checks(&repo_registry, "pi_agent_rust");
 
     match std::fs::read_to_string(&host_registry_path) {
         Ok(host_registry) => {
@@ -1463,6 +1517,21 @@ fn evaluate_dsr_config_drift(cwd: &Path, host_dsr_dir: &Path) -> Finding {
                     "{} is missing tools.pi_agent_rust",
                     host_registry_path.display()
                 ));
+            } else {
+                let host_checks = extract_dsr_tool_checks(&host_registry, "pi_agent_rust");
+                if host_checks.is_empty() {
+                    drift_reasons.push(format!(
+                        "{} is missing checks under tools.pi_agent_rust",
+                        host_registry_path.display()
+                    ));
+                } else if !repo_checks.is_empty() && host_checks != repo_checks {
+                    drift_reasons.push(format!(
+                        "{} checks under tools.pi_agent_rust drifted from .dsr/repos.yaml (host={}, repo={})",
+                        host_registry_path.display(),
+                        host_checks.len(),
+                        repo_checks.len()
+                    ));
+                }
             }
         }
         Err(_) => {
@@ -15021,6 +15090,44 @@ export default function(pi) {
             );
             assert!(detail.contains("build_profile drifted"), "{detail}");
             assert!(detail.contains("workflow key"), "{detail}");
+
+            // Planted negative 2: host registry has pi_agent_rust with 0 checks or drifted checks
+            std::fs::write(
+                host_dir.path().join("repos.yaml"),
+                "tools:\n  pi_agent_rust:\n    checks: []\n",
+            )
+            .unwrap();
+            std::fs::write(
+                host_dir.path().join("repos.d/pi_agent_rust.yaml"),
+                checked_in_authority,
+            )
+            .unwrap();
+            let empty_checks = evaluate_dsr_config_drift(repo_dir.path(), host_dir.path());
+            assert_eq!(empty_checks.severity, Severity::Warn);
+            assert!(
+                empty_checks
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("missing checks under tools.pi_agent_rust"),
+                "{empty_checks:?}"
+            );
+
+            std::fs::write(
+                host_dir.path().join("repos.yaml"),
+                "tools:\n  pi_agent_rust:\n    checks:\n      - cargo fmt --check\n",
+            )
+            .unwrap();
+            let stale_checks = evaluate_dsr_config_drift(repo_dir.path(), host_dir.path());
+            assert_eq!(stale_checks.severity, Severity::Warn);
+            assert!(
+                stale_checks
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("checks under tools.pi_agent_rust drifted"),
+                "{stale_checks:?}"
+            );
 
             // Positive: synced host config passes cleanly
             std::fs::write(host_dir.path().join("repos.yaml"), checked_in_repos).unwrap();

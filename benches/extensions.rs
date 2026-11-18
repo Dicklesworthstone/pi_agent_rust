@@ -9,6 +9,7 @@ mod bench_env;
 
 use std::hint::black_box;
 use std::path::PathBuf;
+#[cfg(feature = "experimental-controllers")]
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,9 +131,11 @@ impl pi::extensions::ExtensionSession for BenchSession {
     }
 }
 
+#[cfg(feature = "experimental-controllers")]
 #[derive(Default)]
 struct BenchUiHandler;
 
+#[cfg(feature = "experimental-controllers")]
 #[async_trait::async_trait]
 impl pi::extension_dispatcher::ExtensionUiHandler for BenchUiHandler {
     async fn request_ui(
@@ -396,6 +399,7 @@ fn bench_protocol_parse_and_validate(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "experimental-controllers")]
 fn bench_protocol_dispatch(c: &mut Criterion) {
     let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let runtime = Rc::new(block_on(PiJsRuntime::new()).expect("create PiJsRuntime"));
@@ -436,6 +440,9 @@ fn bench_protocol_dispatch(c: &mut Criterion) {
     });
     group.finish();
 }
+
+#[cfg(not(feature = "experimental-controllers"))]
+fn bench_protocol_dispatch(_c: &mut Criterion) {}
 
 fn bench_extension_load_init(c: &mut Criterion) {
     let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
