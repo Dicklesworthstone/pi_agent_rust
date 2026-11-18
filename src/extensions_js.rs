@@ -24050,7 +24050,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         PREBAKED_BRIDGE_MODULE_NAME,
                         None,
                     )
-                    .and_then(|module| module.eval())
+                    .and_then(rquickjs::Module::eval)
                     .and_then(|(_evaluated, promise)| promise.finish::<()>())
                 } else {
                     ctx.eval::<(), _>(pi_bridge_js())
@@ -46802,8 +46802,7 @@ export default function register(pi) {
         assert_eq!(prebaked_outcome, expected_outcome);
         assert!(
             prebaked_counters.0 > 0,
-            "prebaked mode should record virtual module cache hits, got {:?}",
-            prebaked_counters
+            "prebaked mode should record virtual module cache hits, got {prebaked_counters:?}"
         );
     }
 }

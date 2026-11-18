@@ -1512,12 +1512,7 @@ fn evaluate_dsr_config_drift(cwd: &Path, host_dsr_dir: &Path) -> Finding {
 
     match std::fs::read_to_string(&host_registry_path) {
         Ok(host_registry) => {
-            if !host_registry.contains("pi_agent_rust:") {
-                drift_reasons.push(format!(
-                    "{} is missing tools.pi_agent_rust",
-                    host_registry_path.display()
-                ));
-            } else {
+            if host_registry.contains("pi_agent_rust:") {
                 let host_checks = extract_dsr_tool_checks(&host_registry, "pi_agent_rust");
                 if host_checks.is_empty() {
                     drift_reasons.push(format!(
@@ -1532,6 +1527,11 @@ fn evaluate_dsr_config_drift(cwd: &Path, host_dsr_dir: &Path) -> Finding {
                         repo_checks.len()
                     ));
                 }
+            } else {
+                drift_reasons.push(format!(
+                    "{} is missing tools.pi_agent_rust",
+                    host_registry_path.display()
+                ));
             }
         }
         Err(_) => {
