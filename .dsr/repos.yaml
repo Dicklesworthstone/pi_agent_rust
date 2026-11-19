@@ -78,10 +78,15 @@ tools:
       - windows/amd64
     checks:
       - cargo fmt --check
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check -j 2 --locked --all-targets --keep-going
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy -j 2 --locked --all-targets --keep-going -- -D warnings
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy -j 2 --locked --lib --bins --test extension_lockfile_provenance --features wasm-host --keep-going -- -D warnings
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols cargo test -j 2 --locked --lib --test extension_lockfile_provenance --features wasm-host --no-fail-fast wasm_host
+      # `--base HEAD --clean-overlay --no-overlay` streams an exact, clean Git
+      # archive of HEAD into an isolated worker staging directory (reaped at
+      # teardown), preventing stale untracked files on shared workers (such as
+      # foreign `node_modules/` directories) or local `.beads/*.db*` sidecars
+      # from contaminating conformance scans or source-authority locks.
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo check -j 2 --locked --all-targets --keep-going
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo clippy -j 2 --locked --all-targets --keep-going -- -D warnings
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo clippy -j 2 --locked --lib --bins --test extension_lockfile_provenance --features wasm-host --keep-going -- -D warnings
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols cargo test -j 2 --locked --lib --test extension_lockfile_provenance --features wasm-host --no-fail-fast wasm_host
       # PI_PROVIDER_REPLAY_GIT_COMMIT is passed because rch does not ship a
       # usable .git to the worker (its exclude_patterns drop .git/index,
       # .git/objects/ and friends), so the provider replay-lineage checks
@@ -89,7 +94,7 @@ tools:
       # `ambiguous_git_commit` — 50 of the ~106 failures this lane used to
       # report. The substitution runs on the operator host, where HEAD is real.
       # See bd-0ngnq and the usage note at the top of tests/provider_streaming.rs.
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py
       # Eleven loopback fixtures treated a socket read timeout as an error and
