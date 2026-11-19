@@ -28,8 +28,10 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   Exposed per-extension persistent `ctx.dataDir` / `pi.dataDir`, wired TTY `render_inline` with configurable cell dimensions, surfaced startup session-recovery diagnostics, and connected all 15 previously inert `AppAction` keybindings (tree navigation, session rename/pin/export/share, retry, reload, thinking toggle, editor launch, background job inspector, subagent overlay).
 - **Segmented `SessionStoreV2` live synchronization.**
   Opt-in `sessionStore: "v2"` (`PI_SESSION_STORE=v2`) atomically maintains `.v2` segments, sidecar offset indexes, manifests, and clean `source-state.json` lineage markers alongside canonical JSONL saves and appends without startup full-replay stalls.
-- **DSR recipe `wasm-host` gates and `pi doctor --only swarm` DSR drift check.**
-  Added `--keep-going` and `--features wasm-host` Clippy/test lanes to `.dsr/repos.yaml`, aligned `.dsr/repos.d/pi_agent_rust.yaml` to `build_profile: dist`, documented all 43 RPC commands in `docs/rpc.md` with an automated parity test, and added host DSR drift detection to `pi doctor`.
+- **DSR recipe `wasm-host` gates, automated DSR contract sync (`check_dsr_contract_sync.py`), and `pi doctor --only swarm` DSR drift check.**
+  Added `--keep-going` and `--features wasm-host` Clippy/test lanes plus `check_readme_evidence_freshness.py` and `check_dsr_contract_sync.py` to `.dsr/repos.yaml` (`11` fail-closed quality checks), aligned `.dsr/repos.d/pi_agent_rust.yaml` to `build_profile: dist`, documented all 43 RPC commands in `docs/rpc.md` with an automated parity test, and added host DSR drift detection to `pi doctor`.
+- **Prebaked QuickJS prelude/shim bytecode bundle and `experimental-controllers` feature gating.**
+  Precompiles the `pi` bridge and built-in virtual Node/`@sinclair/typebox`/`zod` ES modules once per process via `rquickjs::Module::write` + `Bundle` (`PiJsRuntimeConfig::use_prebaked_bytecode`), and gates unreached research controllers (`ExtensionDispatcher`, `VOI`, `IPS/WIS/DR`, `IntentGraph`/LISR, `hostcall_io_uring_lane`) behind the opt-in `experimental-controllers` Cargo feature.
 
 ### Changed
 
@@ -58,6 +60,8 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   Wired real inter-arrival `interval_ms` into `ExtensionManager::record_hostcall_Telemetry`, fixed the inverted `adaptive_alpha` update direction under miscoverage spikes, and eliminated duplicate SHA-256 arena hashing during QuickJS bytecode cache population.
 - **WASM extension slash-command dispatch.**
   `ExtensionManager::execute_interaction_with_abort` now routes `/slash` invocations to loaded WASM components via `WasmExtensionHandle::handle_slash` across FTUI, classic TUI, RPC, and SDK surfaces.
+- **`agent_hub` steering queue `flock` release across concurrent subprocess forks.**
+  `append_steer_line` and `poll_steer_file` now explicitly call `File::unlock` (`LOCK_UN`) via `SteerLockGuard` before closing `.steer.lock`, preventing duplicated descriptors inherited during a concurrent `fork()`-before-`execve()` window from holding the queue lock open.
 - **Installer on a stock Mac.** `install.sh` required an `xz` program before
   extracting a release archive. macOS has none unless Homebrew or MacPorts
   installed one, and its `tar` reads xz without it, so the documented install

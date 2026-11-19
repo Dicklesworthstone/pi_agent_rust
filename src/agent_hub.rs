@@ -767,6 +767,19 @@ fn revival_prompt(prior: &ChildEntry, original_task: &str) -> Result<String> {
     ))
 }
 
+/// Explicit unlock before closing the file descriptor: on Unix, `flock(2)` is
+/// bound to the kernel open file description (`struct file`), so if another
+/// thread spawns a child process (`fork`) while the lock fd is open, closing
+/// `File` alone leaves the kernel lock held until the child calls `execve`,
+/// whereas `File::unlock` (`LOCK_UN`) releases it immediately.
+struct SteerLockGuard(fs::File);
+
+impl Drop for SteerLockGuard {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// The lock inode must never be renamed with the queue: otherwise a writer
 /// that already opened the old inode could append after the reader deleted it.
 /// Opening read/write also permits native Windows file locking.
@@ -814,6 +827,7 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
             ));
         }
     }
+    let queue_lock = SteerLockGuard(queue_lock);
     let mut options = OpenOptions::new();
     options.create(true).read(true).append(true);
     #[cfg(unix)]
@@ -871,6 +885,7 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
             },
         ));
     }
+    drop(queue_lock);
     Ok(())
 }
 
@@ -965,6 +980,7 @@ pub fn poll_steer_file(path: &Path) -> Result<SteerDrain> {
             ));
         }
     }
+    let queue_lock = SteerLockGuard(queue_lock);
     let draining = path.with_extension("draining");
     // There can be at most two batches under this lock: an interrupted
     // drain and the active queue. Skip an empty recovered batch rather than
@@ -1003,6 +1019,7 @@ pub fn poll_steer_file(path: &Path) -> Result<SteerDrain> {
             return Ok(SteerDrain::Messages(messages));
         }
     }
+    drop(queue_lock);
     Ok(SteerDrain::Empty)
 }
 
@@ -1543,6 +1560,7 @@ mod tests {
         let result = rx.recv_timeout(std::time::Duration::from_secs(10));
         // Release before joining even on timeout, so restoring a blocking
         // writer makes this test fail instead of hanging the entire suite.
+        let _ = lock.unlock();
         drop(lock);
         let mut reg = worker.join().expect("hub worker");
         let (blocked, accepted) = result.expect("hub must not wait for the queue lock");
@@ -1648,6 +1666,7 @@ mod tests {
             SteerDrain::Busy
         );
         assert!(child.steer_path.exists());
+        let _ = lock.unlock();
         drop(lock);
         assert_eq!(
             poll_until_ready(&child.steer_path),
@@ -2079,5 +2098,44 @@ mod tests {
         let err = reg.revive(&entry.id).unwrap_err();
         assert!(err.to_string().contains("still running"));
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steer_lock_guard_releases_flock_even_with_duplicated_fd() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let path = temp.path().join("peer-2.steer");
+
+        // Negative control: raw File drop without File::unlock() leaves a Unix
+        // flock active when a concurrent fork() / dup() still holds a second
+        // descriptor to the same kernel open file description.
+        let raw_lock = open_steer_lock(&path).expect("open raw lock");
+        raw_lock.try_lock().expect("acquire raw lock");
+        let inherited_raw = raw_lock.try_clone().expect("dup raw lock fd");
+        drop(raw_lock);
+        let probe = open_steer_lock(&path).expect("open probe lock");
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "raw File close without unlock retains flock across duplicated fd"
+        );
+        inherited_raw.unlock().expect("cleanup raw lock");
+        drop(inherited_raw);
+        drop(probe);
+
+        // Positive contract: SteerLockGuard calls File::unlock() (LOCK_UN)
+        // before closing, releasing the kernel lock immediately even while an
+        // un-exec'd child fd copy remains open.
+        let guarded_file = open_steer_lock(&path).expect("open guarded lock");
+        guarded_file.try_lock().expect("acquire guarded lock");
+        let inherited_fd = guarded_file.try_clone().expect("dup guarded lock fd");
+        let guard = SteerLockGuard(guarded_file);
+        drop(guard);
+
+        let next_writer = open_steer_lock(&path).expect("open next writer lock");
+        next_writer
+            .try_lock()
+            .expect("SteerLockGuard must release flock immediately despite duplicated fd");
+        let _ = next_writer.unlock();
+        drop(inherited_fd);
     }
 }
