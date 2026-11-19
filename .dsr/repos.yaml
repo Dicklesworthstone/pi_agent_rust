@@ -49,13 +49,18 @@
 # and, on a worker that filled completely mid-link,
 #   collect2: fatal error: ld terminated with signal 7 [Bus error]
 # which is a memory-mapped write hitting a full filesystem, not a code fault.
-# Dropping test debuginfo removes the bulk of that tree. Every sibling project
-# on this fleet already does something equivalent: frankenterm runs with
-# CARGO_INCREMENTAL=0 and CARGO_PROFILE_TEST_DEBUG=0, and frankensqlite,
-# frankensim and eidetic_engine_cli all scope to specific packages/tests
-# rather than building every target. The cost is that panic backtraces carry
-# symbol names but not line numbers; re-run a failing binary locally with the
-# default profile when a line number is actually needed. See bd-0iw92.
+# Dropping test debuginfo + ELF symbol tables (`STRIP=symbols`) removes the bulk
+# of that tree (an unstripped `.strtab`+`.symtab` alone adds ~87 MB per test
+# binary across 380+ targets, pushing cold growth past RCH's 40 GiB per-run
+# `DISK_BUDGET` cap). Every sibling project on this fleet already does something
+# equivalent: frankenterm runs with CARGO_INCREMENTAL=0 and
+# CARGO_PROFILE_TEST_DEBUG=0, and frankensqlite, frankensim and
+# eidetic_engine_cli all scope to specific packages/tests rather than building
+# every target. Running the small `wasm-host` test lane before the 380-target
+# `--all-targets` test lane also ensures `--all-targets` does not consume the
+# worker's 73 GiB RCH admission headroom before `wasm-host` starts. Re-run a
+# failing binary locally with the default profile when full backtrace symbols
+# or line numbers are needed. See bd-0iw92.
 
 schema_version: "1.0.0"
 
@@ -76,6 +81,7 @@ tools:
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check -j 2 --locked --all-targets --keep-going
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy -j 2 --locked --all-targets --keep-going -- -D warnings
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy -j 2 --locked --lib --bins --test extension_lockfile_provenance --features wasm-host --keep-going -- -D warnings
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols cargo test -j 2 --locked --lib --test extension_lockfile_provenance --features wasm-host --no-fail-fast wasm_host
       # PI_PROVIDER_REPLAY_GIT_COMMIT is passed because rch does not ship a
       # usable .git to the worker (its exclude_patterns drop .git/index,
       # .git/objects/ and friends), so the provider replay-lineage checks
@@ -83,8 +89,7 @@ tools:
       # `ambiguous_git_commit` — 50 of the ~106 failures this lane used to
       # report. The substitution runs on the operator host, where HEAD is real.
       # See bd-0ngnq and the usage note at the top of tests/provider_streaming.rs.
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=debuginfo CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=debuginfo PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=debuginfo CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=debuginfo cargo test -j 2 --locked --lib --test extension_lockfile_provenance --features wasm-host --no-fail-fast wasm_host
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py
       # Eleven loopback fixtures treated a socket read timeout as an error and
