@@ -13392,16 +13392,25 @@ export const constants = {
   O_TRUNC: 512,
   O_APPEND: 1024,
 };
+let __pi_reset_file_watchers = () => {};
+let __pi_file_watcher_count = () => 0;
+const __pi_fs_date = globalThis.__pi_fs_watch_runtime?.Date ?? Date;
 const __pi_vfs = (() => {
   const state = {
     files: new Map(),
     dirs: new Set(["/"]),
     symlinks: new Map(),
+    metadata: new Map(),
     fds: new Map(),
     nextFd: 100,
+    nextInode: 1,
   };
   const extensionTmpRoot = "/__pi_extension_tmp";
   const windowsPaths = globalThis.process && globalThis.process.platform === "win32";
+  const metadataClock = typeof globalThis.__pi_now_ms_native === "function"
+    ? globalThis.__pi_now_ms_native : Date.now.bind(Date);
+  let lastMetadataClock = -Infinity;
+  let lastMetadataTime = -Infinity;
 
   function childPrefix(path) {
     return path.endsWith("/") ? path : `${path}/`;
@@ -13620,18 +13629,105 @@ const __pi_vfs = (() => {
     return idx < root.length ? root : normalized.slice(0, idx);
   }
 
+  function metadataTime() {
+    const clock = Number(metadataClock());
+    const now = Number.isFinite(clock) ? clock : 0;
+    // Retain sub-millisecond changes within one scheduler tick. Otherwise two
+    // same-size writes are indistinguishable to extension caches and polling.
+    lastMetadataTime = now === lastMetadataClock
+      ? lastMetadataTime + Math.max(0.001, Math.abs(lastMetadataTime) * Number.EPSILON)
+      : now;
+    lastMetadataClock = now;
+    return lastMetadataTime;
+  }
+
+  function ensureMetadata(path, kind, seed = null) {
+    let metadata = state.metadata.get(path);
+    if (metadata) return metadata;
+    const now = metadataTime();
+    metadata = {
+      kind, atimeMs: now, mtimeMs: now, ctimeMs: now, birthtimeMs: now,
+      mode: kind === "dir" ? 0o040755 : kind === "symlink" ? 0o120777 : 0o100644,
+      dev: 0, ino: state.nextInode++, nlink: 1,
+      ...seed,
+    };
+    state.metadata.set(path, metadata);
+    return metadata;
+  }
+
+  function touchParentMetadata(path) {
+    const parent = dirname(path);
+    if (parent !== path && state.dirs.has(parent)) {
+      const metadata = ensureMetadata(parent, "dir");
+      metadata.mtimeMs = metadata.ctimeMs = metadataTime();
+    }
+  }
+
+  function touchMetadata(path, kind, seed = null) {
+    const created = !state.metadata.has(path);
+    const metadata = ensureMetadata(path, kind, seed);
+    metadata.mtimeMs = metadata.ctimeMs = metadataTime();
+    if (created) touchParentMetadata(path);
+  }
+
+  function touchAccessMetadata(path) {
+    const metadata = state.metadata.get(path);
+    if (metadata) metadata.atimeMs = Number(metadataClock());
+  }
+
+  function forgetMetadata(path) {
+    state.metadata.delete(path);
+    touchParentMetadata(path);
+  }
+
+  function renameMetadata(src, dst, kind) {
+    const metadata = ensureMetadata(src, kind);
+    state.metadata.delete(src);
+    metadata.ctimeMs = metadataTime();
+    state.metadata.set(dst, metadata);
+    touchParentMetadata(src);
+    touchParentMetadata(dst);
+  }
+
+  function setMetadataTimes(path, atime, mtime) {
+    const toMillis = (value) => {
+      const time = value instanceof Date ? value.getTime()
+        : (typeof value === "number" || (typeof value === "string" && value.trim() !== ""))
+          ? Number(value) * 1000 : NaN;
+      if (!Number.isFinite(time)) {
+        throw new TypeError("File timestamps must be finite seconds, numeric strings or valid Dates");
+      }
+      return time;
+    };
+    const atimeMs = toMillis(atime);
+    const mtimeMs = toMillis(mtime);
+    if (isPersistentPath(path) || (!state.files.has(path) && !state.dirs.has(path))) {
+      const error = new Error("PiJS timestamp writes require a virtual file or directory; host timestamps were not changed");
+      error.code = "ERR_PI_SHIM_UNSUPPORTED_OPERATION";
+      throw error;
+    }
+    const metadata = ensureMetadata(path, state.dirs.has(path) ? "dir" : "file");
+    metadata.atimeMs = atimeMs;
+    metadata.mtimeMs = mtimeMs;
+    metadata.ctimeMs = metadataTime();
+  }
+
   function ensureDir(path) {
     const normalized = normalizePath(path);
     const { root, tail } = splitRoot(normalized);
     const parts = tail.split("/").filter(Boolean);
     let current = root;
     state.dirs.add(root);
+    ensureMetadata(root, "dir");
     for (const part of parts) {
       current = `${childPrefix(current)}${part}`;
       if (state.files.has(current) || state.symlinks.has(current)) {
         throw new Error(`ENOTDIR: not a directory, mkdir '${String(path ?? "")}'`);
       }
-      state.dirs.add(current);
+      if (!state.dirs.has(current)) {
+        state.dirs.add(current);
+        touchMetadata(current, "dir");
+      }
     }
     return normalized;
   }
@@ -13797,6 +13893,9 @@ const __pi_vfs = (() => {
       // reads and writes intentionally bypass extension policy, so a denied
       // host metadata probe means only that no host overlay is visible. An
       // identified extension must retain the fail-closed policy error.
+      // Native I/O failures are never absence, including during watchFile
+      // polling. Only a structured ENOENT permits a missing-file transition.
+      if (error && error.code !== undefined && error.code !== "ENOENT") throw error;
       if (message.includes("host stat denied") && currentExtensionId()) throw error;
       return undefined;
     }
@@ -14028,45 +14127,16 @@ const __pi_vfs = (() => {
   function makeStat(path, followSymlinks = true) {
     const normalized = resolvePathForRead(path, followSymlinks);
     const linkTarget = state.symlinks.get(normalized);
-    if (linkTarget !== undefined) {
-      if (!followSymlinks) {
-        const size = new TextEncoder().encode(String(linkTarget)).byteLength;
-        return {
-          isFile() { return false; },
-          isDirectory() { return false; },
-          isSymbolicLink() { return true; },
-          isBlockDevice() { return false; },
-          isCharacterDevice() { return false; },
-          isFIFO() { return false; },
-          isSocket() { return false; },
-          size,
-          mode: 0o777,
-          uid: 0,
-          gid: 0,
-          atimeMs: 0,
-          mtimeMs: 0,
-          ctimeMs: 0,
-          birthtimeMs: 0,
-          atime: new Date(0),
-          mtime: new Date(0),
-          ctime: new Date(0),
-          birthtime: new Date(0),
-          dev: 0,
-          ino: 0,
-          nlink: 1,
-          rdev: 0,
-          blksize: 4096,
-          blocks: 0,
-        };
-      }
+    if (linkTarget !== undefined && followSymlinks) {
       return makeStat(resolvePath(normalized, true), true);
     }
 
     const persistent = isPersistentPath(normalized);
     const isDir = !persistent && state.dirs.has(normalized);
-    let bytes = persistent ? undefined : state.files.get(normalized);
+    const bytes = persistent ? undefined : state.files.get(normalized);
+    const isVirtualSymlink = !persistent && linkTarget !== undefined;
     let hostStat = null;
-    if (!isDir && bytes === undefined) {
+    if (!isDir && bytes === undefined && !isVirtualSymlink) {
       hostStat = readHostStat(normalized, followSymlinks) ?? null;
     }
     const hostKind = hostStat && typeof hostStat.kind === "string" ? hostStat.kind : "";
@@ -14075,48 +14145,53 @@ const __pi_vfs = (() => {
     const isHostSymlink = hostKind === "symlink";
     const isHostOther = hostKind === "other";
     const isFile = bytes !== undefined || isHostFile;
-    if (!isDir && !isHostDir && !isFile && !isHostSymlink && !isHostOther) {
+    const isSymlink = isVirtualSymlink || isHostSymlink;
+    if (!isDir && !isHostDir && !isFile && !isSymlink && !isHostOther) {
       const error = new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
       error.code = "ENOENT";
       error.syscall = "stat";
       error.path = String(path ?? "");
       throw error;
     }
-    const hostNumber = (name, fallback = 0) =>
-      hostStat && typeof hostStat[name] === "number" && Number.isFinite(hostStat[name])
-        ? hostStat[name]
+    const metadata = isDir || bytes !== undefined || isVirtualSymlink
+      ? ensureMetadata(normalized, isDir ? "dir" : isVirtualSymlink ? "symlink" : "file")
+      : hostStat;
+    const statNumber = (name, fallback = 0) =>
+      metadata && typeof metadata[name] === "number" && Number.isFinite(metadata[name])
+        ? metadata[name]
         : fallback;
-    const size = bytes !== undefined ? bytes.byteLength : hostNumber("size");
-    const atimeMs = hostNumber("atimeMs");
-    const mtimeMs = hostNumber("mtimeMs");
-    const ctimeMs = hostNumber("ctimeMs");
-    const birthtimeMs = hostNumber("birthtimeMs");
+    const size = bytes !== undefined ? bytes.byteLength : isVirtualSymlink
+      ? new TextEncoder().encode(String(linkTarget)).byteLength : statNumber("size");
+    const atimeMs = statNumber("atimeMs");
+    const mtimeMs = statNumber("mtimeMs");
+    const ctimeMs = statNumber("ctimeMs");
+    const birthtimeMs = statNumber("birthtimeMs");
     return {
       isFile() { return isFile; },
       isDirectory() { return isDir || isHostDir; },
-      isSymbolicLink() { return isHostSymlink; },
-      isBlockDevice() { return hostStat?.isBlockDevice === true; },
-      isCharacterDevice() { return hostStat?.isCharacterDevice === true; },
-      isFIFO() { return hostStat?.isFIFO === true; },
-      isSocket() { return hostStat?.isSocket === true; },
+      isSymbolicLink() { return isSymlink; },
+      isBlockDevice() { return metadata?.isBlockDevice === true; },
+      isCharacterDevice() { return metadata?.isCharacterDevice === true; },
+      isFIFO() { return metadata?.isFIFO === true; },
+      isSocket() { return metadata?.isSocket === true; },
       size,
-      mode: hostNumber("mode", (isDir || isHostDir) ? 0o755 : isHostSymlink ? 0o777 : 0o644),
-      uid: hostNumber("uid"),
-      gid: hostNumber("gid"),
+      mode: statNumber("mode", (isDir || isHostDir) ? 0o755 : isSymlink ? 0o777 : 0o644),
+      uid: statNumber("uid"),
+      gid: statNumber("gid"),
       atimeMs,
       mtimeMs,
       ctimeMs,
       birthtimeMs,
-      atime: new Date(atimeMs),
-      mtime: new Date(mtimeMs),
-      ctime: new Date(ctimeMs),
-      birthtime: new Date(birthtimeMs),
-      dev: hostNumber("dev"),
-      ino: hostNumber("ino"),
-      nlink: hostNumber("nlink", 1),
-      rdev: hostNumber("rdev"),
-      blksize: hostNumber("blksize", 4096),
-      blocks: hostNumber("blocks"),
+      atime: new __pi_fs_date(atimeMs),
+      mtime: new __pi_fs_date(mtimeMs),
+      ctime: new __pi_fs_date(ctimeMs),
+      birthtime: new __pi_fs_date(birthtimeMs),
+      dev: statNumber("dev"),
+      ino: statNumber("ino"),
+      nlink: statNumber("nlink", 1),
+      rdev: statNumber("rdev"),
+      blksize: statNumber("blksize", 4096),
+      blocks: statNumber("blocks"),
     };
   }
 
@@ -14159,6 +14234,7 @@ const __pi_vfs = (() => {
   }
 
   function resetState() {
+    __pi_reset_file_watchers();
     const clearMap = globalThis.__pi_map_clear_primordial;
     const clearSet = globalThis.__pi_set_clear_primordial;
     const addSet = globalThis.__pi_set_add_primordial;
@@ -14173,14 +14249,22 @@ const __pi_vfs = (() => {
     clearSet(state.dirs);
     addSet(state.dirs, "/");
     clearMap(state.symlinks);
+    clearMap(state.metadata);
     clearMap(state.fds);
   }
 
   state.normalizePath = normalizePath;
+  state.absoluteInputPath = absoluteInputPath;
   state.toHostPath = toHostPath;
   state.childPrefix = childPrefix;
   state.dirname = dirname;
   state.ensureDir = ensureDir;
+  state.ensureMetadata = ensureMetadata;
+  state.touchMetadata = touchMetadata;
+  state.touchAccessMetadata = touchAccessMetadata;
+  state.forgetMetadata = forgetMetadata;
+  state.renameMetadata = renameMetadata;
+  state.setMetadataTimes = setMetadataTimes;
   state.toBytes = toBytes;
   state.decodeBytes = decodeBytes;
   state.readHostBytes = readHostBytes;
@@ -14233,8 +14317,10 @@ const __pi_vfs = (() => {
       }
       return {
         files: mapSize(state.files),
+        watchers: __pi_file_watcher_count(),
         dirs: Math.max(0, setSize(state.dirs) - 1),
         symlinks: mapSize(state.symlinks),
+        metadata: mapSize(state.metadata),
         fds: mapSize(state.fds),
       };
     },
@@ -14277,6 +14363,7 @@ export function readFileSync(path, encoding) {
     error.path = String(path ?? "");
     throw error;
   }
+  __pi_vfs.touchAccessMetadata(resolved);
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
 
@@ -14313,14 +14400,14 @@ export function writeFileSync(path, data, opts) {
     });
     return;
   }
-  if (
-    __pi_vfs.dirs.has(resolved) ||
-    __pi_vfs.readHostStat(resolved, true)?.kind === "dir"
-  ) {
+  const hostStat = __pi_vfs.files.has(resolved) || __pi_vfs.dirs.has(resolved)
+    ? undefined : __pi_vfs.readHostStat(resolved, true);
+  if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
   }
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
+  __pi_vfs.touchMetadata(resolved, "file", hostStat);
 }
 
 export function readdirSync(path, opts) {
@@ -14444,11 +14531,13 @@ export function unlinkSync(path) {
     return;
   }
   if (__pi_vfs.symlinks.delete(normalized)) {
+    __pi_vfs.forgetMetadata(normalized);
     return;
   }
   if (!__pi_vfs.files.delete(normalized)) {
     throw new Error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
   }
+  __pi_vfs.forgetMetadata(normalized);
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
@@ -14483,6 +14572,7 @@ export function rmdirSync(path, _opts) {
   if (!__pi_vfs.dirs.delete(normalized)) {
     throw new Error(`ENOENT: no such file or directory, rmdir '${String(path ?? "")}'`);
   }
+  __pi_vfs.forgetMetadata(normalized);
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
@@ -14496,10 +14586,12 @@ export function rmSync(path, opts) {
   const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
+    __pi_vfs.forgetMetadata(normalized);
     return;
   }
   if (__pi_vfs.symlinks.has(normalized)) {
     __pi_vfs.symlinks.delete(normalized);
+    __pi_vfs.forgetMetadata(normalized);
     return;
   }
   if (__pi_vfs.dirs.has(normalized)) {
@@ -14512,20 +14604,24 @@ export function rmSync(path, opts) {
     for (const filePath of Array.from(__pi_vfs.files.keys())) {
       if (filePath === normalized || filePath.startsWith(prefix)) {
         __pi_vfs.files.delete(filePath);
+        __pi_vfs.forgetMetadata(filePath);
       }
     }
     for (const dirPath of Array.from(__pi_vfs.dirs)) {
       if (dirPath === normalized || dirPath.startsWith(prefix)) {
         __pi_vfs.dirs.delete(dirPath);
+        __pi_vfs.forgetMetadata(dirPath);
       }
     }
     for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
       if (linkPath === normalized || linkPath.startsWith(prefix)) {
         __pi_vfs.symlinks.delete(linkPath);
+        __pi_vfs.forgetMetadata(linkPath);
       }
     }
     if (!__pi_vfs.dirs.has("/")) {
       __pi_vfs.dirs.add("/");
+      __pi_vfs.ensureMetadata("/", "dir");
     }
     return;
   }
@@ -14546,16 +14642,20 @@ export function renameSync(oldPath, newPath) {
   }
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
+    if (src === dst) return;
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
     __pi_vfs.symlinks.set(dst, linkTarget);
     __pi_vfs.symlinks.delete(src);
+    __pi_vfs.renameMetadata(src, dst, "symlink");
     return;
   }
   const bytes = __pi_vfs.files.get(src);
   if (bytes !== undefined) {
+    if (src === dst) return;
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
     __pi_vfs.files.set(dst, bytes);
     __pi_vfs.files.delete(src);
+    __pi_vfs.renameMetadata(src, dst, "file");
     return;
   }
   throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
@@ -14588,9 +14688,10 @@ export function chownSync(path, _uid, _gid) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
   __pi_vfs.makeStat(resolved, true);
 }
-export function utimesSync(path, _atime, _mtime) {
+export function utimesSync(path, atime, mtime) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
   __pi_vfs.makeStat(resolved, true);
+  __pi_vfs.setMetadataTimes(resolved, atime, mtime);
 }
 export function readlinkSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForRead(path, false);
@@ -14635,6 +14736,7 @@ export function symlinkSync(target, path, _type) {
     throw new Error(`EEXIST: file already exists, symlink '${String(path ?? "")}'`);
   }
   __pi_vfs.symlinks.set(normalized, String(target ?? ""));
+  __pi_vfs.touchMetadata(normalized, "symlink");
 }
 export function openSync(path, flags = "r", _mode) {
   const opts = __pi_vfs.parseOpenFlags(flags);
@@ -14676,9 +14778,13 @@ export function openSync(path, flags = "r", _mode) {
     const detail = host.error ? `: ${host.error}` : "";
     throw new Error(`EIO: unable to read host file '${String(path ?? "")}'${detail}`);
   }
+  if (needsWriteAccess && existsOnHost) {
+    __pi_vfs.ensureMetadata(resolved, "file", hostStat);
+  }
   if (!exists && opts.create) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
     __pi_vfs.files.set(resolved, new Uint8Array());
+    __pi_vfs.touchMetadata(resolved, "file");
   }
   if (
     existsOnHost &&
@@ -14693,6 +14799,7 @@ export function openSync(path, flags = "r", _mode) {
   }
   if (opts.truncate && opts.writable) {
     __pi_vfs.files.set(resolved, new Uint8Array());
+    __pi_vfs.touchMetadata(resolved, "file");
   }
 
   const fd = __pi_vfs.nextFd++;
@@ -14742,6 +14849,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
   if (position === null || position === undefined) {
     entry.position = cursor + readLen;
   }
+  __pi_vfs.touchAccessMetadata(entry.path);
   return readLen;
 }
 export function writeSync(fd, buffer, offset, length, position) {
@@ -14798,6 +14906,7 @@ export function writeSync(fd, buffer, offset, length, position) {
   next.set(current, 0);
   next.set(chunk, cursor);
   __pi_vfs.files.set(entry.path, next);
+  if (chunk.byteLength > 0) __pi_vfs.touchMetadata(entry.path, "file");
   entry.hostBytes = undefined;
 
   if (!explicitPosition) {
@@ -14822,6 +14931,7 @@ export function ftruncateSync(fd, len = 0) {
   const next = new Uint8Array(targetLen);
   next.set(current.subarray(0, Math.min(current.byteLength, targetLen)));
   __pi_vfs.files.set(entry.path, next);
+  __pi_vfs.touchMetadata(entry.path, "file");
   entry.hostBytes = undefined;
   if (entry.position > targetLen) {
     entry.position = targetLen;
@@ -14835,26 +14945,235 @@ export function truncateSync(path, len = 0) {
     closeSync(fd);
   }
 }
-export function futimesSync(fd, _atime, _mtime) {
+export function futimesSync(fd, atime, mtime) {
   const entry = __pi_vfs.getFdEntry(fd);
   if (!entry.writable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdWrite(entry);
+  __pi_vfs.setMetadataTimes(entry.path, atime, mtime);
 }
-function __fakeWatcher() {
-  const w = { close() {}, unref() { return w; }, ref() { return w; }, on() { return w; }, once() { return w; }, removeListener() { return w; }, removeAllListeners() { return w; } };
-  return w;
+export function watch(_path, _optsOrListener, _listener) {
+  const error = new Error("fs.watch native notifications are unavailable; use fs.watchFile for stat polling");
+  error.code = "ERR_FEATURE_UNAVAILABLE";
+  throw error;
 }
-export function watch(path, _optsOrListener, _listener) {
-  accessSync(path);
-  return __fakeWatcher();
-}
-export function watchFile(path, _optsOrListener, _listener) {
-  accessSync(path);
-  return __fakeWatcher();
-}
-export function unwatchFile(path, _listener) { accessSync(path); }
+const __pi_file_watchers = (() => {
+  const bridge = globalThis.__pi_fs_watch_runtime;
+  const fields = ["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "blksize", "blocks", "atimeMs", "mtimeMs", "ctimeMs", "birthtimeMs"];
+  // Match libuv's fs-poll comparison: reading a changed settings file inside
+  // its listener must not retrigger the watcher through atime alone.
+  const changeFields = ["dev", "ino", "mode", "uid", "gid", "size", "mtimeMs", "ctimeMs", "birthtimeMs"];
+  let first = null, count = 0;
+  function requireOwner(entry) {
+    if (entry.owner !== bridge.owner()) {
+      const error = new Error("host read denied: file watcher belongs to another extension");
+      error.code = "EACCES";
+      throw error;
+    }
+  }
+  function copyStat(stat) {
+    return { ...stat,
+      atime: new bridge.Date(stat.atimeMs), mtime: new bridge.Date(stat.mtimeMs),
+      ctime: new bridge.Date(stat.ctimeMs), birthtime: new bridge.Date(stat.birthtimeMs),
+    };
+  }
+  function zeroStat() {
+    const stat = { __proto__: null,
+      isFile() { return false; }, isDirectory() { return false; },
+      isSymbolicLink() { return false; }, isBlockDevice() { return false; },
+      isCharacterDevice() { return false; }, isFIFO() { return false; }, isSocket() { return false; },
+    };
+    for (let index = 0; index < fields.length; index++) stat[fields[index]] = 0;
+    return copyStat(stat);
+  }
+  function readStat(path) {
+    try { return statSync(path); }
+    catch (error) { if (error && error.code === "ENOENT") return null; throw error; }
+  }
+  function changed(current, previous) {
+    for (let index = 0; index < changeFields.length; index++) {
+      if (current[changeFields[index]] !== previous[changeFields[index]]) return true;
+    }
+    return false;
+  }
+  function remove(entry, node) {
+    if (!node.active) return;
+    node.active = false;
+    if (node.before) node.before.next = node.next; else entry.listeners = node.next;
+    if (node.next) node.next.before = node.before; else entry.lastListener = node.before;
+    entry.listenerCount--;
+    if (node.event === "change") entry.changes--;
+  }
+  function discardListeners(entry) {
+    for (let node = entry.listeners; node; node = node.next) node.active = false;
+    entry.listeners = entry.lastListener = null;
+    entry.listenerCount = entry.changes = 0;
+  }
+  function emit(entry, event, current, previous) {
+    const cutoff = entry.listenerSerial;
+    let handled = false;
+    for (let node = entry.listeners; node && node.serial <= cutoff;) {
+      const next = node.next;
+      if (event === "change" && !entry.active) break;
+      if (node.active && node.event === event) {
+        handled = true;
+        if (node.once) remove(entry, node);
+        bridge.apply(node.callback, entry.handle, event === "change"
+          ? [copyStat(current), copyStat(previous)] : event === "error" ? [current] : []);
+      }
+      node = next;
+    }
+    if (event === "error" && !handled) throw current;
+  }
+  function deactivate(entry) {
+    if (!entry.active) return;
+    entry.active = false;
+    if (entry.before) entry.before.next = entry.next; else first = entry.next;
+    if (entry.next) entry.next.before = entry.before;
+    entry.before = entry.next = null;
+    count--;
+    bridge.clear(entry.timer);
+    entry.timer = null;
+  }
+  function close(entry, error, notify = true) {
+    if (!entry.active) return;
+    deactivate(entry);
+    try {
+      if (notify) {
+        if (error) emit(entry, "error", error);
+        emit(entry, "stop");
+        emit(entry, "close");
+      }
+    } finally { discardListeners(entry); entry.previous = null; }
+  }
+  function poll(entry) {
+    if (!entry.active) return;
+    // Even an accidentally leaked callback cannot run under a foreign owner.
+    if (entry.owner !== bridge.owner()) { close(entry, null, false); return; }
+    let current;
+    try { current = readStat(entry.input); }
+    catch (error) { close(entry, error); return; }
+    try {
+      if (current === null) {
+        if (entry.missingReported) return;
+        entry.missingReported = true;
+        emit(entry, "change", zeroStat(), entry.previous);
+      } else {
+        const previous = entry.previous;
+        const notify = entry.missingReported || entry.initiallyMissing || changed(current, previous);
+        entry.previous = current;
+        entry.missingReported = entry.initiallyMissing = false;
+        if (notify) emit(entry, "change", current, previous);
+      }
+    } finally {
+      if (entry.active && entry.changes === 0) close(entry);
+    }
+  }
+  function add(entry, event, callback, once = false) {
+    requireOwner(entry);
+    if (typeof event !== "string" || typeof callback !== "function") throw new TypeError("watcher listener requires an event name and function");
+    if (!entry.active) throw new Error("file watcher is closed");
+    if (entry.listenerCount >= 32) throw new RangeError("file watcher listener limit is 32");
+    const node = { __proto__: null, event, callback, once, serial: ++entry.listenerSerial,
+      active: true, before: entry.lastListener, next: null };
+    if (entry.lastListener) entry.lastListener.next = node; else entry.listeners = node;
+    entry.lastListener = node;
+    entry.listenerCount++;
+    if (event === "change") entry.changes++;
+    return entry.handle;
+  }
+  function removeListener(entry, event, callback) {
+    requireOwner(entry);
+    if (typeof callback !== "function") throw new TypeError("watcher listener must be a function");
+    for (let node = entry.lastListener; node; node = node.before) {
+      if (node.event === event && node.callback === callback) { remove(entry, node); break; }
+    }
+    if (entry.changes === 0) close(entry);
+    return entry.handle;
+  }
+  function removeAll(entry, event) {
+    requireOwner(entry);
+    for (let node = entry.listeners; node; node = node.next) {
+      if (event === undefined || node.event === event) remove(entry, node);
+    }
+    if (entry.changes === 0) close(entry);
+    return entry.handle;
+  }
+  function reference(entry, value) {
+    requireOwner(entry);
+    if (entry.active) bridge.reference(entry.timer, value);
+    entry.referenced = value;
+    return entry.handle;
+  }
+  function find(path, owner) {
+    for (let entry = first; entry; entry = entry.next) {
+      if (entry.path === path && entry.owner === owner) return entry;
+    }
+    return null;
+  }
+  __pi_file_watcher_count = () => count;
+  __pi_reset_file_watchers = () => { while (first) close(first, null, false); };
+  return {
+    watchFile(path, options, listener) {
+      if (typeof options === "function") { listener = options; options = {}; }
+      if (options === undefined) options = {};
+      if (!options || typeof options !== "object") throw new TypeError("watchFile options must be an object");
+      if (typeof listener !== "function") throw new TypeError("watchFile listener must be a function");
+      const interval = options.interval === undefined ? 5007 : options.interval;
+      const persistent = options.persistent === undefined ? true : options.persistent;
+      if (typeof interval !== "number" || !Number.isInteger(interval) || interval < 1 || interval > 2147483647) throw new RangeError("watchFile interval must be an integer from 1 to 2147483647");
+      if (typeof persistent !== "boolean") throw new TypeError("watchFile persistent must be a boolean");
+      if (options.bigint !== undefined && typeof options.bigint !== "boolean") throw new TypeError("watchFile bigint must be a boolean");
+      if (options.bigint === true) {
+        const error = new Error("watchFile bigint stats are unavailable"); error.code = "ERR_FEATURE_UNAVAILABLE"; throw error;
+      }
+      // Freeze relative resolution at registration without normalizing away
+      // authored traversal components used by protected-storage admission.
+      const input = __pi_vfs.absoluteInputPath(String(path ?? "").replace(/\\/g, "/"));
+      const normalized = __pi_vfs.normalizePath(input);
+      const owner = bridge.owner();
+      // Registration and every later poll independently cross read admission.
+      const initial = readStat(input);
+      const existing = find(normalized, owner);
+      if (existing) return add(existing, "change", listener);
+      if (count >= 128) throw new RangeError("active file watcher limit is 128");
+      const entry = { __proto__: null, owner, path: normalized, input, active: true,
+        previous: initial || zeroStat(), initiallyMissing: initial === null, missingReported: false,
+        listeners: null, lastListener: null, listenerCount: 0, listenerSerial: 0, changes: 0,
+        before: null, next: first, timer: null, handle: null, referenced: persistent,
+      };
+      entry.handle = bridge.freeze({ __proto__: null,
+        on(event, callback) { return add(entry, event, callback); },
+        addListener(event, callback) { return add(entry, event, callback); },
+        once(event, callback) { return add(entry, event, callback, true); },
+        removeListener(event, callback) { return removeListener(entry, event, callback); },
+        off(event, callback) { return removeListener(entry, event, callback); },
+        removeAllListeners(event) { return removeAll(entry, event); },
+        close() { requireOwner(entry); close(entry); return entry.handle; },
+        stop() { requireOwner(entry); close(entry); return entry.handle; },
+        ref() { return reference(entry, true); }, unref() { return reference(entry, false); },
+        hasRef() { requireOwner(entry); return entry.active && entry.referenced; },
+      });
+      if (first) first.before = entry;
+      first = entry; count++;
+      try {
+        add(entry, "change", listener);
+        entry.timer = bridge.interval(() => poll(entry), interval);
+        bridge.reference(entry.timer, persistent);
+      } catch (error) { close(entry, null, false); throw error; }
+      return entry.handle;
+    },
+    unwatchFile(path, listener) {
+      if (listener !== undefined && typeof listener !== "function") throw new TypeError("unwatchFile listener must be a function");
+      const entry = find(__pi_vfs.normalizePath(path), bridge.owner());
+      if (!entry) return;
+      if (listener === undefined) close(entry); else removeListener(entry, "change", listener);
+    },
+  };
+})();
+export function watchFile(path, options, listener) { return __pi_file_watchers.watchFile(path, options, listener); }
+export function unwatchFile(path, listener) { __pi_file_watchers.unwatchFile(path, listener); }
 function __queueMicrotaskPolyfill(fn) {
   if (typeof queueMicrotask === "function") {
     queueMicrotask(fn);
@@ -15149,6 +15468,7 @@ function makeFileHandle(fd) {
     },
     async stat() { requireOpen(); return fstatSync(fd); },
     async truncate(len = 0) { requireOpen(); ftruncateSync(fd, len); },
+    async utimes(atime, mtime) { requireOpen(); futimesSync(fd, atime, mtime); },
     async sync() { __pi_vfs.authorizeFdWrite(requireOpen()); },
     async datasync() { __pi_vfs.authorizeFdWrite(requireOpen()); },
     async close() {
@@ -20383,6 +20703,8 @@ struct JsRuntimeRegistrySnapshot {
     vfs_files: u64,
     vfs_dirs: u64,
     vfs_symlinks: u64,
+    vfs_metadata: u64,
+    vfs_watchers: u64,
     vfs_fds: u64,
     intrinsics_intact: bool,
 }
@@ -20865,6 +21187,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.vfs_files
             + reset_payload.after.vfs_dirs
             + reset_payload.after.vfs_symlinks
+            + reset_payload.after.vfs_metadata
+            + reset_payload.after.vfs_watchers
             + reset_payload.after.vfs_fds;
         report.residual_entries_after = residual_after;
 
@@ -24165,6 +24489,7 @@ const __pi_map_size_primordial = Function.prototype.call.bind(
 const __pi_set_size_primordial = Function.prototype.call.bind(
     Object.getOwnPropertyDescriptor(__pi_original_Set.prototype, 'size').get
 );
+const __pi_reflect_apply_primordial = Reflect.apply;
 for (const [name, value] of Object.entries({
     __pi_map_clear_primordial,
     __pi_set_clear_primordial,
@@ -24561,12 +24886,12 @@ function __pi_runtime_registry_snapshot() {
             !globalThis.__pi_vfs_api ||
             typeof globalThis.__pi_vfs_api.counts !== 'function'
         ) {
-            return { files: 0, dirs: 0, symlinks: 0, fds: 0 };
+            return { files: 0, dirs: 0, symlinks: 0, metadata: 0, watchers: 0, fds: 0 };
         }
         try {
             return globalThis.__pi_vfs_api.counts();
         } catch (_) {
-            return { files: 1, dirs: 1, symlinks: 1, fds: 1 };
+            return { files: 1, dirs: 1, symlinks: 1, metadata: 1, watchers: 1, fds: 1 };
         }
     })();
     const intrinsicsIntact =
@@ -24604,6 +24929,8 @@ function __pi_runtime_registry_snapshot() {
         vfsFiles: Number(vfsCounts.files) || 0,
         vfsDirs: Number(vfsCounts.dirs) || 0,
         vfsSymlinks: Number(vfsCounts.symlinks) || 0,
+        vfsMetadata: Number(vfsCounts.metadata) || 0,
+        vfsWatchers: Number(vfsCounts.watchers) || 0,
         vfsFds: Number(vfsCounts.fds) || 0,
         intrinsicsIntact,
     };
@@ -24706,6 +25033,8 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.vfsFiles === 0 &&
         after.vfsDirs === 0 &&
         after.vfsSymlinks === 0 &&
+        after.vfsMetadata === 0 &&
+        after.vfsWatchers === 0 &&
         after.vfsFds === 0 &&
         after.intrinsicsIntact === true;
 
@@ -29580,7 +29909,7 @@ const __pi_timer_runtime = (() => {
             }
             const callback = state.callback;
             const args = state.args;
-            const invoke = () => callback.apply(handle, args);
+            const invoke = () => __pi_reflect_apply_primordial(callback, handle, args);
             const result = state.owner
                 ? __pi_with_extension_async(state.owner, invoke)
                 : Promise.resolve().then(invoke);
@@ -29636,6 +29965,7 @@ const __pi_timer_runtime = (() => {
         setTimeout: (callback, delay, ...args) => create(callback, delay, false, args),
         setInterval: (callback, delay, ...args) => create(callback, delay, true, args),
         clear,
+        reference(handle, value) { stateOf(handle).referenced = value; },
         count: () => activeCount(active),
         reset(secret) {
             if (!__pi_bridge_secret_matches_native(secret)) throw new Error('Timer reset denied');
@@ -29645,6 +29975,22 @@ const __pi_timer_runtime = (() => {
         },
     });
 })();
+
+// Filesystem pollers capture this narrow capability before extension code can
+// replace global timers. It captures the caller's existing timer authority;
+// no API accepts an owner or exposes a trusted rescheduling closure.
+Object.defineProperty(globalThis, '__pi_fs_watch_runtime', {
+    value: Object.freeze({
+        interval: __pi_timer_runtime.setInterval,
+        clear: __pi_timer_runtime.clear,
+        reference: __pi_timer_runtime.reference,
+        owner: () => __pi_get_current_extension_id() || '',
+        apply: __pi_reflect_apply_primordial,
+        freeze: Object.freeze,
+        Date,
+    }),
+    writable: false, configurable: false, enumerable: false,
+});
 
 if (typeof globalThis.setTimeout !== 'function') {
     globalThis.setTimeout = __pi_timer_runtime.setTimeout;
@@ -38194,6 +38540,207 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(result["ownerSize"], serde_json::json!(9));
             assert_eq!(result["sharedRead"], serde_json::json!(false));
             assert_eq!(result["sharedClose"], serde_json::json!(false));
+        });
+    }
+
+    #[test]
+    fn pijs_file_watchers_recheck_owner_after_shared_handle_handoff() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let shared_path = workspace.join("watched.txt");
+            let secret_path = ext_a.join("owner-secret.txt");
+            let clock = Arc::new(DeterministicClock::new(1_700_000_000_000));
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+            let script = format!(
+                r#"
+                globalThis.watchOwnerScope = {{ denials: {{}}, callbacks: [], injected: 0, error: null }};
+                import('node:fs').then((fs) => {{
+                    const result = globalThis.watchOwnerScope;
+                    const injected = () => {{ result.injected++; }};
+                    globalThis.ownerWatchListener = (current, previous) => {{
+                        result.callbacks.push({{
+                            owner: __pi_get_current_extension_id(),
+                            secret: fs.readFileSync({secret_path:?}, 'utf8'),
+                            sameSizeEdit: current.size === previous.size && current.mtimeMs > previous.mtimeMs,
+                        }});
+                    }};
+                    return __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        fs.writeFileSync({secret_path:?}, 'owner-only');
+                        fs.writeFileSync({shared_path:?}, 'aa');
+                        globalThis.ownerWatchHandle = fs.watchFile(
+                            {shared_path:?}, {{ interval: 10 }}, globalThis.ownerWatchListener);
+                    }}).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {{
+                        const handle = globalThis.ownerWatchHandle;
+                        result.sharedRead = fs.readFileSync({shared_path:?}, 'utf8');
+                        for (const [name, operation] of [
+                            ['on', () => handle.on('change', injected)],
+                            ['addListener', () => handle.addListener('change', injected)],
+                            ['once', () => handle.once('change', injected)],
+                            ['removeListener', () => handle.removeListener('change', globalThis.ownerWatchListener)],
+                            ['off', () => handle.off('change', globalThis.ownerWatchListener)],
+                            ['removeAllListeners', () => handle.removeAllListeners('change')],
+                            ['close', () => handle.close()],
+                            ['stop', () => handle.stop()],
+                            ['ref', () => handle.ref()],
+                            ['unref', () => handle.unref()],
+                            ['hasRef', () => handle.hasRef()],
+                        ]) {{
+                            try {{ operation(); result.denials[name] = 'allowed'; }}
+                            catch (error) {{ result.denials[name] = error.code; }}
+                        }}
+                        result.frozen = Object.isFrozen(handle) && Object.getPrototypeOf(handle) === null;
+                        try {{ Object.defineProperty(handle, 'close', {{ value: injected }}); }} catch (_) {{}}
+                        try {{ Object.setPrototypeOf(handle, {{ close: injected }}); }} catch (_) {{}}
+                        result.immutable = handle.close !== injected && Object.getPrototypeOf(handle) === null;
+                        const ownHandle = fs.watchFile({shared_path:?}, {{ interval: 10 }}, injected);
+                        result.distinctOwners = ownHandle !== handle;
+                        fs.unwatchFile({shared_path:?});
+                        result.watchersAfterForeignUnwatch = globalThis.__pi_vfs_api.counts().watchers;
+                    }})).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        fs.writeFileSync({shared_path:?}, 'bb');
+                    }}));
+                }}).catch((error) => {{
+                    globalThis.watchOwnerScope.error = String(error && error.message || error);
+                }}).finally(() => {{ globalThis.watchOwnerScope.done = true; }});
+                "#
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("hand off watcher to another extension");
+            clock.advance(10);
+            runtime.tick().await.expect("poll under original owner");
+
+            let result = get_global_json(&runtime, "watchOwnerScope").await;
+            assert_eq!(result.get("error"), Some(&serde_json::Value::Null));
+            assert_eq!(result.get("done"), Some(&json!(true)));
+            assert_eq!(result.get("sharedRead"), Some(&json!("aa")));
+            assert_eq!(result.get("frozen"), Some(&json!(true)));
+            assert_eq!(result.get("immutable"), Some(&json!(true)));
+            assert_eq!(result.get("distinctOwners"), Some(&json!(true)));
+            assert_eq!(result.get("watchersAfterForeignUnwatch"), Some(&json!(1)));
+            assert_eq!(result.get("injected"), Some(&json!(0)));
+            let denials = result.get("denials").expect("watcher owner denials");
+            for operation in [
+                "on",
+                "addListener",
+                "once",
+                "removeListener",
+                "off",
+                "removeAllListeners",
+                "close",
+                "stop",
+                "ref",
+                "unref",
+                "hasRef",
+            ] {
+                assert_eq!(
+                    denials.get(operation),
+                    Some(&json!("EACCES")),
+                    "{operation}"
+                );
+            }
+            assert_eq!(
+                result.get("callbacks"),
+                Some(&json!([{
+                    "owner": "ext.a", "secret": "owner-only", "sameSizeEdit": true,
+                }]))
+            );
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    "__pi_with_extension_async(__pi_test_secret, 'ext.a', async () => ownerWatchHandle.close());",
+                ))
+                .await
+                .expect("close watcher under original owner");
+            assert_eq!(runtime.scheduler.borrow().next_timer_deadline(), None);
+        });
+    }
+
+    #[test]
+    fn pijs_file_watcher_reset_cancels_polls_without_calling_extension_code() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let path = temp_dir.path().join("watched.txt");
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                cwd: temp_dir.path().display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
+            runtime
+                .eval(&format!(
+                    r#"
+                    globalThis.watchResetScope = {{ callbacks: [] }};
+                    import('node:fs').then((fs) => {{
+                        fs.writeFileSync({path:?}, 'aa');
+                        globalThis.resetWatchFs = fs;
+                        globalThis.resetWatchHandle = fs.watchFile({path:?}, {{ interval: 10 }}, () => {{
+                            watchResetScope.callbacks.push('change');
+                        }});
+                        resetWatchHandle.on('stop', () => watchResetScope.callbacks.push('stop'));
+                        resetWatchHandle.on('close', () => watchResetScope.callbacks.push('close'));
+                    }});
+                    "#
+                ))
+                .await
+                .expect("create active watcher for reset");
+            let before = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(before.get("vfsWatchers"), Some(&json!(1)));
+            assert_eq!(before.get("timerHandles"), Some(&json!(1)));
+
+            // The public cold-drop scrub correctly rejects pending Rust work;
+            // exercise the secret-gated host lifecycle reset with an active poll.
+            let reset = call_global_fn_json(&runtime, "__pi_reset_extension_runtime_state").await;
+            let after = reset.get("after").expect("reset inventory");
+            assert_eq!(after.get("vfsWatchers"), Some(&json!(0)));
+            assert_eq!(after.get("timerHandles"), Some(&json!(0)));
+            runtime
+                .eval(&format!(
+                    r#"
+                    resetWatchHandle.ref().unref().ref();
+                    watchResetScope.hasRefAfterReset = resetWatchHandle.hasRef();
+                    try {{
+                        resetWatchHandle.on('change', () => watchResetScope.callbacks.push('stale'));
+                        watchResetScope.listenerRejected = false;
+                    }} catch (error) {{
+                        watchResetScope.listenerRejected = error.message === 'file watcher is closed';
+                    }}
+                    resetWatchHandle.close().stop();
+                    resetWatchFs.writeFileSync({path:?}, 'bb');
+                    "#
+                ))
+                .await
+                .expect("exercise held watcher after reset");
+            clock.advance(100);
+            runtime.tick().await.expect("advance after watcher reset");
+            assert_eq!(runtime.scheduler.borrow().next_timer_deadline(), None);
+            let result = get_global_json(&runtime, "watchResetScope").await;
+            assert_eq!(result.get("callbacks"), Some(&json!([])));
+            assert_eq!(result.get("hasRefAfterReset"), Some(&json!(false)));
+            assert_eq!(result.get("listenerRejected"), Some(&json!(true)));
+            let final_snapshot =
+                call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(final_snapshot.get("vfsWatchers"), Some(&json!(0)));
+            assert_eq!(final_snapshot.get("timerHandles"), Some(&json!(0)));
         });
     }
 

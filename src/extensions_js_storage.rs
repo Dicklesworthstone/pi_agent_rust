@@ -70,13 +70,22 @@ pub(super) fn metadata_json(metadata: &Metadata) -> serde_json::Value {
     } else {
         "other"
     };
-    let mut value = serde_json::json!({
-        "kind": kind,
-        "size": metadata.len(),
-        "atimeMs": timestamp_millis(metadata.accessed()),
-        "mtimeMs": timestamp_millis(metadata.modified()),
-        "birthtimeMs": timestamp_millis(metadata.created()),
-    });
+    let mut fields = serde_json::Map::from_iter([
+        ("kind".to_string(), kind.into()),
+        ("size".to_string(), metadata.len().into()),
+        (
+            "atimeMs".to_string(),
+            timestamp_millis(metadata.accessed()).into(),
+        ),
+        (
+            "mtimeMs".to_string(),
+            timestamp_millis(metadata.modified()).into(),
+        ),
+        (
+            "birthtimeMs".to_string(),
+            timestamp_millis(metadata.created()).into(),
+        ),
+    ]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -85,20 +94,28 @@ pub(super) fn metadata_json(metadata: &Metadata) -> serde_json::Value {
         #[allow(clippy::cast_precision_loss)]
         let ctime_ms =
             metadata.ctime() as f64 * 1000.0 + metadata.ctime_nsec() as f64 / 1_000_000.0;
-        value["ctimeMs"] = ctime_ms.into();
-        value["mode"] = metadata.mode().into();
-        value["uid"] = metadata.uid().into();
-        value["gid"] = metadata.gid().into();
-        value["dev"] = metadata.dev().into();
-        value["ino"] = metadata.ino().into();
-        value["nlink"] = metadata.nlink().into();
-        value["rdev"] = metadata.rdev().into();
-        value["blksize"] = metadata.blksize().into();
-        value["blocks"] = metadata.blocks().into();
-        value["isBlockDevice"] = file_type.is_block_device().into();
-        value["isCharacterDevice"] = file_type.is_char_device().into();
-        value["isFIFO"] = file_type.is_fifo().into();
-        value["isSocket"] = file_type.is_socket().into();
+        fields.extend([
+            ("ctimeMs".to_string(), ctime_ms.into()),
+            ("mode".to_string(), metadata.mode().into()),
+            ("uid".to_string(), metadata.uid().into()),
+            ("gid".to_string(), metadata.gid().into()),
+            ("dev".to_string(), metadata.dev().into()),
+            ("ino".to_string(), metadata.ino().into()),
+            ("nlink".to_string(), metadata.nlink().into()),
+            ("rdev".to_string(), metadata.rdev().into()),
+            ("blksize".to_string(), metadata.blksize().into()),
+            ("blocks".to_string(), metadata.blocks().into()),
+            (
+                "isBlockDevice".to_string(),
+                file_type.is_block_device().into(),
+            ),
+            (
+                "isCharacterDevice".to_string(),
+                file_type.is_char_device().into(),
+            ),
+            ("isFIFO".to_string(), file_type.is_fifo().into()),
+            ("isSocket".to_string(), file_type.is_socket().into()),
+        ]);
     }
     #[cfg(not(unix))]
     {
@@ -116,9 +133,9 @@ pub(super) fn metadata_json(metadata: &Metadata) -> serde_json::Value {
         } else {
             0o100000 | permissions
         };
-        value["mode"] = mode.into();
+        fields.insert("mode".to_string(), mode.into());
     }
-    value
+    serde_json::Value::Object(fields)
 }
 
 /// Preserve errno as data: extensions must distinguish absent configuration
@@ -1179,10 +1196,10 @@ mod tests {
         let offset = std::time::Duration::from_micros(1_250);
         let after = timestamp_millis(Ok(UNIX_EPOCH + offset));
         let before = timestamp_millis(Ok(UNIX_EPOCH - offset));
-        assert!((after - 1.25).abs() < f64::EPSILON);
-        assert!((before + 1.25).abs() < f64::EPSILON);
+        assert_eq!(after.to_bits(), 1.25_f64.to_bits());
+        assert_eq!(before.to_bits(), (-1.25_f64).to_bits());
         let unavailable = timestamp_millis(Err(io::Error::from(io::ErrorKind::Unsupported)));
-        assert!(unavailable.abs() < f64::EPSILON);
+        assert_eq!(unavailable.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]

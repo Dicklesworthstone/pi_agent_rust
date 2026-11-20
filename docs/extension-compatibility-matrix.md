@@ -41,7 +41,7 @@ routes `readFileSync` and `statSync` calls through the hostcall boundary
 | `readFileSync` | Real | VFS first, host fallback for real files |
 | `writeFileSync` | Real | VFS-only (sandboxed) |
 | `existsSync` | Real | VFS + host fallback |
-| `statSync` | Real | VFS + host fallback |
+| `statSync`/`lstatSync`/`fstatSync` | Real | Current host metadata and VFS timestamps/entry identity; same-size virtual writes change modification time. Stats include numeric millisecond timestamps and corresponding Dates. |
 | `readdirSync` | Real | VFS-only |
 | `mkdirSync` | Real | VFS-only, supports `recursive` |
 | `promises.readFile` | Real | Async wrapper around sync |
@@ -52,13 +52,15 @@ routes `readFileSync` and `statSync` calls through the hostcall boundary
 | `promises.access` | Real | Async wrapper around sync |
 | `promises.rm` | Real | Async wrapper around sync |
 | `promises.rename` | Real | Async wrapper around sync |
-| `promises.chmod`/`promises.chown`/`promises.utimes` | Partial | Path-checking no-ops; missing paths fail with `ENOENT` |
+| `promises.chmod`/`promises.chown` | Partial | Path-checking no-ops; missing paths fail with `ENOENT` |
+| `utimesSync`/`futimesSync`/`promises.utimes`/`FileHandle.utimes` | Partial | Updates VFS access/modification timestamps; validates both times before changing either. Host timestamp writes explicitly fail with `ERR_PI_SHIM_UNSUPPORTED_OPERATION`. |
 | `openSync`/`closeSync`/`readSync`/`writeSync` | Real | File descriptor API |
 | `readlink`/`readlinkSync` | Real | VFS symlink target lookup |
 | `chmodSync`/`chownSync` | Partial | Path-checking no-ops; missing paths fail with `ENOENT` |
 | `createReadStream` | Real | Returns Readable stream |
 | `createWriteStream` | Real | Returns Writable stream |
-| `watch`/`watchFile` | Stub | No real file watching; existing paths return no-op watcher facades and missing paths fail with `ENOENT` |
+| `watchFile`/`unwatchFile` | Partial | Real authorized stat polling, default 5007 ms; current/previous metadata, missing-file and recreation events, selective listener removal, close/stop/ref/unref. Bounded to 128 watchers and 32 listeners per watcher; `bigint: true` is explicitly unsupported. |
+| `watch` | Unsupported | Throws `ERR_FEATURE_UNAVAILABLE`; native filesystem notifications are unavailable. Use `watchFile` for polling. |
 | Callback variants (`readFile`, `writeFile`, etc.) | Real | 9 callback-style functions |
 
 ### `node:crypto` Detail
