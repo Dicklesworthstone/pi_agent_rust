@@ -19,6 +19,7 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_STORAGE_WRITE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -45,6 +46,79 @@ pub(super) struct PersistentStorage {
 
 fn denied(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
+}
+
+fn timestamp_millis(time: io::Result<SystemTime>) -> f64 {
+    time.map_or(0.0, |time| match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64() * 1000.0,
+        Err(error) => -error.duration().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Serialize an already-authorized metadata snapshot. Do not re-open the path:
+/// protected configuration reads deliberately obtained this snapshot through
+/// their no-follow handle. Millisecond timestamps retain their fractional part
+/// so extensions can detect same-size writes without reading the file again.
+pub(super) fn metadata_json(metadata: &Metadata) -> serde_json::Value {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "dir"
+    } else if file_type.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    let mut value = serde_json::json!({
+        "kind": kind,
+        "size": metadata.len(),
+        "atimeMs": timestamp_millis(metadata.accessed()),
+        "mtimeMs": timestamp_millis(metadata.modified()),
+        "birthtimeMs": timestamp_millis(metadata.created()),
+    });
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        // Node's non-bigint Stats representation is also an IEEE-754 number.
+        #[allow(clippy::cast_precision_loss)]
+        let ctime_ms =
+            metadata.ctime() as f64 * 1000.0 + metadata.ctime_nsec() as f64 / 1_000_000.0;
+        value["ctimeMs"] = ctime_ms.into();
+        value["mode"] = metadata.mode().into();
+        value["uid"] = metadata.uid().into();
+        value["gid"] = metadata.gid().into();
+        value["dev"] = metadata.dev().into();
+        value["ino"] = metadata.ino().into();
+        value["nlink"] = metadata.nlink().into();
+        value["rdev"] = metadata.rdev().into();
+        value["blksize"] = metadata.blksize().into();
+        value["blocks"] = metadata.blocks().into();
+        value["isBlockDevice"] = file_type.is_block_device().into();
+        value["isCharacterDevice"] = file_type.is_char_device().into();
+        value["isFIFO"] = file_type.is_fifo().into();
+        value["isSocket"] = file_type.is_socket().into();
+    }
+    #[cfg(not(unix))]
+    {
+        // Portable metadata exposes readonly/type bits but not POSIX ownership,
+        // inode or change time. Keep unavailable fields at the shim defaults.
+        let permissions = if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        };
+        let mode = if file_type.is_dir() {
+            0o040111 | permissions
+        } else if file_type.is_symlink() {
+            0o120000 | permissions
+        } else {
+            0o100000 | permissions
+        };
+        value["mode"] = mode.into();
+    }
+    value
 }
 
 /// Preserve errno as data: extensions must distinguish absent configuration
@@ -1099,6 +1173,17 @@ pub(super) fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_timestamps_preserve_submillisecond_and_pre_epoch_times() {
+        let offset = std::time::Duration::from_micros(1_250);
+        let after = timestamp_millis(Ok(UNIX_EPOCH + offset));
+        let before = timestamp_millis(Ok(UNIX_EPOCH - offset));
+        assert!((after - 1.25).abs() < f64::EPSILON);
+        assert!((before + 1.25).abs() < f64::EPSILON);
+        let unavailable = timestamp_millis(Err(io::Error::from(io::ErrorKind::Unsupported)));
+        assert!(unavailable.abs() < f64::EPSILON);
+    }
 
     #[test]
     fn namespace_owner_and_foreign_boundaries_are_fail_closed() {

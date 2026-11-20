@@ -14082,37 +14082,41 @@ const __pi_vfs = (() => {
       error.path = String(path ?? "");
       throw error;
     }
-    const hostSize =
-      hostStat && typeof hostStat.size === "number" && Number.isFinite(hostStat.size)
-        ? hostStat.size
-        : 0;
-    const size = bytes !== undefined ? bytes.byteLength : hostSize;
+    const hostNumber = (name, fallback = 0) =>
+      hostStat && typeof hostStat[name] === "number" && Number.isFinite(hostStat[name])
+        ? hostStat[name]
+        : fallback;
+    const size = bytes !== undefined ? bytes.byteLength : hostNumber("size");
+    const atimeMs = hostNumber("atimeMs");
+    const mtimeMs = hostNumber("mtimeMs");
+    const ctimeMs = hostNumber("ctimeMs");
+    const birthtimeMs = hostNumber("birthtimeMs");
     return {
       isFile() { return isFile; },
       isDirectory() { return isDir || isHostDir; },
       isSymbolicLink() { return isHostSymlink; },
-      isBlockDevice() { return false; },
-      isCharacterDevice() { return false; },
-      isFIFO() { return false; },
-      isSocket() { return false; },
+      isBlockDevice() { return hostStat?.isBlockDevice === true; },
+      isCharacterDevice() { return hostStat?.isCharacterDevice === true; },
+      isFIFO() { return hostStat?.isFIFO === true; },
+      isSocket() { return hostStat?.isSocket === true; },
       size,
-      mode: (isDir || isHostDir) ? 0o755 : isHostSymlink ? 0o777 : 0o644,
-      uid: 0,
-      gid: 0,
-      atimeMs: 0,
-      mtimeMs: 0,
-      ctimeMs: 0,
-      birthtimeMs: 0,
-      atime: new Date(0),
-      mtime: new Date(0),
-      ctime: new Date(0),
-      birthtime: new Date(0),
-      dev: 0,
-      ino: 0,
-      nlink: 1,
-      rdev: 0,
-      blksize: 4096,
-      blocks: 0,
+      mode: hostNumber("mode", (isDir || isHostDir) ? 0o755 : isHostSymlink ? 0o777 : 0o644),
+      uid: hostNumber("uid"),
+      gid: hostNumber("gid"),
+      atimeMs,
+      mtimeMs,
+      ctimeMs,
+      birthtimeMs,
+      atime: new Date(atimeMs),
+      mtime: new Date(mtimeMs),
+      ctime: new Date(ctimeMs),
+      birthtime: new Date(birthtimeMs),
+      dev: hostNumber("dev"),
+      ino: hostNumber("ino"),
+      nlink: hostNumber("nlink", 1),
+      rdev: hostNumber("rdev"),
+      blksize: hostNumber("blksize", 4096),
+      blocks: hostNumber("blocks"),
     };
   }
 
@@ -23263,22 +23267,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 storage::filesystem_error(&ctx, &path, "stat", &err)
                             })?;
 
-                            let file_type = metadata.file_type();
-                            let kind = if file_type.is_symlink() {
-                                "symlink"
-                            } else if file_type.is_dir() {
-                                "dir"
-                            } else if file_type.is_file() {
-                                "file"
-                            } else {
-                                "other"
-                            };
-
-                            Ok(serde_json::json!({
-                                "kind": kind,
-                                "size": metadata.len(),
-                            })
-                            .to_string())
+                            Ok(storage::metadata_json(&metadata).to_string())
                         }
                     }),
                 )?;

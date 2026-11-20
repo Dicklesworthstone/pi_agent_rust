@@ -1305,6 +1305,163 @@ fn fs_stat_host_fallback() {
     });
 }
 
+#[test]
+fn fs_host_metadata_detects_same_size_edits_across_stat_surfaces() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, "before").expect("write settings");
+        let first_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open settings")
+            .set_times(std::fs::FileTimes::new().set_modified(first_time))
+            .expect("set first modification time");
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: temp.path().display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async (fs) => {
+                    const path = process.cwd() + '/settings.json';
+                    globalThis.readMetadata = async () => {
+                        const fd = fs.openSync(path, 'r');
+                        let descriptor;
+                        try { descriptor = fs.fstatSync(fd); }
+                        finally { fs.closeSync(fd); }
+                        const stats = [
+                            fs.statSync(path), fs.lstatSync(path), descriptor,
+                            await fs.promises.stat(path), await fs.promises.lstat(path),
+                            await new Promise((resolve, reject) => fs.stat(path, (e, s) => e ? reject(e) : resolve(s))),
+                            await new Promise((resolve, reject) => fs.lstat(path, (e, s) => e ? reject(e) : resolve(s))),
+                        ];
+                        return stats.map(s => ({
+                            size: s.size, mtimeMs: s.mtimeMs,
+                            datesMatch: ['atime', 'mtime', 'ctime', 'birthtime'].every(name =>
+                                s[name] instanceof Date && s[name].getTime() === Math.trunc(s[name + 'Ms'])),
+                        }));
+                    };
+                    globalThis.beforeMetadata = await readMetadata();
+                });
+                "#,
+            )
+            .await
+            .expect("read initial metadata");
+        runtime.drain_microtasks().await.expect("drain");
+        let before = runtime.read_global_json("beforeMetadata").await.unwrap();
+
+        // The original all-zero timestamps conceal this edit from caches even
+        // though its real mtime changes. Assign times instead of racing a clock.
+        std::fs::write(&path, "after!").expect("write same-size edit");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open edited settings")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(first_time + std::time::Duration::from_secs(2)),
+            )
+            .expect("set edited modification time");
+        runtime
+            .eval("readMetadata().then(value => { globalThis.afterMetadata = value; });")
+            .await
+            .expect("read edited metadata");
+        runtime.drain_microtasks().await.expect("drain");
+        let after = runtime.read_global_json("afterMetadata").await.unwrap();
+        for (snapshot, expected) in [
+            (&before, 1_700_000_000_000.0),
+            (&after, 1_700_000_002_000.0),
+        ] {
+            let rows = snapshot.as_array().expect("metadata snapshots");
+            assert_eq!(rows.len(), 7);
+            for row in rows {
+                assert_eq!(row["size"], 6);
+                assert_eq!(row["datesMatch"], true);
+                let modified = row["mtimeMs"].as_f64().expect("mtime in milliseconds");
+                assert!((modified - expected).abs() < 0.001, "{row}");
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_host_metadata_preserves_inode_mode_and_symlink_identity() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("alias.txt");
+        std::fs::write(&target, "target").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("set target permissions");
+        std::os::unix::fs::symlink(&target, &link).expect("create alias");
+        let target_metadata = std::fs::metadata(&target).expect("target metadata");
+        let link_metadata = std::fs::symlink_metadata(&link).expect("link metadata");
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: temp.path().display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    const path = process.cwd() + '/alias.txt';
+                    const describe = s => ({
+                        mode: s.mode, ino: s.ino, dev: s.dev, uid: s.uid, gid: s.gid,
+                        nlink: s.nlink, size: s.size, ctimeMs: s.ctimeMs,
+                        file: s.isFile(), symlink: s.isSymbolicLink(),
+                    });
+                    globalThis.followedMetadata = describe(fs.statSync(path));
+                    globalThis.linkMetadata = describe(fs.lstatSync(path));
+                });
+                "#,
+            )
+            .await
+            .expect("stat alias");
+        runtime.drain_microtasks().await.expect("drain");
+        for (name, metadata, is_link) in [
+            ("followedMetadata", target_metadata, false),
+            ("linkMetadata", link_metadata, true),
+        ] {
+            let observed = runtime.read_global_json(name).await.unwrap();
+            assert_eq!(observed["file"], !is_link);
+            assert_eq!(observed["symlink"], is_link);
+            for (field, expected) in [
+                ("mode", u64::from(metadata.mode())),
+                ("ino", metadata.ino()),
+                ("dev", metadata.dev()),
+                ("uid", u64::from(metadata.uid())),
+                ("gid", u64::from(metadata.gid())),
+                ("nlink", metadata.nlink()),
+                ("size", metadata.len()),
+            ] {
+                // These test fixtures fit exactly in JS's default number Stats.
+                assert_eq!(
+                    observed[field].as_u64(),
+                    Some(expected),
+                    "{field}: {observed}"
+                );
+            }
+            assert!(observed["ctimeMs"].as_f64().unwrap_or_default() > 0.0);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // promises.appendFile
 // ---------------------------------------------------------------------------
