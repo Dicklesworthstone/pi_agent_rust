@@ -3179,10 +3179,43 @@ fn perf_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
     )))
 }
 
+/// Freshness policy for `tests/perf/reports/budget_summary.json` validation.
+///
+/// Disclosed RH-1 win/lose split (`bd-reality-check-2026-11-19-bridge-yxf43.2`):
+/// - **StrictCalendar(age)** fails closed whenever `now - generated_at > age`,
+///   regardless of whether the report authorizes claims. Used whenever
+///   `PI_RELEASE_GATE_STRICT_FRESHNESS=1` (exported by `scripts/release_gate.sh`)
+///   and by strict unit tests.
+/// - **ClaimsRequireFreshness(age)** fails closed whenever `claim_ready`
+///   (`performance_claims_authorized == true`) and `now - generated_at > age`,
+///   while admitting a structurally coherent, explicitly `blocked` / `NO_DATA`
+///   summary aged beyond `age` during per-commit development checks. This ends
+///   calendar-rot timestamp-forging pressure without ever admitting stale
+///   claims, future timestamps, count mismatches, or forged lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerformanceFreshnessPolicy {
+    StrictCalendar(Duration),
+    ClaimsRequireFreshness(Duration),
+}
+
 fn validate_performance_budget_summary(
     summary: &Value,
     now: DateTime<Utc>,
     maximum_age: Duration,
+    source_binding_valid: bool,
+) -> Result<PerformanceClaimValidation, String> {
+    validate_performance_budget_summary_with_policy(
+        summary,
+        now,
+        PerformanceFreshnessPolicy::StrictCalendar(maximum_age),
+        source_binding_valid,
+    )
+}
+
+fn validate_performance_budget_summary_with_policy(
+    summary: &Value,
+    now: DateTime<Utc>,
+    freshness_policy: PerformanceFreshnessPolicy,
     source_binding_valid: bool,
 ) -> Result<PerformanceClaimValidation, String> {
     // `git_commit` is optional source-binding provenance emitted by the perf
@@ -3582,7 +3615,15 @@ fn validate_performance_budget_summary(
         ));
     }
 
-    if now.signed_duration_since(generated_at) > maximum_age {
+    let enforce_age = match freshness_policy {
+        PerformanceFreshnessPolicy::StrictCalendar(maximum_age) => Some(maximum_age),
+        PerformanceFreshnessPolicy::ClaimsRequireFreshness(maximum_age) => {
+            claim_ready.then_some(maximum_age)
+        }
+    };
+    if let Some(maximum_age) = enforce_age
+        && now.signed_duration_since(generated_at) > maximum_age
+    {
         return Err("performance summary is too stale for release admission".to_string());
     }
 
@@ -7984,10 +8025,17 @@ fn performance_source_binding_rejects_head_advance_during_validation() {
 fn performance_budgets_report_has_exact_v2_contract() {
     let (summary, source_binding_valid) = load_source_bound_performance_summary()
         .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
-    let validated = validate_performance_budget_summary(
+    let strict_freshness = std::env::var("PI_RELEASE_GATE_STRICT_FRESHNESS")
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"));
+    let freshness_policy = if strict_freshness {
+        PerformanceFreshnessPolicy::StrictCalendar(Duration::hours(168))
+    } else {
+        PerformanceFreshnessPolicy::ClaimsRequireFreshness(Duration::hours(168))
+    };
+    let validated = validate_performance_budget_summary_with_policy(
         &summary,
         Utc::now(),
-        Duration::hours(168),
+        freshness_policy,
         source_binding_valid,
     )
     .unwrap_or_else(|err| panic!("invalid performance budget summary: {err}"));
@@ -7998,6 +8046,60 @@ fn performance_budgets_report_has_exact_v2_contract() {
             "v0.2.0 must remain explicitly performance-claims-NOT-authorized"
         );
     }
+}
+
+#[test]
+fn performance_contract_two_tier_freshness_enforces_claims_and_strict_mode() {
+    let now = Utc::now();
+    let stale_ts = now - Duration::hours(169);
+
+    // Planted-red 1: Stale claim_ready (>168h) MUST FAIL even under ClaimsRequireFreshness.
+    let stale_claim_ready = claim_ready_performance_summary_fixture(stale_ts);
+    let err = validate_performance_budget_summary_with_policy(
+        &stale_claim_ready,
+        now,
+        PerformanceFreshnessPolicy::ClaimsRequireFreshness(Duration::hours(168)),
+        true,
+    )
+    .expect_err("stale claim_ready performance summary must always fail closed");
+    assert!(err.contains("too stale"), "{err}");
+
+    // Planted-red 2: Stale blocked/NO_DATA (>168h) MUST FAIL under StrictCalendar
+    // (used by scripts/release_gate.sh via PI_RELEASE_GATE_STRICT_FRESHNESS=1).
+    let stale_blocked = blocked_performance_summary_fixture(stale_ts);
+    let err = validate_performance_budget_summary_with_policy(
+        &stale_blocked,
+        now,
+        PerformanceFreshnessPolicy::StrictCalendar(Duration::hours(168)),
+        false,
+    )
+    .expect_err("stale blocked summary must fail under strict release-gate freshness");
+    assert!(err.contains("too stale"), "{err}");
+
+    // Positive: Structurally coherent blocked/NO_DATA summary aged >168h passes
+    // per-commit structural checks without authorizing any performance claim.
+    let validated = validate_performance_budget_summary_with_policy(
+        &stale_blocked,
+        now,
+        PerformanceFreshnessPolicy::ClaimsRequireFreshness(Duration::hours(168)),
+        false,
+    )
+    .expect("structurally valid blocked/NO_DATA summary passes per-commit structural check");
+    assert!(!validated.claim_ready);
+
+    // Planted-red 3: Structurally broken stale blocked/NO_DATA still FAILS closed.
+    let mut bad_stale_blocked = stale_blocked;
+    bad_stale_blocked["no_data"] = json!(0);
+    assert!(
+        validate_performance_budget_summary_with_policy(
+            &bad_stale_blocked,
+            now,
+            PerformanceFreshnessPolicy::ClaimsRequireFreshness(Duration::hours(168)),
+            false,
+        )
+        .is_err(),
+        "structurally inconsistent blocked/NO_DATA summary must fail closed regardless of age policy"
+    );
 }
 
 #[test]
