@@ -95,6 +95,200 @@ fn file_tasks_reach_real_child_stdin_beyond_argv_limits_with_source_provenance()
 }
 
 #[test]
+fn inline_tasks_preserve_small_and_large_utf8_in_stdin_without_file_provenance() {
+    for text in [
+        "--model is task text, not a flag.\r\nKeep trailing spaces.  \n".to_string(),
+        format!("Inspect every case.\n{}", "résumé 雪\n".repeat(24 * 1024)),
+    ] {
+        let script = format!(
+            "printf '%s\\n' \"$@\" > arguments\ncat > instructions-used\n{}",
+            emit(&[ended("complete", "stop")])
+        );
+        let (root, tool) = fixture(&script);
+        let output = run(&tool, json!({"agent":"worker", "task":text}));
+        assert!(!output.is_error, "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
+            format!("Task: {text}")
+        );
+        let arguments = std::fs::read_to_string(root.path().join("arguments")).unwrap();
+        assert!(!arguments.contains(&text));
+        assert!(!arguments.contains("Task: "));
+        assert_eq!(result(&output)["task"], text);
+        assert!(result(&output).get("taskFile").is_none());
+        assert!(result(&output).get("taskFileSha256").is_none());
+    }
+}
+
+#[test]
+fn large_predecessor_output_reaches_the_next_chain_child_without_argv_limits() {
+    let evidence = "retained evidence 雪\n".repeat(9 * 1024);
+    let script = format!(
+        "cat > instructions-used\n\
+         if [ -f first-completed ]; then\n{}\
+         else\ntouch first-completed\ncat predecessor.jsonl\nfi\n",
+        emit(&[ended("reviewed", "stop")])
+    );
+    let (root, tool) = fixture(&script);
+    std::fs::write(
+        root.path().join("predecessor.jsonl"),
+        format!("{}\n", ended(&evidence, "stop")),
+    )
+    .unwrap();
+    let output = run(
+        &tool,
+        json!({"chain":[
+            {"agent":"worker", "task":"produce evidence"},
+            {"agent":"worker", "task":"Review {previous}"}
+        ]}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let records = output.details.as_ref().unwrap()["results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    let retained = records[0]["output"].as_str().unwrap();
+    assert!(retained.len() > 128 * 1024);
+    assert_eq!(retained, evidence);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
+        format!("Task: Review {retained}")
+    );
+    assert_eq!(records[1]["output"], "reviewed");
+}
+
+#[test]
+fn oversized_inline_chain_expansion_preserves_prior_results_without_a_second_launch() {
+    let predecessor = json!({"value":"x".repeat(16 * 1024)}).to_string();
+    for marker in ["{previous}", "{{previous.data.value}}"] {
+        let script = format!(
+            "printf 'launched\\n' >> launches\n{}",
+            emit(&[ended(&predecessor, "stop")])
+        );
+        let (root, tool) = fixture(&script);
+        let output = run(
+            &tool,
+            json!({"chain":[
+                {"agent":"worker", "task":"produce typed evidence",
+                 "outputSchema":{"type":"object"}, "schemaMode":"strict"},
+                {"agent":"worker", "task":marker.repeat(257)}
+            ]}),
+        );
+        assert!(output.is_error, "{output:?}");
+        let records = output.details.as_ref().unwrap()["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["status"], "completed");
+        assert_eq!(records[0]["data"]["value"], "x".repeat(16 * 1024));
+        assert_eq!(records[1]["status"], "failed");
+        assert!(
+            records[1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("PI_SUBAGENT_TASK_LIMIT")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("launches")).unwrap(),
+            "launched\n"
+        );
+    }
+}
+
+#[test]
+fn large_inline_schema_retry_uses_new_stdin_and_retains_the_original_assignment() {
+    let script = format!(
+        "printf '\\n---attempt---\\n' >> instructions-used\ncat >> instructions-used\n\
+         if [ -f retried ]; then\n{}\
+         else\ntouch retried\n{}\
+         fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (root, tool) = fixture(&script);
+    let original = format!(
+        "Inspect the whole assignment.\n{}",
+        "résumé 雪\n".repeat(24 * 1024)
+    );
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":original,
+            "outputSchema":{"type":"object", "required":["accepted"]}, "schemaMode":"strict"}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(result(&output)["schemaRetries"], 1);
+    assert_eq!(result(&output)["task"], original);
+    let instructions = std::fs::read_to_string(root.path().join("instructions-used")).unwrap();
+    assert_eq!(instructions.matches("---attempt---").count(), 2);
+    assert_eq!(instructions.matches(original.as_str()).count(), 2);
+    assert_eq!(
+        instructions
+            .matches("previous output failed schema validation")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_oversized_correction_does_not_launch_or_apply_a_second_attempt() {
+    let script = format!(
+        "printf 'launched\\n' >> launches\n{}",
+        emit(&[ended("not JSON", "stop")])
+    );
+    let (root, tool) = fixture(&script);
+    let original = "x".repeat(task_file::MAX_BYTES);
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":original,
+            "outputSchema":{"type":"object"}, "schemaMode":"strict"}),
+    );
+    assert!(output.is_error, "{output:?}");
+    assert_eq!(result(&output)["schemaRetries"], 0);
+    assert_eq!(result(&output)["schemaValid"], false);
+    assert_eq!(result(&output)["output"], "not JSON");
+    assert_eq!(result(&output)["task"], original);
+    assert!(
+        result(&output)["error"]
+            .as_str()
+            .unwrap()
+            .contains("PI_SUBAGENT_TASK_LIMIT")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("launches")).unwrap(),
+        "launched\n"
+    );
+}
+
+#[test]
+fn workflow_schema_retry_keeps_its_smaller_complete_task_budget() {
+    let script = format!(
+        "printf 'launched\\n' >> launches\n{}",
+        emit(&[ended("not JSON", "stop")])
+    );
+    let (root, tool) = fixture(&script);
+    let output = run(
+        &tool,
+        json!({"workflow":[{"id":"bounded", "call":{
+            "agent":"worker", "task":"x".repeat(64 * 1024),
+            "outputSchema":{"type":"object"}, "schemaMode":"strict"
+        }}]}),
+    );
+    assert!(output.is_error, "{output:?}");
+    let result = &output.details.as_ref().unwrap()["nodes"][0]["result"];
+    assert_eq!(result["schemaRetries"], 0);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("PI_SUBAGENT_TASK_LIMIT")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("launches")).unwrap(),
+        "launched\n"
+    );
+}
+
+#[test]
 fn invalid_later_file_tasks_launch_no_valid_prefix_in_any_delegation_mode() {
     let (root, tool) = fixture("touch launched");
     let bad = root.path().join("bad.md");
@@ -138,7 +332,7 @@ fn queued_chain_file_snapshots_keep_original_bytes_and_render_previous_results()
     use sha2::{Digest as _, Sha256};
 
     let script = format!(
-        "cat >> instructions-used\n{}",
+        "cat > instructions-used\n{}",
         emit(&[ended("accepted", "stop")])
     );
     let (root, tool) = fixture(&script);
@@ -200,7 +394,7 @@ fn oversized_raw_and_typed_file_chain_expansion_fails_before_that_child_launches
             records[1]["error"]
                 .as_str()
                 .expect("expansion failure")
-                .contains("PI_SUBAGENT_TASK_FILE_LIMIT")
+                .contains("PI_SUBAGENT_TASK_LIMIT")
         );
         assert_eq!(records[1]["taskFile"], source.to_string_lossy().as_ref());
         assert_eq!(
@@ -219,7 +413,7 @@ fn workflow_file_instructions_keep_typed_predecessor_data_and_source_digest() {
     use sha2::{Digest as _, Sha256};
 
     let script = format!(
-        "cat >> instructions-used\n{}",
+        "cat > instructions-used\n{}",
         emit(&[ended(r#"{"verdict":"accepted"}"#, "stop")])
     );
     let (root, tool) = fixture(&script);
@@ -1267,7 +1461,7 @@ fn isolated_serial_task_preserves_the_parents_package_directory() {
 #[allow(clippy::too_many_lines)] // Drive queueing, symlink retargeting and schema retry through real children.
 fn queued_isolated_retry_keeps_the_captured_package_when_a_symlink_changes() {
     let script = format!(
-        "for assignment do :; done\n\
+        "assignment=$(cat)\n\
          case \"$assignment\" in\n\
          'Task: retarget source alias')\n\
            mv selected selected-before\n\
@@ -1372,7 +1566,7 @@ fn parallel_worktree_writeback_follows_task_order_and_preserves_the_dirty_baseli
     let control = tempfile::tempdir().unwrap();
     let release = control.path().join("release-first");
     let script = format!(
-        "for assignment do :; done\n\
+        "assignment=$(cat)\n\
          test \"$(cat tracked.txt)\" = 'parent dirty' || exit 8\n\
          test \"$(cat untracked.txt)\" = 'carry me' || exit 9\n\
          case \"$assignment\" in\n\
@@ -1486,7 +1680,7 @@ fn queued_isolated_schema_retry_uses_the_snapshot_before_nonisolated_siblings() 
     let control = tempfile::tempdir().unwrap();
     let marker = quote(control.path().join("attempted").to_str().unwrap());
     let script = format!(
-        "for assignment do :; done\n\
+        "assignment=$(cat)\n\
          case \"$assignment\" in\n\
          'Task: shared writer')\n\
            printf 'shared parent edit\\n' > tracked.txt\n\
@@ -1558,7 +1752,7 @@ fn pending_parallel_fixture() -> PendingParallelFixture {
     let ready_task = format!("ready-{}", uuid::Uuid::new_v4());
     let waiting_task = format!("waiting-{}", uuid::Uuid::new_v4());
     let script = format!(
-        "for assignment do :; done\n\
+        "assignment=$(cat)\n\
          if [ \"$assignment\" = {} ]; then\n\
            printf 'ready patch\\n' > tracked.txt\n\
          else\n\
@@ -2090,6 +2284,7 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     let script = format!(
         "printf '%s\\n' \"$PI_SUBAGENT_RUN_ID\" >> \"$PI_CODING_AGENT_DIR/launches\"\n\
          printf '%s\\n' \"$@\" > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.args\"\n\
+         cat > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.task\"\n\
          printf '%s\\n' \"$PI_SUBAGENT_DEPTH\" > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.depth\"\n\
          pwd > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.cwd\"\n{}",
         emit(&[ended("complete answer", "stop")]),
@@ -2135,12 +2330,18 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     assert!(arguments.contains("Original system policy."));
     assert!(!arguments.contains("fixture/escalated"));
     assert!(!arguments.contains("Changed system policy."));
-    assert!(arguments.contains(&assignment));
-    assert!(arguments.contains("first-history-marker"));
-    assert!(arguments.contains("<pi-secret:"));
-    assert!(!arguments.contains("sk-ant-api03-AAAA"));
-    assert!(arguments.len() < assignment.len() + 20 * 1024);
-    assert_eq!(arguments.matches("Continuation of a prior run").count(), 1);
+    assert!(!arguments.contains(&assignment));
+    let instructions =
+        std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.task")))?;
+    assert!(instructions.contains(&assignment));
+    assert!(instructions.contains("first-history-marker"));
+    assert!(instructions.contains("<pi-secret:"));
+    assert!(!instructions.contains("sk-ant-api03-AAAA"));
+    assert!(instructions.len() < assignment.len() + 20 * 1024);
+    assert_eq!(
+        instructions.matches("Continuation of a prior run").count(),
+        1
+    );
     let original_depth =
         std::fs::read_to_string(tool.global_dir.join(format!("{}.depth", source.id)))?;
     assert_eq!(
@@ -2168,11 +2369,15 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     let repeated = revive_through_hub(unrelated.path(), replacement_id);
     assert!(!repeated.is_error, "{repeated:?}");
     let repeated_id = revived_id(&repeated);
-    let arguments = std::fs::read_to_string(tool.global_dir.join(format!("{repeated_id}.args")))?;
-    assert!(arguments.contains(&assignment));
-    assert!(arguments.contains("second-history-marker"));
-    assert!(!arguments.contains("first-history-marker"));
-    assert_eq!(arguments.matches("Continuation of a prior run").count(), 1);
+    let instructions =
+        std::fs::read_to_string(tool.global_dir.join(format!("{repeated_id}.task")))?;
+    assert!(instructions.contains(&assignment));
+    assert!(instructions.contains("second-history-marker"));
+    assert!(!instructions.contains("first-history-marker"));
+    assert_eq!(
+        instructions.matches("Continuation of a prior run").count(),
+        1
+    );
     assert_eq!(
         std::fs::read_to_string(tool.global_dir.join("launches"))?,
         format!("{}\n{replacement_id}\n{repeated_id}\n", source.id)

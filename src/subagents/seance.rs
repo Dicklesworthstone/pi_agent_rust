@@ -29,8 +29,8 @@ const DEFINITION_PATH: &str = "<built-in:seance>";
 const MAX_CONTEXT_BYTES: usize = 192 * 1024;
 const MAX_QUESTION_BYTES: usize = 8 * 1024;
 const MAX_SCHEMA_BYTES: usize = 8 * 1024;
-// The native runner transports prompts in argv. Stay below per-argument and
-// process-command limits; an oversized snapshot is refused, never truncated.
+// Preserve the consultant's complete-prompt budget independently of the
+// native runner's stdin transport. Refuse oversized snapshots, never truncate.
 #[cfg(not(windows))]
 const MAX_PROMPT_BYTES: usize = 96 * 1024;
 #[cfg(windows)]
@@ -391,10 +391,10 @@ pub(super) async fn execute(
         let prompt = format!(
             "Consultation question:\n{question}\n\n<saved-session-evidence>\n{context}\n</saved-session-evidence>"
         );
-        if prompt.len().saturating_add(schema.len()).saturating_add(SYSTEM_PROMPT.len())
-            > MAX_PROMPT_BYTES
-            || prompt.contains('\0')
-        {
+        let task_limit = MAX_PROMPT_BYTES
+            .saturating_sub(schema.len())
+            .saturating_sub(SYSTEM_PROMPT.len());
+        if prompt.len() > task_limit || prompt.contains('\0') {
             return Err(Error::tool(
                 "subagent",
                 "PI_SEANCE_CONTEXT_LIMIT: the complete protected snapshot exceeds the native child prompt budget; no prefix was sent",
@@ -440,6 +440,7 @@ pub(super) async fn execute(
             deadline,
         )
         .with_parent_model(saved_model)
+        .with_task_limit(task_limit)
         .with_cost_budget(tool.cost_scope.current())
         .with_public_task(Some(question.clone()))
         .with_launch_admission(Some(launch_admission))
@@ -709,7 +710,7 @@ mod tests {
         fs::write(
             &binary,
             format!(
-                "#!/bin/sh\nprintf '%s\\000' \"$@\" > argv.bin\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\nprintf '%s\\000' \"$@\" > argv.bin\ncat > prompt.txt\nprintf '%s\\n' '{}'\n",
                 event.replace('\'', "'\"'\"'")
             ),
         )
@@ -826,10 +827,15 @@ mod tests {
         assert!(value("--system-prompt").contains("read-only consultant"));
         assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
         let all_args = args.join("\n");
-        assert!(all_args.contains("selected evidence"));
-        assert!(!all_args.contains("sibling-only evidence"));
+        assert!(!all_args.contains("selected evidence"));
+        let inputs = format!(
+            "{all_args}\n{}",
+            fs::read_to_string(root.path().join("prompt.txt")).unwrap()
+        );
+        assert!(inputs.contains("selected evidence"));
+        assert!(!inputs.contains("sibling-only evidence"));
         assert!(
-            !all_args.contains(secret),
+            !inputs.contains(secret),
             "the live session's bare secret must be protected"
         );
         // The protected snapshot keeps the omission visible as the
@@ -838,17 +844,17 @@ mod tests {
         // whose encoder writes `<` as `\u003c`, so match both spellings.
         let reversible = regex::Regex::new(r"(?:<|\\u003c)pi-secret:[0-9a-f]{6,16}>").unwrap();
         assert_eq!(
-            reversible.find(&all_args).map(|found| found.as_str()),
+            reversible.find(&inputs).map(|found| found.as_str()),
             None,
             "no reversible vault IDs may leave the owner"
         );
         assert_eq!(
-            all_args.matches("pi-secret:").count(),
-            all_args.matches("pi-secret:redacted>").count(),
-            "every other secret mention must be the irreversible marker: {all_args}"
+            inputs.matches("pi-secret:").count(),
+            inputs.matches("pi-secret:redacted>").count(),
+            "every other secret mention must be the irreversible marker: {inputs}"
         );
-        assert!(!all_args.contains("CUSTOM_DEFINITION_MUST_NOT_LOAD"));
-        assert!(!all_args.contains("task-role-must-not-win"));
+        assert!(!inputs.contains("CUSTOM_DEFINITION_MUST_NOT_LOAD"));
+        assert!(!inputs.contains("task-role-must-not-win"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let details = output.details.unwrap();
         assert_eq!(details["mode"], "seance");
@@ -881,12 +887,14 @@ mod tests {
             .unwrap();
         assert_eq!(replacement.task, "Why was it chosen?");
         let revived_args = argv(&root).join("\n");
+        let revived_prompt = fs::read_to_string(root.path().join("prompt.txt")).unwrap();
         assert!(
-            revived_args.contains("selected evidence"),
+            revived_prompt.contains("selected evidence"),
             "revival must retain private launch history"
         );
-        assert!(!revived_args.contains("sibling-only evidence"));
-        assert!(!revived_args.contains(secret));
+        assert!(!revived_prompt.contains("sibling-only evidence"));
+        assert!(!revived_prompt.contains(secret));
+        assert!(!revived_args.contains("selected evidence"));
         assert!(revived_args.contains("--no-mcp"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
@@ -970,7 +978,11 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(argv(&root).join("\n").contains("external evidence"));
+        assert!(
+            fs::read_to_string(root.path().join("prompt.txt"))
+                .unwrap()
+                .contains("external evidence")
+        );
         fs::rename(&capture, root.path().join("admitted-argv.bin")).unwrap();
         assert!(roots.remove_root(external.path()));
         assert!(invoke().is_err());
@@ -1102,7 +1114,11 @@ mod tests {
         )
         .unwrap();
         assert!(!output.is_error, "{:?}", output.details);
-        assert!(argv(&root).join("\n").contains("native saved history"));
+        assert!(
+            fs::read_to_string(root.path().join("prompt.txt"))
+                .unwrap()
+                .contains("native saved history")
+        );
         assert_eq!(fs::read(&source).unwrap(), bytes);
     }
 

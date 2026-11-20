@@ -99,15 +99,15 @@ async fn settled(session: &str, id: &str) -> JobSnapshot {
 fn graph_returns_early_and_preserves_waves_typed_inputs_and_frozen_launches() -> TestResult {
     let _guard = crate::jobs::process_test_guard();
     event("typed-diamond", "start");
-    // The last argv is the literal task plus any framed typed inputs. The two
+    // Stdin contains the literal task plus any framed typed inputs. The two
     // middle children cannot finish until both have started, proving concurrency.
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: seed'*) touch seed.started; while [ ! -f release ]; do sleep 0.02; done; {} ;;
-  'Task: left'*) printf '%s\n' "$@" > left.argv; touch left.started; while [ ! -f right.started ]; do sleep 0.02; done; {} ;;
-  'Task: right'*) printf '%s\n' "$@" > right.argv; touch right.started; while [ ! -f left.started ]; do sleep 0.02; done; {} ;;
+  'Task: left'*) printf '%s\n' "$@" > left.argv; printf '%s' "$task" > left.task; touch left.started; while [ ! -f right.started ]; do sleep 0.02; done; {} ;;
+  'Task: right'*) printf '%s\n' "$@" > right.argv; printf '%s' "$task" > right.task; touch right.started; while [ ! -f left.started ]; do sleep 0.02; done; {} ;;
   'Task: join'*) printf '%s\n' "$task" > join.task; test -f left.started; test -f right.started; {} ;;
   *) exit 19 ;;
 esac
@@ -169,7 +169,9 @@ esac
             assert!(argv.contains("Original graph definition."));
             assert!(argv.contains("provider-before") && argv.contains("model-before"));
             assert!(!argv.contains("Changed graph definition.") && !argv.contains("model-after"));
-            assert!(argv.contains("\"source\":41"));
+            let task = std::fs::read_to_string(root.path().join(format!("{branch}.task")))?;
+            assert!(task.contains("\"source\":41"));
+            assert!(!argv.contains("\"source\":41"));
         }
         let input = std::fs::read_to_string(root.path().join("join.task"))?;
         assert!(input.contains("\"left\":42") && input.contains("\"right\":43"));
@@ -187,7 +189,7 @@ fn failed_branch_skips_descendants_but_keeps_independent_results() -> TestResult
     event("branch-failure", "start");
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: bad') exit 23 ;;
   'Task: independent') touch independent.ran; {} ;;
@@ -236,7 +238,7 @@ fn typed_fanout_and_downstream_join_use_the_same_native_result_shape() -> TestRe
     event("fanout", "start");
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: source') {} ;;
   'Task: item'*) {} ;;
@@ -334,7 +336,7 @@ fn cancellation_retires_every_active_root_and_never_starts_a_dependent() -> Test
     event("cancel-roots", "start");
     let (root, tool, session) = fixture(
         r#"
-for task do :; done
+task=$(cat)
 task=${task#Task: }
 case "$task" in
   left|right) printf '%s\n' "$$" > "$task.pid"; exec sleep 30 ;;

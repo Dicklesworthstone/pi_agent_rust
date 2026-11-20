@@ -98,7 +98,7 @@ fn partial(snapshot: &JobSnapshot, wrapper: &str) -> Value {
 fn staged_script() -> String {
     format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: seed') printf 'accepted\n' > accepted.txt; {} ;;
   'Task: hold') test -f accepted.txt; echo "$$" > hold.pid; while [ ! -f release ]; do sleep 0.02; done; {} ;;
@@ -266,7 +266,7 @@ fn an_independent_failure_is_visible_in_progress_without_ending_the_whole_job() 
     let _guard = crate::jobs::process_test_guard();
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: bad') exit 23 ;;
   'Task: good') {} ;;
@@ -322,7 +322,7 @@ fn settled_fanout_and_deliberate_exclusions_are_not_flattened_or_lost() {
     let _guard = crate::jobs::process_test_guard();
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: source') {} ;;
   'Task: item'*) {} ;;
@@ -376,7 +376,7 @@ fn empty_fanout_checkpoints_do_not_invent_executed_waves_or_children() {
     let _guard = crate::jobs::process_test_guard();
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: source') {} ;;
   'Task: item'*) touch forbidden; exit 29 ;;
@@ -416,7 +416,7 @@ fn changed_privacy_evidence_withdraws_previous_checkpoint_and_stops_dependants()
     let _guard = crate::jobs::process_test_guard();
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: seed') {} ;;
   'Task: private') {} ;;
@@ -469,7 +469,7 @@ fn oversized_complete_evidence_is_not_truncated_into_a_successful_checkpoint() {
     let _guard = crate::jobs::process_test_guard();
     let script = format!(
         r#"
-for task do :; done
+task=$(cat)
 case "$task" in
   'Task: left'|'Task: right') cat large.jsonl ;;
   'Task: tail') touch forbidden; {} ;;

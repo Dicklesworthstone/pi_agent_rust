@@ -339,7 +339,7 @@ mod native {
     // are contacted. A gate may admit only the intended branch's file effects.
     const CHILD: &str = r#"#!/bin/sh
 set -eu
-for arg do task="$arg"; done
+task=$(cat)
 printf '%s\n' "$task" >> launches
 case "$task" in
   'Task: source') answer='{"verdict":"repair"}' ;;

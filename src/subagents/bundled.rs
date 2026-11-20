@@ -149,7 +149,7 @@ mod tests {
         for name in ["scout", "reviewer", "security-reviewer"] {
             let agent = &agents[name];
             assert_eq!(agent.tools.as_ref().expect("tools"), &split_csv(READ_TOOLS));
-            let args = child_args(agent, "inspect", None, None, None, None);
+            let args = child_args(agent, None, None, None, None);
             assert!(
                 args.windows(2)
                     .any(|pair| pair[0] == "--tools" && pair[1] == READ_TOOLS)
@@ -205,7 +205,7 @@ mod tests {
             .expect("native shell settings");
             for agent in [&agents["task"], &agents["sonic"], &default_agent] {
                 let root = TempDir::new().expect("child workspace");
-                let args = child_args(agent, "verify the assignment", None, None, None, None);
+                let args = child_args(agent, None, None, None, None);
                 let cli = crate::cli::Cli::parse_from(
                     std::iter::once(std::ffi::OsString::from("pi")).chain(args),
                 );
@@ -276,7 +276,7 @@ mod tests {
         };
         let schema = json!({"type": "object", "required": ["ok"]});
         for agent in definitions().values() {
-            let args = child_args(agent, "inspect", None, Some(&parent), None, Some(&schema));
+            let args = child_args(agent, None, Some(&parent), None, Some(&schema));
             assert!(
                 args.windows(2)
                     .any(|pair| pair[0] == "--provider" && pair[1] == "fixture-provider")
@@ -292,14 +292,7 @@ mod tests {
                 .to_string_lossy();
             assert!(prompt.starts_with(&agent.system_prompt));
             assert!(prompt.contains("JSON Schema"));
-            let role_args = child_args(
-                agent,
-                "inspect",
-                Some("role-model"),
-                Some(&parent),
-                None,
-                None,
-            );
+            let role_args = child_args(agent, Some("role-model"), Some(&parent), None, None);
             assert!(
                 role_args
                     .windows(2)

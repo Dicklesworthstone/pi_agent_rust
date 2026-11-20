@@ -14,17 +14,10 @@ fn definition(extra: &str) -> Result<AgentDefinition> {
 }
 
 fn argv(agent: &AgentDefinition) -> Vec<String> {
-    child_args(
-        agent,
-        "inspect",
-        None,
-        None,
-        None,
-        agent.output_schema.as_ref(),
-    )
-    .into_iter()
-    .map(|value| value.to_string_lossy().into_owned())
-    .collect()
+    child_args(agent, None, None, None, agent.output_schema.as_ref())
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[test]
@@ -88,7 +81,7 @@ fn empty_definition_argv_is_accepted_by_the_real_cli_without_builtin_tools() {
     use clap::Parser as _;
     let agent = definition("tools: []").unwrap();
     let mut args = vec![std::ffi::OsString::from("pi")];
-    args.extend(child_args(&agent, "inspect", None, None, None, None));
+    args.extend(child_args(&agent, None, None, None, None));
     let cli = crate::cli::Cli::try_parse_from(args).unwrap();
     assert!(cli.no_tools);
     assert!(
@@ -114,7 +107,7 @@ fn persistent_optional_tools_cannot_expand_child_tool_permissions() {
     for extra in ["", "tools: read, grep", "tools: []"] {
         let agent = definition(extra).expect("child agent definition");
         let mut args = vec![std::ffi::OsString::from("pi")];
-        args.extend(child_args(&agent, "inspect", None, None, None, None));
+        args.extend(child_args(&agent, None, None, None, None));
         let cli = crate::cli::Cli::try_parse_from(args).expect("child CLI");
         assert!(cli.tools.is_some(), "child selection is always explicit");
         let enabled = cli.enabled_tools(&config);

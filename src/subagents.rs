@@ -172,6 +172,7 @@ pub(crate) struct RevivalSpec {
     role_model_spec: Option<String>,
     parent_model: Option<ToolModelSelection>,
     timeout: Duration,
+    max_task_bytes: usize,
     depth: usize,
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
@@ -245,6 +246,7 @@ pub(crate) async fn revive_child(
     )
     .with_parent_model(launch.parent_model.clone())
     .with_cost_budget(launch.cost_budget.clone())
+    .with_task_limit(launch.max_task_bytes)
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
         .with_current(runner.run_one(&agents, task, launch.step, on_update.map(Arc::from)))
@@ -1077,11 +1079,7 @@ impl SubagentTask {
     ) -> std::result::Result<(), &'static str> {
         let raw = previous.map_or("", |result| result.output.as_str());
         let marker = concat!("{", "previous", "}");
-        let limit = if self.task_file.is_some() {
-            task_file::MAX_BYTES
-        } else {
-            usize::MAX
-        };
+        let limit = task_file::MAX_BYTES;
         // Count before replace allocates: a small repeated token can otherwise
         // amplify a bounded file and bounded predecessor into gigabytes.
         let count = self.task.matches(marker).count();
@@ -1106,7 +1104,7 @@ impl SubagentTask {
 }
 
 const CHAIN_TASK_LIMIT: &str =
-    "PI_SUBAGENT_TASK_FILE_LIMIT: expanded taskFile chain instructions exceed 4 MiB";
+    "PI_SUBAGENT_TASK_LIMIT: generated delegation instructions exceed the task byte limit";
 
 fn push_chain_part(
     target: &mut String,
@@ -1304,7 +1302,6 @@ fn with_fallback_policy_args(args: Vec<OsString>, policy: Option<&str>) -> Vec<O
 
 fn child_args(
     agent: &AgentDefinition,
-    task: &str,
     role_model_spec: Option<&str>,
     parent_model: Option<&ToolModelSelection>,
     selection: Option<&model_selection::Selection>,
@@ -1327,7 +1324,6 @@ fn child_args(
         selection,
         output_schema,
     ));
-    args.push(format!("Task: {task}").into());
     args
 }
 
@@ -1526,13 +1522,32 @@ fn balanced_json_region(text: &str) -> Option<&str> {
     None
 }
 
-/// The corrective follow-up task for the single bounded retry. (`child_args`
-/// adds the `Task:` prefix, so this must not.)
-fn corrective_retry_task(original_task: &str, errors: &[String]) -> String {
-    format!(
-        "{original_task}\n\nYour previous output failed schema validation:\n{}\n\nReturn ONLY the corrected JSON value matching the required schema — no prose, no code fences.",
-        errors.join("\n")
-    )
+/// The corrective follow-up task for the single bounded retry. The stdin
+/// transport adds `Task:`. Bound every append before allocating the result.
+fn corrective_retry_task(
+    original_task: &str,
+    errors: &[String],
+    limit: usize,
+) -> std::result::Result<String, &'static str> {
+    let mut task = String::new();
+    push_chain_part(&mut task, original_task, limit)?;
+    push_chain_part(
+        &mut task,
+        "\n\nYour previous output failed schema validation:\n",
+        limit,
+    )?;
+    for (index, error) in errors.iter().enumerate() {
+        if index != 0 {
+            push_chain_part(&mut task, "\n", limit)?;
+        }
+        push_chain_part(&mut task, error, limit)?;
+    }
+    push_chain_part(
+        &mut task,
+        "\n\nReturn ONLY the corrected JSON value matching the required schema — no prose, no code fences.",
+        limit,
+    )?;
+    Ok(task)
 }
 
 fn child_depth() -> usize {
@@ -1911,7 +1926,7 @@ mod tests {
                     assert!(matches!(scout.source, AgentSource::BuiltIn));
                     "read,grep,find,ls"
                 };
-                let args = child_args(scout, "inspect", None, None, None, None);
+                let args = child_args(scout, None, None, None, None);
                 assert!(
                     args.windows(2)
                         .any(|pair| pair[0] == "--tools" && pair[1] == expected)
@@ -1923,7 +1938,7 @@ mod tests {
                 .discover(AgentScope::Both)
                 .expect("explicit host trust");
             assert!(matches!(agents["scout"].source, AgentSource::Project));
-            let args = child_args(&agents["scout"], "inspect", None, None, None, None);
+            let args = child_args(&agents["scout"], None, None, None, None);
             assert!(args.windows(2).any(|pair| {
                 pair[0] == "--tools" && pair[1] == "eval,github,security_scan,subagent"
             }));
@@ -2109,15 +2124,13 @@ mod tests {
         };
         let args_of =
             |agent: &AgentDefinition, spec: Option<&str>, parent: Option<&ToolModelSelection>| {
-                child_args(agent, "inspect provider", spec, parent, None, None)
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
+                child_args(agent, spec, parent, None, None)
             };
-        let model_value = |args: &[String]| {
-            args.windows(2)
-                .find(|pair| pair[0] == "--model")
-                .map(|pair| pair[1].clone())
+        let model_value = |args: &[OsString]| {
+            args.windows(2).find_map(|pair| match pair {
+                [flag, value] if flag == "--model" => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
         };
 
         // No pin + role spec → role spec is used (task/smol resolution
@@ -2173,10 +2186,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None, None, None, None)
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+        let args = child_args(&agent, None, None, None, None);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--model", "ai-router/gpt-5.6-sol"])
@@ -2198,26 +2208,16 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--append-system-prompt", "be precise"])
         );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("Task: inspect provider")
+        assert!(
+            args.iter()
+                .all(|arg| !arg.to_string_lossy().starts_with("Task: "))
         );
         let selected = model_selection::Selection {
             provider: "local".to_string(),
             model: "vendor/model:literal".to_string(),
             thinking: Some(crate::model::ThinkingLevel::Low),
         };
-        let args = child_args(
-            &agent,
-            "inspect provider",
-            Some("role/model"),
-            None,
-            Some(&selected),
-            None,
-        )
-        .iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+        let args = child_args(&agent, Some("role/model"), None, Some(&selected), None);
         assert!(args.windows(2).any(|pair| pair == ["--provider", "local"]));
         assert!(
             args.windows(2)
@@ -2246,7 +2246,7 @@ mod tests {
         agents.push(empty);
         for agent in agents {
             for args in [
-                child_args(&agent, "inspect", None, None, None, None),
+                child_args(&agent, None, None, None, None),
                 worker_args(&agent, None, None, None),
             ] {
                 let cli = crate::cli::Cli::try_parse_from(
@@ -2300,15 +2300,11 @@ mod tests {
     fn tan_definition_uses_task_role_and_default_non_recursive_tools() {
         let args = child_args(
             &tan_agent_definition(),
-            "update the changelog",
             Some("ai-router/gpt-5.6-terra"),
             None,
             None,
             None,
-        )
-        .iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--model", "ai-router/gpt-5.6-terra"])
@@ -2324,9 +2320,9 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--append-system-prompt", TAN_SYSTEM_PROMPT])
         );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("Task: update the changelog")
+        assert!(
+            args.iter()
+                .all(|arg| !arg.to_string_lossy().starts_with("Task: "))
         );
     }
 

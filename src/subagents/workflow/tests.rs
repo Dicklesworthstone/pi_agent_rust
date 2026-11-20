@@ -439,7 +439,7 @@ mod native {
     // shell exit alone cannot stand in for an agent_end result.
     const CHILD: &str = r#"#!/bin/sh
 set -eu
-for arg do task="$arg"; done
+task=$(cat)
 printf '%s\n' "$task" >> launches
 case "$task" in
   'Task: LEFT'|'Task: RIGHT')

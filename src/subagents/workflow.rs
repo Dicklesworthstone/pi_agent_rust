@@ -476,6 +476,7 @@ impl Plan {
             deadline,
         )
         .with_parent_model(parent_model)
+        .with_task_limit(MAX_TASK_BYTES)
         .with_cost_budget(tool.cost_scope.current())
         .with_launch_admission(launch_admission);
         check_authority(&owner)?;

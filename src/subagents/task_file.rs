@@ -22,16 +22,31 @@ fn invalid(message: &str) -> Error {
     Error::tool("subagent", format!("PI_SUBAGENT_TASK_FILE: {message}"))
 }
 
+fn validate_text(text: &str) -> Result<()> {
+    if text.len() > MAX_BYTES {
+        return Err(Error::tool(
+            "subagent",
+            "PI_SUBAGENT_TASK_LIMIT: delegation instructions exceed 4 MiB",
+        ));
+    }
+    if text.trim().is_empty() || text.contains('\0') {
+        return Err(invalid(
+            "task requires nonempty instructions without NUL bytes",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_fields(input: &Value) -> Result<()> {
     if input.get("taskFileSha256").is_some() {
         return Err(invalid("taskFileSha256 is output metadata, not an input"));
     }
     let Some(value) = input.get("taskFile") else {
-        return if input.get("task").is_some_and(Value::is_string) {
-            Ok(())
-        } else {
-            Err(invalid("provide task or taskFile"))
-        };
+        return input
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("provide task or taskFile"))
+            .and_then(validate_text);
     };
     if input.get("task").is_some() {
         return Err(invalid("provide task or taskFile, never both"));
@@ -186,11 +201,13 @@ pub(super) fn prepare<'a>(
     let owner = AgentCx::for_current_or_request();
     for task in tasks {
         let Some(source) = &task.task_file else {
+            validate_text(&task.task)?;
             continue;
         };
         // Re-admission is not a second read. Only this module can set the
         // digest; deserialization explicitly skips it.
         if task.task_file_sha256.is_some() {
+            validate_text(&task.task)?;
             continue;
         }
         if !task.task.is_empty() {
@@ -202,11 +219,7 @@ pub(super) fn prepare<'a>(
         let digest = crate::package_manager::hex_encode(&Sha256::digest(&bytes));
         let text =
             String::from_utf8(bytes).map_err(|_| invalid("taskFile must contain valid UTF-8"))?;
-        if text.trim().is_empty() || text.contains('\0') {
-            return Err(invalid(
-                "taskFile requires nonempty instructions without NUL bytes",
-            ));
-        }
+        validate_text(&text)?;
         task.task = text;
         task.task_file_sha256 = Some(digest);
     }
@@ -239,10 +252,11 @@ pub(super) fn admission<'a>(
     }))
 }
 
-/// The captured text can exceed the OS's argv limit. A private anonymous
+/// Task text can exceed the OS's argv limit. A private anonymous
 /// regular file supplies stdin without a blocking writer or a named file for
 /// the child to race/reopen. Each retry gets its own cursor over its own text.
 pub(super) fn stdin(task: &str, owner: &AgentCx, deadline: Deadline) -> Result<Stdio> {
+    validate_text(task)?;
     check(owner, deadline)?;
     let mut file = tempfile::tempfile()?;
     file.write_all(b"Task: ")?;

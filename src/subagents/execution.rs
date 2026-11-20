@@ -67,6 +67,7 @@ pub(super) struct ChildRunner {
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
     foreground: bool,
+    max_task_bytes: usize,
 }
 
 impl ChildRunner {
@@ -94,11 +95,17 @@ impl ChildRunner {
             public_task: None,
             launch_admission: None,
             foreground: true,
+            max_task_bytes: super::task_file::MAX_BYTES,
         }
     }
 
     pub(super) const fn into_background(mut self) -> Self {
         self.foreground = false;
+        self
+    }
+
+    pub(super) fn with_task_limit(mut self, limit: usize) -> Self {
+        self.max_task_bytes = limit.min(super::task_file::MAX_BYTES);
         self
     }
 
@@ -343,6 +350,7 @@ impl ChildRunner {
                 role_model_spec: self.role_model_spec.clone(),
                 parent_model: self.parent_model.clone(),
                 timeout: self.deadline.remaining(),
+                max_task_bytes: self.max_task_bytes,
                 depth: child_depth(),
                 public_task: self.public_task.clone(),
                 launch_admission: self.launch_admission.clone(),
@@ -411,8 +419,17 @@ impl ChildRunner {
             emit_progress(update, &previous);
             return PendingRun::Settled(previous);
         }
+        let corrective_task = match corrective_retry_task(&task.task, &errors, self.max_task_bytes)
+        {
+            Ok(task) => task,
+            Err(error) => {
+                previous.fail(error.to_string());
+                emit_progress(update, &previous);
+                return PendingRun::Settled(previous);
+            }
+        };
         let corrective = SubagentTask {
-            task: corrective_retry_task(&task.task, &errors),
+            task: corrective_task,
             ..task.clone()
         };
         let mut retry = self
@@ -473,22 +490,26 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let mut args = child_args(
+        let args = child_args(
             agent,
-            &task.task,
             self.role_model_spec.as_deref(),
             launch.parent_model.as_ref(),
             task.model_selection.as_ref(),
             schema,
         );
-        let stdin = if task.task_file.is_some() {
-            // child_args always appends the instruction as its final argv.
-            // A captured file travels through private regular-file stdin so
-            // multi-megabyte instructions cannot exceed the OS argv limit.
-            args.pop();
-            super::task_file::stdin(&task.task, owner, self.deadline)
+        // Every assignment uses the same private regular-file transport.
+        // Inline instructions, predecessor output and corrective retries can
+        // exceed argv limits just as captured taskFile instructions can.
+        let stdin = if task.task.len() > self.max_task_bytes {
+            Err(crate::error::Error::tool(
+                "subagent",
+                format!(
+                    "PI_SUBAGENT_TASK_LIMIT: delegation instructions exceed {} bytes",
+                    self.max_task_bytes
+                ),
+            ))
         } else {
-            Ok(Stdio::null())
+            super::task_file::stdin(&task.task, owner, self.deadline)
         };
         let args = super::with_fallback_policy_args(args, task.fallback_policy.as_deref());
         let policy = isolation_policy(&task);

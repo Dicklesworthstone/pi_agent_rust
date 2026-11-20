@@ -81,15 +81,23 @@ instead of repeating the full body. These are result fields; callers cannot
 inject a digest. The digest identifies the captured source, before chain
 substitution, workflow input framing, or corrective/continuation instructions.
 
+Inline `task` instructions use the same **4 MiB** byte limit and must be
+nonempty, valid text without NUL bytes. Every one-shot child receives its task
+through private file-backed stdin, so inline tasks, files, chained output, and
+corrective retries do not depend on OS command-line limits. The child's standard
+stdin normalization trims trailing whitespace from the submitted `Task:` prompt;
+stored assignments and source digests retain the original text.
+
 Chains apply their existing `{previous}` and typed-data substitutions to the
-captured text. Expanded file-backed chain tasks are also limited to **4 MiB**;
+captured text. All expanded chain tasks are also limited to **4 MiB**;
 an oversized substitution fails that step without launching it, while preserving
 its source digest and the earlier steps' results. Workflows retain their
 **64 KiB** complete task budget, including
 appended typed inputs; using a file does not relax that limit. File content is
 instruction text and cannot select a different agent, model, tools, cwd, schema
-or approval policy. Large captured tasks reach the child through stdin to avoid
-OS command-line limits. Saved-session `seance` and retained worker/pool operations
+or approval policy. Corrective retry instructions must fit the same byte limit;
+an oversized correction preserves the failed attempt without starting another
+child. Saved-session `seance` and retained worker/pool operations
 continue to use their separate input contracts and reject `taskFile`.
 
 ## Per-call model selection

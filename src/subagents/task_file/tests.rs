@@ -62,6 +62,94 @@ fn task_sources_are_explicit_and_cannot_forge_snapshot_metadata() {
 }
 
 #[test]
+fn inline_instructions_are_bounded_before_any_batch_can_be_admitted()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (_root, tool) = fixture();
+    let valid = json!({"agent":"task", "task":"complete this work"});
+    for text in [
+        "".to_string(),
+        " \r\n\t".to_string(),
+        "do\0not".to_string(),
+        "x".repeat(MAX_BYTES + 1),
+    ] {
+        let invalid_input = json!({"agent":"task", "task":text});
+        for input in [
+            invalid_input.clone(),
+            json!({"tasks":[valid, invalid_input]}),
+            json!({"chain":[valid, invalid_input]}),
+        ] {
+            assert!(validate_request(&input).is_err());
+        }
+        let mut task: SubagentTask = serde_json::from_value(invalid_input)?;
+        assert!(prepare(&tool, std::iter::once(&mut task), deadline()).is_err());
+    }
+    let text = "雪".repeat(MAX_BYTES / 3) + "x";
+    assert_eq!(text.len(), MAX_BYTES);
+    validate_fields(&json!({"task":text}))?;
+    assert!(validate_fields(&json!({"task":text + "x"})).is_err());
+    Ok(())
+}
+
+#[test]
+fn stdin_transport_child_fixture() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    let Some(output) = std::env::var_os("PI_SUBAGENT_STDIN_TEST_OUTPUT") else {
+        return Ok(());
+    };
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes)?;
+    std::fs::write(output, bytes)?;
+    Ok(())
+}
+
+#[test]
+fn large_stdin_and_retry_are_inherited_without_command_arguments_on_every_platform()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let original = format!("Full assignment\r\n{}", "résumé 雪\n".repeat(24 * 1024));
+    let retry = crate::subagents::corrective_retry_task(
+        &original,
+        &["expected an integer".to_string()],
+        MAX_BYTES,
+    )?;
+    for (index, task) in [original, retry].iter().enumerate() {
+        let received = root.path().join(format!("received-{index}.txt"));
+        let owner = AgentCx::for_current_or_request();
+        let input = stdin(task, &owner, deadline())?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "subagents::task_file::tests::stdin_transport_child_fixture",
+                "--nocapture",
+            ])
+            .env("PI_SUBAGENT_STDIN_TEST_OUTPUT", &received)
+            .stdin(input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("stdin transport helper timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(&received)?,
+            format!("Task: {task}").as_bytes()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn snapshot_preserves_original_utf8_bytes_and_is_not_reread() {
     let (root, tool) = fixture();
     let path = root.path().join("instructions.md");

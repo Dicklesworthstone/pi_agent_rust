@@ -269,7 +269,7 @@ mod native {
 
     const FIXTURE: &str = r"#!/usr/bin/env python3
 import json, pathlib, sys
-prompt = sys.argv[-1]
+prompt = sys.stdin.read()
 kind = prompt.splitlines()[0].removeprefix('Task: ')
 with pathlib.Path('launches.jsonl').open('a') as log:
     log.write(json.dumps({'kind': kind}) + '\n')

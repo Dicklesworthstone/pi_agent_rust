@@ -6,7 +6,7 @@ use std::time::Duration;
 
 const SCRIPT: &str = r#"#!/bin/sh
 set -eu
-for arg do task="$arg"; done
+task=$(cat)
 command=${task%%"
 "*}
 printf '%s\n' "$command" >> launches

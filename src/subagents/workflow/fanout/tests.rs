@@ -399,7 +399,7 @@ mod native {
     // mock execution backend or new child runner is used by these scenarios.
     const CHILD: &str = r#"#!/bin/sh
 set -eu
-for arg do task="$arg"; done
+task=$(cat)
 global="$PI_CODING_AGENT_DIR"
 printf '%s' "$task" > "$global/launched-$$"
 case "$task" in
