@@ -117,35 +117,134 @@ fn emit_benchmark_build_fingerprint() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn normalize_canonical_git_sha(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 40 || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn resolve_repo_git_sha() -> Option<String> {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    normalize_canonical_git_sha(stdout)
+}
+
+fn emit_git_build_metadata(
+    emitter: &mut Emitter,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-env-changed=PI_BUILD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_DIRTY");
+    println!("cargo:rerun-if-env-changed=PI_REQUIRE_GIT_SHA");
+
+    let require_git_sha = env_truthy("PI_REQUIRE_GIT_SHA");
+
+    let explicit_sha = if let Ok(raw) = std::env::var("PI_BUILD_GIT_SHA") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            let normalized = normalize_canonical_git_sha(trimmed).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "PI_BUILD_GIT_SHA must be a canonical 40-hex commit SHA, got {trimmed:?}"
+                    ),
+                )
+            })?;
+            Some(normalized)
+        }
+    } else if let Ok(raw) = std::env::var("VERGEN_GIT_SHA") {
+        normalize_canonical_git_sha(&raw)
+    } else {
+        None
+    };
+
+    if let Some(sha) = explicit_sha {
+        println!("cargo:rustc-env=VERGEN_GIT_SHA={sha}");
+        let dirty = std::env::var("VERGEN_GIT_DIRTY")
+            .ok()
+            .filter(|value| matches!(value.trim(), "true" | "false"))
+            .unwrap_or_else(|| "false".to_string());
+        println!("cargo:rustc-env=VERGEN_GIT_DIRTY={dirty}");
+        return Ok(None);
+    }
+
+    if let Some(repo_sha) = resolve_repo_git_sha() {
+        // `Gix::builder().sha(short: bool)` -- the bool selects SHORT, it does not
+        // enable the variable (vergen-gix 9.1.0, src/gix/mod.rs:280; unchanged in
+        // 10.0, where `sha` is `with = |short: bool| ...`). Passing `.sha(false)`
+        // emits the full 40-hex SHA required by `is_full_git_sha` in perf records,
+        // while `pi --version` abbreviates it for display.
+        let gix = Gix::builder().sha(false).dirty(true).build();
+        emitter.add_instructions(&gix)?;
+        // Return the verified 40-hex repo SHA so we emit it after `emitter.emit()`
+        // as an authoritative guarantee even in linked worktrees/gitfiles where
+        // `vergen-gix` can fall back to `"unknown"`.
+        return Ok(Some(repo_sha));
+    }
+
+    if require_git_sha {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PI_REQUIRE_GIT_SHA=1 requires a canonical 40-hex commit SHA via \
+             PI_BUILD_GIT_SHA, VERGEN_GIT_SHA, or a .git checkout; refusing to bake 'unknown'",
+        )));
+    }
+
+    // Crates.io source tarballs and other non-git builds without PI_REQUIRE_GIT_SHA=1
+    // keep vergen-gix's quiet fallback behavior so `cargo install` continues to succeed.
+    let gix = Gix::builder().sha(false).dirty(true).build();
+    emitter.add_instructions(&gix)?;
+    Ok(None)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     compress_embedded_text_assets()?;
     emit_benchmark_build_fingerprint()?;
 
     let build = Build::builder().build_timestamp(true).build();
     let cargo = Cargo::builder().target_triple(true).build();
-    // `Gix::builder().sha(short: bool)` -- the bool selects SHORT, it does not
-    // enable the variable (vergen-gix 9.1.0, src/gix/mod.rs:280; unchanged in
-    // 10.0, where `sha` is `with = |short: bool| ...`). So `.sha(true)`
-    // baked a 9-character sha into VERGEN_GIT_SHA, and every perf evidence
-    // record that carries provenance was rejected by its own gate:
-    // `is_full_git_sha` wants 40 hex characters, so `source_identity_verified`
-    // was false, so `eligible_for_regression_gate` was false and `confidence`
-    // came out "medium" where the contract demands "high". An abbreviated sha is
-    // genuinely ambiguous provenance, so the gate is right and this was wrong.
-    // `pi --version` still shows the short form; it abbreviates for display.
-    let gix = Gix::builder().sha(false).dirty(true).build();
     let rustc = Rustc::builder().semver(true).build();
 
     let mut emitter = Emitter::default();
     // Offloaded builds can temporarily miss git objects and trigger fallback warnings.
-    // Keep default env fallbacks, but suppress warning noise in build output.
+    // Keep default env fallbacks unless PI_REQUIRE_GIT_SHA=1 is set, and suppress
+    // warning noise in build output.
     emitter
         .quiet()
         .add_instructions(&build)?
         .add_instructions(&cargo)?
-        .add_instructions(&gix)?
-        .add_instructions(&rustc)?
-        .emit()?;
+        .add_instructions(&rustc)?;
+    let authoritative_repo_sha = emit_git_build_metadata(&mut emitter)?;
+    emitter.emit()?;
+    if let Some(repo_sha) = authoritative_repo_sha {
+        println!("cargo:rustc-env=VERGEN_GIT_SHA={repo_sha}");
+    }
 
     Ok(())
 }
