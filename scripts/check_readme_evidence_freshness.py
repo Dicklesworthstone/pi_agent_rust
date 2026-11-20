@@ -2028,6 +2028,126 @@ def check_evidence_state_table(
     return errors
 
 
+def check_budget_summary_prose_metadata(
+    obligations: list[ClaimObligation],
+    readme_text: str,
+    summary: dict[str, Any] | None,
+) -> list[str]:
+    """Verify README blocks citing budget_summary.json match its date, source_commit, and blockers.
+
+    Prevents prose blocks from stating stale generation dates (e.g. `generated 2026-09-21`),
+    fabricated `from source <sha>` claims when `source_commit` is null, or an incomplete
+    `blocking reason codes` list that omits `source_commit_unbound`.
+    """
+    if summary is None:
+        return []
+    cited = [
+        o for o in obligations if o.artifact_path == CANONICAL_PERFORMANCE_SUMMARY_PATH
+    ]
+    if not cited:
+        return []
+
+    readme_lines = readme_text.splitlines()
+    generated_at_raw = summary.get("generated_at")
+    expected_date = (
+        generated_at_raw[:10]
+        if isinstance(generated_at_raw, str) and len(generated_at_raw) >= 10
+        else None
+    )
+    source_commit = summary.get("source_commit")
+    claim = summary.get("claim_readiness")
+    expected_blockers = (
+        [c for c in claim.get("blocking_reason_codes", []) if isinstance(c, str)]
+        if isinstance(claim, dict)
+        else []
+    )
+
+    def block_span(line_number: int) -> tuple[int, str]:
+        start = line_number - 1
+        while start > 0 and readme_lines[start - 1].strip() and not readme_lines[
+            start - 1
+        ].lstrip().startswith("#"):
+            start -= 1
+        end = line_number
+        while end < len(readme_lines) and readme_lines[end].strip() and not readme_lines[
+            end
+        ].lstrip().startswith("#"):
+            end += 1
+        return start + 1, "\n".join(readme_lines[start:end])
+
+    errors: list[str] = []
+    seen_blocks: set[int] = set()
+    date_re = re.compile(r"\b(?:re)?generated(?:\s+on)?\s+(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
+    source_re = re.compile(r"\bfrom\s+source\s+`?([0-9a-f]{7,40})`?", re.IGNORECASE)
+
+    for obligation in cited:
+        start_line, block = block_span(obligation.line_number)
+        if start_line in seen_blocks:
+            continue
+        seen_blocks.add(start_line)
+
+        if expected_date is not None:
+            for m in date_re.finditer(block):
+                if m.group(1) != expected_date:
+                    errors.append(
+                        f"EVIDENCE METADATA MISMATCH: line {start_line}: README states "
+                        f"generated date {m.group(1)} but {CANONICAL_PERFORMANCE_SUMMARY_PATH} "
+                        f"has generated_at={generated_at_raw!r} (date {expected_date})"
+                    )
+
+        for m in source_re.finditer(block):
+            stated_sha = m.group(1).lower()
+            if source_commit is None:
+                errors.append(
+                    f"EVIDENCE METADATA MISMATCH: line {start_line}: README claims "
+                    f"source commit {stated_sha!r} but {CANONICAL_PERFORMANCE_SUMMARY_PATH} "
+                    "has source_commit=null (unbound)"
+                )
+            elif isinstance(source_commit, str) and not source_commit.lower().startswith(stated_sha):
+                errors.append(
+                    f"EVIDENCE METADATA MISMATCH: line {start_line}: README claims "
+                    f"source commit {stated_sha!r} but {CANONICAL_PERFORMANCE_SUMMARY_PATH} "
+                    f"has source_commit={source_commit!r}"
+                )
+
+    # Also inspect any README paragraph enumerating "blocking reason codes" near
+    # a budget_summary citation or inside Current Evidence State.
+    in_evidence_section = False
+    idx = 0
+    while idx < len(readme_lines):
+        line = readme_lines[idx]
+        if line.startswith("## "):
+            in_evidence_section = bool(EVIDENCE_STATE_HEADING_RE.match(line))
+            idx += 1
+            continue
+        if "blocking reason codes" in line.lower() and expected_blockers:
+            start = idx
+            while start > 0 and readme_lines[start - 1].strip() and not readme_lines[
+                start - 1
+            ].lstrip().startswith("#"):
+                start -= 1
+            end = idx + 1
+            while end < len(readme_lines) and readme_lines[end].strip() and not readme_lines[
+                end
+            ].lstrip().startswith("#"):
+                end += 1
+            paragraph = "\n".join(readme_lines[start:end])
+            if in_evidence_section or CANONICAL_PERFORMANCE_SUMMARY_PATH in paragraph:
+                missing_codes = [
+                    code for code in expected_blockers if f"`{code}`" not in paragraph
+                ]
+                if missing_codes:
+                    errors.append(
+                        f"EVIDENCE METADATA MISMATCH: line {start + 1}: README blocking reason "
+                        f"codes omit {missing_codes!r} present in {CANONICAL_PERFORMANCE_SUMMARY_PATH}"
+                    )
+            idx = end
+            continue
+        idx += 1
+
+    return errors
+
+
 def check_readme(
     repo_root: Path,
     now: datetime | None = None,
@@ -2182,6 +2302,24 @@ def check_readme(
             freshness_time = mtime
             freshness_source = "filesystem_mtime"
             head_commit_time: datetime | None = None
+            if artifact_path.endswith(".json"):
+                json_text, _ = decode_artifact_text(artifact_bytes)
+                if json_text is not None:
+                    json_payload, _ = load_json_object(artifact_path, json_text)
+                    if json_payload is not None:
+                        embedded_generated_at = parse_iso_datetime(
+                            json_payload.get("generated_at")
+                        )
+                        if embedded_generated_at is not None:
+                            freshness_time = embedded_generated_at
+                            freshness_source = "embedded_generated_at"
+                            if (
+                                claim_surface != "historical_snapshot"
+                                and embedded_generated_at > now + MAX_FUTURE_CLOCK_SKEW
+                            ):
+                                release_binding_errors.append(
+                                    "artifact embedded generated_at is more than five minutes in the future"
+                                )
             if (
                 release_snapshot is not None
                 and not artifact_path.endswith(".json")
@@ -2303,6 +2441,9 @@ def check_readme(
         if isinstance(loaded, dict):
             perf_summary = loaded
     evidence_table_errors = check_evidence_state_table(readme_text, perf_summary)
+    evidence_table_errors.extend(
+        check_budget_summary_prose_metadata(obligations, readme_text, perf_summary)
+    )
     for error in evidence_table_errors:
         print(error)
 
@@ -3572,6 +3713,80 @@ def _run_self_test_cases() -> int:
             print(
                 "SELF-TEST FAIL: absent package.include must not authorize docs/evidence followups"
             )
+            return 2
+
+        # Planted-red 1: fresh filesystem mtime MUST NOT mask stale embedded generated_at
+        # on a release-facing JSON artifact (even with a `; no performance claim` citation).
+        stale_json_root = base / "embedded-generated-at-freshness"
+        (stale_json_root / "tests/perf/reports").mkdir(parents=True)
+        stale_generated_at = (now - timedelta(days=20)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        stale_summary = cloned(canonical_summary)
+        assert isinstance(stale_summary, dict)
+        stale_summary["generated_at"] = stale_generated_at
+        stale_summary["source_commit"] = None
+        stale_summary["run_id"] = None
+        stale_summary["correlation_id"] = None
+        stale_summary["strict_mode"] = False
+        stale_summary["claim_readiness"] = {
+            "status": "blocked",
+            "performance_claims_authorized": False,
+            "blocking_reason_codes": [
+                "budget_data_missing",
+                "ci_budget_data_missing",
+                "correlation_id_missing",
+                "data_contract_failure",
+                "run_id_missing",
+                "source_commit_unbound",
+                "strict_mode_disabled",
+            ],
+        }
+        stale_summary_path = stale_json_root / CANONICAL_PERFORMANCE_SUMMARY_PATH
+        stale_summary_path.write_text(json.dumps(stale_summary, indent=2) + "\n", encoding="utf-8")
+        os.utime(stale_summary_path, (fresh_ts, fresh_ts))
+        (stale_json_root / "README.md").write_text(
+            f"- Summary (generated {stale_generated_at[:10]}; `source_commit` unbound): "
+            "`19` declared, `0` PASS, `0` FAIL, `19` NO_DATA. Blocking reason codes: "
+            "`budget_data_missing`, `ci_budget_data_missing`, `correlation_id_missing`, "
+            "`data_contract_failure`, `run_id_missing`, `source_commit_unbound`, `strict_mode_disabled`.\n"
+            "  *(from tests/perf/reports/budget_summary.json; no performance claim)*\n",
+            encoding="utf-8",
+        )
+        git(stale_json_root, "init", "-q")
+        git(stale_json_root, "config", "user.email", "test@example.com")
+        git(stale_json_root, "config", "user.name", "Test")
+        git(stale_json_root, "add", ".")
+        git(stale_json_root, "commit", "-q", "-m", "stale embedded generated_at fixture")
+        os.utime(stale_summary_path, (fresh_ts, fresh_ts))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_stale = check_readme(stale_json_root, now=now, enforce_staleness=True)
+        if rc_stale == 0 or "freshness=embedded_generated_at" not in buf.getvalue():
+            print(buf.getvalue())
+            print("SELF-TEST FAIL: fresh mtime must not mask stale embedded generated_at")
+            return 2
+
+        # Planted-red 2: README metadata drift (stale date, fabricated source commit,
+        # or omitted source_commit_unbound blocker) MUST fail even in --structural-only mode.
+        stale_meta_readme = (
+            "- Current budget summary (generated 2026-09-21 from source `9c887d33`): "
+            "`19` declared, `0` PASS, `0` FAIL, `19` NO_DATA. Blocking reason codes: "
+            "`budget_data_missing`, `ci_budget_data_missing`, `correlation_id_missing`, "
+            "`data_contract_failure`, `run_id_missing`, `strict_mode_disabled`.\n"
+            "  *(from tests/perf/reports/budget_summary.json; no performance claim)*\n"
+        )
+        meta_errors = check_budget_summary_prose_metadata(
+            parse_citation_obligations(stale_meta_readme),
+            stale_meta_readme,
+            stale_summary,
+        )
+        joined_meta = "\n".join(meta_errors)
+        if (
+            "2026-09-21" not in joined_meta
+            or "9c887d33" not in joined_meta
+            or "source_commit_unbound" not in joined_meta
+        ):
+            print(joined_meta)
+            print("SELF-TEST FAIL: README metadata drift must report date, source_commit, and missing blocker")
             return 2
 
     print("SELF-TEST PASS")

@@ -2029,6 +2029,16 @@ fn e2e_cli_version_flag() {
     assert_contains(&harness.harness, &result.stdout, "pi ");
     assert_contains(&harness.harness, &result.stdout, env!("CARGO_PKG_VERSION"));
     assert_contains(&harness.harness, &result.stdout, "\n");
+    if let Some(sha) = option_env!("VERGEN_GIT_SHA")
+        && pi::perf_build::is_canonical_git_sha(sha)
+    {
+        assert!(
+            !result.stdout.contains("(unknown "),
+            "pi --version must not print `(unknown ...)` when VERGEN_GIT_SHA is bound: {}",
+            result.stdout
+        );
+        assert_contains(&harness.harness, &result.stdout, &sha[..9]);
+    }
 }
 
 #[test]

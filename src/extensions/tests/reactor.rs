@@ -3099,3 +3099,178 @@ fn hostcall_marshal_fast_opcode_detects_case_divergence_and_preserves_canonical_
     );
     reset_hostcall_superinstruction_state_for_tests();
 }
+
+#[test]
+fn precomputed_fast_opcode_hashes_match_canonical_dynamic_hashing_bit_for_bit() {
+    let _guard = superinstruction_test_lock();
+    reset_hostcall_superinstruction_state_for_tests();
+
+    // Every op-only fast opcode uses precomputed (params_hash, args_shape_hash).
+    for (method, op, opcode) in [
+        (
+            "session",
+            "get_state",
+            CommonHostcallOpcode::SessionGetState,
+        ),
+        (
+            "session",
+            "get_messages",
+            CommonHostcallOpcode::SessionGetMessages,
+        ),
+        (
+            "session",
+            "get_entries",
+            CommonHostcallOpcode::SessionGetEntries,
+        ),
+        (
+            "session",
+            "get_branch",
+            CommonHostcallOpcode::SessionGetBranch,
+        ),
+        ("session", "get_file", CommonHostcallOpcode::SessionGetFile),
+        ("session", "get_name", CommonHostcallOpcode::SessionGetName),
+        (
+            "session",
+            "get_model",
+            CommonHostcallOpcode::SessionGetModel,
+        ),
+        (
+            "session",
+            "get_thinking_level",
+            CommonHostcallOpcode::SessionGetThinkingLevel,
+        ),
+        ("events", "get_model", CommonHostcallOpcode::EventsGetModel),
+        (
+            "events",
+            "get_thinking_level",
+            CommonHostcallOpcode::EventsGetThinkingLevel,
+        ),
+        (
+            "events",
+            "get_active_tools",
+            CommonHostcallOpcode::EventsGetActiveTools,
+        ),
+        (
+            "events",
+            "get_all_tools",
+            CommonHostcallOpcode::EventsGetAllTools,
+        ),
+        ("events", "list", CommonHostcallOpcode::EventsList),
+        (
+            "events",
+            "list_flags",
+            CommonHostcallOpcode::EventsListFlags,
+        ),
+    ] {
+        let params = json!({ "op": op });
+        let fast = HostcallPayloadArena::new(method, &params, Some(opcode)).marshal();
+        let canonical = HostcallPayloadArena::new(method, &params, None).marshal();
+        assert_eq!(
+            fast.params_hash, canonical.params_hash,
+            "precomputed params_hash mismatch for {method}/{op}"
+        );
+        assert_eq!(
+            fast.args_shape_hash, canonical.args_shape_hash,
+            "precomputed args_shape_hash mismatch for {method}/{op}"
+        );
+    }
+
+    // Common fast tool shapes use precomputed args_shape_hash; mutating the shape
+    // must produce a strictly distinct digest (planted-red invariant).
+    let tool_cases = [
+        (
+            CommonHostcallOpcode::ToolRead,
+            json!({ "name": "read", "input": { "path": "src/lib.rs" } }),
+        ),
+        (
+            CommonHostcallOpcode::ToolRead,
+            json!({ "name": "read", "input": { "path": "src/lib.rs", "offset": 1, "limit": 50 } }),
+        ),
+        (
+            CommonHostcallOpcode::ToolBash,
+            json!({ "name": "bash", "input": { "command": "echo hi", "timeout": 10 } }),
+        ),
+        (
+            CommonHostcallOpcode::ToolWrite,
+            json!({ "name": "write", "input": { "path": "a.txt", "content": "hello" } }),
+        ),
+        (
+            CommonHostcallOpcode::ToolEdit,
+            json!({ "name": "edit", "input": { "path": "a.txt", "oldText": "a", "newText": "b" } }),
+        ),
+    ];
+    for (opcode, params) in &tool_cases {
+        let fast = HostcallPayloadArena::new("tool", params, Some(*opcode)).marshal();
+        let canonical = HostcallPayloadArena::new("tool", params, None).marshal();
+        assert_eq!(fast.params_hash, canonical.params_hash);
+        assert_eq!(fast.args_shape_hash, canonical.args_shape_hash);
+    }
+
+    let read_str_shape = HostcallPayloadArena::new(
+        "tool",
+        &json!({ "name": "read", "input": { "path": "a.rs" } }),
+        Some(CommonHostcallOpcode::ToolRead),
+    )
+    .marshal()
+    .args_shape_hash;
+    let read_mutated_shape = HostcallPayloadArena::new(
+        "tool",
+        &json!({ "name": "read", "input": { "path": 123 } }),
+        Some(CommonHostcallOpcode::ToolRead),
+    )
+    .marshal()
+    .args_shape_hash;
+    assert_ne!(
+        read_str_shape, read_mutated_shape,
+        "mutated tool input shape must not hit the string-path precomputed shape hash"
+    );
+    reset_hostcall_superinstruction_state_for_tests();
+}
+
+#[test]
+fn service_latency_spike_triggers_aci_and_cusum_fallback_before_quota_exhaustion() {
+    let manager = ExtensionManager::new();
+    let mut cfg = ExtensionBudgetControllerConfig {
+        enabled: true,
+        tier: ExtensionBudgetTier::Balanced,
+        overload_window_ms: 60_000,
+        overload_signals_to_fallback: 100,
+        recovery_successes_to_exit: 3,
+        ..Default::default()
+    };
+    cfg.safety_envelope.min_observations = 10;
+    manager.set_budget_controller_config(cfg);
+
+    // Calibrate baseline with 15 normal sub-millisecond hostcalls: must stay on fast lane.
+    for _ in 0..15 {
+        manager.record_budget_call_outcome(Some("ext.service.latency"), true, 1.0);
+    }
+    assert!(
+        !manager.budget_fallback_active("ext.service.latency"),
+        "healthy baseline calls must not enter fallback"
+    );
+
+    // Inject sustained tail-latency regime shift without firing any quota overload signal.
+    for _ in 0..6 {
+        manager.record_budget_call_outcome(Some("ext.service.latency"), true, 250.0);
+    }
+
+    assert!(
+        manager.budget_fallback_active("ext.service.latency"),
+        "sustained hostcall service-latency spike must trigger fallback before quota exhaustion"
+    );
+    let regime = manager
+        .regime_shift_snapshot("ext.service.latency")
+        .expect("regime shift snapshot");
+    assert!(
+        regime.triggered && regime.trigger_count >= 1,
+        "CUSUM/BOCPD must observe service-latency shift: {regime:?}"
+    );
+    let env = manager
+        .safety_envelope_snapshot("ext.service.latency")
+        .expect("safety envelope snapshot");
+    assert!(
+        env.conformal_calibration_size >= 15 && env.conformal_interval_width > 0.0,
+        "ACI safety envelope must track real service-latency observations: {env:?}"
+    );
+}

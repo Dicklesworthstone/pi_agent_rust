@@ -1786,19 +1786,32 @@ fn select_preferred_exact_id_match(candidates: &[ModelEntry]) -> Option<ModelEnt
 /// Multiple rows for the same provider are allowed and tried in order, which
 /// lets a provider expose both a virtual model id (matched by the synthesized
 /// ad-hoc entry) and concrete model ids (matched against registry listings).
-const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
+pub const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     // Prefer Codex (ChatGPT OAuth) when available.
+    // GPT-5.6 Sol/Terra/Luna are the live-supported ChatGPT Codex models;
+    // older gpt-5.1..gpt-5.5 IDs return HTTP 400 `model_not_found` on ChatGPT
+    // Codex accounts, so keep them only as trailing legacy fallbacks when a
+    // custom models.json catalog lists only older IDs.
+    ("openai-codex", "gpt-5.6-sol"),
+    ("openai-codex", "gpt-5.6-terra"),
+    ("openai-codex", "gpt-5.6-luna"),
     ("openai-codex", "gpt-5.5"),
     ("openai-codex", "gpt-5.4"),
     ("openai-codex", "gpt-5.3-codex"),
     ("openai-codex", "gpt-5.2-codex"),
     ("openai-codex", "gpt-5.1-codex-max"),
     // Fall back to OpenAI API when configured.
+    ("openai", "gpt-5.6"),
+    ("openai", "gpt-5.6-sol"),
+    ("openai", "gpt-5.6-terra"),
+    ("openai", "gpt-5.6-luna"),
     ("openai", "gpt-5.5"),
     ("openai", "gpt-5.4"),
     ("openai", "gpt-5.3-codex"),
     ("openai", "gpt-5.2-codex"),
     ("openai", "gpt-5.1-codex"),
+    // Fall back to Anthropic API when configured.
+    ("anthropic", "claude-sonnet-4-6"),
     ("anthropic", "claude-opus-4-5"),
     // Bedrock is credential-exempt (structured AWS credentials resolve at
     // request time, so it always counts as "available"). Rank it BELOW
@@ -3087,6 +3100,62 @@ mod tests {
         let selected = default_model_from_available(&available);
         assert_eq!(selected.model.provider, "openai-codex");
         assert_eq!(selected.model.id, "gpt-5.4");
+    }
+
+    #[test]
+    fn default_model_from_available_prefers_live_gpt_5_6_sol_over_retired_codex_ids() {
+        let available = vec![
+            test_model_entry("gpt-5.5", "openai-codex", true),
+            test_model_entry("gpt-5.4", "openai-codex", true),
+            test_model_entry("gpt-5.6-terra", "openai-codex", true),
+            test_model_entry("gpt-5.6-sol", "openai-codex", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "openai-codex");
+        assert_eq!(
+            selected.model.id, "gpt-5.6-sol",
+            "auto-select must pick live-supported gpt-5.6-sol instead of retired gpt-5.5"
+        );
+    }
+
+    #[test]
+    fn primary_provider_defaults_resolve_in_builtin_registry_and_preserve_explicit_gpt_5_5() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let registry = ModelRegistry::load(&auth, None);
+
+        // Built-in catalog providers must resolve their top default model ID.
+        for provider in [
+            "openai-codex",
+            "openai",
+            "anthropic",
+            "amazon-bedrock",
+            "google",
+            "google-gemini-cli",
+            "google-antigravity",
+        ] {
+            let expected_id = provider_default_model_id(provider);
+            assert!(
+                expected_id.is_some(),
+                "missing default model for {provider}"
+            );
+            let expected_id = expected_id.unwrap_or_default();
+            assert!(
+                registry.find(provider, expected_id).is_some(),
+                "primary default {provider}/{expected_id} must exist in built-in ModelRegistry"
+            );
+        }
+
+        // Feature-preservation invariant: explicit `--model gpt-5.5` remains resolvable.
+        assert!(
+            registry.find("openai-codex", "gpt-5.5").is_some(),
+            "explicit openai-codex/gpt-5.5 opt-in must remain resolvable"
+        );
+        assert!(
+            registry.find("openai", "gpt-5.5").is_some(),
+            "explicit openai/gpt-5.5 opt-in must remain resolvable"
+        );
     }
 
     #[test]

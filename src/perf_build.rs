@@ -16,15 +16,16 @@ pub const BENCH_BUILD_PROFILE_ENV: &str = "PI_BENCH_BUILD_PROFILE";
 /// Environment variable that requests an allocator label for benchmark runs.
 pub const BENCH_ALLOCATOR_ENV: &str = "PI_BENCH_ALLOCATOR";
 
-/// Release binary-size budget (MB) shared by perf regression and budget gates.
+/// Release binary-size budget (MB) retained for historical `[profile.release]`
+/// (`opt-level = "z"`) perf-budget schema checks (`tests/perf_budgets.rs`).
+///
+/// Shipping binaries are built by DSR with `[profile.dist]` (`opt-level = 3`,
+/// LTO + strip) with no arbitrary shipping binary-size ceiling per operator
+/// policy (`bd-dist-binary-size-under-48mib-d7cij`).
 ///
 /// Raised 22.0 → 26.0 on 2026-08-16 with the FrankenSQLite cutover
-/// (bd-oc1wu): the pure-Rust engine replaces libsqlite3-sys C code and costs
-/// ~5.6 MiB of compiled core (parser/planner/VDBE/MVCC/pager) that LTO cannot
-/// remove. Reclaim tracked in the follow-up size bead before tightening.
-/// Raised 26.0 → 48.0 on 2026-08-21 for the v0.3.0 capability wave (BPE
-/// token tables, LSP/DAP bridges, MCP client, eval kernels, web tools);
-/// bd tracker holds the re-trim investigation.
+/// (bd-oc1wu) and 26.0 → 48.0 on 2026-08-21 for the v0.3.0 capability wave;
+/// kept in lockstep with `PERF_BUDGET_INVENTORY_SHA256`.
 pub const BINARY_SIZE_RELEASE_BUDGET_MB: f64 = 48.0;
 
 /// Cargo profile family embedded by `build.rs` (`PROFILE`; custom release-derived
@@ -40,7 +41,13 @@ pub const COMPILED_DEBUG: &str = env!("PI_BUILD_DEBUG");
 /// Sorted, comma-separated package feature set embedded by `build.rs`.
 pub const COMPILED_FEATURES_CSV: &str = env!("PI_BUILD_FEATURES");
 
-/// Exact package feature set for the canonical shipping/system PiJS perf lane.
+/// Exact package feature set for the headless `production_extension_manager`
+/// PiJS performance lane (`scripts/perf/orchestrate.sh`, `--no-default-features
+/// --features clipboard,image,image-resize,sqlite-sessions,wasm-host`).
+///
+/// Deliberately excludes terminal UI features (`tui`, `ftui`, `bpe-tokens`) so
+/// extension-host benchmarks isolate `production_extension_manager` cleanly
+/// while remaining distinct from `Cargo.toml` `[features].default`.
 pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] = &[
     "clipboard",
     "image",
@@ -48,6 +55,16 @@ pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] = &[
     "sqlite-sessions",
     "wasm-host",
 ];
+
+/// Returns `true` when `raw` is a canonical 40-hex non-zero Git commit SHA
+/// (matching `build.rs` `VERGEN_GIT_SHA` provenance requirements).
+#[must_use]
+pub fn is_canonical_git_sha(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.len() == 40
+        && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !trimmed.bytes().all(|byte| byte == b'0')
+}
 
 /// Versioned name for the authoritative Cargo build fingerprint contract.
 pub const BUILD_FINGERPRINT_CONTRACT: &str = "cargo_build_fingerprint.v1";
@@ -1845,5 +1862,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_pijs_perf_features_match_orchestrator_and_cargo_toml() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let orchestrate = std::fs::read_to_string(manifest_dir.join("scripts/perf/orchestrate.sh"))
+            .expect("read scripts/perf/orchestrate.sh");
+        let expected_flag = format!("--features {}", CANONICAL_PIJS_PERF_FEATURES.join(","));
+        let occurrences = orchestrate.matches(&expected_flag).count();
+        assert!(
+            occurrences >= 2,
+            "scripts/perf/orchestrate.sh must pass `{expected_flag}` in both build and run criterion_pijs steps (found {occurrences})"
+        );
+
+        let cargo_toml =
+            std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Cargo.toml");
+        let features_section = cargo_toml
+            .split("\n[features]\n")
+            .nth(1)
+            .expect("Cargo.toml must have a [features] table")
+            .split("\n[")
+            .next()
+            .expect("features table ends cleanly");
+        for &feature in CANONICAL_PIJS_PERF_FEATURES {
+            if feature == "image" {
+                // `image` is an implicit feature created by the optional `image` dependency.
+                assert!(
+                    cargo_toml.contains("image = {")
+                        && features_section.contains("image-resize = [\"image\"]"),
+                    "implicit `image` feature must remain declared"
+                );
+            } else {
+                assert!(
+                    features_section.contains(&format!("{feature} =")),
+                    "CANONICAL_PIJS_PERF_FEATURES entry `{feature}` must be declared under [features]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_canonical_git_sha_accepts_40_hex_and_rejects_unknown_or_short() {
+        assert!(is_canonical_git_sha(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(is_canonical_git_sha(
+            "  ABCDEF0123456789ABCDEF0123456789ABCDEF01\n"
+        ));
+        assert!(!is_canonical_git_sha("unknown"));
+        assert!(!is_canonical_git_sha("b217af54b"));
+        assert!(!is_canonical_git_sha(&"0".repeat(40)));
+        assert!(!is_canonical_git_sha(
+            "0123456789abcdef0123456789abcdef0123456g"
+        ));
+        assert!(!is_canonical_git_sha(
+            "0123456789abcdef0123456789abcdef01234567-dirty"
+        ));
     }
 }

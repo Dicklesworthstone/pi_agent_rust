@@ -10885,6 +10885,38 @@ fn reset_print_text_stream_state(state: &Arc<StdMutex<PrintTextStreamState>>) {
     *guard = PrintTextStreamState::default();
 }
 
+fn print_tty_image_max_cols() -> usize {
+    #[cfg(feature = "tui")]
+    if let Ok((cols, _)) = crossterm::terminal::size()
+        && cols > 0
+    {
+        return usize::from(cols);
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&cols| cols > 0)
+        .unwrap_or(80)
+}
+
+fn render_print_tty_image(
+    image_b64: &str,
+    mime_type: &str,
+    show_images: bool,
+    max_cols: usize,
+    protocol: pi::terminal_images::ImageProtocol,
+) -> String {
+    if !show_images {
+        return pi::terminal_images::placeholder_for_base64(image_b64, mime_type);
+    }
+    pi::terminal_images::render_inline_with_protocol(
+        image_b64,
+        mime_type,
+        max_cols.max(1),
+        protocol,
+    )
+}
+
 fn finish_print_text_response(
     message: &AssistantMessage,
     stream_state: PrintTextStreamState,
@@ -10899,6 +10931,9 @@ fn finish_print_text_response(
         // When stdout is a terminal, render markdown with formatting.
         // When piped, emit plain text via output_final_text to avoid escape codes.
         if std::io::IsTerminal::is_terminal(&io::stdout()) {
+            let show_images = config.terminal_show_images();
+            let max_cols = print_tty_image_max_cols();
+            let protocol = pi::terminal_images::detect_protocol();
             let mut markdown = String::new();
             let mut inline_images = Vec::new();
             for block in &message.content {
@@ -10910,10 +10945,12 @@ fn finish_print_text_response(
                         }
                     }
                     ContentBlock::Image(image) => {
-                        inline_images.push(pi::terminal_images::render_inline(
+                        inline_images.push(render_print_tty_image(
                             &image.data,
                             &image.mime_type,
-                            80,
+                            show_images,
+                            max_cols,
+                            protocol,
                         ));
                     }
                     _ => {}
@@ -19281,5 +19318,81 @@ mod tests {
 
         let anthropic = find_provider("anthropic");
         assert_eq!(anthropic["capabilities"]["vision"], true);
+    }
+
+    #[test]
+    fn render_print_tty_image_honors_show_images_protocol_and_width() {
+        use base64::Engine as _;
+
+        // Minimal structurally valid 1x1 PNG (matches terminal_images unit fixtures).
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        png.extend_from_slice(&13_u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1_u32.to_be_bytes());
+        png.extend_from_slice(&1_u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0]);
+        png.extend_from_slice(&0_u32.to_be_bytes());
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let kitty = render_print_tty_image(
+            &png_b64,
+            "image/png",
+            true,
+            120,
+            pi::terminal_images::ImageProtocol::Kitty,
+        );
+        assert!(
+            kitty.starts_with("\x1b_Ga=T,f=100,c=120,"),
+            "Kitty print TTY must honor dynamic column width, got {kitty:?}"
+        );
+
+        let iterm = render_print_tty_image(
+            &png_b64,
+            "image/png",
+            true,
+            64,
+            pi::terminal_images::ImageProtocol::Iterm2,
+        );
+        assert!(
+            iterm.contains("width=64;inline=1:"),
+            "iTerm2 print TTY must honor dynamic column width, got {iterm:?}"
+        );
+
+        let clamped = render_print_tty_image(
+            &png_b64,
+            "image/png",
+            true,
+            0,
+            pi::terminal_images::ImageProtocol::Kitty,
+        );
+        assert!(
+            clamped.contains("c=1,"),
+            "zero width must clamp safely to 1 column, got {clamped:?}"
+        );
+
+        // Planted-red: when terminal.show_images is false, NEVER emit raw escapes.
+        let hidden = render_print_tty_image(
+            &png_b64,
+            "image/png",
+            false,
+            120,
+            pi::terminal_images::ImageProtocol::Kitty,
+        );
+        assert!(
+            !hidden.contains('\x1b'),
+            "show_images=false must suppress terminal graphics escapes, got {hidden:?}"
+        );
+        assert_eq!(hidden, "[image: image/png, 1x1]");
+
+        let unsupported = render_print_tty_image(
+            &png_b64,
+            "image/png",
+            true,
+            120,
+            pi::terminal_images::ImageProtocol::Unsupported,
+        );
+        assert!(!unsupported.contains('\x1b'));
+        assert_eq!(unsupported, "[image: image/png, 1x1]");
     }
 }

@@ -20422,7 +20422,13 @@ pub async fn dispatch_host_call_shared(
                 method = %method,
                 reason = %qr,
             );
-            manager.record_budget_overload_signal(ctx.extension_id, "quota_exceeded", None, None);
+            let (queue_depth, queue_capacity) = manager.reactor_queue_saturation();
+            manager.record_budget_overload_signal(
+                ctx.extension_id,
+                "quota_exceeded",
+                queue_depth,
+                queue_capacity,
+            );
             // SEC-5.1: Alert for quota breach.
             manager.record_security_alert(SecurityAlert {
                 schema: SECURITY_ALERT_SCHEMA_VERSION.to_string(),
@@ -20484,20 +20490,21 @@ pub async fn dispatch_host_call_shared(
                 &reason,
             );
             if let Some(decision) = runtime_risk_decision.as_ref() {
+                let (queue_depth, queue_capacity) = manager.reactor_queue_saturation();
                 if decision.feature_budget_exceeded {
                     manager.record_budget_overload_signal(
                         ctx.extension_id,
                         "feature_extraction_budget_exceeded",
-                        None,
-                        None,
+                        queue_depth,
+                        queue_capacity,
                     );
                 }
                 if decision.fallback_reason.is_some() {
                     manager.record_budget_overload_signal(
                         ctx.extension_id,
                         "runtime_risk_decision_timeout",
-                        None,
-                        None,
+                        queue_depth,
+                        queue_capacity,
                     );
                 }
             }
@@ -20769,7 +20776,12 @@ impl HostcallFinalization {
             _ => None,
         };
         if let Some(manager) = manager.as_ref() {
-            manager.record_budget_recovery_sample(extension_id, outcome_error_code.is_none());
+            let duration_ms_f64 = self.started_at.elapsed().as_secs_f64() * 1000.0;
+            manager.record_budget_call_outcome(
+                extension_id,
+                outcome_error_code.is_none(),
+                duration_ms_f64,
+            );
         }
         if let (Some(manager), Some(risk_decision)) =
             (manager.as_ref(), self.runtime_risk_decision.as_ref())

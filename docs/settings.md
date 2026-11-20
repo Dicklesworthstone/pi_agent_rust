@@ -928,7 +928,7 @@ They remain outside project recall, reflection, and startup memory.
 
 ### Terminal display
 
-- `terminal.show_images` (bool): Default `true`. When `false`, Pi hides image blocks in terminal tool output (images are still stored in sessions/exports).
+- `terminal.show_images` (bool): Default `true`. Controls inline Kitty/iTerm2 graphics in print-mode TTY output (clamped to live terminal width) and image attachment badges in interactive tool output (interactive TUI/FrankenTUI intentionally renders cell-safe text badges instead of raw APC/OSC graphics escapes so differential cell grids never corrupt). When `false`, Pi suppresses graphics escapes and hides image previews in terminal output (images are still stored in sessions/exports).
 - `terminal.clear_on_shrink` (bool): Default `false`. When `true`, Pi purges scrollback on terminal shrink to avoid stale rows reappearing after resize.
 
 ### Thinking budgets (tokens)

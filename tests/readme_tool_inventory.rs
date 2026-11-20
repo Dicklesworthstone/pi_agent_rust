@@ -242,3 +242,75 @@ fn readme_default_list_count_matches_code() {
         "README default `--tools` count must match xdev::default_enabled_tools()"
     );
 }
+
+/// Primary default `provider/model` slugs for the first `limit` distinct
+/// providers listed in `pi::app::PROVIDER_DEFAULT_MODELS`.
+fn top_provider_defaults(limit: usize) -> Vec<String> {
+    let mut seen_providers = std::collections::HashSet::new();
+    let mut top = Vec::with_capacity(limit);
+    for &(provider, model_id) in pi::app::PROVIDER_DEFAULT_MODELS {
+        if seen_providers.insert(provider) {
+            top.push(format!("{provider}/{model_id}"));
+            if top.len() == limit {
+                break;
+            }
+        }
+    }
+    top
+}
+
+fn verify_readme_model_defaults_line(
+    readme_text: &str,
+    expected_top: &[String],
+) -> Result<(), String> {
+    let row = readme_text
+        .lines()
+        .find(|line| line.starts_with("| `--model <MODEL>` |"))
+        .ok_or_else(|| {
+            "README.md is missing the `| `--model <MODEL>` |` CLI option row".to_string()
+        })?;
+    let expected_prose = expected_top
+        .iter()
+        .enumerate()
+        .map(|(idx, slug)| {
+            if idx == 0 {
+                format!("`{slug}`")
+            } else {
+                format!("then `{slug}`")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected_fragment = format!("auto-select fallback: {expected_prose}");
+    if !row.contains(&expected_fragment) {
+        return Err(format!(
+            "README `--model` row drifted from PROVIDER_DEFAULT_MODELS: expected {expected_fragment:?} in {row:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn readme_model_auto_select_matches_provider_default_models() {
+    let readme = readme();
+    let expected_top = top_provider_defaults(3);
+    assert_eq!(
+        expected_top.len(),
+        3,
+        "PROVIDER_DEFAULT_MODELS must expose at least 3 distinct primary providers"
+    );
+    let parity = verify_readme_model_defaults_line(&readme, &expected_top);
+    assert!(parity.is_ok(), "{}", parity.err().unwrap_or_default());
+}
+
+#[test]
+fn readme_model_auto_select_parity_rejects_drift() {
+    let expected_top = top_provider_defaults(3);
+    let stale_readme = "| `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |\n";
+    let err = verify_readme_model_defaults_line(stale_readme, &expected_top)
+        .expect_err("stale README auto-select prose must fail closed");
+    assert!(
+        err.contains("drifted from PROVIDER_DEFAULT_MODELS"),
+        "unexpected error message: {err}"
+    );
+}

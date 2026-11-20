@@ -135,7 +135,7 @@ Extension runtime guarantees are also concrete:
 | Two-stage `exec` guard (`exec` capability policy + command-level mediation + DCG/heredoc AST signals) | Dangerous shell intent is caught before spawn, including destructive payloads hidden in multiline wrappers |
 | Trust lifecycle + kill switch (`pending/acknowledged/trusted/killed`) | You can quarantine an extension instantly, log who pulled the switch and why, and require explicit re-acknowledgement before restoring access |
 | Hostcall lane kill-switch controls (`forced_compat_global_kill_switch`, `forced_compat_extension_kill_switch`) | Fast-path regressions can be contained immediately by forcing compatibility-lane execution without disabling the extension system |
-| Deterministic hostcall reactor mesh (shard affinity, bounded SPSC lanes, backpressure telemetry, optional NUMA slab tracking) | Runtime behavior stays predictable under contention; queue pressure and routing decisions are observable instead of opaque |
+| Opt-in hostcall reactor telemetry harness (`enable_hostcall_reactor`: shard routing, bounded queue backpressure, optional NUMA slab tracking) | Lets stress harnesses and operators inspect shard backpressure and fallback transitions on demand without adding mutex/clone overhead to default inline fast-lane dispatch |
 | Cold owner-isolated JS realms + persistent transpile cache | Every reload gets a fresh realm while versioned disk-cached transpilation avoids treating mutable JavaScript state as safely reusable |
 | Tamper-evident runtime risk ledger (`verify` / `replay` / `calibrate`) | Security decisions are hash-linked and can be replayed or threshold-tuned from real runtime traces |
 
@@ -183,7 +183,7 @@ assuming one optimization proves an end-to-end result.
 |---|---|---|
 | Cold-start minimization | Single native binary, no Node/Bun runtime bootstrap, no JIT warmup, startup prewarm for extension runtime paths | Reduce time-to-first-interaction |
 | Less copying on hot paths | `Arc`/`Cow` message flow, zero-copy hostcall/tool payload handling, reduced clone-heavy provider/session paths | Reduce CPU and allocation pressure |
-| Deterministic dispatch core | Typed hostcall opcodes, fast-lane/compat-lane routing, bounded shard queues with reactor-mesh telemetry | Reduce tail latency under concurrent extension load |
+| Deterministic dispatch core | Typed hostcall opcodes, inline fast-lane/compat-lane routing, kill switches, and opt-in reactor-mesh backpressure telemetry | Keep common hostcalls fast while preserving predictable fallback and observability under load |
 | Efficient long-session storage | SQLite session index + v2 sidecar (segmented log + offset index) with O(index+tail) reopen path | Avoid full-history work on eligible resumes |
 | Streaming parser tuned for real networks | SSE parser tracks scanned bytes, handles UTF-8 tails, normalizes chunk boundaries, interns event-type strings | Reduce repeated scanning and parser stalls |
 | Safe fast-path controls | Shadow dual execution sampling, automatic backoff on divergence/overhead, compatibility-lane kill switches for containment | Bound optimization risk and preserve fallback behavior |
@@ -1051,7 +1051,7 @@ Pi supports two extension runtime families with capability-gated host connectors
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
 - Trust-state lifecycle and kill-switch controls with audited state transitions (`pending`/`acknowledged`/`trusted`/`killed`)
 - Workspace trust-on-first-use gate: project settings, extension files, MCP configuration, and discovered project agent profiles require approval keyed to workspace path and content digest. `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` support automation; non-interactive launches fail closed.
-- Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
+- Opt-in hostcall reactor mesh telemetry (`enable_hostcall_reactor`) with shard routing and bounded queue backpressure tracking (production defaults use direct inline fast/compat lane dispatch without extra queue cloning)
 - Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
 
 Imported `createReadTool`, `createWriteTool`, `createEditTool`, `createBashTool`,
@@ -1387,7 +1387,7 @@ Interactive file references:
 | `-p, --print` | Single response, no interaction |
 | `--mode text|json|rpc` | Output/protocol mode. `json` streams one event per line; `message_update` records are delta-only (no cumulative `message` / `partial`), so stdout stays linear in the response length — read the full message from `message_end`. A fatal error in `json` or `rpc` mode prints exactly one `{"type":"error","phase":"startup","code":"<stable code>","message":"…","exit_code":N}` record on stdout before the non-zero exit (`phase` is `run` once the stream had opened) |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
-| `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
+| `--model <MODEL>` | Model to use (auto-select fallback: `openai-codex/gpt-5.6-sol`, then `openai/gpt-5.6`, then `anthropic/claude-sonnet-4-6`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
 | `--tools <TOOLS>` | Comma-separated tool list; overrides optional-tool activation settings for this run. An empty list disables all built-ins |
 | `--no-tools` | Disable built-in tools, including tools enabled in settings |
@@ -1801,7 +1801,7 @@ The sections above compare mechanics. This section calls out concrete features p
 | **Argument-aware runtime risk scoring for shell paths** (`dcg_rule_hit`, `dcg_heredoc_hit`, heredoc AST inspection across Bash/Python/JS/TS/Ruby) | Detects destructive intent hidden in multiline scripts and wrapper commands before hostcall execution |
 | **Tamper-evident runtime risk ledger tooling** (`ext_runtime_risk_ledger verify|replay|calibrate`) | Security decisions are hash-chained and can be verified, replayed, and threshold-calibrated from real traces |
 | **Unified incident evidence bundle export** (risk ledger, security alerts, hostcall telemetry, exec mediation, secret-broker events) | Incident response can triage from one structured artifact set instead of stitching ad-hoc logs |
-| **Deterministic hostcall reactor mesh with optional NUMA slab pool** (shard affinity, global-order drain, bounded SPSC lanes, telemetry) | Keeps extension dispatch predictable under load and surfaces queue/backpressure behavior for tuning |
+| **Opt-in hostcall reactor telemetry harness with optional NUMA slab pool** (`enable_hostcall_reactor`: shard affinity, global-order drain, bounded queue backpressure) | Available to stress harnesses and explicit callers for backpressure testing while default production dispatch runs inline on fast/compat lanes |
 | **Cold realm factory + persistent transpile cache** | Rebuilds mutable JS state for every load while reusing only versioned compiled artifacts that are safe to share across realms |
 | **Extension preflight static analysis** (imports/forbidden-pattern scan with policy-aware hints) | Catches risky extension patterns before runtime execution |
 | **Node/Bun-compatible extension runtime without Node/Bun dependency** (embedded QuickJS + shims) | Runs legacy extension workflows in a single native binary deployment model |
@@ -2719,7 +2719,7 @@ Concrete engineering work in this codebase includes:
 |------|---------------|----------------|
 | Extension dispatch core | Typed hostcall opcode fast paths, compatibility fallback lane, zero-copy payload arena, canonical-hash shortcuts, interned operation paths | Cuts per-call overhead on the hottest extension operations while preserving correctness fallback paths |
 | Registry/policy lookup | Immutable policy snapshots with O(1) capability checks, plus RCU-style metadata snapshots for extension registry/tool metadata | Removes repeated dynamic lookup overhead in hot authorization/dispatch paths |
-| Queueing + concurrency | Core-pinned SPSC reactor mesh, S3-FIFO-inspired admission with fairness guards, BRAVO-style fallback behavior | Improves tail latency under contention instead of only optimizing median latency |
+| Queueing + concurrency | Direct inline fast/compat lane dispatch by default, plus opt-in `HostcallReactorMesh` shard-queue backpressure telemetry (`enable_hostcall_reactor`) and budget-controller fallback guards | Avoids extra mutex/clone overhead on normal calls while keeping bounded overflow fallback and backpressure testing available on demand |
 | Batched execution | AMAC-style interleaved batch executor with stall-aware toggling | Avoids head-of-line stalls when many independent hostcalls are in flight |
 | IO specialization | Opt-in `experimental-controllers` `io_uring` lane policy + telemetry and explicit executor-unavailable fallback | Evaluates IO-heavy call policy in experimental builds without presenting the placeholder bridge as real `io_uring` execution |
 | Runtime startup for extensions | Cold owner-isolated QuickJS realms, prebaked `pi` prelude + `node:*` virtual-module bytecode hydration, bounded in-realm source caches, and versioned persistent transpile caching | Avoids mutable-realm reuse while reducing repeated JS prelude/shim parsing and transpilation work |
@@ -2785,14 +2785,15 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- Current budget summary (generated 2026-09-21 from source `9c887d33`; no run
+- Current budget summary (generated 2026-11-13; `source_commit` unbound, no run
   id, no correlation id, `strict_mode` false): `19` declared budgets, of which
   `0` PASS, `0` FAIL and `19` NO_DATA. Header and per-budget `budget_results`
   rows now agree, and they agree on this: the tree carries no performance
   measurements at all. Claim readiness is `blocked`,
   `performance_claims_authorized` is false, and the blocking reason codes are
   `budget_data_missing`, `ci_budget_data_missing`, `correlation_id_missing`,
-  `data_contract_failure`, `run_id_missing` and `strict_mode_disabled`.
+  `data_contract_failure`, `run_id_missing`, `source_commit_unbound`, and
+  `strict_mode_disabled`.
   Counts are value-bound to the artifact:
   *(from tests/perf/reports/budget_summary.json; no performance claim)*
 - Before spending time on a definitive refresh, run
@@ -3745,8 +3746,8 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 > **STATUS: UNMEASURED.** `claim_readiness.status = "blocked"`,
 > `performance_claims_authorized = false`. The checked-in budget summary was
-> regenerated on 2026-09-21 from source `9c887d33` and contains no
-> measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
+> regenerated on 2026-11-13 with `source_commit` unbound (`null`) and contains
+> no measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
 > `19` NO_DATA.
 > *(from tests/perf/reports/budget_summary.json; no performance claim)*
 
@@ -3781,7 +3782,7 @@ unmeasured rather than as good or bad.
 Of the 19, 14 are CI-enforced and none of those has data. Blocking reason
 codes: `budget_data_missing`, `ci_budget_data_missing`,
 `correlation_id_missing`, `data_contract_failure`, `run_id_missing`,
-`strict_mode_disabled`.
+`source_commit_unbound`, `strict_mode_disabled`.
 
 Two adjacent gates, bound to their own artifacts rather than to the budget
 summary:

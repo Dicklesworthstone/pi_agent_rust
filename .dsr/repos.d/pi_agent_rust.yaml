@@ -56,6 +56,7 @@ local_path: /data/projects/pi_agent_rust
 language: rust
 binary_name: pi
 build_cmd: >-
+  PI_BUILD_GIT_SHA="${PI_BUILD_GIT_SHA:-$(git rev-parse HEAD)}"
   cargo build --locked --profile dist --bin pi &&
   cp "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/dist/pi"
   "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/dist/pi_${os}_${arch}"
@@ -105,6 +106,7 @@ cross_compile:
     # the public release name remains pi_windows_amd64.exe.
     build_cmd: >-
       call C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat &&
+      if not defined PI_BUILD_GIT_SHA for /f "delims=" %i in ('git rev-parse HEAD') do set "PI_BUILD_GIT_SHA=%i" &&
       cargo build --locked --profile dist --bin pi &&
       copy /b "%CARGO_TARGET_DIR%\%CARGO_BUILD_TARGET%\dist\pi.exe"
       "%CARGO_TARGET_DIR%\%CARGO_BUILD_TARGET%\dist\pi_windows_amd64.exe.exe"
@@ -166,3 +168,4 @@ include_files:
 
 env:
   CARGO_INCREMENTAL: "0"
+  PI_REQUIRE_GIT_SHA: "1"

@@ -1104,9 +1104,20 @@ impl ExtensionManager {
         );
     }
 
-    pub(super) fn record_budget_recovery_sample(&self, extension_id: Option<&str>, success: bool) {
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn record_budget_call_outcome(
+        &self,
+        extension_id: Option<&str>,
+        success: bool,
+        duration_ms: f64,
+    ) {
         let Some(ext_id) = extension_id.map(str::trim).filter(|id| !id.is_empty()) else {
             return;
+        };
+        let duration_ms = if duration_ms.is_finite() && duration_ms >= 0.0 {
+            duration_ms
+        } else {
+            0.0
         };
         let Ok(mut guard) = self.inner.lock() else {
             return;
@@ -1115,60 +1126,141 @@ impl ExtensionManager {
         if !config.enabled {
             return;
         }
-        let Some(state) = guard.budget_fallback_states.get_mut(ext_id) else {
-            return;
-        };
-        if !state.in_fallback {
-            return;
-        }
+        let state = guard
+            .budget_fallback_states
+            .entry(ext_id.to_string())
+            .or_default();
 
-        let oco_update = state
-            .oco_tuner
-            .as_mut()
-            .filter(|_| config.oco_tuner.enabled)
-            .map(|state| state.update(!success, None, None, &config.oco_tuner));
+        if state.in_fallback {
+            let oco_update = state
+                .oco_tuner
+                .as_mut()
+                .filter(|_| config.oco_tuner.enabled)
+                .map(|oco| oco.update(!success, None, None, &config.oco_tuner));
 
-        // Feed recovery outcome to the safety envelope (latency=0 for success).
-        state
-            .safety_envelope
-            .evaluate(0.0, success, &config.safety_envelope);
+            // Feed real measured execution latency into the safety envelope during recovery.
+            let _ = state
+                .safety_envelope
+                .evaluate(duration_ms, success, &config.safety_envelope);
 
-        if !success {
+            if !success {
+                state.healthy_success_streak = 0;
+                return;
+            }
+
+            state.healthy_success_streak = state.healthy_success_streak.saturating_add(1);
+            if state.healthy_success_streak < config.recovery_successes_to_exit {
+                return;
+            }
+
+            state.in_fallback = false;
             state.healthy_success_streak = 0;
+            state.overload_timestamps_ms.clear();
+            // Reset regime-shift detectors so the next regime starts fresh.
+            state.regime_shift.cusum.reset_cumsum();
+            state.regime_shift.bocpd.reset();
+            state.regime_shift.triggered = false;
+            state.regime_shift.trigger_source = None;
+            // Reset safety envelope so the next regime starts fresh.
+            state.safety_envelope.reset();
+            let oco_snapshot = state.oco_tuner.as_ref().map(OcoTunerState::snapshot);
+            tracing::info!(
+                event = "host_call.budget_controller.recovered",
+                extension_id = %ext_id,
+                budget_tier = config.tier.as_str(),
+                recovery_successes = config.recovery_successes_to_exit,
+                duration_ms,
+                oco_enabled = config.oco_tuner.enabled,
+                oco_queue_budget = ?oco_snapshot.as_ref().map(|s| s.queue_budget),
+                oco_batch_budget = ?oco_snapshot.as_ref().map(|s| s.batch_budget),
+                oco_time_slice_ms = ?oco_snapshot.as_ref().map(|s| s.time_slice_ms),
+                oco_cumulative_regret = ?oco_snapshot.as_ref().map(|s| s.cumulative_regret),
+                oco_instantaneous_loss = ?oco_update.as_ref().map(|u| u.instantaneous_loss),
+                oco_update_cumulative_regret = ?oco_update.as_ref().map(|u| u.cumulative_regret),
+                fallback_lane = "fast",
+                "Budget controller exited compatibility fallback mode"
+            );
             return;
         }
 
-        state.healthy_success_streak = state.healthy_success_streak.saturating_add(1);
-        if state.healthy_success_streak < config.recovery_successes_to_exit {
-            return;
-        }
+        // Normal (pre-fallback) path: feed real hostcall service latency into
+        // the conformal/PAC-Bayes safety envelope and regime-shift detectors so
+        // sustained tail-latency spikes trigger fallback BEFORE quota exhaustion.
+        let safety_veto = if config.safety_envelope.enabled {
+            state
+                .safety_envelope
+                .evaluate(duration_ms, success, &config.safety_envelope)
+        } else {
+            false
+        };
+        let regime_shift_triggered = if config.regime_shift.enabled {
+            let cusum_alarm = state.regime_shift.cusum.observe(
+                duration_ms,
+                config.regime_shift.cusum_k,
+                config.regime_shift.cusum_h,
+            );
+            let bocpd_alarm = state.regime_shift.bocpd.observe(
+                duration_ms,
+                config.regime_shift.bocpd_lambda,
+                config.regime_shift.bocpd_threshold,
+                config.regime_shift.bocpd_max_run_length,
+            );
+            if cusum_alarm || bocpd_alarm {
+                let source = if cusum_alarm { "cusum" } else { "bocpd" };
+                state.regime_shift.triggered = true;
+                state.regime_shift.trigger_source = Some(source);
+                state.regime_shift.trigger_count += 1;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
-        state.in_fallback = false;
-        state.healthy_success_streak = 0;
-        state.overload_timestamps_ms.clear();
-        // Reset regime-shift detectors so the next regime starts fresh.
-        state.regime_shift.cusum.reset_cumsum();
-        state.regime_shift.bocpd.reset();
-        state.regime_shift.triggered = false;
-        state.regime_shift.trigger_source = None;
-        // Reset safety envelope so the next regime starts fresh.
-        state.safety_envelope.reset();
-        let oco_snapshot = state.oco_tuner.as_ref().map(OcoTunerState::snapshot);
-        tracing::info!(
-            event = "host_call.budget_controller.recovered",
-            extension_id = %ext_id,
-            budget_tier = config.tier.as_str(),
-            recovery_successes = config.recovery_successes_to_exit,
-            oco_enabled = config.oco_tuner.enabled,
-            oco_queue_budget = ?oco_snapshot.as_ref().map(|s| s.queue_budget),
-            oco_batch_budget = ?oco_snapshot.as_ref().map(|s| s.batch_budget),
-            oco_time_slice_ms = ?oco_snapshot.as_ref().map(|s| s.time_slice_ms),
-            oco_cumulative_regret = ?oco_snapshot.as_ref().map(|s| s.cumulative_regret),
-            oco_instantaneous_loss = ?oco_update.as_ref().map(|u| u.instantaneous_loss),
-            oco_update_cumulative_regret = ?oco_update.as_ref().map(|u| u.cumulative_regret),
-            fallback_lane = "fast",
-            "Budget controller exited compatibility fallback mode"
-        );
+        let calibrated_regime_shift = regime_shift_triggered
+            && state.safety_envelope.conformal.observation_count
+                >= u64::from(config.safety_envelope.min_observations);
+        if safety_veto || calibrated_regime_shift {
+            let trigger_kind = if safety_veto {
+                state
+                    .safety_envelope
+                    .veto_reason
+                    .unwrap_or("service_latency_safety_envelope")
+            } else {
+                state
+                    .regime_shift
+                    .trigger_source
+                    .unwrap_or("service_latency_regime_shift")
+            };
+            state.in_fallback = true;
+            state.healthy_success_streak = 0;
+            state.last_trigger_reason = Some("service_latency_shift".to_string());
+            tracing::warn!(
+                event = "host_call.budget_controller.fallback_entered",
+                extension_id = %ext_id,
+                budget_tier = config.tier.as_str(),
+                trigger_reason = "service_latency_shift",
+                trigger_kind,
+                duration_ms,
+                safety_veto,
+                regime_shift_triggered,
+                fallback_lane = "compat",
+                "Budget controller entered compatibility fallback mode on sustained service-latency shift"
+            );
+        }
+    }
+
+    /// Snapshot aggregate reactor queue depth and capacity when the opt-in
+    /// reactor mesh is enabled.
+    pub(super) fn reactor_queue_saturation(&self) -> (Option<usize>, Option<usize>) {
+        self.reactor_telemetry().map_or((None, None), |telemetry| {
+            let depth = telemetry.queue_depths.iter().sum::<usize>();
+            let capacity = telemetry
+                .shard_count
+                .saturating_mul(telemetry.lane_capacity);
+            (Some(depth), Some(capacity))
+        })
     }
 
     /// Snapshot the regime-shift detector state for an extension.

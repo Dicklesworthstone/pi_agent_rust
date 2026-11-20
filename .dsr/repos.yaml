@@ -94,7 +94,7 @@ tools:
       # `ambiguous_git_commit` — 50 of the ~106 failures this lane used to
       # report. The substitution runs on the operator host, where HEAD is real.
       # See bd-0ngnq and the usage note at the top of tests/provider_streaming.rs.
-      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols PI_BUILD_GIT_SHA="$(git rev-parse HEAD)" PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py
       # Eleven loopback fixtures treated a socket read timeout as an error and

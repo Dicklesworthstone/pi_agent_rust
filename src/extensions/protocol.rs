@@ -762,30 +762,34 @@ impl<'a> HostcallPayloadArena<'a> {
         });
         let params_hash = sha256_to_hex(hasher.finalize().as_slice());
 
-        let mut shape_hasher = sha2::Sha256::new();
-        hash_hostcall_envelope(
-            self.method,
-            br#","params_shape":"#,
-            &mut shape_hasher,
-            |h| {
-                h.update(b"{");
-                hash_json_escaped_str("input", h);
-                h.update(b":");
-                hash_canonical_shape(input, h);
-                h.update(b",");
-                hash_json_escaped_str("name", h);
-                h.update(b":");
-                h.update(br#""string""#);
-                h.update(b"}");
-            },
-        );
-        let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
+        let args_shape_hash = precomputed_fast_tool_args_shape_hash(self.method, input)
+            .map_or_else(
+                || {
+                    let mut shape_hasher = sha2::Sha256::new();
+                    hash_hostcall_envelope(
+                        self.method,
+                        br#","params_shape":"#,
+                        &mut shape_hasher,
+                        |h| {
+                            h.update(b"{");
+                            hash_json_escaped_str("input", h);
+                            h.update(b":");
+                            hash_canonical_shape(input, h);
+                            h.update(b",");
+                            hash_json_escaped_str("name", h);
+                            h.update(b":");
+                            h.update(br#""string""#);
+                            h.update(b"}");
+                        },
+                    );
+                    sha256_to_hex(shape_hasher.finalize().as_slice())
+                },
+                str::to_string,
+            );
         FastOpcodeHashOutcome::Exact(params_hash, args_shape_hash)
     }
 
     fn hash_fast_op_only_payload(&self, expected_op: &str) -> FastOpcodeHashOutcome {
-        use sha2::Digest as _;
-
         let Some(map) = self.params.as_object() else {
             return FastOpcodeHashOutcome::ShapeMiss;
         };
@@ -801,32 +805,231 @@ impl<'a> HostcallPayloadArena<'a> {
         if op != expected_op {
             return FastOpcodeHashOutcome::Diverged;
         }
-        let mut hasher = sha2::Sha256::new();
-        hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
-            h.update(b"{");
-            hash_json_escaped_str("op", h);
-            h.update(b":");
-            hash_json_escaped_str(expected_op, h);
-            h.update(b"}");
-        });
-        let params_hash = sha256_to_hex(hasher.finalize().as_slice());
+        if let Some((params_hash, args_shape_hash)) =
+            precomputed_fast_op_only_hashes(self.method, expected_op)
+        {
+            return FastOpcodeHashOutcome::Exact(
+                params_hash.to_string(),
+                args_shape_hash.to_string(),
+            );
+        }
 
-        let mut shape_hasher = sha2::Sha256::new();
-        hash_hostcall_envelope(
-            self.method,
-            br#","params_shape":"#,
-            &mut shape_hasher,
-            |h| {
-                h.update(b"{");
-                hash_json_escaped_str("op", h);
-                h.update(b":");
-                h.update(br#""string""#);
-                h.update(b"}");
-            },
-        );
-        let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
+        let (params_hash, args_shape_hash) = compute_fast_op_only_hashes(self.method, expected_op);
         FastOpcodeHashOutcome::Exact(params_hash, args_shape_hash)
     }
+}
+
+fn compute_fast_tool_args_shape_hash(method: &str, canonical_input_shape: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut shape_hasher = sha2::Sha256::new();
+    hash_hostcall_envelope(method, br#","params_shape":"#, &mut shape_hasher, |h| {
+        h.update(b"{");
+        hash_json_escaped_str("input", h);
+        h.update(b":");
+        h.update(canonical_input_shape);
+        h.update(b",");
+        hash_json_escaped_str("name", h);
+        h.update(b":");
+        h.update(br#""string""#);
+        h.update(b"}");
+    });
+    sha256_to_hex(shape_hasher.finalize().as_slice())
+}
+
+/// Precomputed `args_shape_hash` digests for the hottest flat tool input shapes
+/// (`read`, `bash`, `write`, `edit`), cutting fast-lane SHA-256 work from 2 to 1
+/// while staying bit-for-bit identical to dynamic `hash_canonical_shape`.
+fn precomputed_fast_tool_args_shape_hash(method: &str, input: &Value) -> Option<&'static str> {
+    if method != "tool" {
+        return None;
+    }
+    let map = input.as_object()?;
+    match map.len() {
+        1 => {
+            if map.get("path").is_some_and(Value::is_string) {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash("tool", br#"{"path":"string"}"#)
+                        })
+                        .as_str(),
+                )
+            } else if map.get("command").is_some_and(Value::is_string) {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash("tool", br#"{"command":"string"}"#)
+                        })
+                        .as_str(),
+                )
+            } else {
+                None
+            }
+        }
+        2 => {
+            if map.get("content").is_some_and(Value::is_string)
+                && map.get("path").is_some_and(Value::is_string)
+            {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash(
+                                "tool",
+                                br#"{"content":"string","path":"string"}"#,
+                            )
+                        })
+                        .as_str(),
+                )
+            } else if map.get("command").is_some_and(Value::is_string)
+                && map.get("timeout").is_some_and(Value::is_number)
+            {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash(
+                                "tool",
+                                br#"{"command":"string","timeout":"number"}"#,
+                            )
+                        })
+                        .as_str(),
+                )
+            } else if map.get("offset").is_some_and(Value::is_number)
+                && map.get("path").is_some_and(Value::is_string)
+            {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash(
+                                "tool",
+                                br#"{"offset":"number","path":"string"}"#,
+                            )
+                        })
+                        .as_str(),
+                )
+            } else if map.get("limit").is_some_and(Value::is_number)
+                && map.get("path").is_some_and(Value::is_string)
+            {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash(
+                                "tool",
+                                br#"{"limit":"number","path":"string"}"#,
+                            )
+                        })
+                        .as_str(),
+                )
+            } else {
+                None
+            }
+        }
+        3 => {
+            if map.get("newText").is_some_and(Value::is_string)
+                && map.get("oldText").is_some_and(Value::is_string)
+                && map.get("path").is_some_and(Value::is_string)
+            {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash(
+                                "tool",
+                                br#"{"newText":"string","oldText":"string","path":"string"}"#,
+                            )
+                        })
+                        .as_str(),
+                )
+            } else if map.get("limit").is_some_and(Value::is_number)
+                && map.get("offset").is_some_and(Value::is_number)
+                && map.get("path").is_some_and(Value::is_string)
+            {
+                static DIGEST: OnceLock<String> = OnceLock::new();
+                Some(
+                    DIGEST
+                        .get_or_init(|| {
+                            compute_fast_tool_args_shape_hash(
+                                "tool",
+                                br#"{"limit":"number","offset":"number","path":"string"}"#,
+                            )
+                        })
+                        .as_str(),
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn compute_fast_op_only_hashes(method: &str, expected_op: &str) -> (String, String) {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hash_hostcall_envelope(method, br#","params":"#, &mut hasher, |h| {
+        h.update(b"{");
+        hash_json_escaped_str("op", h);
+        h.update(b":");
+        hash_json_escaped_str(expected_op, h);
+        h.update(b"}");
+    });
+    let params_hash = sha256_to_hex(hasher.finalize().as_slice());
+
+    let mut shape_hasher = sha2::Sha256::new();
+    hash_hostcall_envelope(method, br#","params_shape":"#, &mut shape_hasher, |h| {
+        h.update(b"{");
+        hash_json_escaped_str("op", h);
+        h.update(b":");
+        h.update(br#""string""#);
+        h.update(b"}");
+    });
+    let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
+    (params_hash, args_shape_hash)
+}
+
+/// Precomputed `(params_hash, args_shape_hash)` digests for every static
+/// op-only fast opcode (`session` and `events`), eliminating per-call SHA-256
+/// work (2 -> 0) while remaining bit-for-bit identical to dynamic hashing.
+fn precomputed_fast_op_only_hashes(
+    method: &str,
+    expected_op: &str,
+) -> Option<(&'static str, &'static str)> {
+    static TABLE: OnceLock<Vec<(&'static str, &'static str, String, String)>> = OnceLock::new();
+    let entries = TABLE.get_or_init(|| {
+        [
+            ("session", "get_state"),
+            ("session", "get_messages"),
+            ("session", "get_entries"),
+            ("session", "get_branch"),
+            ("session", "get_file"),
+            ("session", "get_name"),
+            ("session", "get_model"),
+            ("session", "get_thinking_level"),
+            ("events", "get_model"),
+            ("events", "get_thinking_level"),
+            ("events", "get_active_tools"),
+            ("events", "get_all_tools"),
+            ("events", "list"),
+            ("events", "list_flags"),
+        ]
+        .into_iter()
+        .map(|(m, op)| {
+            let (params_hash, args_shape_hash) = compute_fast_op_only_hashes(m, op);
+            (m, op, params_hash, args_shape_hash)
+        })
+        .collect()
+    });
+    entries
+        .iter()
+        .find(|(m, op, _, _)| *m == method && *op == expected_op)
+        .map(|(_, _, params_hash, args_shape_hash)| {
+            (params_hash.as_str(), args_shape_hash.as_str())
+        })
 }
 
 const fn hostcall_tool_opcode_name(opcode: CommonHostcallOpcode) -> Option<&'static str> {

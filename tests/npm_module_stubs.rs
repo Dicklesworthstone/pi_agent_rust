@@ -682,20 +682,55 @@ fn zod_enforces_runtime_schema_validation_and_rejects_bad_types() {
 }
 
 #[test]
-fn node_pty_write_fails_closed_with_unsupported_code() {
+fn node_pty_write_resize_kill_fail_closed_with_unsupported_code() {
     let result = eval_ext(
         r#"import { spawn } from "node-pty";"#,
         r#"(() => {
             const p = spawn('/bin/sh', []);
-            try {
-                p.write('echo secret\n');
-                return 'SILENT_DROP';
-            } catch (err) {
-                return err.code || err.message;
+            const codes = [];
+            for (const fn of [
+                () => p.write('echo secret\n'),
+                () => p.resize(120, 40),
+                () => p.kill('SIGTERM'),
+            ]) {
+                try {
+                    fn();
+                    codes.push('SILENT_DROP');
+                } catch (err) {
+                    codes.push(err.code || err.message);
+                }
             }
+            return codes.join(',');
         })()"#,
     );
-    assert_eq!(result, "ERR_PI_SHIM_UNSUPPORTED_OPERATION");
+    assert_eq!(
+        result,
+        "ERR_PI_SHIM_UNSUPPORTED_OPERATION,ERR_PI_SHIM_UNSUPPORTED_OPERATION,ERR_PI_SHIM_UNSUPPORTED_OPERATION"
+    );
+}
+
+#[test]
+fn chokidar_add_unwatch_and_error_listener_fail_closed() {
+    let result = eval_ext(
+        r#"import { watch } from "chokidar";"#,
+        r#"(() => {
+            const w = watch('/tmp/test');
+            const codes = [];
+            for (const fn of [() => w.add('/tmp/a'), () => w.unwatch('/tmp/a')]) {
+                try {
+                    fn();
+                    codes.push('SILENT_DROP');
+                } catch (err) {
+                    codes.push(err.code || err.message);
+                }
+            }
+            return codes.join(',');
+        })()"#,
+    );
+    assert_eq!(
+        result,
+        "ERR_PI_SHIM_UNSUPPORTED_OPERATION,ERR_PI_SHIM_UNSUPPORTED_OPERATION"
+    );
 }
 
 // ─── axios ─────────────────────────────────────────────────────────────────

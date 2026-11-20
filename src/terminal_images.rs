@@ -317,10 +317,21 @@ pub fn placeholder_for_base64(image_b64: &str, mime_type: &str) -> String {
 /// Returns the string to write to the terminal.
 ///
 pub fn render_inline(image_b64: &str, mime_type: &str, max_cols: usize) -> String {
+    render_inline_with_protocol(image_b64, mime_type, max_cols, detect_protocol())
+}
+
+/// Render an image for inline terminal display using an explicit [`ImageProtocol`].
+#[must_use]
+pub fn render_inline_with_protocol(
+    image_b64: &str,
+    mime_type: &str,
+    max_cols: usize,
+    protocol: ImageProtocol,
+) -> String {
     let Some(bytes) = decode_base64_bounded(image_b64, MAX_INLINE_IMAGE_BYTES) else {
         return placeholder(mime_type, None, None);
     };
-    render_inline_bytes(&bytes, mime_type, max_cols, detect_protocol())
+    render_inline_bytes(&bytes, mime_type, max_cols, protocol)
 }
 
 fn decode_base64_bounded(image_b64: &str, max_decoded_bytes: usize) -> Option<Vec<u8>> {

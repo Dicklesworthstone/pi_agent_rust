@@ -307,6 +307,42 @@ def evaluate_contract(
             remediation="Build shipping binaries with --profile dist in .dsr/repos.d/pi_agent_rust.yaml.",
         )
 
+    if "PI_BUILD_GIT_SHA" not in build_cmd:
+        add_diag(
+            diagnostics,
+            code="repo_authority_build_cmd_missing_git_sha",
+            file=repo_authority_path,
+            field="build_cmd",
+            expected="propagates PI_BUILD_GIT_SHA",
+            observed=build_cmd,
+            remediation="Propagate PI_BUILD_GIT_SHA in .dsr/repos.d/pi_agent_rust.yaml build_cmd so pi --version never bakes 'unknown'.",
+        )
+
+    win_cross = (repo_authority.get("cross_compile") or {}).get("windows/amd64")
+    win_build_cmd = str((win_cross or {}).get("build_cmd") or "") if isinstance(win_cross, dict) else ""
+    if win_build_cmd and "PI_BUILD_GIT_SHA" not in win_build_cmd:
+        add_diag(
+            diagnostics,
+            code="repo_authority_win_build_cmd_missing_git_sha",
+            file=repo_authority_path,
+            field="cross_compile.windows/amd64.build_cmd",
+            expected="propagates PI_BUILD_GIT_SHA",
+            observed=win_build_cmd,
+            remediation="Propagate PI_BUILD_GIT_SHA in Windows cross_compile build_cmd in .dsr/repos.d/pi_agent_rust.yaml.",
+        )
+
+    auth_env = repo_authority.get("env")
+    if not isinstance(auth_env, dict) or str(auth_env.get("PI_REQUIRE_GIT_SHA")) != "1":
+        add_diag(
+            diagnostics,
+            code="repo_authority_missing_require_git_sha",
+            file=repo_authority_path,
+            field="env.PI_REQUIRE_GIT_SHA",
+            expected="1",
+            observed=auth_env.get("PI_REQUIRE_GIT_SHA") if isinstance(auth_env, dict) else auth_env,
+            remediation='Set env.PI_REQUIRE_GIT_SHA: "1" in .dsr/repos.d/pi_agent_rust.yaml so release builds fail closed without a commit SHA.',
+        )
+
     if "workflow" in repo_authority:
         add_diag(
             diagnostics,
@@ -494,9 +530,11 @@ def evaluate_contract(
                     "binary_name",
                     "build_profile",
                     "build_cmd",
+                    "cross_compile",
                     "targets",
                     "target_triples",
                     "release_contract",
+                    "env",
                 ):
                     if host_auth.get(auth_key) != repo_authority.get(auth_key):
                         add_diag(
@@ -566,7 +604,7 @@ def _write_valid_fixture(repo_dir: Path, host_dir: Path) -> None:
         "local_path: /data/projects/pi_agent_rust\n"
         "language: rust\n"
         "binary_name: pi\n"
-        "build_cmd: cargo build --locked --profile dist --bin pi\n"
+        'build_cmd: PI_BUILD_GIT_SHA="$(git rev-parse HEAD)" cargo build --locked --profile dist --bin pi\n'
         "build_profile: dist\n"
         "targets:\n"
         "  - linux/amd64\n"
@@ -574,8 +612,15 @@ def _write_valid_fixture(repo_dir: Path, host_dir: Path) -> None:
         "target_triples:\n"
         "  linux/amd64: x86_64-unknown-linux-gnu\n"
         "  windows/amd64: x86_64-pc-windows-msvc\n"
+        "cross_compile:\n"
+        "  windows/amd64:\n"
+        "    host: wsurf\n"
+        '    build_cmd: set "PI_BUILD_GIT_SHA=0123456789abcdef0123456789abcdef01234567" && cargo build --locked --profile dist --bin pi\n'
         "release_contract:\n"
         "  checksum_sidecar: sha256\n"
+        "env:\n"
+        '  CARGO_INCREMENTAL: "0"\n'
+        '  PI_REQUIRE_GIT_SHA: "1"\n'
     )
     (repo_dir / ".dsr" / "repos.yaml").write_text(repos_yaml, encoding="utf-8")
     (repo_dir / ".dsr" / "repos.d" / "pi_agent_rust.yaml").write_text(
@@ -637,7 +682,23 @@ def run_self_test() -> int:
         assert res3["status"] == "fail", "expected missing --keep-going to fail"
         assert "missing_keep_going_flag" in codes3, codes3
 
-    print("SELF-TEST PASS: check_dsr_contract_sync verified clean + 3 planted drift scenarios")
+        # Planted negative 4: missing PI_REQUIRE_GIT_SHA / PI_BUILD_GIT_SHA
+        _write_valid_fixture(repo_dir, host_dir)
+        (repo_dir / ".dsr" / "repos.d" / "pi_agent_rust.yaml").write_text(
+            (repo_dir / ".dsr" / "repos.d" / "pi_agent_rust.yaml")
+            .read_text(encoding="utf-8")
+            .replace('PI_REQUIRE_GIT_SHA: "1"', 'PI_REQUIRE_GIT_SHA: "0"')
+            .replace("PI_BUILD_GIT_SHA", "UNSET_SHA"),
+            encoding="utf-8",
+        )
+        res4 = evaluate_contract(repo_dir, None, require_host=False)
+        codes4 = {d["code"] for d in res4["diagnostics"]}
+        assert res4["status"] == "fail", "expected missing git SHA provenance enforcement to fail"
+        assert "repo_authority_missing_require_git_sha" in codes4, codes4
+        assert "repo_authority_build_cmd_missing_git_sha" in codes4, codes4
+        assert "repo_authority_win_build_cmd_missing_git_sha" in codes4, codes4
+
+    print("SELF-TEST PASS: check_dsr_contract_sync verified clean + 4 planted drift scenarios")
     return 0
 
 
