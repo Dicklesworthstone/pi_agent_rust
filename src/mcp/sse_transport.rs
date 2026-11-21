@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use super::super::{auth, config, manager};
 use super::{
-    ClientRoots, DEFAULT_MCP_TIMEOUT, HTTP_CANCEL_TIMEOUT, HttpTransport, MAX_HTTP_BODY,
-    McpTransport, RequestDispatch, SseEventBudget, is_server_error, redacted_origin,
+    ClientRoots, DEFAULT_MCP_TIMEOUT, HTTP_CANCEL_TIMEOUT, HttpTransport, McpTransport,
+    RequestDispatch, SseEventBudget, is_server_error, redacted_origin,
     reject_authentication_status, request_allows_cancellation_notification, spawn_task_cleanup,
     task_cleanup_has_authority, tool_err, validate_initialize_result, validate_jsonrpc_response,
     validate_outgoing_params,
@@ -1025,6 +1025,7 @@ fn definitive_http_rejection(error: &Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MAX_HTTP_BODY;
     use super::*;
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::net::{SocketAddr, TcpListener, TcpStream};

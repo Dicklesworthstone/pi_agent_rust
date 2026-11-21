@@ -104,3 +104,11 @@ tools:
       - python3 scripts/check_fixture_read_patience.py
       - python3 scripts/check_readme_evidence_freshness.py --structural-only
       - python3 scripts/check_dsr_contract_sync.py --check-host-if-present
+      # Linux-hosted Windows cross-compile gate (bd-reality-check-2026-11-19-bridge-yxf43.5,
+      # bd-dsr-authority-dist-size-budget-dk9av AC #2b, bd-o6hte): checks 100% of
+      # `#[cfg(windows)]` code (`win32job`, `windows`, `mio`, `src/platform.rs`,
+      # `src/tools.rs`, `src/session.rs`, `src/main.rs`) with all default features
+      # enabled using the MinGW `x86_64-pc-windows-gnu` toolchain on Linux RCH
+      # workers even while native Windows host `wsurf` is offline. Distinct from
+      # the pre-release native MSVC runtime gate (`scripts/check_windows_target.sh`).
+      - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo check -j 2 --locked --lib --bins --target x86_64-pc-windows-gnu --keep-going

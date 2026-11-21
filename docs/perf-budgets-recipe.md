@@ -27,9 +27,9 @@ DSR=/Users/jemanuel/projects/doodlestein_self_releaser/dsr
   --work-dir /Users/jemanuel/projects/pi_agent_rust
 ```
 
-## 2. The DSR quality recipe (11 checks, checked in at `.dsr/repos.yaml` and synced to `~/.config/dsr/repos.yaml`)
+## 2. The DSR quality recipe (12 checks, checked in at `.dsr/repos.yaml` and synced to `~/.config/dsr/repos.yaml`)
 
-For `pi_agent_rust`, the active recipe in `.dsr/repos.yaml` (validated by `scripts/check_dsr_contract_sync.py --check-host-if-present`) runs **11 checks**:
+For `pi_agent_rust`, the active recipe in `.dsr/repos.yaml` (validated by `scripts/check_dsr_contract_sync.py --check-host-if-present`) runs **12 checks**:
 
 1. `cargo fmt --check`
 2. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo check -j 2 --locked --all-targets --keep-going`
@@ -42,6 +42,17 @@ For `pi_agent_rust`, the active recipe in `.dsr/repos.yaml` (validated by `scrip
 9. `python3 scripts/check_fixture_read_patience.py`
 10. `python3 scripts/check_readme_evidence_freshness.py --structural-only`
 11. `python3 scripts/check_dsr_contract_sync.py --check-host-if-present`
+12. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo check -j 2 --locked --lib --bins --target x86_64-pc-windows-gnu --keep-going`
+
+Check 12 is the **per-commit Linux-hosted Windows cross-compile gate**
+(`bd-reality-check-2026-11-19-bridge-yxf43.5`, `bd-dsr-authority-dist-size-budget-dk9av`,
+`bd-o6hte`). It compiles `pi` (`--lib --bins`) with all default features
+enabled for `x86_64-pc-windows-gnu` on Linux RCH workers (`mingw-w64`), catching
+`#[cfg(windows)]` compile errors on every commit even when the native Windows
+host `wsurf` is offline. It is distinct from the **pre-release native Windows
+MSVC gate** (`scripts/check_windows_target.sh <commit>` / `bd-m7im4` on `wsurf`),
+which runs `--all-targets`, Clippy, and native Windows runtime tests for the
+shipping `x86_64-pc-windows-msvc` triple before tagging a release.
 
 **Two of those changed on 2026-09-22 and are worth understanding before
 anyone "simplifies" them back.**

@@ -248,15 +248,17 @@ not read.
   exports are self-contained, deleting a session removes its blobs, and
   nothing else garbage-collects them. Older releases do not read these
   references from JSONL, so do not reopen such a session with v0.7.1.
-- **Windows: commands are contained at creation without an unstable std API.**
-  The bash tool, background jobs, subagents, MCP and language servers, the
-  browser, debug adapters and the SDK's RPC subprocess join their kill-on-close
-  Job as part of process creation, so a child cannot start descendants before
-  it is contained, and a command is refused when its Job cannot be set up.
-  The obsolete `windows_process_extensions_raw_attribute` crate feature gate
-  has been removed; stable Rust library consumers are no longer rejected just
-  for targeting Windows. The repository still pins `nightly-2026-08-31` for
-  its authoritative development gates, and `rust-version` remains 1.95.
+- **Windows: commands are contained at creation, and Windows source builds need
+  nightly.** The bash tool, background jobs, subagents, MCP and language
+  servers, the browser, debug adapters and the SDK's RPC subprocess join their
+  kill-on-close Job as part of process creation (`ProcThreadAttributeList` /
+  `spawn_with_attributes`), so a child cannot start descendants before it is
+  contained, and a command is refused when its Job cannot be set up. Because
+  the crate enforces `#![forbid(unsafe_code)]`, Windows targets enable the
+  unstable std feature `windows_process_extensions_raw_attribute` (Rust issue
+  #114854) until stabilized: building `pi` for a Windows target requires a
+  nightly toolchain (the repository pins `nightly-2026-08-31`). Non-Windows
+  targets are unaffected and `rust-version` stays 1.95.
 - **Installer.** `install.sh` reads the latest version from the `tag_name`
   field of GitHub's release metadata whether the JSON is compact or
   pretty-printed; with compact JSON it used to select the release body and

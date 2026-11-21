@@ -5,7 +5,7 @@
 
 use super::{
     Cookie, Document, MAX_STATE_BYTES, State, StorageEntry, checkpoint, cookies_from_response,
-    error, storage_from_response, validate_path,
+    error, storage_from_response,
 };
 use crate::agent_cx::AgentCx;
 use crate::browser::{cdp::Cdp, output, required};
@@ -17,6 +17,7 @@ use std::path::Path;
 
 #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
 fn read_private(owner: &AgentCx, cwd: &Path, requested: &str) -> Result<Vec<u8>> {
+    use super::validate_path;
     use rustix::fs::{Mode, OFlags};
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

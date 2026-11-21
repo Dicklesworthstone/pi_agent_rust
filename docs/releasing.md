@@ -28,14 +28,14 @@ written. Do not re-enable it.
 `dsr quality` reads checks only from the registry file, so a host without the
 `pi_agent_rust` entry cannot run the gate. The registry subset of the recipe
 is checked in at `.dsr/repos.yaml` (fmt, `cargo check --keep-going`, Clippy `--keep-going`, `wasm-host` Clippy,
-`cargo test`, `wasm-host` tests, installer regression, module reachability, fixture read patience, README evidence freshness, and DSR contract sync; Cargo runs through
+`cargo test`, `wasm-host` tests, installer regression, module reachability, fixture read patience, README evidence freshness, DSR contract sync, and Linux-hosted `x86_64-pc-windows-gnu` Windows cross-check; Cargo runs through
 `rch` under `RCH_REQUIRE_REMOTE=1`, so a missing fleet fails the check instead
 of silently compiling on the host, with build/test timeouts raised to fit a
 cold all-targets run). Either point DSR at it for a one-off run or merge it
 into the host registry once:
 
 ```bash
-DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust --dry-run   # expect 11 planned
+DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust --dry-run   # expect 12 planned
 yq -i '.tools.pi_agent_rust = load(".dsr/repos.yaml").tools.pi_agent_rust' ~/.config/dsr/repos.yaml
 dsr quality --tool pi_agent_rust
 ```
@@ -317,21 +317,26 @@ release objective.
 2) **Update version** in `Cargo.toml` (`[package].version`).
 3) **Run the configured DSR quality gate**:
    - `dsr quality --tool pi_agent_rust`
-3b) **Check the Windows target, before the release commit exists** (bd-o6hte):
-   - `scripts/check_windows_target.sh <commit>` — the commit must already be
-     pushed; the Windows host fetches it.
-   - This runs `cargo check --all-targets` and `cargo clippy --all-targets --
-     -D warnings` for `x86_64-pc-windows-msvc`. The DSR gate does **not**: it
-     builds only the rch worker's own triple, and this repository runs no CI,
-     so nothing else notices when Windows stops compiling.
-   - It has stopped compiling before and gone unnoticed for two minor
-     versions. v0.5.0 found the crate had not built for Windows since some
-     point after v0.3.0 — discovered at the release build, after the release
-     commit and tag already existed, which cost a full rebuild of all five
-     platforms and a re-tag. v0.5.1 then found the target still broken under
-     `--all-targets`, along with three real Windows defects.
-   - Budget ~25 minutes warm, over an hour cold. Do this **before** step 5 so
-     a failure costs a commit rather than a release.
+3b) **Windows target gates — per-commit compile gate vs pre-release native runtime gate** (`bd-o6hte`, `bd-reality-check-2026-11-19-bridge-yxf43.5`):
+   - **Per-commit compile gate (Check 12 in `.dsr/repos.yaml`):** `dsr quality`
+     now runs a Linux-hosted `cargo check --locked --lib --bins --target x86_64-pc-windows-gnu --keep-going`
+     check (retaining all default features) via `rch` on every run. That catches
+     `#[cfg(windows)]` compile errors (`win32job`, `windows`, `src/platform.rs`,
+     `src/tools.rs`, `src/session.rs`, `src/main.rs`) immediately even while
+     the native Windows host `wsurf` is offline.
+   - **Pre-release native Windows MSVC + runtime gate (before the release commit exists):**
+     `scripts/check_windows_target.sh <commit>` — the commit must already be
+     pushed; the native Windows host `wsurf` fetches it.
+   - That native script runs `cargo check --all-targets` and `cargo clippy --all-targets -- -D warnings`
+     for the exact shipping `x86_64-pc-windows-msvc` triple (and native Windows
+     runtime verification tracked under `bd-m7im4` / `bd-kgkrq`..`bd-xxtv5`),
+     which the Linux-hosted `--lib --bins` cross-check does not execute.
+   - Historically, Windows stopped compiling undetected for two minor versions
+     (`v0.4.x`..`v0.5.0`, and again in `164351f25` when `windows_process_extensions_raw_attribute`
+     was dropped without running a Windows check). Keeping Check 12 per-commit
+     plus `scripts/check_windows_target.sh` pre-release closes both halves.
+   - Budget ~25 minutes warm, over an hour cold on `wsurf`. Do this **before**
+     step 5 so a native MSVC/test failure costs a commit rather than a release.
 4) **Update changelog**:
    - `br changelog --since-tag vX.Y.Z` (or use `--since YYYY-MM-DD` if no prior tags)
    - paste the output into `CHANGELOG.md` under a new version heading

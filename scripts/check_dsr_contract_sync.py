@@ -44,6 +44,7 @@ REQUIRED_CHECK_SUBSTRINGS = (
     ("fixture_read_patience", "scripts/check_fixture_read_patience.py"),
     ("readme_evidence_freshness", "scripts/check_readme_evidence_freshness.py"),
     ("dsr_contract_sync", "scripts/check_dsr_contract_sync.py"),
+    ("windows_cross_check", "--target x86_64-pc-windows-"),
 )
 
 
@@ -454,6 +455,18 @@ def evaluate_contract(
             remediation="Add --no-fail-fast to the all-targets cargo test check in .dsr/repos.yaml.",
         )
 
+    win_checks = [cmd for cmd in checks_strs if "--target x86_64-pc-windows-" in cmd]
+    if any("--no-default-features" in cmd for cmd in win_checks):
+        add_diag(
+            diagnostics,
+            code="windows_cross_check_drops_default_features",
+            file=repo_registry_path,
+            field=f"tools.{TOOL_KEY}.checks",
+            expected="Windows cross-check retains all default features (no --no-default-features)",
+            observed=win_checks,
+            remediation="Remove --no-default-features from the Windows cross-check in .dsr/repos.yaml.",
+        )
+
     if host_dsr_dir is not None:
         host_registry_path = host_dsr_dir / "repos.yaml"
         host_authority_path = host_dsr_dir / "repos.d" / "pi_agent_rust.yaml"
@@ -597,6 +610,7 @@ def _write_valid_fixture(repo_dir: Path, host_dir: Path) -> None:
         "      - python3 scripts/check_fixture_read_patience.py\n"
         "      - python3 scripts/check_readme_evidence_freshness.py --structural-only\n"
         "      - python3 scripts/check_dsr_contract_sync.py --check-host-if-present\n"
+        "      - cargo check --locked --lib --bins --target x86_64-pc-windows-gnu --keep-going\n"
     )
     authority_yaml = (
         "tool_name: pi_agent_rust\n"
@@ -698,7 +712,34 @@ def run_self_test() -> int:
         assert "repo_authority_build_cmd_missing_git_sha" in codes4, codes4
         assert "repo_authority_win_build_cmd_missing_git_sha" in codes4, codes4
 
-    print("SELF-TEST PASS: check_dsr_contract_sync verified clean + 4 planted drift scenarios")
+        # Planted negative 5: removing Windows cross-check or dropping default features fails contract sync
+        _write_valid_fixture(repo_dir, host_dir)
+        orig_repos = (repo_dir / ".dsr" / "repos.yaml").read_text(encoding="utf-8")
+        (repo_dir / ".dsr" / "repos.yaml").write_text(
+            orig_repos.replace(
+                "      - cargo check --locked --lib --bins --target x86_64-pc-windows-gnu --keep-going\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+        res5a = evaluate_contract(repo_dir, None, require_host=False)
+        codes5a = {d["code"] for d in res5a["diagnostics"]}
+        assert res5a["status"] == "fail", "expected missing Windows cross-check to fail"
+        assert "missing_required_check_windows_cross_check" in codes5a, codes5a
+
+        (repo_dir / ".dsr" / "repos.yaml").write_text(
+            orig_repos.replace(
+                "--target x86_64-pc-windows-gnu --keep-going",
+                "--no-default-features --target x86_64-pc-windows-gnu --keep-going",
+            ),
+            encoding="utf-8",
+        )
+        res5b = evaluate_contract(repo_dir, None, require_host=False)
+        codes5b = {d["code"] for d in res5b["diagnostics"]}
+        assert res5b["status"] == "fail", "expected Windows cross-check with --no-default-features to fail"
+        assert "windows_cross_check_drops_default_features" in codes5b, codes5b
+
+    print("SELF-TEST PASS: check_dsr_contract_sync verified clean + 5 planted drift scenarios")
     return 0
 
 
