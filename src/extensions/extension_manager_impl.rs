@@ -1136,9 +1136,10 @@ impl ExtensionManager {
         // signals. Observe completed calls in both lanes so a slow successful
         // call cannot count as recovery merely because it returned no error.
         state.service_observations = state.service_observations.saturating_add(1);
-        let safety_veto = state
-            .service_safety_envelope
-            .evaluate(duration_ms, success, &config.safety_envelope);
+        let safety_veto =
+            state
+                .service_safety_envelope
+                .evaluate(duration_ms, success, &config.safety_envelope);
         let regime_shift_triggered = if config.regime_shift.enabled {
             let cusum_alarm = state.service_regime_shift.cusum.observe(
                 duration_ms,
@@ -1313,10 +1314,11 @@ impl ExtensionManager {
     ) -> Option<SafetyEnvelopeSnapshot> {
         let guard = self.inner.lock().ok()?;
         let config = &guard.budget_controller_config;
-        guard
-            .budget_fallback_states
-            .get(extension_id)
-            .map(|state| state.service_safety_envelope.snapshot(&config.safety_envelope))
+        guard.budget_fallback_states.get(extension_id).map(|state| {
+            state
+                .service_safety_envelope
+                .snapshot(&config.safety_envelope)
+        })
     }
 
     /// Snapshot OCO tuner state for an extension.

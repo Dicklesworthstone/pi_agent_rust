@@ -4228,12 +4228,10 @@ async fn request_session_shutdown(
     std::thread::Builder::new()
         .name("pi-jobs-session-shutdown".to_string())
         .spawn(move || {
-            let result = snapshot_session_shutdown(
-                attempt,
-                started,
-                SESSION_SHUTDOWN_TIMEOUT,
-                || sender.is_canceled(),
-            );
+            let result =
+                snapshot_session_shutdown(attempt, started, SESSION_SHUTDOWN_TIMEOUT, || {
+                    sender.is_canceled()
+                });
             let _ = sender.send(result);
             drop(worker);
         })
