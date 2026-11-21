@@ -218,6 +218,16 @@ fn price_fallback(
     cache_read: u64,
     cache_write: u64,
 ) -> f64 {
+    let usage = llm_prices::Usage {
+        input: tokens_in,
+        output: tokens_out,
+        cache_read,
+        cache_write_5m: cache_write,
+        ..Default::default()
+    };
+    if let Some(c) = llm_prices::lookup(model).and_then(|p| p.cost_usage(&usage)) {
+        return c.total;
+    }
     let mut best: Option<(&&str, f64, f64)> = None;
     for (prefix, pin, pout) in PRICING {
         if model.starts_with(prefix) && best.is_none_or(|(b, _, _)| prefix.len() > b.len()) {
@@ -737,6 +747,18 @@ mod tests {
             "{}",
             report.cost.total
         );
+    }
+
+    #[test]
+    fn pricing_fallback_uses_current_list_prices() {
+        // Opus 4.5+ lists at $5/$25, not the $15/$75 the "claude-opus-4" prefix matched.
+        let opus = price_fallback("claude-opus-4-5", 1_000_000, 1_000_000, 0, 0);
+        assert!((opus - 30.0).abs() < 1e-6, "{opus}");
+        let haiku = price_fallback("claude-haiku-4-5", 1_000_000, 1_000_000, 0, 0);
+        assert!((haiku - 6.0).abs() < 1e-6, "{haiku}");
+        // Previously missed the table entirely and priced at $0.
+        assert!(price_fallback("gemini-2.5-pro", 1_000_000, 1_000_000, 0, 0) > 0.0);
+        assert!(price_fallback("gpt-5", 1_000_000, 1_000_000, 0, 0) > 0.0);
     }
 
     #[test]
