@@ -857,23 +857,66 @@ fn open_read_file(path: &Path) -> io::Result<(File, StorageParent)> {
     }
 }
 
+/// Capture descriptor contents and metadata through the same authorized handle.
+/// Concurrent length/mtime changes invalidate the capture instead of pairing
+/// bytes with another file or silently publishing a stale size. Filesystems
+/// without modification timestamps still retain the length/identity checks.
+pub(super) fn read_file_snapshot(mut file: File) -> io::Result<(Vec<u8>, Metadata)> {
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file descriptors require a regular host file",
+        ));
+    }
+    if before.len() > MAX_STORAGE_WRITE_BYTES as u64 {
+        return Err(denied("host snapshot read exceeds 64 MiB"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORAGE_WRITE_BYTES {
+        return Err(denied("host snapshot read exceeds 64 MiB"));
+    }
+    let after = file.metadata()?;
+    let changed_time = matches!(
+        (before.modified(), after.modified()),
+        (Ok(before), Ok(after)) if before != after
+    );
+    if before.len() != after.len() || after.len() != bytes.len() as u64 || changed_time {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "host file changed while capturing descriptor contents",
+        ));
+    }
+    Ok((bytes, after))
+}
+
 pub(super) fn read_file(
     path: &Path,
     owner: Option<&str>,
     state: &Rc<RefCell<PiJsModuleState>>,
-) -> io::Result<Option<Vec<u8>>> {
+    snapshot: bool,
+) -> io::Result<Option<(Vec<u8>, Option<Metadata>)>> {
     let Some(path) = authorized_read_path(path, owner, state)? else {
         return Ok(None);
     };
     let (file, parent) = open_read_file(&path)?;
-    let mut bytes = Vec::new();
-    file.take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_STORAGE_WRITE_BYTES {
-        return Err(denied("persistent storage read exceeds 64 MiB"));
-    }
+    let (bytes, metadata) = if snapshot {
+        let (bytes, metadata) = read_file_snapshot(file)?;
+        (bytes, Some(metadata))
+    } else {
+        let mut bytes = Vec::new();
+        file.take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_STORAGE_WRITE_BYTES {
+            return Err(denied("persistent storage read exceeds 64 MiB"));
+        }
+        (bytes, None)
+    };
     parent.verify()?;
-    Ok(Some(bytes))
+    Ok(Some((bytes, metadata)))
 }
 
 /// Metadata uses the same literal grant and pinned file as content reads.
@@ -1192,6 +1235,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn descriptor_snapshot_uses_open_file_after_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, b"original").unwrap();
+        let file = File::open(&path).unwrap();
+        let identity = FileIdentity::of_open_file(&file).unwrap();
+        std::fs::rename(&path, temp.path().join("retained.json")).unwrap();
+        std::fs::write(&path, b"replacement is longer").unwrap();
+
+        let (bytes, metadata) = read_file_snapshot(file).unwrap();
+        assert_eq!(bytes, b"original");
+        assert_eq!(metadata.len(), 8);
+        assert_ne!(identity, FileIdentity::of_path_nofollow(&path).unwrap());
+    }
+
+    #[test]
+    fn descriptor_snapshot_rejects_oversized_and_partial_captures() {
+        use std::io::{Seek as _, SeekFrom};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.bin");
+        std::fs::write(&path, b"content").unwrap();
+        let mut partial = File::open(&path).unwrap();
+        partial.seek(SeekFrom::Start(1)).unwrap();
+        assert_eq!(
+            read_file_snapshot(partial).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let oversized = File::options().read(true).write(true).open(&path).unwrap();
+        oversized
+            .set_len(MAX_STORAGE_WRITE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(
+            read_file_snapshot(oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 64 MiB")
+        );
+    }
+
+    #[test]
     fn metadata_timestamps_preserve_submillisecond_and_pre_epoch_times() {
         let offset = std::time::Duration::from_micros(1_250);
         let after = timestamp_millis(Ok(UNIX_EPOCH + offset));
@@ -1330,7 +1414,7 @@ mod tests {
                     .resolve(path, Some("owner"))
                     .is_err()
             );
-            assert!(read_file(path, Some("owner"), &state).is_err());
+            assert!(read_file(path, Some("owner"), &state, false).is_err());
             for operation in ["write", "append"] {
                 assert!(mutate(operation, path, &contents, None).is_err());
             }
@@ -1353,7 +1437,10 @@ mod tests {
         mutate("write", &regular, &contents, None).unwrap();
         mutate("append", &regular, &contents, None).unwrap();
         assert_eq!(
-            read_file(&regular, Some("owner"), &state).unwrap().unwrap(),
+            read_file(&regular, Some("owner"), &state, false)
+                .unwrap()
+                .unwrap()
+                .0,
             b"session eventsession event"
         );
         let parent = pin_parent(&regular, false).unwrap();
