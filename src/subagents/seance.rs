@@ -710,7 +710,14 @@ mod tests {
         fs::write(
             &binary,
             format!(
-                "#!/bin/sh\nprintf '%s\\000' \"$@\" > argv.bin\ncat > prompt.txt\nprintf '%s\\n' '{}'\n",
+                "#!/bin/sh\nprintf '%s\\000' \"$@\" > argv.bin\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                     case \"$1\" in\n\
+                         --system-prompt) shift; cat \"$1\" > system-prompt.txt ;;\n\
+                     esac\n\
+                     shift\n\
+                 done\n\
+                 cat > prompt.txt\nprintf '%s\\n' '{}'\n",
                 event.replace('\'', "'\"'\"'")
             ),
         )
@@ -824,7 +831,9 @@ mod tests {
         ] {
             assert!(args.iter().any(|arg| arg == flag), "missing {flag}");
         }
-        assert!(value("--system-prompt").contains("read-only consultant"));
+        let system_prompt = fs::read_to_string(root.path().join("system-prompt.txt")).unwrap();
+        assert!(system_prompt.contains("read-only consultant"));
+        assert!(!std::path::Path::new(value("--system-prompt")).exists());
         assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
         let all_args = args.join("\n");
         assert!(!all_args.contains("selected evidence"));

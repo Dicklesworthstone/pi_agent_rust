@@ -1439,9 +1439,84 @@ fn child_options(
     args
 }
 
-/// Compile an `outputSchema`, surfacing draft/keyword errors as strings.
+const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
+const OUTPUT_SCHEMA_LIMIT: &str =
+    "PI_SUBAGENT_SCHEMA_LIMIT: outputSchema must be a bounded object or boolean JSON Schema";
+
+/// Bound authored schemas before recursive serialization or compilation. The
+/// same admission serves one-shot definitions and retained worker contracts;
+/// workers keep their smaller wire-size limit.
+fn encode_output_schema(schema: &Value, limit: usize) -> std::result::Result<String, &'static str> {
+    if !schema.is_object() && !schema.is_boolean() {
+        return Err(OUTPUT_SCHEMA_LIMIT);
+    }
+    let mut remaining = 4096_usize;
+    let mut pending = vec![(schema, 0_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > 32 || remaining == 0 {
+            return Err(OUTPUT_SCHEMA_LIMIT);
+        }
+        remaining -= 1;
+        match value {
+            Value::Array(values) => {
+                if values.len() > remaining.saturating_sub(pending.len()) {
+                    return Err(OUTPUT_SCHEMA_LIMIT);
+                }
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(fields) => {
+                if fields.len() > remaining.saturating_sub(pending.len()) {
+                    return Err(OUTPUT_SCHEMA_LIMIT);
+                }
+                pending.extend(fields.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+
+    struct SchemaBytes {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for SchemaBytes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other(OUTPUT_SCHEMA_LIMIT));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = SchemaBytes {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, schema).map_err(|_| OUTPUT_SCHEMA_LIMIT)?;
+    String::from_utf8(writer.bytes).map_err(|_| OUTPUT_SCHEMA_LIMIT)
+}
+
+struct NoExternalSchemaResources;
+
+impl jsonschema::Retrieve for NoExternalSchemaResources {
+    fn retrieve(
+        &self,
+        _uri: &jsonschema::Uri<String>,
+    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(std::io::Error::other("external subagent schema retrieval is disabled").into())
+    }
+}
+
+/// Compile an `outputSchema`, surfacing bounds and draft/keyword errors as strings.
 fn compile_output_schema(schema: &Value) -> std::result::Result<jsonschema::Validator, String> {
-    jsonschema::validator_for(schema).map_err(|error| error.to_string())
+    encode_output_schema(schema, MAX_OUTPUT_SCHEMA_BYTES).map_err(str::to_string)?;
+    jsonschema::options()
+        .with_retriever(NoExternalSchemaResources)
+        .build(schema)
+        .map_err(|error| error.to_string())
 }
 
 /// Validate a child's final output against `schema` (bd-cv653.5.1).
@@ -2464,6 +2539,40 @@ mod tests {
             no_json.expect_err("no json"),
             vec!["child output contains no parseable JSON value".to_string()]
         );
+    }
+
+    #[test]
+    fn output_schema_admission_bounds_bytes_nodes_depth_and_external_resources() {
+        let padding = MAX_OUTPUT_SCHEMA_BYTES - r#"{"description":""}"#.len();
+        let boundary = json!({"description":"x".repeat(padding)});
+        assert_eq!(
+            encode_output_schema(&boundary, MAX_OUTPUT_SCHEMA_BYTES)
+                .expect("schema at exact byte limit")
+                .len(),
+            MAX_OUTPUT_SCHEMA_BYTES
+        );
+        compile_output_schema(&boundary).expect("bounded annotation is a valid schema");
+        for schema in [
+            json!({"description":"x".repeat(padding + 1)}),
+            json!({"enum":vec![Value::Null; 4096]}),
+            (0..33).fold(json!(true), |value, _| json!({"annotation":value})),
+            json!([]),
+        ] {
+            let error = compile_output_schema(&schema)
+                .err()
+                .expect("schema must be refused");
+            assert!(error.contains("PI_SUBAGENT_SCHEMA_LIMIT"), "{error}");
+        }
+        let local = json!({"$defs":{"answer":{"type":"integer"}}, "$ref":"#/$defs/answer"});
+        let validator = compile_output_schema(&local).expect("local schema references work");
+        assert!(validator.is_valid(&json!(7)));
+        assert!(!validator.is_valid(&json!("seven")));
+        for reference in [
+            "file:///never-read-schema.json",
+            "https://schema.invalid/schema.json",
+        ] {
+            assert!(compile_output_schema(&json!({"$ref":reference})).is_err());
+        }
     }
 
     /// bd-cv653.5.1: an agent definition may carry a single-line JSON

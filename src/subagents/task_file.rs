@@ -4,6 +4,7 @@
 //! keeps the captured text through queueing, schema retries and explicit revival;
 //! it never asks a child to reopen a path that could have changed meanwhile.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Path;
@@ -267,6 +268,49 @@ pub(super) fn stdin(task: &str, owner: &AgentCx, deadline: Deadline) -> Result<S
     file.rewind()?;
     check(owner, deadline)?;
     Ok(Stdio::from(file))
+}
+
+/// Keep the fully composed definition/schema prompt out of the command line.
+/// Both prompt flags already accept a file path, so the child reads this private
+/// snapshot instead of reopening an authored definition that may have changed.
+/// The caller must retain the file until its process has been retired: spawning
+/// alone does not mean the child has finished loading its startup arguments.
+pub(super) fn snapshot_prompt(
+    args: &mut [OsString],
+    owner: &AgentCx,
+    deadline: Deadline,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    // child_options appends this pair last. Inspect that known position rather
+    // than mistaking another option's literal value for a prompt flag.
+    let Some(index) = args.len().checked_sub(2).filter(|&index| {
+        args[index] == "--system-prompt" || args[index] == "--append-system-prompt"
+    }) else {
+        return Ok(None);
+    };
+    let prompt = args
+        .get(index + 1)
+        .and_then(|arg| arg.to_str())
+        .filter(|prompt| prompt.len() <= MAX_BYTES && !prompt.contains('\0'))
+        .ok_or_else(|| {
+            Error::tool(
+                "subagent",
+                "PI_SUBAGENT_PROMPT_LIMIT: system instructions must be UTF-8 without NUL bytes and at most 4 MiB",
+            )
+        })?;
+    check(owner, deadline)?;
+    let mut file = tempfile::Builder::new()
+        .prefix("pi-subagent-prompt-")
+        .suffix(".txt")
+        .tempfile()?;
+    for chunk in prompt.as_bytes().chunks(CHUNK_BYTES) {
+        check(owner, deadline)?;
+        file.write_all(chunk)?;
+    }
+    file.flush()?;
+    check(owner, deadline)?;
+    // TMPDIR may itself be relative; an isolated child can have another cwd.
+    args[index + 1] = std::fs::canonicalize(file.path())?.into_os_string();
+    Ok(Some(file))
 }
 
 #[cfg(test)]

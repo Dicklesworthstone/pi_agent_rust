@@ -150,6 +150,45 @@ fn large_stdin_and_retry_are_inherited_without_command_arguments_on_every_platfo
 }
 
 #[test]
+fn system_prompt_snapshot_preserves_literal_text_and_uses_a_private_short_argument()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let authored = root.path().join("instructions.txt");
+    std::fs::write(
+        &authored,
+        "This file must not replace the literal definition body.",
+    )?;
+    for prompt in [
+        authored.to_string_lossy().into_owned(),
+        format!("Complete instructions\r\n{}", "résumé 雪\n".repeat(24 * 1024)),
+    ] {
+        for flag in ["--append-system-prompt", "--system-prompt"] {
+            let mut args = vec!["--print".into(), flag.into(), prompt.clone().into()];
+            let snapshot = snapshot_prompt(&mut args, &AgentCx::for_request(), deadline())?
+                .ok_or("expected prompt snapshot")?;
+            let path = std::path::PathBuf::from(&args[2]);
+            assert!(path.is_absolute());
+            assert_eq!(std::fs::read_to_string(&path)?, prompt);
+            assert!(args[2].len() < 4096);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            }
+            drop(snapshot);
+            assert!(!path.exists(), "retired prompt snapshots must be reclaimed");
+        }
+    }
+    let mut no_prompt = vec!["--model".into(), "--system-prompt".into()];
+    assert!(snapshot_prompt(&mut no_prompt, &AgentCx::for_request(), deadline())?.is_none());
+    for prompt in ["x".repeat(MAX_BYTES + 1), "invalid\0text".to_string()] {
+        let mut args = vec!["--system-prompt".into(), prompt.into()];
+        assert!(snapshot_prompt(&mut args, &AgentCx::for_request(), deadline()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn snapshot_preserves_original_utf8_bytes_and_is_not_reread() {
     let (root, tool) = fixture();
     let path = root.path().join("instructions.md");

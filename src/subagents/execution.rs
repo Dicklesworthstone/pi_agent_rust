@@ -490,13 +490,14 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let args = child_args(
+        let mut args = child_args(
             agent,
             self.role_model_spec.as_deref(),
             launch.parent_model.as_ref(),
             task.model_selection.as_ref(),
             schema,
         );
+        let prompt_snapshot = super::task_file::snapshot_prompt(&mut args, owner, self.deadline);
         // Every assignment uses the same private regular-file transport.
         // Inline instructions, predecessor output and corrective retries can
         // exceed argv limits just as captured taskFile instructions can.
@@ -518,6 +519,13 @@ impl ChildRunner {
             self.deadline,
         );
         attempt.result.task = launch.display_task().to_string();
+        let _prompt_snapshot = match prompt_snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+        };
         let stdin = match stdin {
             Ok(stdin) => stdin,
             Err(error) => {

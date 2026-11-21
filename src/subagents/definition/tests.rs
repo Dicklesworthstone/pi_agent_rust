@@ -391,7 +391,20 @@ fn child(path: &Path, answer: &str) -> PathBuf {
     .to_string();
     let quoted = event.replace('\'', "'\\''");
     let file = path.join("child.sh");
-    std::fs::write(&file, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > child-argv.txt\nprintf 'run\\n' >> child-runs.txt\nprintf '%s\\n' '{quoted}'\n")).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > child-argv.txt\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+                 case \"$1\" in\n\
+                     --append-system-prompt) shift; cat \"$1\" > child-system-prompt.txt ;;\n\
+                 esac\n\
+                 shift\n\
+             done\n\
+             printf 'run\\n' >> child-runs.txt\nprintf '%s\\n' '{quoted}'\n"
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
     file
 }
@@ -430,7 +443,15 @@ fn typed_definition_reaches_real_child_argv_and_parent_result_validation() {
     let args = std::fs::read_to_string(dir.path().join("child-argv.txt")).unwrap();
     assert!(args.lines().any(|line| line == "--no-tools"));
     assert!(args.contains("--append-system-prompt\n"));
-    assert!(args.contains("single JSON value matching this JSON Schema"));
+    assert!(!args.contains("single JSON value matching this JSON Schema"));
+    let prompt = std::fs::read_to_string(dir.path().join("child-system-prompt.txt")).unwrap();
+    assert!(prompt.contains("single JSON value matching this JSON Schema"));
+    let path = args
+        .lines()
+        .skip_while(|line| *line != "--append-system-prompt")
+        .nth(1)
+        .unwrap();
+    assert!(!Path::new(path).exists());
     assert_eq!(
         std::fs::read_to_string(dir.path().join("child-runs.txt")).unwrap(),
         "run\n"

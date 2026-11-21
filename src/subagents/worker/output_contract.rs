@@ -6,37 +6,12 @@ use crate::error::{Error, Result};
 use crate::subagents::SubagentResult;
 use crate::text_completion::AuxiliaryPrivacySnapshot;
 use serde_json::Value;
-use std::io::{self, Write};
 
 const MAX_SCHEMA_BYTES: usize = 16 * 1024;
 const MAX_ANSWER_BYTES: usize = 32 * 1024;
 const INPUT: &str = "PI_SUBAGENT_WORKER_SCHEMA: expected a bounded object or boolean JSON Schema; external schema resources are unavailable";
 const OUTPUT: &str = "PI_SUBAGENT_WORKER_SCHEMA_OUTPUT: terminal answer must be exactly one bounded JSON value satisfying the frozen schema; no retry was performed";
 const PRIVACY: &str = "PI_SUBAGENT_WORKER_SCHEMA_PRIVACY: privacy projection changed the output contract; no worker started";
-
-struct NoExternalResources;
-impl jsonschema::Retrieve for NoExternalResources {
-    fn retrieve(
-        &self,
-        _uri: &jsonschema::Uri<String>,
-    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        Err(io::Error::other("external worker schema retrieval is disabled").into())
-    }
-}
-
-struct SchemaBytes(Vec<u8>);
-impl Write for SchemaBytes {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_SCHEMA_BYTES.saturating_sub(self.0.len()) {
-            return Err(io::Error::other("worker schema byte limit"));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 pub(in crate::subagents) struct OutputContract {
     encoded: String,
@@ -48,39 +23,13 @@ impl OutputContract {
         let Some(schema) = schema else {
             return Ok(None);
         };
-        if !schema.is_object() && !schema.is_boolean() {
-            return Err(Error::tool("subagent", INPUT));
-        }
-        let mut remaining = 4096_usize;
-        let mut pending = vec![(schema, 0_usize)];
-        while let Some((value, depth)) = pending.pop() {
-            if depth > 32 || remaining == 0 {
-                return Err(Error::tool("subagent", INPUT));
-            }
-            remaining -= 1;
-            match value {
-                Value::Array(values) => {
-                    if values.len() > remaining.saturating_sub(pending.len()) {
-                        return Err(Error::tool("subagent", INPUT));
-                    }
-                    pending.extend(values.iter().map(|value| (value, depth + 1)));
-                }
-                Value::Object(fields) => {
-                    if fields.len() > remaining.saturating_sub(pending.len()) {
-                        return Err(Error::tool("subagent", INPUT));
-                    }
-                    pending.extend(fields.values().map(|value| (value, depth + 1)));
-                }
-                _ => {}
-            }
-        }
         // Bound before copying or compiling, including an oversized SDK Value.
-        let mut bytes = SchemaBytes(Vec::new());
-        serde_json::to_writer(&mut bytes, schema).map_err(|_| Error::tool("subagent", INPUT))?;
-        let encoded = String::from_utf8(bytes.0).map_err(|_| Error::tool("subagent", INPUT))?;
+        let encoded = crate::subagents::encode_output_schema(schema, MAX_SCHEMA_BYTES)
+            .map_err(|_| Error::tool("subagent", INPUT))?;
         crate::judgment::decode_bounded_json(&encoded, MAX_SCHEMA_BYTES)
             .map_err(|_| Error::tool("subagent", INPUT))?;
-        let options = jsonschema::options().with_retriever(NoExternalResources);
+        let options =
+            jsonschema::options().with_retriever(crate::subagents::NoExternalSchemaResources);
         let options = if schema.get("$schema").is_none() {
             options.with_draft(jsonschema::Draft::Draft202012)
         } else {
