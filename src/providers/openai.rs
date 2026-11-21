@@ -1681,6 +1681,16 @@ where
         self.finalized = true;
         self.finalize_deepseek_content();
 
+        // Syntactically complete arguments do not make a token-limited tool
+        // batch complete. The shared agent can execute calls on Length, so
+        // withhold every call even when all received fragments parse.
+        if self.partial.stop_reason == StopReason::Length && !self.tool_calls.is_empty() {
+            self.record_error(
+                "OpenAI response was truncated before tool-call completion; local tool calls withheld"
+                    .to_string(),
+            );
+        }
+
         if let Err(error) = self.finalize_tool_call_arguments() {
             self.record_error(error.to_string());
             // Do not persist a synthetically completed argument snapshot as
@@ -1730,6 +1740,20 @@ where
         if self.done {
             return;
         }
+        // [DONE] closes the transport; only a choice's finish_reason can
+        // complete model generation. Otherwise complete-looking tool prefixes
+        // would become executable simply because the gateway closed its SSE.
+        if !self.finalized
+            && matches!(
+                self.partial.stop_reason,
+                StopReason::Stop | StopReason::ToolUse | StopReason::Length
+            )
+        {
+            self.record_error(
+                "OpenAI stream ended with [DONE] before a finish reason; local tool calls withheld"
+                    .to_string(),
+            );
+        }
         if self.audio_input_in_request && !self.usage_received {
             self.partial.usage.billing = Some(BillingUsage::Unavailable {
                 reason: "The completed audio request did not report token usage or a billed total"
@@ -1769,6 +1793,21 @@ where
                 Some("content_filter" | "error")
             ) {
                 self.record_error("OpenAI reported a terminal stream failure".to_string());
+            } else if choice.finish_reason.as_deref() == Some("length")
+                && !self.tool_calls.is_empty()
+            {
+                // A late truncation signal invalidates an earlier tool_calls
+                // marker too. Block-end events are previews, not authority.
+                self.record_error(
+                    "OpenAI response was truncated before tool-call completion; local tool calls withheld"
+                        .to_string(),
+                );
+            } else if choice
+                .finish_reason
+                .as_deref()
+                .is_some_and(|reason| !matches!(reason, "stop" | "length" | "tool_calls"))
+            {
+                self.record_error("OpenAI returned an unsupported finish reason".to_string());
             }
             let has_content = delta
                 .content
@@ -1964,11 +2003,15 @@ where
             if matches!(reason.as_str(), "content_filter" | "error") {
                 self.record_error(format!("OpenAI stream stopped with finish_reason={reason}"));
             } else if self.partial.stop_reason != StopReason::Error {
-                self.partial.stop_reason = match reason.as_str() {
-                    "length" => StopReason::Length,
-                    "tool_calls" => StopReason::ToolUse,
-                    _ => StopReason::Stop,
-                };
+                match reason.as_str() {
+                    "stop" => self.partial.stop_reason = StopReason::Stop,
+                    "length" => self.partial.stop_reason = StopReason::Length,
+                    "tool_calls" => self.partial.stop_reason = StopReason::ToolUse,
+                    // Never turn an unrecognized failure into an executable
+                    // Stop. Keep diagnostics free of untrusted wire values.
+                    _ => self
+                        .record_error("OpenAI returned an unsupported finish reason".to_string()),
+                }
             }
             self.finalize_content();
         }
@@ -5592,6 +5635,100 @@ mod tests {
             matches!(out.last(), Some(Ok(StreamEvent::Done { .. }))),
             "Done must be the terminal item: {out:?}"
         );
+    }
+
+    #[test]
+    fn stream_withholds_tool_batches_without_complete_generation() {
+        for (finishes, expected_error, preview_ended) in [
+            (vec![], "before a finish reason", false),
+            (vec!["length"], "truncated", false),
+            (vec!["length", "tool_calls"], "truncated", false),
+            (vec!["tool_calls", "length"], "truncated", true),
+            (
+                vec!["private-unknown-finish"],
+                "unsupported finish reason",
+                false,
+            ),
+            (
+                vec!["tool_calls", "private-unknown-finish"],
+                "unsupported finish reason",
+                true,
+            ),
+        ] {
+            let call = json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_first","function":{"name":"write","arguments":"{}"}},
+                {"index":1,"id":"call_second","function":{"name":"write","arguments":"{}"}}
+            ]}}]});
+            let mut body = format!("data: {call}\n\n");
+            for finish in &finishes {
+                let terminal = json!({"choices":[{"delta":{},"finish_reason":finish}]});
+                body.push_str(&format!("data: {terminal}\n\n"));
+            }
+            // Gateways can report the bill after the choice has ended. Failed
+            // generation still consumes tokens and must retain that bill.
+            let usage = json!({"choices":[],"usage":{
+                "prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"cost":0.25
+            }});
+            body.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+            let events = collect_stream_items_from_body(&body);
+            assert!(events.iter().all(Result::is_ok), "{finishes:?}: {events:?}");
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                panic!("missing terminal outcome: {finishes:?}: {events:?}");
+            };
+            assert_eq!(*reason, StopReason::Error, "{finishes:?}");
+            assert_eq!(message.stop_reason, StopReason::Error);
+            let diagnostic = message
+                .error_message
+                .as_deref()
+                .expect("failure diagnostic");
+            assert!(diagnostic.contains(expected_error), "{diagnostic}");
+            assert!(!diagnostic.contains("private-unknown-finish"));
+            assert_eq!(message.usage.total_tokens, 30);
+            assert_eq!(message.usage.cost.total.to_bits(), 0.25_f64.to_bits());
+            assert!(message.usage.has_explicit_billing());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))),
+                preview_ended,
+                "only a previously completed preview may precede a late failure",
+            );
+        }
+    }
+
+    #[test]
+    fn stream_preserves_text_truncation_but_rejects_missing_finish_reason() {
+        for (finish, expected) in [
+            (Some("length"), StopReason::Length),
+            (None, StopReason::Error),
+        ] {
+            let text = json!({"choices":[{"delta":{"content":"Partial answer"}}]});
+            let mut body = format!("data: {text}\n\n");
+            if let Some(finish) = finish {
+                let terminal = json!({"choices":[{"delta":{},"finish_reason":finish}]});
+                body.push_str(&format!("data: {terminal}\n\n"));
+            }
+            body.push_str("data: [DONE]\n\n");
+            let events = collect_stream_items_from_body(&body);
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                panic!("missing terminal outcome: {events:?}");
+            };
+            assert_eq!(*reason, expected);
+            assert!(message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text(text) if text.text == "Partial answer")
+            }));
+            assert_eq!(
+                message.error_message.is_some(),
+                expected == StopReason::Error
+            );
+        }
     }
 
     fn collect_stream_items_from_body(body: &str) -> Vec<Result<StreamEvent>> {

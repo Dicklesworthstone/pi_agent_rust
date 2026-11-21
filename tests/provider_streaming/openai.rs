@@ -421,3 +421,106 @@ openai_test!(openai_bad_request_400, scenario_bad_request);
 openai_test!(openai_auth_failure_401, scenario_auth_failure);
 openai_test!(openai_rate_limit_429, scenario_rate_limit);
 openai_test!(openai_very_long_response, scenario_long_response);
+
+/// Exercise the production HTTP decoder, agent, and builtin write tool. The
+/// local server supplies planted wire failures; this is not a live API test.
+#[test]
+fn openai_terminal_failure_cannot_execute_complete_tool_prefixes() {
+    use crate::common::{MockHttpResponse, run_async};
+    use pi::agent::{Agent, AgentConfig, AgentEvent};
+    use pi::tools::ToolRegistry;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn response(events: Vec<serde_json::Value>) -> MockHttpResponse {
+        let mut body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        body.push_str("data: [DONE]\n\n");
+        MockHttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+            body: body.into_bytes(),
+        }
+    }
+
+    for (finishes, allowed) in [
+        (vec![], false),
+        (vec!["length"], false),
+        (vec!["length", "tool_calls"], false),
+        (vec!["tool_calls", "length"], false),
+        (vec!["unknown"], false),
+        (vec!["tool_calls", "unknown"], false),
+        (vec!["tool_calls"], true),
+    ] {
+        let harness = TestHarness::new(format!("openai_terminal_batch_{}", finishes.join("_")));
+        let server = harness.start_mock_http_server();
+        let mut events = vec![json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"write-first","function":{"name":"write",
+                "arguments":json!({"path":"first.txt","content":"written"}).to_string()}},
+            {"index":1,"id":"write-second","function":{"name":"write",
+                "arguments":json!({"path":"second.txt","content":"written"}).to_string()}}
+        ]}}]})];
+        for finish in &finishes {
+            events.push(json!({"choices":[{"delta":{},"finish_reason":finish}]}));
+        }
+        events.push(json!({"choices":[],"usage":{
+            "prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"cost":0.25
+        }}));
+        let mut responses = vec![response(events)];
+        if allowed {
+            responses.push(response(vec![json!({"choices":[{
+                "delta":{"content":"Both files written."},"finish_reason":"stop"
+            }]})]));
+        }
+        server.add_route_queue("POST", "/chat/completions", responses);
+        let provider = Arc::new(
+            OpenAIProvider::new("test-model")
+                .with_base_url(format!("{}/chat/completions", server.base_url())),
+        );
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(&["write"], harness.temp_dir(), None),
+            AgentConfig {
+                max_tool_iterations: 3,
+                stream_options: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&starts);
+        let result = run_async(async move {
+            Box::pin(agent.run("Write both files", move |event| {
+                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }))
+            .await
+        });
+        if allowed {
+            assert_eq!(result.unwrap().stop_reason, StopReason::Stop);
+            assert_eq!(starts.load(Ordering::SeqCst), 2);
+            for path in ["first.txt", "second.txt"] {
+                assert_eq!(
+                    std::fs::read_to_string(harness.temp_dir().join(path)).unwrap(),
+                    "written"
+                );
+            }
+            assert_eq!(server.requests().len(), 2);
+        } else {
+            let message = result.expect("terminal provider failure is a completed error message");
+            assert_eq!(message.stop_reason, StopReason::Error, "{finishes:?}");
+            assert!(message.error_message.is_some());
+            assert_eq!(message.usage.total_tokens, 30);
+            assert_eq!(message.usage.cost.total.to_bits(), 0.25_f64.to_bits());
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert!(!harness.temp_dir().join("first.txt").exists());
+            assert!(!harness.temp_dir().join("second.txt").exists());
+            assert_eq!(server.requests().len(), 1);
+        }
+    }
+}
