@@ -1442,6 +1442,12 @@ fn child_options(
 const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
 const OUTPUT_SCHEMA_LIMIT: &str =
     "PI_SUBAGENT_SCHEMA_LIMIT: outputSchema must be a bounded object or boolean JSON Schema";
+// Diagnostics are corrective context, not an exhaustive validation report. A
+// bounded answer can fail many schema branches per item, multiplying into far
+// more text than the answer and even preventing the corrective child launch.
+const MAX_OUTPUT_VALIDATION_BYTES: usize = 1024;
+const OUTPUT_VALIDATION_TRUNCATED: &str =
+    "PI_SUBAGENT_SCHEMA_DIAGNOSTICS_TRUNCATED: schema preview omitted remaining text; the complete required schema is in the system instructions.";
 
 /// Bound authored schemas before recursive serialization or compilation. The
 /// same admission serves one-shot definitions and retained worker contracts;
@@ -1524,21 +1530,64 @@ fn compile_output_schema(schema: &Value) -> std::result::Result<jsonschema::Vali
 /// The output is located tolerantly before validation: the whole trimmed
 /// text, else the payload of a ```json fence, else the first balanced
 /// `{...}`/`[...]` region — models frequently wrap yields in prose despite
-/// the directive. Returns the parsed value on success, or the collected
-/// validation (or parse) errors.
+/// the directive. Returns the parsed value on success, or bounded validation
+/// (or parse) diagnostics. Invalid answers return bounded corrective
+/// context instead of enumerating failures: jsonschema's `iter_errors` builds
+/// every error eagerly, and even `validate` builds complete nested error trees
+/// for unsuccessful `anyOf`/`oneOf` branches. Only `is_valid` avoids that fan-out.
 fn validate_child_output(output: &str, schema: &Value) -> std::result::Result<Value, Vec<String>> {
     let validator = compile_output_schema(schema).map_err(|error| vec![error])?;
     let candidate = extract_json_candidate(output)
         .ok_or_else(|| vec!["child output contains no parseable JSON value".to_string()])?;
-    let errors: Vec<String> = validator
-        .iter_errors(&candidate)
-        .map(|error| format!("{}: {error}", error.instance_path()))
-        .collect();
-    if errors.is_empty() {
-        Ok(candidate)
-    } else {
-        Err(errors)
+    if validator.is_valid(&candidate) {
+        return Ok(candidate);
     }
+    // Preserve useful contract context without formatting rejected instances
+    // or allocating an exhaustive error tree. The child receives the complete
+    // schema separately, so a shortened preview never narrows its contract.
+    let (message, truncated) = bounded_schema_diagnostic(
+        format_args!(
+            "PI_SUBAGENT_SCHEMA_OUTPUT: child output does not satisfy outputSchema. Check required fields, value types and every other constraint before returning the complete corrected JSON. Required schema: {schema}"
+        ),
+        MAX_OUTPUT_VALIDATION_BYTES,
+    );
+    let mut errors = vec![message];
+    if truncated {
+        errors.push(OUTPUT_VALIDATION_TRUNCATED.to_string());
+    }
+    Err(errors)
+}
+
+/// Stop formatting at the byte budget instead of allocating the full schema's
+/// display text before shortening its diagnostic preview.
+fn bounded_schema_diagnostic(message: std::fmt::Arguments<'_>, limit: usize) -> (String, bool) {
+    struct Diagnostic {
+        text: String,
+        remaining: usize,
+    }
+
+    impl std::fmt::Write for Diagnostic {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let mut end = self.remaining.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(&text[..end]);
+            self.remaining -= end;
+            if end < text.len() {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let mut diagnostic = Diagnostic {
+        text: String::new(),
+        remaining: limit,
+    };
+    let truncated = std::fmt::write(&mut diagnostic, message).is_err();
+    (diagnostic.text, truncated)
 }
 
 /// Locate the JSON value in a child's final text output.
@@ -2500,7 +2549,7 @@ mod tests {
     }
 
     /// bd-cv653.5.1: JSON extraction tolerates prose/fence wrapping, and
-    /// validation reports keyword errors with instance paths.
+    /// invalid shapes retain their required contract in bounded diagnostics.
     #[test]
     fn output_schema_validation_matrix() {
         let schema = json!({
@@ -2538,6 +2587,65 @@ mod tests {
         assert_eq!(
             no_json.expect_err("no json"),
             vec!["child output contains no parseable JSON value".to_string()]
+        );
+    }
+
+    #[test]
+    fn output_schema_failures_do_not_amplify_instances_or_combinator_errors() {
+        let rejected = "rejected-value-".repeat(14);
+        let output = json!(vec![rejected.clone(); 1200]).to_string();
+        assert!(output.len() < MAX_CHILD_OUTPUT_BYTES);
+        let integer_array = json!({"type":"array", "items":{"type":"integer"}});
+        let boolean_array = json!({"type":"array", "items":{"type":"boolean"}});
+        for schema in [
+            json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}}),
+            json!({"anyOf":[integer_array.clone(), boolean_array.clone()]}),
+            json!({"oneOf":[integer_array, boolean_array]}),
+        ] {
+            // All inputs are admitted and bounded, but exhaustive diagnostics
+            // repeat each rejected value for every failing schema branch.
+            let errors = validate_child_output(&output, &schema).expect_err("invalid values");
+            assert!(errors.len() <= 2, "{errors:?}");
+            assert!(errors[0].contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
+            assert!(errors[0].len() <= MAX_OUTPUT_VALIDATION_BYTES);
+            assert!(
+                errors.iter().map(String::len).sum::<usize>()
+                    <= MAX_OUTPUT_VALIDATION_BYTES + OUTPUT_VALIDATION_TRUNCATED.len()
+            );
+            assert!(errors.iter().all(|message| !message.contains(&rejected)));
+            if errors.len() == 2 {
+                assert_eq!(errors[1], OUTPUT_VALIDATION_TRUNCATED);
+            }
+            // Bounding failure diagnostics cannot change the accepted data or
+            // accidentally accept a later invalid element after valid ones.
+            assert_eq!(validate_child_output("[7,8]", &schema).unwrap(), json!([7, 8]));
+            assert!(validate_child_output(r#"[7,8,"invalid tail"]"#, &schema).is_err());
+        }
+    }
+
+    #[test]
+    fn schema_diagnostic_formatting_stops_at_utf8_budget_without_finishing_display() {
+        struct Repeated<'a>(&'a std::cell::Cell<usize>);
+
+        impl std::fmt::Display for Repeated<'_> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..100_000 {
+                    self.0.set(self.0.get() + 1);
+                    formatter.write_str("雪")?;
+                }
+                Ok(())
+            }
+        }
+
+        let writes = std::cell::Cell::new(0);
+        let (text, truncated) =
+            bounded_schema_diagnostic(format_args!("{}", Repeated(&writes)), 16);
+        assert_eq!(text, "雪".repeat(5));
+        assert!(truncated);
+        assert_eq!(writes.get(), 6, "the formatter must stop producing text");
+        assert_eq!(
+            bounded_schema_diagnostic(format_args!("雪雪"), 6),
+            ("雪雪".to_string(), false)
         );
     }
 

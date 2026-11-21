@@ -343,6 +343,59 @@ fn an_oversized_correction_does_not_launch_or_apply_a_second_attempt() {
 }
 
 #[test]
+fn amplified_schema_failures_still_launch_one_bounded_corrective_child() {
+    let script = r#"set -eu
+printf 'launched\n' >> launches
+if [ -f attempted ]; then
+    cat > corrective-task
+    cat corrected-events.jsonl
+else
+    cat > original-task
+    printf 'attempted\n' > attempted
+    cat invalid-events.jsonl
+fi
+"#;
+    let (root, tool) = fixture(script);
+    let invalid = json!(vec!["rejected-value-".repeat(14); 1200]).to_string();
+    assert!(invalid.len() < MAX_CHILD_OUTPUT_BYTES);
+    std::fs::write(
+        root.path().join("invalid-events.jsonl"),
+        format!("{}\n", ended(&invalid, "stop")),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("corrected-events.jsonl"),
+        format!("{}\n", ended("[7]", "stop")),
+    )
+    .unwrap();
+    // Every item fails all 64 branches. The former error collection exceeded
+    // the 4 MiB task limit, refusing the retry despite a bounded child answer.
+    let schema =
+        json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}});
+    let assignment = "Return the requested structured results.";
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":assignment,
+            "outputSchema":schema, "schemaMode":"strict"}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(result(&output)["schemaRetries"], 1);
+    assert_eq!(result(&output)["schemaValid"], true);
+    assert_eq!(result(&output)["data"], json!([7]));
+    assert_eq!(result(&output)["task"], assignment);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("launches")).unwrap(),
+        "launched\nlaunched\n"
+    );
+    let correction = std::fs::read_to_string(root.path().join("corrective-task")).unwrap();
+    assert!(correction.starts_with(&format!("Task: {assignment}")));
+    assert!(correction.contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
+    assert!(correction.contains(OUTPUT_VALIDATION_TRUNCATED));
+    assert!(correction.len() < assignment.len() + 2 * MAX_OUTPUT_VALIDATION_BYTES);
+    assert!(!correction.contains("rejected-value-"));
+}
+
+#[test]
 fn workflow_schema_retry_keeps_its_smaller_complete_task_budget() {
     let script = format!(
         "printf 'launched\\n' >> launches\n{}",
