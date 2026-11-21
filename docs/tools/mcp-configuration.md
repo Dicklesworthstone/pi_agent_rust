@@ -165,6 +165,20 @@ Protocol references: [OMP v18.12.6 client](https://github.com/can1357/oh-my-pi/b
 [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 and [workspace roots](https://modelcontextprotocol.io/specification/2025-11-25/client/roots).
 
+### Streamable HTTP event limits
+
+The optional GET event stream belongs to the connection. It can deliver more
+than 10 MiB in total without retiring the connection or interrupting POST tool
+calls. Each individual SSE wire event remains limited to 10 MiB, including
+unfinished data and metadata; the allowance resets at a blank event boundary.
+Keepalive comments do not produce model content. An oversized event or invalid
+UTF-8 still stops the transport rather than truncating or dropping part of a
+server request.
+
+Individual POST responses retain their 10 MiB aggregate body limit, including
+SSE notifications preceding the result. Request deadlines, protocol-session
+checks, and replay-ID admission remain the same for both receive paths.
+
 ## Task-augmented tools
 
 Pi supports the experimental

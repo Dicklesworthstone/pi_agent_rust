@@ -20,9 +20,10 @@ use serde_json::{Value, json};
 use super::super::{auth, config, manager};
 use super::{
     ClientRoots, DEFAULT_MCP_TIMEOUT, HTTP_CANCEL_TIMEOUT, HttpTransport, MAX_HTTP_BODY,
-    McpTransport, RequestDispatch, is_server_error, redacted_origin, reject_authentication_status,
-    request_allows_cancellation_notification, spawn_task_cleanup, task_cleanup_has_authority,
-    tool_err, validate_initialize_result, validate_jsonrpc_response, validate_outgoing_params,
+    McpTransport, RequestDispatch, SseEventBudget, is_server_error, redacted_origin,
+    reject_authentication_status, request_allows_cancellation_notification, spawn_task_cleanup,
+    task_cleanup_has_authority, tool_err, validate_initialize_result, validate_jsonrpc_response,
+    validate_outgoing_params,
 };
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{CompletionWaitError, await_completion};
@@ -203,44 +204,6 @@ fn endpoint_url(base: &url::Url, advertised: &str) -> Result<String> {
         ));
     }
     Ok(endpoint.to_string())
-}
-
-/// Bound each wire event, including unfinished data and metadata. Reset only
-/// on an empty SSE line, so many small events do not exhaust a lifetime quota.
-/// Actual SSE decoding, split UTF-8, and CR/LF semantics stay in SseStream.
-#[derive(Default)]
-struct EventBudget {
-    bytes: usize,
-    line_has_bytes: bool,
-    previous_cr: bool,
-}
-
-impl EventBudget {
-    fn check(&mut self, chunk: &[u8]) -> std::io::Result<()> {
-        for &byte in chunk {
-            self.bytes = self.bytes.saturating_add(1);
-            if self.bytes > MAX_HTTP_BODY {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "legacy SSE event exceeds the 10 MiB limit",
-                ));
-            }
-            if byte == b'\n' && self.previous_cr {
-                self.previous_cr = false;
-                continue;
-            }
-            self.previous_cr = byte == b'\r';
-            if matches!(byte, b'\r' | b'\n') {
-                if !self.line_has_bytes {
-                    self.bytes = 0;
-                }
-                self.line_has_bytes = false;
-            } else {
-                self.line_has_bytes = true;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl SseState {
@@ -455,7 +418,7 @@ impl SseState {
     }
 
     async fn read_stream(self: &Arc<Self>, response: crate::http::client::Response) -> Result<()> {
-        let mut budget = EventBudget::default();
+        let mut budget = SseEventBudget::default();
         let bytes = response.bytes_stream().map(move |chunk| {
             chunk.and_then(|chunk| {
                 budget.check(&chunk)?;
@@ -1886,7 +1849,7 @@ mod tests {
             let split = wire.len() - 1;
             [Ok(wire[..split].to_vec()), Ok(wire[split..].to_vec())]
         }));
-        let mut budget = EventBudget::default();
+        let mut budget = SseEventBudget::default();
         let bytes = chunks.map(move |chunk: std::io::Result<Vec<u8>>| {
             chunk.and_then(|chunk| {
                 budget.check(&chunk)?;
@@ -1906,7 +1869,7 @@ mod tests {
             count, events,
             "a long-lived stream must not have a lifetime byte cap"
         );
-        let mut oversized = EventBudget::default();
+        let mut oversized = SseEventBudget::default();
         assert!(oversized.check(&vec![b'x'; MAX_HTTP_BODY + 1]).is_err());
     }
 }

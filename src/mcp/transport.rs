@@ -2116,10 +2116,53 @@ impl HttpSseCursor {
     }
 }
 
+/// Bound one SSE wire event, including unfinished data and metadata. A
+/// connection-owned GET stream must not spend a lifetime response-body quota.
+/// Decode UTF-8 and CR/LF framing in the shared SSE parser as before.
+#[derive(Default)]
+struct SseEventBudget {
+    bytes: usize,
+    line_has_bytes: bool,
+    previous_cr: bool,
+}
+
+impl SseEventBudget {
+    fn check(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        for &byte in chunk {
+            self.bytes = self.bytes.saturating_add(1);
+            if self.bytes > MAX_HTTP_BODY {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "MCP SSE event exceeds the 10 MiB limit",
+                ));
+            }
+            if byte == b'\n' && self.previous_cr {
+                self.previous_cr = false;
+                continue;
+            }
+            self.previous_cr = byte == b'\r';
+            if matches!(byte, b'\r' | b'\n') {
+                if !self.line_has_bytes {
+                    self.bytes = 0;
+                }
+                self.line_has_bytes = false;
+            } else {
+                self.line_has_bytes = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+enum HttpSseByteBudget {
+    Response(usize),
+    ServerEvents(SseEventBudget),
+}
+
 struct BoundedHttpSseDecoder {
     parser: crate::sse::SseParser,
     pending_utf8: Vec<u8>,
-    received_bytes: usize,
+    budget: HttpSseByteBudget,
 }
 
 impl BoundedHttpSseDecoder {
@@ -2127,20 +2170,35 @@ impl BoundedHttpSseDecoder {
         Self {
             parser: crate::sse::SseParser::new(),
             pending_utf8: Vec::new(),
-            received_bytes: 0,
+            budget: HttpSseByteBudget::Response(0),
+        }
+    }
+
+    fn for_server_events() -> Self {
+        Self {
+            budget: HttpSseByteBudget::ServerEvents(SseEventBudget::default()),
+            ..Self::new()
         }
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<crate::sse::SseEvent>> {
-        self.received_bytes = self
-            .received_bytes
-            .checked_add(chunk.len())
-            .ok_or_else(|| tool_err("MCP_PROTOCOL", "SSE response byte count overflowed"))?;
-        if self.received_bytes > MAX_HTTP_BODY {
-            return Err(tool_err(
-                "MCP_PROTOCOL",
-                format!("SSE response exceeded {MAX_HTTP_BODY} bytes"),
-            ));
+        match &mut self.budget {
+            HttpSseByteBudget::Response(received_bytes) => {
+                *received_bytes = received_bytes.checked_add(chunk.len()).ok_or_else(|| {
+                    tool_err("MCP_PROTOCOL", "SSE response byte count overflowed")
+                })?;
+                if *received_bytes > MAX_HTTP_BODY {
+                    return Err(tool_err(
+                        "MCP_PROTOCOL",
+                        format!("SSE response exceeded {MAX_HTTP_BODY} bytes"),
+                    ));
+                }
+            }
+            HttpSseByteBudget::ServerEvents(budget) => {
+                budget
+                    .check(chunk)
+                    .map_err(|error| tool_err("MCP_PROTOCOL", error.to_string()))?;
+            }
         }
         self.pending_utf8.extend_from_slice(chunk);
         let valid_bytes = match std::str::from_utf8(&self.pending_utf8) {
@@ -3249,7 +3307,7 @@ impl HttpTransport {
         wire_state: &HttpWireState,
     ) -> Result<()> {
         let mut stream = response.bytes_stream();
-        let mut decoder = BoundedHttpSseDecoder::new();
+        let mut decoder = BoundedHttpSseDecoder::for_server_events();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| {
                 tool_err(
@@ -4808,6 +4866,78 @@ pub(crate) mod tests {
     fn sse_parse_requires_response() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
         assert!(parse_sse_responses(body, 1).is_err());
+    }
+
+    #[test]
+    fn http_server_event_budget_resets_without_relaxing_post_response_limits() {
+        let text = "snow 雪 résumé ".repeat(4096);
+        for ending in ["\n", "\r\n", "\r"] {
+            let wire = format!(": keepalive{ending}{ending}data: {text}{ending}{ending}");
+            let count = MAX_HTTP_BODY / wire.len() + 2;
+            let mut server_events = BoundedHttpSseDecoder::for_server_events();
+            let mut response = BoundedHttpSseDecoder::new();
+            let mut response_refused = false;
+            let mut delivered = 0;
+            for _ in 0..count {
+                // Split UTF-8, CRLF, and the empty-line delimiter across feeds.
+                for chunk in wire.as_bytes().chunks(4093) {
+                    for event in server_events.feed(chunk).expect("bounded server event") {
+                        assert_eq!(event.data, text);
+                        delivered += 1;
+                    }
+                    if !response_refused
+                        && let Err(error) = response.feed(chunk)
+                    {
+                        assert!(error.to_string().contains("SSE response exceeded"));
+                        response_refused = true;
+                    }
+                }
+            }
+            for event in server_events.finish().expect("complete UTF-8") {
+                assert_eq!(event.data, text);
+                delivered += 1;
+            }
+            assert_eq!(delivered, count, "one event per complete wire frame");
+            assert!(response_refused, "POST responses keep their aggregate cap");
+        }
+    }
+
+    #[test]
+    fn http_server_event_budget_rejects_complete_and_unfinished_oversized_frames() {
+        let payload = "x".repeat(MAX_HTTP_BODY);
+        for (prefix, suffix) in [
+            ("data: ", ""),
+            ("data: ", "\n\n"),
+            ("id: ", "\r\n\r\n"),
+            (": ", "\n\n"),
+        ] {
+            let wire = format!("{prefix}{payload}{suffix}");
+            let mut decoder = BoundedHttpSseDecoder::for_server_events();
+            let error = decoder.feed(wire.as_bytes()).expect_err("oversized event");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+            assert!(error.to_string().contains("event exceeds"), "{error}");
+            assert!(
+                decoder.pending_utf8.is_empty(),
+                "refuse before copying the oversized input into the decoder"
+            );
+        }
+
+        // A per-line cap alone is insufficient: data lines belong to one
+        // pending event until a blank line arrives.
+        let line = format!("data: {}\n", "x".repeat(64 * 1024));
+        let mut decoder = BoundedHttpSseDecoder::for_server_events();
+        let mut refused = false;
+        for _ in 0..(MAX_HTTP_BODY / line.len() + 2) {
+            match decoder.feed(line.as_bytes()) {
+                Ok(events) => assert!(events.is_empty(), "no complete frame yet"),
+                Err(error) => {
+                    assert!(error.to_string().contains("event exceeds"), "{error}");
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "unfinished multiline events retain a shared cap");
     }
 
     #[test]
@@ -6804,6 +6934,68 @@ for line in sys.stdin:
             captured
                 .iter()
                 .filter(|(_, body)| body.contains("\"id\":\"server-2\""))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn streamable_http_long_lived_get_does_not_retire_a_working_post_channel() {
+        let notification = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({
+                "jsonrpc":"2.0", "method":"notifications/message",
+                "params":{"level":"info", "data":"x".repeat(64 * 1024)}
+            })
+        );
+        let count = MAX_HTTP_BODY / notification.len() + 2;
+        let mut body = notification.repeat(count);
+        body.push_str(concat!(
+            ": last keepalive\r\n\r\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"after-byte-budget\",\"method\":\"ping\"}\r\n\r\n",
+        ));
+        let server = ScriptedHttpServer::start(vec![
+            http_ok_with_session("__ECHO_ID__", initialize_success_body(), "sid-long-get"),
+            http_empty(202, "Accepted"),
+            http_event_stream(&body),
+            http_empty(202, "Accepted"),
+            http_ok_plain("__ECHO_ID__", serde_json::json!({"tools":[]})),
+            http_empty(204, "No Content"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        runtime_for_tests().block_on(async {
+            transport
+                .request("initialize", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("initialize");
+            transport
+                .notify("notifications/initialized", serde_json::json!({}))
+                .await
+                .expect("initialized notification");
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .await
+                .expect("activate GET listener");
+            wait_for_requests(&server, 4).await;
+            assert!(transport.is_alive(), "valid GET traffic must not abort POST");
+            let response = transport
+                .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
+                .await
+                .expect("POST still usable after accumulated GET traffic");
+            assert_eq!(response["tools"], serde_json::json!([]));
+            transport.close().await;
+        });
+        let captured = server.captured();
+        let reply: Value = serde_json::from_str(&captured[3].1).expect("late ping reply");
+        assert_eq!(reply["id"], "after-byte-budget");
+        assert_eq!(reply["result"], serde_json::json!({}));
+        assert_eq!(captured.len(), 6, "no hidden reconnect or request replay");
+        assert_eq!(
+            server
+                .request_lines()
+                .iter()
+                .filter(|line| line.starts_with("GET "))
                 .count(),
             1
         );
