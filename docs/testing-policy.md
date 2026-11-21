@@ -1031,8 +1031,10 @@ Two long-horizon defect classes — **session duration** (FD/child-process leaks
 - **Why outside the ordinary DSR quality lane:** Long duration soaks would dominate per-commit runtime, and sustained concurrency latency/load stress tests create cross-binary scheduling noise when run alongside hundreds of parallel integration binaries (`bd-814p6` / `bd-brx7l`).
 - **What stays inside Check 6 (`tests/e2e_soak_stability.rs`):** Fast deterministic unit and mutation-sensitivity tests for the soak sampler/evaluator itself (cadence, deliberately leaked OS file descriptor detection, deliberately unbounded vector detection, well-formed early-abort JSONL output, mutation-fault sensitivity, plus bounded 12-turn duration and 6-wave concurrency smokes).
 - **Explicit soak entrypoints (credential-free, deterministic loopback stub + parameterized Rust lane):**
-  - `scripts/e2e/run_session_soak.sh` (`PI_SOAK_TURNS`, `PI_SOAK_MAX_SECS`, `PI_SOAK_SAMPLE_INTERVAL`, `PI_SOAK_MUTATION_FAULT=none|leak_fd|unbounded_vec`)
-  - `scripts/e2e/run_tool_concurrency_soak.sh` (`PI_CONCURRENCY_WAVES`, `PI_CONCURRENCY_PARALLEL_READS`, `PI_CONCURRENCY_HOSTCALL_BURST`, `PI_SOAK_MAX_SECS`)
+  - Explicit DSR soak recipe entry in `.dsr/repos.yaml` (strictly separate from the ordinary 12-check `pi_agent_rust` recipe):
+    `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust_soak`
+  - `scripts/e2e/run_session_soak.sh` (`PI_SOAK_TURNS`, `PI_SOAK_BINARY_TURNS`, `PI_SOAK_MAX_SECS`, `PI_SOAK_SAMPLE_INTERVAL`, `PI_SOAK_MUTATION_FAULT=none|leak_fd|unbounded_vec`)
+  - `scripts/e2e/run_tool_concurrency_soak.sh` (`PI_CONCURRENCY_WAVES`, `PI_CONCURRENCY_BINARY_WAVES`, `PI_CONCURRENCY_PARALLEL_READS`, `PI_CONCURRENCY_HOSTCALL_BURST`, `PI_SOAK_MAX_SECS`)
 - **Time-series & calibration discipline:** Every run writes machine-readable timestamped JSONL series (`rss_kb`, `open_fds`, `child_procs`, `session_entries`, `session_index_bytes`, `hostcall_queue_depth`, `turn_latency_ms`), per-turn tool-effect batching decisions and fast-ring vs overflow admissions, all binary warnings/errors, and a `first / median / last` summary table. Initial growth thresholds are explicitly marked `"provisional_thresholds": true` until calibrated from observed multi-run series.
 
 

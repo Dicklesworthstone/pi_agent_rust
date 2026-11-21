@@ -645,6 +645,13 @@ summary_table = {
 overall_pass = all(v["status"] == "pass" for v in verdicts)
 summary = {
     "schema": "pi.soak.session_duration.binary.v1",
+    "scenario_parameters": {
+        "binary_turns": turns,
+        "sample_interval": sample_interval,
+        "max_secs": max_secs,
+        "mutation_fault": mutation_fault,
+        "pi_bin": pi_bin,
+    },
     "completed_turns": completed_turns,
     "requested_turns": turns,
     "aborted_early": aborted_early,

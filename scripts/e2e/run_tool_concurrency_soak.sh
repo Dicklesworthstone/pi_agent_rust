@@ -552,6 +552,12 @@ try:
                     "tool_ends": tool_ends,
                     "peak_in_flight": peak_in_flight,
                     "expected_tool_calls": parallel_reads + 2,
+                    "effect_batching": {
+                        "parallel_read_calls": parallel_reads,
+                        "barrier_write_calls": 1,
+                        "post_barrier_read_calls": 1,
+                        "expected_batches": 3,
+                    },
                     "barrier_integrity_ok": barrier_ok,
                     "wave_latency_ms": round(elapsed_ms, 2),
                 }
@@ -619,6 +625,18 @@ summary_table = {
 overall_pass = all(v["status"] == "pass" for v in verdicts)
 summary = {
     "schema": "pi.soak.tool_concurrency.binary.v1",
+    "scenario_parameters": {
+        "binary_waves": waves,
+        "parallel_reads_per_wave": parallel_reads,
+        "max_secs": max_secs,
+        "pi_bin": pi_bin,
+    },
+    "hostcall_queue_telemetry": {
+        "fast_ring_capacity": 256,
+        "overflow_capacity": 2048,
+        "binary_phase_extensions_enabled": False,
+        "note": "Real HostcallRequestQueue fast-ring vs overflow admission counts are captured by Phase 2 (soak_sustained_tool_concurrency_extended).",
+    },
     "completed_waves": completed_waves,
     "requested_waves": waves,
     "aborted_early": aborted_early,

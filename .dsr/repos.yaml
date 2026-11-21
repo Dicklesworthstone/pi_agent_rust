@@ -112,3 +112,18 @@ tools:
       # workers even while native Windows host `wsurf` is offline. Distinct from
       # the pre-release native MSVC runtime gate (`scripts/check_windows_target.sh`).
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo check -j 2 --locked --lib --bins --target x86_64-pc-windows-gnu --keep-going
+
+  # Explicitly invoked duration & sustained multi-tool concurrency soak lane
+  # (GH #213, bd-brx7l). Kept strictly outside `tools.pi_agent_rust.checks` so
+  # multi-minute soaks and concurrency load pressure never slow or destabilize
+  # the ordinary 12-check per-commit DSR quality gate (`docs/testing-policy.md`).
+  # Invoke explicitly via:
+  #   DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust_soak
+  pi_agent_rust_soak:
+    repo: Dicklesworthstone/pi_agent_rust
+    local_path: /data/projects/pi_agent_rust
+    language: rust
+    binary_name: pi
+    checks:
+      - RCH_REQUIRE_REMOTE=1 PI_SOAK_CARGO_RUNNER=rch bash scripts/e2e/run_session_soak.sh
+      - RCH_REQUIRE_REMOTE=1 PI_SOAK_CARGO_RUNNER=rch bash scripts/e2e/run_tool_concurrency_soak.sh
