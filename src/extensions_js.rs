@@ -8453,7 +8453,11 @@ export function homedir() {{
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
       ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
-  return env_home || _homedir;
+  const process_home =
+    globalThis.process && globalThis.process.env
+      ? globalThis.process.env.HOME || globalThis.process.env.USERPROFILE
+      : undefined;
+  return env_home || process_home || _homedir;
 }}
 export function tmpdir() {{
   const env_tmp =
@@ -47179,6 +47183,44 @@ globalThis.__spawn_abort_result = result;
             };
             assert_eq!(r["devNull"], serde_json::json!(expected_dev_null));
             assert_eq!(r["hasConstants"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_os_homedir_prefers_runtime_process_env_over_host_home() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let sandbox_home = "/tmp/pi-sandbox-home-isolated";
+            let config = PiJsRuntimeConfig {
+                env: std::collections::HashMap::from([(
+                    "HOME".to_string(),
+                    sandbox_home.to_string(),
+                )]),
+                deny_env: false,
+                ..Default::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
+                .await
+                .expect("create runtime with sandbox HOME");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.osHomeResult = {};
+                    import('node:os').then((os) => {
+                        globalThis.osHomeResult.homedir = os.homedir();
+                        globalThis.osHomeResult.userInfoHomedir = os.userInfo().homedir;
+                        globalThis.osHomeResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:os homedir");
+
+            let r = get_global_json(&runtime, "osHomeResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["homedir"], serde_json::json!(sandbox_home));
+            assert_eq!(r["userInfoHomedir"], serde_json::json!(sandbox_home));
         });
     }
 
