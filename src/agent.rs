@@ -4623,10 +4623,11 @@ impl Agent {
                 let pause_turn = assistant_arc.stop_reason == StopReason::PauseTurn;
                 // A paused Anthropic server-tool turn must be resubmitted
                 // verbatim. Its content can contain tool-use blocks, but those
-                // are not a request to execute our local tool registry.
+                // are not a request to execute our local tool registry. Token
+                // limits likewise never authorize a partial tool batch.
                 let execute_local_tools = matches!(
                     assistant_arc.stop_reason,
-                    StopReason::Stop | StopReason::ToolUse | StopReason::Length
+                    StopReason::Stop | StopReason::ToolUse
                 ) && !tool_calls.is_empty();
                 has_more_tool_calls = execute_local_tools;
                 if pause_turn {
@@ -5564,10 +5565,9 @@ impl Agent {
         // uniformly for every provider.
         let mut tool_call_raw_args: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
-        // #148: count distinct streamed calls, including any unfinished call
-        // later omitted from the terminal snapshot. Repeated updates at one
-        // content index still describe one call.
-        let mut streamed_tool_call_indices = std::collections::HashSet::new();
+        // Retain tool-call evidence even when the terminal snapshot drops it.
+        // A completed prefix cannot authorize a token-limited batch (#148).
+        let mut saw_tool_call = false;
 
         'stream: loop {
             if checkpoint_cx.checkpoint().is_err()
@@ -5735,6 +5735,10 @@ impl Agent {
 
             match event {
                 StreamEvent::Start { partial } => {
+                    saw_tool_call |= partial
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolCall(_)));
                     if added_partial {
                         if let Some(Message::Assistant(msg_arc)) = self
                             .messages
@@ -6034,7 +6038,7 @@ impl Agent {
                     id,
                     name,
                 } => {
-                    streamed_tool_call_indices.insert(content_index);
+                    saw_tool_call = true;
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -6084,7 +6088,7 @@ impl Agent {
                     delta,
                     ..
                 } => {
-                    streamed_tool_call_indices.insert(content_index);
+                    saw_tool_call = true;
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -6148,7 +6152,7 @@ impl Agent {
                     tool_call,
                     ..
                 } => {
-                    streamed_tool_call_indices.insert(content_index);
+                    saw_tool_call = true;
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -6213,13 +6217,15 @@ impl Agent {
                     if terminal_override {
                         message.stop_reason = reason;
                     }
-                    // #148: a token-limited snapshot may omit an unfinished
-                    // call even while completed peers remain. Report the
-                    // truncation before any peer executes, through the existing
-                    // Error/AgentEnd path.
-                    if is_truncated_before_tool_call(&message, streamed_tool_call_indices.len()) {
+                    // Complete argument objects do not prove the provider
+                    // finished its whole tool batch. A token limit with any
+                    // observed or retained call must stop before approval or
+                    // execution, including calls omitted from the snapshot.
+                    if is_truncated_tool_batch(&message, saw_tool_call) {
                         message.stop_reason = StopReason::Error;
-                        message.error_message = Some(TRUNCATED_TOOL_CALL_ERROR.to_string());
+                        message
+                            .error_message
+                            .get_or_insert_with(|| TRUNCATED_TOOL_CALL_ERROR.to_string());
                     }
                     crate::turn_recovery::finish_empty_response(
                         &mut message,
@@ -6273,13 +6279,14 @@ impl Agent {
             // the connection without a terminal event; the resulting error
             // should name the truncated tool call rather than the generic
             // missing-`Done` condition.
-            let truncated_tool_call =
-                is_truncated_before_tool_call(&final_msg, streamed_tool_call_indices.len());
+            let truncated_tool_call = is_truncated_tool_batch(&final_msg, saw_tool_call);
             final_msg.stop_reason = StopReason::Error;
-            final_msg.error_message = Some(if truncated_tool_call {
-                TRUNCATED_TOOL_CALL_ERROR.to_string()
-            } else {
-                "Stream ended without Done event".to_string()
+            final_msg.error_message.get_or_insert_with(|| {
+                if truncated_tool_call {
+                    TRUNCATED_TOOL_CALL_ERROR.to_string()
+                } else {
+                    "Stream ended without Done event".to_string()
+                }
             });
             return Ok(self.finalize_assistant_message(final_msg, &on_event, true));
         }
@@ -26348,10 +26355,10 @@ fn filter_image_blocks(blocks: &mut Vec<ContentBlock>, placeholder: &str) -> usi
     removed
 }
 
-/// Error text stamped on an assistant message whose stream was cut off by the
-/// provider's token limit while a tool call was still being assembled (#148).
-const TRUNCATED_TOOL_CALL_ERROR: &str = "Model output truncated before tool call completed (provider stop reason: length); \
-     the incomplete tool call was not executed";
+/// A token limit cannot authorize execution of a completed prefix of a batch,
+/// even when every tool argument object received so far is valid (#148).
+const TRUNCATED_TOOL_CALL_ERROR: &str = "Model output truncated before tool-call batch completion (provider stop reason: length); \
+     local tool calls withheld";
 
 /// Validate every call before any peer can reach approval, hooks, or execution.
 /// Streaming ToolCallEnd events are content updates, not execution authority.
@@ -26363,6 +26370,9 @@ fn terminal_tool_batch_error(message: &AssistantMessage) -> Option<String> {
         // Failed or refused turns cannot execute. Paused turns must retain
         // their signed provider payload verbatim for continuation.
         return None;
+    }
+    if is_truncated_tool_batch(message, false) {
+        return Some(TRUNCATED_TOOL_CALL_ERROR.to_string());
     }
 
     let mut ids = std::collections::HashSet::new();
@@ -26390,48 +26400,17 @@ fn terminal_tool_batch_error(message: &AssistantMessage) -> Option<String> {
     None
 }
 
-/// Whether a tool call survived streaming intact enough to execute.
-///
-/// Two ways a truncated call fails this: an empty `name` (the placeholder
-/// `stream_assistant_response` seeds when deltas arrive before the call is
-/// identified), or `arguments` left as JSON null. Providers set null exactly
-/// when the accumulated argument fragment does not parse — see
-/// `openai::finalize_tool_call_arguments` and
-/// `anthropic::handle_content_block_stop`, which both log a parse warning and
-/// fall back to `Value::Null`. A complete no-argument call carries `{}`, not
-/// null, so this does not misjudge argument-less tools.
-fn is_complete_tool_call(tool_call: &ToolCall) -> bool {
-    !tool_call.name.trim().is_empty() && !tool_call.arguments.is_null()
-}
-
-/// Whether the provider's token limit left an incomplete or missing tool batch.
-///
-/// Count distinct indices from `ToolCall{Start,Delta,End}` events so repeated
-/// updates do not invent extra calls. A terminal snapshot can omit an unfinished
-/// call; even if a peer completed, executing it would apply only part of the
-/// batch. Done-only providers have no streamed indices and remain supported.
-///
-/// Otherwise retain #148's incomplete-only detection. Malformed peers still
-/// present in the snapshot are refused by `terminal_tool_batch_error`.
-fn is_truncated_before_tool_call(
-    message: &AssistantMessage,
-    streamed_tool_call_count: usize,
-) -> bool {
-    if message.stop_reason != StopReason::Length {
-        return false;
-    }
-
-    let mut final_tool_call_count = 0;
-    let mut has_complete_tool_call = false;
-    for block in &message.content {
-        if let ContentBlock::ToolCall(tool_call) = block {
-            final_tool_call_count += 1;
-            has_complete_tool_call |= is_complete_tool_call(tool_call);
-        }
-    }
-
-    final_tool_call_count < streamed_tool_call_count
-        || (!has_complete_tool_call && (streamed_tool_call_count > 0 || final_tool_call_count > 0))
+/// A token-limited response cannot authorize local tools. Observe calls across
+/// the stream because its final snapshot can omit them; also inspect the final
+/// content for providers that return only a Done event. Text-only truncation
+/// retains Length and the ordinary turn-recovery policy.
+fn is_truncated_tool_batch(message: &AssistantMessage, saw_tool_call: bool) -> bool {
+    message.stop_reason == StopReason::Length
+        && (saw_tool_call
+            || message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_))))
 }
 
 /// Extract tool calls from content blocks.

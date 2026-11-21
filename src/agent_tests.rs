@@ -2059,7 +2059,11 @@ mod tests {
 
                     assert_eq!(result.stop_reason, StopReason::Error, "{reason:?}/{bad:?}");
                     let error = result.error_message.as_deref().unwrap();
-                    assert!(error.contains("PI_TOOL_CALL_PROTOCOL"));
+                    if reason == StopReason::Length {
+                        assert_eq!(error, TRUNCATED_TOOL_CALL_ERROR);
+                    } else {
+                        assert!(error.contains("PI_TOOL_CALL_PROTOCOL"));
+                    }
                     assert!(!error.contains("private-argument"));
                     assert_eq!(
                         serde_json::to_value(&result.content).unwrap(),
@@ -2107,10 +2111,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_parallel_tool_batch_executes_with_stop_tool_use_and_length() {
+    fn valid_parallel_tool_batch_executes_with_stop_and_tool_use() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::Length] {
+            for reason in [StopReason::Stop, StopReason::ToolUse] {
                 let temp = tempfile::tempdir().unwrap();
                 let mut message = assistant_message("Apply both edits");
                 message.stop_reason = reason;
@@ -2159,8 +2163,183 @@ mod tests {
     }
 
     #[test]
+    fn length_tool_batches_preserve_billing_and_fail_before_approval_or_writes() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for (reason, snapshot_reason) in [
+                (StopReason::Length, StopReason::Length),
+                (StopReason::Length, StopReason::Stop),
+                (StopReason::Length, StopReason::ToolUse),
+                (StopReason::Stop, StopReason::Length),
+                (StopReason::ToolUse, StopReason::Length),
+            ] {
+                for streamed in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let first = temp.path().join("first.txt");
+                    std::fs::write(&first, "original").unwrap();
+                    let calls = [
+                        batch_write_call("first", "first.txt", "overwritten"),
+                        batch_write_call("second", "second.txt", "created"),
+                    ];
+                    let mut message = assistant_message("Retain the partial explanation");
+                    message.stop_reason = snapshot_reason;
+                    message.error_message = Some("original provider limit diagnostic".into());
+                    message.usage.input = 17;
+                    message.usage.output = 5;
+                    message.usage.total_tokens = 22;
+                    message.usage.cost.total = 0.25;
+                    message.usage.billing =
+                        Some(crate::model::BillingUsage::ReportedTotal { total: 0.25 });
+                    message
+                        .content
+                        .extend(calls.iter().cloned().map(ContentBlock::ToolCall));
+                    let mut expected = message.clone();
+                    expected.stop_reason = StopReason::Error;
+                    let expected = serde_json::to_value(expected).unwrap();
+                    let mut stream_events = Vec::new();
+                    if streamed {
+                        stream_events.push(StreamEvent::Start {
+                            partial: assistant_message(""),
+                        });
+                        stream_events.extend(calls.into_iter().enumerate().map(
+                            |(index, tool_call)| StreamEvent::ToolCallEnd {
+                                content_index: index + 1,
+                                tool_call,
+                            },
+                        ));
+                    }
+                    stream_events.push(StreamEvent::Done { reason, message });
+                    let provider = Arc::new(TerminalBatchProvider {
+                        events: stream_events,
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    });
+                    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let observed = Arc::clone(&approvals);
+                    let mut agent = Agent::new(
+                        provider.clone(),
+                        ToolRegistry::new(&["write"], temp.path(), None),
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |_| {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                Box::pin(async { ToolApprovalDecision::Allow })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let captured = Arc::clone(&events);
+                    let result = agent
+                        .run("Apply both edits", move |event| {
+                            captured.lock().unwrap().push(event);
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(serde_json::to_value(&result).unwrap(), expected);
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(approvals.load(Ordering::SeqCst), 0);
+                    assert_eq!(std::fs::read_to_string(&first).unwrap(), "original");
+                    assert!(!temp.path().join("second.txt").exists());
+                    let Message::Assistant(stored) = &agent.messages()[1] else {
+                        panic!("failed assistant batch stays in history");
+                    };
+                    assert_eq!(serde_json::to_value(stored).unwrap(), expected);
+                    assert!(
+                        !agent
+                            .messages()
+                            .iter()
+                            .any(|message| matches!(message, Message::ToolResult(_)))
+                    );
+                    let events = events.lock().unwrap();
+                    let ended = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            AgentEvent::MessageEnd {
+                                message: Message::Assistant(message),
+                            } => Some(message),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(ended.len(), 1);
+                    assert_eq!(serde_json::to_value(ended[0]).unwrap(), expected);
+                    assert!(events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::ProviderError { message, .. }
+                            if message == "original provider limit diagnostic"
+                    )));
+                    assert!(events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::AgentEnd { error: Some(error), .. }
+                            if error == "original provider limit diagnostic"
+                    )));
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::AgentEnd { error: None, .. }
+                    )));
+                    assert!(events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TurnEnd {
+                            message: Message::Assistant(message), tool_results, ..
+                        } if message.stop_reason == StopReason::Error && tool_results.is_empty()
+                    )));
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::ToolExecutionStart { .. }
+                            | AgentEvent::ToolExecutionUpdate { .. }
+                            | AgentEvent::ToolExecutionEnd { .. }
+                    )));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn length_terminal_rejects_calls_observed_only_in_the_start_snapshot() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let mut partial = assistant_message("A call is being assembled");
+            partial
+                .content
+                .push(ContentBlock::ToolCall(batch_write_call(
+                    "partial-call",
+                    "target.txt",
+                    "must not execute",
+                )));
+            let mut message = assistant_message("Retain the partial explanation");
+            message.stop_reason = StopReason::Length;
+            let provider = Arc::new(TerminalBatchProvider {
+                events: vec![
+                    StreamEvent::Start { partial },
+                    StreamEvent::Done {
+                        reason: StopReason::Length,
+                        message,
+                    },
+                ],
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&["write"], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let result = agent.run("Apply the edit", |_| {}).await.unwrap();
+            assert_eq!(result.stop_reason, StopReason::Error);
+            assert_eq!(
+                result.error_message.as_deref(),
+                Some(TRUNCATED_TOOL_CALL_ERROR)
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                assistant_text_content(&result.content),
+                "Retain the partial explanation"
+            );
+            assert!(!temp.path().join("target.txt").exists());
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
-    fn length_tool_batch_withholds_completed_peer_when_another_call_disappears() {
+    fn length_tool_batch_withholds_completed_peers_and_omitted_calls() {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             for omit_started_peer in [false, true] {
@@ -2176,8 +2355,8 @@ mod tests {
                 let mut events = vec![StreamEvent::Start {
                     partial: assistant_message(""),
                 }];
-                // Start, delta, and repeated end updates at the same index
-                // represent one call, not four separate batch members.
+                // Completed and repeated updates still cannot authorize a
+                // token-limited batch, even without an unfinished peer.
                 events.extend([
                     StreamEvent::ToolCallStart {
                         content_index: 1,
@@ -2232,27 +2411,20 @@ mod tests {
                     },
                 );
                 let result = agent.run("Apply the edits", |_| {}).await.unwrap();
-                if omit_started_peer {
-                    assert_eq!(result.stop_reason, StopReason::Error);
-                    assert_eq!(
-                        result.error_message.as_deref(),
-                        Some(TRUNCATED_TOOL_CALL_ERROR)
-                    );
-                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-                    assert_eq!(approvals.load(Ordering::SeqCst), 0);
-                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
-                    assert!(
-                        !agent
-                            .messages()
-                            .iter()
-                            .any(|m| matches!(m, Message::ToolResult(_)))
-                    );
-                } else {
-                    assert_eq!(result.stop_reason, StopReason::Stop);
-                    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-                    assert_eq!(approvals.load(Ordering::SeqCst), 1);
-                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed");
-                }
+                assert_eq!(result.stop_reason, StopReason::Error);
+                assert_eq!(
+                    result.error_message.as_deref(),
+                    Some(TRUNCATED_TOOL_CALL_ERROR)
+                );
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(approvals.load(Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+                assert!(
+                    !agent
+                        .messages()
+                        .iter()
+                        .any(|m| matches!(m, Message::ToolResult(_)))
+                );
                 assert!(!temp.path().join("other.txt").exists());
             }
         });
@@ -2634,6 +2806,10 @@ mod tests {
         > {
             let mut truncated = assistant_message("The answer is fourty-tw");
             truncated.stop_reason = StopReason::Length;
+            truncated.usage.input = 17;
+            truncated.usage.output = 5;
+            truncated.usage.total_tokens = 22;
+            truncated.usage.cost.total = 0.25;
 
             let events = vec![
                 Ok(StreamEvent::Start {
@@ -2679,7 +2855,7 @@ mod tests {
                 .as_deref()
                 .expect("truncated turn carries an error message");
             assert!(
-                error_message.contains("truncated before tool call completed"),
+                error_message == TRUNCATED_TOOL_CALL_ERROR,
                 "unexpected error message: {error_message}"
             );
 
@@ -2735,6 +2911,8 @@ mod tests {
                 "a plain length stop must not be rewritten into an error"
             );
             assert_eq!(result.error_message, None);
+            assert_eq!(result.usage.total_tokens, 22);
+            assert_eq!(result.usage.cost.total.to_bits(), 0.25_f64.to_bits());
             assert!(
                 result
                     .content
