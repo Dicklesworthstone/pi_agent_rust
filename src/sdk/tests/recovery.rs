@@ -6599,3 +6599,220 @@ fn live_login_and_logout_update_failover_eligibility_immediately() {
         ("login-primary".to_string(), "primary".to_string())
     );
 }
+
+#[test]
+fn shared_auth_readers_do_not_republish_credentials_or_reopen_logged_out_fallbacks() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("shared-auth-primary", "primary");
+    let mut fallback = recovery_route_entry("shared-auth-fallback", "fallback");
+    for entry in [&mut primary, &mut fallback] {
+        entry.api_key = None;
+        entry.auth_header = true;
+    }
+    let entries = vec![primary, fallback];
+    let mut initial = AuthStorage::empty_at(dir.path().join("auth.json"));
+    for provider in ["shared-auth-primary", "shared-auth-fallback"] {
+        initial.set(
+            provider,
+            crate::auth::AuthCredential::ApiKey {
+                key: format!("{provider}-initial"),
+            },
+        );
+    }
+    let make_handle = || {
+        let mut handle = credential_binding_handle(&entries, None).with_failover(Some(
+            FailoverOptions {
+                chains: HashMap::new(),
+                available_models: entries.clone(),
+                auth: initial.clone(),
+                cli_api_key: None,
+                cooldown_secs: 0,
+            },
+        ));
+        handle.adopt_auth_storage(initial.clone());
+        handle
+    };
+    let mut writer = make_handle();
+    let mut reader = make_handle();
+    let shared = writer.ensure_shared_auth_storage();
+    reader.shared_auth = Some(Arc::clone(&shared));
+    reader.shared_auth_epoch = writer.shared_auth_epoch;
+
+    writer.update_shared_auth_storage(|auth| {
+        auth.set(
+            "shared-auth-primary",
+            crate::auth::AuthCredential::ApiKey {
+                key: "shared-auth-primary-refreshed".to_string(),
+            },
+        );
+    });
+    assert_eq!(shared.lock().unwrap().0, 2, "one publication per update");
+    for _ in 0..3 {
+        reader.sync_shared_auth_if_updated();
+        writer.sync_shared_auth_if_updated();
+        assert_eq!(shared.lock().unwrap().0, 2, "reads must not publish");
+    }
+    assert_eq!(reader.shared_auth_epoch, 2);
+    assert_eq!(
+        reader.session.agent.stream_options().api_key.as_deref(),
+        Some("shared-auth-primary-refreshed")
+    );
+    assert!(
+        reader
+            .failover
+            .as_ref()
+            .unwrap()
+            .available_models
+            .iter()
+            .any(|entry| entry.model.provider == "shared-auth-fallback")
+    );
+
+    writer.update_shared_auth_storage(|auth| {
+        assert!(auth.remove("shared-auth-primary"));
+        assert!(auth.remove("shared-auth-fallback"));
+    });
+    reader.sync_shared_auth_if_updated();
+    writer.sync_shared_auth_if_updated();
+    assert_eq!(shared.lock().unwrap().0, 3);
+    for handle in [&writer, &reader] {
+        assert_eq!(handle.shared_auth_epoch, 3);
+        assert!(handle.session.agent.stream_options().api_key.is_none());
+        assert!(
+            handle
+                .failover
+                .as_ref()
+                .unwrap()
+                .available_models
+                .is_empty(),
+            "logout must invalidate the fallback credential cache too"
+        );
+    }
+}
+
+struct QueuedAuthPublication {
+    shared: Arc<Mutex<(u64, AuthStorage)>>,
+    auth: AuthStorage,
+}
+
+/// Deterministically publish a newer credential revision during local provider
+/// refresh. This models another owner completing login/logout while a slow
+/// credential command is resolving, without relying on thread scheduling.
+struct AuthRefreshPublisher {
+    queued: Mutex<Option<QueuedAuthPublication>>,
+}
+
+#[async_trait::async_trait]
+impl crate::provider::Provider for AuthRefreshPublisher {
+    fn name(&self) -> &'static str {
+        let queued = self.queued.lock().unwrap().take();
+        if let Some(queued) = queued {
+            let mut shared = queued.shared.lock().unwrap();
+            shared.0 += 1;
+            shared.1 = queued.auth;
+        }
+        "shared-auth-primary"
+    }
+
+    fn api(&self) -> &'static str {
+        "test-api"
+    }
+
+    fn model_id(&self) -> &'static str {
+        "primary"
+    }
+
+    async fn stream(
+        &self,
+        _context: &crate::provider::Context<'_>,
+        _options: &crate::provider::StreamOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+    > {
+        Err(Error::api("credential refresh must not dispatch a request"))
+    }
+}
+
+#[test]
+fn shared_auth_refresh_cannot_overwrite_a_newer_login_or_logout() {
+    for operation in ["adopt", "update", "sync"] {
+        let dir = tempdir().unwrap();
+        let mut initial = AuthStorage::empty_at(dir.path().join("auth.json"));
+        initial.set(
+            "shared-auth-primary",
+            crate::auth::AuthCredential::ApiKey {
+                key: "shared-auth-primary-initial".to_string(),
+            },
+        );
+        let publisher = Arc::new(AuthRefreshPublisher {
+            queued: Mutex::new(None),
+        });
+        let agent = Agent::new(
+            publisher.clone(),
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(Session::in_memory())),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut handle = AgentSessionHandle::from_session_with_listeners(
+            session,
+            EventListeners::default(),
+        );
+        handle.adopt_auth_storage(initial.clone());
+        let shared = handle.ensure_shared_auth_storage();
+        let mut earlier = initial.clone();
+        earlier.set(
+            "shared-auth-primary",
+            crate::auth::AuthCredential::ApiKey {
+                key: "shared-auth-primary-earlier".to_string(),
+            },
+        );
+        let mut newer = initial;
+        assert!(newer.remove("shared-auth-primary"));
+        newer.set(
+            "shared-auth-secondary",
+            crate::auth::AuthCredential::ApiKey {
+                key: "shared-auth-secondary-newer".to_string(),
+            },
+        );
+        if operation == "sync" {
+            *shared.lock().unwrap() = (2, earlier.clone());
+        }
+        *publisher.queued.lock().unwrap() = Some(QueuedAuthPublication {
+            shared: Arc::clone(&shared),
+            auth: newer,
+        });
+
+        match operation {
+            "adopt" => handle.adopt_auth_storage(earlier),
+            "update" => handle.update_shared_auth_storage(|auth| *auth = earlier),
+            "sync" => handle.sync_shared_auth_if_updated(),
+            _ => unreachable!(),
+        }
+        assert!(publisher.queued.lock().unwrap().is_none());
+        {
+            let published = shared.lock().unwrap();
+            assert!(
+                published.1.get("shared-auth-primary").is_none(),
+                "{operation}: completing an older refresh must not undo logout"
+            );
+            assert_eq!(
+                published.1.api_key("shared-auth-secondary").as_deref(),
+                Some("shared-auth-secondary-newer"),
+                "{operation}: an unrelated newer login must survive"
+            );
+            assert_eq!(published.0, 3, "{operation}: exactly two publications");
+        }
+        assert_eq!(
+            handle.shared_auth_epoch, 2,
+            "{operation}: the handle only consumed the earlier revision"
+        );
+        handle.sync_shared_auth_if_updated();
+        assert!(handle.session.agent.stream_options().api_key.is_none());
+        assert_eq!(handle.shared_auth_epoch, 3);
+        assert_eq!(shared.lock().unwrap().0, 3, "{operation}: read-only catchup");
+    }
+}

@@ -4201,6 +4201,29 @@ impl AgentSessionHandle {
     /// live model and future fallback candidates, retaining the CLI key pin.
     pub fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
         self.session.scope_auth_storage(&mut auth);
+        // Publish the explicit replacement before refreshing the local runtime.
+        // Resolving a credential can run a slow command; another owner may
+        // publish a newer login/logout while that refresh is still running.
+        // Record only the revision actually consumed, never republish the old
+        // snapshot after returning from the refresh.
+        let published_epoch = self.shared_auth.as_ref().and_then(|shared| {
+            shared.lock().ok().map(|mut guard| {
+                let epoch = guard.0.saturating_add(1);
+                *guard = (epoch, auth.clone());
+                epoch
+            })
+        });
+        self.apply_auth_storage(auth);
+        if let Some(epoch) = published_epoch {
+            self.shared_auth_epoch = epoch;
+        }
+    }
+
+    /// Refresh this handle from one credential snapshot without publishing it.
+    /// Readers and writers both use this local path after releasing the shared
+    /// lock so provider refreshes cannot erase a newer shared revision.
+    fn apply_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
+        self.session.scope_auth_storage(&mut auth);
         let previous = self
             .session
             .auth_storage()
@@ -4238,14 +4261,7 @@ impl AgentSessionHandle {
             }
             opts.available_models
                 .retain(crate::models::model_entry_is_ready);
-            opts.auth = auth.clone();
-        }
-        if let Some(shared) = &self.shared_auth
-            && let Ok(mut guard) = shared.lock()
-        {
-            let next_epoch = guard.0.saturating_add(1);
-            *guard = (next_epoch, auth);
-            self.shared_auth_epoch = next_epoch;
+            opts.auth = auth;
         }
     }
 
@@ -4253,15 +4269,17 @@ impl AgentSessionHandle {
     /// fallback eligibility dynamically without restarting the session.
     pub fn update_shared_auth_storage(&mut self, f: impl FnOnce(&mut crate::auth::AuthStorage)) {
         let shared = self.ensure_shared_auth_storage();
-        let updated = {
+        let (epoch, updated) = {
             let Ok(mut guard) = shared.lock() else {
                 return;
             };
             f(&mut guard.1);
+            self.session.scope_auth_storage(&mut guard.1);
             guard.0 = guard.0.saturating_add(1);
-            guard.1.clone()
+            (guard.0, guard.1.clone())
         };
-        self.adopt_auth_storage(updated);
+        self.apply_auth_storage(updated);
+        self.shared_auth_epoch = epoch;
     }
 
     pub(crate) fn ensure_shared_auth_storage(
@@ -4290,8 +4308,8 @@ impl AgentSessionHandle {
             (guard.0 != self.shared_auth_epoch).then(|| (guard.0, guard.1.clone()))
         });
         if let Some((epoch, auth)) = maybe_updated {
+            self.apply_auth_storage(auth);
             self.shared_auth_epoch = epoch;
-            self.adopt_auth_storage(auth);
         }
     }
 
