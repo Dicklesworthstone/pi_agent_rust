@@ -544,7 +544,16 @@ mod tests {
         fn prepared_background_request_keeps_definition_and_model_snapshot() {
             let _guard = crate::jobs::process_test_guard();
             let script = format!(
-                "printf '%s\\n' \"$@\" > arguments\n{}",
+                "printf '%s\\n' \"$@\" > arguments\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                   case \"$1\" in\n\
+                     --append-system-prompt|--system-prompt)\n\
+                       shift\n\
+                       cat \"$1\" > system-prompt\n\
+                       ;;\n\
+                   esac\n\
+                   shift\n\
+                 done\n{}",
                 end("frozen launch")
             );
             let (root, mut tool, _owner) = fixture(&script);
@@ -564,9 +573,14 @@ mod tests {
             let results = runtime.block_on(prepared.run(None));
             assert!(!results[0].is_error, "{:?}", results[0]); // ubs:ignore[rust.panic.assert-macros] -- The single prepared child must execute with its frozen definition.
             let argv = std::fs::read_to_string(root.path().join("arguments")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The real child records argv as independent snapshot evidence.
+            let system_prompt = std::fs::read_to_string(root.path().join("system-prompt")).unwrap(); // ubs:ignore[rust.ownership.unwrap-expect] -- The real child reads the frozen prompt snapshot file.
             assert!(argv.contains("model-before") && argv.contains("provider-before")); // ubs:ignore[rust.panic.assert-macros] -- Child argv must use the model captured during preparation.
-            assert!(argv.contains("Original definition.")); // ubs:ignore[rust.panic.assert-macros] -- Child argv must retain the prepared prompt definition.
-            assert!(!argv.contains("model-after") && !argv.contains("Changed definition.")); // ubs:ignore[rust.panic.assert-macros] -- Later settings and file changes must not alter an admitted request.
+            assert!(system_prompt.contains("Original definition.")); // ubs:ignore[rust.panic.assert-macros] -- Child prompt snapshot must retain the prepared prompt definition.
+            assert!(
+                !argv.contains("model-after")
+                    && !argv.contains("Original definition.")
+                    && !system_prompt.contains("Changed definition.")
+            ); // ubs:ignore[rust.panic.assert-macros] -- Later settings and file changes must not alter an admitted request.
         }
 
         #[test]

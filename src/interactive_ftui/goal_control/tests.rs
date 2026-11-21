@@ -469,7 +469,22 @@ fn editable_fork_drafts_deliver_exact_media_and_current_text_to_the_native_turn(
                     _ => None,
                 })
                 .expect("provider received native fork input");
-            same_payload(user, &expected);
+            let expected_wire = match &expected {
+                UserContent::Blocks(blocks) => UserContent::Blocks(
+                    blocks
+                        .iter()
+                        .cloned()
+                        .map(|mut block| {
+                            if let ContentBlock::Text(text) = &mut block {
+                                text.text_signature = None;
+                            }
+                            block
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            };
+            same_payload(user, &expected_wire);
         });
     }
 }

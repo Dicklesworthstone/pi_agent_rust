@@ -157,7 +157,8 @@ fn the_classic_stack_drives_turns_through_the_sdk_recovery_driver() {
     let root = project_root();
     let classic = read(&root.join("src/interactive/agent.rs"));
     assert!(
-        has_live_call(&classic, ".run_recoverable_turn("),
+        has_live_call(&classic, ".run_recoverable_turn_with_handoff(")
+            || has_live_call(&classic, ".run_recoverable_turn("),
         "src/interactive/agent.rs no longer hands its turns to the SDK recovery driver. Route \
          its observation events some other way and give it its own SURFACES row (bd-82331)."
     );

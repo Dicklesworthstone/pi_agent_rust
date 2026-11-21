@@ -1,23 +1,23 @@
 ## Test Coverage Matrix (Current Source Inventory)
 
-> Last regenerated: 2026-11-15
+> Last regenerated: 2026-11-21
 > Owner bead: `bd-8t27h.1`
 
 This document is the current source-file coverage inventory for `src/**/*.rs`. It is not a drop-in certification artifact and does not override `docs/evidence/dropin-certification-verdict.json`.
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 742 current source files.
+- `rg --files src -g '*.rs' | sort` -> 745 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 462 Rust test files under `tests/`.
 - `rg -n '#\[cfg\(test\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 100.00% classified tests traced and 100.00% classified E2E suites covered.
-- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 742-file current tree.
+- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 745-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
 
 ### Current Drift Check
 
-- Latest recorded full `src/` inventory: 742 files (2026-11-15), with no missing or stale rows.
-- Source-file rows below: 742, one per file in the current `src/` inventory.
+- Latest recorded full `src/` inventory: 745 files (2026-11-21), with no missing or stale rows.
+- Source-file rows below: 745, one per file in the current `src/` inventory.
 - The 224 rows added on 2026-10-24 state only what each file shows: its own `//!` summary, its `#[test]` count, and the test modules it declares. Their integration-suite links were not audited, and a listed test count is not a passing result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -36,6 +36,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | Source file | Area | Coverage evidence / status |
 |---|---|---|
 | `src/acp.rs` | ACP protocol | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
+| `src/acp/commands.rs` | ACP slash command dispatch and available-command catalog updates | Exercised through `src/acp.rs` native extension command tests and `src/acp/mcp/integration_tests.rs`. |
 | `src/acp/content.rs` | ACP content conversion at the editor/agent boundary: bounded prompt blocks, embedded resources kept as labeled reference content | Unit (18 in-module tests). |
 | `src/acp/history.rs` | ACP session recovery and transcript replay from the configured session directory, without running an agent turn | Unit (18 in-module tests). |
 | `src/acp/mcp.rs` | Session-owned MCP tools for ACP: inert setup, with trust admission and connection inside the reserved prompt task | Unit (9 in-module tests); `src/acp/mcp/integration_tests.rs`. |
@@ -644,6 +645,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/subagents/execution/ownership.rs` | Subagent execution ownership and registration checkpointing | Unit; `tests/subagent.rs`. |
 | `src/subagents/execution/pipes.rs` | Subagent standard I/O pipe framing and drain loops | Unit; `tests/subagent.rs`. |
 | `src/subagents/execution/worker.rs` | One real RPC process per retained worker | Unit (7 in-module tests). |
+| `src/subagents/execution/writeback_tests.rs` | Test suite for cancellable isolated subagent writeback | Test module; real Git worktree writeback under contended lock and cancellation. |
 | `src/subagents/execution_tests.rs` | Subagent execution tests | Test support module; exercises subagent runner. |
 | `src/subagents/protocol.rs` | Subagent inter-process protocol messages | Unit; `tests/subagent.rs`. |
 | `src/subagents/seance.rs` | Read-only consultation of one saved session through the native child runner | Unit (12 in-module tests). |
@@ -713,6 +715,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/worktree_iso/snapshot/sparse.rs` | Preserve index-only tracked files without treating sparse absence as deletion | `src/worktree_iso/snapshot/sparse/tests.rs` (12 tests). |
 | `src/worktree_iso/snapshot/sparse/tests.rs` | Test suite for `src/worktree_iso/snapshot/sparse.rs` | Test module (12 tests). |
 | `src/worktree_iso/snapshot_tests.rs` | Worktree isolation snapshot test cases | Test support module; exercises snapshotting. |
+| `src/worktree_iso/writeback_tests.rs` | Test suite for cancellable Git worktree writeback | Test module; real Git writeback under contended lock and revoked authority. |
 | `src/xdev.rs` | xdev tool development | `tests/e2e_xdev.rs`. |
 | `src/acp/client_files.rs` | ACP editor-mediated client filesystem bridge | `src/acp/client_files/tests.rs`. |
 | `src/acp/client_files/tests.rs` | Test suite for `src/acp/client_files.rs` | Test module. |

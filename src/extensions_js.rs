@@ -31077,21 +31077,22 @@ mod tests {
     ///
     /// Native tool factory delegation adds 1_640 bridge bytes (259_969 ->
     /// 261_609) and 1_832 trimmed coding-agent module bytes (29_584 -> 31_416).
-    /// Re-pinned 2026-11-15: updates `<bridge>` (`61035a4e3`: +448 bytes for
-    /// provider read interruption and bounded cleanup) and `node:child_process`
-    /// (`768124dcc` +829, `38faea6ca` +3_259, `3dc3336a2` +1_240 = +5_328 bytes
-    /// for subprocess output-reader settlement across terminal paths) against
-    /// exact decompressed source bytes.
+    /// Re-pinned 2026-11-21: updates `<bridge>` (`edc08432b` + `182eea1a1`:
+    /// +1_061 bytes for fail-closed node-pty/chokidar shims and descriptor
+    /// identity retention) and `node:fs` (`d2a2ef9d2` + `182eea1a1`: +17_968
+    /// bytes for bounded stat-polling `fs.watchFile`, explicit `fs.watch`
+    /// rejection, and descriptor-scoped metadata) against exact decompressed
+    /// source bytes.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            269_085,
-            "af5bcf72537e6d486d6c6e1c38f2ad09d9f3cac6e19bacadb5a086e084ff48f6",
+            270_146,
+            "d2728f92c5f23d54ca8e78d2e41459d505dcc9e0bfbfbeb797141f7fbbf2c77f",
         ),
         (
             "node:fs",
-            64_849,
-            "7899ca631ab76d2e60b302bfb20af984ed74cb77d123a9e4fbbcf260ba1b639b",
+            82_817,
+            "6e4defaf0ac6431686f45ff53c4e3b015127e585320094c4453f143795aedab7",
         ),
         (
             "@mariozechner/pi-ai",

@@ -11777,6 +11777,7 @@ struct JsRuntimeShard {
     snapshot: JsExtensionSnapshot,
     published_provider_specs: Vec<Value>,
     published_mcp_specs: Vec<Value>,
+    published_command_specs: Vec<Value>,
     provider_actor: Weak<JsActorLifecycle>,
     provider_generation: Option<Uuid>,
     /// An idle turn polls at most one FIFO dispatch. Retaining its future here
@@ -15770,6 +15771,7 @@ async fn build_js_runtime_shards(
             runtime: Rc::new(runtime),
             published_provider_specs: snapshot.providers.clone(),
             published_mcp_specs: snapshot.mcp_servers.clone(),
+            published_command_specs: snapshot.slash_commands.clone(),
             provider_actor: Weak::new(),
             provider_generation: None,
             snapshot,
@@ -16341,6 +16343,7 @@ fn publish_runtime_shard_registrations(
     let shard = &mut shards.shards[shard_index];
     if shard.published_provider_specs == shard.snapshot.providers
         && shard.published_mcp_specs == shard.snapshot.mcp_servers
+        && shard.published_command_specs == shard.snapshot.slash_commands
     {
         return Ok(());
     }
@@ -16377,6 +16380,19 @@ fn publish_runtime_shard_registrations(
             .published_mcp_specs
             .clone_from(&shard.snapshot.mcp_servers);
     }
+    if shard.published_command_specs != shard.snapshot.slash_commands
+        && manager.replace_runtime_command_specs(
+            &shard.extension_id,
+            &shard.provider_actor,
+            shard.provider_generation,
+            &shard.published_command_specs,
+            &shard.snapshot.slash_commands,
+        )?
+    {
+        shard
+            .published_command_specs
+            .clone_from(&shard.snapshot.slash_commands);
+    }
     Ok(())
 }
 
@@ -16398,6 +16414,15 @@ fn retire_runtime_shard_registrations(manager: &ExtensionManager, shard: &JsRunt
         &[],
     ) {
         tracing::warn!(%error, "Failed to retire stopped MCP registrations");
+    }
+    if let Err(error) = manager.replace_runtime_command_specs(
+        &shard.extension_id,
+        &shard.provider_actor,
+        shard.provider_generation,
+        &shard.published_command_specs,
+        &[],
+    ) {
+        tracing::warn!(%error, "Failed to retire stopped command registrations");
     }
 }
 
@@ -19283,6 +19308,7 @@ mod idle_runtime_tests {
                     .expect("fixture snapshot"),
                 published_provider_specs: Vec::new(),
                 published_mcp_specs: Vec::new(),
+                published_command_specs: Vec::new(),
                 provider_actor: Weak::new(),
                 provider_generation: None,
                 pending_idle_dispatch: None,
@@ -19582,6 +19608,7 @@ mod idle_runtime_tests {
                     .expect("fixture snapshot"),
                 published_provider_specs: Vec::new(),
                 published_mcp_specs: Vec::new(),
+                published_command_specs: Vec::new(),
                 provider_actor: Weak::new(),
                 provider_generation: None,
                 pending_idle_dispatch: Some(pending),
@@ -19687,7 +19714,9 @@ mod idle_runtime_tests {
                 safety_envelope: SafetyEnvelopeConfig {
                     enabled: true,
                     min_observations: 1,
-                    safety_error_threshold: 0.0,
+                    // Single overload failure yields PAC-Bayes bound 1.0 (> 0.99 -> veto);
+                    // single healthy completion yields ~0.976 (<= 0.99 -> permits recovery).
+                    safety_error_threshold: 0.99,
                     ..Default::default()
                 },
                 ..Default::default()

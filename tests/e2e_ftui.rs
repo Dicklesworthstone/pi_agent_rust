@@ -19,7 +19,7 @@ mod common;
 use common::tmux::TuiSession;
 use std::fs::OpenOptions;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Patience budgets for the tmux-driven FTUI lane.
 ///
@@ -663,18 +663,38 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     );
     if blind_stty_sane {
         // SIGKILL path: the tty is expected to still be raw here; a blind
-        // `stty sane` (typed without echo) must recover it.
-        session.tmux.send_literal("stty sane");
+        // `stty sane` (typed without echo) must recover it. Follow with a
+        // formatted marker whose rendered text does not appear in the typed
+        // command so loaded workers wait deterministically for termios
+        // restoration instead of relying on a fixed sleep.
+        session
+            .tmux
+            .send_literal("stty sane; printf 'STTY-SANE-%s\\n' OK");
         session.tmux.send_key("C-j");
-        std::thread::sleep(Duration::from_millis(300));
+        let stty_pane = session
+            .tmux
+            .wait_for_pane_contains("STTY-SANE-OK", COMMAND_TIMEOUT);
+        assert!(
+            stty_pane.contains("STTY-SANE-OK"),
+            "blind `stty sane` recovery did not complete; pane:\n{stty_pane}"
+        );
     }
 
     // Post-signal probe: typed input must echo AND execute.
+    // Poll up to COMMAND_TIMEOUT for two occurrences (echoed input plus `echo`
+    // output) so a loaded worker does not fail by capturing right after input
+    // echo before the shell prints its output. If echo is broken, only the
+    // command output appears (occurrences == 1) and the assertion still fails.
     session.tmux.send_literal("echo POST-KILL-OK");
     session.tmux.send_key("Enter");
-    let pane = session
+    let probe_start = Instant::now();
+    let mut pane = session
         .tmux
         .wait_for_pane_contains("POST-KILL-OK", COMMAND_TIMEOUT);
+    while pane.matches("POST-KILL-OK").count() < 2 && probe_start.elapsed() < COMMAND_TIMEOUT {
+        std::thread::sleep(Duration::from_millis(50));
+        pane = session.tmux.capture_pane();
+    }
     let occurrences = pane.matches("POST-KILL-OK").count();
     assert!(
         occurrences >= 2,

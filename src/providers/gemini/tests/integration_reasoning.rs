@@ -396,9 +396,28 @@ fn signed_state_round_trips_through_session_encoding_and_actual_followup_request
             StreamOptions::default(),
             &success(),
         );
+        let mut expected_parts = parts.clone();
+        if matches!(route, Route::Developer) {
+            let mut call_ids = message.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call.id.as_str()),
+                _ => None,
+            });
+            for part in expected_parts
+                .as_array_mut()
+                .expect("expected parts must be an array")
+            {
+                if let Some(call) = part
+                    .get_mut("functionCall")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    let id = call_ids.next().expect("matching tool call id");
+                    call.insert("id".to_string(), json!(id));
+                }
+            }
+        }
         assert_eq!(
             route.inner(&body)["contents"][1]["parts"],
-            parts,
+            expected_parts,
             "{route:?}"
         );
         assert_eq!(

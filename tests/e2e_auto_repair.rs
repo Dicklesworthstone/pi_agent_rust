@@ -326,6 +326,9 @@ fn is_nonblocking_auto_repair_failure(result: &ExtResult) -> bool {
 fn is_known_package_compat_failure(result: &ExtResult, error: &str) -> bool {
     match result.id.as_str() {
         "base_fixtures" => error.contains("registerTool: spec.name is required"),
+        "community/nicobailon-subagents" => {
+            error.contains("ERR_FEATURE_UNAVAILABLE: fs.watch native notifications are unavailable")
+        }
         "npm/aliou-pi-guardrails" | "npm/aliou-pi-toolchain" => {
             error.contains("cannot read property 'features' of undefined")
         }

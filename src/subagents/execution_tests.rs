@@ -2419,6 +2419,15 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     let script = format!(
         "printf '%s\\n' \"$PI_SUBAGENT_RUN_ID\" >> \"$PI_CODING_AGENT_DIR/launches\"\n\
          printf '%s\\n' \"$@\" > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.args\"\n\
+         while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --append-system-prompt|--system-prompt)\n\
+               shift\n\
+               cat \"$1\" > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.prompt\"\n\
+               ;;\n\
+           esac\n\
+           shift\n\
+         done\n\
          cat > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.task\"\n\
          printf '%s\\n' \"$PI_SUBAGENT_DEPTH\" > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.depth\"\n\
          pwd > \"$PI_CODING_AGENT_DIR/$PI_SUBAGENT_RUN_ID.cwd\"\n{}",
@@ -2459,12 +2468,16 @@ fn hub_revival_executes_retained_policy_and_full_assignment_without_phantom_chil
     assert_ne!(replacement_id, source.id);
     let arguments =
         std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.args")))?;
+    let system_prompt =
+        std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.prompt")))?;
     assert!(arguments.contains("--model\nfixture/original\n"));
     assert!(arguments.contains("--tools\nread\n"));
     assert!(arguments.contains("--thinking\nlow\n"));
-    assert!(arguments.contains("Original system policy."));
+    assert!(system_prompt.contains("Original system policy."));
+    assert!(!arguments.contains("Original system policy."));
     assert!(!arguments.contains("fixture/escalated"));
     assert!(!arguments.contains("Changed system policy."));
+    assert!(!system_prompt.contains("Changed system policy."));
     assert!(!arguments.contains(&assignment));
     let instructions =
         std::fs::read_to_string(tool.global_dir.join(format!("{replacement_id}.task")))?;

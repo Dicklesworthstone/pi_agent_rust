@@ -342,7 +342,7 @@ fn run_native_chain(answer: &str) {
     let script = format!(
         r#"#!/bin/sh
 set -eu
-for arg do task="$arg"; done
+task=$(cat)
 case "$task" in
   'Task: SEED')
     cat seed-result.jsonl

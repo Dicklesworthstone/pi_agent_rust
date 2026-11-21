@@ -104,10 +104,23 @@ fn graph_returns_early_and_preserves_waves_typed_inputs_and_frozen_launches() ->
     let script = format!(
         r#"
 task=$(cat)
+capture_prompt() {{
+  dest="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --append-system-prompt|--system-prompt)
+        shift
+        cat "$1" > "$dest"
+        ;;
+    esac
+    shift
+  done
+}}
 case "$task" in
   'Task: seed'*) touch seed.started; while [ ! -f release ]; do sleep 0.02; done; {} ;;
-  'Task: left'*) printf '%s\n' "$@" > left.argv; printf '%s' "$task" > left.task; touch left.started; while [ ! -f right.started ]; do sleep 0.02; done; {} ;;
-  'Task: right'*) printf '%s\n' "$@" > right.argv; printf '%s' "$task" > right.task; touch right.started; while [ ! -f left.started ]; do sleep 0.02; done; {} ;;
+  'Task: left'*) printf '%s\n' "$@" > left.argv; capture_prompt left.prompt "$@"; printf '%s' "$task" > left.task; touch left.started; while [ ! -f right.started ]; do sleep 0.02; done; {} ;;
+  'Task: right'*) printf '%s\n' "$@" > right.argv; capture_prompt right.prompt "$@"; printf '%s' "$task" > right.task; touch right.started; while [ ! -f left.started ]; do sleep 0.02; done; {} ;;
   'Task: join'*) printf '%s\n' "$task" > join.task; test -f left.started; test -f right.started; {} ;;
   *) exit 19 ;;
 esac
@@ -166,9 +179,14 @@ esac
         }
         for branch in ["left", "right"] {
             let argv = std::fs::read_to_string(root.path().join(format!("{branch}.argv")))?;
-            assert!(argv.contains("Original graph definition."));
+            let prompt = std::fs::read_to_string(root.path().join(format!("{branch}.prompt")))?;
+            assert!(prompt.contains("Original graph definition."));
             assert!(argv.contains("provider-before") && argv.contains("model-before"));
-            assert!(!argv.contains("Changed graph definition.") && !argv.contains("model-after"));
+            assert!(
+                !argv.contains("Original graph definition.")
+                    && !prompt.contains("Changed graph definition.")
+                    && !argv.contains("model-after")
+            );
             let task = std::fs::read_to_string(root.path().join(format!("{branch}.task")))?;
             assert!(task.contains("\"source\":41"));
             assert!(!argv.contains("\"source\":41"));

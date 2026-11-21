@@ -4317,6 +4317,82 @@ impl ExtensionManager {
         Ok(true)
     }
 
+    pub(super) fn replace_runtime_command_specs(
+        &self,
+        extension_id: &str,
+        actor: &Weak<JsActorLifecycle>,
+        provider_generation: Option<Uuid>,
+        previous: &[Value],
+        replacements: &[Value],
+    ) -> Result<bool> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(&guard.runtime, Some(ExtensionRuntimeHandle::Js(runtime))
+            if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
+            || provider_generation.is_none()
+            || guard.js_provider_generation != provider_generation
+            || !guard.js_provider_catalog_ready
+            || (!replacements.is_empty() && actor.upgrade().is_none_or(|actor| actor.is_stopped()))
+        {
+            return Ok(false);
+        }
+        let Ok(target_index) = Self::extension_index_for_owner(&guard, extension_id) else {
+            return Ok(false);
+        };
+        let mut seen = HashSet::new();
+        for spec in replacements {
+            let Some(name) = extract_slash_command_name(spec)
+                .map(|name| js_command_route_name(&name).to_string())
+                .filter(|name| !name.is_empty())
+            else {
+                return Err(Error::extension("registerCommand: name is required"));
+            };
+            if !seen.insert(name.clone()) {
+                return Err(Error::extension(format!(
+                    "registerCommand: command name collision: {name}"
+                )));
+            }
+            for (index, extension) in guard.extensions.iter().enumerate() {
+                if index == target_index {
+                    continue;
+                }
+                if extension.slash_commands.iter().any(|command| {
+                    extract_slash_command_name(command)
+                        .is_some_and(|existing| js_command_route_name(&existing) == name)
+                }) {
+                    return Err(Error::extension(format!(
+                        "registerCommand: command name collision: {name}"
+                    )));
+                }
+            }
+        }
+        let target = &mut guard.extensions[target_index];
+        let mut commands = target
+            .slash_commands
+            .iter()
+            .filter(|cmd| !previous.contains(cmd))
+            .cloned()
+            .collect::<Vec<_>>();
+        for replacement in replacements {
+            if let Some(name) = extract_slash_command_name(replacement) {
+                let normalized = js_command_route_name(&name);
+                commands.retain(|existing| {
+                    extract_slash_command_name(existing)
+                        .is_none_or(|other| js_command_route_name(&other) != normalized)
+                });
+            }
+            commands.push(replacement.clone());
+        }
+        if commands == target.slash_commands {
+            return Ok(true);
+        }
+        target.slash_commands = commands;
+        self.refresh_snapshot_with_guard_release(guard);
+        Ok(true)
+    }
+
     /// Dynamically register an MCP server from native host code.
     pub fn register_mcp_server(&self, mut spec: Value) {
         let name = spec

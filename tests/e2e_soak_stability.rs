@@ -2349,17 +2349,16 @@ fn run_parameterized_session_soak(
                 }
             }
 
-            // Periodically switch models, branch (exercising non-linear path cache),
-            // append compaction anchors, and persist/reload from disk.
+            // Periodically record a model change for the active soak provider,
+            // branch (exercising non-linear path cache), append compaction
+            // anchors, and persist/reload from disk.
             if (turn + 1).is_multiple_of(4) {
                 let cx = asupersync::Cx::for_testing();
                 let mut guard = session.lock(&cx).await.expect("session lock");
-                let model_name = if (turn / 4).is_multiple_of(2) {
-                    "soak-model-a"
-                } else {
-                    "soak-model-b"
-                };
-                guard.append_model_change("soak-provider".to_string(), model_name.to_string());
+                guard.append_model_change(
+                    provider.name().to_string(),
+                    provider.model_id().to_string(),
+                );
                 if let Some(anchor_id) = guard.entries.first().and_then(|e| e.base_id().cloned())
                     && let Some(tip_id) = guard.leaf_id().map(ToOwned::to_owned)
                 {
