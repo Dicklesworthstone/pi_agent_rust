@@ -46,25 +46,37 @@ PI_BIN="${PI_BIN:-}"
 ARTIFACT_DIR="${PI_SOAK_ARTIFACT_DIR:-}"
 CARGO_RUNNER="${PI_SOAK_CARGO_RUNNER:-auto}"
 
+require_arg() {
+    if [[ "$1" -lt 2 ]]; then
+        echo "Option $2 requires a value" >&2
+        exit 2
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --waves)
+            require_arg "$#" "$1"
             WAVES="$2"
             shift 2
             ;;
         --binary-waves)
+            require_arg "$#" "$1"
             BINARY_WAVES="$2"
             shift 2
             ;;
         --parallel-reads)
+            require_arg "$#" "$1"
             PARALLEL_READS="$2"
             shift 2
             ;;
         --hostcall-burst)
+            require_arg "$#" "$1"
             HOSTCALL_BURST="$2"
             shift 2
             ;;
         --max-secs)
+            require_arg "$#" "$1"
             MAX_SECS="$2"
             shift 2
             ;;
@@ -79,10 +91,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --pi-bin)
+            require_arg "$#" "$1"
             PI_BIN="$2"
             shift 2
             ;;
         --artifact-dir)
+            require_arg "$#" "$1"
             ARTIFACT_DIR="$2"
             shift 2
             ;;
@@ -194,7 +208,7 @@ if [[ "$RUN_BINARY" -eq 1 ]]; then
 import http.server
 import json
 import os
-import select
+import queue
 import socketserver
 import statistics
 import subprocess
@@ -234,7 +248,7 @@ class MultiToolOpenAIHandler(http.server.BaseHTTPRequestHandler):
         assert ws is not None
         wave_num = idx // 2
         if idx % 2 == 0:
-            # Emit N compatible read calls + 1 write barrier + 2 trailing read calls in one turn.
+            # Emit N compatible read calls + 1 write barrier + 1 trailing read call in one turn.
             tool_calls = []
             for r in range(parallel_reads):
                 target = ws / f"fixture_{r % 4}.txt"
@@ -339,8 +353,15 @@ stderr_path = artifact_dir / "binary_stderr.log"
 summary_path = artifact_dir / "binary_summary.json"
 samples: list[dict] = []
 warnings_and_errors: list[str] = []
+warnings_lock = threading.Lock()
 completed_waves = 0
+aborted_early = False
+proc_rc: int | None = None
 started_monotonic = time.monotonic()
+
+def record_warning(msg: str) -> None:
+    with warnings_lock:
+        warnings_and_errors.append(msg)
 
 try:
     with tempfile.TemporaryDirectory(prefix="pi-conc-soak-") as tmp:
@@ -400,19 +421,34 @@ try:
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
-        def read_rpc_line(timeout_s: float = 30.0) -> str | None:
-            ready, _, _ = select.select([proc.stdout], [], [], timeout_s)
-            if not ready:
-                return None
-            return proc.stdout.readline()
+        stdout_queue: queue.Queue[str | None] = queue.Queue()
 
-        def drain_stderr():
-            for line in proc.stderr:
-                with stderr_path.open("a", encoding="utf-8") as fh:
+        def pump_stdout() -> None:
+            assert proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    stdout_queue.put(line)
+            finally:
+                stdout_queue.put(None)
+
+        stdout_thread = threading.Thread(target=pump_stdout, daemon=True)
+        stdout_thread.start()
+
+        def read_rpc_line(timeout_s: float = 30.0) -> str | None:
+            try:
+                return stdout_queue.get(timeout=timeout_s)
+            except queue.Empty:
+                return None
+
+        def drain_stderr() -> None:
+            assert proc.stderr is not None
+            with stderr_path.open("a", encoding="utf-8") as fh:
+                for line in proc.stderr:
                     fh.write(line)
-                stripped = line.strip()
-                if stripped and any(tok in stripped.lower() for tok in ("warn", "error", "panic", "fatal")):
-                    warnings_and_errors.append(stripped)
+                    fh.flush()
+                    stripped = line.strip()
+                    if stripped and any(tok in stripped.lower() for tok in ("warn", "error", "panic", "fatal")):
+                        record_warning(stripped)
 
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         stderr_thread.start()
@@ -426,7 +462,8 @@ try:
                 proc.stdin.write(json.dumps({"id": req_id, "type": "get_state"}) + "\n")
                 proc.stdin.flush()
                 while True:
-                    line = read_rpc_line(10.0)
+                    remaining = max(0.2, deadline - time.monotonic())
+                    line = read_rpc_line(remaining)
                     if not line:
                         return False
                     try:
@@ -439,12 +476,13 @@ try:
                             return True
                         break
                 time.sleep(0.01)
-            warnings_and_errors.append(f"wave {wave_idx}: RPC did not return to idle within {timeout_s}s")
+            record_warning(f"wave {wave_idx}: RPC did not return to idle within {timeout_s}s")
             return False
 
         with series_path.open("w", encoding="utf-8") as series_fh:
             for wave in range(waves):
                 if max_secs > 0 and (time.monotonic() - started_monotonic) >= max_secs:
+                    aborted_early = True
                     break
                 t0 = time.monotonic()
                 req = {"id": f"wave-{wave}", "type": "prompt", "message": f"Execute concurrency wave {wave}"}
@@ -455,15 +493,16 @@ try:
                 tool_ends = 0
                 in_flight = 0
                 peak_in_flight = 0
+                post_read_saw_barrier = False
                 got_response = False
                 got_end = False
                 while not (got_response and got_end):
                     line = read_rpc_line(30.0)
                     if line is None:
-                        warnings_and_errors.append(f"timeout waiting for RPC output on wave {wave}")
+                        record_warning(f"timeout waiting for RPC output on wave {wave}")
                         break
                     if not line:
-                        warnings_and_errors.append(f"unexpected EOF on wave {wave}")
+                        record_warning(f"unexpected EOF on wave {wave}")
                         break
                     try:
                         msg = json.loads(line)
@@ -472,7 +511,7 @@ try:
                     mtype = msg.get("type")
                     if mtype == "response" and msg.get("id") == req["id"]:
                         if not msg.get("success", False):
-                            warnings_and_errors.append(f"wave {wave} rpc failed: {msg}")
+                            record_warning(f"wave {wave} rpc failed: {msg}")
                             break
                         got_response = True
                     elif mtype == "tool_execution_start":
@@ -482,17 +521,28 @@ try:
                     elif mtype == "tool_execution_end":
                         tool_ends += 1
                         in_flight = max(0, in_flight - 1)
+                        if msg.get("toolCallId") == f"call_w{wave}_post_read":
+                            rendered = json.dumps(msg.get("result", {}))
+                            if f"wave-{wave}-barrier-ok" in rendered and not msg.get("isError", False):
+                                post_read_saw_barrier = True
                     elif mtype == "agent_end":
                         got_end = True
 
                 idle_ok = wait_rpc_idle(wave) if (got_response and got_end) else False
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
                 expected_file = tmp_path / f"wave_out_{wave}.txt"
-                barrier_ok = expected_file.exists() and expected_file.read_text(encoding="utf-8") == f"wave-{wave}-barrier-ok\n"
+                barrier_ok = (
+                    expected_file.exists()
+                    and expected_file.read_text(encoding="utf-8") == f"wave-{wave}-barrier-ok\n"
+                    and post_read_saw_barrier
+                )
                 if not barrier_ok:
-                    warnings_and_errors.append(f"wave {wave} barrier file integrity check failed")
+                    record_warning(f"wave {wave} barrier file/post-read ordering check failed (post_read_ok={post_read_saw_barrier})")
                 if got_response and got_end and idle_ok:
                     completed_waves += 1
+                else:
+                    aborted_early = True
+                    break
                 sample = {
                     "schema": "pi.soak.concurrency_sample.v1",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -510,24 +560,32 @@ try:
 
         proc.stdin.close()
         try:
-            proc.wait(timeout=15)
+            proc_rc = proc.wait(timeout=15)
+            if proc_rc != 0:
+                record_warning(f"pi binary exited with non-zero code {proc_rc}")
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
-            warnings_and_errors.append("pi binary did not exit cleanly after stdin close")
+            proc_rc = proc.wait(timeout=5)
+            record_warning("pi binary did not exit cleanly after stdin close")
+        stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
 finally:
     server.shutdown()
     server.server_close()
 
-balanced = all(s["tool_starts"] == s["tool_ends"] == s["expected_tool_calls"] for s in samples)
-all_barriers_ok = all(s["barrier_integrity_ok"] for s in samples)
+balanced = bool(samples) and all(s["tool_starts"] == s["tool_ends"] == s["expected_tool_calls"] for s in samples)
+all_barriers_ok = bool(samples) and all(s["barrier_integrity_ok"] for s in samples)
+waves_ok = (
+    completed_waves > 0 and completed_waves <= waves
+    if (aborted_early and max_secs > 0)
+    else completed_waves == waves
+)
 verdicts = [
     {
         "metric": "completed_waves",
-        "status": "pass" if completed_waves == waves else "fail",
-        "threshold": f"completed_waves == {waves}",
-        "detail": f"completed={completed_waves}/{waves}",
+        "status": "pass" if waves_ok else "fail",
+        "threshold": f"completed_waves == {waves}" if not (aborted_early and max_secs > 0) else "completed_waves > 0 under --max-secs",
+        "detail": f"completed={completed_waves}/{waves}, aborted_early={aborted_early}",
     },
     {
         "metric": "tool_balance",
@@ -538,8 +596,14 @@ verdicts = [
     {
         "metric": "barrier_integrity",
         "status": "pass" if all_barriers_ok else "fail",
-        "threshold": "all barrier writes intact",
+        "threshold": "all barrier writes and post-read ordering intact",
         "detail": f"all_barriers_ok={all_barriers_ok}",
+    },
+    {
+        "metric": "process_exit",
+        "status": "pass" if proc_rc == 0 else "fail",
+        "threshold": "exit_code == 0",
+        "detail": f"exit_code={proc_rc}",
     },
 ]
 summary_table = {
@@ -552,6 +616,7 @@ summary = {
     "schema": "pi.soak.tool_concurrency.binary.v1",
     "completed_waves": completed_waves,
     "requested_waves": waves,
+    "aborted_early": aborted_early,
     "parallel_reads_per_wave": parallel_reads,
     "warnings_and_errors": warnings_and_errors,
     "verdicts": verdicts,

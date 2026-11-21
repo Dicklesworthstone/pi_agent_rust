@@ -20,8 +20,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +50,9 @@ PROVIDERS = [
 ]
 
 
+HTTP_ERROR_RE = re.compile(r"\bHTTP\s+([45]\d\d)\b")
+
+
 def has_credentials(prov_id: str, env_var: str) -> tuple[bool, str]:
     """Return whether credentials appear available for `prov_id` without printing secrets."""
     if os.environ.get(env_var):
@@ -63,7 +68,9 @@ def has_credentials(prov_id: str, env_var: str) -> tuple[bool, str]:
                 except (OSError, json.JSONDecodeError):
                     continue
                 if isinstance(data, dict) and (
-                    "tokens" in data or "openai-codex" in data or "OPENAI_API_KEY" in data
+                    bool(data.get("tokens"))
+                    or bool(data.get("openai-codex"))
+                    or bool(data.get("OPENAI_API_KEY"))
                 ):
                     return True, f"file:{candidate.name}"
     return False, f"{env_var} not set"
@@ -95,26 +102,71 @@ def parse_default_probe_response(stdout: str, stderr: str, returncode: int) -> d
                 error_code = event["code"]
 
     combined = f"{stdout}\n{stderr}"
-    if "model_not_found" in combined:
-        error_code = "model_not_found"
-    if "HTTP 400" in combined:
-        http_status = 400
-    elif "HTTP 401" in combined:
-        http_status = 401
-    elif "HTTP 403" in combined:
-        http_status = 403
-    elif "HTTP 404" in combined:
-        http_status = 404
-    elif "HTTP 429" in combined:
-        http_status = 429
-    elif returncode == 0:
+    if returncode == 0:
         http_status = 200
+    else:
+        if "model_not_found" in combined:
+            error_code = "model_not_found"
+        match = HTTP_ERROR_RE.search(combined)
+        if match:
+            http_status = int(match.group(1))
 
     return {
         "selected_model": selected_model,
         "http_status": http_status,
         "error_code": error_code,
     }
+
+
+def self_test() -> int:
+    # 1. parse_default_probe_response must extract 4xx/5xx on failure and never
+    #    misclassify assistant prose mentioning "HTTP 400" on exit 0.
+    ok_resp = parse_default_probe_response(
+        json.dumps({"model": "gpt-5.6-sol", "text": "HTTP 400 means bad request"}) + "\n",
+        "",
+        0,
+    )
+    assert ok_resp["http_status"] == 200, ok_resp
+    assert ok_resp["selected_model"] == "gpt-5.6-sol", ok_resp
+    assert ok_resp["error_code"] is None, ok_resp
+
+    err400 = parse_default_probe_response(
+        "", "HTTP 400 Bad Request: model_not_found", 1
+    )
+    assert err400["http_status"] == 400, err400
+    assert err400["error_code"] == "model_not_found", err400
+
+    err503 = parse_default_probe_response("", "HTTP 503 Service Unavailable", 1)
+    assert err503["http_status"] == 503, err503
+
+    # 2. has_credentials must NOT treat null/empty auth.json keys as credentials.
+    with tempfile.TemporaryDirectory(prefix="pi-live-probe-test-") as tmp:
+        fake_home = Path(tmp)
+        codex_dir = fake_home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": None, "tokens": None}), encoding="utf-8"
+        )
+        old_home = os.environ.get("HOME")
+        old_env = os.environ.pop("OPENAI_CODEX_AUTH_FILE", None)
+        try:
+            os.environ["HOME"] = str(fake_home)
+            present, _ = has_credentials("openai-codex", "OPENAI_CODEX_AUTH_FILE")
+            assert not present, "null OPENAI_API_KEY/tokens must not count as credentials"
+            (codex_dir / "auth.json").write_text(
+                json.dumps({"OPENAI_API_KEY": None, "tokens": {"access_token": "ok"}}),
+                encoding="utf-8",
+            )
+            present2, _ = has_credentials("openai-codex", "OPENAI_CODEX_AUTH_FILE")
+            assert present2, "non-empty tokens dict must count as credentials"
+        finally:
+            if old_home is not None:
+                os.environ["HOME"] = old_home
+            if old_env is not None:
+                os.environ["OPENAI_CODEX_AUTH_FILE"] = old_env
+
+    print("SELF-TEST PASS")
+    return 0
 
 
 def main() -> int:
@@ -140,7 +192,11 @@ def main() -> int:
         type=Path,
         default=ROOT / "docs/evidence/provider-default-probe.jsonl",
     )
+    ap.add_argument("--self-test", action="store_true", help="Run internal self-tests and exit")
     args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     if args.check_defaults:

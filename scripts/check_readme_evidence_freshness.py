@@ -2309,6 +2309,7 @@ def check_readme(
                     if json_payload is not None:
                         embedded_generated_at = parse_iso_datetime(
                             json_payload.get("generated_at")
+                            or json_payload.get("generated_at_utc")
                         )
                         if embedded_generated_at is not None:
                             freshness_time = embedded_generated_at

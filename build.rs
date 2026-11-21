@@ -163,11 +163,9 @@ fn emit_git_build_metadata(
 
     let require_git_sha = env_truthy("PI_REQUIRE_GIT_SHA");
 
-    let explicit_sha = if let Ok(raw) = std::env::var("PI_BUILD_GIT_SHA") {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
+    let explicit_sha = match std::env::var("PI_BUILD_GIT_SHA") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let trimmed = raw.trim();
             let normalized = normalize_canonical_git_sha(trimmed).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -178,10 +176,9 @@ fn emit_git_build_metadata(
             })?;
             Some(normalized)
         }
-    } else if let Ok(raw) = std::env::var("VERGEN_GIT_SHA") {
-        normalize_canonical_git_sha(&raw)
-    } else {
-        None
+        _ => std::env::var("VERGEN_GIT_SHA")
+            .ok()
+            .and_then(|raw| normalize_canonical_git_sha(&raw)),
     };
 
     if let Some(sha) = explicit_sha {

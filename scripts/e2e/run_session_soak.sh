@@ -45,25 +45,37 @@ PI_BIN="${PI_BIN:-}"
 ARTIFACT_DIR="${PI_SOAK_ARTIFACT_DIR:-}"
 CARGO_RUNNER="${PI_SOAK_CARGO_RUNNER:-auto}"
 
+require_arg() {
+    if [[ "$1" -lt 2 ]]; then
+        echo "Option $2 requires a value" >&2
+        exit 2
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --turns)
+            require_arg "$#" "$1"
             TURNS="$2"
             shift 2
             ;;
         --binary-turns)
+            require_arg "$#" "$1"
             BINARY_TURNS="$2"
             shift 2
             ;;
         --max-secs)
+            require_arg "$#" "$1"
             MAX_SECS="$2"
             shift 2
             ;;
         --sample-interval)
+            require_arg "$#" "$1"
             SAMPLE_INTERVAL="$2"
             shift 2
             ;;
         --mutation-fault)
+            require_arg "$#" "$1"
             MUTATION_FAULT="$2"
             shift 2
             ;;
@@ -78,10 +90,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --pi-bin)
+            require_arg "$#" "$1"
             PI_BIN="$2"
             shift 2
             ;;
         --artifact-dir)
+            require_arg "$#" "$1"
             ARTIFACT_DIR="$2"
             shift 2
             ;;
@@ -201,6 +215,7 @@ if [[ "$RUN_BINARY" -eq 1 ]]; then
 import http.server
 import json
 import os
+import queue
 import socketserver
 import statistics
 import subprocess
@@ -296,6 +311,24 @@ def proc_metrics(pid: int) -> tuple[int, int, int]:
     return rss_kb, open_fds, child_procs
 
 
+def count_session_entries(session_dir: Path) -> int:
+    total = 0
+    if not session_dir.exists():
+        return 0
+    for root, _, files in os.walk(session_dir):
+        for fname in files:
+            if not fname.endswith(".jsonl"):
+                continue
+            try:
+                with (Path(root) / fname).open("r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        if line.strip():
+                            total += 1
+            except OSError:
+                pass
+    return total
+
+
 def session_bytes(session_dir: Path) -> int:
     total = 0
     if not session_dir.exists():
@@ -331,10 +364,17 @@ stderr_path = artifact_dir / "binary_stderr.log"
 summary_path = artifact_dir / "binary_summary.json"
 samples: list[dict] = []
 warnings_and_errors: list[str] = []
+warnings_lock = threading.Lock()
 leaked_handles: list = []
+injected_unbounded_entries = 0
 aborted_early = False
 completed_turns = 0
+proc_rc: int | None = None
 started_monotonic = time.monotonic()
+
+def record_warning(msg: str) -> None:
+    with warnings_lock:
+        warnings_and_errors.append(msg)
 
 try:
     with tempfile.TemporaryDirectory(prefix="pi-session-soak-") as tmp:
@@ -390,13 +430,34 @@ try:
         )
         assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
-        def drain_stderr():
-            for line in proc.stderr:
-                with stderr_path.open("a", encoding="utf-8") as fh:
+        stdout_queue: queue.Queue[str | None] = queue.Queue()
+
+        def pump_stdout() -> None:
+            assert proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    stdout_queue.put(line)
+            finally:
+                stdout_queue.put(None)
+
+        stdout_thread = threading.Thread(target=pump_stdout, daemon=True)
+        stdout_thread.start()
+
+        def read_rpc_line(timeout_s: float = 30.0) -> str | None:
+            try:
+                return stdout_queue.get(timeout=timeout_s)
+            except queue.Empty:
+                return None
+
+        def drain_stderr() -> None:
+            assert proc.stderr is not None
+            with stderr_path.open("a", encoding="utf-8") as fh:
+                for line in proc.stderr:
                     fh.write(line)
-                stripped = line.strip()
-                if stripped and any(tok in stripped.lower() for tok in ("warn", "error", "panic", "fatal")):
-                    warnings_and_errors.append(stripped)
+                    fh.flush()
+                    stripped = line.strip()
+                    if stripped and any(tok in stripped.lower() for tok in ("warn", "error", "panic", "fatal")):
+                        record_warning(stripped)
 
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         stderr_thread.start()
@@ -408,8 +469,9 @@ try:
             got_response = False
             got_event = wait_event_type is None
             while not (got_response and got_event):
-                line = proc.stdout.readline()
+                line = read_rpc_line(30.0)
                 if not line:
+                    record_warning(f"RPC timeout/EOF waiting for {payload.get('id')}")
                     return False, (time.monotonic() - t0) * 1000.0
                 try:
                     msg = json.loads(line)
@@ -417,7 +479,7 @@ try:
                     continue
                 if msg.get("type") == "response" and msg.get("id") == payload.get("id"):
                     if not msg.get("success", False):
-                        warnings_and_errors.append(f"rpc response failed: {msg}")
+                        record_warning(f"rpc response failed: {msg}")
                         return False, (time.monotonic() - t0) * 1000.0
                     got_response = True
                 elif wait_event_type and msg.get("type") == wait_event_type:
@@ -433,8 +495,10 @@ try:
                 proc.stdin.write(json.dumps({"id": req_id, "type": "get_state"}) + "\n")
                 proc.stdin.flush()
                 while True:
-                    line = proc.stdout.readline()
+                    remaining = max(0.2, deadline - time.monotonic())
+                    line = read_rpc_line(remaining)
                     if not line:
+                        record_warning(f"turn {turn_idx}: timeout/EOF polling get_state")
                         return False
                     try:
                         msg = json.loads(line)
@@ -446,7 +510,7 @@ try:
                             return True
                         break
                 time.sleep(0.01)
-            warnings_and_errors.append(f"turn {turn_idx}: RPC did not return to idle within {timeout_s}s")
+            record_warning(f"turn {turn_idx}: RPC did not return to idle within {timeout_s}s")
             return False
 
         with series_path.open("w", encoding="utf-8") as series_fh:
@@ -466,11 +530,17 @@ try:
                 if mutation_fault == "leak_fd":
                     for i in range(4):
                         leaked_handles.append(open(tmp_path / f"leak-{turn}-{i}.tmp", "w", encoding="utf-8"))
+                elif mutation_fault == "unbounded_vec":
+                    # Harness sensitivity probe: inject +24 synthetic session entries per turn.
+                    injected_unbounded_entries += 24
 
                 if turn == 0 or (turn + 1) % sample_interval == 0 or turn + 1 == turns:
                     rss_kb, open_fds, child_procs = proc_metrics(proc.pid)
                     if mutation_fault == "leak_fd":
+                        # Driver-level sensitivity check: add harness-held leaked FDs.
                         open_fds += len(leaked_handles)
+                    real_entries = count_session_entries(sessions_dir)
+                    observed_entries = real_entries + injected_unbounded_entries
                     sample = {
                         "schema": "pi.soak.sample.v1",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -479,7 +549,7 @@ try:
                         "rss_kb": rss_kb,
                         "open_fds": open_fds,
                         "child_procs": child_procs,
-                        "session_entries": completed_turns * 2,
+                        "session_entries": observed_entries,
                         "session_index_bytes": session_bytes(sessions_dir),
                         "hostcall_queue_depth": 0,
                         "turn_latency_ms": round(latency_ms, 2),
@@ -490,11 +560,14 @@ try:
 
         proc.stdin.close()
         try:
-            proc.wait(timeout=15)
+            proc_rc = proc.wait(timeout=15)
+            if proc_rc != 0:
+                record_warning(f"pi binary exited with non-zero code {proc_rc}")
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
-            warnings_and_errors.append("pi binary did not exit cleanly after stdin close")
+            proc_rc = proc.wait(timeout=5)
+            record_warning("pi binary did not exit cleanly after stdin close")
+        stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
 finally:
     for fh in leaked_handles:
@@ -515,6 +588,8 @@ entries_vals = [float(s["session_entries"]) for s in samples]
 fd_growth = (fd_vals[-1] - fd_vals[0]) if len(fd_vals) >= 2 else 0.0
 child_growth = (child_vals[-1] - child_vals[0]) if len(child_vals) >= 2 else 0.0
 rss_growth = (rss_vals[-1] - rss_vals[0]) if len(rss_vals) >= 2 else 0.0
+final_entries = int(entries_vals[-1]) if entries_vals else 0
+entries_per_turn = final_entries / max(1, completed_turns)
 
 verdicts = [
     {
@@ -536,10 +611,22 @@ verdicts = [
         "detail": f"growth={rss_growth:.0f} KB",
     },
     {
+        "metric": "session_entries",
+        "status": "pass" if entries_per_turn <= 12.0 else "fail",
+        "threshold": "entries_per_turn <= 12.0 (provisional)",
+        "detail": f"entries={final_entries}, per_turn={entries_per_turn:.2f}",
+    },
+    {
         "metric": "completed_turns",
         "status": "pass" if completed_turns > 0 and (not aborted_early or max_secs > 0) else "fail",
         "threshold": "completed_turns > 0 without unexpected abort",
         "detail": f"completed={completed_turns}/{turns}, aborted_early={aborted_early}",
+    },
+    {
+        "metric": "process_exit",
+        "status": "pass" if proc_rc == 0 else "fail",
+        "threshold": "exit_code == 0",
+        "detail": f"exit_code={proc_rc}",
     },
 ]
 

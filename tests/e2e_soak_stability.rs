@@ -2087,19 +2087,36 @@ fn evaluate_soak_series(
         },
         MetricVerdict {
             metric: "turn_latency_ms".to_string(),
-            status: "pass".to_string(),
+            status: if (if lat_sum.median > 0.0 {
+                lat_sum.last / lat_sum.median
+            } else {
+                1.0
+            }) <= budgets.max_latency_drift_ratio
+            {
+                "info".to_string()
+            } else {
+                "warn".to_string()
+            },
             first: lat_sum.first,
             median: lat_sum.median,
             last: lat_sum.last,
             threshold: format!(
-                "drift_watch <= {:.1}x (provisional)",
+                "drift_watch <= {:.1}x (provisional, observational)",
                 budgets.max_latency_drift_ratio
             ),
-            detail: format!("slope={:.2}ms/sample", lat_sum.slope_per_sample),
+            detail: format!(
+                "drift={:.2}x, slope={:.2}ms/sample",
+                if lat_sum.median > 0.0 {
+                    lat_sum.last / lat_sum.median
+                } else {
+                    1.0
+                },
+                lat_sum.slope_per_sample
+            ),
         },
     ];
 
-    if verdicts.iter().all(|v| v.status == "pass") {
+    if verdicts.iter().all(|v| v.status != "fail") {
         Ok(verdicts)
     } else {
         Err(verdicts)
@@ -2262,11 +2279,19 @@ impl Provider for DurationSoakProvider {
     }
 }
 
+/// Serializes tests that sample or intentionally mutate process-wide OS
+/// counters (`/proc/self/fd`, `/proc/self/task/*/children`) so injected FD
+/// leaks in mutation tests never contaminate concurrent clean soak tests.
+static PROCESS_SAMPLER_LOCK: Mutex<()> = Mutex::new(());
+
 fn run_parameterized_session_soak(
     harness: &TestHarness,
     test_name: &str,
     cfg: &SessionSoakConfig,
 ) -> SoakRunOutcome {
+    let _sampler_guard = PROCESS_SAMPLER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cwd = harness.temp_dir().to_path_buf();
     let out_dir = cfg.artifact_dir.clone().unwrap_or_else(|| cwd.clone());
     std::fs::create_dir_all(&out_dir).expect("create soak artifact dir");
@@ -3056,6 +3081,9 @@ fn soak_detector_catches_deliberately_leaked_descriptor() {
     // 2. Real OS file-descriptor leak detection via /proc/self/fd on Linux.
     #[cfg(target_os = "linux")]
     {
+        let _sampler_guard = PROCESS_SAMPLER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let harness = TestHarness::new("soak_real_fd_leak_probe");
         let probe_path = harness.create_file("fd_leak_probe.tmp", "probe\n");
         let before = sample_open_fds();
@@ -3313,7 +3341,16 @@ fn soak_sustained_tool_concurrency_extended() {
         "soak_sustained_tool_concurrency_extended",
         &cfg,
     );
-    assert_eq!(outcome.completed_waves, cfg.waves);
+    if cfg.max_duration.is_some() {
+        assert!(
+            outcome.completed_waves > 0 && outcome.completed_waves <= cfg.waves,
+            "time-capped concurrency soak must complete at least 1 wave (got {}/{})",
+            outcome.completed_waves,
+            cfg.waves
+        );
+    } else {
+        assert_eq!(outcome.completed_waves, cfg.waves);
+    }
     assert_eq!(outcome.total_tool_starts, outcome.total_tool_ends);
     assert!(outcome.overflow_admissions > 0);
 }
