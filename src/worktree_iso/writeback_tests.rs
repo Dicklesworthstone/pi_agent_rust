@@ -8,13 +8,13 @@ use std::thread;
 
 /// Hold the actual production lock on another thread. The watchdog makes a
 /// regression to a blocking async path fail instead of hanging the test runner.
-pub(crate) struct HeldApply {
+pub struct HeldApply {
     release: Option<mpsc::Sender<()>>,
     worker: Option<thread::JoinHandle<bool>>,
 }
 
 impl HeldApply {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (ready, started) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -36,7 +36,7 @@ impl HeldApply {
         held
     }
 
-    pub(crate) fn release(mut self) {
+    pub fn release(mut self) {
         let sent = self.release.take().unwrap().send(()).is_ok();
         let received = self.worker.take().unwrap().join().unwrap();
         assert!(

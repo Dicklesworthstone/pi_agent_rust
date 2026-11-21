@@ -2400,12 +2400,12 @@ mod tests {
         fn ambiguous_candidate_indices_reject_the_entire_chunk() {
             for mode in MODES {
                 for indices in [
-                    (None, None),
-                    (Some(0), None),
-                    (Some(0), Some(0)),
-                    (Some(1), Some(1)),
+                    [None, None],
+                    [Some(0), None],
+                    [Some(0), Some(0)],
+                    [Some(1), Some(1)],
                 ] {
-                    let candidates: Vec<_> = [indices.0, indices.1]
+                    let candidates: Vec<_> = indices
                         .into_iter()
                         .map(|index| {
                             let mut candidate = json!({"finishReason": "STOP", "content": {

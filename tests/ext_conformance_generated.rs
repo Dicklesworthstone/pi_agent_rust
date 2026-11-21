@@ -6968,8 +6968,14 @@ mod multi_entry_conformance_loading_tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let manager = load_specs_hermetically(specs, temp.path()).expect("load prateekmedia-lsp");
         let obs = observe_registrations(&manager).expect("observe registrations");
-        assert_eq!(obs.tools, vec!["lsp"]);
-        assert_eq!(obs.commands, vec!["lsp"]);
+        assert_eq!(
+            obs.tools,
+            std::collections::BTreeSet::from(["lsp".to_string()])
+        );
+        assert_eq!(
+            obs.commands,
+            std::collections::BTreeSet::from(["lsp".to_string()])
+        );
     }
 
     #[test]
@@ -7012,8 +7018,14 @@ export default function (pi: any) {
         assert_eq!(specs.len(), 2);
         let manager = load_specs_hermetically(specs, temp.path()).expect("atomic load succeeds");
         let obs = observe_registrations(&manager).expect("observe");
-        assert_eq!(obs.tools, vec!["ok_tool"]);
-        assert_eq!(obs.commands, vec!["zeta-cmd"]);
+        assert_eq!(
+            obs.tools,
+            std::collections::BTreeSet::from(["ok_tool".to_string()])
+        );
+        assert_eq!(
+            obs.commands,
+            std::collections::BTreeSet::from(["zeta-cmd".to_string()])
+        );
     }
 
     #[test]
@@ -7106,8 +7118,14 @@ export default function (pi: any) {
         assert_eq!(bundle_specs.len(), 2);
         let manager = load_specs_hermetically(bundle_specs, temp.path()).expect("load bundle");
         let obs = observe_registrations(&manager).expect("observe bundle");
-        assert_eq!(obs.commands, vec!["cmd-a"]);
-        assert_eq!(obs.tools, vec!["tool_b"]);
+        assert_eq!(
+            obs.commands,
+            std::collections::BTreeSet::from(["cmd-a".to_string()])
+        );
+        assert_eq!(
+            obs.tools,
+            std::collections::BTreeSet::from(["tool_b".to_string()])
+        );
 
         // Malformed `package.json` fails closed during spec resolution.
         let bad_manifest = temp.path().join("bad-manifest");

@@ -448,7 +448,7 @@
       "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
     }
   ],
-  "generated_at": "2026-11-13T12:10:00.000Z",
+  "generated_at": "2026-11-21T07:54:11.798Z",
   "no_data": 19,
   "pass": 0,
   "run_id": null,

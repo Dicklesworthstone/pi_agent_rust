@@ -1864,12 +1864,11 @@ fn sample_process_rss_kb() -> u64 {
     {
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    if let Some(num) = rest.split_whitespace().next() {
-                        if let Ok(kb) = num.parse::<u64>() {
-                            return kb;
-                        }
-                    }
+                if let Some(rest) = line.strip_prefix("VmRSS:")
+                    && let Some(num) = rest.split_whitespace().next()
+                    && let Ok(kb) = num.parse::<u64>()
+                {
+                    return kb;
                 }
             }
         }
@@ -1884,11 +1883,11 @@ fn sample_process_rss_kb() -> u64 {
 fn sample_open_fds() -> usize {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_dir("/proc/self/fd").map_or(0, |entries| entries.count())
+        std::fs::read_dir("/proc/self/fd").map_or(0, std::iter::Iterator::count)
     }
     #[cfg(target_os = "macos")]
     {
-        std::fs::read_dir("/dev/fd").map_or(0, |entries| entries.count())
+        std::fs::read_dir("/dev/fd").map_or(0, std::iter::Iterator::count)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1950,7 +1949,7 @@ fn summarize_series(values: &[f64]) -> MetricSummary {
     let median = if sorted.len().is_multiple_of(2) {
         let lo = sorted.get(mid.saturating_sub(1)).copied().unwrap_or(first);
         let hi = sorted.get(mid).copied().unwrap_or(last);
-        (lo + hi) / 2.0
+        f64::midpoint(lo, hi)
     } else {
         sorted.get(mid).copied().unwrap_or(first)
     };
@@ -2361,22 +2360,22 @@ fn run_parameterized_session_soak(
                     "soak-model-b"
                 };
                 guard.append_model_change("soak-provider".to_string(), model_name.to_string());
-                if let Some(anchor_id) = guard.entries.first().and_then(|e| e.base_id().cloned()) {
-                    if let Some(tip_id) = guard.leaf_id().map(ToOwned::to_owned) {
-                        assert!(
-                            guard.create_branch_from(&anchor_id),
-                            "branch to anchor must succeed"
-                        );
-                        guard.append_custom_entry(
-                            "soak.branch_probe".to_string(),
-                            Some(json!({ "turn": turn })),
-                        );
-                        assert!(
-                            guard.create_branch_from(&tip_id),
-                            "restore main branch tip must succeed"
-                        );
-                        branch_count += 1;
-                    }
+                if let Some(anchor_id) = guard.entries.first().and_then(|e| e.base_id().cloned())
+                    && let Some(tip_id) = guard.leaf_id().map(ToOwned::to_owned)
+                {
+                    assert!(
+                        guard.create_branch_from(&anchor_id),
+                        "branch to anchor must succeed"
+                    );
+                    guard.append_custom_entry(
+                        "soak.branch_probe".to_string(),
+                        Some(json!({ "turn": turn })),
+                    );
+                    assert!(
+                        guard.create_branch_from(&tip_id),
+                        "restore main branch tip must succeed"
+                    );
+                    branch_count += 1;
                 }
                 if let Some(kept_id) = guard.leaf_id().map(ToOwned::to_owned) {
                     guard.append_compaction(
@@ -2714,6 +2713,7 @@ fn run_sustained_tool_concurrency_soak(
     let os = Arc::clone(&outcome_store);
     let series_path_async = series_path.clone();
     let summary_path_async = summary_path.clone();
+    let test_name_async = test_name.to_string();
     let cfg_clone = cfg.clone();
 
     run_async(async move {
@@ -2870,6 +2870,12 @@ fn run_sustained_tool_concurrency_soak(
                 wave_fast + wave_overflow,
                 "wave {wave}: lost queued hostcalls"
             );
+            assert!(
+                drained
+                    .iter()
+                    .all(|item| item.wave == wave && item.seq < cfg_clone.hostcall_burst_per_wave),
+                "wave {wave}: drained hostcall metadata corrupted"
+            );
             drained_hostcalls += drained_len;
             hostcall_queue.force_reclaim();
             assert!(
@@ -2907,7 +2913,7 @@ fn run_sustained_tool_concurrency_soak(
 
         let summary = json!({
             "schema": "pi.soak.tool_concurrency.v1",
-            "test": test_name,
+            "test": test_name_async,
             "parameters": {
                 "waves": cfg_clone.waves,
                 "parallel_reads_per_wave": cfg_clone.parallel_reads_per_wave,

@@ -5655,6 +5655,8 @@ mod tests {
                 true,
             ),
         ] {
+            use std::fmt::Write as _;
+
             let call = json!({"choices":[{"delta":{"tool_calls":[
                 {"index":0,"id":"call_first","function":{"name":"write","arguments":"{}"}},
                 {"index":1,"id":"call_second","function":{"name":"write","arguments":"{}"}}
@@ -5662,14 +5664,14 @@ mod tests {
             let mut body = format!("data: {call}\n\n");
             for finish in &finishes {
                 let terminal = json!({"choices":[{"delta":{},"finish_reason":finish}]});
-                body.push_str(&format!("data: {terminal}\n\n"));
+                let _ = write!(body, "data: {terminal}\n\n");
             }
             // Gateways can report the bill after the choice has ended. Failed
             // generation still consumes tokens and must retain that bill.
             let usage = json!({"choices":[],"usage":{
                 "prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"cost":0.25
             }});
-            body.push_str(&format!("data: {usage}\n\ndata: [DONE]\n\n"));
+            let _ = write!(body, "data: {usage}\n\ndata: [DONE]\n\n");
             let events = collect_stream_items_from_body(&body);
             assert!(events.iter().all(Result::is_ok), "{finishes:?}: {events:?}");
             let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
@@ -5709,11 +5711,13 @@ mod tests {
             (Some("length"), StopReason::Length),
             (None, StopReason::Error),
         ] {
+            use std::fmt::Write as _;
+
             let text = json!({"choices":[{"delta":{"content":"Partial answer"}}]});
             let mut body = format!("data: {text}\n\n");
             if let Some(finish) = finish {
                 let terminal = json!({"choices":[{"delta":{},"finish_reason":finish}]});
-                body.push_str(&format!("data: {terminal}\n\n"));
+                let _ = write!(body, "data: {terminal}\n\n");
             }
             body.push_str("data: [DONE]\n\n");
             let events = collect_stream_items_from_body(&body);

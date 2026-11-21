@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-11-13T12:10:00.000Z
+> Generated: 2026-11-21T07:54:11.798Z
 
 > Run ID: not set
 

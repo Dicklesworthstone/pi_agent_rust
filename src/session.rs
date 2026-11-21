@@ -2486,9 +2486,9 @@ pub(crate) fn reconcile_saved_session_leaf(
                 .clone()
                 .zip(header.fallback_model_id.clone())
         });
-        (header.provider, header.model_id) = model
-            .map(|(provider, model)| (Some(provider), Some(model)))
-            .unwrap_or((None, None));
+        (header.provider, header.model_id) = model.map_or((None, None), |(provider, model)| {
+            (Some(provider), Some(model))
+        });
     }
     if entries
         .iter()

@@ -7483,7 +7483,7 @@ impl ReadTool {
     }
 
     #[cfg(test)]
-    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
+    pub(crate) fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
@@ -10458,7 +10458,7 @@ impl BashTool {
     }
 
     #[cfg(test)]
-    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
+    pub(crate) fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             shell_path: None,
@@ -14619,7 +14619,7 @@ impl GrepTool {
     }
 
     #[cfg(test)]
-    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
+    pub(crate) fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
@@ -17138,7 +17138,7 @@ impl LsTool {
     }
 
     #[cfg(test)]
-    fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
+    pub(crate) fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),

@@ -2795,7 +2795,7 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- Current budget summary (generated 2026-11-13; `source_commit` unbound, no run
+- Current budget summary (generated 2026-11-21; `source_commit` unbound, no run
   id, no correlation id, `strict_mode` false): `19` declared budgets, of which
   `0` PASS, `0` FAIL and `19` NO_DATA. Header and per-budget `budget_results`
   rows now agree, and they agree on this: the tree carries no performance
@@ -3757,7 +3757,7 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 > **STATUS: UNMEASURED.** `claim_readiness.status = "blocked"`,
 > `performance_claims_authorized = false`. The checked-in budget summary was
-> regenerated on 2026-11-13 with `source_commit` unbound (`null`) and contains
+> regenerated on 2026-11-21 with `source_commit` unbound (`null`) and contains
 > no measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
 > `19` NO_DATA.
 > *(from tests/perf/reports/budget_summary.json; no performance claim)*

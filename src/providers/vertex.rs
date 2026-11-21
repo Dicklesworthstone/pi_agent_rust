@@ -191,7 +191,7 @@ impl VertexProvider {
         // Gemini 3+ dialect supports them; never infer support from a response
         // that happens to contain the field or from a URL query parameter.
         let include_function_ids = self.endpoint_url_override.as_deref().is_some_and(|url| {
-            let beta_path = url::Url::parse(url).ok().is_some_and(|url| {
+            let beta_path = url::Url::parse(url).is_ok_and(|url| {
                 url.path_segments()
                     .is_some_and(|mut path| path.next() == Some("v1beta1"))
             });

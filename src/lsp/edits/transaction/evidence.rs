@@ -69,7 +69,7 @@ fn prepare_checked(
 /// Staging creates no directories, backups or temporary files. Commit consumes
 /// this value and checks the exact original bytes, permissions and absence;
 /// it never stages a replacement plan against newly read contents.
-pub(crate) struct PreparedEdit(Transaction, Annotations);
+pub struct PreparedEdit(Transaction, Annotations);
 
 impl PreparedEdit {
     /// Build a reviewed local rewrite without translating complete files into

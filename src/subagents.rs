@@ -2598,7 +2598,7 @@ mod tests {
         let boolean_array = json!({"type":"array", "items":{"type":"boolean"}});
         for schema in [
             json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}}),
-            json!({"anyOf":[integer_array.clone(), boolean_array.clone()]}),
+            json!({"anyOf":[integer_array, boolean_array]}),
             json!({"oneOf":[integer_array, boolean_array]}),
         ] {
             // All inputs are admitted and bounded, but exhaustive diagnostics
@@ -2668,9 +2668,7 @@ mod tests {
             (0..33).fold(json!(true), |value, _| json!({"annotation":value})),
             json!([]),
         ] {
-            let error = compile_output_schema(&schema)
-                .err()
-                .expect("schema must be refused");
+            let error = compile_output_schema(&schema).expect_err("schema must be refused");
             assert!(error.contains("PI_SUBAGENT_SCHEMA_LIMIT"), "{error}");
         }
         let local = json!({"$defs":{"answer":{"type":"integer"}}, "$ref":"#/$defs/answer"});
