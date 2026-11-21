@@ -4098,10 +4098,16 @@ struct ExtensionBudgetFallbackState {
     in_fallback: bool,
     healthy_success_streak: u32,
     last_trigger_reason: Option<String>,
-    /// Regime-shift detector state (CUSUM + BOCPD).
+    /// Regime-shift detector state for overload inter-arrival intervals.
     regime_shift: RegimeShiftDetectorState,
-    /// Conformal + PAC-Bayes safety envelope state.
+    /// Conformal + PAC-Bayes safety envelope for overload signals.
     safety_envelope: SafetyEnvelopeState,
+    /// Measured execution durations must not share a baseline with the time
+    /// between overloads: the two observations describe different quantities.
+    service_regime_shift: RegimeShiftDetectorState,
+    service_safety_envelope: SafetyEnvelopeState,
+    /// Service warmup remains independent of whether its envelope is enabled.
+    service_observations: u64,
     /// Online convex optimization tuner state.
     oco_tuner: Option<OcoTunerState>,
 }

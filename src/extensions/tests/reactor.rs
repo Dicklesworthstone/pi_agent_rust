@@ -3238,12 +3238,20 @@ fn service_latency_spike_triggers_aci_and_cusum_fallback_before_quota_exhaustion
         recovery_successes_to_exit: 3,
         ..Default::default()
     };
-    cfg.safety_envelope.min_observations = 10;
+    // With the unchanged 0.15 error threshold, 10 successful observations
+    // still have a PAC-Bayes upper bound of about 0.384. Forty lower it to
+    // about 0.129, so this baseline certifies health before testing latency.
+    cfg.safety_envelope.min_observations = 40;
     manager.set_budget_controller_config(cfg);
 
-    // Calibrate baseline with 15 normal sub-millisecond hostcalls: must stay on fast lane.
-    for _ in 0..15 {
+    for sample in 0..40 {
         manager.record_budget_call_outcome(Some("ext.service.latency"), true, 1.0);
+        assert!(
+            manager
+                .hostcall_compat_kill_switch_reason(Some("ext.service.latency"))
+                .is_none(),
+            "healthy baseline sample {sample} must stay on the fast lane"
+        );
     }
     assert!(
         !manager
@@ -3264,17 +3272,366 @@ fn service_latency_spike_triggers_aci_and_cusum_fallback_before_quota_exhaustion
         "sustained hostcall service-latency spike must trigger fallback before quota exhaustion"
     );
     let regime = manager
-        .regime_shift_snapshot("ext.service.latency")
+        .service_regime_shift_snapshot("ext.service.latency")
         .expect("regime shift snapshot");
     assert!(
         regime.triggered && regime.trigger_count >= 1,
         "CUSUM/BOCPD must observe service-latency shift: {regime:?}"
     );
     let env = manager
-        .safety_envelope_snapshot("ext.service.latency")
+        .service_safety_envelope_snapshot("ext.service.latency")
         .expect("safety envelope snapshot");
     assert!(
-        env.conformal_calibration_size >= 15 && env.conformal_interval_width > 0.0,
+        env.conformal_calibration_size >= 40 && env.conformal_interval_width > 0.0,
         "ACI safety envelope must track real service-latency observations: {env:?}"
     );
+}
+
+#[test]
+fn service_regime_shift_works_with_safety_envelope_disabled() {
+    for regime_enabled in [true, false] {
+        let manager = ExtensionManager::new();
+        manager.set_budget_controller_config(ExtensionBudgetControllerConfig {
+            overload_signals_to_fallback: 100,
+            recovery_successes_to_exit: 3,
+            regime_shift: RegimeShiftConfig {
+                enabled: regime_enabled,
+                ..Default::default()
+            },
+            safety_envelope: SafetyEnvelopeConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            oco_tuner: OcoTunerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        for _ in 0..20 {
+            manager.record_budget_call_outcome(Some("ext.service.regime"), true, 1.0);
+            assert!(
+                manager
+                    .hostcall_compat_kill_switch_reason(Some("ext.service.regime"))
+                    .is_none(),
+                "a stable baseline must not trigger either configuration"
+            );
+        }
+        for _ in 0..6 {
+            manager.record_budget_call_outcome(Some("ext.service.regime"), true, 250.0);
+        }
+        assert_eq!(
+            manager
+                .hostcall_compat_kill_switch_reason(Some("ext.service.regime"))
+                .is_some(),
+            regime_enabled,
+            "the regime detector must work independently of the disabled envelope"
+        );
+        let regime = manager
+            .service_regime_shift_snapshot("ext.service.regime")
+            .expect("service regime snapshot");
+        assert_eq!(regime.triggered, regime_enabled);
+        let envelope = manager
+            .service_safety_envelope_snapshot("ext.service.regime")
+            .expect("service envelope snapshot");
+        assert_eq!(envelope.pac_bayes_total, 0);
+        assert_eq!(envelope.conformal_calibration_size, 0);
+    }
+}
+
+#[test]
+fn budget_controller_keeps_overload_and_service_evidence_independent() {
+    let manager = ExtensionManager::new();
+    manager.set_budget_controller_config(ExtensionBudgetControllerConfig {
+        overload_signals_to_fallback: 100,
+        safety_envelope: SafetyEnvelopeConfig {
+            min_observations: 40,
+            ..Default::default()
+        },
+        oco_tuner: OcoTunerConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..40 {
+        manager.record_budget_call_outcome(Some("ext.channels"), true, 100.0);
+    }
+    let service_regime = manager
+        .service_regime_shift_snapshot("ext.channels")
+        .expect("service regime");
+    let service_envelope = manager
+        .service_safety_envelope_snapshot("ext.channels")
+        .expect("service envelope");
+    assert!(
+        manager
+            .hostcall_compat_kill_switch_reason(Some("ext.channels"))
+            .is_none()
+    );
+
+    // The first overload has no previous interval. Sharing the service
+    // baseline would compare its initial 0 ms with 100 ms and falsely alarm.
+    manager.record_budget_overload_signal(Some("ext.channels"), "quota_exceeded", None, None);
+    assert!(
+        manager
+            .hostcall_compat_kill_switch_reason(Some("ext.channels"))
+            .is_none(),
+        "one overload must not borrow the service detector's calibrated baseline"
+    );
+    assert_eq!(
+        manager.service_regime_shift_snapshot("ext.channels"),
+        Some(service_regime)
+    );
+    assert_eq!(
+        manager.service_safety_envelope_snapshot("ext.channels"),
+        Some(service_envelope)
+    );
+    let overload_regime = manager
+        .regime_shift_snapshot("ext.channels")
+        .expect("overload regime");
+    let overload_envelope = manager
+        .safety_envelope_snapshot("ext.channels")
+        .expect("overload envelope");
+    assert!(!overload_regime.cusum_baseline_ready);
+    assert_eq!(overload_envelope.pac_bayes_total, 1);
+
+    manager.record_budget_call_outcome(Some("ext.channels"), true, 100.0);
+    assert_eq!(
+        manager.regime_shift_snapshot("ext.channels"),
+        Some(overload_regime)
+    );
+    assert_eq!(
+        manager.safety_envelope_snapshot("ext.channels"),
+        Some(overload_envelope),
+        "successful calls must not dilute overload outcomes or change their intervals"
+    );
+    assert_eq!(
+        manager
+            .service_safety_envelope_snapshot("ext.channels")
+            .expect("service envelope after call")
+            .pac_bayes_total,
+        41
+    );
+}
+
+#[test]
+fn service_latency_recovery_requires_healthy_consecutive_calls() {
+    let manager = ExtensionManager::new();
+    manager.set_budget_controller_config(ExtensionBudgetControllerConfig {
+        overload_signals_to_fallback: 100,
+        recovery_successes_to_exit: 3,
+        safety_envelope: SafetyEnvelopeConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        oco_tuner: OcoTunerConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    for _ in 0..20 {
+        manager.record_budget_call_outcome(Some("ext.service.recover"), true, 1.0);
+    }
+    for _ in 0..10 {
+        manager.record_budget_call_outcome(Some("ext.service.recover"), true, 250.0);
+        let (in_fallback, streak, _, _) = manager
+            .budget_fallback_state_snapshot("ext.service.recover")
+            .expect("fallback state");
+        assert!(in_fallback, "slow success must not recover the fast lane");
+        assert_eq!(streak, 0);
+    }
+
+    // BOCPD may identify the return to the healthy regime as a change point.
+    // Allow that observation, then require the full consecutive healthy streak.
+    for _ in 0..10 {
+        manager.record_budget_call_outcome(Some("ext.service.recover"), true, 1.0);
+        if manager
+            .budget_fallback_state_snapshot("ext.service.recover")
+            .is_some_and(|(_, streak, _, _)| streak == 1)
+        {
+            break;
+        }
+    }
+    assert!(
+        manager
+            .budget_fallback_state_snapshot("ext.service.recover")
+            .is_some_and(|(in_fallback, streak, _, _)| in_fallback && streak == 1),
+        "healthy service must begin recovery after the regime settles"
+    );
+    manager.record_budget_call_outcome(Some("ext.service.recover"), true, 1.0);
+    manager.record_budget_call_outcome(Some("ext.service.recover"), false, 1.0);
+    assert!(
+        manager
+            .budget_fallback_state_snapshot("ext.service.recover")
+            .is_some_and(|(in_fallback, streak, _, _)| in_fallback && streak == 0),
+        "a failure must discard the partial recovery streak"
+    );
+    for _ in 0..2 {
+        manager.record_budget_call_outcome(Some("ext.service.recover"), true, 1.0);
+        assert!(
+            manager
+                .hostcall_compat_kill_switch_reason(Some("ext.service.recover"))
+                .is_some()
+        );
+    }
+    manager.record_budget_call_outcome(Some("ext.service.recover"), true, 1.0);
+    assert!(
+        manager
+            .hostcall_compat_kill_switch_reason(Some("ext.service.recover"))
+            .is_none()
+    );
+    let recovered = manager
+        .service_regime_shift_snapshot("ext.service.recover")
+        .expect("recovered service regime");
+    assert!(!recovered.triggered);
+    assert!(recovered.cusum_baseline_ready);
+}
+
+#[test]
+fn service_safety_recovery_retains_calibration_and_honors_active_veto() {
+    let manager = ExtensionManager::new();
+    manager.set_budget_controller_config(ExtensionBudgetControllerConfig {
+        overload_signals_to_fallback: 100,
+        recovery_successes_to_exit: 3,
+        regime_shift: RegimeShiftConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        oco_tuner: OcoTunerConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    // The default PAC-Bayes policy is intentionally conservative until there
+    // is enough evidence: 20 successes still have an upper error bound > .15.
+    for _ in 0..20 {
+        manager.record_budget_call_outcome(Some("ext.service.safety"), true, 1.0);
+    }
+    assert!(manager.any_safety_envelope_vetoing());
+    for _ in 0..3 {
+        manager.record_budget_call_outcome(Some("ext.service.safety"), true, 1.0);
+    }
+    assert!(
+        manager
+            .hostcall_compat_kill_switch_reason(Some("ext.service.safety"))
+            .is_some(),
+        "successful outcomes cannot clear fallback while the bound still vetoes"
+    );
+    assert!(
+        manager
+            .service_safety_envelope_snapshot("ext.service.safety")
+            .expect("service safety envelope")
+            .vetoing
+    );
+
+    for _ in 0..50 {
+        manager.record_budget_call_outcome(Some("ext.service.safety"), true, 1.0);
+        if manager
+            .hostcall_compat_kill_switch_reason(Some("ext.service.safety"))
+            .is_none()
+        {
+            break;
+        }
+    }
+    assert!(
+        manager
+            .hostcall_compat_kill_switch_reason(Some("ext.service.safety"))
+            .is_none(),
+        "enough healthy evidence must eventually permit recovery"
+    );
+    let recovered = manager
+        .service_safety_envelope_snapshot("ext.service.safety")
+        .expect("recovered service evidence");
+    assert!(!recovered.vetoing);
+    assert!(recovered.pac_bayes_total >= 35);
+    assert!(recovered.pac_bayes_bound <= 0.15);
+    assert!(recovered.conformal_calibration_size >= 35);
+    assert!(!manager.any_safety_envelope_vetoing());
+
+    for _ in 0..100 {
+        manager.record_budget_call_outcome(Some("ext.service.safety"), true, 1.0);
+        assert!(
+            manager
+                .hostcall_compat_kill_switch_reason(Some("ext.service.safety"))
+                .is_none(),
+            "recovery must not discard evidence and repeat the cold-start cycle"
+        );
+    }
+    assert_eq!(
+        manager
+            .service_safety_envelope_snapshot("ext.service.safety")
+            .expect("retained service evidence")
+            .pac_bayes_total,
+        recovered.pac_bayes_total + 100
+    );
+}
+
+#[test]
+fn disabling_budget_safety_clears_both_signal_channel_vetoes() {
+    for disable_controller in [false, true] {
+        let manager = ExtensionManager::new();
+        let mut config = ExtensionBudgetControllerConfig {
+            overload_signals_to_fallback: 1_000,
+            regime_shift: RegimeShiftConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            oco_tuner: OcoTunerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        manager.set_budget_controller_config(config.clone());
+        for _ in 0..20 {
+            manager.record_budget_call_outcome(Some("ext.disable.channels"), false, 1.0);
+        }
+        assert!(
+            manager.any_safety_envelope_vetoing(),
+            "a service-only veto must inhibit aggressive optimization"
+        );
+        for _ in 0..20 {
+            manager.record_budget_overload_signal(
+                Some("ext.disable.channels"),
+                "quota_exceeded",
+                None,
+                None,
+            );
+        }
+        let service_before = manager
+            .service_safety_envelope_snapshot("ext.disable.channels")
+            .expect("service veto");
+        let overload_before = manager
+            .safety_envelope_snapshot("ext.disable.channels")
+            .expect("overload veto");
+        assert!(service_before.vetoing && overload_before.vetoing);
+        assert_eq!(service_before.pac_bayes_total, 20);
+        assert_eq!(overload_before.pac_bayes_total, 20);
+
+        if disable_controller {
+            config.enabled = false;
+        } else {
+            config.safety_envelope.enabled = false;
+        }
+        manager.set_budget_controller_config(config);
+        assert!(!manager.any_safety_envelope_vetoing());
+        let service_after = manager
+            .service_safety_envelope_snapshot("ext.disable.channels")
+            .expect("cleared service veto");
+        let overload_after = manager
+            .safety_envelope_snapshot("ext.disable.channels")
+            .expect("cleared overload veto");
+        for (before, after) in [
+            (service_before, service_after),
+            (overload_before, overload_after),
+        ] {
+            assert!(!after.vetoing);
+            assert!(after.veto_reason.is_none());
+            assert_eq!(after.veto_count, before.veto_count);
+            assert_eq!(after.pac_bayes_total, before.pac_bayes_total);
+        }
+    }
 }
