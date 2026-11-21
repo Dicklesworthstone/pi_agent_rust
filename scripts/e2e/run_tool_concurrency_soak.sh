@@ -355,7 +355,8 @@ samples: list[dict] = []
 warnings_and_errors: list[str] = []
 warnings_lock = threading.Lock()
 completed_waves = 0
-aborted_early = False
+stopped_by_max_secs = False
+failed_early = False
 proc_rc: int | None = None
 started_monotonic = time.monotonic()
 
@@ -482,7 +483,7 @@ try:
         with series_path.open("w", encoding="utf-8") as series_fh:
             for wave in range(waves):
                 if max_secs > 0 and (time.monotonic() - started_monotonic) >= max_secs:
-                    aborted_early = True
+                    stopped_by_max_secs = True
                     break
                 t0 = time.monotonic()
                 req = {"id": f"wave-{wave}", "type": "prompt", "message": f"Execute concurrency wave {wave}"}
@@ -541,7 +542,7 @@ try:
                 if got_response and got_end and idle_ok:
                     completed_waves += 1
                 else:
-                    aborted_early = True
+                    failed_early = True
                     break
                 sample = {
                     "schema": "pi.soak.concurrency_sample.v1",
@@ -573,19 +574,23 @@ finally:
     server.shutdown()
     server.server_close()
 
+aborted_early = stopped_by_max_secs or failed_early
 balanced = bool(samples) and all(s["tool_starts"] == s["tool_ends"] == s["expected_tool_calls"] for s in samples)
 all_barriers_ok = bool(samples) and all(s["barrier_integrity_ok"] for s in samples)
 waves_ok = (
-    completed_waves > 0 and completed_waves <= waves
-    if (aborted_early and max_secs > 0)
-    else completed_waves == waves
+    not failed_early
+    and (
+        (completed_waves > 0 and completed_waves <= waves)
+        if stopped_by_max_secs
+        else completed_waves == waves
+    )
 )
 verdicts = [
     {
         "metric": "completed_waves",
         "status": "pass" if waves_ok else "fail",
-        "threshold": f"completed_waves == {waves}" if not (aborted_early and max_secs > 0) else "completed_waves > 0 under --max-secs",
-        "detail": f"completed={completed_waves}/{waves}, aborted_early={aborted_early}",
+        "threshold": f"completed_waves == {waves}" if not stopped_by_max_secs else "completed_waves > 0 under --max-secs without wave failure",
+        "detail": f"completed={completed_waves}/{waves}, stopped_by_max_secs={stopped_by_max_secs}, failed_early={failed_early}",
     },
     {
         "metric": "tool_balance",
@@ -617,6 +622,8 @@ summary = {
     "completed_waves": completed_waves,
     "requested_waves": waves,
     "aborted_early": aborted_early,
+    "stopped_by_max_secs": stopped_by_max_secs,
+    "failed_early": failed_early,
     "parallel_reads_per_wave": parallel_reads,
     "warnings_and_errors": warnings_and_errors,
     "verdicts": verdicts,

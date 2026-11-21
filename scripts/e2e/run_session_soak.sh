@@ -367,7 +367,8 @@ warnings_and_errors: list[str] = []
 warnings_lock = threading.Lock()
 leaked_handles: list = []
 injected_unbounded_entries = 0
-aborted_early = False
+stopped_by_max_secs = False
+failed_early = False
 completed_turns = 0
 proc_rc: int | None = None
 started_monotonic = time.monotonic()
@@ -516,14 +517,14 @@ try:
         with series_path.open("w", encoding="utf-8") as series_fh:
             for turn in range(turns):
                 if max_secs > 0 and (time.monotonic() - started_monotonic) >= max_secs:
-                    aborted_early = True
+                    stopped_by_max_secs = True
                     break
                 ok, latency_ms = rpc_call(
                     {"id": f"turn-{turn}", "type": "prompt", "message": f"Soak binary turn {turn}"},
                     wait_event_type="agent_end",
                 )
                 if not ok or not wait_rpc_idle(turn):
-                    aborted_early = True
+                    failed_early = True
                     break
                 completed_turns += 1
 
@@ -591,6 +592,9 @@ rss_growth = (rss_vals[-1] - rss_vals[0]) if len(rss_vals) >= 2 else 0.0
 final_entries = int(entries_vals[-1]) if entries_vals else 0
 entries_per_turn = final_entries / max(1, completed_turns)
 
+aborted_early = stopped_by_max_secs or failed_early
+turns_ok = completed_turns > 0 and not failed_early and (completed_turns == turns or stopped_by_max_secs)
+
 verdicts = [
     {
         "metric": "open_fds",
@@ -618,9 +622,9 @@ verdicts = [
     },
     {
         "metric": "completed_turns",
-        "status": "pass" if completed_turns > 0 and (not aborted_early or max_secs > 0) else "fail",
-        "threshold": "completed_turns > 0 without unexpected abort",
-        "detail": f"completed={completed_turns}/{turns}, aborted_early={aborted_early}",
+        "status": "pass" if turns_ok else "fail",
+        "threshold": "completed_turns == requested (or > 0 on --max-secs) without turn failure",
+        "detail": f"completed={completed_turns}/{turns}, stopped_by_max_secs={stopped_by_max_secs}, failed_early={failed_early}",
     },
     {
         "metric": "process_exit",
@@ -644,6 +648,8 @@ summary = {
     "completed_turns": completed_turns,
     "requested_turns": turns,
     "aborted_early": aborted_early,
+    "stopped_by_max_secs": stopped_by_max_secs,
+    "failed_early": failed_early,
     "mutation_fault": mutation_fault,
     "provisional_thresholds": True,
     "warnings_and_errors": warnings_and_errors,

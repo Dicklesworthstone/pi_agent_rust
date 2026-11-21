@@ -2015,6 +2015,7 @@ fn evaluate_soak_series(
         .map(|s| s.hostcall_queue_depth)
         .max()
         .unwrap_or(0);
+    let latency_drift = lat_sum.last / lat_sum.median.max(1.0);
 
     let verdicts = vec![
         MetricVerdict {
@@ -2087,12 +2088,7 @@ fn evaluate_soak_series(
         },
         MetricVerdict {
             metric: "turn_latency_ms".to_string(),
-            status: if (if lat_sum.median > 0.0 {
-                lat_sum.last / lat_sum.median
-            } else {
-                1.0
-            }) <= budgets.max_latency_drift_ratio
-            {
+            status: if latency_drift <= budgets.max_latency_drift_ratio {
                 "info".to_string()
             } else {
                 "warn".to_string()
@@ -2105,12 +2101,7 @@ fn evaluate_soak_series(
                 budgets.max_latency_drift_ratio
             ),
             detail: format!(
-                "drift={:.2}x, slope={:.2}ms/sample",
-                if lat_sum.median > 0.0 {
-                    lat_sum.last / lat_sum.median
-                } else {
-                    1.0
-                },
+                "drift={latency_drift:.2}x, slope={:.2}ms/sample",
                 lat_sum.slope_per_sample
             ),
         },
@@ -3141,6 +3132,33 @@ fn soak_detector_catches_deliberately_unbounded_vector() {
             .iter()
             .any(|v| v.metric == "session_entries" && v.status == "fail"),
         "failing verdicts must explicitly name session_entries: {err_verdicts:?}"
+    );
+    assert!(
+        err_verdicts
+            .iter()
+            .any(|v| v.metric == "turn_latency_ms" && v.status == "info"),
+        "flat latency series must report observational info status: {err_verdicts:?}"
+    );
+
+    // 4. Observational turn_latency_ms drift warns above max_latency_drift_ratio
+    // without failing a clean resource series. Use 3 samples [5, 5, 200] so the
+    // median stays at 5ms (drift = 40x > 5x).
+    let first_sample = synthetic.first().expect("first synthetic sample");
+    let second_sample = synthetic.get(1).expect("second synthetic sample");
+    let mut baseline_sample = first_sample.clone();
+    baseline_sample.turn_index = 2;
+    baseline_sample.session_entries = 8;
+    let mut spike_sample = second_sample.clone();
+    spike_sample.session_entries = 12;
+    spike_sample.turn_latency_ms = 200;
+    let drift_only = vec![first_sample.clone(), baseline_sample, spike_sample];
+    let ok_verdicts = evaluate_soak_series(&drift_only, 6, &ProvisionalGrowthBudgets::default())
+        .expect("observational latency drift alone must warn rather than fail");
+    assert!(
+        ok_verdicts
+            .iter()
+            .any(|v| v.metric == "turn_latency_ms" && v.status == "warn"),
+        "steep latency drift must report observational warn status: {ok_verdicts:?}"
     );
 }
 
