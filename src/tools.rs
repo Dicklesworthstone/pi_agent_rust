@@ -10187,7 +10187,9 @@ impl BashTool {
             input.timeout,
             self.artifact_root.as_deref(),
             shell_state,
-        ) {
+        )
+        .await
+        {
             Ok(job) => job,
             // This named refusal precedes OS spawn, so falling back cannot
             // execute the command twice. Other failures are never replayed.
@@ -10819,7 +10821,7 @@ impl Tool for BashTool {
                 .map(|output| Self::annotate_bash_mediation(output, mediation_warning.as_ref()));
         }
         if input.background == Some(true) {
-            let job = match crate::jobs::spawn_background(
+            let job = match crate::jobs::spawn_background_async(
                 background_session_id.as_deref().ok_or_else(|| {
                     Error::tool("bash", "background job session scope was not resolved")
                 })?,
@@ -10829,7 +10831,9 @@ impl Tool for BashTool {
                 &input.command,
                 input.timeout,
                 self.artifact_root.as_deref(),
-            ) {
+            )
+            .await
+            {
                 Ok(job) => job,
                 Err(error) => {
                     return Ok(Self::annotate_bash_mediation(

@@ -1649,7 +1649,7 @@ pub fn spawn_background(
     artifact_root: Option<&Path>,
 ) -> Result<JobSnapshot> {
     spawn_managed(
-        owner_session_id,
+        ShellJobAdmission::new(owner_session_id)?,
         cwd,
         shell_path,
         command_prefix,
@@ -1660,6 +1660,37 @@ pub fn spawn_background(
         None,
     )
     .map(|(snapshot, _)| snapshot)
+}
+
+/// Start an explicit background job without blocking an async executor during
+/// filesystem setup or another launch's lifecycle fence. The job remains
+/// owned by this future until its descriptor is handed back to the caller.
+///
+/// # Errors
+/// The same admission errors as [`spawn_background`], plus
+/// `PI_JOBS_CANCELLED` if the launching future's owner is cancelled.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_background_async(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+) -> Result<JobSnapshot> {
+    let (job, attempt) = spawn_managed_async(
+        owner_session_id,
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        artifact_root,
+        None,
+    )
+    .await?;
+    job.publish_background(attempt.generation())
 }
 
 /// Own a command while the bash tool waits in the foreground. A dropped tool
@@ -1755,6 +1786,72 @@ impl ForegroundJob {
         snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
         Ok(ForegroundPromotion::Background(snapshot))
     }
+
+    /// Explicit background admission retains even a command that completed
+    /// before its launching future resumed. Publication and terminal delivery
+    /// share the registry lock, so exactly one completion notice is emitted.
+    #[allow(clippy::significant_drop_tightening)]
+    fn publish_background(mut self, generation: u64) -> Result<JobSnapshot> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        ensure_process_accepting_jobs(&reg)?;
+        if reg.closing_owners.contains_key(&self.handle.owner_session_id)
+            || reg
+                .owner_shutdown_generations
+                .get(&self.handle.owner_session_id)
+                .copied()
+                .unwrap_or_default()
+                != generation
+        {
+            return Err(session_closing_error(&self.handle.owner_session_id));
+        }
+        let job = reg
+            .jobs
+            .get_mut(&self.handle.id)
+            .filter(|job| {
+                job.owner_session_id == self.handle.owner_session_id
+                    && job.delivery == JobDelivery::Foreground
+            })
+            .ok_or_else(|| unknown_job_error(&self.handle.id))?;
+        let completed = job.status.settled();
+        let completed_snapshot = if completed {
+            Some(
+                settled_snapshot(&self.handle)
+                    .ok_or_else(|| Error::tool("jobs", "background settlement snapshot missing"))?,
+            )
+        } else {
+            None
+        };
+        job.delivery = JobDelivery::Background;
+        {
+            let mut tail = job
+                .tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tail.cap = OUTPUT_TAIL_BYTES;
+            let overflow = tail.buf.len().saturating_sub(OUTPUT_TAIL_BYTES);
+            tail.buf.drain(..overflow);
+            tail.buf.shrink_to(OUTPUT_TAIL_BYTES);
+        }
+        let mut snapshot = completed_snapshot.unwrap_or_else(|| {
+            JobSnapshot::from_source_best_effort(&JobSnapshotSource::from_entry(job))
+        });
+        snapshot.limit_output_tail(OUTPUT_TAIL_BYTES);
+        if completed {
+            *job.settled_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot.clone());
+            enqueue_completion_notice(
+                &mut reg,
+                &self.handle.owner_session_id,
+                &job_completion_notice(&snapshot),
+            );
+        }
+        self.armed = false;
+        prune_settled_jobs(&mut reg);
+        Ok(snapshot)
+    }
 }
 
 impl Drop for ForegroundJob {
@@ -1784,7 +1881,7 @@ impl Drop for ForegroundJob {
 // The optional state transaction travels with the same execution description
 // used by explicit jobs, without changing their public spawn contract.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_foreground(
+pub(crate) async fn spawn_foreground(
     owner_session_id: &str,
     cwd: &Path,
     shell_path: Option<&str>,
@@ -1794,7 +1891,7 @@ pub(crate) fn spawn_foreground(
     artifact_root: Option<&Path>,
     shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
 ) -> Result<ForegroundJob> {
-    let (_, handle) = spawn_managed(
+    spawn_managed_async(
         owner_session_id,
         cwd,
         shell_path,
@@ -1804,18 +1901,134 @@ pub(crate) fn spawn_foreground(
         // command's deadline to the explicit-background default.
         Some(timeout_secs.unwrap_or(crate::tools::DEFAULT_BASH_TIMEOUT_SECS)),
         artifact_root,
-        JobDelivery::Foreground,
         shell_state,
-    )?;
-    Ok(ForegroundJob {
-        handle,
-        armed: true,
-    })
+    )
+    .await
+    .map(|(job, _)| job)
+}
+
+/// Reserve both the owner generation and capacity before dispatch. Waiting
+/// workers count toward the ordinary eight-job limit, rather than creating an
+/// unbounded thread queue behind a blocked filesystem operation.
+struct ShellJobAdmission {
+    owner: crate::agent_cx::AgentCx,
+    attempt: Arc<SessionSpawnAttempt>,
+    reservation: (String, u64, StartingJobSlot),
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ShellJobAdmission {
+    fn new(owner_session_id: &str) -> Result<Self> {
+        if owner_session_id.trim().is_empty() {
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable",
+            ));
+        }
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        check_shell_job_owner(&owner)?;
+        let attempt = Arc::new(capture_session_spawn_generation(owner_session_id)?);
+        let reservation = reserve_job_slot()?;
+        Ok(Self {
+            owner,
+            attempt,
+            reservation,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+struct CancelShellAdmission(Arc<AtomicBool>);
+
+impl Drop for CancelShellAdmission {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_managed_async(
+    owner_session_id: &str,
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    artifact_root: Option<&Path>,
+    shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
+) -> Result<(ForegroundJob, Arc<SessionSpawnAttempt>)> {
+    let admission = ShellJobAdmission::new(owner_session_id)?;
+    let owner = admission.owner.clone();
+    let attempt = Arc::clone(&admission.attempt);
+    let _cancel_on_drop = CancelShellAdmission(Arc::clone(&admission.cancelled));
+    let cwd = cwd.to_path_buf();
+    let shell_path = shell_path.map(str::to_owned);
+    let command_prefix = command_prefix.map(str::to_owned);
+    let command = command.to_owned();
+    let artifact_root = artifact_root.map(Path::to_path_buf);
+    let shell_state = shell_state.cloned();
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+    // spawn_blocking may execute inline in an owner without a blocking pool.
+    // Admission requires a real worker: neither a filesystem lock nor the
+    // lifecycle lane may pin a current-thread runtime's abort/session loop.
+    std::thread::Builder::new()
+        .name(format!("pi-job-{}-admission", admission.reservation.0))
+        .spawn(move || {
+            let _current = admission.owner.cx().clone().set_current_restricted();
+            let result = spawn_managed(
+                admission,
+                &cwd,
+                shell_path.as_deref(),
+                command_prefix.as_deref(),
+                &command,
+                timeout_secs,
+                artifact_root.as_deref(),
+                JobDelivery::Foreground,
+                shell_state.as_ref(),
+            )
+            .map(|(_, handle)| ForegroundJob {
+                handle,
+                armed: true,
+            });
+            // A dropped receiver destroys the guard, whether cancellation
+            // won before send or while the completed value was queued. Its
+            // monitor then cancels/reaps without publishing an unowned notice.
+            let _ = sender.send_blocking(result);
+        })
+        .map_err(|error| {
+            Error::tool(
+                "jobs",
+                format!("PI_JOBS_ADMISSION_WORKER: failed to start launch worker: {error}"),
+            )
+        })?;
+    let job = receiver.recv(owner.cx()).await.map_err(|error| {
+        if error == asupersync::channel::oneshot::RecvError::Cancelled {
+            shell_job_cancelled_error()
+        } else {
+            Error::tool(
+                "jobs",
+                format!("PI_JOBS_ADMISSION_WORKER: launch worker stopped: {error}"),
+            )
+        }
+    })??;
+    check_shell_job_owner(&owner)?;
+    ensure_session_spawn_generation(owner_session_id, attempt.generation())?;
+    Ok((job, attempt))
 }
 
 fn check_shell_job_owner(owner: &crate::agent_cx::AgentCx) -> Result<()> {
     crate::tools::check_bash_spawn_authority(owner)?;
     owner.checkpoint().map_err(|_| shell_job_cancelled_error())
+}
+
+fn check_shell_job_admission(
+    owner: &crate::agent_cx::AgentCx,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(shell_job_cancelled_error());
+    }
+    check_shell_job_owner(owner)
 }
 
 fn shell_job_cancelled_error() -> Error {
@@ -1829,7 +2042,7 @@ fn shell_job_cancelled_error() -> Error {
     clippy::significant_drop_tightening
 )]
 fn spawn_managed(
-    owner_session_id: &str,
+    admission: ShellJobAdmission,
     cwd: &Path,
     shell_path: Option<&str>,
     command_prefix: Option<&str>,
@@ -1839,30 +2052,38 @@ fn spawn_managed(
     delivery: JobDelivery,
     shell_state: Option<&crate::tools::bash_session::ShellTransaction>,
 ) -> Result<(JobSnapshot, JobWaitHandle)> {
-    if owner_session_id.trim().is_empty() {
-        return Err(Error::tool(
-            "jobs",
-            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable"
-                .to_string(),
-        ));
-    }
-    let owner = crate::agent_cx::AgentCx::for_current_or_request();
+    let ShellJobAdmission {
+        owner,
+        attempt: spawn_attempt,
+        reservation: (id, sequence, slot),
+        cancelled,
+    } = admission;
+    let owner_session_id = spawn_attempt.owner_session_id.as_str();
     // This path uses raw process and artifact I/O, so it cannot rely on the
     // ambient async runtime to enforce the invoking tool's capabilities.
-    check_shell_job_owner(&owner)?;
+    check_shell_job_admission(&owner, &cancelled)?;
     // Fail promptly when teardown is already visible. The check under the
     // lifecycle lock below closes the race with a newly published fence.
-    let spawn_attempt = capture_session_spawn_generation(owner_session_id)?;
     let spawn_generation = spawn_attempt.generation();
     #[cfg(test)]
     invoke_after_initial_owner_check_hook(owner_session_id);
     // Serialize the fallible spawn-to-monitor ownership transfer with the
     // process-wide and owner-scoped shutdown snapshots, so neither can miss
     // a child between OS spawn and registry publication.
-    let _lifecycle = lifecycle_lock()
-        .lock()
-        .map_err(|_| Error::tool("jobs", "jobs lifecycle lock poisoned".to_string()))?;
-    check_shell_job_owner(&owner)?;
+    let _lifecycle = loop {
+        check_shell_job_admission(&owner, &cancelled)?;
+        ensure_session_spawn_generation(owner_session_id, spawn_generation)?;
+        match lifecycle_lock().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(Error::tool("jobs", "jobs lifecycle lock poisoned"));
+            }
+        }
+    };
+    check_shell_job_admission(&owner, &cancelled)?;
     ensure_session_spawn_generation(owner_session_id, spawn_generation)?;
     if !cwd.exists() {
         return Err(Error::tool(
@@ -1924,9 +2145,8 @@ fn spawn_managed(
     std::fs::create_dir_all(&jobs_dir)
         .map_err(|e| Error::tool("bash", format!("Failed to create jobs artifact dir: {e}")))?;
 
-    let (id, sequence, slot) = reserve_job_slot()?;
     let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir, || {
-        check_shell_job_owner(&owner)?;
+        check_shell_job_admission(&owner, &cancelled)?;
         ensure_session_spawn_generation(owner_session_id, spawn_generation)
     })?;
     let retention_policy = ArtifactRetentionPolicy::from_environment()?;
@@ -1977,7 +2197,7 @@ fn spawn_managed(
     invoke_before_os_spawn_hook(owner_session_id);
     ensure_session_spawn_generation(owner_session_id, spawn_generation)
         .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
-    check_shell_job_owner(&owner)
+    check_shell_job_admission(&owner, &cancelled)
         .map_err(|err| Error::tool("jobs", format!("{err}{cleanup_failure_context}")))?;
     let child = owner.process().spawn_checked(&mut cmd).map_err(|e| {
         Error::tool(
@@ -1992,7 +2212,7 @@ fn spawn_managed(
     let mut child = BackgroundChild::new(child);
     // Cancellation concurrent with OS spawn still leaves exactly one guard
     // responsible for stopping and reaping the child before returning.
-    if let Err(error) = check_shell_job_owner(&owner) {
+    if let Err(error) = check_shell_job_admission(&owner, &cancelled) {
         child.kill_and_wait();
         return Err(Error::tool(
             "jobs",
@@ -2073,7 +2293,7 @@ fn spawn_managed(
             .unwrap_or_default();
         let admission_error = if let Err(error) = ensure_process_accepting_jobs(&reg) {
             Some(error)
-        } else if owner.checkpoint().is_err() {
+        } else if cancelled.load(Ordering::Acquire) || owner.checkpoint().is_err() {
             Some(shell_job_cancelled_error())
         } else if reg.closing_owners.contains_key(owner_session_id)
             || current_generation != spawn_generation
@@ -3109,24 +3329,7 @@ fn settle_job(
         return;
     };
     let snapshot = JobSnapshot::from_source_best_effort(&source);
-    let tail_excerpt = last_chars(&snapshot.output_tail, 4096);
-    let notice = emit_notice.then(|| format!(
-        "[background job {} settled: {} (exit {}; outputComplete={}; artifactTruncated={})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
-        snapshot.id,
-        snapshot.status,
-        snapshot
-            .exit_code
-            .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
-        snapshot.output_complete,
-        snapshot.artifact_truncated,
-        snapshot.command.lines().next().unwrap_or(&snapshot.command),
-        snapshot.artifact_path,
-        if tail_excerpt.is_empty() {
-            "(no output)"
-        } else {
-            &tail_excerpt
-        }
-    ));
+    let notice = emit_notice.then(|| job_completion_notice(&snapshot));
 
     let notify = {
         let mut reg = registry()
@@ -3164,6 +3367,27 @@ fn settle_job(
         notify
     };
     notify.notify_waiters();
+}
+
+fn job_completion_notice(snapshot: &JobSnapshot) -> String {
+    let tail_excerpt = last_chars(&snapshot.output_tail, 4096);
+    format!(
+        "[background job {} settled: {} (exit {}; outputComplete={}; artifactTruncated={})]\ncommand: {}\nartifact: {}\noutput tail:\n{}",
+        snapshot.id,
+        snapshot.status,
+        snapshot
+            .exit_code
+            .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+        snapshot.output_complete,
+        snapshot.artifact_truncated,
+        snapshot.command.lines().next().unwrap_or(&snapshot.command),
+        snapshot.artifact_path,
+        if tail_excerpt.is_empty() {
+            "(no output)"
+        } else {
+            &tail_excerpt
+        }
+    )
 }
 
 /// Publish a prepared terminal snapshot while the caller holds the registry
@@ -4428,6 +4652,323 @@ mod tests {
                 path.display()
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_launch_cleanup(owner: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let cleaned = {
+                let reg = registry().lock().expect("launch cleanup registry");
+                !reg.owner_spawns_in_flight.contains_key(owner)
+                    && !reg.jobs.values().any(|job| job.owner_session_id == owner)
+            };
+            if cleaned {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abandoned launch must retire its admission and owned process"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_tool_admission_yields_and_drop_prevents_dispatch() {
+        use crate::tools::Tool;
+        use std::future::Future;
+
+        let _guard = process_test_guard();
+        for background in [None, Some(true)] {
+            let root = tempfile::tempdir().expect("isolated Bash workspace");
+            let artifacts = root.path().join("artifacts");
+            let owner_id = format!("async-bash-{}", uuid::Uuid::new_v4().simple());
+            let actor = crate::agent_cx::AgentCx::for_request();
+            let gate = Arc::new(SpawnHookGate::default());
+            let hook_gate = Arc::clone(&gate);
+            let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+                owner_session_id: Some(owner_id.clone()),
+                after_initial_owner_check: Some(Arc::new(move || hook_gate.enter_and_wait())),
+                ..SpawnBackgroundTestHooks::default()
+            });
+            let mut tool = crate::tools::BashTool::with_artifact_root(root.path(), &artifacts)
+                .with_mediation(Some(crate::config::BashSettings {
+                    persistent: Some(false),
+                    pty: Some("off".to_string()),
+                    ..Default::default()
+                }));
+            tool.bind_job_session_scope(JobSessionScope::fixed(&owner_id));
+            let mut launch = Box::pin(actor.with_current(tool.execute(
+                "async-admission",
+                serde_json::json!({
+                    "command": "printf forbidden > command-started",
+                    "background": background,
+                    "timeout": 0,
+                }),
+                None,
+            )));
+            let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let yielded = launch.as_mut().poll(&mut task).is_pending();
+            gate.wait_until_entered();
+            drop(launch);
+            gate.release();
+            wait_for_launch_cleanup(&owner_id);
+            assert!(yielded, "Bash admission must yield before slow setup completes");
+            gate.assert_not_timed_out();
+            assert!(!root.path().join("command-started").exists());
+            assert!(
+                !artifacts.exists(),
+                "dropped admission must stop before artifact I/O"
+            );
+            assert!(take_completion_notices(&owner_id).is_empty());
+            assert!(
+                !actor.is_cancel_requested(),
+                "dropping one launch must not cancel its caller"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_shell_cancellation_retires_while_artifact_lock_remains_held() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().expect("isolated job workspace");
+        let jobs_dir = root.path().join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("artifact directory");
+        let budget_lock = acquire_artifact_budget_lock(&jobs_dir, || Ok(())).expect("hold budget");
+        let owner_id = format!("async-budget-{}", uuid::Uuid::new_v4().simple());
+        let actor = crate::agent_cx::AgentCx::for_request();
+        let gate = Arc::new(SpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner_id.clone()),
+            after_initial_owner_check: Some(Arc::new(move || hook_gate.enter_and_wait())),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let mut launch = Box::pin(actor.with_current(spawn_background_async(
+            &owner_id,
+            root.path(),
+            Some("/bin/sh"),
+            None,
+            "printf forbidden > command-started",
+            Some(5),
+            Some(root.path()),
+        )));
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(launch.as_mut().poll(&mut task).is_pending());
+        gate.wait_until_entered();
+        gate.release();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(
+                lifecycle_lock().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not enter artifact admission"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        actor.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel blocked launch"),
+        );
+        let error = match launch.as_mut().poll(&mut task) {
+            Poll::Ready(Err(error)) => error,
+            _ => {
+                panic!("owner cancellation must wake admission without releasing the filesystem lock")
+            }
+        };
+        assert!(error.to_string().contains("PI_JOBS_CANCELLED"), "{error}");
+        drop(launch);
+        wait_for_launch_cleanup(&owner_id);
+        gate.assert_not_timed_out();
+        assert!(!root.path().join("command-started").exists());
+        assert!(take_completion_notices(&owner_id).is_empty());
+        drop(budget_lock);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn abandoned_async_shell_handoffs_reap_and_suppress_notices() {
+        use std::future::Future;
+
+        let _guard = process_test_guard();
+        for queued_result in [false, true] {
+            let root = tempfile::tempdir().expect("isolated job workspace");
+            let owner_id = format!("async-handoff-{}", uuid::Uuid::new_v4().simple());
+            let gate = Arc::new(SpawnHookGate::default());
+            let hook_gate = Arc::clone(&gate);
+            let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let hook_pid = Arc::clone(&pid);
+            let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+                owner_session_id: Some(owner_id.clone()),
+                after_registry_publication: Some(Arc::new(move |id| {
+                    hook_pid.store(
+                        registry().lock().expect("published child").jobs[id]
+                            .pid
+                            .expect("live PID"),
+                        Ordering::Release,
+                    );
+                    hook_gate.enter_and_wait();
+                })),
+                ..SpawnBackgroundTestHooks::default()
+            });
+            let wakes = Arc::new(WaitWakeCounter::default());
+            let waker = std::task::Waker::from(Arc::clone(&wakes));
+            let mut task = std::task::Context::from_waker(&waker);
+            let mut launch = Box::pin(spawn_background_async(
+                &owner_id,
+                root.path(),
+                Some("/bin/sh"),
+                None,
+                "sleep 300",
+                Some(300),
+                Some(root.path()),
+            ));
+            assert!(launch.as_mut().poll(&mut task).is_pending());
+            gate.wait_until_entered();
+            if queued_result {
+                gate.release();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while wakes.0.load(Ordering::SeqCst) == 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "worker did not queue its owned result"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // Never poll the ready receiver. Drop must retire its queued
+                // ForegroundJob, not leave an inaccessible background process.
+                drop(launch);
+            } else {
+                drop(launch);
+                gate.release();
+            }
+            wait_for_launch_cleanup(&owner_id);
+            gate.assert_not_timed_out();
+            let pid = pid.load(Ordering::Acquire);
+            assert_ne!(pid, 0, "the race must exercise an actual OS child");
+            let error = std::fs::metadata(format!("/proc/{pid}"))
+                .expect_err("abandoned child must be killed and reaped");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            assert!(take_completion_notices(&owner_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn async_admission_reserves_capacity_before_starting_workers() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let _guard = process_test_guard();
+        let root = tempfile::tempdir().expect("isolated job workspace");
+        let owner_id = format!("async-capacity-{}", uuid::Uuid::new_v4().simple());
+        let gate = Arc::new(CountedSpawnHookGate::default());
+        let hook_gate = Arc::clone(&gate);
+        let _hooks = install_spawn_background_test_hooks(SpawnBackgroundTestHooks {
+            owner_session_id: Some(owner_id.clone()),
+            after_initial_owner_check: Some(Arc::new(move || hook_gate.enter_and_wait())),
+            ..SpawnBackgroundTestHooks::default()
+        });
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut launches = Vec::new();
+        for _ in 0..MAX_CONCURRENT_JOBS {
+            let mut launch = Box::pin(spawn_background_async(
+                &owner_id,
+                root.path(),
+                None,
+                None,
+                "true",
+                Some(5),
+                Some(root.path()),
+            ));
+            assert!(launch.as_mut().poll(&mut task).is_pending());
+            launches.push(launch);
+        }
+        gate.wait_until_entered(MAX_CONCURRENT_JOBS);
+        let mut excess = Box::pin(spawn_background_async(
+            &owner_id,
+            root.path(),
+            None,
+            None,
+            "true",
+            Some(5),
+            Some(root.path()),
+        ));
+        let rejected = matches!(excess.as_mut().poll(&mut task), Poll::Ready(Err(error))
+            if error.to_string().contains("PI_JOBS_AT_CAPACITY"));
+        drop(excess);
+        drop(launches);
+        for _ in 0..MAX_CONCURRENT_JOBS {
+            gate.release_one();
+        }
+        wait_for_launch_cleanup(&owner_id);
+        assert!(rejected, "the ninth admission must not allocate a waiting worker");
+        gate.assert_not_timed_out();
+        assert_eq!(registry().lock().expect("released slots").starting_jobs, 0);
+        assert!(!root.path().join("jobs").exists());
+    }
+
+    #[test]
+    fn explicit_background_handoff_retains_completed_jobs_and_rejects_stale_owners() {
+        let _guard = process_test_guard();
+        for shutdown_first in [false, true] {
+            let root = tempfile::tempdir().expect("isolated job workspace");
+            let owner_id = format!("async-completed-{}", uuid::Uuid::new_v4().simple());
+            let (job, admission) = futures::executor::block_on(spawn_managed_async(
+                &owner_id,
+                root.path(),
+                None,
+                None,
+                "printf complete",
+                Some(5),
+                Some(root.path()),
+                None,
+            ))
+            .expect("admit guarded command");
+            let id = job.handle.id.clone();
+            let settled = wait_with_handle(&job.handle, Duration::from_secs(10))
+                .expect("command completed before handoff");
+            assert_eq!(settled.status, "exited");
+            assert!(list(&owner_id).expect("unpublished jobs").is_empty());
+            assert!(take_completion_notices(&owner_id).is_empty());
+            if shutdown_first {
+                SessionShutdownAttempt::begin(&owner_id)
+                    .expect("owner shutdown fence")
+                    .finish_success()
+                    .expect("completed empty shutdown");
+                let error = job
+                    .publish_background(admission.generation())
+                    .expect_err("a completed shutdown must invalidate the pending handoff");
+                assert!(error.to_string().contains("PI_JOBS_SESSION_CLOSING"));
+                assert!(take_completion_notices(&owner_id).is_empty());
+                assert!(
+                    !registry()
+                        .lock()
+                        .expect("discarded job")
+                        .jobs
+                        .contains_key(&id)
+                );
+            } else {
+                let published = job
+                    .publish_background(admission.generation())
+                    .expect("publish explicit background completion");
+                assert_eq!(published.status, "exited");
+                assert_eq!(published.output_tail, "complete");
+                assert_eq!(list(&owner_id).expect("retained completed job").len(), 1);
+                assert_eq!(take_completion_notices(&owner_id).len(), 1);
+                assert!(take_completion_notices(&owner_id).is_empty());
+                registry().lock().expect("test cleanup").jobs.remove(&id);
+            }
         }
     }
 
@@ -7946,7 +8487,7 @@ mod tests {
         let _guard = process_test_guard();
         let root = temp_root();
         let owner = format!("completed-foreground-{}", uuid::Uuid::new_v4().simple());
-        let foreground = spawn_foreground(
+        let foreground = futures::executor::block_on(spawn_foreground(
             &owner,
             &root,
             None,
@@ -7955,7 +8496,7 @@ mod tests {
             Some(10),
             Some(&root),
             None,
-        )
+        ))
         .expect("spawn foreground command");
         let id = foreground.handle.id.clone();
         let settled = wait_with_handle(&foreground.handle, Duration::from_secs(10))
