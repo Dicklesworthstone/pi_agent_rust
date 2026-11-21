@@ -867,6 +867,15 @@ input can include images and audio/video. Aborts, failures, and run-time caps
 preserve unclaimed prepared input for review, including captured attachment
 bytes. Resubmitting an unchanged recovered draft reuses those bytes.
 
+**ACP transport limits.** Input JSON frames are capped at 128 MiB before
+parsing, excluding the final LF. At most two unread frames are queued;
+backpressure preserves their order. An oversized frame, invalid UTF-8, or
+stdin read failure produces a JSON-RPC parse error with a null ID and closes
+input admission. Active prompts follow the normal cancellation, persistence,
+and cleanup path before exit. Ordinary malformed JSON remains recoverable,
+and a bounded final frame without LF is accepted at EOF. Attachment limits
+below still apply independently.
+
 **ACP workspace settings.** Sessions created by `pi --acp` resolve global
 settings and trusted settings from the requested workspace when creating,
 loading from disk, or forking a session. Reattaching to a running session keeps

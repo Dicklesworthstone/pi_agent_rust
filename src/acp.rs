@@ -965,12 +965,106 @@ impl AcpPermissionClient {
     }
 }
 
+// The content decoder applies smaller semantic budgets. Bound the wire frame
+// before JSON parsing as well, including metadata and escaped text, and keep
+// only two unread frames rather than hundreds of attachment-bearing requests.
+const MAX_ACP_INPUT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+const ACP_INPUT_QUEUE_CAPACITY: usize = 2;
+
+enum AcpInput {
+    Stdio(asupersync::channel::mpsc::Receiver<io::Result<String>>),
+    #[cfg(test)]
+    Lines(asupersync::channel::mpsc::Receiver<String>),
+}
+
+impl AcpInput {
+    async fn recv(&mut self, cx: &AgentCx) -> Option<io::Result<String>> {
+        match self {
+            Self::Stdio(receiver) => receiver.recv(cx).await.ok(),
+            #[cfg(test)]
+            Self::Lines(receiver) => receiver.recv(cx).await.ok().map(Ok),
+        }
+    }
+}
+
+fn acp_input_limit_error(max_bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("PI_ACP_INPUT_LIMIT: command exceeds the {max_bytes}-byte frame limit"),
+    )
+}
+
+/// LF terminates a frame; an optional CR remains part of its byte budget.
+/// Reject before copying an oversized suffix, and never resynchronize through
+/// a rejected frame. A bounded final frame without LF remains valid at EOF.
+fn read_acp_input_frame(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if take > max_bytes.saturating_sub(frame.len()) {
+            return Err(acp_input_limit_error(max_bytes));
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
+    }
+    String::from_utf8(frame).map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PI_ACP_INPUT_UTF8: command is not valid UTF-8",
+        )
+    })
+}
+
+fn forward_acp_input(
+    reader: &mut impl BufRead,
+    sender: &asupersync::channel::mpsc::Sender<io::Result<String>>,
+    max_bytes: usize,
+) {
+    loop {
+        let mut frame = match read_acp_input_frame(reader, max_bytes) {
+            Ok(Some(line)) => Ok(line),
+            Ok(None) => return,
+            Err(error) => Err(error),
+        };
+        let failed = frame.is_err();
+        loop {
+            match sender.try_send(frame) {
+                Ok(()) => break,
+                Err(asupersync::channel::mpsc::SendError::Full(unsent)) => {
+                    frame = unsent;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+        if failed {
+            return;
+        }
+    }
+}
+
 /// Run the ACP server over stdio.
 ///
 /// Reads JSON-RPC requests line-by-line from stdin, dispatches them,
 /// and writes JSON-RPC responses/notifications to stdout.
 pub async fn run_stdio(options: AcpOptions) -> Result<()> {
-    let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(256);
+    let (in_tx, in_rx) =
+        asupersync::channel::mpsc::channel::<io::Result<String>>(ACP_INPUT_QUEUE_CAPACITY);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
     let out_tx = AcpOutput::new(out_tx);
 
@@ -978,31 +1072,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let mut reader = io::BufReader::new(stdin.lock());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let trimmed = line.trim().to_string();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    // Retry loop with backpressure.
-                    let mut to_send = trimmed;
-                    loop {
-                        match in_tx.try_send(to_send) {
-                            Ok(()) => break,
-                            Err(asupersync::channel::mpsc::SendError::Full(unsent)) => {
-                                to_send = unsent;
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(_) => return,
-                        }
-                    }
-                }
-            }
-        }
+        forward_acp_input(&mut reader, &in_tx, MAX_ACP_INPUT_FRAME_BYTES);
     });
 
     // Stdout writer thread.
@@ -1020,7 +1090,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
         let _ = writer_done_tx.send(result);
     });
 
-    let result = Box::pin(run(options, in_rx, out_tx)).await;
+    let result = Box::pin(run_with_input(options, AcpInput::Stdio(in_rx), out_tx)).await;
     // Prompt settlement can leave final frames queued. The process must keep
     // running until stdout flushes them, or report that delivery is incomplete.
     // A blocked OS write cannot be joined safely on an async worker.
@@ -1076,10 +1146,19 @@ async fn finish_acp_output(
     result.and(delivered)
 }
 
-/// Core ACP event loop.
+#[cfg(test)]
 async fn run(
     options: AcpOptions,
-    mut in_rx: asupersync::channel::mpsc::Receiver<String>,
+    in_rx: asupersync::channel::mpsc::Receiver<String>,
+    out_tx: AcpOutput,
+) -> Result<()> {
+    Box::pin(run_with_input(options, AcpInput::Lines(in_rx), out_tx)).await
+}
+
+/// Core ACP event loop, including ordered stdin failures and owner cleanup.
+async fn run_with_input(
+    options: AcpOptions,
+    mut input: AcpInput,
     out_tx: AcpOutput,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
@@ -1092,11 +1171,30 @@ async fn run(
     // Capture dispatch errors so every exit path still tears down MCP state.
     let result: Result<()> = {
         let dispatch = async {
-            while let Ok(line) = in_rx.recv(&cx).await {
+            while let Some(frame) = input.recv(&cx).await {
                 // Buffered input can keep this future ready without returning to the
                 // outer failure race. Never dispatch another request after a lost frame.
                 if let Some(reason) = out_tx.failure_reason() {
                     return Err(Error::session(reason));
+                }
+                let line = match frame.and_then(|line| {
+                    if line.strip_suffix('\n').unwrap_or(&line).len() > MAX_ACP_INPUT_FRAME_BYTES {
+                        return Err(acp_input_limit_error(MAX_ACP_INPUT_FRAME_BYTES));
+                    }
+                    Ok(line)
+                }) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        let _ = out_tx.send(json_rpc_error(
+                            Value::Null,
+                            PARSE_ERROR,
+                            format!("Failed to read command: {error}"),
+                        ));
+                        return Err(Error::Io(Box::new(error)));
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
                 let raw_message: Value = match serde_json::from_str(&line) {
                     Ok(value) => value,
@@ -1914,6 +2012,9 @@ async fn run(
         }
     };
 
+    // Release unread frames and wake a backpressured reader before waiting
+    // for prompt persistence, editor requests, and MCP ownership to settle.
+    drop(input);
     let drained = out_tx.finish_prompts().await;
     mcp::shutdown(&sessions).await;
     drained?;
@@ -3805,6 +3906,176 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn acp_input_reader_bounds_bytes_and_preserves_framing() {
+        for (bytes, limit, expected) in [
+            (&b"1234\n"[..], 4, "1234"),
+            (&b"1234"[..], 4, "1234"),
+            (&b"123\r\n"[..], 4, "123\r"),
+            (&b"\n"[..], 0, ""),
+            ("\u{00e9}\n".as_bytes(), 2, "\u{00e9}"),
+        ] {
+            let mut reader = io::BufReader::with_capacity(1, io::Cursor::new(bytes));
+            assert_eq!(
+                read_acp_input_frame(&mut reader, limit).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert!(read_acp_input_frame(&mut reader, limit).unwrap().is_none());
+        }
+        for suffix in ["", "\n", "\r\n", "\n{\"method\":\"exit\"}\n"] {
+            let bytes = format!("{}{suffix}", "x".repeat(1024));
+            let mut reader = io::BufReader::with_capacity(8, io::Cursor::new(bytes.as_bytes()));
+            let error = read_acp_input_frame(&mut reader, 32).expect_err("oversized frame");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("PI_ACP_INPUT_LIMIT"));
+            assert!(reader.get_ref().position() <= 40, "must not read the tail");
+        }
+        let error = read_acp_input_frame(&mut io::Cursor::new(b"\xff\n"), 4)
+            .expect_err("invalid UTF-8");
+        assert!(error.to_string().contains("PI_ACP_INPUT_UTF8"));
+    }
+
+    #[test]
+    fn acp_input_reader_retries_interrupts_but_reports_io_failure() {
+        struct FaultReader {
+            bytes: io::Cursor<Vec<u8>>,
+            fault: Option<io::ErrorKind>,
+        }
+        impl io::Read for FaultReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                io::Read::read(&mut self.bytes, buffer)
+            }
+        }
+        impl BufRead for FaultReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if let Some(kind) = self.fault.take() {
+                    return Err(kind.into());
+                }
+                self.bytes.fill_buf()
+            }
+            fn consume(&mut self, count: usize) {
+                self.bytes.consume(count);
+            }
+        }
+        let mut reader = FaultReader {
+            bytes: io::Cursor::new(b"ok\n".to_vec()),
+            fault: Some(io::ErrorKind::Interrupted),
+        };
+        assert_eq!(
+            read_acp_input_frame(&mut reader, 2).unwrap().as_deref(),
+            Some("ok")
+        );
+        reader.fault = Some(io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            read_acp_input_frame(&mut reader, 2).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn acp_input_forwarder_preserves_failure_order_without_admitting_a_suffix() {
+        let (sender, mut receiver) =
+            asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+        let mut reader = io::Cursor::new(b"ok\n12345\n{\"method\":\"exit\"}\n");
+        forward_acp_input(&mut reader, &sender, 4);
+        assert_eq!(receiver.try_recv().unwrap().unwrap(), "ok");
+        assert!(
+            receiver
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("PI_ACP_INPUT_LIMIT")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn acp_input_failure_reports_parse_error_and_settles_active_owners() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let options = acp_workspace_options(root.path(), handle);
+            let (sender, receiver) =
+                asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+            let bytes = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}}\n{}\n{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\"}}\n",
+                "x".repeat(129)
+            );
+            forward_acp_input(&mut io::Cursor::new(bytes.as_bytes()), &sender, 128);
+            drop(sender);
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            let output = AcpOutput::new(tx);
+            let (abort, signal) = AbortHandle::new();
+            let mut owner = output.begin_prompt("active-owner".into(), abort).unwrap();
+            owner.started = true;
+            let settle = async {
+                signal.wait().await;
+                // The transport must await the owner's durable settlement,
+                // rather than returning as soon as cancellation is requested.
+                owner.settled = true;
+                drop(owner);
+            };
+            let (result, ()) = futures::join!(
+                Box::pin(run_with_input(
+                    options,
+                    AcpInput::Stdio(receiver),
+                    output.clone(),
+                )),
+                settle,
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_ACP_INPUT_LIMIT")
+            );
+            assert!(signal.is_aborted());
+            assert!(output.shared.state.lock().unwrap().prompts.is_empty());
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 2, "rejected tail must never dispatch");
+            assert_eq!(frames[0]["id"], 1);
+            assert_eq!(frames[0]["result"]["protocolVersion"], 1);
+            assert_eq!(frames[1]["id"], Value::Null);
+            assert_eq!(frames[1]["error"]["code"], PARSE_ERROR);
+        });
+    }
+
+    #[test]
+    fn acp_bounded_json_errors_remain_recoverable() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let options = acp_workspace_options(root.path(), handle);
+            let (sender, receiver) =
+                asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+            let bytes = b"{bad json}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}";
+            forward_acp_input(&mut io::Cursor::new(bytes), &sender, 128);
+            drop(sender);
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            Box::pin(run_with_input(
+                options,
+                AcpInput::Stdio(receiver),
+                AcpOutput::new(tx),
+            ))
+            .await
+            .expect("ordinary malformed JSON does not close admission");
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0]["error"]["code"], PARSE_ERROR);
+            assert_eq!(frames[1]["id"], 7);
+            assert_eq!(frames[1]["result"]["protocolVersion"], 1);
+        });
+    }
 
     #[derive(Clone, Copy)]
     enum PromptTestOutcome {
