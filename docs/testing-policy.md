@@ -1016,10 +1016,25 @@ To ensure benchmark integrity and prevent noisy host environments from producing
 
 ### Enforced Contracts & Artifacts
 
+### Host Topology Fingerprint & Variance Gating
 - **Contract**: `docs/contracts/variance-gating-contract.json` (`pi.perf.variance_gating.contract.v1`)
 - **Evaluation Evidence**: `docs/evidence/variance-gate-evaluations.json` (`pi.perf.variance_gate_report.v1`)
 - **Evaluator Tool**: `examples/variance_gate.rs`
 - **Verification Gate**: `tests/variance_gating.rs`
+
+---
+
+## Explicit Duration & Sustained Multi-Tool Concurrency Soak Lanes (GH #213, `bd-brx7l`)
+
+Two long-horizon defect classes — **session duration** (FD/child-process leaks from repeated `bash` use, unbounded entry/index growth, `is_linear` cache drift after repeated branching, compaction anchor durability across reloads) and **sustained multi-tool concurrency** (effect-batcher scheduling of compatible parallel reads interleaved with write/process barriers, mid-batch steering, and `HostcallRequestQueue` 256-fast-ring / 2048-overflow backpressure) — are intentionally split into **explicitly invoked soak lanes** outside Check 6 (`cargo test --all-targets`):
+
+- **Why outside the ordinary DSR quality lane:** Long duration soaks would dominate per-commit runtime, and sustained concurrency latency/load stress tests create cross-binary scheduling noise when run alongside hundreds of parallel integration binaries (`bd-814p6` / `bd-brx7l`).
+- **What stays inside Check 6 (`tests/e2e_soak_stability.rs`):** Fast deterministic unit and mutation-sensitivity tests for the soak sampler/evaluator itself (cadence, deliberately leaked OS file descriptor detection, deliberately unbounded vector detection, well-formed early-abort JSONL output, mutation-fault sensitivity, plus bounded 12-turn duration and 6-wave concurrency smokes).
+- **Explicit soak entrypoints (credential-free, deterministic loopback stub + parameterized Rust lane):**
+  - `scripts/e2e/run_session_soak.sh` (`PI_SOAK_TURNS`, `PI_SOAK_MAX_SECS`, `PI_SOAK_SAMPLE_INTERVAL`, `PI_SOAK_MUTATION_FAULT=none|leak_fd|unbounded_vec`)
+  - `scripts/e2e/run_tool_concurrency_soak.sh` (`PI_CONCURRENCY_WAVES`, `PI_CONCURRENCY_PARALLEL_READS`, `PI_CONCURRENCY_HOSTCALL_BURST`, `PI_SOAK_MAX_SECS`)
+- **Time-series & calibration discipline:** Every run writes machine-readable timestamped JSONL series (`rss_kb`, `open_fds`, `child_procs`, `session_entries`, `session_index_bytes`, `hostcall_queue_depth`, `turn_latency_ms`), per-turn tool-effect batching decisions and fast-ring vs overflow admissions, all binary warnings/errors, and a `first / median / last` summary table. Initial growth thresholds are explicitly marked `"provisional_thresholds": true` until calibrated from observed multi-run series.
+
 
 
 
