@@ -199,7 +199,7 @@ fn sentinel_only_response_does_not_execute_repaired_preview_arguments() {
 }
 
 #[test]
-fn sentinel_only_valid_tool_call_is_strictly_finalized() {
+fn sentinel_only_valid_tool_call_is_withheld_without_a_finish_reason() {
     let mut state = state();
     let arguments = json!({"command": "printf 'complete'"});
     feed(
@@ -208,8 +208,15 @@ fn sentinel_only_valid_tool_call_is_strictly_finalized() {
         None,
     );
     let message = done_message(&mut state);
-    assert_ne!(message.stop_reason, StopReason::Error);
-    assert_eq!(tool_end_count(&state), 1);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(tool_end_count(&state), 0);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("before a finish reason")
+    );
     assert!(matches!(
         &message.content[0],
         ContentBlock::ToolCall(call)
@@ -277,8 +284,12 @@ fn malformed_tool_identities_reject_the_whole_wire_batch() {
             assert_eq!(message.stop_reason, StopReason::Error);
             assert_eq!(tool_end_count(&state), 0);
             let error = message.error_message.as_deref().expect("identity error");
-            assert!(error.contains("index 9"));
-            assert!(error.contains(diagnostic), "{error}");
+            if finish_reason.is_some() {
+                assert!(error.contains("index 9"));
+                assert!(error.contains(diagnostic), "{error}");
+            } else {
+                assert!(error.contains("before a finish reason"), "{error}");
+            }
             assert!(!error.contains("private-call-id"));
             assert!(!error.contains("private-argument"));
             assert_eq!(message.usage.input, 12);

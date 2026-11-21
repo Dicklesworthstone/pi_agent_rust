@@ -624,6 +624,15 @@ where
         }
         self.finalized = true;
 
+        // Complete arguments can still be only a prefix of a token-limited
+        // batch. Keep the provider boundary consistent with Agent admission.
+        if self.partial.stop_reason == StopReason::Length && !self.tool_calls.is_empty() {
+            self.record_error(
+                "Azure OpenAI response was truncated before tool-call completion; local tool calls withheld"
+                    .to_string(),
+            );
+        }
+
         if let Err(error) = self.finalize_tool_call_arguments() {
             self.record_error(error.to_string());
             // Do not persist a synthetically completed argument snapshot as
@@ -672,6 +681,19 @@ where
     fn finish_response(&mut self) {
         if self.done {
             return;
+        }
+        // [DONE] closes the transport; a choice's finish_reason must first
+        // confirm generation ended. Parsed arguments alone cannot do that.
+        if !self.finalized
+            && matches!(
+                self.partial.stop_reason,
+                StopReason::Stop | StopReason::ToolUse | StopReason::Length
+            )
+        {
+            self.record_error(
+                "Azure OpenAI stream ended with [DONE] before a finish reason; local tool calls withheld"
+                    .to_string(),
+            );
         }
         self.ensure_started();
         self.finalize_content();
@@ -769,6 +791,23 @@ where
                 ) {
                     self.record_error(
                         "Azure OpenAI reported a terminal stream failure".to_string(),
+                    );
+                } else if choice.finish_reason.as_deref() == Some("length")
+                    && !self.tool_calls.is_empty()
+                {
+                    // A later failure invalidates an earlier tool_calls
+                    // marker. Block-end events remain previews, not authority.
+                    self.record_error(
+                        "Azure OpenAI response was truncated before tool-call completion; local tool calls withheld"
+                            .to_string(),
+                    );
+                } else if choice
+                    .finish_reason
+                    .as_deref()
+                    .is_some_and(|reason| !matches!(reason, "stop" | "length" | "tool_calls"))
+                {
+                    self.record_error(
+                        "Azure OpenAI returned an unsupported finish reason".to_string(),
                     );
                 }
                 let has_content = choice
@@ -885,13 +924,23 @@ where
                 self.ensure_started();
             }
             if let Some(reason) = choice.finish_reason {
-                if self.partial.stop_reason != StopReason::Error {
-                    self.partial.stop_reason = match reason.as_str() {
-                        "length" => StopReason::Length,
-                        "content_filter" | "error" => StopReason::Error,
-                        "tool_calls" => StopReason::ToolUse,
-                        _ => StopReason::Stop,
-                    };
+                if matches!(reason.as_str(), "content_filter" | "error") {
+                    self.record_error(
+                        "Azure OpenAI reported a terminal stream failure".to_string(),
+                    );
+                } else if matches!(
+                    self.partial.stop_reason,
+                    StopReason::Stop | StopReason::ToolUse | StopReason::Length
+                ) {
+                    match reason.as_str() {
+                        "stop" => self.partial.stop_reason = StopReason::Stop,
+                        "length" => self.partial.stop_reason = StopReason::Length,
+                        "tool_calls" => self.partial.stop_reason = StopReason::ToolUse,
+                        // Do not expose arbitrary provider values in diagnostics.
+                        _ => self.record_error(
+                            "Azure OpenAI returned an unsupported finish reason".to_string(),
+                        ),
+                    }
                 }
                 self.finalize_content();
             }

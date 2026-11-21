@@ -70,12 +70,19 @@ fn malformed_and_non_object_arguments_never_complete_a_tool() {
 }
 
 #[test]
-fn sentinel_without_finish_reason_parses_complete_tool_arguments() {
+fn sentinel_without_finish_reason_withholds_complete_tool_arguments() {
     let mut state = state();
     feed(&mut state, tool_delta(7, r#"{"path":"complete"}"#), None);
     let message = done_message(&mut state);
-    assert_ne!(message.stop_reason, StopReason::Error);
-    assert_eq!(tool_end_count(&state), 1);
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(tool_end_count(&state), 0);
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("before a finish reason")
+    );
     assert!(matches!(
         &message.content[0],
         ContentBlock::ToolCall(call)
@@ -136,8 +143,12 @@ fn malformed_tool_identities_reject_the_whole_wire_batch() {
             assert_eq!(message.stop_reason, StopReason::Error);
             assert_eq!(tool_end_count(&state), 0);
             let error = message.error_message.as_deref().expect("identity error");
-            assert!(error.contains("index 9"));
-            assert!(error.contains(diagnostic), "{error}");
+            if finish_reason.is_some() {
+                assert!(error.contains("index 9"));
+                assert!(error.contains(diagnostic), "{error}");
+            } else {
+                assert!(error.contains("before a finish reason"), "{error}");
+            }
             assert!(!error.contains("call-2"));
             assert!(!error.contains("private-argument"));
             assert_eq!(message.usage.input, 12);
@@ -302,6 +313,103 @@ fn duplicate_finish_frames_and_sentinel_emit_one_tool_end() {
     let queued = state.pending_events.len();
     state.finish_response();
     assert_eq!(state.pending_events.len(), queued);
+}
+
+#[test]
+fn complete_tool_prefixes_require_successful_generation_and_keep_trailing_bills() {
+    for (finishes, diagnostic, preview_ended) in [
+        (vec![], "before a finish reason", false),
+        (vec!["length"], "truncated", false),
+        (vec!["length", "tool_calls"], "truncated", false),
+        (vec!["tool_calls", "length"], "truncated", true),
+        (
+            vec!["private-unknown-finish"],
+            "unsupported finish reason",
+            false,
+        ),
+        (
+            vec!["tool_calls", "private-unknown-finish"],
+            "unsupported finish reason",
+            true,
+        ),
+        (
+            vec!["private-unknown-finish", "stop"],
+            "unsupported finish reason",
+            false,
+        ),
+        (vec!["function_call"], "unsupported finish reason", false),
+    ] {
+        let mut state = state();
+        feed(&mut state, tool_delta(0, r#"{"path":"first"}"#), None);
+        feed(&mut state, tool_delta(1, r#"{"path":"second"}"#), None);
+        for &finish in &finishes {
+            feed(&mut state, json!({}), Some(finish));
+        }
+        state
+            .process_event(
+                r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"cost":0.25}}"#,
+            )
+            .unwrap();
+        let message = done_message(&mut state);
+        assert_eq!(message.stop_reason, StopReason::Error, "{finishes:?}");
+        let error = message.error_message.as_deref().unwrap();
+        assert!(error.contains(diagnostic), "{finishes:?}: {error}");
+        assert!(!error.contains("private-unknown-finish"));
+        assert_eq!(tool_end_count(&state), if preview_ended { 2 } else { 0 });
+        assert_eq!(message.usage.total_tokens, 30);
+        assert_eq!(message.usage.cost.total.to_bits(), 0.25_f64.to_bits());
+        assert!(message.usage.has_explicit_billing());
+        assert_eq!(message.content.len(), 2);
+        assert!(message.content.iter().all(|block| matches!(
+            block, ContentBlock::ToolCall(call) if call.arguments.is_object()
+        )));
+    }
+}
+
+#[test]
+fn text_only_truncation_is_retained_but_a_missing_finish_is_an_error() {
+    for (finish, expected) in [
+        (Some("stop"), StopReason::Stop),
+        (Some("length"), StopReason::Length),
+        (None, StopReason::Error),
+    ] {
+        let mut state = state();
+        feed(&mut state, json!({"content": "Partial answer"}), finish);
+        state
+            .process_event(
+                r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30,"cost":0.25}}"#,
+            )
+            .unwrap();
+        let message = done_message(&mut state);
+        assert_eq!(message.stop_reason, expected);
+        assert_eq!(message.usage.total_tokens, 30);
+        assert_eq!(message.usage.cost.total.to_bits(), 0.25_f64.to_bits());
+        assert_eq!(tool_end_count(&state), 0);
+        assert!(matches!(
+            &message.content[0], ContentBlock::Text(text) if text.text == "Partial answer"
+        ));
+    }
+}
+
+#[test]
+fn sentinel_or_success_finish_cannot_revive_an_existing_failure() {
+    for reason in [StopReason::Aborted, StopReason::Error] {
+        for finish in [None, Some("stop")] {
+            let mut state = state();
+            state.partial.stop_reason = reason;
+            state.partial.error_message = Some("original diagnostic".into());
+            if let Some(finish) = finish {
+                feed(&mut state, json!({}), Some(finish));
+            }
+            let message = done_message(&mut state);
+            assert_eq!(message.stop_reason, reason);
+            assert_eq!(
+                message.error_message.as_deref(),
+                Some("original diagnostic")
+            );
+            assert_eq!(tool_end_count(&state), 0);
+        }
+    }
 }
 
 #[test]
