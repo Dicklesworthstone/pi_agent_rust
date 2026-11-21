@@ -9597,8 +9597,7 @@ async fn finish_first_time_setup(
 ) -> Result<()> {
     let explicit_model = selected_model
         .filter(|entry| {
-            cli.model.is_some()
-                && entry.model.provider.eq_ignore_ascii_case(provider.provider)
+            cli.model.is_some() && entry.model.provider.eq_ignore_ascii_case(provider.provider)
         })
         .map(|entry| entry.model.id.clone());
     let _ = auth.remove_provider_aliases(provider.provider);
@@ -14659,10 +14658,10 @@ mod tests {
                 let auth_path = root.path().join("auth.json");
                 let models_path = root.path().join("models.json");
                 let mut auth = AuthStorage::empty_at(auth_path.clone());
-                let mut registry = ModelRegistry::load_with_credential_resolver(
-                    Some(models_path.clone()),
-                    |_| None,
-                );
+                let mut registry =
+                    ModelRegistry::load_with_credential_resolver(Some(models_path.clone()), |_| {
+                        None
+                    });
                 let mut cli = cli::Cli::parse_from(["pi"]);
                 // Ignore ambient PI_PROVIDER/PI_MODEL in this startup fixture.
                 cli.provider = initial_provider.map(str::to_string);
