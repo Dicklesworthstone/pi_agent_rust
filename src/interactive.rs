@@ -160,9 +160,10 @@ pub use self::state::{AgentState, InputMode, PendingInput};
 pub(crate) use self::state::AutocompleteState;
 use self::state::{
     BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, ExtensionCustomOverlay,
-    GoalCancellation, GoalInvocation, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
-    LoginAttempt, LoginAttemptControl, PendingLoginKind, PendingOAuth, QueuedMessageKind,
-    SessionPickerOverlay, SettingsUiEntry, SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES,
+    ForkDraft, GoalCancellation, GoalInvocation, HistoryList, InjectedMessageQueue,
+    InteractiveMessageQueue, LoginAttempt, LoginAttemptControl, PendingLoginKind, PendingOAuth,
+    QueuedMessageKind, ReturnedForkInput, SessionPickerOverlay, SettingsUiEntry, SettingsUiState,
+    TOOL_COLLAPSE_PREVIEW_LINES,
     ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
@@ -2479,6 +2480,15 @@ pub enum PiMsg {
         owner_session_id: String,
         text: String,
     },
+    /// The selected fork message stays native until an explicit resubmission.
+    RestoreForkInput {
+        owner_session_id: String,
+        branch_anchor: Option<String>,
+        text: String,
+        content: Vec<ContentBlock>,
+    },
+    /// Wake the composer; returned fork payloads live in its lossless inbox.
+    ForkInputReady,
     /// Retain prepared FTUI input for explicit review without re-reading files.
     #[cfg(feature = "ftui")]
     RestorePreparedInput(crate::interactive_ftui::RestoredInput),
@@ -3170,6 +3180,10 @@ pub struct PiApp {
     // Multi-root workspace state (bd-cv653.3.12); installed post-construction.
     workspace: WorkspaceHandle,
     input: TextArea,
+    fork_draft: Option<ForkDraft>,
+    parked_fork_drafts: VecDeque<ForkDraft>,
+    returned_fork_inputs: Arc<StdMutex<VecDeque<ReturnedForkInput>>>,
+    active_fork_submission: Option<uuid::Uuid>,
     history: HistoryList,
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
@@ -3736,6 +3750,10 @@ impl PiApp {
         };
         let mut app = Self {
             input,
+            fork_draft: None,
+            parked_fork_drafts: VecDeque::new(),
+            returned_fork_inputs: Arc::default(),
+            active_fork_submission: None,
             workspace: WorkspaceHandle::default(),
             history: HistoryList::new(),
             input_mode: InputMode::SingleLine,
@@ -4023,6 +4041,7 @@ impl PiApp {
         let was_busy = !matches!(self.agent_state, AgentState::Idle);
         let was_spinner_visible = self.spinner_visible();
         let result = self.update_inner(msg);
+        self.apply_parked_fork_draft();
         let became_busy = !was_busy && !matches!(self.agent_state, AgentState::Idle);
         let spinner_became_visible = !was_spinner_visible && self.spinner_visible();
         let result = if became_busy || spinner_became_visible {

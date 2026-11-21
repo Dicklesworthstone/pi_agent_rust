@@ -521,6 +521,7 @@ impl PiApp {
             };
 
             let selected_text = fork_plan.selected_text.clone();
+            let selected_content = fork_plan.selected_content.clone();
 
             let mut new_session = Session::create_with_dir(session_dir);
             new_session.header.provider = Some(model_provider);
@@ -577,6 +578,7 @@ impl PiApp {
 
             let messages_for_agent = new_session.to_messages_for_current_path();
             let (messages, usage) = conversation_from_session(&new_session);
+            let branch_anchor = new_session.leaf_id().map(str::to_string);
             let service_warning = match Self::try_install_session(
                 &session,
                 &agent,
@@ -627,9 +629,17 @@ impl PiApp {
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::SetEditorText {
-                    owner_session_id: new_session_id.clone(),
-                    text: selected_text,
+                match selected_content {
+                    Some(content) => PiMsg::RestoreForkInput {
+                        owner_session_id: new_session_id.clone(),
+                        branch_anchor,
+                        text: selected_text,
+                        content,
+                    },
+                    None => PiMsg::SetEditorText {
+                        owner_session_id: new_session_id.clone(),
+                        text: selected_text,
+                    },
                 },
             )
             .await;

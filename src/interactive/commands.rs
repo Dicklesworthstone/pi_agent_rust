@@ -1916,6 +1916,7 @@ impl PiApp {
     }
 
     pub(super) fn begin_login_attempt(&mut self, auth_path: &Path) -> Option<String> {
+        self.park_fork_draft();
         self.retire_login();
         let session_id = if let Ok(session) = self.session.try_lock() {
             session.header.id.clone()

@@ -897,7 +897,121 @@ enum SessionEventOwnership {
     Busy,
 }
 
+/// Own the exact edited fork input before the task is spawned. A cancelled
+/// region can drop that task without polling it, so recovery must not depend
+/// on an async error handler or on capacity in the UI event channel.
+struct ForkInputRecovery {
+    request_id: uuid::Uuid,
+    draft: Option<ForkDraft>,
+    handed_off: Arc<AtomicBool>,
+    returned: Arc<StdMutex<VecDeque<ReturnedForkInput>>>,
+    events: mpsc::Sender<PiMsg>,
+}
+
+impl ForkInputRecovery {
+    fn new(
+        draft: ForkDraft,
+        returned: Arc<StdMutex<VecDeque<ReturnedForkInput>>>,
+        events: mpsc::Sender<PiMsg>,
+    ) -> Self {
+        Self {
+            request_id: uuid::Uuid::new_v4(),
+            draft: Some(draft),
+            handed_off: Arc::default(),
+            returned,
+            events,
+        }
+    }
+}
+
+impl Drop for ForkInputRecovery {
+    fn drop(&mut self) {
+        if !self.handed_off.load(Ordering::Acquire)
+            && let Some(draft) = self.draft.take()
+        {
+            self.returned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(ReturnedForkInput {
+                    request_id: self.request_id,
+                    draft,
+                });
+            // A full channel already has a wake pending. The payload remains
+            // in the inbox even when this best-effort notification cannot fit.
+            let _ = self.events.try_send(PiMsg::ForkInputReady);
+        }
+    }
+}
+
 impl PiApp {
+    /// Leave the native payload owned by its session when another editor
+    /// replaces the composer. This runs before private card/login input.
+    pub(super) fn park_fork_draft(&mut self) {
+        if let Some(mut draft) = self.fork_draft.take() {
+            let text = self.input.value();
+            draft.content = crate::session::edit_fork_content(&draft.content, &draft.text, &text);
+            draft.text = text;
+            self.parked_fork_drafts.push_front(draft);
+            self.input.reset();
+        }
+    }
+
+    pub(super) fn apply_parked_fork_draft(&mut self) {
+        let returned = std::mem::take(
+            &mut *self
+                .returned_fork_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for returned in returned {
+            if self.active_fork_submission == Some(returned.request_id) {
+                self.active_fork_submission = None;
+                if self.displayed_session_id.as_deref()
+                    == Some(returned.draft.owner_session_id.as_str())
+                {
+                    self.agent_state = AgentState::Idle;
+                    self.abort_handle = None;
+                    self.extension_streaming.store(false, Ordering::SeqCst);
+                }
+            }
+            self.parked_fork_drafts.push_back(returned.draft);
+        }
+        if self.fork_draft.is_some()
+            || !self.input.value().is_empty()
+            || self.agent_state != AgentState::Idle
+            || self.login_attempt.is_some()
+            || self.has_pending_input_card()
+            || self.active_input_card_kind.is_some()
+            || self.tree_ui.is_some()
+            || self.capability_prompt.is_some()
+            || self.extension_custom_active
+            || self.model_selection.is_some()
+            || self.goal_invocation.is_some()
+            || self.handoff_request_id.is_some()
+            || self.mcp_auth_request_id.is_some()
+        {
+            return;
+        }
+        let Some(index) = self.parked_fork_drafts.iter().position(|draft| {
+            self.displayed_session_id.as_deref() == Some(draft.owner_session_id.as_str())
+                && matches!(
+                    self.session_event_ownership(&draft.owner_session_id),
+                    SessionEventOwnership::Current
+                )
+        }) else {
+            return;
+        };
+        if let Some(draft) = self.parked_fork_drafts.remove(index) {
+            self.input.set_value(&draft.text);
+            self.input.focus();
+            self.fork_draft = Some(draft);
+            self.status_message = Some(
+                "Forked message retains its original attachments. Edit the text and send; Ctrl+C clears this draft."
+                    .to_string(),
+            );
+        }
+    }
+
     fn session_event_ownership(&self, expected_session_id: &str) -> SessionEventOwnership {
         match self.session.try_lock() {
             Ok(session) if session.header.id == expected_session_id => {
@@ -924,7 +1038,10 @@ impl PiApp {
     /// Handle custom Pi messages from the agent.
     pub(super) fn handle_pi_message(&mut self, msg: PiMsg) -> Option<Cmd> {
         self.prune_expired_ask_cards();
-        self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS)
+        let result =
+            self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS);
+        self.apply_parked_fork_draft();
+        result
     }
 
     fn finish_handoff_ui(&mut self) {
@@ -1375,6 +1492,7 @@ impl PiApp {
                     return None;
                 }
 
+                self.active_fork_submission = None;
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.current_tool_id = None;
@@ -1477,6 +1595,7 @@ impl PiApp {
                 }
             }
             PiMsg::AgentError(error) => {
+                self.active_fork_submission = None;
                 self.current_response.clear();
                 self.current_thinking.clear();
                 let content = if error.contains('\n') || error.starts_with("Error:") {
@@ -1998,6 +2117,8 @@ After approving access in the browser, press Enter in Pi to complete login."
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
                 if is_replacement {
+                    self.park_fork_draft();
+                    self.active_fork_submission = None;
                     // A draft captured before an old-session card belongs to
                     // that session. Prevent the generic card drain below from
                     // restoring it into the replacement session's editor.
@@ -2057,8 +2178,32 @@ After approving access in the browser, press Enter in Pi to complete login."
                         );
                     }
                 }
+                self.park_fork_draft();
                 self.input.set_value(&text);
                 self.input.focus();
+            }
+            PiMsg::ForkInputReady => {}
+            PiMsg::RestoreForkInput {
+                owner_session_id,
+                branch_anchor,
+                text,
+                content,
+            } => {
+                if let Err(error) = crate::agent::AgentSession::validate_user_content_blocks(&content)
+                {
+                    self.status_message = Some(error.to_string());
+                    return None;
+                }
+                self.parked_fork_drafts.push_back(ForkDraft {
+                    owner_session_id,
+                    branch_anchor,
+                    text,
+                    content,
+                });
+                self.status_message = Some(
+                    "Forked input is retained. Send or clear the current draft to review it."
+                        .to_string(),
+                );
             }
             PiMsg::RestorePendingInput {
                 owner_session_id,
@@ -2953,6 +3098,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     fn apply_extension_editor_text_effect(&mut self, request: &ExtensionUiRequest) {
         if let Some(text) = request.payload.get("text").and_then(Value::as_str) {
+            self.park_fork_draft();
             self.input.set_value(text);
         }
     }
@@ -3206,6 +3352,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// (bd-1qol9). Subsequent arrivals and queue promotions never clobber an
     /// existing snapshot.
     fn capture_preexisting_card_draft(&mut self) {
+        self.park_fork_draft();
         if self.card_draft_snapshot.is_none() && !self.input.value().trim().is_empty() {
             self.card_draft_snapshot = Some(self.input.value());
             // AC: first activation snapshots AND clears the preexisting draft
@@ -3653,6 +3800,13 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     pub(super) fn queue_input(&mut self, kind: QueuedMessageKind) {
+        if self.fork_draft.is_some() {
+            self.status_message = Some(
+                "Send the fork draft after the current turn finishes; its attachments are retained"
+                    .to_string(),
+            );
+            return;
+        }
         if self.model_selection.is_some() {
             self.status_message =
                 Some("Model selection is still saving; your draft has been retained".to_string());
@@ -3971,7 +4125,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.status_message = Some(message);
             return None;
         }
-        self.spawn_recoverable_turn(None, None);
+        self.spawn_recoverable_turn(None, None, None);
         None
     }
 
@@ -3987,7 +4141,11 @@ After approving access in the browser, press Enter in Pi to complete login."
         &mut self,
         input: Option<UserContent>,
         keyword_scan_source: Option<String>,
+        fork_recovery: Option<ForkInputRecovery>,
     ) {
+        if fork_recovery.is_none() {
+            self.active_fork_submission = None;
+        }
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         // A task in an already cancelled region may stop at its first await
         // before it can report any error. Refuse synchronously (bd-k01i6).
@@ -4015,6 +4173,9 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.extension_streaming.store(true, Ordering::SeqCst);
         self.scroll_to_bottom();
         self.runtime_handle.spawn(async move {
+            let handed_off = fork_recovery
+                .as_ref()
+                .map(|recovery| Arc::clone(&recovery.handed_off));
             #[cfg(test)]
             if input.is_none() {
                 emit_submit_continue_deadline_probe(task_cx.budget().deadline);
@@ -4043,42 +4204,51 @@ After approving access in the browser, press Enter in Pi to complete login."
             let turn_abort = abort_signal.clone();
             let result = agent
                 .handle
-                .run_recoverable_turn(input, abort_signal, move |event| {
-                    match &event {
-                        AgentEvent::AutoCompactionStart { .. } => {
-                            extension_compacting.store(true, Ordering::SeqCst);
+                .run_recoverable_turn_with_handoff(
+                    input,
+                    abort_signal,
+                    move |event| {
+                        match &event {
+                            AgentEvent::AutoCompactionStart { .. } => {
+                                extension_compacting.store(true, Ordering::SeqCst);
+                            }
+                            AgentEvent::AutoCompactionEnd { .. } => {
+                                extension_compacting.store(false, Ordering::SeqCst);
+                            }
+                            _ => {}
                         }
-                        AgentEvent::AutoCompactionEnd { .. } => {
-                            extension_compacting.store(false, Ordering::SeqCst);
+                        // A terminal UI event releases pending input. Retain it
+                        // until the complete logical turn has returned and its
+                        // Agent owner is unlocked, so queued input cannot race
+                        // the final save or be rejected as "Agent busy".
+                        if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                            *callback_terminal
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+                            return;
                         }
-                        _ => {}
-                    }
-                    // A terminal UI event releases pending input. Retain it
-                    // until the complete logical turn has returned and its
-                    // Agent owner is unlocked, so queued input cannot race
-                    // the final save or be rejected as "Agent busy".
-                    if matches!(&event, AgentEvent::AgentEnd { .. }) {
-                        *callback_terminal
+                        let mut batcher = output
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
-                        return;
-                    }
-                    let mut batcher = output
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let AgentEvent::MessageStart {
-                        message: ModelMessage::User(user),
-                    } = &event
-                        && update_user.swap(false, Ordering::SeqCst)
-                    {
-                        let display = match &user.content {
-                            UserContent::Text(text) => text.clone(),
-                            UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
-                        };
-                        batcher.send_immediate(PiMsg::UpdateLastUserMessage(display));
-                    }
-                    dispatch_agent_event_to_ui(&event, &mut batcher);
-                })
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let AgentEvent::MessageStart {
+                            message: ModelMessage::User(user),
+                        } = &event
+                            && update_user.swap(false, Ordering::SeqCst)
+                        {
+                            let display = match &user.content {
+                                UserContent::Text(text) => text.clone(),
+                                UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+                            };
+                            batcher.send_immediate(PiMsg::UpdateLastUserMessage(display));
+                        }
+                        dispatch_agent_event_to_ui(&event, &mut batcher);
+                    },
+                    move |_| {
+                        if let Some(handed_off) = handed_off {
+                            handed_off.store(true, Ordering::Release);
+                        }
+                    },
+                )
                 .await;
             // The handle remains installed in the same mutex through the
             // final durable save and every recovery step; idle operations
@@ -4128,6 +4298,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 let message = crate::error_hints::format_error_with_hints(&error);
                 enqueue_pi_event(&event_tx, &Cx::for_request(), PiMsg::AgentError(message)).await;
             }
+            drop(fork_recovery);
         });
     }
 
@@ -4153,6 +4324,17 @@ After approving access in the browser, press Enter in Pi to complete login."
         display: &str,
         keyword_scan_source: Option<String>,
     ) -> Option<Cmd> {
+        self.submit_content_with_fork_recovery(content, display, keyword_scan_source, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn submit_content_with_fork_recovery(
+        &mut self,
+        content: Vec<ContentBlock>,
+        display: &str,
+        keyword_scan_source: Option<String>,
+        fork: Option<ForkDraft>,
+    ) -> Option<Cmd> {
         if content.is_empty() {
             return None;
         }
@@ -4173,6 +4355,20 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.status_message = Some(message);
             return None;
         }
+
+        let recovery = fork.map(|draft| {
+            ForkInputRecovery::new(
+                draft,
+                Arc::clone(&self.returned_fork_inputs),
+                self.event_tx.clone(),
+            )
+        });
+        if recovery.is_some() {
+            self.fork_draft = None;
+        } else {
+            self.park_fork_draft();
+        }
+        self.active_fork_submission = recovery.as_ref().map(|recovery| recovery.request_id);
 
         let display_owned = display.to_string();
         if !display_owned.trim().is_empty() {
@@ -4201,7 +4397,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             }
             _ => UserContent::Blocks(content),
         };
-        self.spawn_recoverable_turn(Some(input), keyword_scan_source);
+        self.spawn_recoverable_turn(Some(input), keyword_scan_source, recovery);
 
         None
     }
@@ -4209,6 +4405,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// Submit a message to the agent.
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_message(&mut self, message: &str) -> Option<Cmd> {
+        let authored = message;
         let message = message.trim();
         if self.login_attempt.is_some() {
             // Commands leave the sensitive prompt; they are never credentials.
@@ -4225,7 +4422,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             }
             return None;
         }
-        if message.is_empty() {
+        if message.is_empty() && self.fork_draft.is_none() {
             return None;
         }
 
@@ -4242,14 +4439,16 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
 
         if self.model_selection.is_some()
-            && !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _)))
+            && (self.fork_draft.is_some()
+                || !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _))))
         {
             self.status_message =
                 Some("Model selection is still saving; your draft has been retained".to_string());
             return None;
         }
         if self.goal_invocation.is_some()
-            && !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _)))
+            && (self.fork_draft.is_some()
+                || !matches!(SlashCommand::parse(message), Some((SlashCommand::Exit, _))))
         {
             self.status_message = Some(
                 "Goal work is active; Escape pauses it. Your draft has been retained".to_string(),
@@ -4269,6 +4468,54 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.bash_running {
             self.status_message = Some("Bash is still running; Escape cancels it".to_string());
             return None;
+        }
+
+        if let Some(draft) = &self.fork_draft {
+            if self.agent_state != AgentState::Idle {
+                self.status_message = Some(
+                    "Wait for the current turn; your fork draft is retained".to_string(),
+                );
+                return None;
+            }
+            if Cx::current().is_some_and(|cx| cx.is_cancel_requested()) {
+                self.status_message = Some("Cancelled; your fork draft is retained".to_string());
+                return None;
+            }
+            let belongs = self.session.try_lock().map(|session| {
+                session.header.id == draft.owner_session_id
+                    && draft.branch_anchor.as_deref().is_none_or(|anchor| {
+                        session
+                            .entries_for_current_path()
+                            .iter()
+                            .any(|entry| entry.base().id.as_deref() == Some(anchor))
+                    })
+            });
+            if !matches!(belongs, Ok(true)) {
+                self.status_message = Some(
+                    "Fork input belongs to another session or branch, or the session is busy; nothing was sent"
+                        .to_string(),
+                );
+                return None;
+            }
+            let content = crate::session::edit_fork_content(&draft.content, &draft.text, authored);
+            if let Err(error) = crate::agent::AgentSession::validate_user_content_blocks(&content) {
+                self.status_message = Some(error.to_string());
+                return None;
+            }
+            let display = content_blocks_to_text(&content);
+            let retained = ForkDraft {
+                owner_session_id: draft.owner_session_id.clone(),
+                branch_anchor: draft.branch_anchor.clone(),
+                text: authored.to_string(),
+                content: content.clone(),
+            };
+            self.history.push(authored.to_string());
+            return self.submit_content_with_fork_recovery(
+                content,
+                &display,
+                Some(authored.to_string()),
+                Some(retained),
+            );
         }
 
         if let Some((command, exclude_from_context)) = parse_bash_command(message) {
@@ -4399,6 +4646,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.spawn_recoverable_turn(
             Some(UserContent::Text(message_for_agent)),
             Some(message_owned),
+            None,
         );
 
         None
@@ -7768,6 +8016,208 @@ mod stream_delta_batcher_tests {
         assert!(
             app.tree_ui.is_some(),
             "the current idle session's tree request must still open"
+        );
+    }
+
+    #[test]
+    fn classic_fork_drafts_edit_native_content_without_reopening_file_names() {
+        for edited in ["Revise @missing-original.wav", ""] {
+            let state = Arc::new(ContinueProbeState::default());
+            let (mut app, mut events) =
+                build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&state),
+                }));
+            let owner = app.session.try_lock().unwrap().header.id.clone();
+            let content = crate::session::fork_tests::multimodal_content();
+            let _ = app.handle_pi_message(PiMsg::RestoreForkInput {
+                owner_session_id: owner,
+                branch_anchor: None,
+                text: crate::session::fork_tests::MULTIMODAL_TEXT.to_string(),
+                content: content.clone(),
+            });
+            assert!(app.fork_draft.is_some());
+            app.input.set_value(edited);
+            let _ = app.submit_message(edited);
+            assert!(app.fork_draft.is_none());
+            wait_for_agent_done(&mut events);
+            assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *state.received_media.lock().unwrap(),
+                vec!["d29ybGQ=", "dmlkZW8="]
+            );
+            let expected = crate::session::edit_fork_content(
+                &content,
+                crate::session::fork_tests::MULTIMODAL_TEXT,
+                edited,
+            );
+            let session = app.session.try_lock().unwrap();
+            let messages = session.to_messages_for_current_path();
+            let user = messages
+                .iter()
+                .find_map(|message| match message {
+                    ModelMessage::User(user) => Some(&user.content),
+                    _ => None,
+                })
+                .expect("submitted user content");
+            assert_eq!(
+                serde_json::to_value(user).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn fork_input_guard_survives_an_unpolled_drop_and_a_full_event_channel() {
+        let returned = Arc::new(StdMutex::new(VecDeque::new()));
+        let (events, _receiver) = mpsc::channel(1);
+        events
+            .try_send(PiMsg::System("channel already full".into()))
+            .unwrap();
+        let content = crate::session::fork_tests::multimodal_content();
+        let draft = ForkDraft {
+            owner_session_id: "original session".into(),
+            branch_anchor: Some("original branch".into()),
+            text: crate::session::fork_tests::MULTIMODAL_TEXT.into(),
+            content: content.clone(),
+        };
+        let recovery = ForkInputRecovery::new(draft, Arc::clone(&returned), events.clone());
+        let unpolled = async move {
+            let _recovery = recovery;
+            futures::future::pending::<()>().await;
+        };
+        drop(unpolled);
+        let returned = returned
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("recover before first poll");
+        assert_eq!(returned.draft.owner_session_id, "original session");
+        assert_eq!(
+            returned.draft.branch_anchor.as_deref(),
+            Some("original branch")
+        );
+        assert_eq!(
+            serde_json::to_value(&returned.draft.content).unwrap(),
+            serde_json::to_value(content).unwrap()
+        );
+
+        let inbox = Arc::new(StdMutex::new(VecDeque::new()));
+        let recovery = ForkInputRecovery::new(returned.draft, Arc::clone(&inbox), events);
+        recovery.handed_off.store(true, Ordering::Release);
+        drop(recovery);
+        assert!(
+            inbox.lock().unwrap().is_empty(),
+            "consumed input must never be replayed"
+        );
+    }
+
+    #[test]
+    fn classic_fork_startup_failure_returns_exact_edited_input_behind_a_newer_draft() {
+        for cancelled_before_spawn in [false, true] {
+            let state = Arc::new(ContinueProbeState::default());
+            let (mut app, mut events) =
+                build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&state),
+                }));
+            let owner = app.session.try_lock().unwrap().header.id.clone();
+            app.agent
+                .try_lock()
+                .unwrap()
+                .handle
+                .session()
+                .provider_admission_gate()
+                .block("fixture requires durable recovery".into());
+            let content = crate::session::edit_fork_content(
+                &crate::session::fork_tests::multimodal_content(),
+                crate::session::fork_tests::MULTIMODAL_TEXT,
+                "edited before failed startup",
+            );
+            // Exercise the boundary after UI preflight: startup may fail or
+            // its initiating region may be cancelled before the task runs.
+            let recovery = ForkInputRecovery::new(
+                ForkDraft {
+                    owner_session_id: owner.clone(),
+                    branch_anchor: None,
+                    text: "edited before failed startup".into(),
+                    content: content.clone(),
+                },
+                Arc::clone(&app.returned_fork_inputs),
+                app.event_tx.clone(),
+            );
+            app.active_fork_submission = Some(recovery.request_id);
+            let current = cancelled_before_spawn.then(|| {
+                let cx = Cx::for_testing();
+                cx.set_cancel_requested(true);
+                Cx::set_current(Some(cx))
+            });
+            app.spawn_recoverable_turn(
+                Some(UserContent::Blocks(content.clone())),
+                Some("edited before failed startup".into()),
+                Some(recovery),
+            );
+            drop(current);
+            app.input.set_value("newer draft");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.parked_fork_drafts.is_empty() && std::time::Instant::now() < deadline {
+                if let Ok(event) = events.try_recv() {
+                    let _ = app.handle_pi_message(event);
+                }
+                app.apply_parked_fork_draft();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(app.input.value(), "newer draft");
+            assert_eq!(app.parked_fork_drafts.len(), 1);
+            app.input.reset();
+            app.apply_parked_fork_draft();
+            let draft = app.fork_draft.as_ref().unwrap();
+            assert_eq!(draft.owner_session_id, owner);
+            assert_eq!(draft.text, "edited before failed startup");
+            assert_eq!(
+                serde_json::to_value(&draft.content).unwrap(),
+                serde_json::to_value(content).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn classic_fork_drafts_survive_newer_private_and_failed_editor_owners() {
+        let (mut app, _events) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let owner = app.session.try_lock().unwrap().header.id.clone();
+        app.input.set_value("newer draft");
+        let content = crate::session::fork_tests::multimodal_content();
+        for session_id in ["stale session".to_string(), owner.clone()] {
+            let _ = app.handle_pi_message(PiMsg::RestoreForkInput {
+                owner_session_id: session_id,
+                branch_anchor: None,
+                text: crate::session::fork_tests::MULTIMODAL_TEXT.to_string(),
+                content: content.clone(),
+            });
+            assert_eq!(app.input.value(), "newer draft");
+        }
+        assert_eq!(app.parked_fork_drafts.len(), 2);
+        app.input.reset();
+        app.apply_parked_fork_draft();
+        app.input.set_value("edited fork text");
+        app.session.try_lock().unwrap().header.id = "replacement".to_string();
+        let _ = app.submit_message("edited fork text");
+        assert!(app.fork_draft.is_some());
+        assert_eq!(app.input.value(), "edited fork text");
+        app.session.try_lock().unwrap().header.id = owner;
+        assert!(app.begin_login_attempt(Path::new("fork-fixture-auth.json")).is_some());
+        assert!(app.fork_draft.is_none());
+        app.input.set_value("private credential");
+        app.apply_parked_fork_draft();
+        assert_eq!(app.input.value(), "private credential");
+        assert!(app.retire_login());
+        app.apply_parked_fork_draft();
+        assert_eq!(app.input.value(), "edited fork text");
+        let draft = app.fork_draft.as_ref().unwrap();
+        assert_eq!(draft.content.len(), 4);
+        assert!(
+            !serde_json::to_string(&draft.content)
+                .unwrap()
+                .contains("private credential")
         );
     }
 

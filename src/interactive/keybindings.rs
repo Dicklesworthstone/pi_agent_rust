@@ -303,6 +303,7 @@ impl PiApp {
     }
 
     fn apply_history_selection(&mut self) {
+        self.park_fork_draft();
         let selected = self.history.selected_value();
         if selected.is_empty() {
             self.input.reset();
@@ -612,7 +613,8 @@ impl PiApp {
 
                 // If editor has text, clear it
                 let editor_text = self.input.value();
-                if !editor_text.is_empty() {
+                if !editor_text.is_empty() || self.fork_draft.is_some() {
+                    self.fork_draft = None;
                     self.input.reset();
                     self.last_ctrlc_time = Some(std::time::Instant::now());
                     self.status_message = Some("Input cleared".to_string());

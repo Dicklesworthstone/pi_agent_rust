@@ -11,7 +11,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::goal::GoalControl;
-use crate::model::UserContent;
+use crate::model::{ContentBlock, UserContent};
 use crate::session_control::{PendingInput, SessionControlHandle};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -287,6 +287,7 @@ pub struct RestoredInput {
     owner_session_id: String,
     branch_anchor: Option<String>,
     pending: Arc<Mutex<Vec<PendingInput>>>,
+    editable_fork: bool,
     compaction: Option<RestoredCompaction>,
     following: Arc<Mutex<VecDeque<Self>>>,
     claimed: Arc<AtomicBool>,
@@ -329,6 +330,7 @@ impl RestoredInput {
             owner_session_id: owner,
             branch_anchor: branch,
             pending: Arc::new(Mutex::new(pending)),
+            editable_fork: false,
             compaction: None,
             following: Arc::default(),
             claimed: Arc::default(),
@@ -342,6 +344,47 @@ impl RestoredInput {
         pending: Vec<PendingInput>,
     ) -> Self {
         Self::new(uuid::Uuid::new_v4(), owner, branch, pending)
+    }
+
+    pub(super) fn for_fork(
+        owner: String,
+        branch: Option<String>,
+        text: String,
+        content: Vec<ContentBlock>,
+    ) -> Result<Self> {
+        crate::agent::AgentSession::validate_user_content_blocks(&content)?;
+        let mut request = Self::for_turn(
+            owner,
+            branch,
+            vec![PendingInput::prepared_initial(
+                UserContent::Blocks(content),
+                text,
+            )],
+        );
+        request.editable_fork = true;
+        Ok(request)
+    }
+
+    fn edited_fork(&self, text: &str) -> Result<Self> {
+        if self.claimed.load(Ordering::Acquire) {
+            return Err(Error::validation("This fork input was already submitted"));
+        }
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let [original] = pending.as_slice() else {
+            return Err(Error::validation("The fork draft is no longer available"));
+        };
+        let UserContent::Blocks(content) = &original.content else {
+            return Err(Error::validation("The fork draft has no structured input"));
+        };
+        Self::for_fork(
+            self.owner_session_id.clone(),
+            self.branch_anchor.clone(),
+            text.to_string(),
+            crate::session::edit_fork_content(content, &original.text, text),
+        )
     }
 
     /// Keep a maintenance command between its original native batches.
@@ -416,7 +459,37 @@ pub(super) struct Draft {
 }
 
 impl PiFtuiModel {
+    pub(super) fn has_fork_draft(&self) -> bool {
+        self.goal_draft
+            .as_ref()
+            .is_some_and(|draft| draft.request.editable_fork)
+    }
+
+    /// Park native fork content before another editor owner replaces it.
+    /// Called while the ordinary composer still owns its text, never after
+    /// a login prompt or response card has taken over the editor.
+    pub(super) fn park_fork_draft(&mut self) {
+        if self
+            .goal_draft
+            .as_ref()
+            .is_some_and(|draft| draft.request.editable_fork)
+            && let Some(draft) = self.goal_draft.take()
+        {
+            let request = draft
+                .request
+                .edited_fork(&self.input.text())
+                .unwrap_or(draft.request);
+            self.pending_goal_inputs.push_front(request);
+            self.input.set_text("");
+        }
+    }
+
     pub(super) fn park_goal_draft_for(&mut self, session_id: &str) {
+        if self.goal_draft.as_ref().is_some_and(|draft| {
+            draft.request.editable_fork && draft.request.owner_session_id != session_id
+        }) {
+            self.park_fork_draft();
+        }
         if self
             .goal_draft
             .as_ref()
@@ -531,6 +604,7 @@ impl PiFtuiModel {
 
     fn show_goal_draft(&mut self, request: RestoredInput) {
         let maintenance = request.compaction.is_some();
+        let editable_fork = request.editable_fork;
         let text = request.text();
         self.input.set_text(&text);
         self.goal_draft = Some(Draft { request, text });
@@ -540,6 +614,8 @@ impl PiFtuiModel {
             EntryRole::System,
             if maintenance {
                 "Restored queued compaction. Review before running; later input remains retained. Ctrl+C clears this recovery."
+            } else if editable_fork {
+                "Forked message retains its original attachments. Edit the text and send; Ctrl+C clears this draft."
             } else {
                 "Restored unsent input with its original attachments. Review before sending; Ctrl+C clears this recovery."
             }
@@ -600,14 +676,39 @@ impl PiFtuiModel {
             );
             return true;
         }
-        if self.input.text() != draft.text {
+        if self.input.text() != draft.text && !draft.request.editable_fork {
             self.push_entry(
                 EntryRole::Error,
                 "Recovered input retains prepared attachments. Alt+Up restores the original; Ctrl+C clears it so you can compose a new message.".to_string(),
             );
             return true;
         }
-        let request = draft.request.clone();
+        // Stage edited content independently. A failed admission leaves the
+        // original draft and its attachments owned by the composer.
+        let fork_owner = draft.request.editable_fork.then(|| draft.request.clone());
+        let request = if draft.request.editable_fork {
+            match draft.request.edited_fork(&self.input.text()) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.push_entry(EntryRole::Error, error.to_string());
+                    return true;
+                }
+            }
+        } else {
+            draft.request.clone()
+        };
+        let display = if request.editable_fork {
+            let pending = request
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &pending[0].content {
+                UserContent::Blocks(content) => super::prompt_display("", content),
+                UserContent::Text(text) => text.clone(),
+            }
+        } else {
+            request.text()
+        };
         let replaying = request.clone();
         let maintenance = request.compaction.as_ref().map(|step| step.request.clone());
         let driver_submission = self.live_goal().is_none() && self.state != AgentUiState::Working;
@@ -657,13 +758,13 @@ impl PiFtuiModel {
         };
         match result {
             Ok(()) => {
-                let text = self
-                    .goal_draft
-                    .take()
-                    .map(|draft| draft.text)
-                    .unwrap_or_default();
+                if let Some(owner) = fork_owner {
+                    owner.claimed.store(true, Ordering::Release);
+                }
+                let text = self.input.text();
+                self.goal_draft = None;
                 self.record_history(&text);
-                self.push_entry(EntryRole::User, text);
+                self.push_entry(EntryRole::User, display);
                 self.input.set_text("");
                 self.autocomplete.close();
                 if driver_submission {
@@ -739,10 +840,11 @@ impl Drop for ReplayRecovery<'_> {
             control.abort();
             pending.extend(control.take_pending());
         }
-        if self
+        let initial_not_handed_off = self
             .control
             .as_ref()
-            .is_none_or(|control| !control.initial_input_handed_off())
+            .is_none_or(|control| !control.initial_input_handed_off());
+        if initial_not_handed_off
             && let Some(first) = self.first.take()
         {
             // Startup may fail or be dropped before the SDK transfers the
@@ -759,12 +861,24 @@ impl Drop for ReplayRecovery<'_> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         let next = if !pending.is_empty() || self.compaction.is_some() {
+            // Only the selected, still-unsent fork message is editable.
+            // Queued tails keep their ordinary native recovery semantics.
+            let editable_fork = self.request.editable_fork
+                && initial_not_handed_off
+                && matches!(
+                    pending.as_slice(),
+                    [PendingInput {
+                        content: UserContent::Blocks(_),
+                        ..
+                    }]
+                );
             let mut next = RestoredInput::new(
                 self.request.source_invocation,
                 self.request.owner_session_id.clone(),
                 self.request.branch_anchor.clone(),
                 pending,
             );
+            next.editable_fork = editable_fork;
             next.compaction = self.compaction.take().map(|mut step| {
                 // A reviewed retry gets a fresh cancellation identity. An
                 // old completion or Escape clone cannot control the next try.

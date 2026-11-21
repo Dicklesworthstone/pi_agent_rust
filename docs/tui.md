@@ -116,6 +116,18 @@ Language-server operations use the agent-facing `lsp` tool, not a `/lsp`
 command. Ask Pi to use LSP in ordinary language; see
 [supported servers and setup](lsp-configuration.md).
 
+### Editing a forked message
+
+`/fork` returns the selected message to the editor without submitting it.
+Image, audio, and video attachments retain their original bytes and order in
+both terminal interfaces, even if the original files have moved or changed.
+Edit the prose and press Enter to send it with those attachments. Clearing
+only the prose permits an attachment-only prompt; Ctrl+C clears the entire
+fork draft. Fork drafts wait behind newer text and private input prompts.
+While reviewing a structured fork draft, text is sent literally: file
+references and slash commands are not expanded again. Clear the draft to
+start a new command.
+
 ### Model selection
 - Use `/model` to switch models (by `provider/id` or fuzzy match).
 - Some builds also define shortcuts like `Ctrl+L` (model selector) and `Ctrl+P`

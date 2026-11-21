@@ -601,6 +601,43 @@ mod tests {
         assert!(target.retract(receipts[1].new_id).is_none());
     }
 
+    #[cfg(feature = "ftui")]
+    #[test]
+    fn prepared_initial_fork_inputs_cannot_bypass_mailbox_admission() {
+        let (target, _guard, _) = live();
+        target.follow_up("already accepted").unwrap();
+        let before = target.snapshot();
+        for (content, text) in [
+            (
+                UserContent::Text("valid".into()),
+                "x".repeat(MAX_INPUT_BYTES + 1),
+            ),
+            (UserContent::Blocks(Vec::new()), String::new()),
+            (
+                UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+                    data: "A".repeat(4 * 1024 * 1024),
+                    mime_type: "image/png".into(),
+                })]),
+                String::new(),
+            ),
+        ] {
+            let mut pending = vec![PendingInput::prepared_initial(content, text)];
+            let original = fingerprint(&pending);
+            assert!(target.restore_pending(&mut pending).is_err());
+            assert_eq!(target.snapshot(), before);
+            assert_eq!(fingerprint(&pending), original);
+        }
+        let content = UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        })]);
+        let bytes = serde_json::to_vec(&content).unwrap().len() + "current text".len();
+        let mut pending = vec![PendingInput::prepared_initial(content, "current text".into())];
+        target.restore_pending(&mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(target.snapshot().pending_bytes, before.pending_bytes + bytes);
+    }
+
     #[test]
     fn detached_duplicate_identities_are_rejected_before_any_admission() {
         event("duplicate_identity");

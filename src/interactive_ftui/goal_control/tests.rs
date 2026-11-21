@@ -401,6 +401,203 @@ fn recovered_media_waits_for_the_ordinary_editor_and_resubmits_without_text() {
 }
 
 #[test]
+fn editable_fork_drafts_deliver_exact_media_and_current_text_to_the_native_turn() {
+    for edited in [
+        crate::session::fork_tests::MULTIMODAL_TEXT,
+        "Revise @missing-original.wav",
+        "/web unpair",
+        "",
+    ] {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(Probe::default());
+            let mut session = handle(Arc::clone(&provider));
+            let owner = session
+                .with_session(|session| session.header.id.clone())
+                .await
+                .unwrap();
+            let controls: TurnControlSlot = Arc::default();
+            let mut model = model(&owner, &controls);
+            let (submit, received) = mpsc::channel();
+            model.submit_tx = Some(submit);
+            let original = crate::session::fork_tests::multimodal_content();
+            let _ = model.handle_agent(PiMsg::RestoreForkInput {
+                owner_session_id: owner,
+                branch_anchor: None,
+                text: crate::session::fork_tests::MULTIMODAL_TEXT.to_string(),
+                content: original.clone(),
+            });
+            assert!(model.goal_draft.is_some());
+            model.input.set_text(edited);
+            model.submit_input();
+            let UiCommand::RestoredGoalInput(request) = received.try_recv().unwrap() else {
+                panic!("fork must use native prepared input");
+            };
+            let expected = UserContent::Blocks(crate::session::edit_fork_content(
+                &original,
+                crate::session::fork_tests::MULTIMODAL_TEXT,
+                edited,
+            ));
+            {
+                let pending = request.pending.lock().unwrap();
+                assert_eq!(pending[0].text, edited, "authored source must match the edit");
+                same_payload(&pending[0].content, &expected);
+            }
+            let (events, returned) = mpsc::channel();
+            let (tx, _rx) = mpsc::channel();
+            run_restored(
+                &mut session,
+                request,
+                &tx,
+                &events,
+                &controls,
+                Arc::default(),
+            )
+            .await;
+            assert!(returned.try_recv().is_err());
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let user = requests[0]
+                .iter()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(&user.content),
+                    _ => None,
+                })
+                .expect("provider received native fork input");
+            same_payload(user, &expected);
+        });
+    }
+}
+
+#[test]
+fn cancelled_fork_turn_recovers_text_follow_up_without_fork_edit_semantics() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let provider = Arc::new(Probe {
+            pending: true,
+            ..Default::default()
+        });
+        let mut session = handle(Arc::clone(&provider));
+        let owner = session
+            .with_session(|session| session.header.id.clone())
+            .await
+            .unwrap();
+        let request = RestoredInput::for_fork(
+            owner.clone(),
+            None,
+            crate::session::fork_tests::MULTIMODAL_TEXT.into(),
+            crate::session::fork_tests::multimodal_content(),
+        )
+        .unwrap();
+        let controls: TurnControlSlot = Arc::default();
+        let (events, returned) = mpsc::channel();
+        let (tx, _rx) = mpsc::channel();
+        let mut replay = Box::pin(run_restored(
+            &mut session,
+            request,
+            &tx,
+            &events,
+            &controls,
+            Arc::default(),
+        ));
+        assert!(futures::poll!(replay.as_mut()).is_pending());
+        let control = controls.lock().unwrap().current.clone().unwrap();
+        assert!(control.initial_input_handed_off());
+        control.follow_up("ordinary text follow-up").unwrap();
+        drop(replay);
+        let Event::Pending(returned) = returned.try_recv().unwrap() else {
+            panic!("unclaimed follow-up remains recoverable");
+        };
+        assert!(!returned.editable_fork);
+        let mut model = model(&owner, &controls);
+        let (submit, received) = mpsc::channel();
+        model.submit_tx = Some(submit);
+        model.show_goal_draft(returned);
+        model.submit_input();
+        let UiCommand::RestoredGoalInput(request) = received.try_recv().unwrap() else {
+            panic!("ordinary recovered follow-up can still be submitted");
+        };
+        let pending = request.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "ordinary text follow-up");
+        same_payload(
+            &pending[0].content,
+            &UserContent::Text("ordinary text follow-up".into()),
+        );
+    });
+}
+
+#[test]
+fn late_fork_input_is_parked_until_its_own_session_returns() {
+    let controls: TurnControlSlot = Arc::default();
+    let mut model = model("replacement", &controls);
+    model.input.set_text("newer draft");
+    let _ = model.handle_agent(PiMsg::RestoreForkInput {
+        owner_session_id: "original".into(),
+        branch_anchor: None,
+        text: crate::session::fork_tests::MULTIMODAL_TEXT.into(),
+        content: crate::session::fork_tests::multimodal_content(),
+    });
+    assert_eq!(model.input.text(), "newer draft");
+    assert_eq!(model.pending_goal_inputs.len(), 1);
+    model.displayed_session_id = Some("original".into());
+    model.input.set_text("");
+    model.apply_goal_input_restores();
+    assert_eq!(model.input.text(), crate::session::fork_tests::MULTIMODAL_TEXT);
+    assert!(model.goal_draft.as_ref().unwrap().request.editable_fork);
+}
+
+#[test]
+fn fork_drafts_preserve_edits_when_another_editor_or_failed_submission_takes_over() {
+    let controls: TurnControlSlot = Arc::default();
+    let mut model = model("one", &controls);
+    let _ = model.handle_agent(PiMsg::RestoreForkInput {
+        owner_session_id: "one".into(),
+        branch_anchor: None,
+        text: crate::session::fork_tests::MULTIMODAL_TEXT.into(),
+        content: crate::session::fork_tests::multimodal_content(),
+    });
+    model.input.set_text("edited fork text");
+    // No driver: failure must retain the editable native draft.
+    assert!(model.submit_goal_draft());
+    assert!(model.goal_draft.is_some());
+    assert_eq!(model.input.text(), "edited fork text");
+    model.set_prompt_editor_text("newer draft");
+    assert!(model.goal_draft.is_none());
+    assert_eq!(model.input.text(), "newer draft");
+    assert_eq!(model.pending_goal_inputs.len(), 1);
+    model.input.set_text("");
+    model.apply_goal_input_restores();
+    assert_eq!(model.input.text(), "edited fork text");
+    model.start_login_input("private provider".into(), false);
+    model.input.set_text("private credential");
+    model.apply_goal_input_restores();
+    assert_eq!(model.input.text(), "private credential");
+    assert!(model.goal_draft.is_none());
+    model.finish_login_input(false);
+    model.apply_goal_input_restores();
+    assert_eq!(model.input.text(), "edited fork text");
+    let pending = model
+        .goal_draft
+        .as_ref()
+        .unwrap()
+        .request
+        .pending
+        .lock()
+        .unwrap();
+    assert_eq!(pending[0].text, "edited fork text");
+    assert!(
+        !serde_json::to_string(&pending[0].content)
+            .unwrap()
+            .contains("private credential")
+    );
+}
+
+#[test]
 fn restored_input_cannot_cross_into_a_different_goal_or_session() {
     let controls: TurnControlSlot = Arc::default();
     let (sender, _receiver) = mpsc::channel();

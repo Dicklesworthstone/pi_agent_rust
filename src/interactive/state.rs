@@ -262,6 +262,19 @@ pub enum PendingInput {
     Continue,
 }
 
+/// Native input selected by `/fork`, owned by its destination session.
+pub(super) struct ForkDraft {
+    pub owner_session_id: String,
+    pub branch_anchor: Option<String>,
+    pub text: String,
+    pub content: Vec<ContentBlock>,
+}
+
+pub(super) struct ReturnedForkInput {
+    pub request_id: uuid::Uuid,
+    pub draft: ForkDraft,
+}
+
 /// Autocomplete dropdown state.
 #[derive(Debug)]
 pub struct AutocompleteState {

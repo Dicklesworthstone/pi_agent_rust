@@ -3066,6 +3066,7 @@ impl PiFtuiModel {
         // Response cards cannot retain a credential in their saved draft.
         // Settle any earlier card burst before parking the ordinary editor.
         self.dismiss_pending_interactions();
+        self.park_fork_draft();
         self.autocomplete.close();
         self.pending_image_pastes.clear();
         self.input.reset_mouse_interaction();
@@ -3110,6 +3111,7 @@ impl PiFtuiModel {
     /// Programmatic editor APIs describe the ordinary composer, including
     /// while a separate login editor is collecting a credential.
     fn set_prompt_editor_text(&mut self, text: &str) {
+        self.park_fork_draft();
         if let Some(draft) = &mut self.login_draft {
             draft.input.set_text(text);
             if let Some(index) = draft.history_cursor {
@@ -3836,6 +3838,7 @@ impl PiFtuiModel {
         let Some(newest) = self.input_history.len().checked_sub(1) else {
             return;
         };
+        self.park_fork_draft();
         let index = match self.history_cursor {
             None => {
                 self.history_draft = self.input.text();
@@ -4831,6 +4834,17 @@ impl PiFtuiModel {
                 // shared native composer protects newer and private drafts.
                 self.pending_goal_inputs.push_back(request);
             }
+            PiMsg::RestoreForkInput {
+                owner_session_id,
+                branch_anchor,
+                text,
+                content,
+            } => {
+                match RestoredInput::for_fork(owner_session_id, branch_anchor, text, content) {
+                    Ok(request) => self.restore_native_input(request),
+                    Err(error) => self.push_entry(EntryRole::Error, error.to_string()),
+                }
+            }
             PiMsg::RestorePendingInput {
                 owner_session_id,
                 text,
@@ -4967,7 +4981,7 @@ impl PiFtuiModel {
         if self.login_pending.is_some() {
             return;
         }
-        if self.submit_browser_command() {
+        if !self.has_fork_draft() && self.submit_browser_command() {
             return;
         }
         if self.compaction_request.is_some() {
@@ -5392,7 +5406,7 @@ impl PiFtuiModel {
             );
             return;
         }
-        if self.submit_browser_command() {
+        if !self.has_fork_draft() && self.submit_browser_command() {
             return;
         }
         if self.browser_request_active() && self.state != AgentUiState::Working {
@@ -8218,6 +8232,7 @@ impl PiFtuiModel {
         // Even an empty prompt can have a pending mouse gesture. An answer
         // is a new editor owner regardless of whether a draft was saved.
         self.input.reset_mouse_interaction();
+        self.park_fork_draft();
         let draft = self.input.text();
         if self.card_draft_snapshot.is_none() && !draft.is_empty() {
             self.card_draft_snapshot = Some(draft);
@@ -13317,9 +13332,14 @@ fn build_fork_session(
     entry_id: &str,
     provider: String,
     model_id: String,
-) -> crate::error::Result<(crate::session::Session, String)> {
+) -> crate::error::Result<(
+    crate::session::Session,
+    String,
+    Option<Vec<crate::model::ContentBlock>>,
+)> {
     let plan = source.plan_fork_from_user_message(entry_id)?;
     let selected_text = plan.selected_text.clone();
+    let selected_content = plan.selected_content.clone();
     let mut forked = crate::session::Session::create_with_dir(source.session_dir.clone());
     forked.header.provider = Some(provider);
     forked.header.model_id = Some(model_id);
@@ -13328,7 +13348,7 @@ fn build_fork_session(
         .thinking_level
         .clone_from(&source.header.thinking_level);
     forked.init_from_fork_plan(plan);
-    Ok((forked, selected_text))
+    Ok((forked, selected_text, selected_content))
 }
 
 /// Handle `/fork [list|index|id]` in the driver: pick a user message, let
@@ -13405,7 +13425,7 @@ async fn fork_session_command(
     }
 
     let (provider, model_id) = handle.model();
-    let (mut forked, selected_text) =
+    let (mut forked, selected_text, selected_content) =
         match build_fork_session(&source, &selection.id, provider, model_id) {
             Ok(built) => built,
             Err(err) => {
@@ -13447,6 +13467,7 @@ async fn fork_session_command(
         )));
         return Ok(());
     };
+    let branch_anchor = forked.leaf_id().map(str::to_string);
     let mut options = replacement_options(&fork_template, ext_handler, runtime_handle);
     options.session_path = Some(path);
     Box::pin(resume_prepared_session(
@@ -13470,9 +13491,17 @@ async fn fork_session_command(
             "Forked new session from {}",
             selection.summary
         )));
-        let _ = agent_tx.send(PiMsg::SetEditorText {
-            owner_session_id: new_session_id.clone(),
-            text: selected_text,
+        let _ = agent_tx.send(match selected_content {
+            Some(content) => PiMsg::RestoreForkInput {
+                owner_session_id: new_session_id.clone(),
+                branch_anchor,
+                text: selected_text,
+                content,
+            },
+            None => PiMsg::SetEditorText {
+                owner_session_id: new_session_id.clone(),
+                text: selected_text,
+            },
         });
         if let Some(manager) = handle.extension_manager() {
             let _ = manager
@@ -27185,7 +27214,7 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         let second = crate::interactive::select_fork_candidate(&candidates, "2").expect("select");
 
-        let (forked, selected_text) = build_fork_session(
+        let (forked, selected_text, selected_content) = build_fork_session(
             &source,
             &second.id,
             String::from("anthropic"),
@@ -27193,6 +27222,7 @@ mod tests {
         )
         .expect("build fork");
         assert_eq!(selected_text, "second question");
+        assert!(selected_content.is_none());
         let texts = forked
             .to_messages_for_current_path()
             .iter()
@@ -27385,7 +27415,7 @@ mod tests {
             .expect("runtime");
         runtime.block_on(Box::pin(async {
             let fixture = crate::session::fork_tests::workspace_fixture(temp.path(), true).await;
-            let (mut fork, selected_text) = build_fork_session(
+            let (mut fork, selected_text, selected_content) = build_fork_session(
                 &fixture.source,
                 &fixture.target_id,
                 "anthropic".to_string(),
@@ -27393,6 +27423,7 @@ mod tests {
             )
             .expect("build FTUI fork");
             assert_eq!(selected_text, "revise this request");
+            assert!(selected_content.is_none());
             fixture.assert_workspace(&fork);
             fixture.assert_selected_context(&fork);
             fork.save().await.expect("persist FTUI fork");

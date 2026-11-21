@@ -67,6 +67,23 @@ pub struct PendingInput {
     bytes: usize,
 }
 
+impl PendingInput {
+    /// A prepared initial turn, held by the native composer, not admitted to
+    /// a live mailbox. Its provider handoff uses ordinary prompt validation.
+    /// `restore_pending` still revalidates and charges the full payload if a
+    /// caller subsequently tries to enqueue it, including all queue limits.
+    #[cfg(feature = "ftui")]
+    pub(crate) fn prepared_initial(content: UserContent, text: String) -> Self {
+        Self {
+            id: InputId(uuid::Uuid::new_v4()),
+            kind: InputKind::FollowUp,
+            text,
+            content,
+            bytes: 0,
+        }
+    }
+}
+
 impl fmt::Debug for PendingInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingInput")
