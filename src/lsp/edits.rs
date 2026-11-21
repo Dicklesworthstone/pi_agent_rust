@@ -20,7 +20,8 @@ mod annotations;
 mod sequence;
 mod transaction;
 
-pub(in crate::lsp) use transaction::evidence::{FileEvidence, PreparedEdit, apply_checked};
+pub(crate) use transaction::evidence::PreparedEdit;
+pub(in crate::lsp) use transaction::evidence::{FileEvidence, apply_checked};
 
 /// A file operation from `documentChanges`.
 #[derive(Debug, Clone, PartialEq, Eq)]

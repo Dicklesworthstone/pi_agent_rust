@@ -1,9 +1,9 @@
 //! Unit-level integration tests for the `ast_grep` and `ast_edit` structural
 //! tools (bd-cv653.1.3).
 //!
-//! Coverage: staging lifecycle, atomic rollback with an injected write failure
-//! on file 2 of 3, stale-anchor rejection, metavariable identity, comment and
-//! string exclusion (planted negative), malformed-pattern named errors, empty
+//! Coverage: staging lifecycle, prepare failure before any target is written,
+//! preserved modes and file identities, stale-anchor rejection, metavariable
+//! identity, comment and string exclusion (planted negative), malformed-pattern named errors, empty
 //! `out` deletion, and `--tools` registry gating.
 //!
 //! Logging: every case emits structured JSONL per the repo harness pattern
@@ -259,6 +259,222 @@ fn ast_edit_resolve_is_one_undo_unit() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn ast_edit_preserves_executable_and_readonly_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    asupersync::test_utils::run_test(|| async {
+        let harness = TestHarness::new("ast_edit_preserves_executable_and_readonly_permissions");
+        for (name, mode) in [("executable.rs", 0o751), ("readonly.rs", 0o444)] {
+            write_file(&harness, name, "fn main() { marker(); }\n");
+            std::fs::set_permissions(
+                harness.temp_path(name),
+                std::fs::Permissions::from_mode(mode),
+            )
+            .expect("set original mode");
+        }
+        let registry = ToolRegistry::new(&["ast_edit"], harness.temp_dir(), None);
+        let edit = registry.get("ast_edit").expect("ast_edit registered");
+        let staged = stage(
+            &harness,
+            edit,
+            json!({"ops": [{"pat": "marker()", "out": "renamed()"}]}),
+        )
+        .await;
+        let output = resolve_raw(
+            edit,
+            json!({
+                "action": "resolve",
+                "proposalId": output_json(&staged)["proposalId"],
+                "reason": "rename call sites without changing file modes",
+            }),
+        )
+        .await
+        .expect("apply retained rewrite");
+        assert_eq!(output_json(&output)["filesWritten"], json!(2));
+        for (name, mode) in [("executable.rs", 0o751), ("readonly.rs", 0o444)] {
+            assert_eq!(read_file(&harness, name), "fn main() { renamed(); }\n");
+            assert_eq!(
+                std::fs::metadata(harness.temp_path(name))
+                    .expect("stat rewritten file")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "structural rewrites must retain {name}'s mode"
+            );
+        }
+        finish_case(
+            &harness,
+            "ast_edit_preserves_executable_and_readonly_permissions",
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn ast_edit_permission_drift_rejects_the_whole_proposal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    asupersync::test_utils::run_test(|| async {
+        let harness = TestHarness::new("ast_edit_permission_drift_rejects_the_whole_proposal");
+        for name in ["a.rs", "b.rs"] {
+            write_file(&harness, name, "fn main() { marker(); }\n");
+            std::fs::set_permissions(
+                harness.temp_path(name),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("set original mode");
+        }
+        let recorder = std::sync::Arc::new(pi::undo::FileMutationRecorder::default());
+        let registry = ToolRegistry::with_mutation_recorder(
+            &["ast_edit"],
+            harness.temp_dir(),
+            None,
+            Some(std::sync::Arc::clone(&recorder)),
+            None,
+        );
+        let edit = registry.get("ast_edit").expect("ast_edit registered");
+        let staged = stage(
+            &harness,
+            edit,
+            json!({"ops": [{"pat": "marker()", "out": "renamed()"}]}),
+        )
+        .await;
+        std::fs::set_permissions(
+            harness.temp_path("b.rs"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("concurrent permission change");
+        let error = resolve_raw(
+            edit,
+            json!({
+                "action": "resolve",
+                "proposalId": output_json(&staged)["proposalId"],
+                "reason": "rename call sites",
+            }),
+        )
+        .await
+        .expect_err("permission drift invalidates the reviewed transaction");
+        let message = error.to_string();
+        assert!(message.contains("[AST_PROPOSAL_STALE]"), "{message}");
+        assert!(message.contains("b.rs"), "{message}");
+        assert_eq!(read_file(&harness, "a.rs"), "fn main() { marker(); }\n");
+        assert_eq!(read_file(&harness, "b.rs"), "fn main() { marker(); }\n");
+        assert_eq!(
+            std::fs::metadata(harness.temp_path("b.rs"))
+                .expect("stat external mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            recorder.stats().undo_depth,
+            0,
+            "stale approval creates no undo unit"
+        );
+        finish_case(
+            &harness,
+            "ast_edit_permission_drift_rejects_the_whole_proposal",
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn ast_edit_staging_refuses_to_replace_symlinks_or_shared_hard_links() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    asupersync::test_utils::run_test(|| async {
+        let harness =
+            TestHarness::new("ast_edit_staging_refuses_to_replace_symlinks_or_shared_hard_links");
+        write_file(&harness, "target.rs", "fn main() { marker(); }\n");
+        symlink("target.rs", harness.temp_path("symlink.rs")).expect("create symlink");
+        std::fs::hard_link(
+            harness.temp_path("target.rs"),
+            harness.temp_path("hardlink.rs"),
+        )
+        .expect("create shared hard link");
+        let registry = ToolRegistry::new(&["ast_edit"], harness.temp_dir(), None);
+        let edit = registry.get("ast_edit").expect("ast_edit registered");
+        for path in ["symlink.rs", "hardlink.rs"] {
+            let error = edit
+                .execute(
+                    "stage-link",
+                    json!({"path": path, "ops": [{"pat": "marker()", "out": "renamed()"}]}),
+                    None,
+                )
+                .await
+                .expect_err("a structural rewrite must not replace a link identity");
+            assert!(error.to_string().contains("[AST_STAGE_FAILED]"), "{error}");
+            assert!(error.to_string().contains(path), "{error}");
+        }
+        assert_eq!(
+            std::fs::read_link(harness.temp_path("symlink.rs")).expect("symlink preserved"),
+            std::path::PathBuf::from("target.rs")
+        );
+        assert_eq!(
+            std::fs::metadata(harness.temp_path("target.rs"))
+                .expect("target metadata")
+                .nlink(),
+            2
+        );
+        assert_eq!(read_file(&harness, "target.rs"), "fn main() { marker(); }\n");
+        assert_eq!(read_file(&harness, "hardlink.rs"), "fn main() { marker(); }\n");
+        finish_case(
+            &harness,
+            "ast_edit_staging_refuses_to_replace_symlinks_or_shared_hard_links",
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn ast_edit_same_content_symlink_swap_invalidates_approval() {
+    use std::os::unix::fs::symlink;
+
+    asupersync::test_utils::run_test(|| async {
+        let harness = TestHarness::new("ast_edit_same_content_symlink_swap_invalidates_approval");
+        write_file(&harness, "a.rs", "fn main() { marker(); }\n");
+        write_file(&harness, "b.rs", "fn main() { marker(); }\n");
+        let registry = ToolRegistry::new(&["ast_edit"], harness.temp_dir(), None);
+        let edit = registry.get("ast_edit").expect("ast_edit registered");
+        let staged = stage(
+            &harness,
+            edit,
+            json!({"ops": [{"pat": "marker()", "out": "renamed()"}]}),
+        )
+        .await;
+        std::fs::rename(harness.temp_path("b.rs"), harness.temp_path("retained.rs"))
+            .expect("retain reviewed file");
+        symlink("retained.rs", harness.temp_path("b.rs")).expect("swap same-content symlink");
+        let error = resolve_raw(
+            edit,
+            json!({
+                "action": "resolve",
+                "proposalId": output_json(&staged)["proposalId"],
+                "reason": "rename call sites",
+            }),
+        )
+        .await
+        .expect_err("hash-equivalent symlink must not authorize a replacement");
+        assert!(error.to_string().contains("[AST_PROPOSAL_STALE]"), "{error}");
+        assert!(error.to_string().contains("b.rs"), "{error}");
+        assert_eq!(read_file(&harness, "a.rs"), "fn main() { marker(); }\n");
+        assert_eq!(read_file(&harness, "retained.rs"), "fn main() { marker(); }\n");
+        assert_eq!(
+            std::fs::read_link(harness.temp_path("b.rs")).expect("replacement link preserved"),
+            std::path::PathBuf::from("retained.rs")
+        );
+        finish_case(
+            &harness,
+            "ast_edit_same_content_symlink_swap_invalidates_approval",
+        );
+    });
+}
+
 #[test]
 fn ast_edit_reject_discards_with_zero_writes() {
     asupersync::test_utils::run_test(|| async {
@@ -316,16 +532,16 @@ fn ast_edit_reject_discards_with_zero_writes() {
 }
 
 // ---------------------------------------------------------------------------
-// Atomic rollback with injected write failure on file 2 of 3
+// Prepare all replacements before publishing any target
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 #[test]
-fn ast_edit_atomic_rollback_on_mid_apply_failure() {
+fn ast_edit_prepares_all_files_before_writing() {
     use std::os::unix::fs::PermissionsExt;
 
     asupersync::test_utils::run_test(|| async {
-        let harness = TestHarness::new("ast_edit_atomic_rollback_on_mid_apply_failure");
+        let harness = TestHarness::new("ast_edit_prepares_all_files_before_writing");
         // Sorted scan order: a_first.rs, locked/b_second.rs, z_third.rs.
         write_file(&harness, "a_first.rs", "fn a() {\n    marker(1);\n}\n");
         write_file(
@@ -356,7 +572,7 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
         let proposal_id = staged_json["proposalId"].as_str().unwrap().to_string();
 
         // Inject the failure: make the middle file's directory unwritable so
-        // temp-file creation fails at apply time (file 2 of 3).
+        // temp-file creation fails during preparation (file 2 of 3).
         let locked_dir = harness.temp_path("locked");
         let original_perms = std::fs::metadata(&locked_dir)
             .expect("stat locked dir")
@@ -397,7 +613,7 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
                 "skip",
                 "running with elevated privileges; permission injection ineffective",
             );
-            finish_case(&harness, "ast_edit_atomic_rollback_on_mid_apply_failure");
+            finish_case(&harness, "ast_edit_prepares_all_files_before_writing");
             return;
         }
 
@@ -412,8 +628,8 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
             "error must name the failed file, got: {message}"
         );
         assert!(
-            message.contains("rolled back 1 previously-written file(s)"),
-            "error must report rollback, got: {message}"
+            message.contains("original files restored"),
+            "error must report that the original images remain, got: {message}"
         );
         harness
             .log()
@@ -421,11 +637,11 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
                 ctx.push(("error".into(), message));
             });
 
-        // Atomicity: file 1 rolled back, file 2 untouched, file 3 never written.
+        // Every replacement is prepared before any target is published.
         assert_eq!(
             read_file(&harness, "a_first.rs"),
             "fn a() {\n    marker(1);\n}\n",
-            "first file must be rolled back to its original content"
+            "first file must retain its original content"
         );
         assert_eq!(
             read_file(&harness, "locked/b_second.rs"),
@@ -436,7 +652,7 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
             "fn c() {\n    marker(3);\n}\n",
             "third file must never be written"
         );
-        finish_case(&harness, "ast_edit_atomic_rollback_on_mid_apply_failure");
+        finish_case(&harness, "ast_edit_prepares_all_files_before_writing");
     });
 }
 

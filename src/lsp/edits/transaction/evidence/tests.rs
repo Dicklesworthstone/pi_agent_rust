@@ -200,3 +200,83 @@ fn checked_batches_reuse_the_existing_rollback_commit_path() {
     assert!(error.to_string().contains("LSP_EDIT_APPLY"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "old\n");
 }
+
+#[test]
+fn full_file_rewrite_requires_the_exact_source_used_to_compute_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().canonicalize().unwrap().join("source.rs");
+    std::fs::write(&path, "external\n").unwrap();
+    let mut prepared = PreparedEdit::replacements();
+    let error = prepared
+        .replace_file(&path, "original\n", "rewritten\n".to_string())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed while computing"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "external\n");
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+
+    let mut prepared = PreparedEdit::replacements();
+    prepared
+        .replace_file(&path, "external\n", "rewritten\n".to_string())
+        .unwrap();
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    prepared.commit(|| Ok(())).unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "rewritten\n");
+}
+
+#[test]
+fn full_file_rewrites_do_not_overwrite_external_writes_during_apply_or_rollback() {
+    for change_committed_target in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("a.rs");
+        let second = root.join("b.rs");
+        let mut prepared = PreparedEdit::replacements();
+        for path in [&first, &second] {
+            std::fs::write(path, "original\n").unwrap();
+            prepared
+                .replace_file(path, "original\n", "rewritten\n".to_string())
+                .unwrap();
+        }
+        let error = prepared
+            .0
+            .commit_with(|index, changed| {
+                if index == 0 {
+                    assert_eq!(changed, first.as_path());
+                    if change_committed_target {
+                        std::fs::write(changed, "external\n")?;
+                        return Err(std::io::Error::other("failure after an external edit"));
+                    }
+                    std::fs::write(&second, "external\n")?;
+                }
+                Ok(())
+            })
+            .expect_err("external edits must survive both commit and compensation");
+        if change_committed_target {
+            assert!(error.to_string().contains("LSP_EDIT_ROLLBACK"), "{error}");
+            assert!(error.to_string().contains("original retained at"), "{error}");
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "external\n");
+            assert_eq!(std::fs::read_to_string(&second).unwrap(), "original\n");
+            let backups: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".pi-lsp-backup-")
+                })
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "original\n");
+        } else {
+            assert!(error.to_string().contains("LSP_EDIT_APPLY"), "{error}");
+            assert!(error.to_string().contains("b.rs"), "{error}");
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "original\n");
+            assert_eq!(std::fs::read_to_string(&second).unwrap(), "external\n");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        }
+    }
+}

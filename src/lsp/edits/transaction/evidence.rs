@@ -69,9 +69,61 @@ fn prepare_checked(
 /// Staging creates no directories, backups or temporary files. Commit consumes
 /// this value and checks the exact original bytes, permissions and absence;
 /// it never stages a replacement plan against newly read contents.
-pub(in crate::lsp) struct PreparedEdit(Transaction, Annotations);
+pub(crate) struct PreparedEdit(Transaction, Annotations);
 
 impl PreparedEdit {
+    /// Build a reviewed local rewrite without translating complete files into
+    /// LSP ranges. Each replacement retains the same bounded regular-file
+    /// images, permissions and rollback path as server-originated edits.
+    pub(crate) fn replacements() -> Self {
+        Self(Transaction::default(), Annotations::default())
+    }
+
+    /// Retain the exact file used to compute a structural rewrite. A second
+    /// read must match that source before it can become the approval baseline.
+    /// Staging creates no directories or scratch files.
+    pub(crate) fn replace_file(
+        &mut self,
+        path: &Path,
+        original: &str,
+        replacement: String,
+    ) -> Result<()> {
+        let normalized = self.0.load(path)?;
+        if self.0.text_paths.contains(&normalized) {
+            return Err(conflict(format!(
+                "{} occurs more than once in the rewrite",
+                path.display()
+            )));
+        }
+        let image = self.0.files[&normalized].before.as_ref().ok_or_else(|| {
+            conflict(format!("{} disappeared while staging", path.display()))
+        })?;
+        if image.bytes.as_ref() != original.as_bytes() {
+            return Err(conflict(format!(
+                "{} changed while computing the rewrite; re-stage the proposal",
+                path.display()
+            )));
+        }
+        if replacement.len() > super::MAX_FILE_BYTES {
+            return Err(super::plan_error(
+                "LSP_EDIT_LIMIT",
+                "text replacement exceeds 16 MiB",
+            ));
+        }
+        let permissions = image.permissions.clone();
+        self.0.spend(replacement.len())?;
+        self.0
+            .files
+            .get_mut(&normalized)
+            .expect("loaded target")
+            .after = Some(Image {
+            bytes: replacement.into_bytes().into(),
+            permissions,
+        });
+        self.0.text_paths.insert(normalized);
+        Ok(())
+    }
+
     pub(in crate::lsp) fn with_recording(
         mut self,
         recording: Option<std::sync::Arc<crate::lsp::recording::Invocation>>,
@@ -97,7 +149,7 @@ impl PreparedEdit {
         self.1.required()
     }
 
-    pub(in crate::lsp) fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.0.files.keys()
     }
 
@@ -149,7 +201,7 @@ impl PreparedEdit {
         Ok(())
     }
 
-    pub(in crate::lsp) fn commit(
+    pub(crate) fn commit(
         self,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<ApplyOutcome> {

@@ -445,16 +445,21 @@ impl Transaction {
                 ensure_parents(&moving.new, &mut directories)?;
             }
             for change in &mut changes {
-                if let Some(moving) = &self.directory
+                let prepared = if let Some(moving) = &self.directory
                     && change.path.starts_with(&moving.old)
                 {
-                    change.prepare_with_backup_anchor(&mut directories, &moving.old)?;
+                    change.prepare_with_backup_anchor(&mut directories, &moving.old)
                 } else {
-                    change.prepare(&mut directories)?;
-                }
+                    change.prepare(&mut directories)
+                };
+                prepared.map_err(|error| {
+                    io::Error::new(error.kind(), format!("{}: {error}", change.path.display()))
+                })?;
             }
             for (index, change) in changes.iter_mut().enumerate() {
-                change.apply()?;
+                change.apply().map_err(|error| {
+                    io::Error::new(error.kind(), format!("{}: {error}", change.path.display()))
+                })?;
                 after_change(index, &change.path)?;
             }
             if let Some(moving) = &self.directory {

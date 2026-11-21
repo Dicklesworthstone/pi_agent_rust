@@ -17,22 +17,21 @@
 //! `ast_edit` never writes on the first call. `action: "stage"` computes all
 //! replacements and returns a proposal id, a replacement count, and per-file
 //! unified diff previews. `action: "resolve"` with the proposal id and a
-//! one-line reason applies the proposal atomically: every file is re-hashed
-//! at apply time (any drift rejects the whole proposal, naming the file),
-//! then each file is written via temp-file + rename; a mid-apply failure
-//! rolls back already-written files from the staged originals.
+//! one-line reason applies the retained transaction: exact file contents and
+//! permissions are rechecked before writing and before each replacement.
+//! Reported failures restore prior writes unless a concurrent editor changed
+//! them; conflicts retain recovery files instead of overwriting that work.
 //! `action: "reject"` discards the proposal with zero writes.
 
 use crate::error::{Error, Result};
+use crate::lsp::edits::PreparedEdit;
 use crate::model::{ContentBlock, TextContent};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use ast_grep_core::{AstGrep, Pattern};
 use ast_grep_language::SupportLang;
 use async_trait::async_trait;
 use serde::Deserialize;
-use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -188,16 +187,6 @@ fn display_path(path: &Path, cwd: &Path) -> String {
     )
 }
 
-/// SHA-256 hex digest of file content (stale-anchor hash).
-fn content_hash(content: &str) -> String {
-    let digest = sha2::Sha256::digest(content.as_bytes());
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
 /// Build a gitignore-style glob override filter anchored at `cwd`.
 fn build_glob_override(
     cwd: &Path,
@@ -342,21 +331,24 @@ fn unified_diff_preview(display: &str, old: &str, new: &str) -> String {
     text
 }
 
-/// Write file content atomically via temp-file + rename in the same directory.
-fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let tmp = path.with_file_name(format!(
-        ".{file_name}.pi-ast-edit-{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
-    let result = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+/// Keep AST diagnostics stable while sharing the workspace edit transaction.
+fn transaction_error(code: &str, error: Error) -> Error {
+    let message = match error {
+        Error::Tool { message, .. } => message,
+        other => other.to_string(),
+    };
+    let code = if message.starts_with("[LSP_EDIT_LIMIT]") {
+        "AST_LIMIT_EXCEEDED"
+    } else if code == "AST_APPLY_FAILED" && message.starts_with("[LSP_EDIT_CONFLICT]") {
+        "AST_PROPOSAL_STALE"
+    } else {
+        code
+    };
+    let detail = message
+        .strip_prefix("[LSP_EDIT_")
+        .and_then(|message| message.split_once("] ").map(|(_, detail)| detail))
+        .unwrap_or(&message);
+    Error::tool("ast_edit", format!("[{code}] {detail}"))
 }
 
 fn text_output(text: String, details: serde_json::Value) -> ToolOutput {
@@ -646,29 +638,25 @@ struct TextEdit {
     inserted_text: String,
 }
 
-/// A staged file rewrite: original content retained for hash verification and
-/// rollback, new content plus diff preview for review.
+/// Review metadata for one rewrite. The prepared transaction owns all file
+/// images, so preview and approval cannot silently adopt a newer preimage.
 #[derive(Debug)]
 struct StagedFile {
-    path: PathBuf,
     display: String,
-    original_hash: String,
-    original_content: String,
-    new_content: String,
     replacements: usize,
     diff: String,
 }
 
 /// A staged rewrite proposal awaiting resolve/reject.
-#[derive(Debug)]
 struct StagedProposal {
     files: Vec<StagedFile>,
+    transaction: PreparedEdit,
     total_replacements: usize,
     sequence: u64,
 }
 
 /// Bounded proposal store with oldest-first eviction.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ProposalStore {
     proposals: HashMap<String, StagedProposal>,
     order: VecDeque<String>,
@@ -701,7 +689,7 @@ impl ProposalStore {
 ///
 /// `action: "stage"` (default) computes the rewrite and returns a proposal id
 /// with per-file diff previews. `action: "resolve"` applies a staged proposal
-/// atomically after re-hashing every file. `action: "reject"` discards it.
+/// after checking every retained file image. `action: "reject"` discards it.
 pub struct AstEditTool {
     cwd: PathBuf,
     proposals: Mutex<ProposalStore>,
@@ -880,6 +868,7 @@ impl AstEditTool {
         }
 
         let mut staged_files: Vec<StagedFile> = Vec::new();
+        let mut transaction = PreparedEdit::replacements();
         let mut total_replacements = 0_usize;
         let mut skipped_files = 0_usize;
         for file in &scan.files {
@@ -907,12 +896,11 @@ impl AstEditTool {
             }
             let display = display_path(file, &self.cwd);
             let diff = unified_diff_preview(&display, &original, &new_content);
+            transaction
+                .replace_file(file, &original, new_content)
+                .map_err(|error| transaction_error("AST_STAGE_FAILED", error))?;
             staged_files.push(StagedFile {
-                path: file.clone(),
                 display,
-                original_hash: content_hash(&original),
-                original_content: original,
-                new_content,
                 replacements: count,
                 diff,
             });
@@ -935,6 +923,7 @@ impl AstEditTool {
         let proposal = StagedProposal {
             total_replacements,
             files: staged_files,
+            transaction,
             sequence: 0,
         };
         let files_json: Vec<serde_json::Value> = proposal
@@ -961,14 +950,13 @@ impl AstEditTool {
             "filesScanned": scan.files.len(),
             "skippedFiles": skipped_files,
             "scanTruncated": scan.truncated,
-            "message": "proposal staged; NOTHING was written. Review the diffs, then call ast_edit with action=resolve, this proposalId, and a one-line reason to apply atomically (or action=reject to discard).",
+            "message": "proposal staged; NOTHING was written. Review the diffs, then call ast_edit with action=resolve, this proposalId, and a one-line reason to apply the retained rewrite (or action=reject to discard).",
         });
         let text = serde_json::to_string_pretty(&payload)
             .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
         Ok(text_output(text, payload))
     }
 
-    #[allow(clippy::too_many_lines)] // verify, record, apply with rollback, report
     fn resolve(&self, tool_call_id: &str, input: &AstEditInput) -> Result<ToolOutput> {
         let proposal_id = input
             .proposal_id
@@ -993,74 +981,32 @@ impl AstEditTool {
                 ))
             })?;
 
-        // Pre-verify every file before writing anything: stale-anchor
-        // rejection (content re-hash) applies to the whole proposal.
-        for file in &proposal.files {
-            let current = std::fs::read_to_string(&file.path).map_err(|error| {
-                Error::tool(
-                    "ast_edit",
-                    format!(
-                        "[AST_PROPOSAL_STALE] cannot re-read '{}': {error}; whole proposal '{proposal_id}' rejected",
-                        file.display
-                    ),
-                )
-            })?;
-            if content_hash(&current) != file.original_hash {
-                return Err(Error::tool(
-                    "ast_edit",
-                    format!(
-                        "[AST_PROPOSAL_STALE] file '{}' changed since staging; whole proposal '{proposal_id}' rejected (re-stage to proceed)",
-                        file.display
-                    ),
-                ));
-            }
-        }
-
-        // Apply: temp-file + rename per file; roll back on mid-failure.
-        // The whole proposal is one undo unit.
+        // Keep the reviewed images through commit. Shared transaction checks
+        // protect each write and each rollback from concurrent editor changes.
+        // Capture the complete undo unit once, after preimage verification.
         let recorder = self.mutation_recorder.as_deref();
-        for file in &proposal.files {
+        let paths: Vec<_> = proposal.transaction.paths().cloned().collect();
+        let result = proposal.transaction.commit(|| {
             if let Some(recorder) = recorder {
                 recorder
-                    .begin_file(tool_call_id, "ast_edit", &file.path)
+                    .begin_files(tool_call_id, "ast_edit", &paths)
                     .map_err(|error| {
                         Error::tool("ast_edit", format!("Cannot record undo intent: {error}"))
                     })?;
             }
-        }
-        let mut written = 0_usize;
-        for file in &proposal.files {
-            if let Err(error) = write_file_atomic(&file.path, &file.new_content) {
-                let mut rollback_errors = Vec::new();
-                for previous in &proposal.files[..written] {
-                    if let Err(rollback_error) =
-                        write_file_atomic(&previous.path, &previous.original_content)
-                    {
-                        rollback_errors.push(format!("{}: {rollback_error}", previous.display));
-                    }
-                }
-                // Keep the pending intent durable throughout compensation. An
-                // interrupted or failed rollback must remain an undo gap.
+            Ok(())
+        });
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // This also settles a partially admitted durable undo intent.
+                // Partial rollback retains the recorder's omission barrier.
                 if let Some(recorder) = recorder {
                     recorder.abort(tool_call_id);
                 }
-                let mut message = format!(
-                    "[AST_APPLY_FAILED] failed to write '{}': {error}; rolled back {written} previously-written file(s)",
-                    file.display
-                );
-                if rollback_errors.is_empty() {
-                    message.push_str("; all prior writes restored");
-                } else {
-                    let _ = write!(
-                        message,
-                        "; ROLLBACK ERRORS (manual repair needed): {}",
-                        rollback_errors.join("; ")
-                    );
-                }
-                return Err(Error::tool("ast_edit", message));
+                return Err(transaction_error("AST_APPLY_FAILED", error));
             }
-            written += 1;
-        }
+        };
         if let Some(recorder) = recorder {
             recorder.commit(tool_call_id);
         }
@@ -1080,7 +1026,7 @@ impl AstEditTool {
             "proposalId": proposal_id,
             "reason": reason,
             "replacements": proposal.total_replacements,
-            "filesWritten": written,
+            "filesWritten": outcome.changed_paths.len(),
             "files": files_json,
         });
         let text = serde_json::to_string_pretty(&payload)
@@ -1147,7 +1093,7 @@ impl Tool for AstEditTool {
     }
 
     fn description(&self) -> &str {
-        "Staged structural code rewrite using tree-sitter AST patterns (ast-grep syntax). Patterns match AST structure, NOT text, and never match inside comments or strings. ops are applied in order; each op is {pat, out}: `$NAME` captures exactly one AST node, `$$$NAME` captures zero or more (use `$$$NAME`, NOT `$$NAME`); reusing the same `$NAME` twice in `pat` requires identical code at both sites; `pat` and `out` must each parse as a single AST node; an empty `out` deletes the matched node; substitution is 1:1 (each match replaced independently). action=stage (default) returns a proposalId, replacement count, and per-file diff previews — NOTHING is written. action=resolve with proposalId and a one-line `reason` applies atomically: every file is re-hashed at apply time and any change since staging rejects the WHOLE proposal naming the file; writes are temp-file+rename per file with rollback on mid-failure. action=reject discards a proposal with zero writes."
+        "Staged structural code rewrite using tree-sitter AST patterns (ast-grep syntax). Patterns match AST structure, NOT text, and never match inside comments or strings. ops are applied in order; each op is {pat, out}: `$NAME` captures exactly one AST node, `$$$NAME` captures zero or more (use `$$$NAME`, NOT `$$NAME`); reusing the same `$NAME` twice in `pat` requires identical code at both sites; `pat` and `out` must each parse as a single AST node; an empty `out` deletes the matched node; substitution is 1:1 (each match replaced independently). action=stage (default) returns a proposalId, replacement count, and per-file diff previews — NOTHING is written. action=resolve with proposalId and a one-line `reason` applies the retained rewrite: exact contents and permissions are checked before writing and before each replacement. Stale files reject the proposal; write failures roll back prior changes without overwriting concurrent edits, retaining recovery files if needed. File permissions are preserved; symlinks and shared hard links are rejected. Transactions are limited to 1024 files and 64 MiB of snapshots and replacements. action=reject discards a proposal with zero writes."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1157,7 +1103,7 @@ impl Tool for AstEditTool {
                 "action": {
                     "type": "string",
                     "enum": ["stage", "resolve", "reject"],
-                    "description": "stage (default): compute rewrite and return a proposal; resolve: apply a staged proposal atomically; reject: discard it"
+                    "description": "stage (default): compute rewrite and return a proposal; resolve: apply a retained proposal with drift checks and rollback; reject: discard it"
                 },
                 "ops": {
                     "type": "array",
