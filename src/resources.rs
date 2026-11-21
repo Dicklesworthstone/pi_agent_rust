@@ -8,8 +8,8 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::package_manager::{
-    PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
-    project_universal_skill_dirs,
+    PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolveRoots, ResolvedResource,
+    ResourceOrigin, project_universal_skill_dirs,
 };
 use crate::theme::{MAX_RESOURCE_FILE_BYTES, Theme};
 use serde_json::{Value, json};
@@ -265,9 +265,8 @@ impl ResourceCliOptions {
             || !self.theme_paths.is_empty()
     }
 
-    /// Returns `true` when every resource category is disabled via `--no-*` flags
-    /// and there are no explicit CLI `-e` extension sources that would require
-    /// package resolution.
+    /// Returns `true` when every configured resource category is disabled.
+    /// Explicit CLI sources still resolve through their separate loading path.
     #[must_use]
     pub const fn all_configured_resources_disabled(&self) -> bool {
         self.no_skills && self.no_prompt_templates && self.no_extensions && self.no_themes
@@ -321,27 +320,38 @@ impl ResourceLoader {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn load(
         manager: &PackageManager,
         cwd: &Path,
         config: &Config,
         cli: &ResourceCliOptions,
     ) -> Result<Self> {
+        let roots = manager.effective_roots();
+        Self::load_with_roots(manager, cwd, config, cli, &roots).await
+    }
+
+    /// Load resources from the caller's captured settings and discovery roots.
+    /// The caller applies its workspace-trust decision to the project root flag.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn load_with_roots(
+        manager: &PackageManager,
+        cwd: &Path,
+        config: &Config,
+        cli: &ResourceCliOptions,
+        roots: &ResolveRoots,
+    ) -> Result<Self> {
         let enable_skill_commands = config.enable_skill_commands();
 
-        // Skip the expensive package/settings resolution when every resource
-        // category is disabled (--no-extensions --no-skills etc.) and there are
-        // no explicit CLI `-e` sources.  This avoids reading settings.json,
-        // running npm lookups, and hitting the network on startup when the user
-        // explicitly opted out of all configured resources (Issue #38).
-        let skip_configured_resolution =
-            cli.all_configured_resources_disabled() && cli.extension_paths.is_empty();
+        // Skip configured package/settings resolution when every category is
+        // disabled (--no-extensions --no-skills etc.). Explicit CLI `-e` sources
+        // resolve independently below, without reading disabled settings or
+        // triggering their package-install side effects (Issue #38).
+        let skip_configured_resolution = cli.all_configured_resources_disabled();
 
         let resolved = if skip_configured_resolution {
             crate::package_manager::ResolvedPaths::default()
         } else {
-            Box::pin(manager.resolve()).await?
+            Box::pin(manager.resolve_with_roots(roots)).await?
         };
 
         let cli_extensions = if cli.extension_paths.is_empty() {
@@ -426,16 +436,16 @@ impl ResourceLoader {
 
         // Load skills, prompt templates, and themes in parallel — they are independent
         // filesystem walks that benefit from overlapped I/O on multi-core machines.
-        let agent_dir = Config::global_dir();
+        let agent_dir = &roots.global_base_dir;
         let cwd_buf = cwd.to_path_buf();
         let (skills_join, prompts_join, themes_join) = std::thread::scope(|s| {
             let cwd_s = &cwd_buf;
-            let agent_s = &agent_dir;
+            let agent_s = agent_dir;
             let skills_handle = s.spawn(move || {
                 load_skills(LoadSkillsOptions {
                     cwd: cwd_s.clone(),
                     agent_dir: agent_s.clone(),
-                    home_dir: dirs::home_dir(),
+                    home_dir: roots.home_dir.clone(),
                     skill_paths,
                     include_defaults: false,
                 })
@@ -3671,6 +3681,63 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_cli_package_skips_disabled_configured_resolution() {
+        run_async(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().join("workspace");
+            let package = cwd.join("explicit-package");
+            let skill_dir = package.join("skills/explicit");
+            fs::create_dir_all(&skill_dir).expect("create explicit package");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: explicit\ndescription: Explicit package skill\n---\nBody",
+            )
+            .expect("write explicit skill");
+            let extension = package.join("explicit.native.json");
+            fs::write(&extension, "{}").expect("write explicit extension");
+            fs::write(
+                package.join("package.json"),
+                r#"{"pi":{"skills":["skills"],"extensions":["explicit.native.json"]}}"#,
+            )
+            .expect("write package manifest");
+            let roots = ResolveRoots {
+                global_settings_path: temp.path().join("invalid-global.json"),
+                project_settings_path: temp.path().join("invalid-project.json"),
+                global_base_dir: temp.path().join("global"),
+                project_base_dir: cwd.join(".pi"),
+                project_settings_enabled: true,
+                home_dir: None,
+            };
+            for path in [&roots.global_settings_path, &roots.project_settings_path] {
+                fs::write(path, "invalid JSON must not be read").expect("write invalid settings");
+            }
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: vec![package.to_string_lossy().into_owned()],
+                theme_paths: Vec::new(),
+            };
+            let loader = ResourceLoader::load_with_roots(
+                &PackageManager::new(cwd.clone()),
+                &cwd,
+                &Config::default(),
+                &cli,
+                &roots,
+            )
+            .await
+            .expect("explicit-only resolution must not read disabled configuration");
+            assert_eq!(loader.extensions(), &[extension]);
+            assert_eq!(loader.skills().len(), 1);
+            assert_eq!(loader.skills()[0].file_path, skill_dir.join("SKILL.md"));
+            assert_eq!(loader.skills()[0].name, "explicit");
+        });
+    }
+
+    #[test]
     fn test_resource_loader_rejects_invalid_cli_theme_file() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4221,6 +4288,7 @@ still frontmatter",
         run_async(async {
             let temp = tempfile::tempdir().expect("tempdir");
             let cwd = temp.path().join("project");
+            fs::create_dir_all(cwd.join(".git")).expect("create workspace boundary");
             let agent_dir = temp.path().join("custom-agent");
             let home = temp.path().join("home");
             let cli_package = temp.path().join("cli-package");
@@ -4237,9 +4305,8 @@ still frontmatter",
                 user_package.join("skills"),
                 agent_dir.join("skills.managed"),
             ];
-            // Each winner competes with every lower tier. This exercises real
-            // package resolution, including its path sorting, before the same
-            // merge/load pipeline used by ResourceLoader::load.
+            // Each winner competes with every lower tier through the complete
+            // loader, including package resolution and captured-root attribution.
             for winner in 0..tiers.len() {
                 let name = format!("tier-{winner}");
                 for dir in &tiers[winner..] {
@@ -4278,52 +4345,149 @@ still frontmatter",
                 .expect("write settings");
             }
             let manager = PackageManager::new(cwd.clone());
-            let resolved = manager
-                .resolve_with_roots(&roots)
-                .await
-                .expect("resolve defaults");
-            let cli = manager
-                .resolve_extension_sources(
-                    &[cli_package.to_string_lossy().into_owned()],
-                    ResolveExtensionSourcesOptions {
-                        local: false,
-                        temporary: true,
-                    },
-                )
-                .await
-                .expect("resolve CLI package");
+            let config = Config::default();
 
             for include_configured in [true, false] {
-                let paths = merge_resource_paths(
-                    &tiers[..1],
-                    cli.skills.clone(),
-                    resolved.skills.clone(),
-                    include_configured,
-                );
-                let result = load_skills(LoadSkillsOptions {
-                    cwd: cwd.clone(),
-                    agent_dir: agent_dir.clone(),
-                    home_dir: Some(home.clone()),
-                    skill_paths: paths,
-                    include_defaults: false,
-                });
+                let cli = ResourceCliOptions {
+                    no_skills: !include_configured,
+                    no_prompt_templates: true,
+                    no_extensions: true,
+                    no_themes: true,
+                    skill_paths: vec![tiers[0].to_string_lossy().into_owned()],
+                    prompt_paths: Vec::new(),
+                    extension_paths: vec![cli_package.to_string_lossy().into_owned()],
+                    theme_paths: Vec::new(),
+                };
+                let result =
+                    ResourceLoader::load_with_roots(&manager, &cwd, &config, &cli, &roots)
+                        .await
+                        .expect("load resources from captured roots");
                 let expected_count = if include_configured { 9 } else { 2 };
-                assert_eq!(result.skills.len(), expected_count);
-                for (index, skill) in result.skills.iter().enumerate() {
+                assert_eq!(result.skills().len(), expected_count);
+                for (index, skill) in result.skills().iter().enumerate() {
                     let name = format!("tier-{index}");
                     assert_eq!(skill.name, name);
                     assert_eq!(skill.file_path, tiers[index].join(name).join("SKILL.md"));
+                    assert_eq!(
+                        skill.source,
+                        [
+                            "path", "path", "project", "project", "user", "user", "path",
+                            "path", "managed",
+                        ][index]
+                    );
                 }
                 assert_eq!(
-                    result.diagnostics.len(),
+                    result.skill_diagnostics().len(),
                     if include_configured { 36 } else { 1 }
                 );
                 assert!(
                     result
-                        .diagnostics
+                        .skill_diagnostics()
                         .iter()
                         .all(|d| d.kind == DiagnosticKind::Collision)
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_captured_roots_exclude_ambient_and_disabled_projects() {
+        run_async(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().join("workspace");
+            fs::create_dir_all(cwd.join(".git")).expect("create workspace boundary");
+            let mut roots = ResolveRoots {
+                global_settings_path: temp.path().join("captured-global.json"),
+                project_settings_path: temp.path().join("captured-project.json"),
+                global_base_dir: temp.path().join("global-resources"),
+                project_base_dir: temp.path().join("project-resources"),
+                project_settings_enabled: true,
+                home_dir: None,
+            };
+            for (base, name) in [
+                (roots.global_base_dir.join("configured"), "global-skill"),
+                (roots.project_base_dir.join("configured"), "project-skill"),
+                (cwd.join(".pi/skills"), "ambient-skill"),
+                (cwd.join(".agents/skills"), "universal-skill"),
+            ] {
+                let dir = base.join(name);
+                fs::create_dir_all(&dir).expect("create skill dir");
+                fs::write(
+                    dir.join("SKILL.md"),
+                    format!("---\nname: {name}\ndescription: Captured roots fixture\n---\nBody"),
+                )
+                .expect("write skill");
+            }
+            for (settings, base, extension) in [
+                (
+                    &roots.global_settings_path,
+                    &roots.global_base_dir,
+                    "global.native.json",
+                ),
+                (
+                    &roots.project_settings_path,
+                    &roots.project_base_dir,
+                    "project.native.json",
+                ),
+            ] {
+                fs::write(
+                    settings,
+                    serde_json::to_vec(&json!({
+                        "skills": ["configured"], "extensions": [extension],
+                    }))
+                    .expect("encode captured settings"),
+                )
+                .expect("write captured settings");
+                fs::write(base.join(extension), "{}").expect("write selected extension");
+            }
+            let manager = PackageManager::new(cwd.clone());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: false,
+                no_prompt_templates: true,
+                no_extensions: false,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+            for project_enabled in [true, false] {
+                roots.project_settings_enabled = project_enabled;
+                if !project_enabled {
+                    fs::write(&roots.project_settings_path, "invalid JSON must not be read")
+                        .expect("make disabled project settings unreadable as configuration");
+                }
+                let loader =
+                    ResourceLoader::load_with_roots(&manager, &cwd, &config, &cli, &roots)
+                        .await
+                        .expect("load captured roots");
+                let expected_skills = if project_enabled {
+                    vec!["global-skill", "project-skill", "universal-skill"]
+                } else {
+                    vec!["global-skill"]
+                };
+                assert_eq!(
+                    loader
+                        .skills()
+                        .iter()
+                        .map(|skill| skill.name.as_str())
+                        .collect::<Vec<_>>(),
+                    expected_skills
+                );
+                assert!(loader.skill_diagnostics().is_empty());
+                assert!(
+                    loader
+                        .extensions()
+                        .contains(&roots.global_base_dir.join("global.native.json"))
+                );
+                assert_eq!(
+                    loader
+                        .extensions()
+                        .contains(&roots.project_base_dir.join("project.native.json")),
+                    project_enabled
+                );
+                assert_eq!(loader.extensions().len(), if project_enabled { 2 } else { 1 });
             }
         });
     }

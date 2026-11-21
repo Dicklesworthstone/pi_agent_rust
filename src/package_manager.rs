@@ -274,6 +274,33 @@ impl PackageManager {
         resolve_install_source_alias(source, &self.cwd).unwrap_or_else(|| source.to_string())
     }
 
+    /// Bind an explicit extension source to this manager's workspace before
+    /// another workspace resolves it. Missing local paths retain their origin;
+    /// aliases and remote sources retain the parser's package semantics.
+    pub(crate) fn anchor_extension_source(&self, source: &str) -> Result<String> {
+        let source = validate_non_empty_source(source, "Extension source")?;
+        let cwd = std::path::absolute(&self.cwd)?;
+        match parse_source(source, &cwd) {
+            ParsedSource::Local { path } => path
+                .into_os_string()
+                .into_string()
+                .map_err(|_| Error::config("Extension source path is not valid UTF-8")),
+            ParsedSource::Npm { spec, .. } => Ok(format!("npm:{spec}")),
+            ParsedSource::Git {
+                clone_source,
+                r#ref,
+                ..
+            } => {
+                let mut anchored = format!("git:{clone_source}");
+                if let Some(reference) = r#ref {
+                    anchored.push('@');
+                    anchored.push_str(&reference);
+                }
+                Ok(anchored)
+            }
+        }
+    }
+
     /// Get a stable identity for a package source, ignoring version/ref.
     ///
     /// Mirrors pi-mono's `getPackageIdentity()`:
@@ -700,7 +727,7 @@ impl PackageManager {
     /// untrusted workspace resolves as if it declared no project settings or
     /// project resources (see `test_config_override_roots_ignore_project_
     /// package_filters` for what a disabled flag excludes).
-    fn effective_roots(&self) -> ResolveRoots {
+    pub(crate) fn effective_roots(&self) -> ResolveRoots {
         self.apply_project_trust(ResolveRoots::from_env(&self.cwd))
     }
 
@@ -5272,6 +5299,85 @@ mod tests {
             ParsedSource::Local { path } => assert_eq!(path, local),
             other => panic!("Unexpected parsed source: {:?}", other),
         }
+    }
+
+    #[test]
+    fn anchored_extension_sources_cannot_fall_back_to_another_workspace() {
+        run_async(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let launch = temp.path().join("launch");
+            let target = temp.path().join("target");
+            fs::create_dir_all(&launch).expect("create launch workspace");
+            fs::create_dir_all(&target).expect("create target workspace");
+            fs::write(target.join("plugin.ts"), "export default function init() {}")
+                .expect("write target-only extension");
+            let launch_manager = PackageManager::new(launch.clone());
+            let target_manager = PackageManager::new(target);
+            for source in ["./plugin.ts", "plugin.ts"] {
+                let anchored = launch_manager
+                    .anchor_extension_source(source)
+                    .expect("anchor absent local extension");
+                assert_eq!(Path::new(&anchored), launch.join("plugin.ts"));
+                let error = target_manager
+                    .resolve_extension_sources(
+                        &[anchored],
+                        ResolveExtensionSourcesOptions {
+                            local: false,
+                            temporary: true,
+                        },
+                    )
+                    .await
+                    .expect_err("the editor workspace must not supply the missing launch file");
+                assert!(error.to_string().contains("does not exist"));
+                assert!(error.to_string().contains(&launch.display().to_string()));
+            }
+            let local_alias_name = launch.join("checkpoint-pi");
+            fs::create_dir_all(&local_alias_name).expect("create local alias-name directory");
+            let anchored_alias = launch_manager
+                .anchor_extension_source("checkpoint-pi")
+                .expect("anchor local alias-name directory");
+            assert_eq!(
+                Path::new(&anchored_alias),
+                local_alias_name,
+                "an existing launch path retains precedence over an index alias"
+            );
+            assert!(launch_manager.anchor_extension_source(" \t ").is_err());
+        });
+    }
+
+    #[test]
+    fn anchored_extension_sources_preserve_remote_and_local_git_specs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = temp.path().join("launch");
+        let manager = PackageManager::new(launch.clone());
+        for (source, expected) in [
+            ("npm:@scope/pkg@1.2.3", "npm:@scope/pkg@1.2.3"),
+            ("github.com/owner/repo@v2", "git:github.com/owner/repo@v2"),
+            (
+                "https://github.com/owner/repo.git@main",
+                "git:https://github.com/owner/repo.git@main",
+            ),
+            (
+                "git:https://fixture-token@github.com/owner/repo.git@release",
+                "git:https://fixture-token@github.com/owner/repo.git@release",
+            ),
+            (
+                "git:git@github.com:owner/repo.git@main",
+                "git:git@github.com:owner/repo.git@main",
+            ),
+        ] {
+            assert_eq!(manager.anchor_extension_source(source).unwrap(), expected);
+        }
+        assert_eq!(
+            manager
+                .anchor_extension_source("git:./repo@release/candidate")
+                .unwrap(),
+            format!("git:{}@release/candidate", launch.join("repo").display())
+        );
+        assert_eq!(
+            manager.anchor_extension_source("git:../sibling").unwrap(),
+            format!("git:{}", temp.path().join("sibling").display())
+        );
     }
 
     #[test]

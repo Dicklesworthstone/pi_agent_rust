@@ -2964,6 +2964,10 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
             pi.on("session_start", () => {
                 sessionTag = pi.getFlag("acp-probe-tag");
             });
+            pi.registerCommand("acp-status", {
+                description: "Read the extension's startup state without a provider turn",
+                handler: args => `ACP_COMMAND:${args}:${startupTag}:${sessionTag}`
+            });
             pi.registerTool({
                 name: "acp_ext_probe",
                 label: "ACP Extension Probe",
@@ -3080,11 +3084,21 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
             )
             .await;
             let id = created["result"]["sessionId"].as_str().unwrap().to_string();
-            approved_fork_prompt(
+            let command = discovery_request(
                 &input,
                 &outgoing,
                 &mut transcript,
                 3,
+                "session/prompt",
+                json!({ "sessionId": id, "prompt": [{ "type": "text", "text": "/acp-status new" }] }),
+            )
+            .await;
+            assert_eq!(command["result"]["stopReason"], "end_turn", "{command}");
+            approved_fork_prompt(
+                &input,
+                &outgoing,
+                &mut transcript,
+                4,
                 &id,
                 "Run the extension probe",
             )
@@ -3106,6 +3120,18 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
     assert!(
         wire_log.contains("EXT_OK:zed-turn-1:host-startup-value:host-startup-value"),
         "extension flags must reach startup and session_start before ACP tool execution: {wire_log}"
+    );
+    assert!(wire_log.contains("ACP_COMMAND:new:host-startup-value:host-startup-value"));
+    assert!(
+        prompt_updates.iter().any(|value| {
+            value["params"]["update"]["sessionUpdate"] == "available_commands_update"
+                && value["params"]["update"]["availableCommands"]
+                    .as_array()
+                    .is_some_and(|commands| {
+                        commands.iter().any(|command| command["name"] == "acp-status")
+                    })
+        }),
+        "an extension-only session advertises its actual commands"
     );
 
     // 3. Restart ACP server and verify `session/load` replays persisted transcript + re-boots extension!
@@ -3147,6 +3173,38 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
                 loaded.get("error").is_none(),
                 "session/load failed: {loaded}"
             );
+            let command = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                3,
+                "session/prompt",
+                json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "/acp-status restored" }] }),
+            )
+            .await;
+            assert_eq!(command["result"]["stopReason"], "end_turn", "{command}");
+            let forked = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                4,
+                "session/fork",
+                json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+            )
+            .await;
+            let fork_id = forked["result"]["sessionId"]
+                .as_str()
+                .expect("forked session");
+            let command = discovery_request(
+                &input,
+                &outgoing,
+                &mut transcript,
+                5,
+                "session/prompt",
+                json!({ "sessionId": fork_id, "prompt": [{ "type": "text", "text": "/acp-status forked" }] }),
+            )
+            .await;
+            assert_eq!(command["result"]["stopReason"], "end_turn", "{command}");
             input
                 .try_send(json!({"jsonrpc": "2.0", "method": "exit"}).to_string())
                 .unwrap();
@@ -3164,6 +3222,23 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
         reload_wire.contains("Run the extension probe")
             && reload_wire.contains("Recovered editor answer"),
         "restarted ACP server must replay persisted transcript: {reload_wire}"
+    );
+    assert!(reload_wire.contains("ACP_COMMAND:restored:extension-default:extension-default"));
+    assert!(reload_wire.contains("ACP_COMMAND:forked:extension-default:extension-default"));
+    assert_eq!(
+        reload_updates
+            .iter()
+            .filter(|value| {
+                value["params"]["update"]["sessionUpdate"] == "available_commands_update"
+                    && value["params"]["update"]["availableCommands"]
+                        .as_array()
+                        .is_some_and(|commands| {
+                            commands.iter().any(|command| command["name"] == "acp-status")
+                        })
+            })
+            .count(),
+        2,
+        "load and fork both restore command discovery"
     );
 
     provider.finish(2);

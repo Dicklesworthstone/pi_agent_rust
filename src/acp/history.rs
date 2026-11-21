@@ -281,10 +281,10 @@ pub(super) async fn load(
             send_update(out, id, update).await?;
         }
     }
-    if guard.mcp.is_some() {
+    if let Some(notification) = super::commands::for_state(id, &guard) {
         // This is configuration, not replayed conversation content; resume
         // remains history-free. Servers connect only through native trust.
-        send_line(out, super::mcp::commands_notification(id)).await?;
+        send_line(out, notification).await?;
     }
     Ok(response)
 }
@@ -550,10 +550,7 @@ pub(super) async fn fork(
     let response = session_setup_response(&fork_id, &state)
         .map_err(|error| HistoryError::internal(error.to_string()))?
         .ok_or_else(HistoryError::busy)?;
-    let mcp_notification = state
-        .mcp
-        .as_ref()
-        .map(|_| super::mcp::commands_notification(&fork_id));
+    let commands_notification = super::commands::for_state(&fork_id, &state);
     let state = Arc::new(Mutex::new(state));
     let mut registry = sessions
         .lock(cx)
@@ -580,7 +577,7 @@ pub(super) async fn fork(
     if let Some(notification) = plan_notification {
         send_line(out, notification).await?;
     }
-    if let Some(notification) = mcp_notification {
+    if let Some(notification) = commands_notification {
         send_line(out, notification).await?;
     }
     Ok(response)

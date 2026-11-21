@@ -271,21 +271,12 @@ pub(super) fn check_reattach(
     Ok(())
 }
 
-pub(super) fn commands_notification(id: &str) -> String {
-    json_rpc_notification(
-        "session/update",
-        json!({
-            "sessionId": id,
-            "update": {
-                "sessionUpdate": "available_commands_update",
-                "availableCommands": [{
-                    "name": "mcp",
-                    "description": "Inspect, refresh, trust, authenticate, or test this session's MCP servers",
-                    "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME | reauth NAME | unauth NAME" },
-                }],
-            },
-        }),
-    )
+pub(super) fn command_metadata() -> Value {
+    json!({
+        "name": "mcp",
+        "description": "Inspect, refresh, trust, authenticate, or test this session's MCP servers",
+        "input": { "hint": "list | refresh | inspect NAME | trust NAME | deny NAME | test NAME | reauth NAME | unauth NAME" },
+    })
 }
 
 fn status(state: &SessionMcp) -> String {
@@ -320,9 +311,6 @@ pub(super) async fn announce(
     id: &str,
     out: &AcpOutput,
 ) -> Result<(), String> {
-    history::send_line(out, commands_notification(id))
-        .await
-        .map_err(|_| "Cannot deliver MCP command availability".to_string())?;
     emit_text(out, id, &status(state)).await
 }
 
@@ -882,10 +870,11 @@ mod tests {
                 }));
                 let (out, receiver) = std::sync::mpsc::sync_channel(128);
                 let out = AcpOutput::new(out);
-                let run = |command| {
+                let run = |command: Option<Command>| {
                     let (_, signal) = super::super::AbortHandle::new();
                     Box::pin(super::super::run_prompt(Arc::clone(&state), vec![crate::model::ContentBlock::Text(
-                        crate::model::TextContent::new("Observe the tool schema"))], command,
+                        crate::model::TextContent::new("Observe the tool schema"))],
+                        command.map(super::super::commands::PromptCommand::Mcp),
                         signal, out.clone(), "schema-probe".into(), cx.clone()))
                 };
                 assert_eq!(run(Some(Command::Trust("remote".into()))).await, ACP_STOP_REASON_END_TURN);
@@ -1195,7 +1184,11 @@ mod tests {
 
     #[test]
     fn command_advertisement_uses_acp_envelope() {
-        let value: Value = serde_json::from_str(&commands_notification("session-1")).unwrap();
+        let value: Value = serde_json::from_str(&super::super::commands::notification(
+            "session-1",
+            &[command_metadata()],
+        ))
+        .unwrap();
         assert_eq!(value["method"], "session/update");
         assert_eq!(value["params"]["sessionId"], "session-1");
         assert_eq!(
