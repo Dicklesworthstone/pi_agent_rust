@@ -1287,7 +1287,7 @@ async fn rpc_dispatch_session_fork_event(manager: Option<ExtensionManager>, payl
         .await;
 }
 
-fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
+fn try_send_line_with_backpressure<T>(tx: &mpsc::Sender<T>, mut line: T) -> bool {
     loop {
         match tx.try_send(line) {
             Ok(()) => return true,
@@ -1356,6 +1356,102 @@ struct RpcCompletedToolTranscript {
 }
 
 const MAX_RPC_PENDING_MESSAGES: usize = 128;
+
+// Match the SDK's frame ceiling while leaving room for the 64 MiB native
+// content budget, JSON escaping, and command metadata. Bound allocation before
+// parsing: checking attachment sizes after serde has read stdin is too late.
+const MAX_RPC_INPUT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+// At most two unread frames plus the reader's current frame are retained by
+// stdio ingress. A count-only queue of 1024 frames can otherwise retain many
+// GiB of valid attachment requests before the dispatcher reaches them.
+const RPC_INPUT_QUEUE_CAPACITY: usize = 2;
+
+enum RpcInput {
+    Lines(mpsc::Receiver<String>),
+    Stdio(mpsc::Receiver<io::Result<String>>),
+}
+
+impl RpcInput {
+    async fn recv(&mut self, cx: &AgentCx) -> Option<io::Result<String>> {
+        match self {
+            Self::Lines(receiver) => receiver.recv(cx).await.ok().map(Ok),
+            Self::Stdio(receiver) => receiver.recv(cx).await.ok(),
+        }
+    }
+}
+
+fn rpc_input_limit_error(max_bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("PI_RPC_INPUT_LIMIT: command exceeds the {max_bytes}-byte frame limit"),
+    )
+}
+
+fn validate_rpc_input_frame(line: &str, max_bytes: usize) -> io::Result<()> {
+    // Direct `run` callers may include the final LF, unlike the stdio reader.
+    let frame = line.strip_suffix('\n').unwrap_or(line);
+    if frame.len() > max_bytes {
+        return Err(rpc_input_limit_error(max_bytes));
+    }
+    Ok(())
+}
+
+/// Read one LF-delimited frame without ever buffering an unbounded line.
+/// The LF is framing; an optional CR counts toward the byte limit. A framing
+/// failure closes ingress instead of interpreting an arbitrary suffix as a new
+/// command. Complete, bounded final frames without LF are accepted at EOF.
+fn read_rpc_input_frame(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if take > max_bytes.saturating_sub(frame.len()) {
+            return Err(rpc_input_limit_error(max_bytes));
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
+    }
+    String::from_utf8(frame).map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PI_RPC_INPUT_UTF8: command is not valid UTF-8",
+        )
+    })
+}
+
+fn forward_rpc_input(
+    reader: &mut impl BufRead,
+    tx: &mpsc::Sender<io::Result<String>>,
+    max_bytes: usize,
+) {
+    loop {
+        let frame = match read_rpc_input_frame(reader, max_bytes) {
+            Ok(Some(line)) => Ok(line),
+            Ok(None) => break,
+            Err(error) => Err(error),
+        };
+        let failed = frame.is_err();
+        // Move the allocation into the bounded queue. Keeping a reusable
+        // String and cloning it pins another maximum-sized buffer forever.
+        if !try_send_line_with_backpressure(tx, frame) || failed {
+            break;
+        }
+    }
+}
 
 /// In-band shutdown marker for the stdout writer thread. Never a valid JSON
 /// event line (leading NUL), so it cannot collide with real output. Sent by
@@ -3083,27 +3179,13 @@ impl RpcUiBridgeState {
 
 pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
     session.set_input_source(InputSource::Rpc);
-    let (in_tx, in_rx) = mpsc::channel::<String>(1024);
+    let (in_tx, in_rx) = mpsc::channel::<io::Result<String>>(RPC_INPUT_QUEUE_CAPACITY);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
 
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let mut reader = io::BufReader::new(stdin.lock());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let line_to_send = line.clone();
-                    // Retry loop to handle backpressure (channel full) without dropping input.
-                    // Stop when the receiver side has closed so this thread does not spin forever.
-                    if !try_send_line_with_backpressure(&in_tx, line_to_send) {
-                        break;
-                    }
-                }
-            }
-        }
+        forward_rpc_input(&mut reader, &in_tx, MAX_RPC_INPUT_FRAME_BYTES);
     });
 
     let writer_handle = std::thread::spawn(move || {
@@ -3127,7 +3209,13 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
 
     let out_tx_shutdown = out_tx.clone();
     // Boxed: clippy::large_futures.
-    let result = Box::pin(run(session, options, in_rx, out_tx)).await;
+    let result = Box::pin(run_with_input(
+        session,
+        options,
+        RpcInput::Stdio(in_rx),
+        out_tx,
+    ))
+    .await;
 
     // `run` has drained any in-flight turn, so everything queued ahead of the
     // sentinel is the complete event stream. The sentinel (rather than a bare
@@ -3148,15 +3236,24 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     result
 }
 
+pub async fn run(
+    session: AgentSession,
+    options: RpcOptions,
+    in_rx: mpsc::Receiver<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+) -> Result<()> {
+    Box::pin(run_with_input(session, options, RpcInput::Lines(in_rx), out_tx)).await
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(
     clippy::significant_drop_tightening,
     clippy::significant_drop_in_scrutinee
 )]
-pub async fn run(
+async fn run_with_input(
     mut session: AgentSession,
     mut options: RpcOptions,
-    mut in_rx: mpsc::Receiver<String>,
+    mut input: RpcInput,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
@@ -3470,8 +3567,24 @@ pub async fn run(
 
     let mut pending_bg_commands = Vec::new();
     let mut in_flight_fork = None;
+    let mut input_error = None;
 
-    while let Ok(line) = in_rx.recv(&cx).await {
+    while let Some(frame) = input.recv(&cx).await {
+        let line = match frame.and_then(|line| {
+            validate_rpc_input_frame(&line, MAX_RPC_INPUT_FRAME_BYTES)?;
+            Ok(line)
+        }) {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = out_tx.send(response_error(
+                    None,
+                    "parse",
+                    format!("Failed to read command: {error}"),
+                ));
+                input_error = Some(error);
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -6809,6 +6922,10 @@ pub async fn run(
         }
     }
 
+    // Release queued frames and wake a backpressured reader before draining
+    // accepted work. A framing failure must not leave its input queue alive.
+    drop(input);
+
     // EOF and client cancellation both drain accepted work. Cleanup must not
     // inherit the cancelled receive context or its exhausted deadline.
     let cx = AgentCx::from_cx(
@@ -6907,7 +7024,8 @@ pub async fn run(
     flush_rpc_session_on_shutdown(&session, &preservation_cx).await?;
 
     service_result
-        .map_err(|error| Error::session(format!("RPC hub service cleanup was incomplete: {error}")))
+        .map_err(|error| Error::session(format!("RPC hub service cleanup was incomplete: {error}")))?;
+    input_error.map_or(Ok(()), |error| Err(Error::Io(Box::new(error))))
 }
 
 // =============================================================================
@@ -23514,6 +23632,173 @@ export default function init(pi) {
     // -----------------------------------------------------------------------
     // try_send_line_with_backpressure
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn rpc_input_reader_preserves_bounded_frames_and_eof() {
+        for (bytes, limit, expected) in [
+            (&b"1234\n"[..], 4, "1234"),
+            (&b"1234"[..], 4, "1234"),
+            (&b"123\r\n"[..], 4, "123\r"),
+            (&b"\n"[..], 0, ""),
+            ("\u{00e9}\n".as_bytes(), 2, "\u{00e9}"),
+        ] {
+            // One-byte buffering splits UTF-8 and framing across reads.
+            let mut reader = io::BufReader::with_capacity(1, io::Cursor::new(bytes));
+            assert_eq!(
+                read_rpc_input_frame(&mut reader, limit)
+                    .expect("bounded frame")
+                    .as_deref(),
+                Some(expected)
+            );
+            assert!(read_rpc_input_frame(&mut reader, limit).unwrap().is_none());
+        }
+
+        let mut reader = io::BufReader::with_capacity(2, io::Cursor::new(b"one\r\ntwo\nlast"));
+        for expected in ["one\r", "two", "last"] {
+            assert_eq!(
+                read_rpc_input_frame(&mut reader, 4).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(read_rpc_input_frame(&mut reader, 4).unwrap().is_none());
+    }
+
+    #[test]
+    fn rpc_input_reader_refuses_before_buffering_the_tail() {
+        for suffix in ["", "\n", "\r\n", "\n{\"type\":\"abort\"}\n"] {
+            let bytes = format!("{}{suffix}", "x".repeat(1024));
+            let mut reader = io::BufReader::with_capacity(8, io::Cursor::new(bytes.as_bytes()));
+            let error = read_rpc_input_frame(&mut reader, 32).expect_err("oversized frame");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("PI_RPC_INPUT_LIMIT"));
+            assert!(
+                reader.get_ref().position() <= 40,
+                "the reader must reject at the byte limit, before reading the rest of the command"
+            );
+        }
+
+        let mut reader = io::Cursor::new(b"\xff\n");
+        let error = read_rpc_input_frame(&mut reader, 16).expect_err("invalid UTF-8");
+        assert!(error.to_string().contains("PI_RPC_INPUT_UTF8"));
+
+        // The in-process entry point applies the same ceiling before serde.
+        assert!(validate_rpc_input_frame("1234\n", 4).is_ok());
+        assert!(validate_rpc_input_frame("123\r\n", 4).is_ok());
+        assert!(validate_rpc_input_frame("12345", 4).is_err());
+        assert!(validate_rpc_input_frame("1234\r\n", 4).is_err());
+        assert!(validate_rpc_input_frame("     ", 4).is_err());
+    }
+
+    #[test]
+    fn rpc_input_reader_retries_interrupted_reads() {
+        struct InterruptedReader {
+            bytes: io::Cursor<Vec<u8>>,
+            interrupt: bool,
+        }
+
+        impl io::Read for InterruptedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                io::Read::read(&mut self.bytes, buffer)
+            }
+        }
+
+        impl BufRead for InterruptedReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.bytes.fill_buf()
+            }
+
+            fn consume(&mut self, amount: usize) {
+                self.bytes.consume(amount);
+            }
+        }
+
+        let mut reader = InterruptedReader {
+            bytes: io::Cursor::new(b"{\"type\":\"get_state\"}\n".to_vec()),
+            interrupt: true,
+        };
+        assert_eq!(
+            read_rpc_input_frame(&mut reader, 32).unwrap().as_deref(),
+            Some(r#"{"type":"get_state"}"#)
+        );
+    }
+
+    #[test]
+    fn rpc_input_forwarder_orders_failure_and_never_admits_its_tail() {
+        let (tx, mut rx) = mpsc::channel(RPC_INPUT_QUEUE_CAPACITY);
+        let mut reader = io::Cursor::new(b"ok\n12345\n{\"type\":\"abort\"}\n");
+        forward_rpc_input(&mut reader, &tx, 4);
+        assert_eq!(rx.try_recv().unwrap().unwrap(), "ok");
+        assert!(
+            rx.try_recv()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("PI_RPC_INPUT_LIMIT")
+        );
+        assert!(rx.try_recv().is_err(), "no suffix may become a command");
+        drop(tx);
+    }
+
+    #[test]
+    fn rpc_input_framing_failure_drains_accepted_work_before_returning_error() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let agent_session = build_test_agent_session(Session::in_memory());
+            let stored = Arc::clone(&agent_session.session);
+            let options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+            let (tx, rx) = mpsc::channel(RPC_INPUT_QUEUE_CAPACITY);
+            let input = format!(
+                "{{\"type\":\"prompt\",\"id\":\"accepted\",\"message\":\"retain this turn\"}}\n{}\n{{\"type\":\"fresh\",\"id\":\"discarded\"}}\n",
+                "x".repeat(129)
+            );
+            forward_rpc_input(&mut io::Cursor::new(input.as_bytes()), &tx, 128);
+            drop(tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+
+            let error = Box::pin(run_with_input(
+                agent_session,
+                options,
+                RpcInput::Stdio(rx),
+                out_tx,
+            ))
+            .await
+            .expect_err("framing failure remains an I/O error after cleanup");
+            assert!(error.to_string().contains("PI_RPC_INPUT_LIMIT"));
+            let events = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert!(events.iter().any(|event| {
+                event["id"] == "accepted" && event["success"] == true
+            }));
+            assert!(events.iter().any(|event| {
+                event["command"] == "parse" && event["success"] == false
+            }));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "agent_end")
+                    .count(),
+                1,
+                "accepted turn still owns exactly one terminal event"
+            );
+            assert!(events.iter().all(|event| event["id"] != "discarded"));
+            let cx = AgentCx::for_testing();
+            let stored = stored.lock(&cx).await.unwrap();
+            assert!(stored.to_messages_for_current_path().iter().any(|message| {
+                matches!(message, Message::User(UserMessage {
+                    content: UserContent::Text(text), ..
+                }) if text == "retain this turn")
+            }));
+        });
+    }
 
     #[test]
     fn try_send_line_with_backpressure_enqueues_when_capacity_available() {
