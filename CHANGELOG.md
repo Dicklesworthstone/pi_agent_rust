@@ -14,7 +14,9 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
-A major feature and hardening wave on top of `v0.8.0` (~835+ commits). Adds native `/goal` workflows across both terminal stacks and RPC/SDK, the `pi web` browser companion (`--terminal` mirror + TLS 1.3 + scannable QR), project memory learning (`/memory sync`), `--wait-async` background print loops, shared session-tree cost caps (`--warn-cost`/`--max-cost`), ACP session forks/live steering/editor-buffered file tools/native audio-video prompts, native MCP OAuth/SSE/form & URL elicitation, live model discovery v2 (`models.fetched.json`, `/fast ultrafast`), live `/rules` stream rules, `grep` exclusions and URL search, `SnapCompact`, real `better-sqlite3`/`axios`/`zod`/`node:readline` extension shims, `wasmtime 48.0.8` (0 RUSTSEC advisories), Minisign signature verification in `install.sh`/`pi update`, and fixes the live `openai-codex` default model (`gpt-5.6-sol`) and DSR `VERGEN_GIT_SHA` provenance.
+## [v0.9.0] — 2026-11-21 — Release
+
+A major feature and hardening wave on top of `v0.8.0` (~887 commits). Adds native `/goal` workflows across both terminal stacks and RPC/SDK, the `pi web` browser companion (`--terminal` mirror + TLS 1.3 + scannable QR), project memory learning (`/memory sync`), `--wait-async` background print loops, shared session-tree cost caps (`--warn-cost`/`--max-cost`), ACP session forks/live steering/editor-buffered file tools/native audio-video prompts, native MCP OAuth/SSE/form & URL elicitation, live model discovery v2 (`models.fetched.json`, `/fast ultrafast`), live `/rules` stream rules, `grep` exclusions and URL search, `SnapCompact`, real `better-sqlite3`/`axios`/`zod`/`node:readline` extension shims, `wasmtime 48.0.10` (0 RUSTSEC advisories), Minisign signature verification in `install.sh`/`pi update`, and fixes the live `openai-codex` default model (`gpt-5.6-sol`) and DSR `VERGEN_GIT_SHA` provenance.
 
 Requires a minor SemVer bump (`0.9.0`) because four `pi::sdk` types marked Stable in `docs/sdk.md` added public struct fields or adjusted signatures (see **Changed**).
 
@@ -132,8 +134,8 @@ Requires a minor SemVer bump (`0.9.0`) because four `pi::sdk` types marked Stabl
 
 - **Startup Merkle `package-lock.json` verification and streaming digest hardening.**
   `PackageManager::ensure_installed_packages_verified` now verifies installed package trees at startup against `package-lock.json` using 64 KiB streaming CRLF-normalized SHA-256 digests without unbounded file buffering, rejecting escaping symlinks (`..` or external targets) fail-closed.
-- **Zero RUSTSEC advisories across workspace and fuzz lockfiles (`wasmtime 48.0.8`).**
-  Upgraded optional `wasmtime` to `48.0.8` (remediating GH [#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258) / `RUSTSEC-2026-0422`, `0423`, `0424`, and prior Wasmtime advisories), dropped the unused `pprof` `flamegraph` feature, updated transitive `rustls`/`webpki`/`zstd`/`pulldown-cmark`/`rustix`/`tokio` lock entries, and synchronized `fuzz/Cargo.lock` (`0` advisories in `cargo audit`).
+- **Zero RUSTSEC advisories across workspace and fuzz lockfiles (`wasmtime 48.0.10`).**
+  Upgraded optional `wasmtime` to `48.0.10` (remediating GH [#258](https://github.com/Dicklesworthstone/pi_agent_rust/issues/258) / `RUSTSEC-2026-0422`, `0423`, `0424`, `0566`–`0573`, and prior Wasmtime advisories), dropped the unused `pprof` `flamegraph` feature, updated semver-compatible direct and transitive lock entries (`clap`, `clap_complete`, `arboard`, `serde_json`, `regex`, `sha2`, `uuid`, `win32job`, `rustls`, `webpki`, `zstd`, `pulldown-cmark`, `rustix`, `tokio`), and synchronized `fuzz/Cargo.lock` (`0` advisories in `cargo audit`).
 
 ## [v0.8.0] — 2026-10-13 — Release
 
