@@ -18,6 +18,8 @@
 //! PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" \
 //!   rch exec -- cargo test --test provider_streaming
 //! ```
+#![recursion_limit = "512"]
+
 mod common;
 
 use common::{MockHttpResponse, TestHarness};
