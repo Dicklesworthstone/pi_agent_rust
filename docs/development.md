@@ -2,14 +2,15 @@
 
 ## Building
 
-Pi release builds use the exact `nightly-2026-07-05` toolchain pinned in
+Pi release builds use the exact `nightly-2026-08-31` toolchain pinned in
 `rust-toolchain.toml`. The locked dependency graph requires Rust 1.95 or newer;
 use the repository pin so compiler and Clippy results remain reproducible.
 
 The one authoritative quality entry point is the registered DSR recipe; it
-owns formatting, compiler checks, Clippy, tests, the installer regression, and
-module reachability, and it routes Cargo through `rch` so a shared host never
-compiles locally:
+owns formatting, compiler checks, Clippy, tests, the installer regression,
+module reachability, README freshness, and DSR contract sync, and it routes
+Cargo through `rch` so a shared host never compiles locally (`AGENTS.md`
+"Build, Quality, and Release Authority: DSR Only"):
 
 ```bash
 # Authoritative gate (registry entry in ~/.config/dsr/repos.yaml, or the
@@ -21,17 +22,9 @@ DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust
 dsr build pi_agent_rust
 ```
 
-The `rch exec -- cargo ...` commands below are the same invocations the recipe
-runs; use them for a tight inner development loop, never as a substitute for
-the DSR result when closing a Bead or making a quality claim.
-
-```bash
-# Build dev binary
-rch exec -- cargo build
-
-# Build release binary (optimized)
-rch exec -- cargo build --release
-```
+Do not substitute direct `cargo` or `rch exec` invocations for `dsr quality`
+when validating changes, closing a Bead, or making a quality claim; add any
+needed focused lane to `.dsr/repos.yaml` instead.
 
 ## Sibling Crates (Published vs Local Dev)
 
@@ -61,42 +54,19 @@ We enforce a strict "no mocks" policy for core logic. Tests use real filesystem 
 ### Unit & Integration Tests
 
 ```bash
-# Authoritative: the DSR recipe runs `cargo test --locked --all-targets --no-fail-fast`
-# through rch together with fmt/check/clippy/installer/reachability
+# Authoritative: the DSR recipe runs fmt, check, clippy (default + wasm-host),
+# wasm-host tests, full --all-targets tests, installer regression, reachability,
+# fixture patience, README freshness, and DSR contract sync through rch.
 dsr quality --tool pi_agent_rust
-
-# Inner loop only (not a quality claim)
-rch exec -- cargo test
-
-# Run specific module
-rch exec -- cargo test config
-rch exec -- cargo test session
 ```
 
-For multi-agent sessions, treat `rch exec --` as mandatory for compilation commands. Use
-`./scripts/smoke.sh --require-rch` and `./scripts/ext_quality_pipeline.sh --require-rch`
-to avoid accidental local compile storms. For ad hoc Cargo gates, prefer the
-headroom wrapper because it emits a JSON admission decision before running:
+If a focused test lane is required repeatedly, register it in `.dsr/repos.yaml`
+and sync `~/.config/dsr/repos.yaml` rather than running ad hoc local Cargo or
+direct RCH commands. For headroom inspection before launching DSR on a busy
+host, check `uptime` (1m load `< 10`) or use the read-only admission probe:
 
 ```bash
-# Probe whether a heavy gate is safe to start without running it
-./scripts/cargo_headroom.sh --runner auto --admit-only clippy --all-targets -- -D warnings
-
-# Run through rch with target/tmp directories outside the repo
-PI_CARGO_AGENT_SUFFIX="$USER" ./scripts/cargo_headroom.sh --runner rch clippy --all-targets -- -D warnings
-```
-
-In `--runner auto` mode, the wrapper falls back locally only for safe local
-commands such as `cargo fmt` or when the operator passes
-`--allow-local-fallback` / `PI_CARGO_ALLOW_LOCAL_FALLBACK=1`. If `rch` is
-missing, saturated, or unhealthy for a heavy command, the wrapper returns a
-machine-readable `backoff` decision instead of silently starting a broad local
-Cargo run.
-
-Before starting a swarm or a heavyweight all-target gate, inspect the host
-resource budget:
-
-```bash
+# Probe host resource posture and DSR sync status
 pi doctor --only swarm --format json
 ```
 
@@ -232,44 +202,26 @@ CI uploads conformance logs and reports as downloadable artifacts.
 ### Performance Report Smoke Tests
 
 Perf/report generators should not rewrite checked-in artifacts during ordinary
-`cargo test` runs. Their smoke-test mode writes under `TMPDIR` by default, while
-intentional evidence refreshes must pass an explicit output root:
-
-```bash
-PERF_EVIDENCE_DIR=tests/perf/reports \
-  rch exec -- cargo test --test perf_comparison generate_perf_comparison -- --nocapture
-```
+test runs. Their smoke-test mode writes under `TMPDIR` by default, while
+intentional evidence refreshes must run through the DSR perf/evidence lane with
+an explicit `PERF_EVIDENCE_DIR=tests/perf/reports` output root (`docs/perf-budgets-recipe.md`).
 
 ### VCR Mode
 
 Provider tests use recorded "cassettes" to avoid network calls and ensure determinism.
 
-- **Playback (Default)**: Replays recorded responses. Fails if cassette missing.
-- **Record**: Makes real API calls and saves cassettes.
-
-```bash
-# Run in playback mode (CI default)
-VCR_MODE=playback cargo test
-
-# Record new cassettes (requires API keys)
-export ANTHROPIC_API_KEY=...
-VCR_MODE=record cargo test --test provider_streaming
-```
+- **Playback (Default)**: Replays recorded responses. Fails if cassette missing (`VCR_MODE=playback` is enforced during `dsr quality --tool pi_agent_rust`).
+- **Record**: Operator-only cassette refresh against real API keys (`VCR_MODE=record`).
 
 ## Quality Gates
 
-Before submitting a PR, ensure all gates pass:
+Before committing or closing any Bead, run the single authoritative DSR quality gate (`AGENTS.md`):
 
 ```bash
-# Format check
-cargo fmt --check
-
-# Lint check (deny warnings)
-rch exec -- cargo clippy --all-targets -- -D warnings
-
-# Tests
-rch exec -- cargo test --all-targets
+dsr quality --tool pi_agent_rust
 ```
+
+All formatting (`cargo fmt --check`), compiler checks, Clippy (`-D warnings` on default and `wasm-host`), full test targets, installer regression, module reachability, README evidence freshness, and DSR contract sync checks run inside that fail-closed recipe. GitHub Actions workflows (`ci.yml`, `conformance.yml`) are permanently disabled and non-authoritative.
 
 ## Project Structure
 

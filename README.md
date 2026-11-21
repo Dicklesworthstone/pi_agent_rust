@@ -226,7 +226,7 @@ If you want full details, see:
 
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
-| **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
+| **Startup** | Native single-binary path (Fresh comparative measurement pending; historical pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
 | **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
 | **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
@@ -1045,7 +1045,7 @@ Pi supports two extension runtime families with capability-gated host connectors
   - `.js/.ts/.mjs/.cjs/.tsx/.mts/.cts` run directly in embedded QuickJS (no descriptor conversion).
   - `*.native.json` loads the native-rust descriptor runtime.
   - One session currently uses one runtime family at a time (JS/TS or native descriptor).
-- Cold/warm extension load paths are instrumented; fresh `v0.3.0` measurements are pending
+- Cold/warm extension load paths are instrumented; fresh comparative measurements are pending
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
@@ -1186,7 +1186,7 @@ From:
 - Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Extension health delta, as regenerated `2026-08-17`: `226` extensions tested at `95.6%` pass rate with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
 - Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
-- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a `v0.3.0` performance claim.
+- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a release-facing performance claim.
 
 ---
 
@@ -1194,7 +1194,7 @@ From:
 
 ### Curl Installer (Recommended)
 
-As of November 3, 2026, the latest published stable release is **v0.8.0**. It does
+As of November 20, 2026, the latest published stable release is **v0.8.0**. It does
 not include `/goal`; the [goal guide](docs/goal-mode.md#availability) describes
 the newer implementation on `main`. Fetching the installer from `main` still selects a published release
 binary, so it does not install every feature documented on `main`. Check the full
@@ -2551,8 +2551,9 @@ Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and
 - Validation checks offset bounds, checksum matches, and frame/index alignment before trusting the sidecar.
 - Truncated trailing frames are recoverable during rebuild; non-EOF frame corruption fails closed instead of silently dropping data.
 
-**CLI support:**
+**CLI & opt-in live sync support:**
 
+- Set `sessionStore: "v2"` in `settings.json` (or `PI_SESSION_STORE=v2` in the environment) to enable live incremental `.v2` segment/index synchronization alongside canonical JSONL writes (default remains JSONL v3 without live sidecar syncing).
 - `pi migrate <path> --dry-run` validates migration without writing.
 - `pi migrate <path>` performs JSONL-to-v2 migration and verifies parity.
 
@@ -2684,7 +2685,7 @@ CLI tools have different performance requirements than servers or GUI applicatio
 | Application runtime bootstrap | Required | Not required |
 | Application module loading | Commonly dynamic | Ahead-of-time linked Rust code |
 | JIT warmup | Runtime-dependent | Not used |
-| Current release timing | Not measured here | Fresh `v0.3.0` measurement pending |
+| Current release timing | Not measured here | Fresh comparative measurement pending |
 
 Current comparative timing numbers are intentionally omitted until a fresh,
 provenance-matched benchmark run is available.
@@ -3156,7 +3157,7 @@ multi-agent runs, see [docs/swarm-operations-runbook.md](docs/swarm-operations-r
 
 Pi's perf pipeline includes strict evidence checks so global speed claims cannot be based on partial or stale data.
 
-**v0.3.0 performance-claim status: NOT authorized.** Its checked-in
+**Current release performance-claim status: NOT authorized.** Its checked-in
 `pi.perf.budget_summary.v2` artifact is an explicit blocked/NO_DATA result, so
 this release may ship only without quantitative or global performance claims.
 That blocked state is not a passing benchmark result.
@@ -3202,7 +3203,7 @@ closed to the compiled allocator and includes a fallback reason in artifacts.
 ### Memory Usage
 
 Rust's ownership model avoids a garbage-collected application runtime. Current
-memory figures are intentionally withheld until the `v0.3.0` evidence inputs
+memory figures are intentionally withheld until fresh evidence inputs
 are regenerated with matching source and run provenance.
 
 ### Streaming Architecture
@@ -3482,7 +3483,7 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 A: Startup time matters when you're in a terminal all day. Rust provides a native single-binary deployment without a managed application runtime. Fresh comparative measurements are required before this release makes a speed claim.
 
 **Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Cursor/Codex)?**
-A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, OrcaRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
+A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. GitLab Duo and Cursor provide multi-turn tool calling via `<pi_tool_call>` prompt-tag emulation (capability flags for `multi_turn`, `tool_use`, `streaming`, and `vision` are introspectable via `pi::sdk::ProviderCapabilities` and `pi --list-providers`). Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, OrcaRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
 
 **Q: How do sessions work?**
 A: By default, each session is a JSONL v3 file with message entries, parent references for branching, and compaction metadata. Builds include `sqlite-sessions` support by default, so configured deployments can use SQLite-backed session storage too; JSONL remains the default store unless configuration selects SQLite.
@@ -3567,11 +3568,12 @@ visible instead of being promoted to green validation evidence.
 
 ### Feature defaults
 
-Default DSR builds enable `sqlite-sessions` only; JSONL remains the default
-session store unless configuration selects SQLite. Heavyweight extras
-(`image-resize`, `jemalloc`, `clipboard`, `wasm-host`, and syntax highlighting)
-are opt-in so the default release binary stays under the size budget. Feature
-variants must be declared in the DSR recipe instead of injected through a
+Default builds (`Cargo.toml` `[features].default`) enable `sqlite-sessions`,
+`tui`, `bpe-tokens`, and `ftui`; JSONL remains the default session store unless
+configuration selects SQLite. Heavyweight extras (`image-resize`, `jemalloc`,
+`clipboard`, `wasm-host`, `url-pdf`, `profiler`, and `syntax-highlighting`) are
+opt-in. Shipping DSR binaries use `[profile.dist]` (`opt-level = 3`, LTO + strip).
+Feature variants must be declared in the DSR recipe instead of injected through a
 direct Cargo invocation.
 
 ### Testing
@@ -3789,7 +3791,7 @@ summary:
 
 | Gate | Status | Notes |
 |---|---|---|
-| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
+| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); tracked for audited inclusion-list adjudication and refresh in `bd-reality-check-2026-11-19-bridge-yxf43.9` (superseding closed deferral `bd-marckrenn-pi-sub-triage-xd3gh`) |
 | `evidence_bundle` | partial | 0 invalid sections; 18 present, 12 missing (all optional) |
 
 Thresholds, categories, methodology and failing data contracts for every

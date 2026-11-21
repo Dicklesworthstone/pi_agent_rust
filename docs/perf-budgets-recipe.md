@@ -27,19 +27,21 @@ DSR=/Users/jemanuel/projects/doodlestein_self_releaser/dsr
   --work-dir /Users/jemanuel/projects/pi_agent_rust
 ```
 
-## 2. The DSR quality recipe (8 checks, registered in `~/.config/dsr/repos.yaml`)
+## 2. The DSR quality recipe (11 checks, checked in at `.dsr/repos.yaml` and synced to `~/.config/dsr/repos.yaml`)
 
-For `pi_agent_rust`, the recipe is, as reported by
-`dsr quality --tool pi_agent_rust --dry-run` on 2026-09-22:
+For `pi_agent_rust`, the active recipe in `.dsr/repos.yaml` (validated by `scripts/check_dsr_contract_sync.py --check-host-if-present`) runs **11 checks**:
 
 1. `cargo fmt --check`
-2. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo check --locked --all-targets --keep-going`
-3. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked --all-targets --keep-going -- -D warnings`
-4. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test --locked --all-targets --no-fail-fast`
-5. `bash tests/installer_regression.sh`
-6. `python3 scripts/check_module_reachability.py`
-7. `python3 scripts/check_fixture_read_patience.py`
-8. `python3 scripts/check_readme_evidence_freshness.py --structural-only`
+2. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo check -j 2 --locked --all-targets --keep-going`
+3. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo clippy -j 2 --locked --all-targets --keep-going -- -D warnings`
+4. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env CARGO_INCREMENTAL=0 cargo clippy -j 2 --locked --lib --bins --test extension_lockfile_provenance --features wasm-host --keep-going -- -D warnings`
+5. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=3600 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols cargo test -j 2 --locked --lib --test extension_lockfile_provenance --features wasm-host --no-fail-fast wasm_host`
+6. `RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec --base HEAD --clean-overlay --no-overlay -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_STRIP=symbols CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_TEST_STRIP=symbols PI_BUILD_GIT_SHA="$(git rev-parse HEAD)" PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test -j 2 --locked --all-targets --no-fail-fast`
+7. `bash tests/installer_regression.sh`
+8. `python3 scripts/check_module_reachability.py`
+9. `python3 scripts/check_fixture_read_patience.py`
+10. `python3 scripts/check_readme_evidence_freshness.py --structural-only`
+11. `python3 scripts/check_dsr_contract_sync.py --check-host-if-present`
 
 **Two of those changed on 2026-09-22 and are worth understanding before
 anyone "simplifies" them back.**

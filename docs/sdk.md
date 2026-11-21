@@ -4,9 +4,11 @@ This guide is for teams embedding Pi as a Rust library. The Rust SDK provides
 idiomatic Rust APIs for Pi's core embedding workflows, using Rust-native
 patterns such as `Result` types and structured concurrency.
 
-**Note**: This SDK is an idiomatic Rust companion to the pi-mono TypeScript
-SDK, not a drop-in equivalent. Parity remains governed by the active
-certification contract and its provenance-matched verdict.
+**Note**: This SDK is an idiomatic, OMP-inspired Rust library for embedding Pi —
+not a legacy TypeScript Pi drop-in equivalent. Supported behavior is governed by
+the documented `pi::sdk` SemVer surface and the authoritative DSR quality gate
+(`AGENTS.md`); historical drop-in certification artifacts under `docs/contracts/`
+and `docs/evidence/` are retired records, not active release gates.
 
 ## Install
 
@@ -19,24 +21,16 @@ futures = "0.3"
 When developing against a local checkout, replace `version = "0.8.0"` with
 `path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
-### Raise your crate's `recursion_limit`
+### `recursion_limit` notes (post-type-erasure)
 
-Add this at the top of the crate that drives a session:
-
-```rust
-#![recursion_limit = "256"]
-```
-
-Pi's runtime nests its future types deeply enough that proving `Send` for a
-session future can exceed rustc's default limit of 128. `recursion_limit` is
-per-crate and is **not** inherited from a dependency, so pi raising it
-internally does nothing for yours. Without it you get an `overflow evaluating
-the requirement ...: std::marker::Send` error, or a
-`recursion_depth_exceeding_limit` warning that `-D warnings` makes fatal — and
-neither names the real cause.
-
-This is not hypothetical: every one of pi's own binaries, examples and
-integration tests needed the attribute, `examples/basic_sdk.rs` included.
+Following type erasure of extension manager and WASM runtime futures
+(`WasmExtensionHandle` and `JsExtensionRuntimeHandle`), standard SDK consumers
+and `examples/basic_sdk.rs` compile cleanly at `rustc`'s default
+`recursion_limit = 128`. If your crate nests Pi session futures inside deep
+custom combinators or trait adapters and hits `overflow evaluating the
+requirement ...: std::marker::Send` (or a `recursion_depth_exceeding_limit`
+lint under `-D warnings`), add `#![recursion_limit = "256"]` at your crate root
+because `recursion_limit` is per-crate and is not inherited from dependencies.
 
 ## SemVer Surface
 

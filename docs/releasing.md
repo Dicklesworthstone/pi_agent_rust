@@ -359,11 +359,15 @@ dsr release verify pi_agent_rust X.Y.Z
 GitHub Actions. A tag, Cargo build, or uploaded-but-unverified asset set is not
 a completed release.
 
-Before the first real release, `dsr status` must report a configured signing
-key and every required native host healthy, and
-`dsr repos validate --repo pi_agent_rust` must pass. As of 2026-08-26, signing
-is unconfigured, the required Windows host is unhealthy, and the registered
-recipe does not verify the live immutable-tag ruleset, so release is blocked.
+Before cutting a release, `dsr status` on the release operator's host must
+report an active Minisign signing keypair matching the checked-in `minisign.pub`
+public key and every required native build host healthy (`ts1`, `mmini`,
+`wsurf`), and `dsr repos validate --repo pi_agent_rust` plus
+`python3 scripts/check_dsr_contract_sync.py --check-host` must pass.
+`.dsr/repos.d/pi_agent_rust.yaml` pins `minisign.pub`, the live immutable-tag
+ruleset (`repository_id: 1148330949`, `ruleset_id: 20418963`), and
+`PI_REQUIRE_GIT_SHA: "1"` (fail-closed `VERGEN_GIT_SHA` provenance). `install.sh`
+and `pi update` verify `.minisig` signatures against `minisign.pub` directly.
 GitHub asset publication through DSR does not authorize a stable crates.io
 publication; that remains blocked until DSR grows and validates its own Cargo
 registry operation.

@@ -82,15 +82,11 @@ All tests belong to exactly one of three suites:
   that suppress real behavior).
 
 **How to run:**
+All unit, VCR, conformance, and E2E suites run through the single authoritative DSR quality gate (`AGENTS.md` "Build, Quality, and Release Authority: DSR Only"):
 ```bash
-cargo test --all-targets --lib          # inline #[cfg(test)] modules only
-cargo test --all-targets --test model_serialization --test config_precedence \
-  --test session_conformance --test error_types     # curated integration subset
-
-# Opt-in loom model checks for hostcall queue concurrency invariants.
-rch exec -- cargo test --features loom-tests --test hostcall_queue_loom
-rch exec -- cargo test --features loom-tests --lib hostcall_queue::tests::loom_
+dsr quality --tool pi_agent_rust
 ```
+Do not substitute direct `cargo test` or `rch exec` invocations as a quality claim. Loom model checks (`--features loom-tests`, `hostcall_queue_loom`) remain opt-in specialized verification lanes.
 
 **Identifying tests in this suite:** Tests live in `#[cfg(test)]` modules inside `src/*.rs` or in
 `tests/` files listed in the `[suite.unit]` section of `tests/suite_classification.toml`.
@@ -110,11 +106,7 @@ registration against recorded or pre-built data.
 - Tests must be deterministic: same cassette/fixture, same result. Flaky tests are bugs.
 
 **How to run:**
-```bash
-cargo test --all-targets                          # default: includes VCR-backed tests
-cargo test --features ext-conformance             # + extension conformance
-VCR_MODE=playback cargo test --all-targets        # force playback (CI default)
-```
+VCR playback (`VCR_MODE=playback`) is executed automatically inside `dsr quality --tool pi_agent_rust`. Extended `--features ext-conformance` runs are triggered through DSR's conformance/evidence recipes rather than ad hoc local Cargo commands.
 
 **Identifying tests:** Files listed in `[suite.vcr]` of `tests/suite_classification.toml`, or any
 test file that imports from `pi::vcr` / references `cassette_root()` / loads JSON fixtures.
@@ -130,13 +122,7 @@ test file that imports from `pi::vcr` / references `cassette_root()` / loads JSO
 - Cost budget: each test run must stay under configurable token/dollar limits.
 
 **How to run:**
-```bash
-# With live providers (requires API keys)
-PI_E2E=1 cargo test --test e2e_cli --test e2e_tui --test e2e_tools
-
-# VCR-backed E2E (deterministic, no API keys needed)
-VCR_MODE=playback cargo test --test e2e_provider_streaming --test agent_loop_vcr
-```
+Deterministic VCR-backed E2E tests run automatically inside `dsr quality --tool pi_agent_rust`. Live credentialed E2E validation (`PI_E2E=1` / `scripts/perf/run_provider_live_e2e.py --check-defaults`) is an explicit operator release-validation lane.
 
 **Identifying tests:** Files listed in `[suite.e2e]` of `tests/suite_classification.toml`, or any
 test file prefixed with `e2e_`.
@@ -325,38 +311,22 @@ Review checklist for exception approval:
 5. **Mock leak guard:** Enhanced version of guard #2 that also checks Suite 1 `src/` test modules
    for `NullSession`, `NullUiHandler`, `DummyProvider`.
 
-### CI Gate Lanes (bd-1f42.8.8.1)
+### DSR Gate Lanes (bd-1f42.8.8.1)
 
-CI gates are organized into two evaluation lanes:
-
-**Preflight fast-fail lane:** Evaluates only blocking gates, stops at first failure.
-Used for fast PR feedback. Command:
-```bash
-cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact
-```
-
-**Full certification lane:** Evaluates all gates (blocking + non-blocking), generates
-waiver audit, and produces a verdict with promotion rules and rerun guidance. Command:
-```bash
-cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact
-```
+Authoritative release verification runs through `dsr quality --tool pi_agent_rust` (`.dsr/repos.yaml`) and `scripts/release_gate.sh` (which exports `PI_RELEASE_GATE_STRICT_FRESHNESS=1` for pre-release 168h freshness enforcement). The `ci_full_suite_gate` integration target (`preflight_fast_fail`, `full_certification`) runs as part of Check 6 (`--all-targets`) inside DSR rather than through retired GitHub Actions workflows.
 
 **Extension must-pass authority:** The release-blocking `ext_must_pass` corpus is
 the exact selection in `docs/extension-inclusion-list.json` (`tier1` plus
 `tier1_review`). `tests/ext_conformance/VALIDATED_MANIFEST.json` supplies the
 corresponding artifact metadata, but its numeric tier labels do not independently
-define or shrink the release set. A passing extension gate is necessary release
-evidence; it does not by itself authorize a strict drop-in claim.
+define or shrink the release set.
 
-**Drop-in contract gate (bd-35t7i):** strict drop-in release language is only
-allowed when `docs/contracts/dropin-certification-contract.json` evaluates to
-all hard gates `pass` and the emitted
-`docs/evidence/dropin-certification-verdict.json` has
-`overall_verdict = CERTIFIED` with `git_commit` naming the clean release source
-commit. The final release ref must equal that commit or descend from it only
-through allowlisted evidence-only commits.
-Operational incident response for parity regressions is documented in
-`docs/ci-operator-runbook.md` under **Parity Incident Response (DROPIN-162)**.
+**Historical drop-in certification contract (RETIRED per `AGENTS.md`):** Strict
+legacy TypeScript Pi drop-in certification (`docs/contracts/dropin-certification-contract.json`,
+`docs/evidence/dropin-certification-verdict.json`, `tests/full_suite_gate/certification_verdict.json`)
+is retained solely as a historical record and is **not** an active release gate
+or completeness authority. User-facing copy must not call Pi Rust a drop-in
+replacement.
 
 Artifacts:
 - `tests/full_suite_gate/preflight_verdict.json` (schema `pi.ci.preflight_lane.v1`)

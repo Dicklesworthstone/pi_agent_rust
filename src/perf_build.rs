@@ -1869,7 +1869,10 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let orchestrate = std::fs::read_to_string(manifest_dir.join("scripts/perf/orchestrate.sh"))
             .expect("read scripts/perf/orchestrate.sh");
-        let expected_flag = format!("--features {}", CANONICAL_PIJS_PERF_FEATURES.join(","));
+        let expected_flag = format!(
+            "--features {}",
+            super::CANONICAL_PIJS_PERF_FEATURES.join(",")
+        );
         let occurrences = orchestrate.matches(&expected_flag).count();
         assert!(
             occurrences >= 2,
@@ -1885,7 +1888,7 @@ mod tests {
             .split("\n[")
             .next()
             .expect("features table ends cleanly");
-        for &feature in CANONICAL_PIJS_PERF_FEATURES {
+        for &feature in super::CANONICAL_PIJS_PERF_FEATURES {
             if feature == "image" {
                 // `image` is an implicit feature created by the optional `image` dependency.
                 assert!(
@@ -1904,19 +1907,19 @@ mod tests {
 
     #[test]
     fn is_canonical_git_sha_accepts_40_hex_and_rejects_unknown_or_short() {
-        assert!(is_canonical_git_sha(
+        assert!(super::is_canonical_git_sha(
             "0123456789abcdef0123456789abcdef01234567"
         ));
-        assert!(is_canonical_git_sha(
+        assert!(super::is_canonical_git_sha(
             "  ABCDEF0123456789ABCDEF0123456789ABCDEF01\n"
         ));
-        assert!(!is_canonical_git_sha("unknown"));
-        assert!(!is_canonical_git_sha("b217af54b"));
-        assert!(!is_canonical_git_sha(&"0".repeat(40)));
-        assert!(!is_canonical_git_sha(
+        assert!(!super::is_canonical_git_sha("unknown"));
+        assert!(!super::is_canonical_git_sha("b217af54b"));
+        assert!(!super::is_canonical_git_sha(&"0".repeat(40)));
+        assert!(!super::is_canonical_git_sha(
             "0123456789abcdef0123456789abcdef0123456g"
         ));
-        assert!(!is_canonical_git_sha(
+        assert!(!super::is_canonical_git_sha(
             "0123456789abcdef0123456789abcdef01234567-dirty"
         ));
     }

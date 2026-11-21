@@ -14,29 +14,59 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+A major feature and hardening wave on top of `v0.8.0` (~835+ commits). Adds native `/goal` workflows across both terminal stacks and RPC/SDK, the `pi web` browser companion (`--terminal` mirror + TLS 1.3 + scannable QR), project memory learning (`/memory sync`), `--wait-async` background print loops, shared session-tree cost caps (`--warn-cost`/`--max-cost`), ACP session forks/live steering/editor-buffered file tools/native audio-video prompts, native MCP OAuth/SSE/form & URL elicitation, live model discovery v2 (`models.fetched.json`, `/fast ultrafast`), live `/rules` stream rules, `grep` exclusions and URL search, `SnapCompact`, real `better-sqlite3`/`axios`/`zod`/`node:readline` extension shims, `wasmtime 48.0.8` (0 RUSTSEC advisories), Minisign signature verification in `install.sh`/`pi update`, and fixes the live `openai-codex` default model (`gpt-5.6-sol`) and DSR `VERGEN_GIT_SHA` provenance.
+
+Requires a minor SemVer bump (`0.9.0`) because four `pi::sdk` types marked Stable in `docs/sdk.md` added public struct fields or adjusted signatures (see **Changed**).
+
 ### Added
 
-- **Agent Client Protocol (`pi --acp`) persistent sessions, extensions, and MCP parity.**
-  ACP sessions now default to persistent project session directories unless `--no-session` is passed, wire trust-gated extension loading (`ExtensionPolicy::evaluate_startup_trust`), and honor `mcp_servers` updates during `session/load` with deterministic invalid-transport error reporting (`-32602`).
-- **Mobile Web Remote (`pi --web`) TLS 1.3, fail-closed LAN bind gate, and scannable terminal QR.**
-  `--web-tls-cert` and `--web-tls-key` serve HTTPS and WSS via `asupersync` TLS 1.3 (`rustls`); non-loopback `--web-bind` addresses fail closed unless paired with TLS or `--web-allow-insecure-lan`; and terminal pairing renders a real ISO/IEC 18004 QR Model 2 matrix using Unicode half-blocks (`▀`/`▄`/`█`).
-- **Progressive `xdev` tool discovery bijection and configurable `DebugTool` allowlist.**
-  `TOOL_TIERS` now covers all 36 built-in tools in exact 1:1 bijection with `BUILTIN_TOOL_NAMES` + `subagent`, exposes `discoverable_index()` in system prompts, syncs activated tools into `Agent::extend_tools` mid-session, and supports `debug.extraAdapters` / `debug.allowCustomAdapters` with `DAP_ADAPTER_BLOCKED` diagnostics.
+- **Native `/goal` mode across FrankenTUI, classic TUI, SDK, and RPC.**
+  Run budgeted multi-turn autonomous objectives with continuation, budget revisions, interrupted-run reconciliation without replay or budget resets, and RPC/SDK lifecycle hooks (`RpcGoalOp`, `RpcGoal`, `RpcGoalModeState`, `RpcGoalResult`).
+- **Mobile Web Remote (`pi web` / `pi --web`) with `--terminal` mirror, TLS 1.3, fail-closed LAN bind gate, and scannable terminal QR.**
+  Serves the browser companion and live terminal mirror (`pi web --terminal`), supports `--web-tls-cert` and `--web-tls-key` over `asupersync` TLS 1.3 (`rustls`), fails closed on non-loopback `--web-bind` unless paired with TLS or `--web-allow-insecure-lan`, and renders an ISO/IEC 18004 QR Model 2 matrix using Unicode half-blocks (`▀`/`▄`/`█`).
+- **Project memory learning and consolidation (`/memory sync`).**
+  Extracts and consolidates durable project facts from completed sessions (`autoExtract`, `extractEveryTurns`, branch-aware checkpoints) and exposes `AgentSessionHandle::sync_memory`.
+- **Background print-mode follow-ups (`--wait-async` / `async.printWake`).**
+  `pi -p --wait-async` waits for owned background subagent/job completions and executes follow-up turns within `--max-time` bounds instead of exiting while background tasks are still running.
+- **Shared session-tree model spend limits (`--warn-cost`, `--max-cost`).**
+  Enforces per-session and shared session-tree budgets via CLI flags or `session.warnCost`/`session.maxCost` with durable `.pi-cost-*.json` billing journals that persist late model charges to their source sessions and reject stale lock identities.
+- **ACP session forks, live steering, editor-buffered file tools, editor terminals, and native media.**
+  Added `session/fork`, `_session/steering` live steering, `fs/read_text_file` & `fs/write_text_file` routing through editor buffers, foreground bash in negotiated editor terminals, native audio/video editor prompts, `configOptions` model selectors, persistent project session directories by default unless `--no-session` is passed, trust-gated extension loading (`ExtensionPolicy::evaluate_startup_trust`), and `mcp_servers` updates during `session/load` with deterministic `-32602` invalid-transport errors.
+- **MCP OAuth, legacy HTTP SSE transport, interactive form/URL elicitation, and project discovery controls.**
+  Added native HTTP OAuth with durable credential lifecycle and cancellable auth in both TUI stacks, legacy HTTP SSE transport, user-approved form and URL elicitation (`--mcp-config`, `/mcp reauth` stale header repair, `/mcp unauth`), task-augmented tools, and `mcp.enableProjectConfig` project discovery settings.
+- **Live model discovery v2 (`models.fetched.json`) and `/fast ultrafast` service tiers.**
+  Discovers and persists `supported_reasoning_levels`, reasoning aliases, and `service_tiers` (`--fetch-models`, `--refresh-models`, `--persist-models`), enabling `/fast ultrafast` selection and `/effort` & `/models` command spellings across both terminal stacks.
+- **Live `/rules` stream rules and in-place `/handoff`.**
+  Enforces user-configured stream rules and corrections during live model generation (`/rules`) and runs native in-place context handoff in both terminal UIs and SDK/RPC.
+- **Ordered `SnapCompact` and configurable automatic compaction policies.**
+  Added budgeted `SnapCompact` with native archive preservation across saves plus configurable `compaction.thresholdPercent` and `compaction.methodOrder`.
+- **`grep` path exclusions (`!glob`), internal document URLs, and HTTP(S) search; archive/video `read` support.**
+  `grep` prunes scoped `!glob` exclusions consistently across native and external backends and searches internal document and HTTP(S) resources; `read` navigates bounded TAR/gzip/PAX/GNU source archives and local video metadata/frame previews; `/review` supports hosted GitHub pull requests and GitLab merge requests.
+- **Persistent optional-tool settings and progressive `xdev` tool discovery bijection.**
+  Added `tools.enableEval`, `tools.enableGithub`, `tools.enableSecurityScan`, `tools.enableSubagent`, and `tools.loadMode.<name>` settings; aligned `TOOL_TIERS` in exact 1:1 bijection across all 36 built-in tools (`BUILTIN_TOOL_NAMES` + `subagent`), surfaced `discoverable_index()` in system prompts, synced activated tools into `Agent::extend_tools` mid-session, and added `debug.extraAdapters` / `debug.allowCustomAdapters` with `DAP_ADAPTER_BLOCKED` diagnostics.
+- **Real extension runtime shims (`better-sqlite3`, `axios`, `node:readline`, imported native tool factories) and prebaked QuickJS bytecode.**
+  Backed `better-sqlite3` with native SQLite, replaced the `axios` stub with a real HTTP adapter, added `node:readline` subprocess protocol streams, wired `createReadTool`..`createLsTool` factories to native host tools, precompiled the `pi` bridge and static virtual modules once per process via `rquickjs::Module::write` + `Bundle`, and gated unreached research controllers behind the opt-in `experimental-controllers` Cargo feature.
+- **`eval` workpool pipelines, structured extraction, and persistent CommonJS realms.**
+  Added streaming JavaScript and Python workpool map/reduce pipelines with bounded retries, recoverable acknowledgments, schema-validated extraction, and workspace CommonJS module loading in retained JS realms.
 - **Provider capability introspection and agentic tool-use parity across GitLab Duo, Cursor, Copilot, and Codex OAuth.**
-  Added `ProviderCapabilities` (`pi::sdk::ProviderCapabilities`), wired multi-turn history and `<pi_tool_call>` tool execution (`StopReason::ToolUse`) for `GitLabProvider` and streaming `CursorProvider`, forwarded model reasoning/vision/cost metadata plus live `AuthStorage` reload on Copilot's Chat Completions route, and implemented `openai-codex` OAuth refresh.
+  Added `ProviderCapabilities` (`pi::sdk::ProviderCapabilities`), wired multi-turn history and `<pi_tool_call>` tool execution (`StopReason::ToolUse`) for `GitLabProvider` and streaming `CursorProvider`, forwarded model reasoning/vision/cost metadata plus live `AuthStorage` reload on Copilot's Chat Completions route, added DeepSeek text-encoded tool-call recovery, and implemented `openai-codex` OAuth refresh.
 - **FrankenTUI extension `dataDir`, terminal inline image sizing, and complete `KeyAction` wiring.**
   Exposed per-extension persistent `ctx.dataDir` / `pi.dataDir`, wired print-mode TTY `render_inline` to honor `terminal.show_images` and live terminal column width (while interactive TUI/FrankenTUI renders cell-safe attachment badges), surfaced startup session-recovery diagnostics, and connected all 15 previously inert `AppAction` keybindings (tree navigation, session rename/pin/export/share, retry, reload, thinking toggle, editor launch, background job inspector, subagent overlay).
 - **Segmented `SessionStoreV2` live synchronization.**
   Opt-in `sessionStore: "v2"` (`PI_SESSION_STORE=v2`) atomically maintains `.v2` segments, sidecar offset indexes, manifests, and clean `source-state.json` lineage markers alongside canonical JSONL saves and appends without startup full-replay stalls.
 - **DSR recipe `wasm-host` gates, automated DSR contract sync (`check_dsr_contract_sync.py`), and `pi doctor --only swarm` DSR drift check.**
-  Added `--keep-going` and `--features wasm-host` Clippy/test lanes plus `check_readme_evidence_freshness.py` and `check_dsr_contract_sync.py` to `.dsr/repos.yaml` (`11` fail-closed quality checks), aligned `.dsr/repos.d/pi_agent_rust.yaml` to `build_profile: dist`, documented all 43 RPC commands in `docs/rpc.md` with an automated parity test, and added host DSR drift detection to `pi doctor`.
-- **Prebaked QuickJS prelude/shim bytecode bundle and `experimental-controllers` feature gating.**
-  Precompiles the `pi` bridge and built-in virtual Node/`@sinclair/typebox`/`zod` ES modules once per process via `rquickjs::Module::write` + `Bundle` (`PiJsRuntimeConfig::use_prebaked_bytecode`), and gates unreached research controllers (`ExtensionDispatcher`, `VOI`, `IPS/WIS/DR`, `IntentGraph`/LISR, `hostcall_io_uring_lane`) behind the opt-in `experimental-controllers` Cargo feature.
+  Added `--keep-going` and `--features wasm-host` Clippy/test lanes plus `check_readme_evidence_freshness.py` (with embedded `generated_at` freshness and metadata binding) and `check_dsr_contract_sync.py` to `.dsr/repos.yaml` (`11` fail-closed quality checks), aligned `.dsr/repos.d/pi_agent_rust.yaml` to `build_profile: dist` with fail-closed `PI_REQUIRE_GIT_SHA=1`, documented all 43 RPC commands in `docs/rpc.md` with an automated parity test, and added host DSR drift detection to `pi doctor`.
 
 ### Changed
 
-- **Crate-root SemVer surface sealing (`pi::sdk`).**
-  Internal root modules in `src/lib.rs` now carry `#[doc(hidden)]`, keeping `pi::Error`, `pi::PiResult`, and `pi::sdk` as the sole documented SemVer contract; `main.rs` consumes `SdkStartupBootstrap` directly for interactive FTUI handoff without double session initialization.
+- **Breaking (`pi::sdk` SemVer surface).** Audited against `git diff v0.8.0..HEAD -- src/sdk.rs src/lib.rs`:
+  - `pi::sdk::SessionOptions` added public fields `prewalk`, `out_enabled`, `out_default_enabled`, `workspace_trust_guard`, `warn_cost`, `max_cost`, `cost_budget`, `mutation_recorder`, and `startup_bootstrap` (callers constructing `SessionOptions` must include `..SessionOptions::default()`).
+  - `pi::sdk::RpcSessionStats` added `context_tokens` and `context_window`; `pi::sdk::RpcBashResult` added `capture`.
+  - `AgentSessionHandle::set_max_tokens` changed from `pub const fn` to `pub fn`.
+  - Crate-root internal modules in `src/lib.rs` are now marked `#[doc(hidden)]`, sealing the documented SemVer surface to `pi::Error`, `pi::PiResult`, and `pi::sdk`, and gating `ExtensionDispatcher` and `hostcall_io_uring_lane` behind `experimental-controllers`.
+  - Additive `pi::sdk` exports: `AgentCx`, `ApprovalMode`, `ApprovalState`, `AutoCompactionMethod`, `CompactionReader`, `PlanChange`, `PlanMode`, `PlanPersistence`, `SessionPlanReview`, `SdkStartupBootstrap`, `ToolFactoryContext`, `ExplicitBuiltinTools`, `RpcGoalOp`, `RpcGoal`, `RpcGoalModeState`, `RpcGoalResult`, `ProviderCapabilities`.
+- **Live default model priority (`PROVIDER_DEFAULT_MODELS`).**
+  Prioritized live-supported `openai-codex/gpt-5.6-sol` (`gpt-5.6-terra`, `gpt-5.6-luna`), `openai/gpt-5.6`, and `anthropic/claude-sonnet-4-6` ahead of retired ChatGPT Codex IDs (`gpt-5.1`..`gpt-5.5`, which now return HTTP 400 `model_not_found` on ChatGPT accounts while remaining resolvable via explicit `--model` opt-in). Enforced bijection with `README.md` via automated parity tests and added `--check-defaults` to `scripts/perf/run_provider_live_e2e.py`.
 - **Distinct cost-cap exit code (`EXIT_CODE_COST_CAP = 5`).**
   Print/JSON runs halted by `Error::CostCap` now exit with status `5`, preserving status `3` exclusively for non-interactive approval unavailability, and explicit `--skill` / `--prompt-template` / `--theme-path` load failures exit with status `4`.
 - **64 MiB default audio/video attachment cap (`media.maxBytes`) and sidecar/Gemini Files staging.**
@@ -45,19 +75,29 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   Tools explicitly selected via `--tools` are promoted to `LoadMode::Essential` in the initial schema without requiring an `xdev` hop, and `pi --list-providers` plus `pi doctor` now report per-provider `ProviderCapabilities` (`multi_turn`, `tool_use`, `streaming`, `vision`).
 - **Type-erased extension futures (`WasmExtensionHandle` + `JsExtensionRuntimeHandle`).**
   Type-erased WASM component instances and extension runtime `TimeoutFuture` boundaries so downstream SDK/test crates compile cleanly under `--features wasm-host` at `rustc`'s default `recursion_limit = 128`.
-- **Honest Node compatibility shims and real `npm:zod` validation.**
-  Replaced silent fake-success stubs in `node:zlib`, `node:http2`, `node:tls`, `node:net`, `node:dgram`, `node:vm`, `node:worker_threads`, `node:cluster`, `node:inspector`, and `node:dns` with fail-closed `ERR_PI_SHIM_UNSUPPORTED_OPERATION` errors, and replaced the permissive `npm:zod` stub with recursive runtime validation (`safeParse`/`parse` rejecting invalid inputs with structured `ZodError.issues`).
+- **Honest Node/npm compatibility shims and real `npm:zod` validation.**
+  Replaced silent fake-success stubs in `node:zlib`, `node:http2`, `node:tls`, `node:net`, `node:dgram`, `node:vm`, `node:worker_threads`, `node:cluster`, `node:inspector`, `node:dns`, `node-pty` (`write`/`resize`/`kill`), and `chokidar` (`add`/`unwatch`/error events) with fail-closed `ERR_PI_SHIM_UNSUPPORTED_OPERATION` errors, and replaced the permissive `npm:zod` stub with recursive runtime validation (`safeParse`/`parse` rejecting invalid inputs with structured `ZodError.issues`).
+- **Precomputed fast-opcode hashes and honest `HostcallReactorMesh` scope.**
+  Precomputed static op-only fast-opcode `(params_hash, args_shape_hash)` digests (2 → 0 SHA-256 calls) and common flat tool `args_shape_hash` digests (2 → 1 SHA-256 calls) in `src/extensions/protocol.rs`, and aligned `README.md` to describe `HostcallReactorMesh` accurately as an opt-in telemetry/backpressure harness (`enable_hostcall_reactor`) rather than default production scheduling.
+- **Two-tier `budget_summary.json` freshness gate (`tests/release_evidence_gate.rs`, `scripts/release_gate.sh`).**
+  Per-commit structural checks remain 100% fail-closed on stale `claim_ready` summaries, future timestamps, count mismatches, and forged lineage while admitting structurally valid `blocked`/`NO_DATA` summaries aged >168h; `scripts/release_gate.sh` exports `PI_RELEASE_GATE_STRICT_FRESHNESS=1` to enforce strict 168h calendar freshness on every release cut.
 
 ### Fixed
 
+- **Shipped `pi --version` printing `(unknown ...)` on detached/gitless build hosts.**
+  `build.rs` now resolves canonical 40-hex commit SHAs from `PI_BUILD_GIT_SHA`, `VERGEN_GIT_SHA`, or `git rev-parse HEAD` and fails closed when `PI_REQUIRE_GIT_SHA=1` (enabled in `.dsr/repos.d/pi_agent_rust.yaml`) while keeping crates.io source tarballs building cleanly.
+- **Plain-host `pi doctor` failures (`#267`) and read-only SQLite session loading (`#250`).**
+  Made development swarm diagnostics strictly opt-in (`pi doctor --only swarm`, [#267](https://github.com/Dicklesworthstone/pi_agent_rust/issues/267)), hardened settings validation, and allowed loading read-only SQLite session archives without requiring writable WAL sidecars ([#250](https://github.com/Dicklesworthstone/pi_agent_rust/issues/250)).
+- **User-reported reliability and platform fixes (`#257`, `#262`, `#264`, `#271`, `#279`, `#282`).**
+  Fixed LSP fixture stdin handling under `dash` ([#262](https://github.com/Dicklesworthstone/pi_agent_rust/issues/262)), persisted extension `ctx.dataDir` and startup warnings ([#279](https://github.com/Dicklesworthstone/pi_agent_rust/issues/279)), handled authenticated HTTPS proxies with independent origin TLS, streamed all native subagent tasks through bounded stdin, exposed real filesystem metadata to extension caches, and closed related session/ACP/TUI defects ([#257](https://github.com/Dicklesworthstone/pi_agent_rust/issues/257), [#264](https://github.com/Dicklesworthstone/pi_agent_rust/issues/264), [#271](https://github.com/Dicklesworthstone/pi_agent_rust/issues/271), [#282](https://github.com/Dicklesworthstone/pi_agent_rust/issues/282)).
 - **Clap-derived CLI flag pre-parser (`--wait-async`).**
   Replaced the hand-maintained `known_long_option()` flag list in `src/cli.rs` with introspection over `Cli::command()`, fixing `Unknown option: --wait-async` while still isolating dynamic extension flags.
 - **Lock-free optimistic concurrency control (OCC) for RPC `rewind`.**
   Refactored `run_rpc_rewind` into a cancellable 3-phase read/persist/validate-commit pipeline so `abort` and state reads remain responsive during slow saves and concurrent session mutations abort cleanly without partial state corruption.
 - **Live `/login` and `/logout` credential refresh across active sessions.**
   Interactive `/login` and `/logout` flows now reload `AuthStorage` and rebuild the available model list immediately without requiring a process restart.
-- **Hostcall overload telemetry and Gibbs-Candès ACI step sign.**
-  Wired real inter-arrival `interval_ms` into `ExtensionManager::record_hostcall_Telemetry`, fixed the inverted `adaptive_alpha` update direction under miscoverage spikes, and eliminated duplicate SHA-256 arena hashing during QuickJS bytecode cache population.
+- **Hostcall service-latency & overload telemetry and Gibbs-Candès ACI step sign.**
+  Wired real `started_at.elapsed()` hostcall service latency, inter-arrival `interval_ms`, and reactor queue saturation into `ExtensionManager` ACI/CUSUM/BOCPD controllers, fixed the inverted `adaptive_alpha` update direction under miscoverage spikes, and eliminated duplicate SHA-256 arena hashing during QuickJS bytecode cache population.
 - **WASM extension slash-command dispatch.**
   `ExtensionManager::execute_interaction_with_abort` now routes `/slash` invocations to loaded WASM components via `WasmExtensionHandle::handle_slash` across FTUI, classic TUI, RPC, and SDK surfaces.
 - **`agent_hub` steering queue `flock` release across concurrent subprocess forks.**

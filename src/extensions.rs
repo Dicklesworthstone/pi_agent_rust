@@ -19760,7 +19760,7 @@ mod idle_runtime_tests {
                 ["after-veto-one", "after-veto-two"]
             );
 
-            manager.record_budget_recovery_sample(Some("overloaded-peer"), true);
+            manager.record_budget_call_outcome(Some("overloaded-peer"), true, 1.0);
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert!(!manager.any_safety_envelope_vetoing());
             fixture

@@ -916,7 +916,7 @@ fn budget_controller_recovery_requires_consecutive_successes() {
         Some("forced_compat_budget_controller")
     );
 
-    manager.record_budget_recovery_sample(Some("ext.recover"), true);
+    manager.record_budget_call_outcome(Some("ext.recover"), true, 1.0);
     assert_eq!(
         manager.hostcall_compat_kill_switch_reason(Some("ext.recover")),
         Some("forced_compat_budget_controller")
@@ -928,8 +928,8 @@ fn budget_controller_recovery_requires_consecutive_successes() {
         .expect("budget state");
     assert_eq!(snapshot.1, 0, "overload should reset recovery streak");
 
-    manager.record_budget_recovery_sample(Some("ext.recover"), true);
-    manager.record_budget_recovery_sample(Some("ext.recover"), true);
+    manager.record_budget_call_outcome(Some("ext.recover"), true, 1.0);
+    manager.record_budget_call_outcome(Some("ext.recover"), true, 1.0);
     assert_eq!(
         manager.hostcall_compat_kill_switch_reason(Some("ext.recover")),
         None
@@ -1401,8 +1401,8 @@ fn budget_controller_recovery_resets_regime_shift_state() {
             .is_some()
     );
 
-    manager.record_budget_recovery_sample(Some("ext.reset"), true);
-    manager.record_budget_recovery_sample(Some("ext.reset"), true);
+    manager.record_budget_call_outcome(Some("ext.reset"), true, 1.0);
+    manager.record_budget_call_outcome(Some("ext.reset"), true, 1.0);
     assert!(
         manager
             .hostcall_compat_kill_switch_reason(Some("ext.reset"))
@@ -1984,8 +1984,8 @@ fn budget_controller_recovery_resets_safety_envelope() {
     );
 
     // Recover.
-    manager.record_budget_recovery_sample(Some("ext.se.reset"), true);
-    manager.record_budget_recovery_sample(Some("ext.se.reset"), true);
+    manager.record_budget_call_outcome(Some("ext.se.reset"), true, 1.0);
+    manager.record_budget_call_outcome(Some("ext.se.reset"), true, 1.0);
     assert!(
         manager
             .hostcall_compat_kill_switch_reason(Some("ext.se.reset"))
@@ -2057,8 +2057,8 @@ fn amac_safety_veto_cleared_after_recovery() {
     );
 
     // Recover via success samples.
-    manager.record_budget_recovery_sample(Some("ext.amac.recover"), true);
-    manager.record_budget_recovery_sample(Some("ext.amac.recover"), true);
+    manager.record_budget_call_outcome(Some("ext.amac.recover"), true, 1.0);
+    manager.record_budget_call_outcome(Some("ext.amac.recover"), true, 1.0);
     assert!(
         manager
             .hostcall_compat_kill_switch_reason(Some("ext.amac.recover"))
@@ -2090,7 +2090,7 @@ fn amac_safety_veto_multiple_extensions_any_vetoing() {
     manager.record_budget_overload_signal(Some("ext.bad"), "latency", None, None);
 
     // Record a successful sample for the healthy extension (creates its state).
-    manager.record_budget_recovery_sample(Some("ext.good"), true);
+    manager.record_budget_call_outcome(Some("ext.good"), true, 1.0);
 
     // The overloaded extension should cause the kill-switch for itself.
     assert!(
@@ -3246,7 +3246,9 @@ fn service_latency_spike_triggers_aci_and_cusum_fallback_before_quota_exhaustion
         manager.record_budget_call_outcome(Some("ext.service.latency"), true, 1.0);
     }
     assert!(
-        !manager.budget_fallback_active("ext.service.latency"),
+        !manager
+            .budget_fallback_state_snapshot("ext.service.latency")
+            .is_some_and(|snapshot| snapshot.0),
         "healthy baseline calls must not enter fallback"
     );
 
@@ -3256,7 +3258,9 @@ fn service_latency_spike_triggers_aci_and_cusum_fallback_before_quota_exhaustion
     }
 
     assert!(
-        manager.budget_fallback_active("ext.service.latency"),
+        manager
+            .budget_fallback_state_snapshot("ext.service.latency")
+            .is_some_and(|snapshot| snapshot.0),
         "sustained hostcall service-latency spike must trigger fallback before quota exhaustion"
     );
     let regime = manager
