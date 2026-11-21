@@ -613,7 +613,7 @@ fn foreign_and_claude_vertex_signatures_are_not_relabelled_as_gemini_state() {
             ],
             ..AssistantMessage::default()
         });
-        let wire = serde_json::to_value(convert_message_to_gemini(&message)).unwrap();
+        let wire = serde_json::to_value(convert_message_to_gemini(&message, true)).unwrap();
         assert_eq!(wire[0]["parts"].as_array().unwrap().len(), 2);
         assert_eq!(wire[0]["parts"][0], json!({"text":"visible answer"}));
         assert!(wire[0]["parts"][1].get("thoughtSignature").is_none());
@@ -643,9 +643,10 @@ fn unicode_and_signed_part_boundaries_are_invariant_at_every_transport_split() {
         );
         let events: Vec<_> = futures::executor::block_on(state.into_stream(false).collect());
         let message = done(&events);
-        let wire = serde_json::to_value(convert_message_to_gemini(&Message::assistant(
-            message.clone(),
-        )))
+        let wire = serde_json::to_value(convert_message_to_gemini(
+            &Message::assistant(message.clone()),
+            true,
+        ))
         .unwrap();
         assert_eq!(wire[0]["parts"], parts, "byte split {split}");
         assert_eq!(

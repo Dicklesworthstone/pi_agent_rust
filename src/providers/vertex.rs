@@ -182,13 +182,28 @@ impl VertexProvider {
 
     /// Build the base Gemini request. Live requests apply model-specific
     /// thinking controls before the request-rewrite hook.
-    #[allow(clippy::unused_self)]
     pub fn build_gemini_request(
         &self,
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> GeminiRequest {
-        let contents = gemini::convert_messages_to_gemini(&context.messages);
+        // Vertex v1 rejects function IDs. Only the explicitly selected v1beta1
+        // Gemini 3+ dialect supports them; never infer support from a response
+        // that happens to contain the field or from a URL query parameter.
+        let include_function_ids = self.endpoint_url_override.as_deref().is_some_and(|url| {
+            let beta_path = url::Url::parse(url).ok().is_some_and(|url| {
+                url.path_segments()
+                    .is_some_and(|mut path| path.next() == Some("v1beta1"))
+            });
+            let model = self.model.rsplit('/').next().unwrap_or(&self.model);
+            let supported_model = model
+                .strip_prefix("gemini-")
+                .and_then(|version| version.split(['.', '-']).next())
+                .and_then(|major| major.parse::<u32>().ok())
+                .is_some_and(|major| major >= 3);
+            beta_path && supported_model
+        });
+        let contents = gemini::convert_messages_to_gemini(&context.messages, include_function_ids);
         let system_instruction = context.system_prompt.as_deref().map(|s| GeminiContent {
             role: None,
             parts: vec![GeminiPart::Text {
@@ -940,7 +955,7 @@ mod tests {
     fn signed_tool_call_survives_vertex_stream_session_and_replay() {
         let events = [
             serde_json::json!({"candidates": [{"content": {"parts": [{
-                "functionCall": {"name": "read", "args": {"path": "a.txt"}},
+                "functionCall": {"id": "opaque:vertex/call=1", "name": "read", "args": {"path": "a.txt"}},
                 "thoughtSignature": "dmVydGV4"
             }]}}]}),
             serde_json::json!({"candidates": [{"finishReason": "STOP"}]}),
@@ -954,6 +969,7 @@ mod tests {
             })
             .expect("completed tool call");
         assert_eq!(call.thought_signature.as_deref(), Some("dmVydGV4"));
+        assert_eq!(call.id, "opaque:vertex/call=1");
         let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
             panic!("expected Done");
         };
@@ -997,6 +1013,58 @@ mod tests {
             wire["contents"][2]["parts"][0]["functionResponse"]["name"],
             "read"
         );
+        assert!(
+            wire["contents"][1]["parts"][0]["functionCall"]
+                .get("id")
+                .is_none()
+        );
+        assert!(
+            wire["contents"][2]["parts"][0]["functionResponse"]
+                .get("id")
+                .is_none()
+        );
+
+        for (model, endpoint, supports_ids) in [
+            (
+                "gemini-3-pro",
+                "https://example.test/v1beta1/projects/p/models/gemini-3-pro:streamGenerateContent",
+                true,
+            ),
+            (
+                "gemini-3.1-pro",
+                "https://example.test/v1beta1/projects/p/models/gemini-3.1-pro:streamGenerateContent",
+                true,
+            ),
+            (
+                "gemini-2.5-pro",
+                "https://example.test/v1beta1/projects/p/models/gemini-2.5-pro:streamGenerateContent",
+                false,
+            ),
+            (
+                "gemini-3-pro",
+                "https://example.test/v1/projects/p/models/gemini-3-pro:streamGenerateContent?v1beta1=true",
+                false,
+            ),
+            (
+                "gemini-3-pro",
+                "https://example.test/not-v1beta1/projects/p/models/gemini-3-pro:streamGenerateContent",
+                false,
+            ),
+        ] {
+            let provider = VertexProvider::new(model).with_endpoint_url(endpoint);
+            let wire = serde_json::to_value(
+                provider.build_gemini_request(&context, &StreamOptions::default()),
+            )
+            .unwrap();
+            for (turn, key) in [(1, "functionCall"), (2, "functionResponse")] {
+                let id = wire["contents"][turn]["parts"][0][key].get("id");
+                if supports_ids {
+                    assert_eq!(id.and_then(Value::as_str), Some("opaque:vertex/call=1"));
+                } else {
+                    assert!(id.is_none(), "{model}/{endpoint}");
+                }
+            }
+        }
     }
 
     #[test]
