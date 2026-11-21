@@ -26,6 +26,8 @@ use crate::error::{Error, Result};
 mod snapshot;
 #[cfg(test)]
 mod snapshot_tests;
+#[cfg(test)]
+pub(crate) mod writeback_tests;
 
 /// Tool-result schema tag for isolation outcomes.
 pub const ISO_SCHEMA: &str = "pi.worktree_iso.v1";
@@ -414,8 +416,64 @@ pub fn apply_to_parent(handle: &IsoHandle, patch: &str) -> Result<()> {
     let _guard = parent_apply_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    apply_authorized(handle, patch, &mut || true).map(|_| ())
+}
+
+/// Await writeback authority without parking the executor behind another
+/// caller's Git operation. The checkpoint owns cancellation, deadline and hub
+/// admission; `false` preserves the worktree without dispatching a mutation.
+/// Once the real apply has begun, its outcome is reported without a later
+/// checkpoint inventing a rollback of edits already installed in the parent.
+pub(crate) async fn apply_to_parent_owned(
+    handle: &IsoHandle,
+    patch: &str,
+    owner: &crate::agent_cx::AgentCx,
+    mut checkpoint: impl FnMut() -> bool,
+) -> Result<bool> {
+    loop {
+        if !checkpoint() {
+            return Ok(false);
+        }
+        if patch.trim().is_empty() {
+            return Ok(true);
+        }
+        if let Some(outcome) = try_apply_authorized(handle, patch, &mut checkpoint) {
+            return outcome;
+        }
+        owner.time().sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn try_apply_authorized(
+    handle: &IsoHandle,
+    patch: &str,
+    checkpoint: &mut impl FnMut() -> bool,
+) -> Option<Result<bool>> {
+    // Keep every MutexGuard in this synchronous frame: the owned async path
+    // must remain Send and must never suspend while holding writeback authority.
+    let _guard = match parent_apply_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(apply_authorized(handle, patch, checkpoint))
+}
+
+fn apply_authorized(
+    handle: &IsoHandle,
+    patch: &str,
+    checkpoint: &mut impl FnMut() -> bool,
+) -> Result<bool> {
+    // Admission before waiting is insufficient: cancellation can arrive while
+    // another caller owns the lock, or while Git checks the staged patch.
+    if !checkpoint() {
+        return Ok(false);
+    }
     let staged = PatchFile::new(patch)?;
     for check in [true, false] {
+        if !check && !checkpoint() {
+            return Ok(false);
+        }
         let output = staged.apply(&handle.repo_root, check)?;
         if !output.status.success() {
             let diagnostic: String = String::from_utf8_lossy(&output.stderr)
@@ -434,7 +492,7 @@ pub fn apply_to_parent(handle: &IsoHandle, patch: &str) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Remove a matching pi-iso worktree and its branch. A basename prefix alone

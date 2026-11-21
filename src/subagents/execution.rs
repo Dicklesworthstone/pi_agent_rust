@@ -5,8 +5,9 @@
 //! all required gates pass. Dropping a pending run kills its process tree and
 //! settles the hub lease; rejected worktrees remain available for inspection.
 //! One request deadline covers launch, execution, validation and retries. It
-//! gates mutation dispatch, but cannot interrupt synchronous Git/filesystem
-//! calls or arbitrary host callbacks already running.
+//! gates mutation dispatch, including a cancellable wait for writeback, but
+//! cannot interrupt synchronous Git/filesystem calls or arbitrary host callbacks
+//! already running.
 
 use super::deadline::Deadline;
 use super::{
@@ -37,6 +38,8 @@ mod ownership;
 #[cfg(any(unix, windows))]
 mod pipes;
 pub(super) mod worker;
+#[cfg(all(test, unix))]
+mod writeback_tests;
 use ownership::{HubLease, ProcessLease};
 
 const DRAIN_BATCH: usize = 32;
@@ -197,10 +200,11 @@ impl ChildRunner {
             .collect::<Vec<_>>()
             .await;
         completed.sort_by_key(|(index, _)| *index);
-        completed
-            .into_iter()
-            .map(|(_, pending)| self.public_result(pending.finish(update)))
-            .collect()
+        let mut results = Vec::with_capacity(completed.len());
+        for (_, pending) in completed {
+            results.push(self.public_result(pending.finish(update).await));
+        }
+        results
     }
 
     fn task_cwd(&self, task: &SubagentTask) -> PathBuf {
@@ -293,7 +297,8 @@ impl ChildRunner {
         let result = self
             .run_pending(agents, task, step, update, None)
             .await
-            .finish(update);
+            .finish(update)
+            .await;
         self.public_result(result)
     }
 
@@ -383,7 +388,7 @@ impl ChildRunner {
             )
             .await;
         if attempt.result.is_error || schema.is_none() {
-            return attempt.defer(owner, true, update);
+            return attempt.defer(owner, true, update).await;
         }
         let schema = schema.as_ref().expect("schema checked above");
         attempt.result.schema_retries = Some(0);
@@ -391,7 +396,7 @@ impl ChildRunner {
             Ok(data) => {
                 attempt.result.data = Some(data);
                 attempt.result.schema_valid = Some(true);
-                return attempt.defer(owner, true, update);
+                return attempt.defer(owner, true, update).await;
             }
             Err(errors) => {
                 attempt.result.schema_valid = Some(false);
@@ -401,7 +406,7 @@ impl ChildRunner {
 
         let errors = attempt.result.validation_errors.clone().unwrap_or_default();
         attempt.result.fail("Child output failed schema validation; preserving this attempt before one corrective retry.".to_string());
-        let mut previous = attempt.finish(&owner, false, update);
+        let mut previous = attempt.finish(&owner, false, update).await;
         // A hub kill during validation/settlement is not a schema failure to
         // repair by launching a replacement child behind the operator's back.
         if matches!(previous.status, SubagentStatus::Cancelled) {
@@ -455,7 +460,7 @@ impl ChildRunner {
         if retry.result.is_error {
             retry.result.schema_valid = Some(false);
             retry.result.validation_errors = Some(errors);
-            return retry.defer(owner, false, update);
+            return retry.defer(owner, false, update).await;
         }
         match validate_child_output(&retry.result.output, schema) {
             Ok(data) => {
@@ -473,7 +478,7 @@ impl ChildRunner {
         // Permissive mode permits returning an invalid answer with a warning,
         // not installing edits that failed the requested acceptance contract.
         let accepted = retry.result.schema_valid == Some(true);
-        retry.defer(owner, accepted, update)
+        retry.defer(owner, accepted, update).await
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -898,14 +903,14 @@ enum PendingRun {
 }
 
 impl PendingRun {
-    fn finish(self, update: Option<&UpdateCallback>) -> SubagentResult {
+    async fn finish(self, update: Option<&UpdateCallback>) -> SubagentResult {
         match self {
             Self::Settled(result) => result,
             Self::AwaitingWriteback {
                 attempt,
                 accepted,
                 owner,
-            } => attempt.finish(&owner, accepted, update),
+            } => attempt.finish(&owner, accepted, update).await,
         }
     }
 }
@@ -929,7 +934,12 @@ impl Attempt {
         }
     }
 
-    fn defer(self, owner: AgentCx, accepted: bool, update: Option<&UpdateCallback>) -> PendingRun {
+    async fn defer(
+        self,
+        owner: AgentCx,
+        accepted: bool,
+        update: Option<&UpdateCallback>,
+    ) -> PendingRun {
         if accepted
             && !self.result.is_error
             && matches!(self.result.status, SubagentStatus::Completed)
@@ -945,11 +955,11 @@ impl Attempt {
         } else {
             // Non-isolated work and explicit keep/drop do not mutate the
             // parent. Preserve their immediate completion and retry behavior.
-            PendingRun::Settled(self.finish(&owner, accepted, update))
+            PendingRun::Settled(self.finish(&owner, accepted, update).await)
         }
     }
 
-    fn finish(
+    async fn finish(
         mut self,
         owner: &AgentCx,
         accepted: bool,
@@ -988,12 +998,25 @@ impl Attempt {
                     if !in_budget {
                         outcome.apply_mode = "keep".to_string();
                     } else if mode == IsoApplyMode::Apply {
-                        match crate::worktree_iso::apply_to_parent(&handle, &outcome.patch) {
-                            Ok(()) => {
+                        let applied = crate::worktree_iso::apply_to_parent_owned(
+                            &handle,
+                            &outcome.patch,
+                            owner,
+                            || check_budget(owner, self.deadline, &mut self.result),
+                        )
+                        .await;
+                        match applied {
+                            Ok(true) => {
                                 outcome.applied = true;
                                 if let Err(error) = crate::worktree_iso::drop_worktree(&handle) {
                                     self.result.fail(format!("Edits were applied, but isolated worktree cleanup failed: {error}"));
                                 }
+                            }
+                            Ok(false) => {
+                                // The checkpoint already records the actual
+                                // cancellation, timeout or lost hub authority.
+                                // Preserve it and the unapplied worktree.
+                                outcome.apply_mode = "keep".to_string();
                             }
                             Err(error) => {
                                 outcome.conflicted_files =
