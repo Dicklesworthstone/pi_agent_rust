@@ -67,8 +67,8 @@ eval does not enable any other tool. A disabled tool fails with
 Agent. Calling an opt-in tool such as `subagent` therefore requires that tool to
 be mounted and the ordinary approval policy to permit its request.
 
-There are at most **64 attempted host tool calls per cell**, including denied
-calls. Each receives a fresh native tool-call ID and the normal start, update
+There are at most **64 attempted native tool calls per cell**, including denied
+calls and every item in an explicit tool batch. Each receives a fresh native tool-call ID and the normal start, update
 and end events. All calls, including time spent awaiting approval, use the
 cell's existing deadline. The native caller captures the session identity before
 queueing, checks it at the first bridge lookup, and checks it again immediately
@@ -80,8 +80,9 @@ successful; effects already performed by a tool are not rolled back.
 `EVAL_BRIDGE_RECURSION`. Call a discoverable tool by its own name. This avoids
 reacquiring the same kernel lease or obtaining a fresh host budget through a
 wrapper. The host is borrowed only by the active invocation, never retained in
-the kernel or forwarded to a nested tool. Native calls are serialized, but an
-explicit background subagent launch returns while its owned task keeps running.
+the kernel or forwarded to a nested tool. Scalar native calls are serialized;
+`tool.batch` below explicitly groups compatible calls for bounded concurrency.
+An explicit background subagent launch returns while its owned task keeps running.
 The retained helpers below use this same bridge for launch and management.
 
 Native result details include `toolCalls` with schema `pi.eval.tool_calls.v1`.
@@ -98,6 +99,107 @@ Agent call. Typed model judgments use the separate explicit `__pi_judge` and
 `__pi_judge_batch` operations with their own selection and privacy policies.
 Completions, single judgments and batch items share a 16-reserved-attempt limit,
 including the background model requests below.
+
+## Bounded tool batches
+
+Both kernels expose `await tool.batch(calls)` for an explicit group of native
+tool calls. Compatible reads can run concurrently; mutations and other ordered
+effects form barriers. Results remain in input order regardless of completion
+order.
+
+JavaScript:
+
+```javascript
+const batch = await tool.batch([
+  {name: "read", args: {path: "README.md"}},
+  {name: "grep", args: {pattern: "TODO", path: "src"}}
+]);
+for (const item of batch.items) {
+  if ("error" in item) {
+    console.log(item.name, item.error);
+  } else {
+    console.log(item.name, item.result.isError, item.result.content);
+  }
+}
+```
+
+Python:
+
+```python
+batch = await tool.batch([
+    {"name": "read", "args": {"path": "README.md"}},
+    {"name": "grep", "args": {"pattern": "TODO", "path": "src"}},
+])
+for item in batch["items"]:
+    if "error" in item:
+        print(item["name"], item["error"])
+    else:
+        print(item["name"], item["result"]["isError"], item["result"]["content"])
+```
+
+The aggregate has `schema: "pi.eval.tool_batch.v1"` and an `items` array.
+Each item contains its zero-based `index`, original `name`, fresh native
+`toolCallId`, and exactly one of:
+
+- `result`: the full `pi.eval.tool_result.v1` envelope, including native
+  content, images, details and `isError`. A native denial or unsuccessful tool
+  outcome remains a result with `isError: true`.
+- `error`: an explicit bridge, host or result-encoding failure for this item.
+
+A returned aggregate does not mean every tool succeeded. Inspect both item
+errors and `result.isError`. One failed item does not erase successful peers
+or retry them. A batch is not a transaction: effects are never rolled back.
+
+| Limit | Behavior |
+|---|---|
+| Calls per batch | 1–16 |
+| Compatible calls in flight | At most 8; the host may lower this |
+| Native calls per cell | 64 shared by scalar calls and all batch items |
+| Encoded batch input | 256 KiB |
+| Encoded aggregate result | 4 MiB |
+| Deadline | The original cell deadline, including approval waits |
+
+Pass one array/list argument, with exactly `name` and object/dictionary-valued
+`args` in every entry. There are no batch options. Names are nonempty, at most
+128 UTF-8 bytes and contain no control characters. The helpers snapshot plain
+JSON before queueing and enforce the existing depth and value-count bounds.
+JavaScript accessors, hidden properties, sparse arrays and custom serializers
+are rejected without invoking them.
+
+Malformed batches, recursive wrapper names and insufficient remaining call
+budget fail before any native dispatch. Admission reserves all items at once,
+including later failures. Tool-specific argument validation and current tool
+availability remain per-item decisions in the ordinary native execution path.
+
+Scheduling uses trusted native effect metadata. Writes, process effects and
+unknown or ordered effects form serial barriers; the guest cannot declare a
+tool safe for concurrent execution. Each item still uses the current plan,
+approval, extension-hook, privacy, cancellation and session policy. The Agent
+rechecks the concrete tool handle after approval and hooks. If a previously
+compatible tool has become an ordered tool, that item fails with
+`EVAL_BRIDGE_EFFECTS_CHANGED` and is not retried serially. Observed session
+revocation is shared with the cell runner and remains revoked even if the
+original session is selected again.
+
+Standalone embeddings keep the exact `read`, `grep`, `find`, `ls`
+whitelist and pin the native handles they classify. SDK hosts default to
+serial execution unless they explicitly implement the effect and concurrent
+dispatch contract.
+
+An individually invalid or oversized result becomes an item error. If the
+combined result exceeds 4 MiB, native execution continues settling the
+admitted calls within the original deadline, then rejects the whole aggregate
+with `EVAL_BRIDGE_LIMIT`. It never returns a successful prefix. Native tool
+receipts are updated as each item settles and survive cancellation, timeout
+or aggregate encoding failure; inspect them before deciding whether to retry
+anything. Cancellation does not undo completed effects.
+
+The internal operation is `__pi_tool_batch`, with exactly
+`{"calls": [{"name": "...", "args": {}}]}`. Calls to `eval`, `xdev` and
+`__pi_*` wrappers are rejected. This operation uses the existing serialized
+guest bridge as one exchange. JavaScript `Promise.all` and Python
+`asyncio.gather` over scalar tool calls retain their existing serialized
+dispatch semantics; `tool.batch` is the explicit concurrency interface.
 
 ## Retained background model requests
 

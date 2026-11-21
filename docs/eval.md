@@ -209,9 +209,11 @@ launch native background subagents and retain handles across cells.
 `agent(..., keep_alive=True)` retains one child conversation for queued
 `send()` follow-ups; [reusable workpools](eval-structured-results.md#reusable-workpools)
 distribute prompts across bounded native workers. Await each pool command and
-close workers when finished. Bridge exchanges are serialized even when
-wrapped in `asyncio.gather`; admitted background jobs and worker queues run
-independently. Host errors are raised back into the cell.
+close workers when finished. Scalar bridge exchanges are serialized even when
+wrapped in `asyncio.gather`. Use [explicit `tool.batch` calls](eval-structured-results.md#bounded-tool-batches)
+for bounded concurrency between compatible tools with ordered mutation barriers.
+Admitted background jobs and worker queues run independently. Host errors are
+raised back into the cell.
 The eval tool itself executes arbitrary code and is not a sandbox.
 
 ## Reusable Python scripts with `%load`
@@ -325,8 +327,10 @@ by the existing synchronous helpers. It accepts object arguments. Agent-owned
 calls use the Agent's current tool availability and execution policy;
 standalone calls expose only `read`, `grep`, `find`, and `ls`. Rejected calls
 reject an `Error` that can be caught with `try`/`catch` or `.catch()`.
-`Promise.all` can compose calls, but the asynchronous bridge dispatches them
-one at a time. Native background subagents keep running after launch returns;
+`Promise.all` can compose scalar calls, but the asynchronous bridge dispatches
+them one at a time. Use [explicit `tool.batch` calls](eval-structured-results.md#bounded-tool-batches)
+for bounded concurrency between compatible tools with ordered mutation barriers.
+Native background subagents keep running after launch returns;
 see [retained agent jobs](eval-structured-results.md#retained-background-agent-jobs).
 `agent(prompt, {keepAlive: true})` keeps a child conversation available for
 `send()` follow-ups. [Reusable workpools](eval-structured-results.md#reusable-workpools)

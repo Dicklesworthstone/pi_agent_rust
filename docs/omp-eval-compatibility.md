@@ -26,6 +26,11 @@ the watchdog as it does in OMP. Fractional seconds are not accepted. These
 aliases do not add backend sniffing or multiple cells. Agent-owned eval now
 supports [policy-checked tool orchestration](eval-structured-results.md#agent-scoped-tool-orchestration)
 through `tool.call` and `tool.result`, plus the explicit typed-judgment bridge.
+Both kernels also expose [explicit `tool.batch` groups](eval-structured-results.md#bounded-tool-batches)
+of 1–16 native calls with bounded compatible concurrency and ordered mutation
+barriers. Ordered items preserve full native results or explicit item errors,
+and share the cell's 64-call allowance with scalar calls. Existing scalar
+`Promise.all` and `asyncio.gather` dispatch remains serialized.
 The [retained `agent()` and `wait()` helpers](eval-structured-results.md#retained-background-agent-jobs)
 launch and manage native background subagent jobs across cells. Set
 `keepAlive: true` / `keep_alive=True` for a [reusable agent](eval-structured-results.md#reusable-agents-and-queued-turns)

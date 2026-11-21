@@ -771,8 +771,11 @@ impl Tool for EvalTool {
          Module state is cached until reset. No package, network or Node imports. \
          In either language await tool.call(name, args) calls an enabled Agent \
          tool and returns text; await tool.result(name, args) preserves native \
-         content blocks, details and isError. Every nested call uses the current \
-         approval, plan, extension-hook and secrets policies. At most 64 host \
+         content blocks, details and isError. await tool.batch([{name, args}, ...]) \
+         runs 1–16 calls with bounded compatible concurrency and ordered mutation \
+         barriers. Its ordered items contain result or error; also inspect each \
+         result.isError. Every nested call uses the current approval, plan, \
+         extension-hook and secrets policies. At most 64 scalar and batch tool \
          calls per cell, all within this cell's deadline; eval and xdev cannot \
          be called recursively. Call discoverable tools by their actual names. \
          Standalone embeddings retain only the local read/grep/find/ls bridge. \

@@ -77,6 +77,145 @@ test('out-of-order replies keep text and result modes attached to the right call
     h.dispatch.dispatch(2,false,false,'late duplicate');
 });
 
+const toolBatchPage = (names = ['read']) => ({schema:'pi.eval.tool_batch.v1',items:names.map((name,index) =>
+    ({index,name,toolCallId:`eval-native-${index}`,result:envelope({index})}))});
+test('tool batches use one native request and preserve ordered complete outcomes', async () => {
+    const h = host();
+    const pending = vm.runInContext(`tool.batch([
+        {name:'read',args:{path:'a',nested:[null,false,{count:7}]}},
+        {name:'grep',args:{pattern:'needle'}}, {name:'write',args:{path:'b',content:'updated'}}
+    ])`,h.context);
+    assert.deepEqual(h.requests, [{id:1,name:'__pi_tool_batch',args:{calls:[
+        {name:'read',args:{path:'a',nested:[null,false,{count:7}]}},
+        {name:'grep',args:{pattern:'needle'}}, {name:'write',args:{path:'b',content:'updated'}}
+    ]}}]);
+    const page = toolBatchPage(['read','grep','write']);
+    page.items[0].result.content.push({type:'image',mimeType:'image/png',data:'aW1hZ2U='});
+    delete page.items[1].result;
+    page.items[1].error = 'EVAL_BRIDGE_UNAVAILABLE: tool is not enabled';
+    page.items[2].result.isError = true;
+    page.items[2].result.details = {reason:'write denied'};
+    h.dispatch.dispatch(1,false,true,JSON.stringify(page));
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)),page);
+    assert.equal(h.requests.length,1,'individual failures must not retry the batch');
+});
+test('tool batches accept the 16-call limit and exact UTF-8 name boundary', async () => {
+    const h = host();
+    const names = ['é'.repeat(64),...Array(15).fill('read')];
+    const pending = vm.runInContext(`tool.batch(${JSON.stringify(names.map(name=>({name,args:{}})))})`,h.context);
+    h.dispatch.dispatch(1,false,true,JSON.stringify(toolBatchPage(names)));
+    assert.equal((await pending).items.length,16);
+});
+test('tool batches snapshot inputs and do not invoke inherited serializers', async () => {
+    const h = host();
+    const pending = vm.runInContext(`
+        Object.prototype.toJSON = function(){throw Error('inherited object serializer')};
+        Array.prototype.toJSON = function(){throw Error('inherited array serializer')};
+        globalThis.batchInput = [{name:'read',args:{path:'original',nested:[{value:1}]}}];
+        tool.batch(batchInput)
+    `,h.context);
+    vm.runInContext("batchInput[0].name='write';batchInput[0].args.path='changed';batchInput[0].args.nested[0].value=9",h.context);
+    assert.deepEqual(h.requests[0].args,{calls:[{name:'read',args:{path:'original',nested:[{value:1}]}}]});
+    h.dispatch.dispatch(1,false,true,JSON.stringify(toolBatchPage()));
+    assert.equal((await pending).items[0].name,'read');
+});
+test('tool batch admission rejects malformed or recursive input before any dispatch', async () => {
+    const expressions = [
+        'tool.batch()', 'tool.batch([])', 'tool.batch({})',
+        "tool.batch([{name:'read',args:{}}],{concurrency:2})",
+        "tool.batch(Array(17).fill({name:'read',args:{}}))",
+        "tool.batch([null])", "tool.batch([{name:'read'}])", "tool.batch([{name:'read',args:[]}])",
+        "tool.batch([{name:'read',args:null}])", "tool.batch([{name:'read',args:{},extra:1}])",
+        "tool.batch([{name:'',args:{}}])", "tool.batch([{name:7,args:{}}])",
+        "tool.batch([{name:'a'.repeat(129),args:{}}])", "tool.batch([{name:'é'.repeat(65),args:{}}])",
+        ...['eval','xdev','__pi_tool_batch','__pi_tool_result','bad\nname','bad\u0085name','\ud800']
+            .map(name=>`tool.batch([{name:${JSON.stringify(name)},args:{}}])`),
+        "tool.batch([,{name:'read',args:{}}])", "tool.batch([{name:'read',args:{nested:[,1]}}])",
+        "tool.batch([Object.create({name:'read',args:{}})])",
+        "tool.batch([{name:'read',args:new Date()}])",
+        ...['undefined','Infinity','NaN','1n','Symbol()','()=>1']
+            .map(value=>`tool.batch([{name:'read',args:{value:${value}}}])`),
+        "(()=>{const args={};args.self=args;return tool.batch([{name:'read',args}])})()",
+        "tool.batch([{name:'read',args:{path:'\\n'.repeat(131072)}}])",
+        "tool.batch([{name:'read',args:{path:'é'.repeat(131072)}}])",
+    ];
+    for (const expression of expressions) {
+        const h = host();
+        await assert.rejects(vm.runInContext(expression,h.context),/EVAL_TOOL_BATCH_INPUT/,expression);
+        assert.equal(h.requests.length,0,expression);
+    }
+});
+test('tool batches reject getters and hidden properties without reading or publishing them', async () => {
+    for (const expression of [
+        "tool.batch([{get name(){hits++;return 'read'},args:{}}])",
+        "tool.batch([{name:'read',args:{get path(){hits++;return 'secret'}}}])",
+        "tool.batch([{name:'read',args:Object.defineProperty({},'hidden',{value:'secret'})}])",
+        "tool.batch([{name:'read',args:{toJSON(){hits++;return {path:'changed'}}}}])",
+    ]) {
+        const h = host({hits:0});
+        await assert.rejects(vm.runInContext(expression,h.context),/EVAL_TOOL_BATCH_INPUT/);
+        assert.equal(vm.runInContext('hits',h.context),0);
+        assert.equal(h.requests.length,0);
+    }
+});
+test('tool batches retain installed admission and decoding intrinsics', async () => {
+    const h = host();
+    vm.runInContext(`JSON.parse=()=>{throw Error('guest parser')};JSON.stringify=()=>{throw Error('guest encoder')};
+        Array.isArray=()=>false;Number.isFinite=()=>false;Object.keys=()=>[];
+        Object.getOwnPropertyDescriptor=()=>{throw Error('guest descriptor')};
+        String.prototype.charCodeAt=()=>0;String.prototype.startsWith=()=>true;globalThis.String=()=> 'wrong';`,h.context);
+    const pending = vm.runInContext("tool.batch([{name:'read',args:{path:'a',items:[1,2]}}])",h.context);
+    assert.deepEqual(h.requests[0].args,{calls:[{name:'read',args:{path:'a',items:[1,2]}}]});
+    h.dispatch.dispatch(1,false,true,JSON.stringify(toolBatchPage()));
+    assert.equal((await pending).items[0].result.details.index,0);
+});
+test('tool batch responses must match every original item and a unique native identity', async () => {
+    const mutations = [
+        page=>{page.schema='wrong'}, page=>{page.extra=true}, page=>{page.items.pop()},
+        page=>{page.items.reverse()}, page=>{page.items[0].index=false}, page=>{page.items[0].name='write'},
+        page=>{page.items[0].toolCallId=''}, page=>{page.items[0].toolCallId='é'.repeat(65)},
+        page=>{page.items[1].toolCallId=page.items[0].toolCallId},
+        page=>{page.items[0].extra=true}, page=>{page.items[0].error='both'},
+        page=>{delete page.items[0].result}, page=>{delete page.items[0].result;page.items[0].error=''},
+        page=>{page.items[0].result.schema='wrong'}, page=>{delete page.items[0].result.details},
+        page=>{page.items[0].result.content={}}, page=>{page.items[0].result.isError=0},
+    ];
+    const invalid = ['invalid-json','null','[]','{}',...mutations.map(mutate=>{
+        const page=toolBatchPage(['read','grep']);mutate(page);return JSON.stringify(page);
+    })];
+    for (const reply of invalid) {
+        const h = host();
+        const pending = vm.runInContext("tool.batch([{name:'read',args:{}},{name:'grep',args:{}}])",h.context);
+        h.dispatch.dispatch(1,false,true,reply);
+        await assert.rejects(pending,/EVAL_TOOL_BATCH_PROTOCOL/);
+        assert.equal(h.requests.length,1);
+    }
+});
+test('tool batch reply limits count aggregate UTF-8 bytes and accept the exact boundary', async () => {
+    const page = toolBatchPage();
+    delete page.items[0].result;
+    page.items[0].error='';
+    const overhead=Buffer.byteLength(JSON.stringify(page));
+    for (const [body,allowed] of [['x'.repeat(4*1024*1024-overhead),true],
+        ['é'.repeat(Math.ceil((4*1024*1024-overhead)/2)+1),false]]) {
+        const h=host();const pending=vm.runInContext("tool.batch([{name:'read',args:{}}])",h.context);
+        page.items[0].error=body;
+        h.dispatch.dispatch(1,false,true,JSON.stringify(page));
+        if (allowed) assert.equal((await pending).items[0].error.length,body.length);
+        else await assert.rejects(pending,/EVAL_BRIDGE_LIMIT/);
+        assert.equal(h.requests.length,1);
+    }
+});
+test('a batch bridge failure is not replayed and leaves scalar helpers usable', async () => {
+    const h=host();const pending=vm.runInContext("tool.batch([{name:'read',args:{}}])",h.context);
+    h.dispatch.dispatch(1,false,false,'EVAL_BRIDGE_LIMIT: aggregate was withheld');
+    await assert.rejects(pending,/aggregate was withheld/);
+    const next=vm.runInContext("tool.call('read',{path:'next'})",h.context);
+    h.dispatch.dispatch(2,false,true,'next-cell');
+    assert.equal(await next,'next-cell');
+    assert.equal(h.requests.length,2);
+});
+
 const jobSnapshot = (id, status = 'exited', result = {content:[{type:'text',text:'child completed'}], details:{results:[{data:{count:7}}]}}) =>
     ({schema:'pi.host_job.v1', id, status, ...(status === 'running' ? {} : {result})});
 async function launchAgent(h, variable, id) {

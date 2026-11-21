@@ -824,6 +824,127 @@ async def _finish_bridge_calls(output):
     return "EVAL_BRIDGE_PENDING: cell ended with unawaited tool work; queued calls were cancelled and dispatched replies drained. Effects are not rolled back."
 
 
+def _make_tool_batch():
+    # These values belong to the installed helper, not a later cell's aliases.
+    # Exact builtin containers have no guest getters or custom JSON serializers.
+    kind, size, ordinal = type, len, ord
+    dictionary, sequence, text_type = dict, list, str
+    integer_type, float_type, boolean_type = int, float, bool
+    finite, parse, utf8 = math.isfinite, json.loads, str.encode
+    encode = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":")).iterencode
+    input_error, protocol_error = TypeError, ToolBridgeError
+
+    def invalid():
+        return input_error("EVAL_TOOL_BATCH_INPUT: expected 1..16 JSON calls with exactly name and args")
+
+    def protocol():
+        return protocol_error("EVAL_TOOL_BATCH_PROTOCOL: invalid native tool batch result")
+
+    def byte_count(value, maximum, failure, identifier=False):
+        if kind(value) is not text_type:
+            raise failure()
+        try:
+            count = size(utf8(value, "utf-8"))
+        except UnicodeError:
+            raise failure() from None
+        if count > maximum or identifier and any(ordinal(char) < 32 or 127 <= ordinal(char) <= 159 for char in value):
+            raise failure()
+        return count
+
+    def copy_json(value, budget, depth=0):
+        budget[0] -= 1
+        budget[1] -= 1
+        if depth > 64 or budget[0] < 0 or budget[1] < 0:
+            raise invalid()
+        value_type = kind(value)
+        if value is None or value_type is boolean_type:
+            return value
+        if value_type is integer_type:
+            if not -(1 << 63) <= value < (1 << 64):
+                raise invalid()
+            return value
+        if value_type is float_type:
+            if not finite(value):
+                raise invalid()
+            return value
+        if value_type is text_type:
+            budget[1] -= byte_count(value, budget[1], invalid)
+            return value
+        if value_type is sequence:
+            if size(value) > budget[0]:
+                raise invalid()
+            return [copy_json(item, budget, depth + 1) for item in value]
+        if value_type is dictionary:
+            if size(value) > budget[0]:
+                raise invalid()
+            copied = {}
+            for key, item in value.items():
+                budget[1] -= byte_count(key, budget[1], invalid)
+                copied[key] = copy_json(item, budget, depth + 1)
+            return copied
+        raise invalid()
+
+    def reject_constant(_value):
+        raise ValueError("non-JSON number")
+
+    async def batch(calls):
+        """Await one bounded native batch, preserving ordered full results.
+
+        The host schedules compatible calls and enforces mutation barriers.
+        Individual failures are data; cancellation still drains this one bridge
+        exchange and never retries a dispatched item or detaches its work.
+        """
+        if kind(calls) is not sequence or not 1 <= size(calls) <= 16:
+            raise invalid()
+        copied = copy_json(calls, [131072, 256 * 1024])
+        for call in copied:
+            if (kind(call) is not dictionary or set(call) != {"name", "args"}
+                    or kind(call["name"]) is not text_type or not call["name"]
+                    or call["name"] in ("eval", "xdev") or call["name"].startswith("__pi_")
+                    or kind(call["args"]) is not dictionary):
+                raise invalid()
+            byte_count(call["name"], 128, invalid, True)
+        payload = {"calls": copied}
+        request_bytes = 0
+        for chunk in encode(payload):
+            request_bytes += byte_count(chunk, 256 * 1024, invalid)
+            if request_bytes > 256 * 1024:
+                raise invalid()
+        encoded = await _bridge_call_async("__pi_tool_batch", payload)
+        byte_count(encoded, 4 * 1024 * 1024,
+                   lambda: protocol_error("EVAL_BRIDGE_LIMIT: tool batch result exceeds 4 MiB"))
+        try:
+            page = parse(encoded, parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            raise protocol() from None
+        if (kind(page) is not dictionary or set(page) != {"schema", "items"}
+                or page["schema"] != "pi.eval.tool_batch.v1" or kind(page["items"]) is not sequence
+                or size(page["items"]) != size(copied)):
+            raise protocol()
+        identifiers = set()
+        for index, item in enumerate(page["items"]):
+            if (kind(item) is not dictionary or size(item) != 4
+                    or kind(item.get("index")) is not integer_type or item["index"] != index
+                    or item.get("name") != copied[index]["name"]
+                    or kind(item.get("toolCallId")) is not text_type or not item["toolCallId"]
+                    or item["toolCallId"] in identifiers or ("result" in item) == ("error" in item)):
+                raise protocol()
+            byte_count(item["toolCallId"], 128, protocol, True)
+            identifiers.add(item["toolCallId"])
+            if "error" in item:
+                if kind(item["error"]) is not text_type or not item["error"]:
+                    raise protocol()
+            else:
+                result = item["result"]
+                if (kind(result) is not dictionary or result.get("schema") != "pi.eval.tool_result.v1"
+                        or kind(result.get("content")) is not sequence or "details" not in result
+                        or kind(result.get("isError")) is not boolean_type):
+                    raise protocol()
+        return page
+
+    return batch
+
+
 class _PiTools:
     """`tool` object exposed to cells: whitelisted re-entry into pi tools."""
 
@@ -872,6 +993,8 @@ class _PiTools:
                 or type(result.get("isError")) is not bool):
             raise ToolBridgeError("EVAL_BRIDGE_PROTOCOL: invalid structured tool result")
         return result
+
+    batch = staticmethod(_make_tool_batch())
 
     @staticmethod
     def read(path, **kwargs):
