@@ -614,7 +614,7 @@ async fn resolve_selection_with_auth(
                 if let Some(startup) = err.downcast_ref::<StartupError>()
                     && allow_setup_prompt
                 {
-                    if run_first_time_setup(startup, auth, cli, models_path).await? {
+                    if run_first_time_setup(startup, auth, cli, models_path, None).await? {
                         *model_registry = reload_model_registry_with_extra_entries(
                             auth,
                             models_path,
@@ -639,7 +639,15 @@ async fn resolve_selection_with_auth(
                 if let Some(startup) = err.downcast_ref::<StartupError>()
                     && allow_setup_prompt
                 {
-                    if run_first_time_setup(startup, auth, cli, models_path).await? {
+                    if run_first_time_setup(
+                        startup,
+                        auth,
+                        cli,
+                        models_path,
+                        Some(&selection.model_entry),
+                    )
+                    .await?
+                    {
                         *model_registry = reload_model_registry_with_extra_entries(
                             auth,
                             models_path,
@@ -9240,6 +9248,7 @@ async fn run_first_time_setup(
     auth: &mut AuthStorage,
     cli: &mut cli::Cli,
     models_path: &Path,
+    selected_model: Option<&ModelEntry>,
 ) -> Result<bool> {
     let console = PiConsole::new();
 
@@ -9556,22 +9565,7 @@ Code expires in {} seconds.\n",
         }
     };
 
-    let _ = auth.remove_provider_aliases(provider.provider);
-    auth.set(provider.provider.to_string(), credential);
-    auth.save_async().await?;
-
-    // Make the next startup attempt use the credential we just created.
-    if cli
-        .provider
-        .as_deref()
-        .is_none_or(|selected| selected.ne(provider.provider))
-    {
-        cli.provider = Some(provider.provider.to_string());
-        cli.model = None;
-    }
-    if provider.provider.eq("openai-codex") {
-        cli.model = Some("gpt-5.5".to_string());
-    }
+    finish_first_time_setup(auth, cli, provider, credential, selected_model).await?;
 
     let saved_label = match provider.kind {
         SetupCredentialKind::ApiKey => "API key",
@@ -9587,6 +9581,33 @@ Code expires in {} seconds.\n",
     ));
     console.render_info("Continuing startup...");
     Ok(true)
+}
+
+/// Save the selected credential before changing the next startup destination.
+/// Reuse the model identity already resolved by startup: a CLI model can be a
+/// provider-qualified spec, a native alias, or a literal ID containing slashes.
+/// Implicit choices and provider switches return to the ordinary default-model
+/// resolver instead of pinning a second, eventually stale setup-only default.
+async fn finish_first_time_setup(
+    auth: &mut AuthStorage,
+    cli: &mut cli::Cli,
+    provider: ProviderChoice,
+    credential: AuthCredential,
+    selected_model: Option<&ModelEntry>,
+) -> Result<()> {
+    let explicit_model = selected_model
+        .filter(|entry| {
+            cli.model.is_some()
+                && entry.model.provider.eq_ignore_ascii_case(provider.provider)
+        })
+        .map(|entry| entry.model.id.clone());
+    let _ = auth.remove_provider_aliases(provider.provider);
+    auth.set(provider.provider.to_string(), credential);
+    auth.save_async().await?;
+
+    cli.provider = Some(provider.provider.to_string());
+    cli.model = explicit_model;
+    Ok(())
 }
 
 fn filter_models_by_pattern<'a>(models: Vec<&'a ModelEntry>, pattern: &str) -> Vec<&'a ModelEntry> {
@@ -14595,6 +14616,157 @@ mod tests {
         // Out of range
         assert!(provider_choice_from_token("0").is_none());
         assert!(provider_choice_from_token("15").is_none());
+    }
+
+    #[test]
+    fn first_time_setup_resolves_defaults_and_explicit_models_after_saving_credentials() {
+        run_cli_workdir_test(async {
+            for (initial_provider, initial_model, destination, explicit_model) in [
+                (None, None, "openai-codex", None),
+                (Some("openai-codex"), None, "openai-codex", None),
+                (
+                    Some("codex"),
+                    Some("gpt-5.6-terra"),
+                    "openai-codex",
+                    Some("gpt-5.6-terra"),
+                ),
+                (
+                    None,
+                    Some("openai-codex/gpt-5.6-luna"),
+                    "openai-codex",
+                    Some("gpt-5.6-luna"),
+                ),
+                (
+                    Some("openai-codex"),
+                    Some("gpt-5.5"),
+                    "openai-codex",
+                    Some("gpt-5.5"),
+                ),
+                (
+                    Some("openai-codex"),
+                    Some("gpt-5.6-terra"),
+                    "anthropic",
+                    None,
+                ),
+                (
+                    None,
+                    Some("anthropic/claude-sonnet-4-6"),
+                    "openai-codex",
+                    None,
+                ),
+            ] {
+                let root = TempDir::new().expect("setup fixture");
+                let auth_path = root.path().join("auth.json");
+                let models_path = root.path().join("models.json");
+                let mut auth = AuthStorage::empty_at(auth_path.clone());
+                let mut registry = ModelRegistry::load_with_credential_resolver(
+                    Some(models_path.clone()),
+                    |_| None,
+                );
+                let mut cli = cli::Cli::parse_from(["pi"]);
+                // Ignore ambient PI_PROVIDER/PI_MODEL in this startup fixture.
+                cli.provider = initial_provider.map(str::to_string);
+                cli.model = initial_model.map(str::to_string);
+                let config = Config::default();
+                let session = Session::in_memory();
+                let previous = pi::app::select_model_and_thinking(
+                    &cli,
+                    &config,
+                    &session,
+                    &registry,
+                    &[],
+                    root.path(),
+                )
+                .expect("resolve startup destination before authentication");
+
+                finish_first_time_setup(
+                    &mut auth,
+                    &mut cli,
+                    provider_choice_default_for_provider(destination).expect("setup provider"),
+                    AuthCredential::OAuth {
+                        access_token: "setup-fixture-token".to_string(),
+                        refresh_token: "setup-fixture-refresh".to_string(),
+                        expires: i64::MAX,
+                        token_url: None,
+                        client_id: None,
+                        extra: std::collections::HashMap::new(),
+                    },
+                    Some(&previous.model_entry),
+                )
+                .await
+                .expect("complete authentication setup");
+                assert_eq!(cli.provider.as_deref(), Some(destination));
+                assert_eq!(cli.model.as_deref(), explicit_model);
+                let saved = AuthStorage::load(auth_path).expect("read saved setup credentials");
+                assert_eq!(
+                    saved.api_key(destination).as_deref(),
+                    Some("setup-fixture-token")
+                );
+
+                // Exercise the same catalog reload and startup-selection loop
+                // that resumes after the interactive setup step succeeds.
+                registry = reload_model_registry_with_extra_entries(&auth, &models_path, &[], &[])
+                    .expect("reload authenticated catalog");
+                let (selection, key) = resolve_selection_with_auth(
+                    &mut cli,
+                    &config,
+                    &session,
+                    root.path(),
+                    &mut registry,
+                    &[],
+                    &mut auth,
+                    &models_path,
+                    false,
+                    &[],
+                    &[],
+                )
+                .await
+                .expect("continue startup with the new credential")
+                .expect("setup must not be required again");
+                let expected = explicit_model.unwrap_or_else(|| {
+                    pi::app::PROVIDER_DEFAULT_MODELS
+                        .iter()
+                        .find(|(provider, _)| *provider == destination)
+                        .map(|(_, model)| *model)
+                        .expect("canonical provider default")
+                });
+                assert_eq!(selection.model_entry.model.provider, destination);
+                assert_eq!(selection.model_entry.model.id, expected);
+                assert!(key.is_some(), "saved credentials must reach startup");
+            }
+        });
+    }
+
+    #[test]
+    fn first_time_setup_does_not_change_selection_when_credentials_cannot_be_saved() {
+        run_cli_workdir_test(async {
+            let root = TempDir::new().expect("setup fixture");
+            let blocked_path = root.path().join("auth.json");
+            fs::create_dir(&blocked_path).expect("directory blocks credential replacement");
+            let mut auth = AuthStorage::empty_at(blocked_path.clone());
+            let mut cli = cli::Cli::parse_from([
+                "pi",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-sonnet-4-6",
+            ]);
+            let error = finish_first_time_setup(
+                &mut auth,
+                &mut cli,
+                provider_choice_default_for_provider("openai-codex").expect("setup provider"),
+                AuthCredential::ApiKey {
+                    key: "setup-fixture-key".to_string(),
+                },
+                None,
+            )
+            .await
+            .expect_err("failed credential persistence must stop setup");
+            assert!(!error.to_string().is_empty());
+            assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+            assert_eq!(cli.model.as_deref(), Some("claude-sonnet-4-6"));
+            assert!(blocked_path.is_dir());
+        });
     }
 
     #[test]
