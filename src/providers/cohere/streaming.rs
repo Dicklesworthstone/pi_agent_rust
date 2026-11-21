@@ -388,6 +388,12 @@ where
             "COMPLETE" | "STOP_SEQUENCE" | "TOOL_CALL" if has_tools => StopReason::ToolUse,
             "COMPLETE" | "STOP_SEQUENCE" => StopReason::Stop,
             "TOOL_CALL" => return Err(protocol("TOOL_CALL completion has no tool calls")),
+            // MAX_TOKENS is an incomplete generation, even when every call
+            // received so far has closed. The shared agent can execute calls
+            // attached to Length, so a completed prefix of a truncated batch
+            // must enter its non-execution path. Text-only truncation retains
+            // Length. https://docs.cohere.com/v2/reference/chat-stream
+            "MAX_TOKENS" if has_tools => StopReason::Error,
             "MAX_TOKENS" => StopReason::Length,
             "ERROR" | "ERROR_TOXIC" => StopReason::Error,
             _ => return Err(protocol("unknown message finish reason")),
@@ -401,8 +407,14 @@ where
         self.close_plan()?;
         self.partial.stop_reason = reason;
         if reason == StopReason::Error {
-            self.partial.error_message =
-                Some("Cohere reported an unsuccessful generation".to_string());
+            self.partial.error_message = Some(
+                if finish == "MAX_TOKENS" {
+                    "Cohere response was truncated (MAX_TOKENS); local tool calls withheld"
+                } else {
+                    "Cohere reported an unsuccessful generation"
+                }
+                .to_string(),
+            );
         }
         self.pending_events.push_back(StreamEvent::Done {
             reason,
@@ -940,10 +952,7 @@ mod tests {
 
     #[test]
     fn usage_saturates_and_explicit_failures_are_not_tool_successes() {
-        for (finish, expected) in [
-            ("MAX_TOKENS", StopReason::Length),
-            ("ERROR", StopReason::Error),
-        ] {
+        for finish in ["MAX_TOKENS", "ERROR", "ERROR_TOXIC"] {
             let mut state = started();
             feed(&mut state, &start(0, "a", "{}")).unwrap();
             feed(&mut state, &json!({"type":"tool-call-end","index":0})).unwrap();
@@ -953,8 +962,76 @@ mod tests {
             let Some(StreamEvent::Done { reason, message }) = state.pending_events.back() else {
                 panic!("Done");
             };
-            assert_eq!(*reason, expected);
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(message.stop_reason, StopReason::Error);
             assert_eq!(message.usage.total_tokens, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn token_limit_withholds_complete_tool_batches_without_losing_content_or_billing() {
+        for call_count in [1, 2] {
+            let mut state = started();
+            for index in 0..call_count {
+                feed(&mut state, &start(index, &format!("call-{index}"), "{}")).unwrap();
+                feed(&mut state, &json!({"type":"tool-call-end","index":index})).unwrap();
+            }
+            let mut terminal = end("MAX_TOKENS");
+            terminal["delta"]["usage"]["billed_units"] =
+                json!({"input_tokens":1,"output_tokens":2});
+            feed(&mut state, &terminal).unwrap();
+            let Some(StreamEvent::Done { reason, message }) = state.pending_events.back() else {
+                panic!("missing terminal outcome");
+            };
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert!(
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("local tool calls withheld")
+            );
+            assert_eq!(message.content.len(), usize::try_from(call_count).unwrap());
+            assert!(message.content.iter().all(|block| matches!(block,
+                ContentBlock::ToolCall(call) if call.arguments == json!({}))));
+            assert_eq!(message.usage.total_tokens, 5);
+            let Some(BillingUsage::Tokens { text, .. }) = &message.usage.billing else {
+                panic!("truncation must preserve the received bill");
+            };
+            assert_eq!((text.input, text.output), (1, 2));
+        }
+    }
+
+    #[test]
+    fn text_only_token_limit_and_successful_tool_batches_keep_their_outcomes() {
+        for (finish, call_count, expected) in [
+            ("MAX_TOKENS", 0, StopReason::Length),
+            ("TOOL_CALL", 2, StopReason::ToolUse),
+            ("COMPLETE", 2, StopReason::ToolUse),
+            ("STOP_SEQUENCE", 2, StopReason::ToolUse),
+        ] {
+            let mut state = started();
+            feed(&mut state, &json!({"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":"visible"}}}})).unwrap();
+            feed(&mut state, &json!({"type":"content-end","index":0})).unwrap();
+            for index in 0..call_count {
+                feed(&mut state, &start(index, &format!("call-{index}"), "{}")).unwrap();
+                feed(&mut state, &json!({"type":"tool-call-end","index":index})).unwrap();
+            }
+            feed(&mut state, &end(finish)).unwrap();
+            let Some(StreamEvent::Done { reason, message }) = state.pending_events.back() else {
+                panic!("missing terminal outcome");
+            };
+            assert_eq!(*reason, expected);
+            assert_eq!(message.stop_reason, expected);
+            assert!(message.error_message.is_none());
+            assert!(
+                matches!(&message.content[0], ContentBlock::Text(text) if text.text == "visible")
+            );
+            assert_eq!(
+                message.content.len(),
+                usize::try_from(call_count).unwrap() + 1
+            );
         }
     }
 
@@ -1309,6 +1386,39 @@ mod tests {
                     order,
                     ["start", "text_start", "text_delta", "text_end", "done"]
                 );
+                assert_retired(&mut output, &observation);
+            }
+        }
+
+        #[test]
+        fn truncated_tool_batch_releases_source_and_cannot_be_revived_by_trailing_success() {
+            for fragmented in [false, true] {
+                let bytes = wire([
+                    json!({"type":"message-start"}),
+                    start(0, "call-a", "{}"),
+                    json!({"type":"tool-call-end","index":0}),
+                    end("MAX_TOKENS"),
+                    end("TOOL_CALL"),
+                ]);
+                let chunks = if fragmented {
+                    bytes.into_iter().map(|byte| Ok(vec![byte])).collect()
+                } else {
+                    vec![Ok(bytes)]
+                };
+                let (mut output, observation) = observed(chunks, Tail::Pending);
+                let terminal = futures::executor::block_on(async {
+                    loop {
+                        let event = output.next().await.unwrap().unwrap();
+                        if let StreamEvent::Done { reason, message } = event {
+                            assert_eq!(reason, StopReason::Error);
+                            break message;
+                        }
+                    }
+                });
+                assert_eq!(terminal.stop_reason, StopReason::Error);
+                assert_eq!(terminal.usage.total_tokens, 5);
+                assert!(matches!(&terminal.content[0], ContentBlock::ToolCall(call)
+                    if call.id == "call-a" && call.arguments == json!({})));
                 assert_retired(&mut output, &observation);
             }
         }

@@ -121,6 +121,89 @@ fn inline_tasks_preserve_small_and_large_utf8_in_stdin_without_file_provenance()
 }
 
 #[test]
+fn large_definition_and_schema_use_a_frozen_prompt_file_for_each_native_retry()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let script = format!(
+        r#"set -eu
+printf '%s\n' "$@" >> arguments
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --append-system-prompt)
+            shift
+            test -f "$1"
+            printf '%s\n' "$1" >> prompt-paths
+            cat "$1" >> system-instructions-used
+            ;;
+    esac
+    shift
+done
+cat >> task-instructions-used
+if [ -f retried ]; then
+{}
+else
+    touch retried
+    printf '%s\n' 'changed after admission' > global/agents/worker.md
+{}
+fi
+"#,
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (root, tool) = fixture(&script);
+    let body = format!("Full definition.\n{}", "résumé 雪\n".repeat(24 * 1024));
+    std::fs::write(
+        root.path().join("global/agents/worker.md"),
+        format!("---\nname: worker\ndescription: large native instructions\n---\n{body}"),
+    )?;
+    let schema = json!({"type":"object", "required":["accepted"],
+        "description":"schema context ".repeat(3 * 1024)});
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":"complete the original assignment",
+            "outputSchema":schema, "schemaMode":"strict"}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(result(&output)["schemaRetries"], 1);
+    assert_eq!(result(&output)["data"], json!({"accepted":true}));
+    let expected = format!(
+        "{}\n\nYour final answer MUST be a single JSON value matching this JSON Schema (no prose, no code fences):\n{schema}",
+        body.trim(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("system-instructions-used"))?,
+        expected.repeat(2)
+    );
+    let arguments = std::fs::read_to_string(root.path().join("arguments"))?;
+    assert!(!arguments.contains("Full definition."));
+    assert!(!arguments.contains("schema context"));
+    assert!(arguments.len() < 8192);
+    let paths = std::fs::read_to_string(root.path().join("prompt-paths"))?;
+    let paths: Vec<_> = paths.lines().collect();
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1]);
+    assert!(paths.iter().all(|path| !Path::new(path).exists()));
+    Ok(())
+}
+
+#[test]
+fn oversized_schema_is_rejected_before_starting_any_native_child() {
+    let (root, tool) = fixture("touch should-not-start");
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":"bounded assignment",
+            "outputSchema":{"description":"x".repeat(MAX_OUTPUT_SCHEMA_BYTES)}}),
+    );
+    assert!(output.is_error);
+    assert!(
+        result(&output)["error"]
+            .as_str()
+            .unwrap()
+            .contains("PI_SUBAGENT_SCHEMA_LIMIT")
+    );
+    assert!(!root.path().join("should-not-start").exists());
+}
+
+#[test]
 fn large_predecessor_output_reaches_the_next_chain_child_without_argv_limits() {
     let evidence = "retained evidence 雪\n".repeat(9 * 1024);
     let script = format!(
@@ -257,6 +340,59 @@ fn an_oversized_correction_does_not_launch_or_apply_a_second_attempt() {
         std::fs::read_to_string(root.path().join("launches")).unwrap(),
         "launched\n"
     );
+}
+
+#[test]
+fn amplified_schema_failures_still_launch_one_bounded_corrective_child() {
+    let script = r#"set -eu
+printf 'launched\n' >> launches
+if [ -f attempted ]; then
+    cat > corrective-task
+    cat corrected-events.jsonl
+else
+    cat > original-task
+    printf 'attempted\n' > attempted
+    cat invalid-events.jsonl
+fi
+"#;
+    let (root, tool) = fixture(script);
+    let invalid = json!(vec!["rejected-value-".repeat(14); 1200]).to_string();
+    assert!(invalid.len() < MAX_CHILD_OUTPUT_BYTES);
+    std::fs::write(
+        root.path().join("invalid-events.jsonl"),
+        format!("{}\n", ended(&invalid, "stop")),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("corrected-events.jsonl"),
+        format!("{}\n", ended("[7]", "stop")),
+    )
+    .unwrap();
+    // Every item fails all 64 branches. The former error collection exceeded
+    // the 4 MiB task limit, refusing the retry despite a bounded child answer.
+    let schema =
+        json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}});
+    let assignment = "Return the requested structured results.";
+    let output = run(
+        &tool,
+        json!({"agent":"worker", "task":assignment,
+            "outputSchema":schema, "schemaMode":"strict"}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(result(&output)["schemaRetries"], 1);
+    assert_eq!(result(&output)["schemaValid"], true);
+    assert_eq!(result(&output)["data"], json!([7]));
+    assert_eq!(result(&output)["task"], assignment);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("launches")).unwrap(),
+        "launched\nlaunched\n"
+    );
+    let correction = std::fs::read_to_string(root.path().join("corrective-task")).unwrap();
+    assert!(correction.starts_with(&format!("Task: {assignment}")));
+    assert!(correction.contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
+    assert!(correction.contains(OUTPUT_VALIDATION_TRUNCATED));
+    assert!(correction.len() < assignment.len() + 2 * MAX_OUTPUT_VALIDATION_BYTES);
+    assert!(!correction.contains("rejected-value-"));
 }
 
 #[test]

@@ -107,6 +107,7 @@ struct Actor {
     hub: HubLease,
     lifecycle: SubagentResult,
     child: Option<ChildProcessGuard>,
+    prompt_snapshot: Option<tempfile::NamedTempFile>,
     stdin: Option<WorkerStdin>,
     stdout: Option<FramedPipe<WorkerStdout>>,
     stderr: Option<FramedPipe<WorkerStderr>>,
@@ -137,6 +138,7 @@ impl Actor {
             hub: HubLease::empty(),
             lifecycle,
             child: None,
+            prompt_snapshot: None,
             stdin: None,
             stdout: None,
             stderr: None,
@@ -238,7 +240,7 @@ impl Actor {
         } else {
             None
         };
-        let args = crate::subagents::with_fallback_policy_args(
+        let mut args = crate::subagents::with_fallback_policy_args(
             crate::subagents::worker_args(
                 &self.agent,
                 self.runner.role_model_spec.as_deref(),
@@ -247,6 +249,11 @@ impl Actor {
             ),
             self.runner.worker_fallback_policy.as_deref(),
         );
+        self.prompt_snapshot = crate::subagents::task_file::snapshot_prompt(
+            &mut args,
+            &self.owner,
+            self.runner.deadline,
+        )?;
         let mut command = Command::new(&self.runner.child_binary);
         crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, channel.as_ref());
         self.runner
@@ -594,6 +601,7 @@ impl Drop for Actor {
         drop(self.stdout.take());
         drop(self.stderr.take());
         drop(self.child.take());
+        drop(self.prompt_snapshot.take());
         if self.failure.is_some() && !self.lifecycle.is_error {
             self.lifecycle.status = SubagentStatus::Cancelled;
             self.lifecycle.is_error = true;
@@ -900,6 +908,107 @@ while IFS= read -r line; do
     esac
 done
 "#;
+
+    #[test]
+    fn large_definition_snapshots_survive_worker_and_pool_reuse_then_retire() {
+        let _guard = crate::jobs::process_test_guard();
+        let script = format!(
+            r#"set -eu
+printf '%s\n' "$@" > arguments
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --append-system-prompt)
+            shift
+            test -f "$1"
+            printf '%s' "$1" > prompt-path
+            cat "$1" > system-instructions-used
+            ;;
+    esac
+    shift
+done
+{RPC_CHILD}
+"#,
+        );
+        for pooled in [false, true] {
+            let fixture = Fixture::new(&script);
+            let body = format!("Frozen worker definition.\n{}", "résumé 雪\n".repeat(24 * 1024));
+            std::fs::write(
+                fixture.root.path().join("global/agents/worker.md"),
+                format!("---\nname: worker\ndescription: large retained instructions\ntools: []\n---\n{body}"),
+            )
+            .unwrap();
+            std::fs::write(fixture.root.path().join("release"), "ready").unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let started = if pooled {
+                    fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                        "concurrency":1, "tasks":["remember silver", "recall the remembered word"]})).await
+                } else {
+                    fixture.call(json!({"operation":"worker_start", "agent":"worker",
+                        "task":"remember silver"})).await
+                };
+                let id = field(&started, if pooled { "poolId" } else { "workerId" });
+                let first = if pooled {
+                    fixture.call(json!({"operation":"pool_wait", "poolId":id,
+                        "itemId":1, "timeoutMs":5000})).await
+                } else {
+                    fixture.wait(&id, 1).await
+                };
+                let result_path = if pooled {
+                    "/item/result/details/results/0"
+                } else {
+                    "/turn/result/details/results/0"
+                };
+                assert_eq!(first.pointer(result_path).unwrap()["output"], "silver");
+                let path = std::path::PathBuf::from(
+                    std::fs::read_to_string(fixture.root.path().join("prompt-path")).unwrap(),
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), body.trim());
+                assert_eq!(
+                    std::fs::read_to_string(fixture.root.path().join("system-instructions-used"))
+                        .unwrap(),
+                    body.trim()
+                );
+                let arguments =
+                    std::fs::read_to_string(fixture.root.path().join("arguments")).unwrap();
+                assert!(!arguments.contains("Frozen worker definition."));
+                assert!(arguments.len() < 8192);
+                std::fs::write(
+                    fixture.root.path().join("global/agents/worker.md"),
+                    "changed after the worker started",
+                )
+                .unwrap();
+                let second = if pooled {
+                    fixture.call(json!({"operation":"pool_wait", "poolId":id,
+                        "itemId":2, "timeoutMs":5000})).await
+                } else {
+                    fixture.call(json!({"operation":"worker_send", "workerId":id,
+                        "task":"recall the remembered word"})).await;
+                    fixture.wait(&id, 2).await
+                };
+                let first = first.pointer(result_path).unwrap();
+                let second = second.pointer(result_path).unwrap();
+                assert_eq!(first["pid"], second["pid"]);
+                assert_eq!(second["output"], "silver");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), body.trim());
+                if pooled {
+                    fixture.call(json!({"operation":"pool_finish", "poolId":id})).await;
+                    let settled = fixture.call(json!({"operation":"pool_wait", "poolId":id,
+                        "timeoutMs":5000})).await;
+                    assert_eq!(settled["status"], "completed");
+                } else {
+                    let closed = fixture.call(json!({"operation":"worker_close", "workerId":id})).await;
+                    assert_eq!(closed["status"], "closed");
+                }
+                assert!(
+                    !path.exists(),
+                    "retirement must release the private prompt snapshot"
+                );
+            });
+        }
+    }
 
     fn isolation_git(root: &std::path::Path, args: &[&str]) -> String {
         let output = Command::new("git")

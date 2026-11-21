@@ -783,6 +783,33 @@ The returned `RpcEvents` vector still contains the delivered events for callers
 that need the completed transcript. Live callbacks are therefore additive, not a
 change to the completion payload.
 
+For a long turn whose events you render or forward as they arrive, use
+`RpcTransportClient::stream_prompt(message, images, streaming_behavior, on_event)`
+or `stream_prompt_with_content(content, streaming_behavior, on_event)`. These
+methods return `Result<()>` and transfer each event to the callback without
+retaining a transcript. Their client memory use does not grow with the number of
+delivered events: the same bounded pipe queue and pre-acknowledgement buffer
+apply. Any events retained by your callback are your application's responsibility.
+The existing `prompt_with_options_streaming` and `prompt_with_content_streaming`
+methods continue collecting and returning all events.
+
+```rust
+async fn stream(rpc: &mut pi::sdk::RpcTransportClient) -> pi::sdk::Result<()> {
+    rpc.stream_prompt("Review the current changes", None, None, |event| {
+        println!("{event}");
+    })
+    .await
+}
+```
+
+Both callback-only methods use the same acknowledgement and cancellation rules
+as the collecting methods. A failed acknowledgement delivers no speculative
+events. Success means the callback received `agent_end`; inspect its `error`
+field to distinguish a completed turn from a provider failure or abort.
+Protocol and I/O failures return an error. Keep polling after sending
+`control_handle().abort()` to preserve the connection for later requests;
+dropping the stream future closes the transport.
+
 ### Cancellation and subprocess ownership
 
 The ordinary `RpcTransportClient` request and prompt methods await pipe I/O

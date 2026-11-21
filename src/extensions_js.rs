@@ -13675,6 +13675,10 @@ const __pi_vfs = (() => {
     if (metadata) metadata.atimeMs = Number(metadataClock());
   }
 
+  function touchFileAccess(file) {
+    if (!file.snapshot) file.metadata.atimeMs = Number(metadataClock());
+  }
+
   function forgetMetadata(path) {
     state.metadata.delete(path);
     touchParentMetadata(path);
@@ -13689,7 +13693,37 @@ const __pi_vfs = (() => {
     touchParentMetadata(dst);
   }
 
-  function setMetadataTimes(path, atime, mtime) {
+  // Paths name files; open descriptors retain the file itself. Keeping the
+  // bytes and metadata together prevents an atomic rename from redirecting
+  // an existing descriptor to a replacement or resurrecting an unlinked name.
+  function setFile(path, bytes, seed = null) {
+    let file = state.files.get(path);
+    if (file) {
+      file.bytes = bytes;
+    } else {
+      file = { bytes, metadata: ensureMetadata(path, "file", seed), path };
+      state.files.set(path, file);
+      touchParentMetadata(path);
+    }
+    return file;
+  }
+
+  function unlinkFile(path) {
+    const file = state.files.get(path);
+    if (!file) return false;
+    state.files.delete(path);
+    file.metadata.nlink = 0;
+    file.metadata.ctimeMs = metadataTime();
+    forgetMetadata(path);
+    return true;
+  }
+
+  function replaceFileBytes(file, bytes) {
+    file.bytes = bytes;
+    file.metadata.mtimeMs = file.metadata.ctimeMs = metadataTime();
+  }
+
+  function applyMetadataTimes(metadata, atime, mtime) {
     const toMillis = (value) => {
       const time = value instanceof Date ? value.getTime()
         : (typeof value === "number" || (typeof value === "string" && value.trim() !== ""))
@@ -13701,15 +13735,19 @@ const __pi_vfs = (() => {
     };
     const atimeMs = toMillis(atime);
     const mtimeMs = toMillis(mtime);
+    metadata.atimeMs = atimeMs;
+    metadata.mtimeMs = mtimeMs;
+    metadata.ctimeMs = metadataTime();
+  }
+
+  function setMetadataTimes(path, atime, mtime) {
     if (isPersistentPath(path) || (!state.files.has(path) && !state.dirs.has(path))) {
       const error = new Error("PiJS timestamp writes require a virtual file or directory; host timestamps were not changed");
       error.code = "ERR_PI_SHIM_UNSUPPORTED_OPERATION";
       throw error;
     }
     const metadata = ensureMetadata(path, state.dirs.has(path) ? "dir" : "file");
-    metadata.atimeMs = atimeMs;
-    metadata.mtimeMs = mtimeMs;
-    metadata.ctimeMs = metadataTime();
+    applyMetadataTimes(metadata, atime, mtime);
   }
 
   function ensureDir(path) {
@@ -13846,7 +13884,7 @@ const __pi_vfs = (() => {
     return new TextDecoder().decode(bytes);
   }
 
-  function readHostBytes(resolved) {
+  function readHostBytes(resolved, snapshot = false) {
     if (
       isCurrentExtensionTempPath(resolved) ||
       typeof globalThis.__pi_host_read_file_sync !== "function"
@@ -13854,7 +13892,11 @@ const __pi_vfs = (() => {
       return { bytes: undefined, error: "" };
     }
     try {
-      const content = globalThis.__pi_host_read_file_sync(toHostPath(resolved));
+      const content = globalThis.__pi_host_read_file_sync(toHostPath(resolved), snapshot);
+      if (snapshot) {
+        const captured = JSON.parse(content);
+        return { bytes: toBytes(captured.data, "base64"), metadata: captured.metadata, error: "" };
+      }
       return { bytes: toBytes(content, "base64"), error: "" };
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
@@ -14051,11 +14093,15 @@ const __pi_vfs = (() => {
   function authorizeFdRead(entry) {
     assertFdOwner(entry, "read");
     authorizeReadResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
+    // A namespace move may place a shared virtual file inside another
+    // extension's root. Retaining the file must not retain revoked authority.
+    if (entry.file.path !== entry.path) resolvePathForRead(entry.file.path, false);
   }
 
   function authorizeFdWrite(entry) {
     assertFdOwner(entry, "write");
     authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
+    if (entry.file.path !== entry.path) resolvePathForWrite(entry.file.path, false);
   }
 
   function assertFdOwner(entry, capability) {
@@ -14133,7 +14179,7 @@ const __pi_vfs = (() => {
 
     const persistent = isPersistentPath(normalized);
     const isDir = !persistent && state.dirs.has(normalized);
-    const bytes = persistent ? undefined : state.files.get(normalized);
+    const bytes = persistent ? undefined : state.files.get(normalized)?.bytes;
     const isVirtualSymlink = !persistent && linkTarget !== undefined;
     let hostStat = null;
     if (!isDir && bytes === undefined && !isVirtualSymlink) {
@@ -14162,20 +14208,28 @@ const __pi_vfs = (() => {
         : fallback;
     const size = bytes !== undefined ? bytes.byteLength : isVirtualSymlink
       ? new TextEncoder().encode(String(linkTarget)).byteLength : statNumber("size");
+    return makeStatValue(isDir || isHostDir ? "dir" : isSymlink ? "symlink" : isFile ? "file" : "other", size, metadata);
+  }
+
+  function makeStatValue(kind, size, metadata) {
+    const statNumber = (name, fallback = 0) =>
+      metadata && typeof metadata[name] === "number" && Number.isFinite(metadata[name])
+        ? metadata[name]
+        : fallback;
     const atimeMs = statNumber("atimeMs");
     const mtimeMs = statNumber("mtimeMs");
     const ctimeMs = statNumber("ctimeMs");
     const birthtimeMs = statNumber("birthtimeMs");
     return {
-      isFile() { return isFile; },
-      isDirectory() { return isDir || isHostDir; },
-      isSymbolicLink() { return isSymlink; },
+      isFile() { return kind === "file"; },
+      isDirectory() { return kind === "dir"; },
+      isSymbolicLink() { return kind === "symlink"; },
       isBlockDevice() { return metadata?.isBlockDevice === true; },
       isCharacterDevice() { return metadata?.isCharacterDevice === true; },
       isFIFO() { return metadata?.isFIFO === true; },
       isSocket() { return metadata?.isSocket === true; },
       size,
-      mode: statNumber("mode", (isDir || isHostDir) ? 0o755 : isSymlink ? 0o777 : 0o644),
+      mode: statNumber("mode", kind === "dir" ? 0o755 : kind === "symlink" ? 0o777 : 0o644),
       uid: statNumber("uid"),
       gid: statNumber("gid"),
       atimeMs,
@@ -14262,9 +14316,14 @@ const __pi_vfs = (() => {
   state.ensureMetadata = ensureMetadata;
   state.touchMetadata = touchMetadata;
   state.touchAccessMetadata = touchAccessMetadata;
+  state.touchFileAccess = touchFileAccess;
   state.forgetMetadata = forgetMetadata;
   state.renameMetadata = renameMetadata;
   state.setMetadataTimes = setMetadataTimes;
+  state.applyMetadataTimes = applyMetadataTimes;
+  state.setFile = setFile;
+  state.unlinkFile = unlinkFile;
+  state.replaceFileBytes = replaceFileBytes;
   state.toBytes = toBytes;
   state.decodeBytes = decodeBytes;
   state.readHostBytes = readHostBytes;
@@ -14272,6 +14331,7 @@ const __pi_vfs = (() => {
   state.listChildren = listChildren;
   state.makeDirent = makeDirent;
   state.makeStat = makeStat;
+  state.makeStatValue = makeStatValue;
   state.resolvePathDetails = resolvePathDetails;
   state.resolvePath = resolvePath;
   state.resolvePathForRead = resolvePathForRead;
@@ -14348,7 +14408,7 @@ export function existsSync(path) {
 
 export function readFileSync(path, encoding) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
-  let bytes = __pi_vfs.isPersistentPath(resolved) ? undefined : __pi_vfs.files.get(resolved);
+  let bytes = __pi_vfs.isPersistentPath(resolved) ? undefined : __pi_vfs.files.get(resolved)?.bytes;
   let hostError = "";
   if (bytes === undefined) {
     const host = __pi_vfs.readHostBytes(resolved);
@@ -14406,7 +14466,7 @@ export function writeFileSync(path, data, opts) {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
   }
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-  __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
+  __pi_vfs.setFile(resolved, __pi_vfs.toBytes(data, opts), hostStat);
   __pi_vfs.touchMetadata(resolved, "file", hostStat);
 }
 
@@ -14534,10 +14594,9 @@ export function unlinkSync(path) {
     __pi_vfs.forgetMetadata(normalized);
     return;
   }
-  if (!__pi_vfs.files.delete(normalized)) {
+  if (!__pi_vfs.unlinkFile(normalized)) {
     throw new Error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
   }
-  __pi_vfs.forgetMetadata(normalized);
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
@@ -14585,8 +14644,7 @@ export function rmSync(path, opts) {
   }
   const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
-    __pi_vfs.files.delete(normalized);
-    __pi_vfs.forgetMetadata(normalized);
+    __pi_vfs.unlinkFile(normalized);
     return;
   }
   if (__pi_vfs.symlinks.has(normalized)) {
@@ -14603,8 +14661,7 @@ export function rmSync(path, opts) {
     __pi_vfs.authorizeTreeWrite(normalized);
     for (const filePath of Array.from(__pi_vfs.files.keys())) {
       if (filePath === normalized || filePath.startsWith(prefix)) {
-        __pi_vfs.files.delete(filePath);
-        __pi_vfs.forgetMetadata(filePath);
+        __pi_vfs.unlinkFile(filePath);
       }
     }
     for (const dirPath of Array.from(__pi_vfs.dirs)) {
@@ -14641,20 +14698,27 @@ export function renameSync(oldPath, newPath) {
     return;
   }
   const linkTarget = __pi_vfs.symlinks.get(src);
+  if (__pi_vfs.dirs.has(dst)) {
+    throw new Error(`EISDIR: illegal operation on a directory, rename '${String(newPath ?? "")}'`);
+  }
   if (linkTarget !== undefined) {
     if (src === dst) return;
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
+    __pi_vfs.unlinkFile(dst);
     __pi_vfs.symlinks.set(dst, linkTarget);
     __pi_vfs.symlinks.delete(src);
     __pi_vfs.renameMetadata(src, dst, "symlink");
     return;
   }
-  const bytes = __pi_vfs.files.get(src);
-  if (bytes !== undefined) {
+  const file = __pi_vfs.files.get(src);
+  if (file !== undefined) {
     if (src === dst) return;
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
-    __pi_vfs.files.set(dst, bytes);
+    __pi_vfs.unlinkFile(dst);
+    __pi_vfs.symlinks.delete(dst);
+    __pi_vfs.files.set(dst, file);
     __pi_vfs.files.delete(src);
+    file.path = dst;
     __pi_vfs.renameMetadata(src, dst, "file");
     return;
   }
@@ -14761,7 +14825,7 @@ export function openSync(path, flags = "r", _mode) {
   }
 
   const existsInVfs = __pi_vfs.files.has(resolved);
-  const host = existsInVfs ? { bytes: undefined, error: "" } : __pi_vfs.readHostBytes(resolved);
+  const host = existsInVfs ? { bytes: undefined, error: "" } : __pi_vfs.readHostBytes(resolved, true);
   const existsOnHost = hostStat !== undefined;
   const exists = existsInVfs || existsOnHost;
   if (!exists && !opts.create) {
@@ -14779,11 +14843,11 @@ export function openSync(path, flags = "r", _mode) {
     throw new Error(`EIO: unable to read host file '${String(path ?? "")}'${detail}`);
   }
   if (needsWriteAccess && existsOnHost) {
-    __pi_vfs.ensureMetadata(resolved, "file", hostStat);
+    __pi_vfs.ensureMetadata(resolved, "file", host.metadata || hostStat);
   }
   if (!exists && opts.create) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-    __pi_vfs.files.set(resolved, new Uint8Array());
+    __pi_vfs.setFile(resolved, new Uint8Array());
     __pi_vfs.touchMetadata(resolved, "file");
   }
   if (
@@ -14795,15 +14859,17 @@ export function openSync(path, flags = "r", _mode) {
     // Writes are isolated in the runtime overlay; seed it from a fresh host
     // snapshot so append/update flags preserve existing bytes.
     __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
-    __pi_vfs.files.set(resolved, host.bytes);
+    __pi_vfs.setFile(resolved, host.bytes, host.metadata || hostStat);
   }
   if (opts.truncate && opts.writable) {
-    __pi_vfs.files.set(resolved, new Uint8Array());
+    __pi_vfs.setFile(resolved, new Uint8Array());
     __pi_vfs.touchMetadata(resolved, "file");
   }
 
   const fd = __pi_vfs.nextFd++;
-  const current = __pi_vfs.files.get(resolved) || host.bytes || new Uint8Array();
+  const file = __pi_vfs.files.get(resolved) || {
+    path: resolved, bytes: host.bytes, metadata: host.metadata, snapshot: true,
+  };
   __pi_vfs.fds.set(fd, {
     path: resolved,
     extensionId: __pi_vfs.currentExtensionId(),
@@ -14812,8 +14878,8 @@ export function openSync(path, flags = "r", _mode) {
     readable: opts.readable,
     writable: opts.writable,
     append: opts.append,
-    position: opts.append ? current.byteLength : 0,
-    hostBytes: needsWriteAccess ? undefined : host.bytes,
+    position: opts.append ? file.bytes.byteLength : 0,
+    file,
   });
   return fd;
 }
@@ -14840,7 +14906,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
     typeof position === "number" && Number.isFinite(position) && position >= 0
       ? Math.floor(position)
       : entry.position;
-  const source = __pi_vfs.files.get(entry.path) || entry.hostBytes || new Uint8Array();
+  const source = entry.file.bytes;
   if (cursor >= source.byteLength || maxLen <= 0 || start >= out.byteLength) {
     return 0;
   }
@@ -14849,7 +14915,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
   if (position === null || position === undefined) {
     entry.position = cursor + readLen;
   }
-  __pi_vfs.touchAccessMetadata(entry.path);
+  __pi_vfs.touchFileAccess(entry.file);
   return readLen;
 }
 export function writeSync(fd, buffer, offset, length, position) {
@@ -14894,20 +14960,15 @@ export function writeSync(fd, buffer, offset, length, position) {
     }
   }
 
-  if (!explicitPosition) {
-    cursor = entry.append
-      ? (__pi_vfs.files.get(entry.path)?.byteLength || 0)
-      : entry.position;
-  }
+  if (entry.append) cursor = entry.file.bytes.byteLength;
+  else if (!explicitPosition) cursor = entry.position;
 
-  const current = __pi_vfs.files.get(entry.path) || entry.hostBytes || new Uint8Array();
+  const current = entry.file.bytes;
   const required = cursor + chunk.byteLength;
   const next = new Uint8Array(Math.max(current.byteLength, required));
   next.set(current, 0);
   next.set(chunk, cursor);
-  __pi_vfs.files.set(entry.path, next);
-  if (chunk.byteLength > 0) __pi_vfs.touchMetadata(entry.path, "file");
-  entry.hostBytes = undefined;
+  if (chunk.byteLength > 0) __pi_vfs.replaceFileBytes(entry.file, next);
 
   if (!explicitPosition) {
     entry.position = cursor + chunk.byteLength;
@@ -14917,7 +14978,7 @@ export function writeSync(fd, buffer, offset, length, position) {
 export function fstatSync(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
   __pi_vfs.authorizeFdRead(entry);
-  return __pi_vfs.makeStat(entry.path, true);
+  return __pi_vfs.makeStatValue("file", entry.file.bytes.byteLength, entry.file.metadata);
 }
 export function ftruncateSync(fd, len = 0) {
   const entry = __pi_vfs.getFdEntry(fd);
@@ -14927,15 +14988,10 @@ export function ftruncateSync(fd, len = 0) {
   __pi_vfs.authorizeFdWrite(entry);
   const targetLen =
     Number.isInteger(len) && len >= 0 ? len : 0;
-  const current = __pi_vfs.files.get(entry.path) || entry.hostBytes || new Uint8Array();
+  const current = entry.file.bytes;
   const next = new Uint8Array(targetLen);
   next.set(current.subarray(0, Math.min(current.byteLength, targetLen)));
-  __pi_vfs.files.set(entry.path, next);
-  __pi_vfs.touchMetadata(entry.path, "file");
-  entry.hostBytes = undefined;
-  if (entry.position > targetLen) {
-    entry.position = targetLen;
-  }
+  __pi_vfs.replaceFileBytes(entry.file, next);
 }
 export function truncateSync(path, len = 0) {
   const fd = openSync(path, "r+");
@@ -14951,7 +15007,7 @@ export function futimesSync(fd, atime, mtime) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
   __pi_vfs.authorizeFdWrite(entry);
-  __pi_vfs.setMetadataTimes(entry.path, atime, mtime);
+  __pi_vfs.applyMetadataTimes(entry.file.metadata, atime, mtime);
 }
 export function watch(_path, _optsOrListener, _listener) {
   const error = new Error("fs.watch native notifications are unavailable; use fs.watchFile for stat polling");
@@ -23738,7 +23794,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
-                // __pi_host_read_file_sync(path) -> base64 string (throws on error)
+                // __pi_host_read_file_sync(path, snapshot?) -> base64 or
+                // {data, metadata} JSON captured through the same open handle.
                 // Synchronous real-filesystem read fallback for node:fs readFileSync.
                 // Reads are confined to the workspace root AND any registered
                 // extension roots to prevent host filesystem probing outside
@@ -23752,8 +23809,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let configured_repair_mode = repair_mode;
                         let repair_events = Arc::clone(&repair_events);
                         let runtime_id = runtime_id.clone();
-                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                        move |ctx: Ctx<'_>,
+                              path: String,
+                              snapshot: Opt<bool>|
+                              -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
+                            let snapshot = snapshot.0.unwrap_or(false);
+                            let encode = |bytes: Vec<u8>, metadata: Option<std::fs::Metadata>| {
+                                let data = BASE64_STANDARD.encode(bytes);
+                                if let Some(metadata) = metadata {
+                                    serde_json::json!({
+                                        "data": data,
+                                        "metadata": storage::metadata_json(&metadata),
+                                    })
+                                    .to_string()
+                                } else {
+                                    data
+                                }
+                            };
                             let extension_id = current_extension_id(&ctx);
 
                             let workspace_root =
@@ -23766,15 +23839,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 workspace_root.join(requested)
                             };
 
-                            if let Some(bytes) = storage::read_file(
+                            if let Some((bytes, metadata)) = storage::read_file(
                                 &requested_abs,
                                 extension_id.as_deref(),
                                 &module_state,
+                                snapshot,
                             ).map_err(|error| storage::filesystem_error(&ctx, &path, "open", &error))? {
-                                return Ok(BASE64_STANDARD.encode(bytes));
+                                return Ok(encode(bytes, metadata));
                             }
 
                             let apply_missing_asset_fallback = |checked_path: &Path, error_msg: &str| -> rquickjs::Result<String> {
+                                if snapshot {
+                                    return Err(rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!("host descriptor requires an existing regular file: {error_msg}"),
+                                    ));
+                                }
                                 let in_ext_root = path_is_in_leaf_allowed_extension_root(
                                     checked_path,
                                     extension_id.as_deref(),
@@ -23933,6 +24013,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
+                                if snapshot {
+                                    let (bytes, metadata) = storage::read_file_snapshot(file)
+                                        .map_err(|error| storage::filesystem_error(&ctx, &path, "open", &error))?;
+                                    return Ok(encode(bytes, Some(metadata)));
+                                }
+
                                 let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
                                 reader.read_to_end(&mut buffer).map_err(|err| {
@@ -24006,6 +24092,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         ));
                                     }
                                 };
+
+                                if snapshot {
+                                    let (bytes, metadata) = storage::read_file_snapshot(file)
+                                        .map_err(|error| storage::filesystem_error(&ctx, &path, "open", &error))?;
+                                    return Ok(encode(bytes, Some(metadata)));
+                                }
 
                                 let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
@@ -38540,6 +38632,73 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(result["ownerSize"], serde_json::json!(9));
             assert_eq!(result["sharedRead"], serde_json::json!(false));
             assert_eq!(result["sharedClose"], serde_json::json!(false));
+        });
+    }
+
+    #[test]
+    fn pijs_vfs_descriptors_recheck_admission_after_file_moves_to_another_owner() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            for path in [&workspace, &ext_a, &ext_b] {
+                std::fs::create_dir_all(path).expect("mkdir");
+            }
+            let shared = workspace.join("shared.txt");
+            let moved = ext_b.join("moved.txt");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                PiJsRuntimeConfig {
+                    cwd: workspace.display().to_string(),
+                    ..PiJsRuntimeConfig::default()
+                },
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+            let script = format!(
+                r#"
+                globalThis.movedFdScope = {{}};
+                import('node:fs').then(fs => {{
+                    let fd;
+                    return __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        fs.writeFileSync({shared:?}, 'shared-data');
+                        fd = fs.openSync({shared:?}, 'r+');
+                    }}).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {{
+                        fs.renameSync({shared:?}, {moved:?});
+                    }})).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        for (const [name, operation] of [
+                            ['read', () => fs.readSync(fd, Buffer.alloc(32), 0, 32, 0)],
+                            ['write', () => fs.writeSync(fd, 'tampered', 0)],
+                            ['stat', () => fs.fstatSync(fd)],
+                            ['truncate', () => fs.ftruncateSync(fd, 1)],
+                            ['times', () => fs.futimesSync(fd, 0, 0)],
+                        ]) {{
+                            try {{ operation(); movedFdScope[name] = false; }}
+                            catch (error) {{ movedFdScope[name] = String(error).includes('denied'); }}
+                        }}
+                        fs.closeSync(fd);
+                        movedFdScope.closed = true;
+                    }})).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {{
+                        movedFdScope.data = fs.readFileSync({moved:?}, 'utf8');
+                    }}));
+                }});
+                "#
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("exercise moved descriptor admission");
+            assert_eq!(
+                get_global_json(&runtime, "movedFdScope").await,
+                json!({
+                    "read": true, "write": true, "stat": true, "truncate": true,
+                    "times": true, "closed": true, "data": "shared-data",
+                })
+            );
         });
     }
 

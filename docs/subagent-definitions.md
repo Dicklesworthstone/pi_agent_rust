@@ -277,6 +277,11 @@ schema mappings are not accepted by this initial implementation. Schemas are
 compiled at definition load time, before a child is launched. Parser and schema
 errors identify the file and failure category without echoing schema values.
 
+Schemas in definitions and ordinary `outputSchema` calls are limited to 64 KiB
+of encoded JSON, 32 nesting levels, and 4,096 values. Local schema references are
+supported; external file and network references are unavailable. Retained
+worker and pool output contracts keep their smaller 16 KiB schema limit.
+
 `structured: true` keeps native JSON validation active independently of the
 optional structured-result text footer. Without an explicit schema it selects
 an unconstrained JSON schema: any JSON value is allowed, ordinary prose is not.
@@ -293,6 +298,14 @@ list at most 128 entries. Unix reads are nonblocking before checking the opened
 file type so a FIFO named `.md` cannot stall discovery. Authored file symlinks
 remain supported; these checks are not an atomic snapshot or a new trust boundary.
 Tags, anchors, merge keys, includes and executable constructors are unsupported.
+
+Definition bodies and schema directives reach native children through a private
+temporary prompt file, so valid large definitions do not consume command-line
+space. The composed prompt is limited to 4 MiB. Each one-shot attempt receives
+its own snapshot; a retained worker or pool member keeps its snapshot until the
+process is retired. Editing the original definition after admission does not
+change those instructions. A body that happens to name an existing file remains
+literal instruction text.
 
 Regression coverage lives in `src/subagents/definition/tests.rs`, including three
 public `SubagentTool` child-process protocol fixtures for schema validation,

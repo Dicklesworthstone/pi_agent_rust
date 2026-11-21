@@ -5754,16 +5754,44 @@ impl ExtensionManager {
                 .unwrap_or(false))
     }
 
-    /// Dispatch multiple fire-and-forget events in a single JS bridge call.
+    /// Dispatch multiple fire-and-forget events to subscribed runtimes.
     ///
     /// Events that have no registered hooks are filtered out before crossing
     /// the bridge.  Returns `Ok(())` — individual per-event errors are logged
-    /// but do not fail the batch.
+    /// but do not fail the batch. JS-only batches retain a single bridge call;
+    /// batches with WASM subscribers use the shared ordered dispatch path.
     pub async fn dispatch_event_batch(
         &self,
         events: Vec<(ExtensionEventName, Option<Value>)>,
     ) -> Result<()> {
         if events.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(feature = "wasm-host")]
+        if self.wasm_extensions().iter().any(|extension| {
+            events.iter().any(|(event, _)| {
+                extension
+                    .event_hooks()
+                    .iter()
+                    .any(|hook| hook == event.as_str())
+            })
+        }) {
+            // The single-bridge optimization only reaches JS/native runtimes.
+            // Observation events arrive here through EventCoalescer, so using
+            // it for WASM would silently discard message/tool boundaries while
+            // still delivering their coalesced updates. Share direct dispatch's
+            // subscriptions, context, deadlines, and cancellation ownership.
+            for (event, data) in events {
+                if let Err(err) = self.dispatch_event(event, data).await {
+                    tracing::warn!(
+                        event = "ext.event_batch.error",
+                        event_name = %event,
+                        error = %err,
+                        "Batch event dispatch failed"
+                    );
+                }
+            }
             return Ok(());
         }
 

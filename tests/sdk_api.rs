@@ -292,6 +292,241 @@ printf '{"type":"agent_end","sessionId":"early","messages":[]}\n'
 }
 
 #[cfg(unix)]
+mod callback_only_rpc {
+    use super::*;
+
+    fn client(script: &str) -> sdk::RpcTransportClient {
+        sdk::RpcTransportClient::connect(sdk::RpcTransportOptions {
+            // Timed reads make a missing callback/control a bounded fixture
+            // failure instead of leaving the suite parked on its handshake.
+            binary_path: PathBuf::from("/bin/bash"),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+        })
+        .expect("connect callback-only RPC fixture")
+    }
+
+    #[test]
+    fn streams_in_order_and_cooperative_abort_preserves_the_connection() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 10 request || exit 1
+printf '{"type":"agent_start","sessionId":"callback-only"}\n'
+printf '{"type":"response","id":"rpc-1","command":"prompt","success":true}\n'
+printf '{"type":"fixture_input","frame":%s}\n' "$request"
+IFS= read -r -t 10 control || exit 1
+printf '{"type":"response","id":"rpc-2","command":"abort","success":true}\n'
+index=0
+while [ "$index" -lt 300 ]; do
+  printf '{"type":"message_update","index":%s,"delta":"bounded"}\n' "$index"
+  index=$((index + 1))
+done
+printf '{"type":"agent_end","messages":[],"error":"Aborted","control":%s}\n' "$control"
+IFS= read -r -t 10 probe || exit 1
+printf '{"type":"response","id":"rpc-3","command":"get_state","success":true,"data":{"alive":true}}\n'
+"#,
+        );
+        let control = client.control_handle();
+        let mut phase = 0;
+        let mut deltas = 0;
+        let images = vec![sdk::ImageContent {
+            data: "YQ==".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let expected = json!({
+            "type":"prompt", "id":"rpc-1", "message":"inspect this",
+            "images":images, "streamingBehavior":"steer"
+        });
+        futures::executor::block_on(client.stream_prompt(
+            "inspect this",
+            Some(images),
+            Some("steer"),
+            |event| match event["type"].as_str() {
+                Some("agent_start") => {
+                    assert_eq!(phase, 0);
+                    phase = 1;
+                }
+                Some("fixture_input") => {
+                    assert_eq!(phase, 1);
+                    assert_eq!(event["frame"], expected);
+                    assert_eq!(control.abort().expect("live abort"), "rpc-2");
+                    phase = 2;
+                }
+                Some("message_update") => {
+                    assert_eq!(phase, 2);
+                    assert_eq!(event["index"], deltas);
+                    deltas += 1;
+                }
+                Some("agent_end") => {
+                    assert_eq!(phase, 2);
+                    assert_eq!(event["error"], "Aborted");
+                    assert_eq!(event["control"], json!({"type":"abort", "id":"rpc-2"}));
+                    phase = 3;
+                }
+                _ => panic!("unexpected event: {event}"),
+            },
+        ))
+        .expect("terminal turn error is delivered as an event");
+        assert_eq!(phase, 3);
+        // The pre-ACK event-count budget must not become a whole-turn cap.
+        // This callback keeps only counters, regardless of the event count.
+        assert_eq!(deltas, 300);
+        let state = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+            .expect("cooperative abort must preserve the connection");
+        assert_eq!(state, json!({"alive":true}));
+        client.shutdown().expect("shutdown callback-only fixture");
+    }
+
+    #[test]
+    fn native_content_validates_before_dispatch_and_delivers_pre_ack_terminal() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 10 request || exit 1
+printf '{"type":"fixture_input","frame":%s}\n' "$request"
+printf '{"type":"agent_end","messages":[]}\n'
+printf '{"type":"response","id":"rpc-1","command":"prompt","success":true}\n'
+IFS= read -r -t 10 probe || exit 1
+printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"data":{"alive":true}}\n'
+"#,
+        );
+        let invalid = futures::executor::block_on(client.stream_prompt_with_content(
+            Vec::new(),
+            None,
+            |_| panic!("rejected native input must not deliver events"),
+        ));
+        assert!(invalid.is_err());
+        let content = vec![
+            sdk::ContentBlock::Text(sdk::TextContent::new("listen first")),
+            sdk::ContentBlock::Media(sdk::MediaContent {
+                data: "Yg".to_string(),
+                mime_type: "AUDIO/WAV".to_string(),
+                name: Some("  voice\n.wav  ".to_string()),
+            }),
+        ];
+        let mut delivered = Vec::new();
+        futures::executor::block_on(client.stream_prompt_with_content(
+            content,
+            Some("followUp"),
+            |event| {
+                if event["type"] == "fixture_input" {
+                    assert_eq!(
+                        event["frame"],
+                        json!({
+                            "type":"prompt", "id":"rpc-1", "streamingBehavior":"followUp",
+                            "content":[
+                                {"type":"text", "text":"listen first"},
+                                {"type":"media", "data":"Yg", "mimeType":"audio/wav", "name":"voice.wav"}
+                            ]
+                        })
+                    );
+                }
+                delivered.push(event["type"].as_str().unwrap().to_string());
+            },
+        ))
+        .expect("native callback-only stream");
+        assert_eq!(delivered, ["fixture_input", "agent_end"]);
+        let state = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+            .expect("pre-ACK terminal leaves the next response aligned");
+        assert_eq!(state, json!({"alive":true}));
+        client.shutdown().expect("shutdown native fixture");
+    }
+
+    #[test]
+    fn failed_ack_hides_speculative_events_and_allows_the_next_request() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 10 request || exit 1
+printf '{"type":"agent_start","sessionId":"not-admitted"}\n'
+printf '{"type":"agent_end","messages":[]}\n'
+printf '{"type":"response","id":"rpc-1","command":"prompt","success":false,"error":"fixture refusal"}\n'
+IFS= read -r -t 10 probe || exit 1
+printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"data":{"alive":true}}\n'
+"#,
+        );
+        let error = futures::executor::block_on(client.stream_prompt(
+            "refuse this turn",
+            None,
+            None,
+            |_| panic!("a failed acknowledgement must not expose speculative events"),
+        ))
+        .expect_err("server refusal");
+        assert!(error.to_string().contains("fixture refusal"));
+        let state = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+            .expect("acknowledged refusal preserves the connection");
+        assert_eq!(state, json!({"alive":true}));
+        client.shutdown().expect("shutdown refusal fixture");
+    }
+
+    #[test]
+    fn malformed_ack_and_early_eof_revoke_the_transport() {
+        for reply in [
+            r#"{"type":"response","id":"rpc-1","command":"wrong","success":true}"#,
+            r#"{"type":"response","id":"rpc-1","command":"prompt","success":"true"}"#,
+            r#"{"type":"response","id":"rpc-1","command":"prompt","success":true}"#,
+        ] {
+            let script = format!(
+                "IFS= read -r -t 10 request || exit 1\nprintf '%s\\n' '{reply}'\n"
+            );
+            let mut client = client(&script);
+            let control = client.control_handle();
+            let error = futures::executor::block_on(client.stream_prompt(
+                "hello",
+                None,
+                None,
+                |_| panic!("fixture sends no complete events"),
+            ))
+            .expect_err("malformed acknowledgement or missing terminal");
+            assert!(
+                error.to_string().contains("wrong command")
+                    || error.to_string().contains("boolean success flag")
+                    || error.to_string().contains("exited before sending"),
+                "{error}"
+            );
+            assert!(control.abort().is_err(), "invalid protocol revokes controls");
+            client.shutdown().expect("shutdown failed stream");
+        }
+    }
+
+    #[test]
+    fn dropping_a_live_stream_revokes_controls_and_later_requests() {
+        let mut client = client(
+            r#"
+IFS= read -r -t 10 request || exit 1
+printf '{"type":"response","id":"rpc-1","command":"prompt","success":true}\n'
+printf '{"type":"agent_start","sessionId":"drop-stream"}\n'
+IFS= read -r -t 10 control || exit 1
+"#,
+        );
+        let control = client.control_handle();
+        let (cancel, cancelled) = futures::channel::oneshot::channel();
+        let mut cancel = Some(cancel);
+        let prompt = Box::pin(client.stream_prompt("hello", None, None, move |event| {
+            if event["type"] == "agent_start"
+                && let Some(cancel) = cancel.take()
+            {
+                cancel.send(()).expect("cancel live stream");
+            }
+        }));
+        match futures::executor::block_on(futures::future::select(prompt, cancelled)) {
+            futures::future::Either::Right((Ok(()), pending)) => drop(pending),
+            futures::future::Either::Right((Err(error), _)) => {
+                panic!("start event was not delivered: {error}");
+            }
+            futures::future::Either::Left((result, _)) => {
+                panic!("the live stream did not yield to cancellation: {result:?}");
+            }
+        }
+        assert!(control.abort().is_err(), "dropped stream revokes controls");
+        assert!(
+            futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+                .is_err(),
+            "a cancelled stream cannot lend unread frames to another request"
+        );
+        client.shutdown().expect("join cancelled pipe workers");
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn sdk_rpc_prompt_rejects_wrong_ack_and_reserved_request_fields() {
     let script = r#"

@@ -339,3 +339,150 @@ cohere_test!(cohere_unicode_content, scenario_unicode);
 cohere_test!(cohere_tool_call_single, scenario_tool_call_single);
 cohere_test!(cohere_tool_call_multiple, scenario_tool_call_multiple);
 cohere_test!(cohere_very_long_response, scenario_long_response);
+
+/// A planted wire response feeds the real provider and agent, with real file
+/// tools as the execution observable. This is protocol regression evidence,
+/// not a credentialed Cohere run or a recorded provider response.
+#[test]
+fn cohere_truncated_tool_batch_cannot_execute_completed_writes() {
+    use crate::common::{MockHttpResponse, run_async};
+    use pi::agent::{Agent, AgentConfig, AgentEvent};
+    use pi::tools::ToolRegistry;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn response(events: impl IntoIterator<Item = serde_json::Value>) -> MockHttpResponse {
+        MockHttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".into(), "text/event-stream".into())],
+            body: events
+                .into_iter()
+                .flat_map(|event| format!("data: {event}\n\n").into_bytes())
+                .collect(),
+        }
+    }
+
+    for (finish, unfinished_peer, allowed) in [
+        ("MAX_TOKENS", false, false),
+        ("MAX_TOKENS", true, false),
+        ("ERROR", false, false),
+        ("ERROR_TOXIC", false, false),
+        ("TOOL_CALL", false, true),
+        ("COMPLETE", false, true),
+        ("STOP_SEQUENCE", false, true),
+    ] {
+        let harness = TestHarness::new(format!("cohere_terminal_write_{finish}_{unfinished_peer}"));
+        let server = harness.start_mock_http_server();
+        let mut events = vec![json!({"type":"message-start"})];
+        for (index, path) in [(0, "first.txt"), (1, "second.txt")] {
+            events.push(json!({"type":"tool-call-start","index":index,"delta":{
+                "message":{"tool_calls":{"id":format!("write-{index}"),"type":"function",
+                "function":{"name":"write","arguments":json!({"path":path,"content":"committed"}).to_string()}}}
+            }}));
+            events.push(json!({"type":"tool-call-end","index":index}));
+        }
+        if unfinished_peer {
+            events.push(json!({"type":"tool-call-start","index":2,"delta":{
+                "message":{"tool_calls":{"id":"unfinished-write","type":"function",
+                "function":{"name":"write","arguments":"{"}}}
+            }}));
+        }
+        events.push(json!({"type":"message-end","delta":{"finish_reason":finish,
+            "usage":{"tokens":{"input_tokens":10,"output_tokens":20},
+                     "billed_units":{"input_tokens":5,"output_tokens":10}}
+        }}));
+        if allowed {
+            server.add_route_queue(
+                "POST",
+                "/v2/chat",
+                vec![
+                    response(events),
+                    response([
+                        json!({"type":"message-start"}),
+                        json!({"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":"Both files written."}}}}),
+                        json!({"type":"content-end","index":0}),
+                        json!({"type":"message-end","delta":{"finish_reason":"COMPLETE"}}),
+                    ]),
+                ],
+            );
+        } else {
+            server.add_route("POST", "/v2/chat", response(events));
+        }
+        let provider = Arc::new(
+            CohereProvider::new("command-test")
+                .with_base_url(format!("{}/v2/chat", server.base_url())),
+        );
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(&["write"], harness.temp_dir(), None),
+            AgentConfig {
+                max_tool_iterations: 3,
+                stream_options: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&starts);
+        let result = run_async(async move {
+            Box::pin(agent.run("Write both files", move |event| {
+                if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }))
+            .await
+        });
+        if allowed {
+            assert_eq!(result.unwrap().stop_reason, StopReason::Stop);
+            assert_eq!(starts.load(Ordering::SeqCst), 2);
+            for path in ["first.txt", "second.txt"] {
+                assert_eq!(
+                    std::fs::read_to_string(harness.temp_dir().join(path)).unwrap(),
+                    "committed"
+                );
+            }
+            assert_eq!(server.requests().len(), 2);
+        } else {
+            let error = match result {
+                Err(error) => {
+                    assert!(
+                        unfinished_peer,
+                        "terminal outcome lost its message: {error}"
+                    );
+                    error.to_string()
+                }
+                Ok(message) => {
+                    assert_eq!(message.stop_reason, StopReason::Error);
+                    if !unfinished_peer {
+                        assert_eq!(message.usage.total_tokens, 30);
+                        assert!(message.usage.billing.is_some());
+                    }
+                    message
+                        .error_message
+                        .expect("failed generation has an error")
+                }
+            };
+            if finish == "MAX_TOKENS" && !unfinished_peer {
+                assert!(error.contains("local tool calls withheld"), "{error}");
+            }
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert!(!harness.temp_dir().join("first.txt").exists());
+            assert!(!harness.temp_dir().join("second.txt").exists());
+            assert_eq!(server.requests().len(), 1);
+        }
+        harness.log().info_ctx(
+            "terminal_authorization",
+            "Cohere tool batch checked",
+            |ctx| {
+                ctx.push(("finish_reason".into(), finish.into()));
+                ctx.push(("unfinished_peer".into(), unfinished_peer.to_string()));
+                ctx.push((
+                    "executed_tools".into(),
+                    starts.load(Ordering::SeqCst).to_string(),
+                ));
+            },
+        );
+    }
+}

@@ -1350,6 +1350,7 @@ mod tests {
   (core module $guest
     (memory (export "memory") 2)
     (global $heap (mut i32) (i32.const 8192))
+    @@EVENT_STATE@@
     (data (i32.const 0) "@@REGISTRATION_DATA@@")
     (data (i32.const 2048) "@@TOOL_DATA@@")
     (data (i32.const 4096) "@@SLASH_DATA@@")
@@ -1394,7 +1395,7 @@ mod tests {
     (func (export "cabi_post_handle-slash") (param i32))
 
     (func (export "handle-event") (param i32 i32) (result i32)
-      unreachable)
+      @@EVENT_BODY@@)
     (func (export "cabi_post_handle-event") (param i32))
     (func (export "shutdown")))
 
@@ -1513,6 +1514,14 @@ mod tests {
     }
 
     fn real_component_fixture_with_registration(payload: &RegisterPayload) -> Vec<u8> {
+        real_component_fixture_with_event_behavior(payload, "", "unreachable")
+    }
+
+    fn real_component_fixture_with_event_behavior(
+        payload: &RegisterPayload,
+        event_state: &str,
+        event_body: &str,
+    ) -> Vec<u8> {
         let registration = serde_json::to_string(payload).expect("serialize registration");
         let tool_output = serde_json::to_string(&ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("wasm-tool-ok"))],
@@ -1541,6 +1550,8 @@ mod tests {
         let slash_len = slash_output.len();
 
         let component = REAL_COMPONENT_WAT_TEMPLATE
+            .replace("@@EVENT_STATE@@", event_state)
+            .replace("@@EVENT_BODY@@", event_body)
             .replace("@@REGISTRATION_DATA@@", &registration_data)
             .replace("@@TOOL_DATA@@", &tool_data)
             .replace("@@SLASH_DATA@@", &slash_data)
@@ -2568,5 +2579,123 @@ mod tests {
                 .contains("Extension runtime not configured"),
             "unexpected error: {missing_err}"
         );
+    }
+
+    #[test]
+    fn wasm_host_event_batches_deliver_boundaries_in_order_and_continue_after_errors() {
+        let hooks = [
+            "message_start",
+            "tool_execution_start",
+            "tool_execution_end",
+            "message_end",
+        ];
+        for fail_first in [false, true] {
+            let dir = tempdir().expect("tempdir");
+            let component_path = dir.path().join("event-extension.wasm");
+            let mut payload = registration_payload();
+            payload.event_hooks = hooks.iter().map(ToString::to_string).collect();
+            // Count invocations inside the actual component. Returning a guest
+            // error for the first call also proves later events still execute;
+            // observing manager dispatch logs alone would not establish that.
+            let event_state = format!(
+                r#"(global $event-count (mut i32) (i32.const 0))
+                   (global $fail-first i32 (i32.const {}))
+                   (data (i32.const 6144) "0")"#,
+                i32::from(fail_first)
+            );
+            let event_body = r"
+                (global.set $event-count
+                  (i32.add (global.get $event-count) (i32.const 1)))
+                (i32.store8 (i32.const 6144)
+                  (i32.add (global.get $event-count) (i32.const 48)))
+                (drop (call $ok-result (i32.const 6144) (i32.const 1)))
+                (if (i32.and (global.get $fail-first)
+                      (i32.eq (global.get $event-count) (i32.const 1)))
+                  (then (i32.store (i32.const 7168) (i32.const 1))))
+                (i32.const 7168)";
+            std::fs::write(
+                &component_path,
+                real_component_fixture_with_event_behavior(&payload, &event_state, event_body),
+            )
+            .expect("write event component");
+            let manifest_value = json!({
+                "schema": "pi.ext.manifest.v1",
+                "extension_id": "wasm-event-ext",
+                "name": payload.name,
+                "version": payload.version,
+                "api_version": PROTOCOL_VERSION,
+                "runtime": "wasm",
+                "entrypoint": "event-extension.wasm",
+                "capability_manifest": payload.capability_manifest,
+            });
+            let spec = WasmExtensionLoadSpec {
+                manifest: serde_json::from_value(manifest_value.clone()).expect("parse manifest"),
+                manifest_json: serde_json::to_string(&manifest_value).expect("serialize manifest"),
+                root: dir.path().to_path_buf(),
+                entry_path: component_path,
+            };
+            let host = WasmExtensionHost::new(dir.path(), permissive_policy()).expect("WASM host");
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::SharedToolRegistry::new(ToolRegistry::new(
+                &["read"],
+                dir.path(),
+                None,
+            ));
+            run_async(manager.load_wasm_extensions(&host, vec![spec], tools))
+                .expect("load event component without a JS runtime");
+            let (result, logs) = capture_tracing_events(|| {
+                run_async(manager.dispatch_event_batch(vec![
+                    (ExtensionEventName::MessageStart, Some(json!({ "id": "m1" }))),
+                    // This event is deliberately not subscribed. Broadcasting
+                    // every event would advance the guest counter incorrectly.
+                    (ExtensionEventName::SessionShutdown, None),
+                    (ExtensionEventName::ToolExecutionStart, None),
+                    (
+                        ExtensionEventName::ToolExecutionEnd,
+                        Some(json!({ "ok": true })),
+                    ),
+                    (ExtensionEventName::MessageEnd, None),
+                ]))
+            });
+            result.expect("informational batches isolate individual event errors");
+
+            let completed = logs
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| value == "ext.event.end")
+                })
+                .map(|entry| {
+                    assert_eq!(
+                        entry.fields.get("has_response").map(String::as_str),
+                        Some("true")
+                    );
+                    entry.fields["event_name"].as_str()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(completed, hooks[usize::from(fail_first)..]);
+            let failed = logs
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| value == "ext.wasm.dispatch.failed")
+                })
+                .count();
+            assert_eq!(failed, usize::from(fail_first));
+
+            // A fifth direct call reads the component's counter. Old batch
+            // dispatch returns success without calling WASM and reports 1;
+            // duplicate or unsubscribed delivery would report more than 5.
+            let observed = run_async(manager.wasm_extensions()[0].handle_event_value(
+                &json!({ "type": "inspect_count" }),
+                5_000,
+            ))
+            .expect("read guest invocation count");
+            assert_eq!(observed, Some(json!(5)), "fail_first={fail_first}");
+        }
     }
 }
