@@ -2216,13 +2216,44 @@ impl RpcTransportClient {
     /// `streaming_behavior` has the same meaning as in
     /// [`Self::prompt_with_options_streaming`]. Native content uses the same
     /// bounded pre-acknowledgement buffer and terminal `agent_end` handling as
-    /// text and image prompts. Input is validated before dispatch.
+    /// text and image prompts. Input is validated before dispatch. This method
+    /// also retains every event for its return value; use
+    /// [`Self::stream_prompt_with_content`] to deliver events without retaining
+    /// a completed transcript in the client.
     pub async fn prompt_with_content_streaming(
         &mut self,
         content: Vec<ContentBlock>,
         streaming_behavior: Option<&str>,
-        on_event: impl FnMut(Value),
+        mut on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        self.stream_prompt_with_content(content, streaming_behavior, |event| {
+            on_event(event.clone());
+            events.push(event);
+        })
+        .await?;
+        Ok(events)
+    }
+
+    /// Stream ordered native content without collecting the resulting events.
+    ///
+    /// The callback owns each event, and the client retains no delivered
+    /// transcript. The bounded pipe queue and pre-acknowledgement buffer still
+    /// apply; memory does not grow with the number of acknowledged events
+    /// unless the callback stores them. Input validation, live controls,
+    /// acknowledgement checks, and terminal `agent_end` handling are identical
+    /// to [`Self::prompt_with_content_streaming`].
+    ///
+    /// A normal return means `agent_end` was delivered, including its error
+    /// field if the turn failed. Protocol and I/O failures return an error.
+    /// Dropping the future closes the transport; to cancel and reuse it, send
+    /// [`RpcControlHandle::abort`] and keep polling until the terminal event.
+    pub async fn stream_prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        streaming_behavior: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<()> {
         let payload = rpc_native_content_payload(content)?;
         self.prompt_payload_streaming(payload, streaming_behavior, on_event)
             .await
@@ -2234,13 +2265,45 @@ impl RpcTransportClient {
     /// flushed. Those events are retained under explicit count/byte bounds and
     /// released in order once the matching success acknowledgement arrives.
     /// A failed acknowledgement never leaks speculative events to the caller.
+    /// Delivered events are also retained for the return value; use
+    /// [`Self::stream_prompt`] when only the live callback is needed.
     pub async fn prompt_with_options_streaming(
         &mut self,
         message: impl Into<String>,
         images: Option<Vec<ImageContent>>,
         streaming_behavior: Option<&str>,
-        on_event: impl FnMut(Value),
+        mut on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        self.stream_prompt(message, images, streaming_behavior, |event| {
+            on_event(event.clone());
+            events.push(event);
+        })
+        .await?;
+        Ok(events)
+    }
+
+    /// Stream text and optional images without collecting the resulting events.
+    ///
+    /// Unlike [`Self::prompt_with_options_streaming`], this method transfers
+    /// every acknowledged event directly to the callback and returns `()`.
+    /// The client retains only the bounded pipe queue and pre-acknowledgement
+    /// buffer, so it does not accumulate a transcript over long turns.
+    /// Callbacks that retain events own that additional memory themselves.
+    ///
+    /// Success means a terminal `agent_end` event reached the callback; inspect
+    /// that event's `error` field for turn failures. Protocol and I/O failures
+    /// return an error. A failed acknowledgement exposes no speculative events.
+    /// Dropping this future closes the transport. For cooperative cancellation
+    /// and continued use, obtain [`Self::control_handle`] first, send its abort,
+    /// and keep polling this future until the terminal event arrives.
+    pub async fn stream_prompt(
+        &mut self,
+        message: impl Into<String>,
+        images: Option<Vec<ImageContent>>,
+        streaming_behavior: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<()> {
         let mut payload = Map::new();
         payload.insert("message".to_string(), Value::String(message.into()));
         if let Some(images) = images {
@@ -2261,7 +2324,7 @@ impl RpcTransportClient {
         mut payload: Map<String, Value>,
         streaming_behavior: Option<&str>,
         mut on_event: impl FnMut(Value),
-    ) -> Result<Vec<Value>> {
+    ) -> Result<()> {
         let request_id = self.next_request_id()?;
         payload.insert("type".to_string(), Value::String("prompt".to_string()));
         payload.insert("id".to_string(), Value::String(request_id.clone()));
@@ -2275,7 +2338,6 @@ impl RpcTransportClient {
         self.write_json_line(&Value::Object(payload)).await?;
 
         let mut saw_ack = false;
-        let mut events = Vec::new();
         // Annotated, not inferred: the first USE of the element type is
         // `event.get("type")` in the drain loop below, and the only thing that
         // would constrain it is the `pre_ack.push(item)` further down. Method
@@ -2317,11 +2379,10 @@ impl RpcTransportClient {
                 for event in std::mem::take(&mut pre_ack) {
                     let reached_end =
                         event.get("type").and_then(Value::as_str) == Some("agent_end");
-                    on_event(event.clone());
-                    events.push(event);
+                    on_event(event);
                     if reached_end {
                         operation.finish();
-                        return Ok(events);
+                        return Ok(());
                     }
                 }
                 continue;
@@ -2344,11 +2405,10 @@ impl RpcTransportClient {
             }
 
             let reached_end = item_type == Some("agent_end");
-            on_event(item.clone());
-            events.push(item);
+            on_event(item);
             if reached_end {
                 operation.finish();
-                return Ok(events);
+                return Ok(());
             }
         }
     }
