@@ -956,8 +956,8 @@ where
                         }
 
                         // Serialize args for the delta event
-                        let args_str = serde_json::to_string(&args)
-                            .unwrap_or_else(|_| "{}".to_string());
+                        let args_str =
+                            serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
 
                         let tool_call = ToolCall {
                             id,
@@ -4208,7 +4208,10 @@ mod tests {
                     .is_none()
             );
         }
-        assert_eq!(wire["contents"][1]["parts"][0]["thoughtSignature"], SIGNATURE);
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["thoughtSignature"],
+            SIGNATURE
+        );
     }
 
     #[test]
@@ -4834,7 +4837,10 @@ mod tests {
                 .unwrap();
             assert_eq!(message.stop_reason, StopReason::Error, "{case}");
             assert_eq!(executions.load(Ordering::SeqCst), 0, "{case}");
-            assert!(!marker.exists(), "ambiguous completion executed a write: {case}");
+            assert!(
+                !marker.exists(),
+                "ambiguous completion executed a write: {case}"
+            );
             assert!(
                 !agent
                     .messages()
@@ -4870,8 +4876,10 @@ mod tests {
                         "finishReason": "STOP"}]}),
                 ]
             } else {
-                vec![json!({"candidates": [{"content": {"parts": [call(&first), call(&second)]},
-                    "finishReason": "STOP"}]})]
+                vec![
+                    json!({"candidates": [{"content": {"parts": [call(&first), call(&second)]},
+                    "finishReason": "STOP"}]}),
+                ]
             };
             let body = frames
                 .iter()

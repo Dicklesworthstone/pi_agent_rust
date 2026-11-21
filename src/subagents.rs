@@ -1446,8 +1446,7 @@ const OUTPUT_SCHEMA_LIMIT: &str =
 // bounded answer can fail many schema branches per item, multiplying into far
 // more text than the answer and even preventing the corrective child launch.
 const MAX_OUTPUT_VALIDATION_BYTES: usize = 1024;
-const OUTPUT_VALIDATION_TRUNCATED: &str =
-    "PI_SUBAGENT_SCHEMA_DIAGNOSTICS_TRUNCATED: schema preview omitted remaining text; the complete required schema is in the system instructions.";
+const OUTPUT_VALIDATION_TRUNCATED: &str = "PI_SUBAGENT_SCHEMA_DIAGNOSTICS_TRUNCATED: schema preview omitted remaining text; the complete required schema is in the system instructions.";
 
 /// Bound authored schemas before recursive serialization or compilation. The
 /// same admission serves one-shot definitions and retained worker contracts;
@@ -2618,7 +2617,10 @@ mod tests {
             }
             // Bounding failure diagnostics cannot change the accepted data or
             // accidentally accept a later invalid element after valid ones.
-            assert_eq!(validate_child_output("[7,8]", &schema).unwrap(), json!([7, 8]));
+            assert_eq!(
+                validate_child_output("[7,8]", &schema).unwrap(),
+                json!([7, 8])
+            );
             assert!(validate_child_output(r#"[7,8,"invalid tail"]"#, &schema).is_err());
         }
     }

@@ -95,9 +95,10 @@ impl PreparedEdit {
                 path.display()
             )));
         }
-        let image = self.0.files[&normalized].before.as_ref().ok_or_else(|| {
-            conflict(format!("{} disappeared while staging", path.display()))
-        })?;
+        let image = self.0.files[&normalized]
+            .before
+            .as_ref()
+            .ok_or_else(|| conflict(format!("{} disappeared while staging", path.display())))?;
         if image.bytes.as_ref() != original.as_bytes() {
             return Err(conflict(format!(
                 "{} changed while computing the rewrite; re-stage the proposal",
@@ -201,10 +202,7 @@ impl PreparedEdit {
         Ok(())
     }
 
-    pub(crate) fn commit(
-        self,
-        before_commit: impl FnOnce() -> Result<()>,
-    ) -> Result<ApplyOutcome> {
+    pub(crate) fn commit(self, before_commit: impl FnOnce() -> Result<()>) -> Result<ApplyOutcome> {
         self.1.require_no_confirmation()?;
         self.commit_reviewed(before_commit)
     }

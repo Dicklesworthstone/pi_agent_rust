@@ -103,7 +103,10 @@ fn parent_cancel_and_hub_kill_reject_queued_native_writeback_and_preserve_edits(
             if operator_killed {
                 registry().lock().unwrap().mark_killed(&id);
             } else {
-                owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel writeback"));
+                owner.cancel_with(
+                    asupersync::types::CancelKind::User,
+                    Some("cancel writeback"),
+                );
             }
             let result = finishing.await;
             // Cancellation must finish while the unrelated writer still owns

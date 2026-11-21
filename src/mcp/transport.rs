@@ -4885,9 +4885,7 @@ pub(crate) mod tests {
                         assert_eq!(event.data, text);
                         delivered += 1;
                     }
-                    if !response_refused
-                        && let Err(error) = response.feed(chunk)
-                    {
+                    if !response_refused && let Err(error) = response.feed(chunk) {
                         assert!(error.to_string().contains("SSE response exceeded"));
                         response_refused = true;
                     }
@@ -6978,7 +6976,10 @@ for line in sys.stdin:
                 .await
                 .expect("activate GET listener");
             wait_for_requests(&server, 4).await;
-            assert!(transport.is_alive(), "valid GET traffic must not abort POST");
+            assert!(
+                transport.is_alive(),
+                "valid GET traffic must not abort POST"
+            );
             let response = transport
                 .request("tools/list", serde_json::json!({}), Duration::from_secs(5))
                 .await

@@ -632,10 +632,16 @@ mod tests {
             mime_type: "image/png".into(),
         })]);
         let bytes = serde_json::to_vec(&content).unwrap().len() + "current text".len();
-        let mut pending = vec![PendingInput::prepared_initial(content, "current text".into())];
+        let mut pending = vec![PendingInput::prepared_initial(
+            content,
+            "current text".into(),
+        )];
         target.restore_pending(&mut pending).unwrap();
         assert!(pending.is_empty());
-        assert_eq!(target.snapshot().pending_bytes, before.pending_bytes + bytes);
+        assert_eq!(
+            target.snapshot().pending_bytes,
+            before.pending_bytes + bytes
+        );
     }
 
     #[test]

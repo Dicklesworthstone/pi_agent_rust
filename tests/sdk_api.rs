@@ -371,8 +371,9 @@ printf '{"type":"response","id":"rpc-3","command":"get_state","success":true,"da
         // The pre-ACK event-count budget must not become a whole-turn cap.
         // This callback keeps only counters, regardless of the event count.
         assert_eq!(deltas, 300);
-        let state = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
-            .expect("cooperative abort must preserve the connection");
+        let state =
+            futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+                .expect("cooperative abort must preserve the connection");
         assert_eq!(state, json!({"alive":true}));
         client.shutdown().expect("shutdown callback-only fixture");
     }
@@ -425,8 +426,9 @@ printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"da
         ))
         .expect("native callback-only stream");
         assert_eq!(delivered, ["fixture_input", "agent_end"]);
-        let state = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
-            .expect("pre-ACK terminal leaves the next response aligned");
+        let state =
+            futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+                .expect("pre-ACK terminal leaves the next response aligned");
         assert_eq!(state, json!({"alive":true}));
         client.shutdown().expect("shutdown native fixture");
     }
@@ -451,8 +453,9 @@ printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"da
         ))
         .expect_err("server refusal");
         assert!(error.to_string().contains("fixture refusal"));
-        let state = futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
-            .expect("acknowledged refusal preserves the connection");
+        let state =
+            futures::executor::block_on(client.request("get_state", serde_json::Map::new()))
+                .expect("acknowledged refusal preserves the connection");
         assert_eq!(state, json!({"alive":true}));
         client.shutdown().expect("shutdown refusal fixture");
     }
@@ -464,25 +467,25 @@ printf '{"type":"response","id":"rpc-2","command":"get_state","success":true,"da
             r#"{"type":"response","id":"rpc-1","command":"prompt","success":"true"}"#,
             r#"{"type":"response","id":"rpc-1","command":"prompt","success":true}"#,
         ] {
-            let script = format!(
-                "IFS= read -r -t 10 request || exit 1\nprintf '%s\\n' '{reply}'\n"
-            );
+            let script =
+                format!("IFS= read -r -t 10 request || exit 1\nprintf '%s\\n' '{reply}'\n");
             let mut client = client(&script);
             let control = client.control_handle();
-            let error = futures::executor::block_on(client.stream_prompt(
-                "hello",
-                None,
-                None,
-                |_| panic!("fixture sends no complete events"),
-            ))
-            .expect_err("malformed acknowledgement or missing terminal");
+            let error =
+                futures::executor::block_on(client.stream_prompt("hello", None, None, |_| {
+                    panic!("fixture sends no complete events")
+                }))
+                .expect_err("malformed acknowledgement or missing terminal");
             assert!(
                 error.to_string().contains("wrong command")
                     || error.to_string().contains("boolean success flag")
                     || error.to_string().contains("exited before sending"),
                 "{error}"
             );
-            assert!(control.abort().is_err(), "invalid protocol revokes controls");
+            assert!(
+                control.abort().is_err(),
+                "invalid protocol revokes controls"
+            );
             client.shutdown().expect("shutdown failed stream");
         }
     }

@@ -844,9 +844,7 @@ impl Drop for ReplayRecovery<'_> {
             .control
             .as_ref()
             .is_none_or(|control| !control.initial_input_handed_off());
-        if initial_not_handed_off
-            && let Some(first) = self.first.take()
-        {
+        if initial_not_handed_off && let Some(first) = self.first.take() {
             // Startup may fail or be dropped before the SDK transfers the
             // first payload to native input hooks. Return it ahead of its
             // unclaimed tail; a dispatched input must never be replayed just

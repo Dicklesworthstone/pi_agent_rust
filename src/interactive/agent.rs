@@ -2189,7 +2189,8 @@ After approving access in the browser, press Enter in Pi to complete login."
                 text,
                 content,
             } => {
-                if let Err(error) = crate::agent::AgentSession::validate_user_content_blocks(&content)
+                if let Err(error) =
+                    crate::agent::AgentSession::validate_user_content_blocks(&content)
                 {
                     self.status_message = Some(error.to_string());
                     return None;
@@ -4472,9 +4473,8 @@ After approving access in the browser, press Enter in Pi to complete login."
 
         if let Some(draft) = &self.fork_draft {
             if self.agent_state != AgentState::Idle {
-                self.status_message = Some(
-                    "Wait for the current turn; your fork draft is retained".to_string(),
-                );
+                self.status_message =
+                    Some("Wait for the current turn; your fork draft is retained".to_string());
                 return None;
             }
             if Cx::current().is_some_and(|cx| cx.is_cancel_requested()) {
@@ -8204,7 +8204,10 @@ mod stream_delta_batcher_tests {
         assert!(app.fork_draft.is_some());
         assert_eq!(app.input.value(), "edited fork text");
         app.session.try_lock().unwrap().header.id = owner;
-        assert!(app.begin_login_attempt(Path::new("fork-fixture-auth.json")).is_some());
+        assert!(
+            app.begin_login_attempt(Path::new("fork-fixture-auth.json"))
+                .is_some()
+        );
         assert!(app.fork_draft.is_none());
         app.input.set_value("private credential");
         app.apply_parked_fork_draft();

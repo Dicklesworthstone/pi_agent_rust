@@ -2162,7 +2162,10 @@ mod tests {
             let error = futures::executor::block_on(read_response_head(&mut reader))
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("connection closed before headers"), "{error}");
+            assert!(
+                error.contains("connection closed before headers"),
+                "{error}"
+            );
         }
     }
 
@@ -2237,13 +2240,17 @@ mod tests {
 
     #[test]
     fn response_header_budget_rejects_each_oversized_head() {
-        for (interim_first, oversized_status) in [(false, 103), (false, 200), (true, 103), (true, 200)] {
+        for (interim_first, oversized_status) in
+            [(false, 103), (false, 200), (true, 103), (true, 200)]
+        {
             let mut wire = Vec::new();
             if interim_first {
                 wire.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
             }
             let start = wire.len();
-            wire.extend_from_slice(format!("HTTP/1.1 {oversized_status} Status\r\nX-Pad: ").as_bytes());
+            wire.extend_from_slice(
+                format!("HTTP/1.1 {oversized_status} Status\r\nX-Pad: ").as_bytes(),
+            );
             wire.resize(start + MAX_HEADER_BYTES - 3, b'a');
             wire.extend_from_slice(b"\r\n\r\n");
             let error = futures::executor::block_on(read_response_head(&mut wire.as_slice()))

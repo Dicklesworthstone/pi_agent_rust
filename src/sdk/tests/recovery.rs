@@ -6620,15 +6620,14 @@ fn shared_auth_readers_do_not_republish_credentials_or_reopen_logged_out_fallbac
         );
     }
     let make_handle = || {
-        let mut handle = credential_binding_handle(&entries, None).with_failover(Some(
-            FailoverOptions {
+        let mut handle =
+            credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
                 chains: HashMap::new(),
                 available_models: entries.clone(),
                 auth: initial.clone(),
                 cli_api_key: None,
                 cooldown_secs: 0,
-            },
-        ));
+            }));
         handle.adopt_auth_storage(initial.clone());
         handle
     };
@@ -6757,10 +6756,8 @@ fn shared_auth_refresh_cannot_overwrite_a_newer_login_or_logout() {
             false,
             crate::compaction::ResolvedCompactionSettings::default(),
         );
-        let mut handle = AgentSessionHandle::from_session_with_listeners(
-            session,
-            EventListeners::default(),
-        );
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default());
         handle.adopt_auth_storage(initial.clone());
         let shared = handle.ensure_shared_auth_storage();
         let mut earlier = initial.clone();
@@ -6813,6 +6810,10 @@ fn shared_auth_refresh_cannot_overwrite_a_newer_login_or_logout() {
         handle.sync_shared_auth_if_updated();
         assert!(handle.session.agent.stream_options().api_key.is_none());
         assert_eq!(handle.shared_auth_epoch, 3);
-        assert_eq!(shared.lock().unwrap().0, 3, "{operation}: read-only catchup");
+        assert_eq!(
+            shared.lock().unwrap().0,
+            3,
+            "{operation}: read-only catchup"
+        );
     }
 }

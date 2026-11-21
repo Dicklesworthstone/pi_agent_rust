@@ -4442,7 +4442,7 @@ mod tests {
         let entry = root.join("acp-commands.mjs");
         std::fs::write(
             &entry,
-            r#"
+            r"
             export default function(pi) {
                 pi.registerCommand('echo', {
                     description: 'Echo the original command arguments',
@@ -4487,7 +4487,7 @@ mod tests {
                 }});
                 pi.registerCommand('mcp', { handler: () => { throw new Error('reserved'); }});
             }
-            "#,
+            ",
         )
         .unwrap();
         let cx = AgentCx::for_current_or_request();

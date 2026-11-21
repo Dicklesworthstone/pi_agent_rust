@@ -2645,7 +2645,10 @@ mod tests {
                 .expect("load event component without a JS runtime");
             let (result, logs) = capture_tracing_events(|| {
                 run_async(manager.dispatch_event_batch(vec![
-                    (ExtensionEventName::MessageStart, Some(json!({ "id": "m1" }))),
+                    (
+                        ExtensionEventName::MessageStart,
+                        Some(json!({ "id": "m1" })),
+                    ),
                     // This event is deliberately not subscribed. Broadcasting
                     // every event would advance the guest counter incorrectly.
                     (ExtensionEventName::SessionShutdown, None),
@@ -2690,10 +2693,10 @@ mod tests {
             // A fifth direct call reads the component's counter. Old batch
             // dispatch returns success without calling WASM and reports 1;
             // duplicate or unsubscribed delivery would report more than 5.
-            let observed = run_async(manager.wasm_extensions()[0].handle_event_value(
-                &json!({ "type": "inspect_count" }),
-                5_000,
-            ))
+            let observed = run_async(
+                manager.wasm_extensions()[0]
+                    .handle_event_value(&json!({ "type": "inspect_count" }), 5_000),
+            )
             .expect("read guest invocation count");
             assert_eq!(observed, Some(json!(5)), "fail_first={fail_first}");
         }

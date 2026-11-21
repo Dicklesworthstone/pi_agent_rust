@@ -1414,7 +1414,10 @@ fn fs_watch_file_tracks_namespace_replacement_and_ignores_detached_writes() {
             .unwrap();
         poll_files(&runtime, &clock, 30).await.unwrap();
         assert_eq!(
-            runtime.read_global_json("replacementChanges").await.unwrap(),
+            runtime
+                .read_global_json("replacementChanges")
+                .await
+                .unwrap(),
             serde_json::json!([
                 { "size": 3, "changedIdentity": true },
                 { "size": 8, "changedIdentity": false },
@@ -1937,7 +1940,10 @@ fn fs_descriptors_retain_file_identity_across_rename_unlink_and_replacement() {
             .expect("exercise descriptor lifecycle");
         runtime.drain_microtasks().await.expect("drain");
         assert_eq!(
-            runtime.read_global_json("descriptorLifecycle").await.unwrap(),
+            runtime
+                .read_global_json("descriptorLifecycle")
+                .await
+                .unwrap(),
             serde_json::json!({
                 "moved": {
                     "sourceAbsent": true, "data": "abcdef", "peer": "abcdef",

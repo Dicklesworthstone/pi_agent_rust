@@ -256,7 +256,10 @@ fn full_file_rewrites_do_not_overwrite_external_writes_during_apply_or_rollback(
             .expect_err("external edits must survive both commit and compensation");
         if change_committed_target {
             assert!(error.to_string().contains("LSP_EDIT_ROLLBACK"), "{error}");
-            assert!(error.to_string().contains("original retained at"), "{error}");
+            assert!(
+                error.to_string().contains("original retained at"),
+                "{error}"
+            );
             assert_eq!(std::fs::read_to_string(&first).unwrap(), "external\n");
             assert_eq!(std::fs::read_to_string(&second).unwrap(), "original\n");
             let backups: Vec<_> = std::fs::read_dir(&root)

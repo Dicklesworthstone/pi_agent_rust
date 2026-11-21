@@ -3249,7 +3249,13 @@ pub async fn run(
     in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
-    Box::pin(run_with_input(session, options, RpcInput::Lines(in_rx), out_tx)).await
+    Box::pin(run_with_input(
+        session,
+        options,
+        RpcInput::Lines(in_rx),
+        out_tx,
+    ))
+    .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7040,8 +7046,9 @@ async fn run_with_input(
 
     flush_rpc_session_on_shutdown(&session, &preservation_cx).await?;
 
-    service_result
-        .map_err(|error| Error::session(format!("RPC hub service cleanup was incomplete: {error}")))?;
+    service_result.map_err(|error| {
+        Error::session(format!("RPC hub service cleanup was incomplete: {error}"))
+    })?;
     input_error.map_or(Ok(()), |error| Err(Error::Io(Box::new(error))))
 }
 
@@ -15690,7 +15697,9 @@ mod retry_tests {
                 .unwrap();
             drop(in_tx);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
-            Box::pin(run(session, options, in_rx, out_tx)).await.unwrap();
+            Box::pin(run(session, options, in_rx, out_tx))
+                .await
+                .unwrap();
             let response = out_rx
                 .try_iter()
                 .map(|line| serde_json::from_str::<Value>(&line).unwrap())
@@ -15706,7 +15715,11 @@ mod retry_tests {
                 serde_json::to_value(content).unwrap()
             );
             assert_eq!(
-                inner.try_lock().unwrap().to_messages_for_current_path().len(),
+                inner
+                    .try_lock()
+                    .unwrap()
+                    .to_messages_for_current_path()
+                    .len(),
                 1
             );
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);

@@ -2371,7 +2371,10 @@ pub(crate) fn reconcile_session_header(
     };
     let (fallback_provider, fallback_model_id) = merge_session_header_field(
         "fallback model",
-        &(base.fallback_provider.clone(), base.fallback_model_id.clone()),
+        &(
+            base.fallback_provider.clone(),
+            base.fallback_model_id.clone(),
+        ),
         &(
             incoming.fallback_provider.clone(),
             incoming.fallback_model_id.clone(),
@@ -19823,7 +19826,9 @@ mod tests {
                 stale.append_message(make_test_message("pending local turn"));
                 stale.save().await.expect("merge independent model edit");
 
-                let reloaded = Session::open(&path_text).await.expect("reload merged session");
+                let reloaded = Session::open(&path_text)
+                    .await
+                    .expect("reload merged session");
                 assert!(reloaded.additional_roots().is_empty());
                 assert!(stale.additional_roots().is_empty());
                 assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
@@ -19833,10 +19838,18 @@ mod tests {
                 // This edit must compare against the newly accepted revocation,
                 // not the original header that still granted the shared root.
                 stale.set_additional_roots(std::slice::from_ref(&replacement));
-                stale.save().await.expect("advance accepted-header baseline");
+                stale
+                    .save()
+                    .await
+                    .expect("advance accepted-header baseline");
                 revoker.set_branched_from(Some("source-session.jsonl".to_string()));
-                revoker.save().await.expect("merge independent provenance edit");
-                let reloaded = Session::open(&path_text).await.expect("reload second merge");
+                revoker
+                    .save()
+                    .await
+                    .expect("merge independent provenance edit");
+                let reloaded = Session::open(&path_text)
+                    .await
+                    .expect("reload second merge");
                 assert_eq!(reloaded.additional_roots(), vec![replacement]);
                 assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
                 assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
@@ -19876,11 +19889,17 @@ mod tests {
 
                 for _ in 0..2 {
                     let error = stale.save().await.expect_err("conflicting grant must fail");
-                    assert!(error.to_string().contains("header conflict in additional roots"));
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("header conflict in additional roots")
+                    );
                     assert_eq!(stale.persisted_header, accepted_before);
                     assert!(stale.autosave_metrics().pending_mutations > 0);
                     assert!(stale.get_entry(&pending_id).is_some());
-                    let unchanged = Session::open(&path_text).await.expect("reload refused save");
+                    let unchanged = Session::open(&path_text)
+                        .await
+                        .expect("reload refused save");
                     assert_eq!(unchanged.header, durable_before.header);
                     assert_eq!(
                         serde_json::to_value(&unchanged.entries).expect("encode durable entries"),
@@ -19895,7 +19914,9 @@ mod tests {
                 stale.set_additional_roots(&[]);
                 stale.save().await.expect("save resolved pending turn");
                 stale.save().await.expect("idempotent retry");
-                let reloaded = Session::open(&path_text).await.expect("reload resolved save");
+                let reloaded = Session::open(&path_text)
+                    .await
+                    .expect("reload resolved save");
                 assert!(reloaded.additional_roots().is_empty());
                 assert_eq!(
                     reloaded
@@ -19939,7 +19960,9 @@ mod tests {
                 second.set_model_header(None, Some("other-model".to_string()), None);
                 let error = second.save().await.expect_err("model pair must conflict");
                 assert!(error.to_string().contains("header conflict in model"));
-                let reloaded = Session::open(&path_text).await.expect("reload model choice");
+                let reloaded = Session::open(&path_text)
+                    .await
+                    .expect("reload model choice");
                 assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
                 assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
 
@@ -19948,8 +19971,13 @@ mod tests {
                     Some("new-model".to_string()),
                     Some("high".to_string()),
                 );
-                second.save().await.expect("resolve pair and preserve independent edit");
-                let reloaded = Session::open(&path_text).await.expect("reload resolved pair");
+                second
+                    .save()
+                    .await
+                    .expect("resolve pair and preserve independent edit");
+                let reloaded = Session::open(&path_text)
+                    .await
+                    .expect("reload resolved pair");
                 assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
                 assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
                 assert_eq!(reloaded.header.thinking_level.as_deref(), Some("high"));
@@ -19999,9 +20027,13 @@ mod tests {
                     Some("left-model".to_string()),
                     Some("medium".to_string()),
                 );
-                left.save().await.expect("merge independent branch model selection");
+                left.save()
+                    .await
+                    .expect("merge independent branch model selection");
 
-                let merged = Session::open(&path_text).await.expect("reload merged branches");
+                let merged = Session::open(&path_text)
+                    .await
+                    .expect("reload merged branches");
                 assert_eq!(merged.leaf_id(), Some(left_leaf.as_str()));
                 assert_eq!(merged.header.provider.as_deref(), Some("left-provider"));
                 assert_eq!(merged.header.model_id.as_deref(), Some("left-model"));
@@ -20012,11 +20044,19 @@ mod tests {
                 // the other histories are merged, that same selection needs an
                 // explicit durable leaf instead of another writer's final row.
                 anchor.set_additional_roots(&[dir.path().join("extra-root")]);
-                anchor.save().await.expect("save metadata on the original branch");
-                let mut reloaded = Session::open(&path_text).await.expect("reload original branch");
+                anchor
+                    .save()
+                    .await
+                    .expect("save metadata on the original branch");
+                let mut reloaded = Session::open(&path_text)
+                    .await
+                    .expect("reload original branch");
                 assert_eq!(anchor.leaf_id(), Some(original_leaf.as_str()));
                 assert_eq!(reloaded.leaf_id(), anchor.leaf_id());
-                assert_eq!(reloaded.header.provider.as_deref(), Some("original-provider"));
+                assert_eq!(
+                    reloaded.header.provider.as_deref(),
+                    Some("original-provider")
+                );
                 assert_eq!(reloaded.header.model_id.as_deref(), Some("original-model"));
                 assert_eq!(reloaded.header.thinking_level.as_deref(), Some("low"));
                 assert!(reloaded.navigate_to(&right_leaf));
@@ -20059,17 +20099,14 @@ mod tests {
             external.model_id = Some("external-model".to_string());
             external.fallback_provider = None;
             external.fallback_model_id = None;
-            save_jsonl_full_rewrite_blocking(
-                &path,
-                dir.path(),
-                &external,
-                &session.entries,
-                true,
-            )
-            .expect("publish unnormalized external header");
+            save_jsonl_full_rewrite_blocking(&path, dir.path(), &external, &session.entries, true)
+                .expect("publish unnormalized external header");
             session.append_message(make_test_message("incremental local turn"));
             assert!(!session.header_dirty, "fixture must use incremental append");
-            session.save().await.expect("append without rewriting header");
+            session
+                .save()
+                .await
+                .expect("append without rewriting header");
 
             let (on_disk, _) = open_jsonl_for_append(&path).expect("read exact disk header");
             assert_eq!(on_disk, external);
@@ -20082,25 +20119,27 @@ mod tests {
 
             external.provider = Some("next-provider".to_string());
             external.model_id = Some("next-model".to_string());
-            save_jsonl_full_rewrite_blocking(
-                &path,
-                dir.path(),
-                &external,
-                &session.entries,
-                true,
-            )
-            .expect("publish a later independent model choice");
+            save_jsonl_full_rewrite_blocking(&path, dir.path(), &external, &session.entries, true)
+                .expect("publish a later independent model choice");
             session.set_additional_roots(&[dir.path().join("extra-root")]);
-            session.save().await.expect("publish pending normalization with merged metadata");
+            session
+                .save()
+                .await
+                .expect("publish pending normalization with merged metadata");
 
             let (on_disk, _) = open_jsonl_for_append(&path).expect("read normalized disk header");
             assert_eq!(on_disk.provider.as_deref(), Some("next-provider"));
             assert_eq!(on_disk.model_id.as_deref(), Some("next-model"));
-            assert_eq!(on_disk.fallback_provider.as_deref(), Some("external-provider"));
+            assert_eq!(
+                on_disk.fallback_provider.as_deref(),
+                Some("external-provider")
+            );
             assert_eq!(on_disk.fallback_model_id.as_deref(), Some("external-model"));
             assert_eq!(session.persisted_header.as_ref(), Some(&on_disk));
             assert!(!session.header_dirty);
-            let reloaded = Session::open(&path.to_string_lossy()).await.expect("reload receipt");
+            let reloaded = Session::open(&path.to_string_lossy())
+                .await
+                .expect("reload receipt");
             assert_eq!(reloaded.header, on_disk);
             assert_eq!(reloaded.entries.len(), 2);
         });

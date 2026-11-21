@@ -38631,7 +38631,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
             runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
             let script = format!(
-                r#"
+                r"
                 globalThis.movedFdScope = {{}};
                 import('node:fs').then(fs => {{
                     let fd;
@@ -38657,7 +38657,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         movedFdScope.data = fs.readFileSync({moved:?}, 'utf8');
                     }}));
                 }});
-                "#
+                "
             );
             runtime
                 .eval(&privileged_test_script(&runtime, &script))
@@ -38697,7 +38697,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
             runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
             let script = format!(
-                r#"
+                r"
                 globalThis.watchOwnerScope = {{ denials: {{}}, callbacks: [], injected: 0, error: null }};
                 import('node:fs').then((fs) => {{
                     const result = globalThis.watchOwnerScope;
@@ -38747,7 +38747,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 }}).catch((error) => {{
                     globalThis.watchOwnerScope.error = String(error && error.message || error);
                 }}).finally(() => {{ globalThis.watchOwnerScope.done = true; }});
-                "#
+                "
             );
             runtime
                 .eval(&privileged_test_script(&runtime, &script))
@@ -38818,7 +38818,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     .expect("create runtime");
             runtime
                 .eval(&format!(
-                    r#"
+                    r"
                     globalThis.watchResetScope = {{ callbacks: [] }};
                     import('node:fs').then((fs) => {{
                         fs.writeFileSync({path:?}, 'aa');
@@ -38829,7 +38829,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         resetWatchHandle.on('stop', () => watchResetScope.callbacks.push('stop'));
                         resetWatchHandle.on('close', () => watchResetScope.callbacks.push('close'));
                     }});
-                    "#
+                    "
                 ))
                 .await
                 .expect("create active watcher for reset");
@@ -38845,7 +38845,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(after.get("timerHandles"), Some(&json!(0)));
             runtime
                 .eval(&format!(
-                    r#"
+                    r"
                     resetWatchHandle.ref().unref().ref();
                     watchResetScope.hasRefAfterReset = resetWatchHandle.hasRef();
                     try {{
@@ -38856,7 +38856,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     }}
                     resetWatchHandle.close().stop();
                     resetWatchFs.writeFileSync({path:?}, 'bb');
-                    "#
+                    "
                 ))
                 .await
                 .expect("exercise held watcher after reset");

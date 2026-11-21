@@ -16,9 +16,9 @@ use pi::model::{
 use pi::sdk::{
     AgentSessionHandle, AgentSessionState, EventListeners, RpcBashResult, RpcCancelledResult,
     RpcCommandInfo, RpcCompactionResult, RpcCycleModelResult, RpcExportHtmlResult,
-    RpcExtensionUiResponse, RpcForkContentResult, RpcForkMessage, RpcForkResult, RpcLastAssistantText,
-    RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats,
-    RpcTransportOptions, SessionOptions, SessionPromptResult, SessionTransportEvent,
+    RpcExtensionUiResponse, RpcForkContentResult, RpcForkMessage, RpcForkResult,
+    RpcLastAssistantText, RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult,
+    RpcTokenStats, RpcTransportOptions, SessionOptions, SessionPromptResult, SessionTransportEvent,
     SessionTransportState, create_agent_session,
 };
 use pi::tools::{ToolOutput, ToolRegistry};
@@ -803,7 +803,8 @@ done
         assert!(veto.text.is_empty() && veto.content.is_none());
         client.shutdown().expect("shutdown protocol fixture");
 
-        let recorded = std::fs::read_to_string(directory.path().join("fork-commands.jsonl")).unwrap();
+        let recorded =
+            std::fs::read_to_string(directory.path().join("fork-commands.jsonl")).unwrap();
         let requests: Vec<serde_json::Value> = recorded
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())

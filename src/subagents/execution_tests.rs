@@ -344,7 +344,7 @@ fn an_oversized_correction_does_not_launch_or_apply_a_second_attempt() {
 
 #[test]
 fn amplified_schema_failures_still_launch_one_bounded_corrective_child() {
-    let script = r#"set -eu
+    let script = r"set -eu
 printf 'launched\n' >> launches
 if [ -f attempted ]; then
     cat > corrective-task
@@ -354,7 +354,7 @@ else
     printf 'attempted\n' > attempted
     cat invalid-events.jsonl
 fi
-"#;
+";
     let (root, tool) = fixture(script);
     let invalid = json!(vec!["rejected-value-".repeat(14); 1200]).to_string();
     assert!(invalid.len() < MAX_CHILD_OUTPUT_BYTES);
@@ -370,8 +370,7 @@ fi
     .unwrap();
     // Every item fails all 64 branches. The former error collection exceeded
     // the 4 MiB task limit, refusing the retry despite a bounded child answer.
-    let schema =
-        json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}});
+    let schema = json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}});
     let assignment = "Return the requested structured results.";
     let output = run(
         &tool,

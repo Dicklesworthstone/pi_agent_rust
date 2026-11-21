@@ -421,8 +421,14 @@ fn ast_edit_staging_refuses_to_replace_symlinks_or_shared_hard_links() {
                 .nlink(),
             2
         );
-        assert_eq!(read_file(&harness, "target.rs"), "fn main() { marker(); }\n");
-        assert_eq!(read_file(&harness, "hardlink.rs"), "fn main() { marker(); }\n");
+        assert_eq!(
+            read_file(&harness, "target.rs"),
+            "fn main() { marker(); }\n"
+        );
+        assert_eq!(
+            read_file(&harness, "hardlink.rs"),
+            "fn main() { marker(); }\n"
+        );
         finish_case(
             &harness,
             "ast_edit_staging_refuses_to_replace_symlinks_or_shared_hard_links",
@@ -460,10 +466,16 @@ fn ast_edit_same_content_symlink_swap_invalidates_approval() {
         )
         .await
         .expect_err("hash-equivalent symlink must not authorize a replacement");
-        assert!(error.to_string().contains("[AST_PROPOSAL_STALE]"), "{error}");
+        assert!(
+            error.to_string().contains("[AST_PROPOSAL_STALE]"),
+            "{error}"
+        );
         assert!(error.to_string().contains("b.rs"), "{error}");
         assert_eq!(read_file(&harness, "a.rs"), "fn main() { marker(); }\n");
-        assert_eq!(read_file(&harness, "retained.rs"), "fn main() { marker(); }\n");
+        assert_eq!(
+            read_file(&harness, "retained.rs"),
+            "fn main() { marker(); }\n"
+        );
         assert_eq!(
             std::fs::read_link(harness.temp_path("b.rs")).expect("replacement link preserved"),
             std::path::PathBuf::from("retained.rs")

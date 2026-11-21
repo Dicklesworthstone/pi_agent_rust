@@ -442,7 +442,10 @@ fn editable_fork_drafts_deliver_exact_media_and_current_text_to_the_native_turn(
             ));
             {
                 let pending = request.pending.lock().unwrap();
-                assert_eq!(pending[0].text, edited, "authored source must match the edit");
+                assert_eq!(
+                    pending[0].text, edited,
+                    "authored source must match the edit"
+                );
                 same_payload(&pending[0].content, &expected);
             }
             let (events, returned) = mpsc::channel();
@@ -547,7 +550,10 @@ fn late_fork_input_is_parked_until_its_own_session_returns() {
     model.displayed_session_id = Some("original".into());
     model.input.set_text("");
     model.apply_goal_input_restores();
-    assert_eq!(model.input.text(), crate::session::fork_tests::MULTIMODAL_TEXT);
+    assert_eq!(
+        model.input.text(),
+        crate::session::fork_tests::MULTIMODAL_TEXT
+    );
     assert!(model.goal_draft.as_ref().unwrap().request.editable_fork);
 }
 

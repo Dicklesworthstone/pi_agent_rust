@@ -4839,12 +4839,10 @@ impl PiFtuiModel {
                 branch_anchor,
                 text,
                 content,
-            } => {
-                match RestoredInput::for_fork(owner_session_id, branch_anchor, text, content) {
-                    Ok(request) => self.restore_native_input(request),
-                    Err(error) => self.push_entry(EntryRole::Error, error.to_string()),
-                }
-            }
+            } => match RestoredInput::for_fork(owner_session_id, branch_anchor, text, content) {
+                Ok(request) => self.restore_native_input(request),
+                Err(error) => self.push_entry(EntryRole::Error, error.to_string()),
+            },
             PiMsg::RestorePendingInput {
                 owner_session_id,
                 text,

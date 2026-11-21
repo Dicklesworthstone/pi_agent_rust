@@ -1796,7 +1796,9 @@ impl ForegroundJob {
             .lock()
             .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
         ensure_process_accepting_jobs(&reg)?;
-        if reg.closing_owners.contains_key(&self.handle.owner_session_id)
+        if reg
+            .closing_owners
+            .contains_key(&self.handle.owner_session_id)
             || reg
                 .owner_shutdown_generations
                 .get(&self.handle.owner_session_id)
@@ -4715,7 +4717,10 @@ mod tests {
             drop(launch);
             gate.release();
             wait_for_launch_cleanup(&owner_id);
-            assert!(yielded, "Bash admission must yield before slow setup completes");
+            assert!(
+                yielded,
+                "Bash admission must yield before slow setup completes"
+            );
             gate.assert_not_timed_out();
             assert!(!root.path().join("command-started").exists());
             assert!(
@@ -4784,7 +4789,9 @@ mod tests {
         let error = match launch.as_mut().poll(&mut task) {
             Poll::Ready(Err(error)) => error,
             _ => {
-                panic!("owner cancellation must wake admission without releasing the filesystem lock")
+                panic!(
+                    "owner cancellation must wake admission without releasing the filesystem lock"
+                )
             }
         };
         assert!(error.to_string().contains("PI_JOBS_CANCELLED"), "{error}");
@@ -4912,7 +4919,10 @@ mod tests {
             gate.release_one();
         }
         wait_for_launch_cleanup(&owner_id);
-        assert!(rejected, "the ninth admission must not allocate a waiting worker");
+        assert!(
+            rejected,
+            "the ninth admission must not allocate a waiting worker"
+        );
         gate.assert_not_timed_out();
         assert_eq!(registry().lock().expect("released slots").starting_jobs, 0);
         assert!(!root.path().join("jobs").exists());

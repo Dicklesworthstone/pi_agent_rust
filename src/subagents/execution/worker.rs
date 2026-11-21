@@ -931,7 +931,10 @@ done
         );
         for pooled in [false, true] {
             let fixture = Fixture::new(&script);
-            let body = format!("Frozen worker definition.\n{}", "résumé 雪\n".repeat(24 * 1024));
+            let body = format!(
+                "Frozen worker definition.\n{}",
+                "résumé 雪\n".repeat(24 * 1024)
+            );
             std::fs::write(
                 fixture.root.path().join("global/agents/worker.md"),
                 format!("---\nname: worker\ndescription: large retained instructions\ntools: []\n---\n{body}"),

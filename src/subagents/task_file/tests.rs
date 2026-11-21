@@ -67,7 +67,7 @@ fn inline_instructions_are_bounded_before_any_batch_can_be_admitted()
     let (_root, tool) = fixture();
     let valid = json!({"agent":"task", "task":"complete this work"});
     for text in [
-        "".to_string(),
+        String::new(),
         " \r\n\t".to_string(),
         "do\0not".to_string(),
         "x".repeat(MAX_BYTES + 1),
@@ -160,7 +160,10 @@ fn system_prompt_snapshot_preserves_literal_text_and_uses_a_private_short_argume
     )?;
     for prompt in [
         authored.to_string_lossy().into_owned(),
-        format!("Complete instructions\r\n{}", "résumé 雪\n".repeat(24 * 1024)),
+        format!(
+            "Complete instructions\r\n{}",
+            "résumé 雪\n".repeat(24 * 1024)
+        ),
     ] {
         for flag in ["--append-system-prompt", "--system-prompt"] {
             let mut args = vec!["--print".into(), flag.into(), prompt.clone().into()];
@@ -173,7 +176,10 @@ fn system_prompt_snapshot_preserves_literal_text_and_uses_a_private_short_argume
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+                assert_eq!(
+                    std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                    0o600
+                );
             }
             drop(snapshot);
             assert!(!path.exists(), "retired prompt snapshots must be reclaimed");

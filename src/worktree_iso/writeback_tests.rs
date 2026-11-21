@@ -61,7 +61,11 @@ fn fixture() -> (tempfile::TempDir, IsoHandle, String) {
     let repo = tempfile::tempdir().unwrap();
     git_ok(repo.path(), &["init", "-b", "main"]).unwrap();
     git_ok(repo.path(), &["config", "user.name", "Writeback Fixture"]).unwrap();
-    git_ok(repo.path(), &["config", "user.email", "writeback@localhost"]).unwrap();
+    git_ok(
+        repo.path(),
+        &["config", "user.email", "writeback@localhost"],
+    )
+    .unwrap();
     git_ok(repo.path(), &["config", "commit.gpgSign", "false"]).unwrap();
     fs::write(repo.path().join("tracked.txt"), "original\n").unwrap();
     git_ok(repo.path(), &["add", "tracked.txt"]).unwrap();
@@ -85,7 +89,10 @@ fn owned_writeback_yields_and_cancels_without_waiting_for_the_other_writer() {
             owner.checkpoint().is_ok()
         }));
         assert!(futures::poll!(&mut applying).is_pending());
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel writeback"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel writeback"),
+        );
         assert!(!applying.await.unwrap());
     });
     assert_eq!(
