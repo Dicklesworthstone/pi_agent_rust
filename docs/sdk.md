@@ -72,6 +72,27 @@ be breaking for Rust consumers.
 | `pi::sdk::{SessionPromptResult, SessionTransport, SessionTransportEvent, SessionTransportState}` | Stable | Unified in-process/RPC transport adapter. |
 | `pi::sdk::{RpcTransportClient, RpcTransportOptions}` | Stable | Subprocess RPC transport client. |
 | `pi::sdk::{RpcBashResult, RpcCancelledResult, RpcCommandInfo, RpcCompactionResult, RpcCycleModelResult, RpcExportHtmlResult, RpcExtensionUiResponse, RpcForkMessage, RpcForkResult, RpcLastAssistantText, RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats}` | Stable | RPC request/response payloads. |
+| `pi::sdk::{RpcForkContentResult, edit_fork_content}` | Stable | Native fork selection and attachment-preserving edits. `RpcForkContentResult` is non-exhaustive. |
+
+`RpcTransportClient::fork_with_content` returns editable prose in
+`RpcForkContentResult.text` and the full ordered native blocks in `content`
+when the selected prompt was structured. Image, audio, and video bytes remain
+attached to those blocks; no source file needs to exist when resubmitting.
+After checking `cancelled`, pass
+`content` to `prompt_with_content` or `stream_prompt_with_content`. The fork
+itself does not submit the selected prompt. For plain text prompts, `content`
+is `None`; older servers that omit the field also decode successfully. An
+extension veto returns `cancelled: true`, empty `text`, and no content.
+
+The existing `fork` method keeps its `RpcForkResult` text-only API, including
+its original public fields and `PartialEq`/`Eq` implementations. Both methods
+send the same RPC `fork` command. Use `fork_with_content` when attachments
+must survive selection and resubmission.
+
+To edit a structured selection, `pi::sdk::edit_fork_content` replaces the
+prose while retaining its native attachments. Pass the returned blocks,
+the original `text`, and the edited text. An unchanged edit preserves the
+complete original block layout and text metadata.
 
 ## Migration Map (TypeScript -> Rust)
 

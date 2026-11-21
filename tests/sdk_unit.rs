@@ -16,10 +16,10 @@ use pi::model::{
 use pi::sdk::{
     AgentSessionHandle, AgentSessionState, EventListeners, RpcBashResult, RpcCancelledResult,
     RpcCommandInfo, RpcCompactionResult, RpcCycleModelResult, RpcExportHtmlResult,
-    RpcExtensionUiResponse, RpcForkMessage, RpcForkResult, RpcLastAssistantText, RpcModelInfo,
-    RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats, RpcTransportOptions,
-    SessionOptions, SessionPromptResult, SessionTransportEvent, SessionTransportState,
-    create_agent_session,
+    RpcExtensionUiResponse, RpcForkContentResult, RpcForkMessage, RpcForkResult, RpcLastAssistantText,
+    RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats,
+    RpcTransportOptions, SessionOptions, SessionPromptResult, SessionTransportEvent,
+    SessionTransportState, create_agent_session,
 };
 use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::json;
@@ -677,6 +677,147 @@ fn rpc_fork_result_serde() {
         .info_ctx("sdk", "RpcForkResult serde ok", |ctx| {
             ctx.push(("text".to_string(), result.text.clone()));
         });
+}
+
+#[test]
+fn rpc_fork_content_result_retains_native_content_and_accepts_legacy_payloads() {
+    let value = json!({
+        "text": "  revise this\n",
+        "content": [
+            {"type":"image", "mimeType":"image/png", "data":"aGVsbG8="},
+            {"type":"text", "text":"  revise this\n", "textSignature":"saved-text-metadata"},
+            {"type":"media", "mimeType":"audio/wav", "name":"voice.wav", "data":"d29ybGQ="},
+            {"type":"media", "mimeType":"video/mp4", "name":"clip.mp4", "data":"dmlkZW8="}
+        ],
+        "cancelled": false
+    });
+    let result: RpcForkContentResult = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(result.content.as_ref().unwrap().len(), 4);
+    let retained = pi::sdk::edit_fork_content(
+        result.content.as_deref().unwrap(),
+        &result.text,
+        &result.text,
+    );
+    assert_eq!(serde_json::to_value(retained).unwrap(), value["content"]);
+    assert_eq!(serde_json::to_value(result).unwrap(), value);
+
+    let plain = json!({"text": "plain selection", "cancelled": false});
+    let result: RpcForkContentResult = serde_json::from_value(plain.clone()).unwrap();
+    assert!(result.content.is_none());
+    assert_eq!(serde_json::to_value(result).unwrap(), plain);
+    let veto: RpcForkContentResult = serde_json::from_value(json!({"cancelled": true})).unwrap();
+    assert!(veto.cancelled);
+    assert!(veto.text.is_empty());
+    assert!(veto.content.is_none());
+    assert_eq!(
+        serde_json::to_value(veto).unwrap(),
+        json!({"text": "", "cancelled": true})
+    );
+}
+
+#[test]
+fn rpc_fork_legacy_result_preserves_public_fields_and_equality() {
+    // Downstream struct literals, exhaustive destructuring, and Eq bounds
+    // must keep compiling when the richer opt-in response is introduced.
+    fn assert_legacy_eq<T: std::fmt::Debug + Eq>(actual: T, expected: T) {
+        assert_eq!(actual, expected);
+    }
+    let native_reply = json!({
+        "text": "selected text",
+        "content": [{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}],
+        "cancelled": false
+    });
+    let legacy: RpcForkResult = serde_json::from_value(native_reply).unwrap();
+    assert_legacy_eq(
+        legacy.clone(),
+        RpcForkResult {
+            text: "selected text".to_string(),
+            cancelled: false,
+        },
+    );
+    let RpcForkResult { text, cancelled } = legacy;
+    assert_eq!(text, "selected text");
+    assert!(!cancelled);
+    let legacy_veto: RpcForkResult = serde_json::from_value(json!({"cancelled": true})).unwrap();
+    assert_legacy_eq(
+        legacy_veto,
+        RpcForkResult {
+            text: String::new(),
+            cancelled: true,
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_fork_methods_share_the_wire_command_without_submitting_selected_content() {
+    run_async(async {
+        let directory = tempfile::tempdir().expect("protocol fixture directory");
+        let mut client = pi::sdk::RpcTransportClient::connect(RpcTransportOptions {
+            binary_path: "/bin/bash".into(),
+            args: vec![
+                "-c".to_string(),
+                r#"
+for ordinal in 1 2 3 4; do
+    IFS= read -r -t 5 command || exit 1
+    printf '%s\n' "$command" >> fork-commands.jsonl
+    case "$ordinal" in
+        1|2) data='{"text":"selected text","content":[{"type":"image","mimeType":"image/png","data":"aGVsbG8="},{"type":"text","text":"selected text"},{"type":"media","mimeType":"audio/wav","name":"voice.wav","data":"d29ybGQ="}],"cancelled":false}' ;;
+        3) data='{"text":"legacy server text","cancelled":false}' ;;
+        4) data='{"cancelled":true}' ;;
+    esac
+    printf '{"type":"response","id":"rpc-%s","command":"fork","success":true,"data":%s}\n' "$ordinal" "$data"
+done
+"#
+                .to_string(),
+            ],
+            cwd: Some(directory.path().to_path_buf()),
+        })
+        .expect("connect protocol fixture");
+
+        let legacy: RpcForkResult = client.fork("entry-legacy").await.unwrap();
+        assert_eq!(
+            legacy,
+            RpcForkResult {
+                text: "selected text".to_string(),
+                cancelled: false,
+            }
+        );
+        let native = client.fork_with_content("entry-native").await.unwrap();
+        assert!(!native.cancelled);
+        assert_eq!(native.text, "selected text");
+        assert_eq!(
+            serde_json::to_value(native.content.unwrap()).unwrap(),
+            json!([
+                {"type":"image", "mimeType":"image/png", "data":"aGVsbG8="},
+                {"type":"text", "text":"selected text"},
+                {"type":"media", "mimeType":"audio/wav", "name":"voice.wav", "data":"d29ybGQ="}
+            ])
+        );
+        let old_server = client.fork_with_content("entry-old-server").await.unwrap();
+        assert_eq!(old_server.text, "legacy server text");
+        assert!(old_server.content.is_none());
+        assert!(!old_server.cancelled);
+        let veto = client.fork_with_content("entry-veto").await.unwrap();
+        assert!(veto.cancelled);
+        assert!(veto.text.is_empty() && veto.content.is_none());
+        client.shutdown().expect("shutdown protocol fixture");
+
+        let recorded = std::fs::read_to_string(directory.path().join("fork-commands.jsonl")).unwrap();
+        let requests: Vec<serde_json::Value> = recorded
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            requests,
+            vec![
+                json!({"type":"fork", "id":"rpc-1", "entryId":"entry-legacy"}),
+                json!({"type":"fork", "id":"rpc-2", "entryId":"entry-native"}),
+                json!({"type":"fork", "id":"rpc-3", "entryId":"entry-old-server"}),
+                json!({"type":"fork", "id":"rpc-4", "entryId":"entry-veto"}),
+            ]
+        );
+    });
 }
 
 #[test]

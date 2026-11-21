@@ -8,6 +8,31 @@ use crate::session_workdir::{
 use serde_json::json;
 
 pub const WORKSPACE_CONTEXT: &str = "FORK_WORKSPACE_CONTEXT: continue in this project.";
+pub const MULTIMODAL_TEXT: &str = "Compare the originals.\nKeep the details.";
+
+pub fn multimodal_content() -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::Image(crate::model::ImageContent {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+        ContentBlock::Text(TextContent {
+            text: "Compare the originals.".to_string(),
+            text_signature: Some("retained text metadata".to_string()),
+        }),
+        ContentBlock::Media(crate::model::MediaContent {
+            data: "d29ybGQ=".to_string(),
+            mime_type: "audio/wav".to_string(),
+            name: Some("original.wav".to_string()),
+        }),
+        ContentBlock::Text(TextContent::new("Keep the details.")),
+        ContentBlock::Media(crate::model::MediaContent {
+            data: "dmlkZW8=".to_string(),
+            mime_type: "video/mp4".to_string(),
+            name: Some("original.mp4".to_string()),
+        }),
+    ]
+}
 
 pub struct WorkspaceFixture {
     pub source: Session,
@@ -157,6 +182,102 @@ fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         .build()
         .expect("runtime");
     runtime.block_on(Box::pin(future))
+}
+
+#[test]
+fn fork_from_a_reopened_multimodal_message_returns_exact_unsent_content() {
+    let root = tempfile::tempdir().unwrap();
+    run_async(async {
+        let mut source = Session::create_with_dir(Some(root.path().to_path_buf()));
+        source.append_message(user("retained context"));
+        let selected = source.append_message(SessionMessage::User {
+            content: UserContent::Blocks(multimodal_content()),
+            timestamp: Some(2),
+        });
+        source.append_message(assistant("answer to omit"));
+        source.save().await.unwrap();
+        let path = source.path.as_ref().unwrap();
+        let original_bytes = std::fs::read(path).unwrap();
+        let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+        let plan = reopened.plan_fork_from_user_message(&selected).unwrap();
+        assert_eq!(plan.selected_text, MULTIMODAL_TEXT);
+        assert_eq!(
+            serde_json::to_value(plan.selected_content.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(multimodal_content()).unwrap(),
+        );
+        let mut fork = Session::in_memory();
+        fork.init_from_fork_plan(plan);
+        let context = fork.to_messages_for_current_path();
+        assert_eq!(context.len(), 1, "the selected prompt is still unsent");
+        assert!(
+            serde_json::to_string(&context)
+                .unwrap()
+                .contains("retained context")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original_bytes);
+        assert!(
+            reopened
+                .plan_fork_current_context()
+                .unwrap()
+                .selected_content
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn fork_rejects_assistant_only_blocks_without_mutating_the_source() {
+    for content in [
+        Vec::new(),
+        vec![ContentBlock::Thinking(crate::model::ThinkingContent {
+            thinking: "not a user attachment".to_string(),
+            thinking_signature: None,
+        })],
+    ] {
+        let mut source = Session::in_memory();
+        let id = source.append_message(SessionMessage::User {
+            content: UserContent::Blocks(content),
+            timestamp: Some(1),
+        });
+        let before = serde_json::to_value(&source.entries).unwrap();
+        assert!(source.plan_fork_from_user_message(&id).is_err());
+        assert_eq!(serde_json::to_value(&source.entries).unwrap(), before);
+        assert_eq!(source.leaf_id(), Some(id.as_str()));
+    }
+}
+
+#[test]
+fn editing_fork_prose_keeps_native_order_and_removes_old_text_metadata() {
+    let original = multimodal_content();
+    let unchanged = edit_fork_content(&original, MULTIMODAL_TEXT, MULTIMODAL_TEXT);
+    assert_eq!(
+        serde_json::to_value(&unchanged).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    let edited = edit_fork_content(&original, MULTIMODAL_TEXT, "Revise @missing-file.wav");
+    let expected = vec![
+        original[0].clone(),
+        ContentBlock::Text(TextContent::new("Revise @missing-file.wav")),
+        original[2].clone(),
+        original[4].clone(),
+    ];
+    assert_eq!(
+        serde_json::to_value(&edited).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    let media_only = edit_fork_content(&original, MULTIMODAL_TEXT, "");
+    assert_eq!(media_only.len(), 3);
+    assert!(
+        media_only
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::Text(_)))
+    );
+    let added = edit_fork_content(&media_only, "", "New text");
+    assert!(matches!(&added[0], ContentBlock::Text(text) if text.text == "New text"));
+    assert_eq!(
+        serde_json::to_value(&added[1..]).unwrap(),
+        serde_json::to_value(&media_only).unwrap()
+    );
 }
 
 #[test]

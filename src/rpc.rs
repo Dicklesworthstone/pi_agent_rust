@@ -469,10 +469,17 @@ fn command_payload_can_advance_rpc_session(
     }
 }
 
-/// Payload of a completed RPC `fork`: `(selected_text, previous_session_file,
-/// source_session_id, new_session_id)`; `None` when an extension cancelled the
-/// fork.
-type ForkCompletion = Option<(String, Option<String>, String, String)>;
+/// Payload of a completed RPC `fork`: `(selected_text, selected_content,
+/// previous_session_file, source_session_id, new_session_id)`; `None` when an
+/// extension cancelled the fork. Structured input remains native because the
+/// selected message is deliberately excluded from the new session's history.
+type ForkCompletion = Option<(
+    String,
+    Option<Vec<ContentBlock>>,
+    Option<String>,
+    String,
+    String,
+)>;
 
 /// `run` consumes a live registry. Dropping the RPC loop must close service
 /// admission and request process cleanup even when no asynchronous shutdown
@@ -6497,6 +6504,7 @@ async fn run_with_input(
                         // Phase 2: Build new session on the blocking pool without holding any
                         // lock or occupying a single-threaded async executor during large forks.
                         let selected_text = fork_plan.selected_text.clone();
+                        let selected_content = fork_plan.selected_content.clone();
                         let previous_session_file = parent_path;
                         let origin_session_id = header_snapshot.id.clone();
                         let (mut new_session, target_plan_mode, messages) =
@@ -6707,6 +6715,7 @@ async fn run_with_input(
 
                         Ok(Some((
                             selected_text,
+                            selected_content,
                             previous_session_file,
                             origin_session_id,
                             session_id,
@@ -6724,13 +6733,21 @@ async fn run_with_input(
                         }
                         Ok(Some((
                             selected_text,
+                            selected_content,
                             previous_session_file,
                             source_session_id,
                             new_session_id,
                         ))) => {
+                            let mut payload = json!({
+                                "text": selected_text,
+                                "cancelled": false,
+                            });
+                            if let Some(content) = selected_content {
+                                payload["content"] = json!(content);
+                            }
                             let response_data = finish_session_service_cleanup(
                                 service_shutdown,
-                                json!({ "text": selected_text, "cancelled": false }),
+                                payload,
                             )
                             .await;
                             rpc_dispatch_session_fork_event(
@@ -15631,6 +15648,68 @@ mod retry_tests {
             assert_eq!(restored.spent(), 3.0);
             assert_eq!(restored.refresh().unwrap().spent, 3.0);
             assert!(matches!(restored.admit(), Err(Error::CostCap { .. })));
+        }));
+    }
+
+    #[test]
+    fn rpc_fork_returns_the_selected_native_payload_without_resubmitting_it() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut source, _) = rpc_fork_source_session();
+            source.session_dir = Some(temp.path().join("sessions"));
+            let content = crate::session::fork_tests::multimodal_content();
+            let entry_id = source.append_message(SessionMessage::User {
+                content: UserContent::Blocks(content.clone()),
+                timestamp: Some(1),
+            });
+            let provider = Arc::new(FlakyProvider::new());
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let inner = Arc::new(asupersync::sync::Mutex::new(source));
+            let session = AgentSession::new(
+                agent,
+                Arc::clone(&inner),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let options = rpc_fork_test_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(4);
+            in_tx
+                .send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id":"native-fork", "type":"fork", "entryId":entry_id}).to_string(),
+                )
+                .await
+                .unwrap();
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
+            Box::pin(run(session, options, in_rx, out_tx)).await.unwrap();
+            let response = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .find(|value| value["command"] == "fork")
+                .expect("fork response");
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(
+                response["data"]["text"],
+                crate::session::fork_tests::MULTIMODAL_TEXT
+            );
+            assert_eq!(
+                response["data"]["content"],
+                serde_json::to_value(content).unwrap()
+            );
+            assert_eq!(
+                inner.try_lock().unwrap().to_messages_for_current_path().len(),
+                1
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         }));
     }
 

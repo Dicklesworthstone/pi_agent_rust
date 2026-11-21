@@ -65,7 +65,7 @@ pub use crate::provider::{
     Context as ProviderContext, InputType, Model, ModelCost, Provider, ProviderCapabilities,
     StreamOptions, ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
-pub use crate::session::Session;
+pub use crate::session::{Session, edit_fork_content};
 pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 
 /// Stable alias for model-exposed tool schema definitions.
@@ -1178,10 +1178,29 @@ pub struct RpcCompactionResult {
     pub details: Value,
 }
 
-/// Result payload returned by RPC `fork`.
+/// Text-only result payload returned by [`RpcTransportClient::fork`].
+/// Use [`RpcForkContentResult`] when the selected prompt may contain attachments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcForkResult {
+    /// Editable prose; attachment badges and encoded bytes are not text.
+    #[serde(default)]
     pub text: String,
+    pub cancelled: bool,
+}
+
+/// Native selected input returned by [`RpcTransportClient::fork_with_content`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RpcForkContentResult {
+    /// Editable prose, without attachment badges or encoded payloads.
+    #[serde(default)]
+    pub text: String,
+    /// Exact structured selected prompt, absent for plain text, a veto, or a
+    /// server that predates native fork content.
+    /// Resubmit with `prompt_with_content`/`stream_prompt_with_content` to
+    /// preserve attachments and their order rather than sending `text` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentBlock>>,
     pub cancelled: bool,
 }
 
@@ -2118,7 +2137,22 @@ impl RpcTransportClient {
         self.request_typed("switch_session", payload).await
     }
 
+    /// Fork and return the selected prompt's editable text without submitting it.
+    /// Use [`Self::fork_with_content`] to retain native attachments as well.
     pub async fn fork(&mut self, entry_id: impl Into<String>) -> Result<RpcForkResult> {
+        let mut payload = Map::new();
+        payload.insert("entryId".to_string(), Value::String(entry_id.into()));
+        self.request_typed("fork", payload).await
+    }
+
+    /// Fork and retain the selected prompt's ordered native attachments.
+    /// The selected message remains unsent. Edit it with [`edit_fork_content`]
+    /// and explicitly submit using [`Self::prompt_with_content`] when ready.
+    /// An extension veto returns `cancelled: true` without selected content.
+    pub async fn fork_with_content(
+        &mut self,
+        entry_id: impl Into<String>,
+    ) -> Result<RpcForkContentResult> {
         let mut payload = Map::new();
         payload.insert("entryId".to_string(), Value::String(entry_id.into()));
         self.request_typed("fork", payload).await

@@ -3344,12 +3344,48 @@ pub struct ForkPlan {
     pub leaf_id: Option<String>,
     /// Text for editor pre-fill; empty for a current-context fork.
     pub selected_text: String,
+    /// Exact selected structured input, including image/audio/video blocks.
+    /// The selected message is deliberately absent from `entries`; hosts must
+    /// retain these blocks until the user edits and explicitly resubmits it.
+    /// Plain-text and current-context forks do not need a separate payload.
+    pub selected_content: Option<Vec<ContentBlock>>,
     // Session-wide metadata must come from the source, independently of the
     // selected conversation ancestry or the caller's process directory.
     original_cwd: String,
     additional_roots: Option<Vec<String>>,
     parent_session: Option<String>,
     inherited_workdir_binding: Option<Value>,
+}
+
+/// Edit a selected fork prompt without reparsing saved attachment bytes or
+/// file references. Unchanged text retains the exact block layout; a text
+/// edit replaces the old prose at its first position and keeps every native
+/// attachment in order. Clearing the prose still permits a media-only turn.
+#[must_use]
+pub fn edit_fork_content(
+    content: &[ContentBlock],
+    original_text: &str,
+    edited_text: &str,
+) -> Vec<ContentBlock> {
+    if original_text == edited_text {
+        return content.to_vec();
+    }
+    let mut edited = Vec::with_capacity(content.len() + 1);
+    let mut inserted = false;
+    for block in content {
+        if matches!(block, ContentBlock::Text(_)) {
+            if !inserted && !edited_text.is_empty() {
+                edited.push(ContentBlock::Text(TextContent::new(edited_text)));
+            }
+            inserted = true;
+        } else {
+            edited.push(block.clone());
+        }
+    }
+    if !inserted && !edited_text.is_empty() {
+        edited.insert(0, ContentBlock::Text(TextContent::new(edited_text)));
+    }
+    edited
 }
 
 /// Lightweight snapshot of session data for non-blocking export.
@@ -6596,10 +6632,24 @@ impl Session {
             )));
         };
 
-        let selected_text = user_content_to_text(content);
+        let (selected_text, selected_content) = match content {
+            UserContent::Text(text) => (text.clone(), None),
+            UserContent::Blocks(blocks) => {
+                crate::agent::AgentSession::validate_user_content_blocks(blocks)?;
+                let text = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (text, Some(blocks.clone()))
+            }
+        };
         let leaf_id = message_entry.base.parent_id.clone();
 
-        self.plan_fork_at(leaf_id, selected_text)
+        self.plan_fork_at(leaf_id, selected_text, selected_content)
     }
 
     /// Fork the complete selected conversation, including its current leaf.
@@ -6615,10 +6665,15 @@ impl Session {
             complete.ensure_full_v2_hydration_before_save()?;
             return complete.plan_fork_current_context();
         }
-        self.plan_fork_at(self.leaf_id.clone(), String::new())
+        self.plan_fork_at(self.leaf_id.clone(), String::new(), None)
     }
 
-    fn plan_fork_at(&self, leaf_id: Option<String>, selected_text: String) -> Result<ForkPlan> {
+    fn plan_fork_at(
+        &self,
+        leaf_id: Option<String>,
+        selected_text: String,
+        selected_content: Option<Vec<ContentBlock>>,
+    ) -> Result<ForkPlan> {
         let entries = if let Some(ref leaf_id) = leaf_id {
             if self.is_linear {
                 let idx = self.entry_index.get(leaf_id).copied().ok_or_else(|| {
@@ -6663,6 +6718,7 @@ impl Session {
             entries,
             leaf_id,
             selected_text,
+            selected_content,
             original_cwd: self.header.cwd.clone(),
             additional_roots: self.header.additional_roots.clone(),
             parent_session: self.path.as_ref().map(|path| path.display().to_string()),
