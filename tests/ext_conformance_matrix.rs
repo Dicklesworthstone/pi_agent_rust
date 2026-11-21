@@ -379,8 +379,8 @@ fn build_runtime_api_matrix_report() -> Value {
             "npm_module_stubs",
             "tests/npm_module_stubs.rs",
             &[
-                "fn node_pty_spawn_returns_pty()",
-                "fn chokidar_watch_returns_watcher()",
+                "fn node_pty_spawn_rejects_unsupported_native_io()",
+                "fn chokidar_watch_rejects_unsupported_native_io()",
             ][..],
         ),
     ]

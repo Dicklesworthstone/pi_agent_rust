@@ -18813,23 +18813,13 @@ export default { getText, setText };
     modules.insert(
         "node-pty".to_string(),
         r"
-let _pid = 1000;
 function __pi_pty_unsupported(op) {
     const err = new Error(`${op} is not supported in the PiJS QuickJS sandbox (native PTY allocation is unavailable; use pi.exec instead)`);
     err.code = 'ERR_PI_SHIM_UNSUPPORTED_OPERATION';
     return err;
 }
-export function spawn(shell, args, options) {
-    const pid = _pid++;
-    const handlers = {};
-    return {
-        pid,
-        onData(cb) { handlers.data = cb; },
-        onExit(cb) { if (cb) setTimeout(() => cb({ exitCode: 1, signal: undefined }), 0); },
-        write(_d) { throw __pi_pty_unsupported('node-pty.write'); },
-        resize(_c, _r) { throw __pi_pty_unsupported('node-pty.resize'); },
-        kill(_s) { throw __pi_pty_unsupported('node-pty.kill'); },
-    };
+export function spawn(_shell, _args, _options) {
+    throw __pi_pty_unsupported('node-pty.spawn');
 }
 export default { spawn };
 "
@@ -18842,32 +18832,13 @@ export default { spawn };
         compressed_js_literal!(
             r"
 function __pi_chokidar_unsupported(op) {
-    const err = new Error(`${op} is not supported in the PiJS QuickJS sandbox (native filesystem watching is unavailable)`);
+    const err = new Error(`${op} is not supported in the PiJS QuickJS sandbox (native filesystem watching is unavailable; use fs.watchFile for stat polling)`);
     err.code = 'ERR_PI_SHIM_UNSUPPORTED_OPERATION';
     return err;
 }
-function makeWatcher() {
-    const w = {
-        on(ev, cb) {
-            if (ev === 'error' && typeof cb === 'function') {
-                setTimeout(() => cb(__pi_chokidar_unsupported('chokidar.watch')), 0);
-            }
-            return w;
-        },
-        once(ev, cb) {
-            if (ev === 'error' && typeof cb === 'function') {
-                setTimeout(() => cb(__pi_chokidar_unsupported('chokidar.watch')), 0);
-            }
-            return w;
-        },
-        close() { return Promise.resolve(); },
-        add(_p) { throw __pi_chokidar_unsupported('chokidar.add'); },
-        unwatch(_p) { throw __pi_chokidar_unsupported('chokidar.unwatch'); },
-        getWatched() { return {}; },
-    };
-    return w;
+export function watch(_paths, _options) {
+    throw __pi_chokidar_unsupported('chokidar.watch');
 }
-export function watch(paths, options) { return makeWatcher(); }
 export default { watch };
 "
         )

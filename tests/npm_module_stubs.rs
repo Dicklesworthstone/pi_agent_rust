@@ -1,8 +1,8 @@
 //! Tests for npm package virtual module stubs (bd-3opk).
 //!
 //! Verifies that extensions can import the stubbed npm packages and
-//! call their APIs without crashing. These stubs exist so that
-//! extensions requiring native bindings or large dependency trees can
+//! receive explicit failures for unsupported native operations. These stubs let
+//! extensions requiring native bindings or large dependency trees
 //! at least *load* and register tools/commands in the `QuickJS` sandbox.
 #![allow(clippy::needless_raw_string_hashes)]
 
@@ -113,25 +113,36 @@ fn chokidar_import_named() {
 }
 
 #[test]
-fn chokidar_watch_returns_watcher() {
+fn chokidar_watch_rejects_unsupported_native_io() {
     let result = eval_ext(
         r#"import { watch } from "chokidar";"#,
         r#"(() => {
-            const w = watch('/tmp/test');
-            return typeof w.on === 'function' && typeof w.close === 'function' && typeof w.add === 'function';
+            try {
+                watch('/tmp/test');
+                return 'SILENT_WATCHER';
+            } catch (err) {
+                return err instanceof Error
+                    && err.code === 'ERR_PI_SHIM_UNSUPPORTED_OPERATION'
+                    && err.message.includes('chokidar.watch')
+                    && err.message.includes('fs.watchFile');
+            }
         })()"#,
     );
     assert_eq!(result, "true");
 }
 
 #[test]
-fn chokidar_watcher_chaining() {
+fn chokidar_change_subscriptions_do_not_require_an_error_listener_to_fail() {
     let result = eval_ext(
         r#"import { watch } from "chokidar";"#,
         r#"(() => {
-            const w = watch('/tmp');
-            const w2 = w.on('change', () => {}).on('add', () => {}).on('ready', () => {});
-            return w === w2;
+            let callbackCalled = false;
+            try {
+                watch('/tmp').on('change', () => { callbackCalled = true; });
+                return 'SILENT_SUBSCRIPTION';
+            } catch (err) {
+                return err.code === 'ERR_PI_SHIM_UNSUPPORTED_OPERATION' && !callbackCalled;
+            }
         })()"#,
     );
     assert_eq!(result, "true");
@@ -152,12 +163,19 @@ fn node_pty_named_import() {
 }
 
 #[test]
-fn node_pty_spawn_returns_pty() {
+fn node_pty_spawn_rejects_unsupported_native_io() {
     let result = eval_ext(
         r#"import { spawn } from "node-pty";"#,
         r#"(() => {
-            const p = spawn('/bin/sh', []);
-            return typeof p.pid === 'number' && typeof p.write === 'function' && typeof p.kill === 'function';
+            try {
+                spawn('/bin/sh', []);
+                return 'FAKE_PROCESS';
+            } catch (err) {
+                return err instanceof Error
+                    && err.code === 'ERR_PI_SHIM_UNSUPPORTED_OPERATION'
+                    && err.message.includes('node-pty.spawn')
+                    && err.message.includes('pi.exec');
+            }
         })()"#,
     );
     assert_eq!(result, "true");
@@ -682,22 +700,21 @@ fn zod_enforces_runtime_schema_validation_and_rejects_bad_types() {
 }
 
 #[test]
-fn node_pty_write_resize_kill_fail_closed_with_unsupported_code() {
+fn node_pty_default_and_named_spawns_cannot_return_fake_processes() {
     let result = eval_ext(
-        r#"import { spawn } from "node-pty";"#,
+        r#"import pty, { spawn } from "node-pty";"#,
         r#"(() => {
-            const p = spawn('/bin/sh', []);
             const codes = [];
             for (const fn of [
-                () => p.write('echo secret\n'),
-                () => p.resize(120, 40),
-                () => p.kill('SIGTERM'),
+                () => spawn('/bin/sh', []),
+                () => pty.spawn('powershell.exe', [], { cols: 120, rows: 40 }),
+                () => spawn('/bin/sh', ['-c', 'echo secret'], { env: { TOKEN: 'secret' } }),
             ]) {
                 try {
                     fn();
-                    codes.push('SILENT_DROP');
+                    codes.push('FAKE_PROCESS');
                 } catch (err) {
-                    codes.push(err.code || err.message);
+                    codes.push(err.message.includes('secret') ? 'LEAKED_ARGUMENTS' : err.code);
                 }
             }
             return codes.join(',');
@@ -710,18 +727,21 @@ fn node_pty_write_resize_kill_fail_closed_with_unsupported_code() {
 }
 
 #[test]
-fn chokidar_add_unwatch_and_error_listener_fail_closed() {
+fn chokidar_default_and_named_watches_fail_before_returning_a_handle() {
     let result = eval_ext(
-        r#"import { watch } from "chokidar";"#,
+        r#"import chokidar, { watch } from "chokidar";"#,
         r#"(() => {
-            const w = watch('/tmp/test');
             const codes = [];
-            for (const fn of [() => w.add('/tmp/a'), () => w.unwatch('/tmp/a')]) {
+            for (const fn of [
+                () => watch([]),
+                () => chokidar.watch('/tmp/secret', { persistent: false, ignoreInitial: true }),
+                () => watch(['/tmp/a', '/tmp/b'], { usePolling: true }),
+            ]) {
                 try {
                     fn();
-                    codes.push('SILENT_DROP');
+                    codes.push('SILENT_WATCHER');
                 } catch (err) {
-                    codes.push(err.code || err.message);
+                    codes.push(err.message.includes('secret') ? 'LEAKED_ARGUMENTS' : err.code);
                 }
             }
             return codes.join(',');
@@ -729,7 +749,7 @@ fn chokidar_add_unwatch_and_error_listener_fail_closed() {
     );
     assert_eq!(
         result,
-        "ERR_PI_SHIM_UNSUPPORTED_OPERATION,ERR_PI_SHIM_UNSUPPORTED_OPERATION"
+        "ERR_PI_SHIM_UNSUPPORTED_OPERATION,ERR_PI_SHIM_UNSUPPORTED_OPERATION,ERR_PI_SHIM_UNSUPPORTED_OPERATION"
     );
 }
 

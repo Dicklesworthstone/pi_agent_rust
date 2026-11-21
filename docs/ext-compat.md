@@ -516,8 +516,8 @@ repository gate.
 
 | Package | Key exports |
 |---------|-------------|
-| `node-pty` | `spawn` (returns PTY stub) |
-| `chokidar` | `watch` (returns watcher stub) |
+| `node-pty` | Importable; `spawn` throws `ERR_PI_SHIM_UNSUPPORTED_OPERATION` (use `pi.exec` for subprocesses) |
+| `chokidar` | Importable; `watch` throws `ERR_PI_SHIM_UNSUPPORTED_OPERATION` (use `fs.watchFile` for stat polling) |
 | `@xterm/headless` | `Terminal` |
 | `@xterm/addon-serialize` | `SerializeAddon` |
 | `turndown` | `TurndownService` |
