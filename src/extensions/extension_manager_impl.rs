@@ -902,6 +902,7 @@ impl ExtensionManager {
             if !clamped.enabled || !clamped.safety_envelope.enabled {
                 for state in guard.budget_fallback_states.values_mut() {
                     state.safety_envelope.clear_veto();
+                    state.service_safety_envelope.clear_veto();
                 }
             }
 
@@ -1131,6 +1132,43 @@ impl ExtensionManager {
             .entry(ext_id.to_string())
             .or_default();
 
+        // Execution duration and overload inter-arrival time are independent
+        // signals. Observe completed calls in both lanes so a slow successful
+        // call cannot count as recovery merely because it returned no error.
+        state.service_observations = state.service_observations.saturating_add(1);
+        let safety_veto = state
+            .service_safety_envelope
+            .evaluate(duration_ms, success, &config.safety_envelope);
+        let regime_shift_triggered = if config.regime_shift.enabled {
+            let cusum_alarm = state.service_regime_shift.cusum.observe(
+                duration_ms,
+                config.regime_shift.cusum_k,
+                config.regime_shift.cusum_h,
+            );
+            let bocpd_alarm = state.service_regime_shift.bocpd.observe(
+                duration_ms,
+                config.regime_shift.bocpd_lambda,
+                config.regime_shift.bocpd_threshold,
+                config.regime_shift.bocpd_max_run_length,
+            );
+            if cusum_alarm || bocpd_alarm {
+                let source = if cusum_alarm { "cusum" } else { "bocpd" };
+                state.service_regime_shift.triggered = true;
+                state.service_regime_shift.trigger_source = Some(source);
+                state.service_regime_shift.trigger_count =
+                    state.service_regime_shift.trigger_count.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // The regime detector must still work when the independently
+        // configurable envelope is disabled and records no observations.
+        let calibrated_regime_shift = regime_shift_triggered
+            && state.service_observations >= u64::from(config.safety_envelope.min_observations);
+
         if state.in_fallback {
             let oco_update = state
                 .oco_tuner
@@ -1138,12 +1176,7 @@ impl ExtensionManager {
                 .filter(|_| config.oco_tuner.enabled)
                 .map(|oco| oco.update(!success, None, None, &config.oco_tuner));
 
-            // Feed real measured execution latency into the safety envelope during recovery.
-            let _ = state
-                .safety_envelope
-                .evaluate(duration_ms, success, &config.safety_envelope);
-
-            if !success {
+            if !success || safety_veto || calibrated_regime_shift {
                 state.healthy_success_streak = 0;
                 return;
             }
@@ -1156,13 +1189,18 @@ impl ExtensionManager {
             state.in_fallback = false;
             state.healthy_success_streak = 0;
             state.overload_timestamps_ms.clear();
-            // Reset regime-shift detectors so the next regime starts fresh.
+            // Overload recovery starts a new signal window.
             state.regime_shift.cusum.reset_cumsum();
             state.regime_shift.bocpd.reset();
             state.regime_shift.triggered = false;
             state.regime_shift.trigger_source = None;
-            // Reset safety envelope so the next regime starts fresh.
             state.safety_envelope.reset();
+            // Keep the service evidence that established recovery. Discarding
+            // its calibration would manufacture cold-start uncertainty and
+            // repeatedly put healthy traffic back into fallback.
+            state.service_regime_shift.cusum.reset_cumsum();
+            state.service_regime_shift.triggered = false;
+            state.service_regime_shift.trigger_source = None;
             let oco_snapshot = state.oco_tuner.as_ref().map(OcoTunerState::snapshot);
             tracing::info!(
                 event = "host_call.budget_controller.recovered",
@@ -1183,53 +1221,15 @@ impl ExtensionManager {
             return;
         }
 
-        // Normal (pre-fallback) path: feed real hostcall service latency into
-        // the conformal/PAC-Bayes safety envelope and regime-shift detectors so
-        // sustained tail-latency spikes trigger fallback BEFORE quota exhaustion.
-        let safety_veto = if config.safety_envelope.enabled {
-            state
-                .safety_envelope
-                .evaluate(duration_ms, success, &config.safety_envelope)
-        } else {
-            false
-        };
-        let regime_shift_triggered = if config.regime_shift.enabled {
-            let cusum_alarm = state.regime_shift.cusum.observe(
-                duration_ms,
-                config.regime_shift.cusum_k,
-                config.regime_shift.cusum_h,
-            );
-            let bocpd_alarm = state.regime_shift.bocpd.observe(
-                duration_ms,
-                config.regime_shift.bocpd_lambda,
-                config.regime_shift.bocpd_threshold,
-                config.regime_shift.bocpd_max_run_length,
-            );
-            if cusum_alarm || bocpd_alarm {
-                let source = if cusum_alarm { "cusum" } else { "bocpd" };
-                state.regime_shift.triggered = true;
-                state.regime_shift.trigger_source = Some(source);
-                state.regime_shift.trigger_count += 1;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let calibrated_regime_shift = regime_shift_triggered
-            && state.safety_envelope.conformal.observation_count
-                >= u64::from(config.safety_envelope.min_observations);
         if safety_veto || calibrated_regime_shift {
             let trigger_kind = if safety_veto {
                 state
-                    .safety_envelope
+                    .service_safety_envelope
                     .veto_reason
                     .unwrap_or("service_latency_safety_envelope")
             } else {
                 state
-                    .regime_shift
+                    .service_regime_shift
                     .trigger_source
                     .unwrap_or("service_latency_regime_shift")
             };
@@ -1263,13 +1263,22 @@ impl ExtensionManager {
         })
     }
 
-    /// Snapshot the regime-shift detector state for an extension.
+    /// Snapshot the overload inter-arrival regime-shift state for an extension.
     pub fn regime_shift_snapshot(&self, extension_id: &str) -> Option<RegimeShiftSnapshot> {
         let guard = self.inner.lock().ok()?;
         guard
             .budget_fallback_states
             .get(extension_id)
             .map(|state| state.regime_shift.snapshot())
+    }
+
+    /// Snapshot regime-shift detection over measured hostcall execution time.
+    pub fn service_regime_shift_snapshot(&self, extension_id: &str) -> Option<RegimeShiftSnapshot> {
+        let guard = self.inner.lock().ok()?;
+        guard
+            .budget_fallback_states
+            .get(extension_id)
+            .map(|state| state.service_regime_shift.snapshot())
     }
 
     /// Check if any extension has an active safety envelope veto.
@@ -1284,10 +1293,10 @@ impl ExtensionManager {
         guard
             .budget_fallback_states
             .values()
-            .any(|state| state.safety_envelope.vetoing)
+            .any(|state| state.safety_envelope.vetoing || state.service_safety_envelope.vetoing)
     }
 
-    /// Snapshot the safety envelope state for an extension.
+    /// Snapshot the overload-signal safety envelope for an extension.
     pub fn safety_envelope_snapshot(&self, extension_id: &str) -> Option<SafetyEnvelopeSnapshot> {
         let guard = self.inner.lock().ok()?;
         let config = &guard.budget_controller_config;
@@ -1295,6 +1304,19 @@ impl ExtensionManager {
             .budget_fallback_states
             .get(extension_id)
             .map(|state| state.safety_envelope.snapshot(&config.safety_envelope))
+    }
+
+    /// Snapshot the independent execution-time and outcome safety envelope.
+    pub fn service_safety_envelope_snapshot(
+        &self,
+        extension_id: &str,
+    ) -> Option<SafetyEnvelopeSnapshot> {
+        let guard = self.inner.lock().ok()?;
+        let config = &guard.budget_controller_config;
+        guard
+            .budget_fallback_states
+            .get(extension_id)
+            .map(|state| state.service_safety_envelope.snapshot(&config.safety_envelope))
     }
 
     /// Snapshot OCO tuner state for an extension.
