@@ -393,8 +393,10 @@ fn verify_changelog_unreleased_completeness(changelog: &str) -> Result<(), Strin
         .find("## [Unreleased]")
         .ok_or_else(|| "CHANGELOG.md missing `## [Unreleased]` heading".to_string())?;
     let rest = &changelog[start..];
-    let end = rest[1..].find("\n## [v").map_or(rest.len(), |idx| idx + 1);
-    let unreleased = &rest[..end];
+    let end = rest[1..]
+        .find("\n## [v0.8.0]")
+        .map_or(rest.len(), |idx| idx + 1);
+    let post_v080 = &rest[..end];
     for required in [
         "/goal",
         "pi web",
@@ -410,9 +412,9 @@ fn verify_changelog_unreleased_completeness(changelog: &str) -> Result<(), Strin
         "SnapCompact",
         "pi::sdk",
     ] {
-        if !unreleased.contains(required) {
+        if !post_v080.contains(required) {
             return Err(format!(
-                "CHANGELOG.md [Unreleased] omits post-v0.8.0 flagship item `{required}`"
+                "CHANGELOG.md post-v0.8.0 section omits flagship item `{required}`"
             ));
         }
     }
