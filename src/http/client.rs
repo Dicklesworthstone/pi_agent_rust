@@ -24,6 +24,9 @@ use std::task::{Context, Poll};
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
 const ANTIGRAVITY_VERSION_ENV: &str = "PI_AI_ANTIGRAVITY_VERSION";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+// Bound work even when request timeouts are explicitly disabled and a peer
+// keeps sending informational heads instead of a final response.
+const MAX_INFORMATIONAL_RESPONSES: usize = 32;
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
 const MAX_TEXT_BODY_BYTES: usize = 50 * 1024 * 1024;
@@ -1308,25 +1311,46 @@ fn host_header_value(parsed: &ParsedUrl) -> String {
     }
 }
 
-async fn read_response_head(
-    transport: &mut Transport,
+async fn read_response_head<R: AsyncRead + Unpin>(
+    transport: &mut R,
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(8192);
     let mut scratch = [0u8; READ_CHUNK_BYTES];
     let mut search_start = 0;
+    let mut informational_count = 0;
 
     loop {
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(Error::api("HTTP response headers too large"));
-        }
-
         let haystack = &buf[search_start..];
         if let Some(pos) = find_headers_end(haystack) {
             let absolute_pos = search_start + pos;
-            let head = &buf[..absolute_pos];
+            // A read can contain a complete head and part of the body (or
+            // another head). Only the current head consumes its byte budget.
+            if absolute_pos > MAX_HEADER_BYTES {
+                return Err(Error::api("HTTP response headers too large"));
+            }
+            let (status, headers) = parse_response_head(&buf[..absolute_pos])?;
+            if status == 101 {
+                // This client never negotiates an upgraded protocol. Treating
+                // its bytes as another HTTP head or an empty success is unsafe.
+                return Err(Error::api("HTTP protocol upgrade is not supported (101)"));
+            }
+            if (100..200).contains(&status) {
+                // RFC 9110 section 15.2: 1xx heads have no body and precede
+                // the final response, including on a proxy CONNECT hop.
+                informational_count += 1;
+                if informational_count > MAX_INFORMATIONAL_RESPONSES {
+                    return Err(Error::api("Too many HTTP informational responses"));
+                }
+                buf.drain(..absolute_pos);
+                search_start = 0;
+                continue;
+            }
             let leftover = buf[absolute_pos..].to_vec();
-            let (status, headers) = parse_response_head(head)?;
             return Ok((status, headers, leftover));
+        }
+
+        if buf.len() >= MAX_HEADER_BYTES {
+            return Err(Error::api("HTTP response headers too large"));
         }
 
         let n = read_some(transport, &mut scratch).await?;
@@ -2086,6 +2110,147 @@ mod tests {
     fn parse_response_head_empty() {
         let head = b"";
         assert!(parse_response_head(head).is_err());
+    }
+
+    struct FragmentedHeadReader<'a> {
+        remaining: &'a [u8],
+        fragment: usize,
+    }
+
+    impl AsyncRead for FragmentedHeadReader<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let count = self.fragment.min(buf.remaining()).min(self.remaining.len());
+            buf.put_slice(&self.remaining[..count]);
+            self.remaining = &self.remaining[count..];
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn response_head_skips_informational_heads_across_read_boundaries() {
+        let wire = b"HTTP/1.1 100 Continue\r\nX-Interim: first\r\n\r\n\
+                     HTTP/1.1 103 Early Hints\r\nLink: </model>; rel=preload\r\n\r\n\
+                     HTTP/1.1 199 Progress\r\n\r\n\
+                     HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Final: yes\r\n\r\nbody";
+        for fragment in [1, 2, 3, 7, 31, READ_CHUNK_BYTES] {
+            let mut reader = FragmentedHeadReader {
+                remaining: wire,
+                fragment,
+            };
+            let (status, headers, leftover) =
+                futures::executor::block_on(read_response_head(&mut reader)).unwrap();
+            assert_eq!(status, 200, "fragment size {fragment}");
+            assert_eq!(headers.len(), 2);
+            assert_eq!(header_value(&headers, "X-Final"), Some("yes"));
+            assert_eq!(header_value(&headers, "X-Interim"), None);
+            assert_eq!(header_value(&headers, "Link"), None);
+            assert_eq!([leftover.as_slice(), reader.remaining].concat(), b"body");
+        }
+    }
+
+    #[test]
+    fn response_head_requires_a_final_response_after_informational_heads() {
+        for wire in [
+            b"HTTP/1.1 100 Continue\r\n\r\n".as_slice(),
+            b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nX: partial".as_slice(),
+        ] {
+            let mut reader = wire;
+            let error = futures::executor::block_on(read_response_head(&mut reader))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("connection closed before headers"), "{error}");
+        }
+    }
+
+    #[test]
+    fn response_head_retains_final_error_status_and_body() {
+        let mut wire = b"HTTP/1.1 100 Continue\r\n\r\n\
+                         HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nContent-Length: 5\r\n\r\nretry"
+            .as_slice();
+        let (status, headers, leftover) =
+            futures::executor::block_on(read_response_head(&mut wire)).unwrap();
+        assert_eq!(status, 429);
+        assert_eq!(header_value(&headers, "Retry-After"), Some("3"));
+        assert_eq!(leftover, b"retry");
+    }
+
+    #[test]
+    fn response_head_rejects_unnegotiated_protocol_upgrades() {
+        let mut wire = b"HTTP/1.1 103 Early Hints\r\n\r\n\
+                         HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
+            .as_slice();
+        let error = futures::executor::block_on(read_response_head(&mut wire))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("protocol upgrade"), "{error}");
+    }
+
+    #[test]
+    fn response_head_bounds_informational_work_even_without_a_timeout() {
+        for count in [MAX_INFORMATIONAL_RESPONSES, MAX_INFORMATIONAL_RESPONSES + 1] {
+            let mut wire = b"HTTP/1.1 103 Early Hints\r\n\r\n".repeat(count);
+            wire.extend_from_slice(b"HTTP/1.1 204 No Content\r\n\r\n");
+            let result = futures::executor::block_on(read_response_head(&mut wire.as_slice()));
+            if count == MAX_INFORMATIONAL_RESPONSES {
+                assert_eq!(result.unwrap().0, 204);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Too many HTTP informational"),
+                    "a peer must not keep the header reader busy indefinitely"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn response_header_budget_excludes_coalesced_body_and_other_heads() {
+        let mut wire = b"HTTP/1.1 103 Early Hints\r\nX-Pad: ".to_vec();
+        wire.resize(MAX_HEADER_BYTES - 4, b'a');
+        wire.extend_from_slice(b"\r\n\r\n");
+        wire.extend_from_slice(b"HTTP/1.1 200 OK\r\nX-Pad: ");
+        wire.resize(2 * MAX_HEADER_BYTES - 4, b'b');
+        wire.extend_from_slice(b"\r\n\r\n");
+        let body = b"body".repeat(4096);
+        wire.extend_from_slice(&body);
+        let mut reader = FragmentedHeadReader {
+            remaining: &wire,
+            fragment: READ_CHUNK_BYTES - 1,
+        };
+        let (status, headers, leftover) =
+            futures::executor::block_on(read_response_head(&mut reader)).unwrap();
+        assert_eq!(status, 200);
+        assert!(
+            header_value(&headers, "X-Pad")
+                .unwrap()
+                .bytes()
+                .all(|byte| byte == b'b')
+        );
+        assert_eq!([leftover.as_slice(), reader.remaining].concat(), body);
+    }
+
+    #[test]
+    fn response_header_budget_rejects_each_oversized_head() {
+        for (interim_first, oversized_status) in [(false, 103), (false, 200), (true, 103), (true, 200)] {
+            let mut wire = Vec::new();
+            if interim_first {
+                wire.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+            }
+            let start = wire.len();
+            wire.extend_from_slice(format!("HTTP/1.1 {oversized_status} Status\r\nX-Pad: ").as_bytes());
+            wire.resize(start + MAX_HEADER_BYTES - 3, b'a');
+            wire.extend_from_slice(b"\r\n\r\n");
+            let error = futures::executor::block_on(read_response_head(&mut wire.as_slice()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("HTTP response headers too large"), "{error}");
+        }
     }
 
     // ── body_kind_from_headers ─────────────────────────────────────────
@@ -3989,8 +4154,7 @@ uMpFxVamNIo=
         });
     }
 
-    #[test]
-    fn https_proxy_connect_keeps_origin_tls_and_credentials_independent() {
+    fn check_https_proxy_connect_with_informational_heads(informational: bool) {
         run_tls_proxy_fixture(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy = test_proxy(&format!(
@@ -4010,7 +4174,17 @@ uMpFxVamNIo=
                 assert!(connect.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
                 assert!(!connect.contains("origin-token"));
                 assert!(!connect.contains("caller-proxy-secret"));
-                tls_fixture_send(&mut hop, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                if informational {
+                    tls_fixture_send(
+                        &mut hop,
+                        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\n\
+                          HTTP/1.1 200 Connection Established\r\n\r\n",
+                    )
+                    .await;
+                } else {
+                    tls_fixture_send(&mut hop, b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await;
+                }
 
                 let tls = tls_proxy_test_acceptor(ORIGIN_TEST_CERT)
                     .accept(hop)
@@ -4025,6 +4199,10 @@ uMpFxVamNIo=
                 assert!(!head.contains("dXNlcjpwYXNz"));
                 assert!(!head.contains("caller-proxy-secret"));
                 tls_fixture_prompt(&mut origin).await;
+                if informational {
+                    tls_fixture_send(&mut origin, b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                    tls_fixture_send(&mut origin, b"HTTP/1.1 103 Early Hints\r\n\r\n").await;
+                }
                 tls_fixture_sse(&mut origin).await;
             };
             let client = tls_proxy_test_client(true);
@@ -4034,6 +4212,16 @@ uMpFxVamNIo=
             );
             assert_eq!(response.unwrap(), b"data: ready\n\n");
         });
+    }
+
+    #[test]
+    fn https_proxy_connect_keeps_origin_tls_and_credentials_independent() {
+        check_https_proxy_connect_with_informational_heads(false);
+    }
+
+    #[test]
+    fn https_proxy_and_origin_informational_heads_preserve_streaming_body() {
+        check_https_proxy_connect_with_informational_heads(true);
     }
 
     #[test]
