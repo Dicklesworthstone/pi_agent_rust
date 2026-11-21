@@ -1236,6 +1236,7 @@ use exec_mediation::{
     classify_process_termination, classify_recursive_delete, classify_reverse_shell,
     classify_system_shutdown, normalize_command_for_classification,
 };
+pub use protocol::run_hostcall_egraph_paired_benchmark;
 pub(crate) use protocol::validate_host_call;
 
 /// Classify a command string into dangerous command classes.

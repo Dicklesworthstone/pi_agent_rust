@@ -144,6 +144,10 @@ struct Args {
     /// Optional path for trace JSONL artifact.
     #[arg(long)]
     trace_out: Option<PathBuf>,
+
+    /// Run the interleaved paired hostcall e-graph hot-trace benchmark and print JSON to stdout.
+    #[arg(long)]
+    egraph_paired_bench: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -451,6 +455,11 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    if args.egraph_paired_bench {
+        let report = pi::extensions::run_hostcall_egraph_paired_benchmark(60, 250)?;
+        println!("{}", to_json_pretty(&report)?);
+        return Ok(());
+    }
     let started_at = Utc::now();
     let wall_start = Instant::now();
     let build_profile = perf_build::detect_build_profile();

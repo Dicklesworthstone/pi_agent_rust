@@ -88,7 +88,20 @@ const MUST_PASS_SOURCE_PATHS: &[&str] = &[
 ];
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    if let Some(override_dir) = std::env::var_os("PI_REPO_ROOT")
+        .or_else(|| std::env::var_os("CARGO_MANIFEST_DIR"))
+        .filter(|value| !value.is_empty())
+    {
+        let path = PathBuf::from(override_dir);
+        if path.join("Cargo.toml").is_file() {
+            return path;
+        }
+    }
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if compiled.join("Cargo.toml").is_file() {
+        return compiled;
+    }
+    std::env::current_dir().unwrap_or(compiled)
 }
 
 fn load_json(path: &Path) -> Option<Value> {

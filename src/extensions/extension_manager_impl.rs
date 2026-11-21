@@ -4018,8 +4018,9 @@ impl ExtensionManager {
                 continue;
             }
             if extension.slash_commands.iter().any(|command| {
-                extract_slash_command_name(command)
-                    .is_some_and(|existing| js_command_route_name(&existing) == normalized_name)
+                !is_non_callable_compat_inferred(command)
+                    && extract_slash_command_name(command)
+                        .is_some_and(|existing| js_command_route_name(&existing) == normalized_name)
             }) {
                 return Err(Error::extension(format!(
                     "registerCommand: command name collision: {normalized_name}"
@@ -4359,8 +4360,9 @@ impl ExtensionManager {
                     continue;
                 }
                 if extension.slash_commands.iter().any(|command| {
-                    extract_slash_command_name(command)
-                        .is_some_and(|existing| js_command_route_name(&existing) == name)
+                    !is_non_callable_compat_inferred(command)
+                        && extract_slash_command_name(command)
+                            .is_some_and(|existing| js_command_route_name(&existing) == name)
                 }) {
                     return Err(Error::extension(format!(
                         "registerCommand: command name collision: {name}"
@@ -4369,6 +4371,8 @@ impl ExtensionManager {
             }
         }
         let target = &mut guard.extensions[target_index];
+        // A host may have replaced an owned command since the last publication.
+        // Retire only the exact accepted definitions, never a name alone.
         let mut commands = target
             .slash_commands
             .iter()
@@ -4378,9 +4382,20 @@ impl ExtensionManager {
         for replacement in replacements {
             if let Some(name) = extract_slash_command_name(replacement) {
                 let normalized = js_command_route_name(&name);
+                if commands.iter().any(|existing| {
+                    !is_non_callable_compat_inferred(existing)
+                        && extract_slash_command_name(existing)
+                            .is_some_and(|other| js_command_route_name(&other) == normalized)
+                }) {
+                    return Err(Error::extension(format!(
+                        "registerCommand: command name collision: {normalized}"
+                    )));
+                }
+                // Live runtime registration supersedes any static-scan compat stub.
                 commands.retain(|existing| {
-                    extract_slash_command_name(existing)
-                        .is_none_or(|other| js_command_route_name(&other) != normalized)
+                    !is_non_callable_compat_inferred(existing)
+                        || extract_slash_command_name(existing)
+                            .is_none_or(|other| js_command_route_name(&other) != normalized)
                 });
             }
             commands.push(replacement.clone());

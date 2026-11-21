@@ -3647,3 +3647,347 @@ fn isolated_runtime_provider_collision_cancels_inner_and_quarantines_shard() {
         assert!(manager.shutdown(Duration::from_secs(3)).await);
     });
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_ignores_compat_stubs()
+ {
+    let manager = ExtensionManager::new();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+
+    runtime.block_on(async move {
+        let dir = tempdir().expect("tempdir");
+        let ext_a_dir = dir.path().join("ext-a");
+        let ext_b_dir = dir.path().join("ext-b");
+        std::fs::create_dir_all(&ext_a_dir).expect("mkdir ext-a");
+        std::fs::create_dir_all(&ext_b_dir).expect("mkdir ext-b");
+        let ext_a_path = ext_a_dir.join("index.mjs");
+        let ext_b_path = ext_b_dir.join("index.mjs");
+        std::fs::write(
+            &ext_a_path,
+            r#"
+            export default function init(pi) {
+                pi.registerCommand("runtime-cmd", {
+                    description: "v1 runtime command",
+                    handler: async () => "v1",
+                });
+            }
+            "#,
+        )
+        .expect("write ext-a");
+        std::fs::write(
+            &ext_b_path,
+            r#"
+            export default function init(pi) {
+                pi.registerCommand("peer-cmd", {
+                    description: "peer command",
+                    handler: async () => "peer",
+                });
+            }
+            "#,
+        )
+        .expect("write ext-b");
+
+        let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: dir.path().display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime.clone());
+        let spec_a = JsExtensionLoadSpec::from_entry_path(&ext_a_path).expect("spec a");
+        let spec_b = JsExtensionLoadSpec::from_entry_path(&ext_b_path).expect("spec b");
+        manager
+            .load_js_extensions(vec![spec_a, spec_b])
+            .await
+            .expect("load extensions");
+
+        let actor = js_runtime.actor_lifecycle.clone();
+        let (generation, owner_a, owner_b, published_a) = {
+            let guard = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                guard.js_provider_generation,
+                guard.extension_ids[0].clone(),
+                guard.extension_ids[1].clone(),
+                guard.extensions[0].slash_commands.clone(),
+            )
+        };
+        let command_names = |mgr: &ExtensionManager| -> Vec<String> {
+            let mut names = mgr
+                .list_commands()
+                .into_iter()
+                .filter_map(|cmd| cmd.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        assert_eq!(command_names(&manager), ["peer-cmd", "runtime-cmd"]);
+
+        // 1. Stale actor, wrong/missing generation, and unknown owner must no-op cleanly.
+        let candidate = json!({ "name": "late-cmd", "description": "late" });
+        for (candidate_actor, candidate_gen, candidate_owner) in [
+            (std::sync::Weak::new(), generation, owner_a.as_str()),
+            (actor.clone(), Some(uuid::Uuid::new_v4()), owner_a.as_str()),
+            (actor.clone(), None, owner_a.as_str()),
+            (actor.clone(), generation, "unknown-owner"),
+        ] {
+            assert_eq!(
+                manager
+                    .replace_runtime_command_specs(
+                        candidate_owner,
+                        &candidate_actor,
+                        candidate_gen,
+                        &published_a,
+                        std::slice::from_ref(&candidate),
+                    )
+                    .expect("stale authority must return Ok(false)"),
+                false
+            );
+            assert_eq!(command_names(&manager), ["peer-cmd", "runtime-cmd"]);
+        }
+
+        // 2. Unready catalog must reject without mutation.
+        manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .js_provider_catalog_ready = false;
+        let unready = manager
+            .replace_runtime_command_specs(
+                &owner_a,
+                &actor,
+                generation,
+                &published_a,
+                std::slice::from_ref(&candidate),
+            )
+            .expect("unready catalog returns Ok(false)");
+        manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .js_provider_catalog_ready = true;
+        assert_eq!(unready, false);
+        assert_eq!(command_names(&manager), ["peer-cmd", "runtime-cmd"]);
+
+        // 3. Invalid empty name, duplicate in batch, and cross-extension callable collision fail closed.
+        let empty_err = manager
+            .replace_runtime_command_specs(
+                &owner_a,
+                &actor,
+                generation,
+                &published_a,
+                &[json!({ "name": "  /  ", "description": "empty" })],
+            )
+            .expect_err("empty command name must fail");
+        assert!(
+            empty_err.to_string().contains("name is required"),
+            "{empty_err}"
+        );
+        let dup_err = manager
+            .replace_runtime_command_specs(
+                &owner_a,
+                &actor,
+                generation,
+                &published_a,
+                &[
+                    json!({ "name": "dup", "description": "one" }),
+                    json!({ "name": "/dup", "description": "two" }),
+                ],
+            )
+            .expect_err("duplicate command in batch must fail");
+        assert!(
+            dup_err.to_string().contains("command name collision"),
+            "{dup_err}"
+        );
+        let peer_collision = manager
+            .replace_runtime_command_specs(
+                &owner_a,
+                &actor,
+                generation,
+                &published_a,
+                &[json!({ "name": "/peer-cmd", "description": "hijack" })],
+            )
+            .expect_err("collision with peer callable command must fail");
+        assert!(
+            peer_collision
+                .to_string()
+                .contains("command name collision: peer-cmd"),
+            "{peer_collision}"
+        );
+        assert_eq!(command_names(&manager), ["peer-cmd", "runtime-cmd"]);
+
+        // 4. Non-callable compat-inferred stubs on a peer OR on self must NOT block live registration.
+        {
+            let mut guard = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.extensions[0].slash_commands.push(json!({
+                "name": "self-stub",
+                "description": "compat stub",
+                "compatInferred": true,
+                "callable": false,
+            }));
+            guard.extensions[1].slash_commands.push(json!({
+                "name": "peer-stub",
+                "description": "compat stub",
+                "compatInferred": true,
+                "callable": false,
+            }));
+        }
+        let v2_specs = vec![
+            json!({ "name": "runtime-cmd", "description": "v2 runtime command" }),
+            json!({ "name": "self-stub", "description": "real self command" }),
+            json!({ "name": "peer-stub", "description": "real command ignoring peer stub" }),
+        ];
+        assert_eq!(
+            manager
+                .replace_runtime_command_specs(
+                    &owner_a,
+                    &actor,
+                    generation,
+                    &published_a,
+                    &v2_specs,
+                )
+                .expect("v2 update + compat stub upgrade must succeed"),
+            true
+        );
+        assert_eq!(
+            command_names(&manager),
+            ["peer-cmd", "peer-stub", "runtime-cmd", "self-stub"]
+        );
+        // Same non-callable compat stub check holds for register_command_for_extension.
+        manager
+            .register_command_for_extension(&owner_b, "peer-only-host", Some("host registered"))
+            .expect("register_command_for_extension must succeed");
+
+        // 5. A newer host-authored callable override on the same owner must NOT be clobbered.
+        manager
+            .register_command_for_extension(&owner_a, "runtime-cmd", Some("host override"))
+            .expect("host override on owner_a");
+        let clobber_err = manager
+            .replace_runtime_command_specs(&owner_a, &actor, generation, &v2_specs, &v2_specs)
+            .expect_err("runtime cannot overwrite a newer host-authored command");
+        assert!(
+            clobber_err
+                .to_string()
+                .contains("command name collision: runtime-cmd"),
+            "{clobber_err}"
+        );
+        let runtime_cmd_desc = manager
+            .list_commands()
+            .into_iter()
+            .find(|cmd| cmd.get("name").and_then(Value::as_str) == Some("runtime-cmd"))
+            .and_then(|cmd| {
+                cmd.get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        assert_eq!(runtime_cmd_desc.as_deref(), Some("host override"));
+
+        // 6. Exact retirement removes only owner_a's published definitions, preserving host override and peer commands.
+        assert_eq!(
+            manager
+                .replace_runtime_command_specs(&owner_a, &actor, generation, &v2_specs, &[])
+                .expect("exact retirement must succeed"),
+            true
+        );
+        assert_eq!(
+            command_names(&manager),
+            ["peer-cmd", "peer-only-host", "runtime-cmd"]
+        );
+
+        assert!(manager.shutdown(Duration::from_secs(3)).await);
+    });
+}
+
+#[test]
+fn runtime_dynamic_register_command_publishes_to_manager_and_retires_on_shutdown() {
+    let manager = ExtensionManager::new();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+
+    runtime.block_on(async move {
+        let dir = tempdir().expect("tempdir");
+        let ext_path = dir.path().join("dynamic-cmd.mjs");
+        std::fs::write(
+            &ext_path,
+            r#"
+            export default function init(pi) {
+                pi.registerCommand("bootstrap", {
+                    description: "Registers a second command dynamically",
+                    handler: async () => {
+                        pi.registerCommand("dynamic-late", {
+                            description: "Added at runtime",
+                            handler: async (args) => `late:${args}`,
+                        });
+                        return "bootstrapped";
+                    },
+                });
+            }
+            "#,
+        )
+        .expect("write dynamic-cmd");
+
+        let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: dir.path().display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime);
+        let spec = JsExtensionLoadSpec::from_entry_path(&ext_path).expect("spec");
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load dynamic-cmd");
+
+        assert!(manager.has_callable_command("bootstrap"));
+        assert!(!manager.has_command("dynamic-late"));
+
+        manager
+            .execute_command("bootstrap", "", 5_000)
+            .await
+            .expect("execute bootstrap command");
+
+        assert!(manager.has_callable_command("dynamic-late"));
+        let late_meta = manager
+            .list_commands()
+            .into_iter()
+            .find(|cmd| cmd.get("name").and_then(Value::as_str) == Some("dynamic-late"))
+            .expect("dynamic-late must be published to ExtensionManager");
+        assert_eq!(
+            late_meta.get("description").and_then(Value::as_str),
+            Some("Added at runtime")
+        );
+
+        let late_out = manager
+            .execute_command("dynamic-late", "hello", 5_000)
+            .await
+            .expect("execute dynamic-late command");
+        assert_eq!(late_out, json!("late:hello"));
+
+        assert!(manager.shutdown(Duration::from_secs(3)).await);
+        assert!(
+            !manager.has_command("bootstrap") && !manager.has_command("dynamic-late"),
+            "shutdown must retire both startup and dynamically published commands"
+        );
+    });
+}

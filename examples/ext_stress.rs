@@ -105,7 +105,7 @@ struct Args {
 
 fn main() {
     if let Err(err) = main_impl() {
-        eprintln!("{err}");
+        eprintln!("{err:#}");
         std::process::exit(1);
     }
 }
@@ -1322,14 +1322,17 @@ fn build_synthetic_hostcall_specs(
     let mut specs = Vec::with_capacity(count);
     let mut names = Vec::with_capacity(count);
     for idx in 0..count {
-        let path = root.join(format!("synthetic-hostcall-{idx}.js"));
+        let ext_dir = root.join(format!("synthetic-hostcall-{idx}"));
+        std::fs::create_dir_all(&ext_dir)
+            .with_context(|| format!("create synthetic extension dir {}", ext_dir.display()))?;
+        let path = ext_dir.join("index.js");
         std::fs::write(&path, synthetic_hostcall_source(idx))
             .with_context(|| format!("write synthetic extension {}", path.display()))?;
         specs.push(
             JsExtensionLoadSpec::from_entry_path(&path)
                 .with_context(|| format!("build synthetic load spec for {}", path.display()))?,
         );
-        names.push(format!("synthetic-hostcall-{idx}.js"));
+        names.push(format!("synthetic-hostcall-{idx}/index.js"));
     }
     Ok((specs, names))
 }
@@ -1614,6 +1617,35 @@ mod tests {
         assert!(source.contains("syntheticHostcall3"));
         assert!(source.contains("agent_start"));
         assert!(source.contains(r#"pi.events("list_flags", {})"#));
+    }
+
+    #[test]
+    fn synthetic_hostcall_specs_use_distinct_extension_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (specs, names) = build_synthetic_hostcall_specs(temp.path(), 3).expect("build specs");
+        assert_eq!(specs.len(), 3);
+        assert_eq!(
+            names,
+            vec![
+                "synthetic-hostcall-0/index.js",
+                "synthetic-hostcall-1/index.js",
+                "synthetic-hostcall-2/index.js",
+            ]
+        );
+        let roots: std::collections::HashSet<_> = specs
+            .iter()
+            .map(|spec| {
+                spec.entry_path
+                    .parent()
+                    .expect("synthetic extension parent dir")
+                    .to_path_buf()
+            })
+            .collect();
+        assert_eq!(
+            roots.len(),
+            3,
+            "each synthetic extension must own a distinct root directory"
+        );
     }
 
     #[test]

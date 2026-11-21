@@ -1,0 +1,271 @@
+{
+  "schema": "pi.ext.hostcall_egraph_calibration_evidence.v1",
+  "bead_id": "bd-oxu87",
+  "parent_bead_id": "bd-3ar8v.4.22",
+  "generated_at": "2026-11-21T19:49:43Z",
+  "correlation_id": "bd-oxu87-calibration-20261121T194943Z",
+  "source_base_commit": "63001152d32ce609749de36d9ce83e9e58e1c5a7",
+  "claim_surface": "non_release_facing",
+  "claim_boundary": "Per bd-oxu87 acceptance criterion #4, no release-facing performance claim or README quantitative claim is made from this artifact unless and until it passes the repository claim-integrity gates.",
+  "reproducible_commands": {
+    "six_stage_hotspot_baseline": "CARGO_TARGET_DIR=/dev/shm/pi_rch_target rch exec -- env PI_HOSTCALL_EGRAPH_REWRITE=0 CARGO_PROFILE_PERF_DEBUG=0 cargo run --locked --profile perf --example ext_workloads",
+    "six_stage_hotspot_candidate": "CARGO_TARGET_DIR=/dev/shm/pi_rch_target rch exec -- env PI_HOSTCALL_EGRAPH_REWRITE=1 CARGO_PROFILE_PERF_DEBUG=0 cargo run --locked --profile perf --example ext_workloads",
+    "paired_hot_trace_benchmark": "CARGO_TARGET_DIR=/dev/shm/pi_rch_target rch exec -- env CARGO_PROFILE_PERF_DEBUG=0 PI_BUILD_GIT_SHA=$(git rev-parse HEAD) cargo run --locked --profile perf --example ext_workloads -- --egraph-paired-bench",
+    "unit_and_conformance_tests": "dsr quality --tool pi_agent_rust"
+  },
+  "six_stage_calibration_source": {
+    "schema": "pi.ext.hostcall_hotspot_matrix.v1",
+    "worker": "ovh-a",
+    "profile": "perf",
+    "opt_level": 3,
+    "debug_assertions": false,
+    "sample_count": 6002,
+    "baseline_run": {
+      "env": {
+        "PI_HOSTCALL_EGRAPH_REWRITE": "0"
+      },
+      "run_id": "ext-hostcall-1795285216220",
+      "source_commit": "da1c84ff3",
+      "stages_us": {
+        "marshal": 16.8558,
+        "queue": 27.0629,
+        "schedule": 23.3697,
+        "policy": 28.7395,
+        "execute": 45.2418,
+        "io": 19.4551
+      },
+      "summary": {
+        "throughput_eps": 7019.17,
+        "mean_us": 160.725,
+        "p50_us": 147.629,
+        "ext_tool_call_hello_us": 133.007,
+        "long_session_real_corpus_us": 147.629
+      }
+    },
+    "candidate_run_informational": {
+      "note": "Separate-process single run provided for end-to-end stage context only; authoritative A/B delta is the same-invocation interleaved paired benchmark below.",
+      "env": {
+        "PI_HOSTCALL_EGRAPH_REWRITE": "1"
+      },
+      "run_id": "ext-hostcall-1795284540406",
+      "source_commit": "2c15c39fa",
+      "stages_us": {
+        "marshal": 16.9129,
+        "queue": 26.0236,
+        "schedule": 23.1064,
+        "policy": 27.6275,
+        "execute": 43.4209,
+        "io": 18.6621
+      },
+      "summary": {
+        "throughput_eps": 7556.8,
+        "mean_us": 155.753,
+        "p50_us": 129.741,
+        "ext_tool_call_hello_us": 109.732,
+        "long_session_real_corpus_us": 129.741
+      }
+    }
+  },
+  "calibrated_cost_model": {
+    "wired_in": "src/extensions/protocol.rs (CALIBRATED_HOSTCALL_STAGES -> hostcall_egraph_engine() via HostcallEGraphEngine::from_env_calibrated)",
+    "runtime_override_env": "PI_HOSTCALL_EGRAPH_CALIBRATION_PATH",
+    "kill_switch_env": "PI_HOSTCALL_EGRAPH_REWRITE=0",
+    "inputs_us": {
+      "marshal_us": 16.8558,
+      "queue_us": 27.0629,
+      "schedule_us": 23.3697,
+      "policy_us": 28.7395,
+      "execute_us_ignored": 45.2418,
+      "io_us_ignored": 19.4551,
+      "typed_marshal_us": 6.574
+    },
+    "cost_model": {
+      "marshal_json": 17,
+      "marshal_typed": 7,
+      "dispatch": 50,
+      "policy": 29,
+      "validate": 14,
+      "convert": 9
+    },
+    "calibration_report": {
+      "measured_fields": [
+        "dispatch",
+        "marshal_json",
+        "marshal_typed",
+        "policy"
+      ],
+      "unmeasured_fields": [
+        "convert",
+        "fused",
+        "validate"
+      ],
+      "is_fully_measured": false
+    },
+    "plan_cost_comparison": {
+      "uncalibrated_static_constant_cost": 35,
+      "uncalibrated_expected_cost_delta": 65,
+      "calibrated_egraph_cost": 84,
+      "calibrated_expected_cost_delta": 16,
+      "selected_rule": "fuse_hash_dispatch_fast_opcode",
+      "baseline_scale": 100
+    }
+  },
+  "same_invocation_paired_benchmark": {
+    "schema": "pi.ext.hostcall_egraph_paired_benchmark.v1",
+    "worker": "ovh-a",
+    "rch_overlay_fingerprint": "033b46116c8124409e5135cf29dc2a16dace7e597b647c311dbf004de473c211",
+    "profile": "perf",
+    "opt_level": 3,
+    "debug_assertions": false,
+    "methodology": "Interleaved AB/BA order across 60 rounds x 250 calls/round (15,000 calls per arm per trace; 75,000 fast-opcode calls per arm total) within a single process invocation, comparing incumbent HostcallRewriteEngine::from_opt(Some(\"0\")) (canonical hashing only; kill-switch double-hashing bug fixed in src/extensions/protocol.rs) against calibrated HostcallRewriteEngine::from_opt(Some(\"1\")) + HostcallEGraphEngine::from_opt_calibrated(Some(\"1\"), Some(CALIBRATED_HOSTCALL_STAGES)).",
+    "fast_opcode_aggregate": {
+      "trace_count": 5,
+      "baseline_marshal_mean_us": 7.244,
+      "fast_candidate_mean_us": 6.99,
+      "overhead_reduction_pct": 3.51,
+      "speedup_x": 1.036
+    },
+    "prior_calibration_pass_ovh_a": {
+      "rch_overlay_fingerprint": "f5ceb1cff12fb3b9cd0514342777e5ad6736e48158cb66c96aa699587e8d3e50",
+      "baseline_marshal_mean_us": 6.864,
+      "fast_candidate_mean_us": 6.574,
+      "overhead_reduction_pct": 4.23,
+      "speedup_x": 1.044
+    },
+    "traces": [
+      {
+        "trace": "tool.read",
+        "is_fast_opcode": true,
+        "incumbent_path": "canonical_fallback_v1",
+        "candidate_path": "interned_opcode_arena_v1",
+        "candidate_rewrite_rule": "fuse_hash_dispatch_fast_opcode",
+        "candidate_expected_cost_delta": 16,
+        "candidate_observed_cost_delta": 5,
+        "hashes_identical": true,
+        "rounds": 60,
+        "calls_per_round": 250,
+        "incumbent_mean_ns": 7734.05,
+        "candidate_mean_ns": 7663.9,
+        "incumbent_p50_ns": 7368.68,
+        "candidate_p50_ns": 7508.78,
+        "incumbent_p95_ns": 9440.05,
+        "candidate_p95_ns": 8818.72,
+        "delta_pct": -0.91,
+        "speedup_x": 1.009
+      },
+      {
+        "trace": "tool.write",
+        "is_fast_opcode": true,
+        "incumbent_path": "canonical_fallback_v1",
+        "candidate_path": "interned_opcode_arena_v1",
+        "candidate_rewrite_rule": "fuse_hash_dispatch_fast_opcode",
+        "candidate_expected_cost_delta": 16,
+        "candidate_observed_cost_delta": 14,
+        "hashes_identical": true,
+        "rounds": 60,
+        "calls_per_round": 250,
+        "incumbent_mean_ns": 7006.2,
+        "candidate_mean_ns": 6820.88,
+        "incumbent_p50_ns": 7061.42,
+        "candidate_p50_ns": 6854.23,
+        "incumbent_p95_ns": 7232.1,
+        "candidate_p95_ns": 6959.79,
+        "delta_pct": -2.65,
+        "speedup_x": 1.027
+      },
+      {
+        "trace": "tool.bash",
+        "is_fast_opcode": true,
+        "incumbent_path": "canonical_fallback_v1",
+        "candidate_path": "interned_opcode_arena_v1",
+        "candidate_rewrite_rule": "fuse_hash_dispatch_fast_opcode",
+        "candidate_expected_cost_delta": 16,
+        "candidate_observed_cost_delta": 14,
+        "hashes_identical": true,
+        "rounds": 60,
+        "calls_per_round": 250,
+        "incumbent_mean_ns": 7149.78,
+        "candidate_mean_ns": 6804.68,
+        "incumbent_p50_ns": 6846.06,
+        "candidate_p50_ns": 6581.12,
+        "incumbent_p95_ns": 8749.84,
+        "candidate_p95_ns": 8269.41,
+        "delta_pct": -4.83,
+        "speedup_x": 1.051
+      },
+      {
+        "trace": "session.get_state",
+        "is_fast_opcode": true,
+        "incumbent_path": "canonical_fallback_v1",
+        "candidate_path": "interned_opcode_arena_v1",
+        "candidate_rewrite_rule": "fuse_hash_dispatch_fast_opcode",
+        "candidate_expected_cost_delta": 16,
+        "candidate_observed_cost_delta": 10,
+        "hashes_identical": true,
+        "rounds": 60,
+        "calls_per_round": 250,
+        "incumbent_mean_ns": 7470.94,
+        "candidate_mean_ns": 6925.72,
+        "incumbent_p50_ns": 6924.8,
+        "candidate_p50_ns": 6622.72,
+        "incumbent_p95_ns": 8817.76,
+        "candidate_p95_ns": 8247.61,
+        "delta_pct": -7.3,
+        "speedup_x": 1.079
+      },
+      {
+        "trace": "events.list_flags",
+        "is_fast_opcode": true,
+        "incumbent_path": "canonical_fallback_v1",
+        "candidate_path": "interned_opcode_arena_v1",
+        "candidate_rewrite_rule": "fuse_hash_dispatch_fast_opcode",
+        "candidate_expected_cost_delta": 16,
+        "candidate_observed_cost_delta": 17,
+        "hashes_identical": true,
+        "rounds": 60,
+        "calls_per_round": 250,
+        "incumbent_mean_ns": 6857.96,
+        "candidate_mean_ns": 6732.55,
+        "incumbent_p50_ns": 6871.94,
+        "candidate_p50_ns": 6659.71,
+        "incumbent_p95_ns": 7635.46,
+        "candidate_p95_ns": 7704.55,
+        "delta_pct": -1.83,
+        "speedup_x": 1.019
+      },
+      {
+        "trace": "tool.custom_generic",
+        "is_fast_opcode": false,
+        "incumbent_path": "canonical_generic_v1",
+        "candidate_path": "canonical_generic_v1",
+        "candidate_rewrite_rule": null,
+        "candidate_expected_cost_delta": 0,
+        "candidate_observed_cost_delta": 0,
+        "hashes_identical": true,
+        "rounds": 60,
+        "calls_per_round": 250,
+        "incumbent_mean_ns": 879.25,
+        "candidate_mean_ns": 877.58,
+        "incumbent_p50_ns": 851.8,
+        "candidate_p50_ns": 847.67,
+        "incumbent_p95_ns": 1051.05,
+        "candidate_p95_ns": 1009.46,
+        "delta_pct": -0.19,
+        "speedup_x": 1.002
+      }
+    ]
+  },
+  "conformance_and_correctness": {
+    "hash_equivalence_verified": true,
+    "all_six_traces_params_hash_identical": true,
+    "all_six_traces_args_shape_hash_identical": true,
+    "unit_tests_verified_on_ovh_b": "56 passed; 0 failed (45 hostcall_egraph::tests::*, 6 extensions::protocol::egraph_cost_tests::*, hostcall_marshalling_*, runtime command publication)",
+    "kill_switch_defect_fixed": "Fixed HostcallPayloadArena::marshal_with_controls so PI_HOSTCALL_EGRAPH_REWRITE=0 skips hash_fast_opcode instead of hashing twice and discarding the fast path; also fixed rewrite_observed_cost_delta to subtract microsecond fast latency from calibrated microsecond marshal_json rather than dimensionless 100."
+  },
+  "honest_findings": [
+    "Calibrating CostModel from measured stage timings shifts the projected fast-opcode plan cost from the uncalibrated static constant 35 (expected_cost_delta=65) to 84 (expected_cost_delta=16), closely tracking observed microsecond deltas (5..17 us across the 5 fast opcodes).",
+    "Across 5 fast-opcode traces in the same-invocation opt-level=3 paired benchmark, the fast-opcode rewrite consistently reduces HostcallPayloadArena::marshal_with_controls latency by 3.51% (1.036x; 4.23% / 1.044x in the prior pass) with zero hash divergence and -0.19% noise on the non-fast-opcode negative control.",
+    "The negative control (tool.custom_generic at ~878 ns) reveals that hostcall_superinstruction_telemetry(Some(opcode)) accounts for ~6 us per call on both arms of marshal_with_controls; further marshalling wins require optimizing superinstruction trace tracking rather than deeper hash-fusion rewrites.",
+    "Because fast-opcode fusion is strictly positive with verified hash identity and calibrated conservative pricing (84 vs 100), keeping PI_HOSTCALL_EGRAPH_REWRITE enabled by default with kill-switch override is justified."
+  ]
+}

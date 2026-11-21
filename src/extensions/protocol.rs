@@ -10,7 +10,7 @@ use super::*;
 // Equality-saturation rewrite search (bd-3ar8v.4.22). Named explicitly rather
 // than riding the glob above: it feeds the marshalling candidate list, so the
 // dependency should be visible at the top of the file.
-use crate::hostcall_egraph::{HostcallEGraphEngine, PlanExpr, Repr, StageOp};
+use crate::hostcall_egraph::{HostcallEGraphEngine, MeasuredStages, PlanExpr, Repr, StageOp};
 
 // ============================================================================
 // Protocol (v1)
@@ -254,17 +254,27 @@ fn hostcall_rewrite_engine() -> &'static HostcallRewriteEngine {
     ENGINE.get_or_init(HostcallRewriteEngine::from_env)
 }
 
+/// Calibrated per-call stage timings derived from `examples/ext_workloads`
+/// (`pi.ext.hostcall_hotspot_matrix.v1`, `run_id=ext-hostcall-1795285216220`,
+/// `perf` profile, `opt-level=3`, `6,002` samples, `PI_HOSTCALL_EGRAPH_REWRITE=0`
+/// baseline) and same-invocation paired marshalling telemetry
+/// (`examples/ext_workloads --egraph-paired-bench`, `perf` profile, `opt-level=3`,
+/// `fast_candidate_mean_us = 6.574 us`, `baseline_marshal_mean_us = 6.864 us`)
+/// for bd-oxu87. Overridable at runtime via `PI_HOSTCALL_EGRAPH_CALIBRATION_PATH`.
+const CALIBRATED_HOSTCALL_STAGES: MeasuredStages =
+    MeasuredStages::from_stage_matrix(16.8558, 27.0629, 23.3697, 28.7395, 45.2418, 19.4551)
+        .with_typed_marshal(6.574);
+
 /// The process-wide rewrite-search engine.
 ///
-/// Uses `CostModel::measured_default()`, which is a hand-written cost *shape*
-/// rather than a calibrated measurement — so the number this engine yields
-/// today is derived, not measured. `CostModel::from_measured_stages` exists to
-/// replace it from a real run, but nothing wires a calibrated model in here
-/// yet; that is bd-oxu87. Until it does, treat the refined cost as a better
-/// structured estimate than the static constant, not as evidence.
+/// Calibrated from measured six-stage attribution + typed-marshal telemetry via
+/// [`CostModel::from_measured_stages`] (bd-oxu87), with runtime override via
+/// `PI_HOSTCALL_EGRAPH_CALIBRATION_PATH` and kill switch via
+/// `PI_HOSTCALL_EGRAPH_REWRITE=0`.
 fn hostcall_egraph_engine() -> &'static HostcallEGraphEngine {
     static ENGINE: OnceLock<HostcallEGraphEngine> = OnceLock::new();
-    ENGINE.get_or_init(HostcallEGraphEngine::from_env)
+    ENGINE
+        .get_or_init(|| HostcallEGraphEngine::from_env_calibrated(Some(CALIBRATED_HOSTCALL_STAGES)))
 }
 
 /// Price the fast-opcode candidate by searching both marshalling plans instead
@@ -328,7 +338,13 @@ fn egraph_marshal_plan(opcode: CommonHostcallOpcode, marshal: Repr) -> PlanExpr 
 /// The uncached search. Separated so the opcode-independence test can exercise
 /// it per opcode without defeating the cache.
 fn egraph_fast_opcode_cost_uncached(opcode: CommonHostcallOpcode) -> Option<(u32, &'static str)> {
-    let engine = hostcall_egraph_engine();
+    egraph_fast_opcode_cost_for_engine(opcode, hostcall_egraph_engine())
+}
+
+fn egraph_fast_opcode_cost_for_engine(
+    opcode: CommonHostcallOpcode,
+    engine: &HostcallEGraphEngine,
+) -> Option<(u32, &'static str)> {
     if !engine.enabled() {
         return None;
     }
@@ -339,9 +355,10 @@ fn egraph_fast_opcode_cost_uncached(opcode: CommonHostcallOpcode) -> Option<(u32
     let typed = engine.optimize(&egraph_marshal_plan(opcode, Repr::Typed));
     let projected = typed.relative_to(&canonical, HOSTCALL_REWRITE_COST_BASELINE)?;
 
-    // Neither model is calibrated, so take the more conservative of the two
-    // rather than the more flattering one: the search may shrink the claimed
-    // saving, never inflate it past what the static constant already asserts.
+    // Take the more conservative of the calibrated projection and the static
+    // fast-opcode floor so the search may shrink a claimed saving without
+    // over-claiming beyond what unmeasured stages (`validate`/`convert`/`fused`)
+    // justify.
     let estimated = projected.max(HOSTCALL_REWRITE_COST_FAST_OPCODE);
     if estimated >= HOSTCALL_REWRITE_COST_BASELINE {
         return None;
@@ -584,8 +601,21 @@ impl<'a> HostcallPayloadArena<'a> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(super) fn marshal(&self) -> HostcallMarshallingArtifacts {
+        self.marshal_with_controls(
+            hostcall_rewrite_engine(),
+            egraph_fast_opcode_cost(),
+            i64::from(hostcall_egraph_engine().cost_model().marshal_json),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn marshal_with_controls(
+        &self,
+        rewrite_engine: &HostcallRewriteEngine,
+        egraph_cost: Option<(u32, &'static str)>,
+        calibrated_baseline_marshal_us: i64,
+    ) -> HostcallMarshallingArtifacts {
         let baseline_plan = HostcallRewritePlan {
             kind: HostcallRewritePlanKind::BaselineCanonical,
             estimated_cost: HOSTCALL_REWRITE_COST_BASELINE,
@@ -594,12 +624,15 @@ impl<'a> HostcallPayloadArena<'a> {
 
         let mut fallback_reason = self
             .opcode
+            .filter(|_| rewrite_engine.enabled())
             .map(|_| HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS.to_string());
         let mut fast_candidate_hashes: Option<(String, String)> = None;
         let mut fast_candidate_latency_us = 0_u64;
         let mut rewrite_candidates = Vec::new();
 
-        if let Some(opcode) = self.opcode {
+        if rewrite_engine.enabled()
+            && let Some(opcode) = self.opcode
+        {
             let fast_started = Instant::now();
             let fast_outcome = self.hash_fast_opcode(opcode);
             let fast_latency =
@@ -620,7 +653,7 @@ impl<'a> HostcallPayloadArena<'a> {
                     fallback_reason = None;
                     fast_candidate_latency_us = fast_latency;
                     fast_candidate_hashes = Some((fast_params_hash, fast_args_shape_hash));
-                    let (estimated_cost, rule_id) = egraph_fast_opcode_cost().unwrap_or((
+                    let (estimated_cost, rule_id) = egraph_cost.unwrap_or((
                         HOSTCALL_REWRITE_COST_FAST_OPCODE,
                         HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION,
                     ));
@@ -638,8 +671,7 @@ impl<'a> HostcallPayloadArena<'a> {
             }
         }
 
-        let rewrite_decision =
-            hostcall_rewrite_engine().select_plan(baseline_plan, &rewrite_candidates);
+        let rewrite_decision = rewrite_engine.select_plan(baseline_plan, &rewrite_candidates);
         let use_fast_rewrite = rewrite_decision.selected.kind
             == HostcallRewritePlanKind::FastOpcodeFusion
             && fast_candidate_hashes.is_some();
@@ -685,9 +717,8 @@ impl<'a> HostcallPayloadArena<'a> {
             rewrite_decision.fallback_reason.map(str::to_string)
         };
         let rewrite_observed_cost_delta = if use_fast_rewrite {
-            let estimated_baseline = i64::from(HOSTCALL_REWRITE_COST_BASELINE);
             let fast_latency = i64::try_from(fast_candidate_latency_us).unwrap_or(i64::MAX);
-            estimated_baseline.saturating_sub(fast_latency)
+            calibrated_baseline_marshal_us.saturating_sub(fast_latency)
         } else {
             let _ = baseline_latency_us;
             0
@@ -2658,6 +2689,246 @@ fn validate_error(payload: &ErrorPayload) -> Result<()> {
     Ok(())
 }
 
+/// Run an interleaved, same-invocation paired hot-trace benchmark comparing
+/// incumbent canonical marshalling (`PI_HOSTCALL_EGRAPH_REWRITE=0`) against the
+/// calibrated fast-opcode rewrite candidate (`PI_HOSTCALL_EGRAPH_REWRITE=1`)
+/// while verifying bit-for-bit `params_hash` and `args_shape_hash` conformance
+/// on every trace (bd-oxu87).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+pub fn run_hostcall_egraph_paired_benchmark(
+    rounds: usize,
+    calls_per_round: usize,
+) -> Result<Value> {
+    use std::hint::black_box;
+
+    let rounds = rounds.max(1);
+    let calls_per_round = calls_per_round.max(1);
+    let incumbent_rewrite = HostcallRewriteEngine::from_opt(Some("0"));
+    let incumbent_egraph =
+        HostcallEGraphEngine::from_opt_calibrated(Some("0"), Some(CALIBRATED_HOSTCALL_STAGES));
+    let candidate_rewrite = HostcallRewriteEngine::from_opt(Some("1"));
+    let candidate_egraph =
+        HostcallEGraphEngine::from_opt_calibrated(Some("1"), Some(CALIBRATED_HOSTCALL_STAGES));
+    let incumbent_cost =
+        egraph_fast_opcode_cost_for_engine(CommonHostcallOpcode::ToolRead, &incumbent_egraph);
+    let candidate_cost =
+        egraph_fast_opcode_cost_for_engine(CommonHostcallOpcode::ToolRead, &candidate_egraph);
+    let baseline_us_i64 = i64::from(candidate_egraph.cost_model().marshal_json);
+    let (_, calibration_report) =
+        crate::hostcall_egraph::CostModel::from_measured_stages(CALIBRATED_HOSTCALL_STAGES);
+
+    let traces: Vec<(&str, &str, Value, Option<CommonHostcallOpcode>)> = vec![
+        (
+            "tool.read",
+            "tool",
+            serde_json::json!({
+                "name": "read",
+                "input": { "path": "src/main.rs", "offset": 1, "limit": 120 }
+            }),
+            Some(CommonHostcallOpcode::ToolRead),
+        ),
+        (
+            "tool.write",
+            "tool",
+            serde_json::json!({
+                "name": "write",
+                "input": { "path": "src/out.rs", "content": "fn main() {}\n" }
+            }),
+            Some(CommonHostcallOpcode::ToolWrite),
+        ),
+        (
+            "tool.bash",
+            "tool",
+            serde_json::json!({
+                "name": "bash",
+                "input": { "command": "git status --short" }
+            }),
+            Some(CommonHostcallOpcode::ToolBash),
+        ),
+        (
+            "session.get_state",
+            "session",
+            serde_json::json!({ "op": "get_state" }),
+            Some(CommonHostcallOpcode::SessionGetState),
+        ),
+        (
+            "events.list_flags",
+            "events",
+            serde_json::json!({ "op": "list_flags" }),
+            Some(CommonHostcallOpcode::EventsListFlags),
+        ),
+        (
+            "tool.custom_generic",
+            "tool",
+            serde_json::json!({
+                "name": "custom_ext_tool",
+                "input": { "mode": "audit", "limit": 42 }
+            }),
+            None,
+        ),
+    ];
+
+    let warmup_calls = calls_per_round.min(200);
+    let mut trace_reports = Vec::with_capacity(traces.len());
+    let mut fast_baseline_ns_sum = 0.0_f64;
+    let mut fast_candidate_ns_sum = 0.0_f64;
+    let mut fast_trace_count = 0_usize;
+
+    for (trace_name, method, params, opcode) in &traces {
+        let req = HostcallPayloadArena::new(method, params, *opcode);
+        let inc_check =
+            req.marshal_with_controls(&incumbent_rewrite, incumbent_cost, baseline_us_i64);
+        let cand_check =
+            req.marshal_with_controls(&candidate_rewrite, candidate_cost, baseline_us_i64);
+        if inc_check.params_hash != cand_check.params_hash {
+            return Err(Error::validation(format!(
+                "e-graph paired benchmark params_hash diverged for {trace_name}"
+            )));
+        }
+        if inc_check.args_shape_hash != cand_check.args_shape_hash {
+            return Err(Error::validation(format!(
+                "e-graph paired benchmark args_shape_hash diverged for {trace_name}"
+            )));
+        }
+
+        for _ in 0..warmup_calls {
+            black_box(req.marshal_with_controls(
+                &incumbent_rewrite,
+                incumbent_cost,
+                baseline_us_i64,
+            ));
+            black_box(req.marshal_with_controls(
+                &candidate_rewrite,
+                candidate_cost,
+                baseline_us_i64,
+            ));
+        }
+
+        let mut inc_round_ns = Vec::with_capacity(rounds);
+        let mut cand_round_ns = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            if round % 2 == 0 {
+                let t0 = Instant::now();
+                for _ in 0..calls_per_round {
+                    black_box(req.marshal_with_controls(
+                        &incumbent_rewrite,
+                        incumbent_cost,
+                        baseline_us_i64,
+                    ));
+                }
+                inc_round_ns.push(t0.elapsed().as_nanos() as f64 / calls_per_round as f64);
+
+                let t1 = Instant::now();
+                for _ in 0..calls_per_round {
+                    black_box(req.marshal_with_controls(
+                        &candidate_rewrite,
+                        candidate_cost,
+                        baseline_us_i64,
+                    ));
+                }
+                cand_round_ns.push(t1.elapsed().as_nanos() as f64 / calls_per_round as f64);
+            } else {
+                let t1 = Instant::now();
+                for _ in 0..calls_per_round {
+                    black_box(req.marshal_with_controls(
+                        &candidate_rewrite,
+                        candidate_cost,
+                        baseline_us_i64,
+                    ));
+                }
+                cand_round_ns.push(t1.elapsed().as_nanos() as f64 / calls_per_round as f64);
+
+                let t0 = Instant::now();
+                for _ in 0..calls_per_round {
+                    black_box(req.marshal_with_controls(
+                        &incumbent_rewrite,
+                        incumbent_cost,
+                        baseline_us_i64,
+                    ));
+                }
+                inc_round_ns.push(t0.elapsed().as_nanos() as f64 / calls_per_round as f64);
+            }
+        }
+
+        inc_round_ns.sort_by(f64::total_cmp);
+        cand_round_ns.sort_by(f64::total_cmp);
+        let pct = |xs: &[f64], p: f64| -> f64 {
+            let idx = ((xs.len() - 1) as f64 * p).round() as usize;
+            xs[idx.min(xs.len() - 1)]
+        };
+        let inc_mean = inc_round_ns.iter().sum::<f64>() / inc_round_ns.len() as f64;
+        let cand_mean = cand_round_ns.iter().sum::<f64>() / cand_round_ns.len() as f64;
+        let inc_p50 = pct(&inc_round_ns, 0.50);
+        let cand_p50 = pct(&cand_round_ns, 0.50);
+        let inc_p95 = pct(&inc_round_ns, 0.95);
+        let cand_p95 = pct(&cand_round_ns, 0.95);
+        let delta_pct = ((cand_mean - inc_mean) / inc_mean.max(1e-9)) * 100.0;
+        let speedup = inc_mean / cand_mean.max(1e-9);
+
+        if opcode.is_some() {
+            fast_baseline_ns_sum += inc_mean;
+            fast_candidate_ns_sum += cand_mean;
+            fast_trace_count += 1;
+        }
+
+        trace_reports.push(serde_json::json!({
+            "trace": trace_name,
+            "is_fast_opcode": opcode.is_some(),
+            "incumbent_path": inc_check.telemetry.path,
+            "candidate_path": cand_check.telemetry.path,
+            "candidate_rewrite_rule": cand_check.telemetry.rewrite_rule,
+            "candidate_expected_cost_delta": cand_check.telemetry.rewrite_expected_cost_delta,
+            "candidate_observed_cost_delta": cand_check.telemetry.rewrite_observed_cost_delta,
+            "hashes_identical": true,
+            "rounds": rounds,
+            "calls_per_round": calls_per_round,
+            "incumbent_mean_ns": (inc_mean * 100.0).round() / 100.0,
+            "candidate_mean_ns": (cand_mean * 100.0).round() / 100.0,
+            "incumbent_p50_ns": (inc_p50 * 100.0).round() / 100.0,
+            "candidate_p50_ns": (cand_p50 * 100.0).round() / 100.0,
+            "incumbent_p95_ns": (inc_p95 * 100.0).round() / 100.0,
+            "candidate_p95_ns": (cand_p95 * 100.0).round() / 100.0,
+            "delta_pct": (delta_pct * 100.0).round() / 100.0,
+            "speedup_x": (speedup * 1000.0).round() / 1000.0,
+        }));
+    }
+
+    let fast_baseline_mean_us = (fast_baseline_ns_sum / fast_trace_count.max(1) as f64) / 1_000.0;
+    let fast_candidate_mean_us = (fast_candidate_ns_sum / fast_trace_count.max(1) as f64) / 1_000.0;
+    Ok(serde_json::json!({
+        "schema": "pi.ext.hostcall_egraph_paired_benchmark.v1",
+        "git_sha": option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        "debug_assertions": cfg!(debug_assertions),
+        "calibration": {
+            "measured_fields": calibration_report.measured,
+            "unmeasured_fields": calibration_report.unmeasured,
+            "is_fully_measured": calibration_report.is_fully_measured(),
+            "cost_model": {
+                "marshal_json": candidate_egraph.cost_model().marshal_json,
+                "marshal_typed": candidate_egraph.cost_model().marshal_typed,
+                "dispatch": candidate_egraph.cost_model().dispatch,
+                "policy": candidate_egraph.cost_model().policy,
+                "validate": candidate_egraph.cost_model().validate,
+                "convert": candidate_egraph.cost_model().convert,
+            },
+        },
+        "candidate_egraph_cost": candidate_cost.map(|(cost, rule)| serde_json::json!({ "cost": cost, "rule": rule })),
+        "fast_opcode_aggregate": {
+            "trace_count": fast_trace_count,
+            "baseline_marshal_mean_us": (fast_baseline_mean_us * 1000.0).round() / 1000.0,
+            "fast_candidate_mean_us": (fast_candidate_mean_us * 1000.0).round() / 1000.0,
+            "overhead_reduction_pct": (((fast_baseline_mean_us - fast_candidate_mean_us) / fast_baseline_mean_us.max(1e-9)) * 10000.0).round() / 100.0,
+            "speedup_x": ((fast_baseline_mean_us / fast_candidate_mean_us.max(1e-9)) * 1000.0).round() / 1000.0,
+        },
+        "traces": trace_reports,
+    }))
+}
+
 #[cfg(test)]
 mod egraph_cost_tests {
     use super::*;
@@ -2723,5 +2994,85 @@ mod egraph_cost_tests {
         for _ in 0..4 {
             assert_eq!(egraph_fast_opcode_cost(), first);
         }
+    }
+
+    /// Process-wide engine must be wired to a calibrated cost model rather than
+    /// the hand-written `CostModel::measured_default()` (bd-oxu87).
+    #[test]
+    fn hostcall_egraph_engine_uses_calibrated_stages() {
+        let (expected_model, report) =
+            crate::hostcall_egraph::CostModel::from_measured_stages(CALIBRATED_HOSTCALL_STAGES);
+        assert!(report.measured.contains(&"marshal_json"));
+        assert!(report.measured.contains(&"marshal_typed"));
+        assert!(report.measured.contains(&"policy"));
+        assert!(report.measured.contains(&"dispatch"));
+        let engine =
+            HostcallEGraphEngine::from_opt_calibrated(Some("1"), Some(CALIBRATED_HOSTCALL_STAGES));
+        assert_eq!(engine.cost_model(), &expected_model);
+    }
+
+    #[test]
+    fn egraph_paired_benchmark_verifies_hash_identity_across_hot_traces() {
+        let report =
+            run_hostcall_egraph_paired_benchmark(2, 4).expect("paired benchmark should succeed");
+        assert_eq!(
+            report["schema"],
+            "pi.ext.hostcall_egraph_paired_benchmark.v1"
+        );
+        let traces = report["traces"].as_array().expect("traces array");
+        assert_eq!(traces.len(), 6);
+        for trace in traces {
+            assert_eq!(trace["hashes_identical"], true);
+            if trace["is_fast_opcode"].as_bool() == Some(true) {
+                assert_eq!(
+                    trace["incumbent_path"],
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK
+                );
+                assert_eq!(
+                    trace["candidate_path"],
+                    HOSTCALL_MARSHALLING_PATH_FAST_OPCODE
+                );
+            } else {
+                assert_eq!(
+                    trace["incumbent_path"],
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC
+                );
+                assert_eq!(
+                    trace["candidate_path"],
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marshal_with_disabled_rewrite_engine_skips_fast_path_cleanly() {
+        let params = serde_json::json!({
+            "name": "read",
+            "input": { "path": "src/main.rs", "offset": 1, "limit": 120 }
+        });
+        let req = HostcallPayloadArena::new("tool", &params, Some(CommonHostcallOpcode::ToolRead));
+        let disabled = HostcallRewriteEngine::from_opt(Some("0"));
+        let enabled = HostcallRewriteEngine::from_opt(Some("1"));
+        let fast_cost = egraph_fast_opcode_cost();
+        let baseline_us = i64::from(hostcall_egraph_engine().cost_model().marshal_json);
+
+        let inc = req.marshal_with_controls(&disabled, None, baseline_us);
+        let cand = req.marshal_with_controls(&enabled, fast_cost, baseline_us);
+
+        assert_eq!(inc.params_hash, cand.params_hash);
+        assert_eq!(inc.args_shape_hash, cand.args_shape_hash);
+        assert_eq!(
+            inc.telemetry.path,
+            HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK
+        );
+        assert_eq!(inc.telemetry.fallback_reason, None);
+        assert_eq!(
+            inc.telemetry.rewrite_fallback_reason.as_deref(),
+            Some("rewrite_disabled")
+        );
+        assert_eq!(inc.telemetry.rewrite_rule, None);
+        assert_eq!(inc.telemetry.rewrite_observed_cost_delta, 0);
+        assert_eq!(cand.telemetry.path, HOSTCALL_MARSHALLING_PATH_FAST_OPCODE);
     }
 }

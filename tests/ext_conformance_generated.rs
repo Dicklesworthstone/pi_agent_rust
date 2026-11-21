@@ -76,15 +76,32 @@ impl Manifest {
 
 // ─── Manifest loading ───────────────────────────────────────────────────────
 
+fn conformance_repo_root() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("PI_REPO_ROOT")
+        .or_else(|| std::env::var_os("CARGO_MANIFEST_DIR"))
+        .filter(|value| !value.is_empty())
+    {
+        let path = PathBuf::from(override_dir);
+        if path.join(MUST_PASS_MANIFEST_PATH).is_file() {
+            return path;
+        }
+    }
+    let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if compiled.join(MUST_PASS_MANIFEST_PATH).is_file() {
+        return compiled;
+    }
+    std::env::current_dir().unwrap_or(compiled)
+}
+
 fn artifacts_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("artifacts")
 }
 
 fn manifest_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(MUST_PASS_MANIFEST_PATH)
+    conformance_repo_root().join(MUST_PASS_MANIFEST_PATH)
 }
 
 const MUST_PASS_INCLUSION_PATH: &str = "docs/extension-inclusion-list.json";
@@ -1279,10 +1296,10 @@ fn load_provider_mirror_probe(entry_file: &Path, cwd: &Path) -> Result<Extension
         )
     })?;
     let manager = ExtensionManager::new();
-    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let tools = Arc::new(ToolRegistry::new(&[], cwd, None));
     let js_config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
-        env: hermetic_conformance_env(&cwd),
+        env: hermetic_conformance_env(cwd),
         deny_env: false,
         ..Default::default()
     };
@@ -1302,7 +1319,7 @@ fn load_provider_mirror_probe(entry_file: &Path, cwd: &Path) -> Result<Extension
         let manager = manager.clone();
         async move { manager.load_js_extensions(vec![spec]).await }
     });
-    load_result.map(|_| manager).map_err(|err| err.to_string())
+    load_result.map(|()| manager).map_err(|err| err.to_string())
 }
 
 fn assert_provider_mirror_probe_registration(manager: &ExtensionManager) -> Result<(), String> {
@@ -1731,7 +1748,7 @@ fn validate_named_registration_contract(
     declared: &[String],
     actual: &std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
-    if capability != !actual.is_empty() {
+    if capability == actual.is_empty() {
         return Err(format!(
             "Extension '{entry_id}': manifest {kind} capability={capability}, but runtime registered {} {kind}: {actual:?}",
             actual.len()
@@ -1774,7 +1791,7 @@ fn validate_registration_observation(
         &entry.registrations.tools,
         &actual.tools,
     )?;
-    if entry.capabilities.registers_providers != !actual.providers.is_empty() {
+    if entry.capabilities.registers_providers == actual.providers.is_empty() {
         return Err(format!(
             "Extension '{}': manifest provider capability={}, but runtime registered {} providers",
             entry.id,
@@ -1805,10 +1822,10 @@ fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
     try_conformance_with_manifest(load_manifest(), ext_id)
 }
 
-/// When PI_DUMP_REGISTRATION_OBSERVATIONS=1, append every extension's
+/// When `PI_DUMP_REGISTRATION_OBSERVATIONS=1`, append every extension's
 /// runtime-observed registration identities to a JSONL oracle artifact. This
-/// is the ground-truth feed for regenerating VALIDATED_MANIFEST.json entries
-/// (see docs/EXTENSION_REFRESH_CHECKLIST.md §3.2) and for diagnosing manifest
+/// is the ground-truth feed for regenerating `VALIDATED_MANIFEST.json` entries
+/// (see `docs/EXTENSION_REFRESH_CHECKLIST.md` §3.2) and for diagnosing manifest
 /// drift like bd-sog97.29.
 fn maybe_dump_registration_observation(ext_id: &str, observation: &RegistrationObservation) {
     if std::env::var("PI_DUMP_REGISTRATION_OBSERVATIONS")
@@ -1835,7 +1852,7 @@ fn maybe_dump_registration_observation(ext_id: &str, observation: &RegistrationO
         providers: &observation.providers,
         event_handlers: &observation.event_handlers,
     };
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -2057,7 +2074,7 @@ fn conformance_full_report() {
     use std::fmt::Write as _;
 
     let manifest = load_manifest();
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -2491,7 +2508,7 @@ fn conformance_sharded_matrix() {
     let config = ShardConfig::from_env();
     let manifest = load_manifest();
 
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -2757,7 +2774,7 @@ fn conformance_merge_shard_reports() {
     use chrono::{SecondsFormat, Utc};
     use std::fmt::Write as _;
 
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -3193,7 +3210,7 @@ fn conformance_failure_dossiers() {
 
     let manifest = load_manifest();
 
-    let dossier_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let dossier_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -3845,9 +3862,9 @@ fn gate_hardening_runtime_registration_contract_rejects_undeclared_extras() {
 
 #[test]
 fn canonical_contract_currently_maps_all_208_must_pass_ids() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = conformance_repo_root();
     let snapshot =
-        capture_must_pass_source_snapshot(repo_root).expect("capture canonical source snapshot");
+        capture_must_pass_source_snapshot(&repo_root).expect("capture canonical source snapshot");
     let manifest = parse_manifest(&snapshot.manifest_contents).expect("parse canonical manifest");
     let ids = parse_authoritative_must_pass_ids(
         &snapshot.inclusion_contents,
@@ -3919,8 +3936,8 @@ fn conformance_must_pass_gate() {
         "vendored conformance corpus failed verification:\n{}",
         String::from_utf8_lossy(&verify.stdout)
     );
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source_snapshot = capture_must_pass_source_snapshot(repo_root)
+    let repo_root = conformance_repo_root();
+    let source_snapshot = capture_must_pass_source_snapshot(&repo_root)
         .expect("capture coherent must-pass release source snapshot");
     let source_provenance = &source_snapshot.provenance;
     let git_commit = source_provenance.git_commit.clone();
@@ -3946,7 +3963,7 @@ fn conformance_must_pass_gate() {
     let generated_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let (run_id, correlation_id) = current_must_pass_gate_lineage(now);
 
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -4036,7 +4053,7 @@ fn conformance_must_pass_gate() {
         stretch_results.push(result);
     }
 
-    let source_snapshot_after = capture_must_pass_source_snapshot(repo_root)
+    let source_snapshot_after = capture_must_pass_source_snapshot(&repo_root)
         .expect("must-pass source inputs changed or became untracked during execution");
     ensure_must_pass_source_unchanged(source_provenance, &source_snapshot_after.provenance)
         .expect("must-pass source provenance changed during extension execution");
@@ -4067,6 +4084,7 @@ fn conformance_must_pass_gate() {
     let st_tested = st_pass + st_fail;
 
     // ── Gate checks ──
+    #[allow(clippy::float_cmp)]
     let rate_ok = mp_pass_rate == min_pass_rate;
     let count_ok = mp_fail == max_failures;
     let coverage_ok = mp_tested == must_pass.len();
@@ -4367,7 +4385,7 @@ fn conformance_must_pass_gate() {
     eprintln!("    MD:      {}", md_path.display());
     eprintln!();
 
-    let final_source_snapshot = capture_must_pass_source_snapshot(repo_root)
+    let final_source_snapshot = capture_must_pass_source_snapshot(&repo_root)
         .expect("must-pass source inputs changed while writing gate evidence");
     ensure_must_pass_source_unchanged(source_provenance, &final_source_snapshot.provenance)
         .expect("must-pass source provenance changed while writing gate evidence");
@@ -4732,7 +4750,7 @@ fn conformance_provider_compat_matrix() {
     let manifest = load_manifest();
     let modes = provider_modes();
 
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -5525,7 +5543,7 @@ fn conformance_extension_journeys() {
     use std::fmt::Write as _;
 
     let manifest = load_manifest();
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -5862,7 +5880,7 @@ fn conformance_health_delta() {
 
     let manifest = load_manifest();
 
-    let report_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let report_dir = conformance_repo_root()
         .join("tests")
         .join("ext_conformance")
         .join("reports")
@@ -5872,7 +5890,7 @@ fn conformance_health_delta() {
     // ── Load baseline ──
     let baseline_path = std::env::var("PI_HEALTH_BASELINE_PATH").ok().map_or_else(
         || {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
+            conformance_repo_root()
                 .join("tests")
                 .join("ext_conformance")
                 .join("reports")
@@ -5931,14 +5949,13 @@ fn conformance_health_delta() {
 
     // Check for per-extension baseline snapshot (from previous health delta run).
     let per_ext_baseline_path = report_dir.join("per_extension_baseline.json");
-    if per_ext_baseline_path.exists() {
-        if let Ok(data) = std::fs::read_to_string(&per_ext_baseline_path) {
-            if let Ok(statuses) = serde_json::from_str::<Vec<ExtHealthStatus>>(&data) {
-                // More precise per-extension data overrides the coarse baseline.
-                for s in statuses {
-                    baseline_status_map.insert(s.id.clone(), s);
-                }
-            }
+    if per_ext_baseline_path.exists()
+        && let Ok(data) = std::fs::read_to_string(&per_ext_baseline_path)
+        && let Ok(statuses) = serde_json::from_str::<Vec<ExtHealthStatus>>(&data)
+    {
+        // More precise per-extension data overrides the coarse baseline.
+        for s in statuses {
+            baseline_status_map.insert(s.id.clone(), s);
         }
     }
 
@@ -7075,8 +7092,9 @@ export default function (pi: any) {
 "#,
         )
         .expect("write beta");
-        let indep_specs = resolve_conformance_extension_specs(&alpha).expect("resolve independent");
-        assert_eq!(indep_specs.len(), 1);
+        let standalone_specs =
+            resolve_conformance_extension_specs(&alpha).expect("resolve independent");
+        assert_eq!(standalone_specs.len(), 1);
     }
 
     #[test]

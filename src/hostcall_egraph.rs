@@ -53,6 +53,10 @@ use crate::hostcall_rewrite::{HostcallRewritePlan, HostcallRewritePlanKind};
 /// Schema tag for emitted decision telemetry.
 pub const HOSTCALL_EGRAPH_SCHEMA: &str = "pi.ext.hostcall_egraph_decision.v1";
 
+/// Schema tag of the six-stage hotspot attribution matrix emitted by
+/// `examples/ext_workloads` and consumed by [`MeasuredStages::from_hotspot_matrix_json`].
+pub const HOTSPOT_MATRIX_SCHEMA: &str = "pi.ext.hostcall_hotspot_matrix.v1";
+
 /// Default ceiling on saturation iterations.
 pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 
@@ -258,7 +262,7 @@ impl PlanExpr {
 /// reports — JSON marshalling dominates, conversions are not free, fused
 /// intrinsics cost less than the sum of their parts — without claiming to be a
 /// calibrated measurement. Callers with real numbers should override.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CostModel {
     pub opcode: u32,
     pub marshal_json: u32,
@@ -332,6 +336,85 @@ impl MeasuredStages {
     pub const fn with_typed_marshal(mut self, fast_candidate_latency_us: f64) -> Self {
         self.marshal_typed_us = Some(fast_candidate_latency_us);
         self
+    }
+
+    /// Parse per-call six-stage timings from a `pi.ext.hostcall_hotspot_matrix.v1`
+    /// artifact emitted by `examples/ext_workloads` (bd-oxu87).
+    ///
+    /// Fails closed on schema mismatch, zero sample count, missing stage
+    /// totals, or non-finite/negative values so malformed telemetry never
+    /// silently steers rewrite pricing.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn from_hotspot_matrix_json(value: &serde_json::Value) -> crate::error::Result<Self> {
+        let schema = value
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if schema != HOTSPOT_MATRIX_SCHEMA {
+            return Err(crate::error::Error::validation(format!(
+                "hotspot matrix schema mismatch: expected {HOTSPOT_MATRIX_SCHEMA}, got {schema:?}"
+            )));
+        }
+        let sample_count = value
+            .get("sample_count")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&count| count > 0)
+            .ok_or_else(|| {
+                crate::error::Error::validation(
+                    "hotspot matrix sample_count must be a positive integer",
+                )
+            })?;
+        let stage_totals = value
+            .get("stage_totals_us")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                crate::error::Error::validation("hotspot matrix missing stage_totals_us object")
+            })?;
+        let samples = sample_count as f64;
+        let stage_us = |key: &str| -> crate::error::Result<f64> {
+            let total = stage_totals
+                .get(key)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    crate::error::Error::validation(format!(
+                        "hotspot matrix stage_totals_us missing numeric field {key:?}"
+                    ))
+                })?;
+            if !total.is_finite() || total < 0.0 {
+                return Err(crate::error::Error::validation(format!(
+                    "hotspot matrix stage_totals_us.{key} must be finite and non-negative"
+                )));
+            }
+            Ok(total / samples)
+        };
+
+        let mut stages = Self::from_stage_matrix(
+            stage_us("marshal")?,
+            stage_us("queue")?,
+            stage_us("schedule")?,
+            stage_us("policy")?,
+            stage_us("execute")?,
+            stage_us("io")?,
+        );
+        let typed_raw = value.get("marshal_typed_us").or_else(|| {
+            value
+                .get("marshalling_calibration")
+                .and_then(|cal| cal.get("fast_candidate_mean_us"))
+        });
+        if let Some(raw) = typed_raw {
+            let typed_us = raw.as_f64().ok_or_else(|| {
+                crate::error::Error::validation(
+                    "hotspot matrix marshal_typed_us must be a positive finite number",
+                )
+            })?;
+            if !typed_us.is_finite() || typed_us <= 0.0 {
+                return Err(crate::error::Error::validation(
+                    "hotspot matrix marshal_typed_us must be finite and positive",
+                ));
+            }
+            stages = stages.with_typed_marshal(typed_us);
+        }
+        Ok(stages)
     }
 }
 
@@ -455,6 +538,15 @@ impl CostModel {
                 unmeasured,
             },
         )
+    }
+
+    /// Build a calibrated cost model directly from a `pi.ext.hostcall_hotspot_matrix.v1`
+    /// artifact emitted by `examples/ext_workloads` (bd-oxu87).
+    pub fn from_hotspot_matrix_json(
+        value: &serde_json::Value,
+    ) -> crate::error::Result<(Self, CalibrationReport)> {
+        let stages = MeasuredStages::from_hotspot_matrix_json(value)?;
+        Ok(Self::from_measured_stages(stages))
     }
 
     /// Cost shape matching the harness's stage attribution.
@@ -1285,6 +1377,54 @@ impl HostcallEGraphEngine {
     #[must_use]
     pub fn from_env() -> Self {
         Self::from_opt(std::env::var("PI_HOSTCALL_EGRAPH_REWRITE").ok().as_deref())
+    }
+
+    /// Read the kill switch and optionally override the cost model from
+    /// `PI_HOSTCALL_EGRAPH_CALIBRATION_PATH` (a `pi.ext.hostcall_hotspot_matrix.v1`
+    /// JSON artifact), falling back to `fallback_stages` when provided (bd-oxu87).
+    #[must_use]
+    pub fn from_env_calibrated(fallback_stages: Option<MeasuredStages>) -> Self {
+        let enabled_opt = std::env::var("PI_HOSTCALL_EGRAPH_REWRITE").ok();
+        let stages = std::env::var_os("PI_HOSTCALL_EGRAPH_CALIBRATION_PATH")
+            .filter(|path| !path.is_empty())
+            .and_then(|path| {
+                let path = std::path::PathBuf::from(path);
+                match std::fs::read_to_string(&path)
+                    .map_err(|err| crate::error::Error::validation(err.to_string()))
+                    .and_then(|raw| {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .map_err(|err| crate::error::Error::validation(err.to_string()))
+                    })
+                    .and_then(|json| MeasuredStages::from_hotspot_matrix_json(&json))
+                {
+                    Ok(measured) => Some(measured),
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Ignoring invalid PI_HOSTCALL_EGRAPH_CALIBRATION_PATH; using fallback calibration"
+                        );
+                        None
+                    }
+                }
+            })
+            .or(fallback_stages);
+        Self::from_opt_calibrated(enabled_opt.as_deref(), stages)
+    }
+
+    /// Construct from explicit kill-switch value and optional measured stage
+    /// calibration, testable under `#![forbid(unsafe_code)]` without mutating
+    /// process environment variables.
+    #[must_use]
+    pub fn from_opt_calibrated(value: Option<&str>, stages: Option<MeasuredStages>) -> Self {
+        let engine = Self::from_opt(value);
+        match stages {
+            Some(measured) => {
+                let (model, _) = CostModel::from_measured_stages(measured);
+                engine.with_cost_model(model)
+            }
+            None => engine,
+        }
     }
 
     /// Parse the kill switch from an explicit value.
@@ -2444,6 +2584,84 @@ mod tests {
                 HostcallEGraphEngine::from_opt(value).enabled(),
                 HostcallRewriteEngine::from_opt(value).enabled(),
                 "kill-switch parsers disagree on {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hotspot_matrix_json_calibrates_cost_model_and_rejects_malformed_inputs() {
+        let matrix = serde_json::json!({
+            "schema": HOTSPOT_MATRIX_SCHEMA,
+            "sample_count": 1000,
+            "stage_totals_us": {
+                "marshal": 38_400.0,
+                "queue": 5_500.0,
+                "schedule": 4_500.0,
+                "policy": 9_200.0,
+                "execute": 420_000.0,
+                "io": 80_000.0,
+                "total": 557_600.0
+            },
+            "marshalling_calibration": {
+                "fast_candidate_mean_us": 11.4
+            }
+        });
+        let (model, report) =
+            CostModel::from_hotspot_matrix_json(&matrix).expect("valid hotspot matrix");
+        assert_eq!(model.marshal_json, 38);
+        assert_eq!(model.marshal_typed, 11);
+        assert_eq!(model.dispatch, 10);
+        assert_eq!(model.policy, 9);
+        assert_eq!(
+            report.measured,
+            ["dispatch", "marshal_json", "marshal_typed", "policy"]
+        );
+        assert_eq!(report.unmeasured, ["convert", "fused", "validate"]);
+
+        let engine = HostcallEGraphEngine::from_opt_calibrated(
+            Some("1"),
+            Some(MeasuredStages::from_hotspot_matrix_json(&matrix).expect("stages")),
+        );
+        assert!(engine.enabled());
+        assert_eq!(engine.cost_model(), &model);
+        let disabled = HostcallEGraphEngine::from_opt_calibrated(
+            Some("0"),
+            Some(MeasuredStages::from_hotspot_matrix_json(&matrix).expect("stages")),
+        );
+        assert!(!disabled.enabled());
+
+        // Planted-red negatives: schema mismatch, zero sample_count, missing stage, negative total.
+        for bad in [
+            serde_json::json!({
+                "schema": "pi.ext.wrong.v1",
+                "sample_count": 100,
+                "stage_totals_us": { "marshal": 10.0, "queue": 1.0, "schedule": 1.0, "policy": 1.0, "execute": 1.0, "io": 1.0 }
+            }),
+            serde_json::json!({
+                "schema": HOTSPOT_MATRIX_SCHEMA,
+                "sample_count": 0,
+                "stage_totals_us": { "marshal": 10.0, "queue": 1.0, "schedule": 1.0, "policy": 1.0, "execute": 1.0, "io": 1.0 }
+            }),
+            serde_json::json!({
+                "schema": HOTSPOT_MATRIX_SCHEMA,
+                "sample_count": 100,
+                "stage_totals_us": { "marshal": 10.0, "queue": 1.0, "schedule": 1.0, "execute": 1.0, "io": 1.0 }
+            }),
+            serde_json::json!({
+                "schema": HOTSPOT_MATRIX_SCHEMA,
+                "sample_count": 100,
+                "stage_totals_us": { "marshal": -1.0, "queue": 1.0, "schedule": 1.0, "policy": 1.0, "execute": 1.0, "io": 1.0 }
+            }),
+            serde_json::json!({
+                "schema": HOTSPOT_MATRIX_SCHEMA,
+                "sample_count": 100,
+                "stage_totals_us": { "marshal": 10.0, "queue": 1.0, "schedule": 1.0, "policy": 1.0, "execute": 1.0, "io": 1.0 },
+                "marshal_typed_us": 0.0
+            }),
+        ] {
+            assert!(
+                MeasuredStages::from_hotspot_matrix_json(&bad).is_err(),
+                "malformed hotspot matrix must fail closed: {bad}"
             );
         }
     }
