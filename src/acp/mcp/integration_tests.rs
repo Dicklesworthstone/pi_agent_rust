@@ -3,6 +3,7 @@
 //! bypassing the production permission callback.
 
 use super::*;
+use crate::acp::commands::PromptCommand;
 use crate::acp::{
     AbortHandle, AcpOptions, AcpPermissionClient, AcpSessionState, PendingPermissionMap,
 };
@@ -518,7 +519,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             let reason = Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
                 text("/mcp trust remote"),
-                Some(Command::Trust("remote".into())),
+                Some(PromptCommand::Mcp(Command::Trust("remote".into()))),
                 signal,
                 tx.clone(),
                 id.clone(),
@@ -585,7 +586,7 @@ fn real_mcp_tool_round_trip_requires_editor_permission_and_preserves_literal_hea
             Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
                 text("/mcp deny remote"),
-                Some(Command::Deny("remote".into())),
+                Some(PromptCommand::Mcp(Command::Deny("remote".into()))),
                 signal,
                 tx,
                 id,
@@ -638,7 +639,7 @@ fn assert_cancelled_setup(transport: Transport) {
         let prompt = crate::acp::run_prompt(
             Arc::clone(&state),
             text("/mcp trust remote"),
-            Some(Command::Trust("remote".into())),
+            Some(PromptCommand::Mcp(Command::Trust("remote".into()))),
             signal,
             tx,
             id.clone(),
@@ -743,7 +744,7 @@ fn sse_authentication_failure_is_repairable_without_sharing_session_tool_authori
             Box::pin(crate::acp::run_prompt(
                 Arc::clone(&state),
                 text("MCP operator command"),
-                Some(command),
+                Some(PromptCommand::Mcp(command)),
                 signal,
                 out.clone(),
                 id.clone(),

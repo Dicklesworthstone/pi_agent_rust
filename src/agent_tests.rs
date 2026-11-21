@@ -2271,10 +2271,11 @@ mod tests {
                         AgentEvent::AgentEnd { error: Some(error), .. }
                             if error == "original provider limit diagnostic"
                     )));
-                    assert!(!events.iter().any(|event| matches!(
-                        event,
-                        AgentEvent::AgentEnd { error: None, .. }
-                    )));
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, AgentEvent::AgentEnd { error: None, .. }))
+                    );
                     assert!(events.iter().any(|event| matches!(
                         event,
                         AgentEvent::TurnEnd {

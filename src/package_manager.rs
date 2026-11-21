@@ -5309,8 +5309,11 @@ mod tests {
             let target = temp.path().join("target");
             fs::create_dir_all(&launch).expect("create launch workspace");
             fs::create_dir_all(&target).expect("create target workspace");
-            fs::write(target.join("plugin.ts"), "export default function init() {}")
-                .expect("write target-only extension");
+            fs::write(
+                target.join("plugin.ts"),
+                "export default function init() {}",
+            )
+            .expect("write target-only extension");
             let launch_manager = PackageManager::new(launch.clone());
             let target_manager = PackageManager::new(target);
             for source in ["./plugin.ts", "plugin.ts"] {

@@ -4358,10 +4358,9 @@ still frontmatter",
                     extension_paths: vec![cli_package.to_string_lossy().into_owned()],
                     theme_paths: Vec::new(),
                 };
-                let result =
-                    ResourceLoader::load_with_roots(&manager, &cwd, &config, &cli, &roots)
-                        .await
-                        .expect("load resources from captured roots");
+                let result = ResourceLoader::load_with_roots(&manager, &cwd, &config, &cli, &roots)
+                    .await
+                    .expect("load resources from captured roots");
                 let expected_count = if include_configured { 9 } else { 2 };
                 assert_eq!(result.skills().len(), expected_count);
                 for (index, skill) in result.skills().iter().enumerate() {
@@ -4371,8 +4370,8 @@ still frontmatter",
                     assert_eq!(
                         skill.source,
                         [
-                            "path", "path", "project", "project", "user", "user", "path",
-                            "path", "managed",
+                            "path", "path", "project", "project", "user", "user", "path", "path",
+                            "managed",
                         ][index]
                     );
                 }
@@ -4455,13 +4454,15 @@ still frontmatter",
             for project_enabled in [true, false] {
                 roots.project_settings_enabled = project_enabled;
                 if !project_enabled {
-                    fs::write(&roots.project_settings_path, "invalid JSON must not be read")
-                        .expect("make disabled project settings unreadable as configuration");
+                    fs::write(
+                        &roots.project_settings_path,
+                        "invalid JSON must not be read",
+                    )
+                    .expect("make disabled project settings unreadable as configuration");
                 }
-                let loader =
-                    ResourceLoader::load_with_roots(&manager, &cwd, &config, &cli, &roots)
-                        .await
-                        .expect("load captured roots");
+                let loader = ResourceLoader::load_with_roots(&manager, &cwd, &config, &cli, &roots)
+                    .await
+                    .expect("load captured roots");
                 let expected_skills = if project_enabled {
                     vec!["global-skill", "project-skill", "universal-skill"]
                 } else {
@@ -4487,7 +4488,10 @@ still frontmatter",
                         .contains(&roots.project_base_dir.join("project.native.json")),
                     project_enabled
                 );
-                assert_eq!(loader.extensions().len(), if project_enabled { 2 } else { 1 });
+                assert_eq!(
+                    loader.extensions().len(),
+                    if project_enabled { 2 } else { 1 }
+                );
             }
         });
     }

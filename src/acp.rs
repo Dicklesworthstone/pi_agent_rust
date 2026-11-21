@@ -1164,11 +1164,7 @@ async fn run(
 }
 
 /// Core ACP event loop, including ordered stdin failures and owner cleanup.
-async fn run_with_input(
-    options: AcpOptions,
-    mut input: AcpInput,
-    out_tx: AcpOutput,
-) -> Result<()> {
+async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOutput) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
     let sessions: AcpSessionsMap = Arc::new(Mutex::new(HashMap::new()));
     let prompt_counter = Arc::new(AtomicU64::new(0));
@@ -1333,7 +1329,8 @@ async fn run_with_input(
                                 }
                                 let result = session_setup_response(&session_id, &state)?
                                     .ok_or_else(|| Error::session("New session is unavailable"))?;
-                                let commands_notification = commands::for_state(&session_id, &state);
+                                let commands_notification =
+                                    commands::for_state(&session_id, &state);
                                 let mcp_state = state.mcp.clone();
                                 let state_arc = Arc::new(Mutex::new(state));
                                 {
@@ -1434,7 +1431,8 @@ async fn run_with_input(
                                 ) {
                                     Ok(command) => prompt_command = command,
                                     Err(error) => {
-                                        let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                                        let _ =
+                                            out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
                                         continue;
                                     }
                                 }
@@ -2812,25 +2810,28 @@ fn acp_resource_roots(
     cwd: &std::path::Path,
 ) -> crate::package_manager::ResolveRoots {
     let global_dir = options.global_dir();
-    let config_override = options.settings_source.as_ref().and_then(|source| {
-        source
-            .config_override
-            .as_deref()
-            .map(|path| Config::resolve_config_override_path(path, &source.launch_cwd))
-    }).or_else(|| {
-        options
-            .workspace_trust_guard
-            .as_ref()
-            .and_then(|guard| guard.config_override().map(std::path::Path::to_path_buf))
-    });
+    let config_override = options
+        .settings_source
+        .as_ref()
+        .and_then(|source| {
+            source
+                .config_override
+                .as_deref()
+                .map(|path| Config::resolve_config_override_path(path, &source.launch_cwd))
+        })
+        .or_else(|| {
+            options
+                .workspace_trust_guard
+                .as_ref()
+                .and_then(|guard| guard.config_override().map(std::path::Path::to_path_buf))
+        });
     let project_settings_enabled = config_override.is_none()
         && options
             .workspace_trust_guard
             .as_ref()
             .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted);
     crate::package_manager::ResolveRoots {
-        global_settings_path: config_override
-            .unwrap_or_else(|| global_dir.join("settings.json")),
+        global_settings_path: config_override.unwrap_or_else(|| global_dir.join("settings.json")),
         project_settings_path: cwd.join(Config::project_dir()).join("settings.json"),
         global_base_dir: global_dir,
         project_base_dir: cwd.join(Config::project_dir()),
@@ -2854,7 +2855,13 @@ fn acp_explicit_skill_paths(options: &AcpOptions) -> Vec<String> {
             }
             options.settings_source.as_ref().map_or_else(
                 || raw.clone(),
-                |source| source.launch_cwd.join(candidate).to_string_lossy().into_owned(),
+                |source| {
+                    source
+                        .launch_cwd
+                        .join(candidate)
+                        .to_string_lossy()
+                        .into_owned()
+                },
             )
         })
         .collect()
@@ -2866,15 +2873,14 @@ fn install_acp_skills_prompt(
     resources: &crate::resources::ResourceLoader,
 ) -> Result<()> {
     let loaded = resources.format_skills_for_prompt();
-    let skills_prompt = if options.settings_source.is_some()
-        || options.workspace_trust_guard.is_some()
-    {
-        loaded
-    } else {
-        let mut supplied = options.skills_prompt.clone().unwrap_or_default();
-        supplied.push_str(&loaded);
-        supplied
-    };
+    let skills_prompt =
+        if options.settings_source.is_some() || options.workspace_trust_guard.is_some() {
+            loaded
+        } else {
+            let mut supplied = options.skills_prompt.clone().unwrap_or_default();
+            supplied.push_str(&loaded);
+            supplied
+        };
     let cli = options.launch.selection_cli()?;
     let enabled_tools = acp_enabled_tools(&cli, &options.config);
     let enabled_tools_refs: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
@@ -2890,7 +2896,10 @@ fn install_acp_skills_prompt(
         .agent_session
         .as_mut()
         .ok_or_else(|| Error::session("Cannot install skills while the session is busy"))?;
-    handle.session_mut().agent.set_system_prompt(Some(prompt.clone()));
+    handle
+        .session_mut()
+        .agent
+        .set_system_prompt(Some(prompt.clone()));
     if let Some(manager) = handle.extension_manager() {
         manager.set_system_prompt(Some(prompt));
     }
@@ -2913,10 +2922,10 @@ async fn boot_acp_extensions(state: &mut AcpSessionState, options: &AcpOptions) 
         .workspace_trust_guard
         .as_ref()
         .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted);
-    let launch_cwd = workspace_options.settings_source.as_ref().map_or_else(
-        || state.cwd.clone(),
-        |source| source.launch_cwd.clone(),
-    );
+    let launch_cwd = workspace_options
+        .settings_source
+        .as_ref()
+        .map_or_else(|| state.cwd.clone(), |source| source.launch_cwd.clone());
     let launch_manager = crate::package_manager::PackageManager::new(launch_cwd);
     let extension_paths = workspace_options
         .launch
@@ -4079,8 +4088,8 @@ mod tests {
             assert!(error.to_string().contains("PI_ACP_INPUT_LIMIT"));
             assert!(reader.get_ref().position() <= 40, "must not read the tail");
         }
-        let error = read_acp_input_frame(&mut io::Cursor::new(b"\xff\n"), 4)
-            .expect_err("invalid UTF-8");
+        let error =
+            read_acp_input_frame(&mut io::Cursor::new(b"\xff\n"), 4).expect_err("invalid UTF-8");
         assert!(error.to_string().contains("PI_ACP_INPUT_UTF8"));
     }
 
@@ -4123,8 +4132,7 @@ mod tests {
 
     #[test]
     fn acp_input_forwarder_preserves_failure_order_without_admitting_a_suffix() {
-        let (sender, mut receiver) =
-            asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+        let (sender, mut receiver) = asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
         let mut reader = io::Cursor::new(b"ok\n12345\n{\"method\":\"exit\"}\n");
         forward_acp_input(&mut reader, &sender, 4);
         assert_eq!(receiver.try_recv().unwrap().unwrap(), "ok");
@@ -4201,8 +4209,7 @@ mod tests {
         runtime.block_on(async {
             let root = tempfile::tempdir().unwrap();
             let options = acp_workspace_options(root.path(), handle);
-            let (sender, receiver) =
-                asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+            let (sender, receiver) = asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
             let bytes = b"{bad json}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}";
             forward_acp_input(&mut io::Cursor::new(bytes), &sender, 128);
             drop(sender);
@@ -4333,8 +4340,7 @@ mod tests {
             } else {
                 message.stop_reason = if matches!(
                     self.outcome,
-                    PromptTestOutcome::StreamAborted
-                        | PromptTestOutcome::StreamAbortedThenComplete
+                    PromptTestOutcome::StreamAborted | PromptTestOutcome::StreamAbortedThenComplete
                 ) {
                     StopReason::Aborted
                 } else {
@@ -4578,7 +4584,10 @@ mod tests {
             );
             let (_, signal) = AbortHandle::new();
             let (_, updates) = drive_test_command(state, "/late-command", signal).await;
-            assert_eq!(prompt_notice_text(&updates[0]), "/late-command → late result");
+            assert_eq!(
+                prompt_notice_text(&updates[0]),
+                "/late-command → late result"
+            );
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         });
     }
@@ -4735,7 +4744,8 @@ mod tests {
                 ),
             ] {
                 let root = tempfile::tempdir().unwrap();
-                let (state, provider, stored) = prompt_test_state(root.path(), outcome, false).await;
+                let (state, provider, stored) =
+                    prompt_test_state(root.path(), outcome, false).await;
                 enable_acp_command_fixture(&state, root.path()).await;
                 let (_, signal) = AbortHandle::new();
                 let (reason, updates) =
@@ -4751,7 +4761,10 @@ mod tests {
                     .map(prompt_notice_text)
                     .collect();
                 assert_eq!(
-                    texts.iter().filter(|text| **text == "Provider reply").count(),
+                    texts
+                        .iter()
+                        .filter(|text| **text == "Provider reply")
+                        .count(),
                     1,
                     "the native driver completed the second generated turn"
                 );
@@ -4793,10 +4806,13 @@ mod tests {
             let cancel = async {
                 loop {
                     let started = stored.try_lock().is_ok_and(|session| {
-                        session.to_messages_for_current_path().iter().any(|message| {
-                            matches!(message, crate::model::Message::Custom(message)
+                        session
+                            .to_messages_for_current_path()
+                            .iter()
+                            .any(|message| {
+                                matches!(message, crate::model::Message::Custom(message)
                                 if message.custom_type == "waiting")
-                        })
+                            })
                     });
                     if started {
                         abort.abort();
@@ -5964,7 +5980,9 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("skill parent")).unwrap();
         std::fs::write(
             path,
-            format!("---\nname: {name}\ndescription: ACP workspace skill fixture\n---\nInstructions\n"),
+            format!(
+                "---\nname: {name}\ndescription: ACP workspace skill fixture\n---\nInstructions\n"
+            ),
         )
         .unwrap();
     }
@@ -6033,10 +6051,7 @@ mod tests {
             &source.launch_cwd.join("explicit/SKILL.md"),
             "acp-explicit-launch",
         );
-        write_acp_skill(
-            &cwd.join("explicit/SKILL.md"),
-            "acp-explicit-target",
-        );
+        write_acp_skill(&cwd.join("explicit/SKILL.md"), "acp-explicit-target");
         disabled.launch.skills = vec!["explicit/SKILL.md".to_string()];
         let prompt = acp_skill_prompt(&boot(&disabled));
         assert!(prompt.contains("<name>acp-explicit-launch</name>"));
@@ -6065,8 +6080,7 @@ mod tests {
             let mut extension_options = options.clone();
             extension_options.launch.no_skills = true;
             extension_options.launch.extensions = vec![source_name.into()];
-            let (_, mut missing) =
-                handle_session_new(&params, &extension_options, None).unwrap();
+            let (_, mut missing) = handle_session_new(&params, &extension_options, None).unwrap();
             assert!(
                 runtime
                     .block_on(boot_acp_extensions(&mut missing, &extension_options))

@@ -3128,7 +3128,9 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
                 && value["params"]["update"]["availableCommands"]
                     .as_array()
                     .is_some_and(|commands| {
-                        commands.iter().any(|command| command["name"] == "acp-status")
+                        commands
+                            .iter()
+                            .any(|command| command["name"] == "acp-status")
                     })
         }),
         "an extension-only session advertises its actual commands"
@@ -3233,7 +3235,9 @@ fn acp_boots_workspace_extensions_honoring_trust_and_persists_across_restart() {
                     && value["params"]["update"]["availableCommands"]
                         .as_array()
                         .is_some_and(|commands| {
-                            commands.iter().any(|command| command["name"] == "acp-status")
+                            commands
+                                .iter()
+                                .any(|command| command["name"] == "acp-status")
                         })
             })
             .count(),
