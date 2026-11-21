@@ -3742,8 +3742,8 @@ fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_
             (actor.clone(), None, owner_a.as_str()),
             (actor.clone(), generation, "unknown-owner"),
         ] {
-            assert_eq!(
-                manager
+            assert!(
+                !manager
                     .replace_runtime_command_specs(
                         candidate_owner,
                         &candidate_actor,
@@ -3751,8 +3751,7 @@ fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_
                         &published_a,
                         std::slice::from_ref(&candidate),
                     )
-                    .expect("stale authority must return Ok(false)"),
-                false
+                    .expect("stale authority must return Ok(false)")
             );
             assert_eq!(command_names(&manager), ["peer-cmd", "runtime-cmd"]);
         }
@@ -3777,7 +3776,7 @@ fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .js_provider_catalog_ready = true;
-        assert_eq!(unready, false);
+        assert!(!unready);
         assert_eq!(command_names(&manager), ["peer-cmd", "runtime-cmd"]);
 
         // 3. Invalid empty name, duplicate in batch, and cross-extension callable collision fail closed.
@@ -3851,7 +3850,7 @@ fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_
             json!({ "name": "self-stub", "description": "real self command" }),
             json!({ "name": "peer-stub", "description": "real command ignoring peer stub" }),
         ];
-        assert_eq!(
+        assert!(
             manager
                 .replace_runtime_command_specs(
                     &owner_a,
@@ -3860,8 +3859,7 @@ fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_
                     &published_a,
                     &v2_specs,
                 )
-                .expect("v2 update + compat stub upgrade must succeed"),
-            true
+                .expect("v2 update + compat stub upgrade must succeed")
         );
         assert_eq!(
             command_names(&manager),
@@ -3897,11 +3895,10 @@ fn runtime_command_publication_fences_stale_actors_preserves_host_overrides_and_
         assert_eq!(runtime_cmd_desc.as_deref(), Some("host override"));
 
         // 6. Exact retirement removes only owner_a's published definitions, preserving host override and peer commands.
-        assert_eq!(
+        assert!(
             manager
                 .replace_runtime_command_specs(&owner_a, &actor, generation, &v2_specs, &[])
-                .expect("exact retirement must succeed"),
-            true
+                .expect("exact retirement must succeed")
         );
         assert_eq!(
             command_names(&manager),

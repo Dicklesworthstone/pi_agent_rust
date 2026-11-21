@@ -1,8 +1,8 @@
 {
   "schema": "pi.release_evidence.ledger.v1",
-  "generated_at": "2026-08-24T12:35:49.709446+00:00",
+  "generated_at": "2026-11-21T22:55:15.086606+00:00",
   "contract_path": "docs/contracts/release-evidence-ledger-contract.json",
-  "head_hash": "b54cb188d2f5a1e460dd559003ff079cd4a1d2fe53fd9626dd15313c0fc0ced3",
+  "head_hash": "ca0497df45c26dde2eb291bb9c125e70a683a134be80f71bc987b696cb873266",
   "entry_count": 59,
   "entries": [
     {
@@ -173,13 +173,13 @@
     {
       "index": 15,
       "path": "docs/evidence/ext-stress-reactor-queue-coverage.json",
-      "sha256": "e1cd016614b9b9ecedcf470722751b3df33dc87db580910882e04ef7613cd1b1",
-      "correlation_id": null,
-      "source_commit": null,
-      "owning_bead": "bd-2zcs5.24",
+      "sha256": "e58dff12763f64363046a08d8d5fb918d45618090e94417eb5c004571ab17626",
+      "correlation_id": "bd-bridge-9-reactor-proof-20261121",
+      "source_commit": "dc8a1975466079f26e48c9403afafc0cfb767573",
+      "owning_bead": "bd-reality-check-2026-11-19-bridge-yxf43.9",
       "schema": "pi.ext.reactor_queue_coverage_evidence.v1",
       "prev_hash": "571a36fdf82bda9a3a42a6feb2f7f3569fb6e58480859f5e15c815a881c1be6b",
-      "entry_hash": "94ab6dcd0542397d7c1bedb50ffef5a96e5580c1ce6659961996595eac1d1def"
+      "entry_hash": "ea2613f458ea90df72c0c0e1a79b3aed50c95055e4c1a1f79f7bd205d7e4d95a"
     },
     {
       "index": 16,
@@ -189,8 +189,8 @@
       "source_commit": null,
       "owning_bead": "bd-d7v9g.7",
       "schema": "pi.ext.compatibility_closeout_gate.v1",
-      "prev_hash": "94ab6dcd0542397d7c1bedb50ffef5a96e5580c1ce6659961996595eac1d1def",
-      "entry_hash": "a0668114c939ce8a8c1fff73db94e888d68e62c4f6de9355797b599d5249e8d4"
+      "prev_hash": "ea2613f458ea90df72c0c0e1a79b3aed50c95055e4c1a1f79f7bd205d7e4d95a",
+      "entry_hash": "12f8f7a5ddd8e2f4e6e7c885c979e562181573f0f74818361f5281fe1f3d41c8"
     },
     {
       "index": 17,
@@ -200,8 +200,8 @@
       "source_commit": null,
       "owning_bead": "bd-d7v9g.1",
       "schema": "pi.ext.event_subscription_failure_taxonomy.v1",
-      "prev_hash": "a0668114c939ce8a8c1fff73db94e888d68e62c4f6de9355797b599d5249e8d4",
-      "entry_hash": "f2be28188922e562bce91a5bc88a2acb1f598b732372cce0604d871d98079c7e"
+      "prev_hash": "12f8f7a5ddd8e2f4e6e7c885c979e562181573f0f74818361f5281fe1f3d41c8",
+      "entry_hash": "fd37e1c34364f13dc4b7aa08e8997048ca2fbdc3a24286ca9211122afba37600"
     },
     {
       "index": 18,
@@ -211,8 +211,8 @@
       "source_commit": null,
       "owning_bead": "bd-d7v9g.6",
       "schema": "pi.ext.health_delta_failure_disposition.v1",
-      "prev_hash": "f2be28188922e562bce91a5bc88a2acb1f598b732372cce0604d871d98079c7e",
-      "entry_hash": "13fea2e24cc1b595c86167feb4c57c9d5781b06696e0d3a99fc8956fe1705e16"
+      "prev_hash": "fd37e1c34364f13dc4b7aa08e8997048ca2fbdc3a24286ca9211122afba37600",
+      "entry_hash": "01ff3bc0ff67257481f6eda8242051373b22a7967b6a9a14fbea429b19cfea2c"
     },
     {
       "index": 19,
@@ -222,8 +222,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.fourth_wave_self_healing.closeout_gate.v1",
-      "prev_hash": "13fea2e24cc1b595c86167feb4c57c9d5781b06696e0d3a99fc8956fe1705e16",
-      "entry_hash": "4a41bfa3d5d91bb38aed1145105b012cab0e5f9cc5832326d42d6aa7a7097d26"
+      "prev_hash": "01ff3bc0ff67257481f6eda8242051373b22a7967b6a9a14fbea429b19cfea2c",
+      "entry_hash": "e4512cbbee69641cce6b923234fe708c8d3eb8c548faab49a72c1d2e47e28741"
     },
     {
       "index": 20,
@@ -233,8 +233,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.traceability.high_value_suite_artifact_inventory.v1",
-      "prev_hash": "4a41bfa3d5d91bb38aed1145105b012cab0e5f9cc5832326d42d6aa7a7097d26",
-      "entry_hash": "4629830a8112fab268216ebc614910bca0b7c45b2d98bf7b428f2d3a04f53f22"
+      "prev_hash": "e4512cbbee69641cce6b923234fe708c8d3eb8c548faab49a72c1d2e47e28741",
+      "entry_hash": "94e315f3d0dfd1bf502309395c81fe9c6fd43acda42beb5d4482425041baac24"
     },
     {
       "index": 21,
@@ -244,8 +244,8 @@
       "source_commit": null,
       "owning_bead": "bd-h66tp.5",
       "schema": "pi.large_session_tui_frame_budget.proof.v1",
-      "prev_hash": "4629830a8112fab268216ebc614910bca0b7c45b2d98bf7b428f2d3a04f53f22",
-      "entry_hash": "26e51cf62acd32e9b74da927277a4160afd048e0d311345d0d320c987fda2f68"
+      "prev_hash": "94e315f3d0dfd1bf502309395c81fe9c6fd43acda42beb5d4482425041baac24",
+      "entry_hash": "4a60a4b85f27b6c1541262bb48b11f65aff21b304acc55b2a0456c084d63aa10"
     },
     {
       "index": 22,
@@ -255,8 +255,8 @@
       "source_commit": "52e9fbfb24352045985b59df9d7ea63f1f8f2ef8",
       "owning_bead": "bd-sog97",
       "schema": "pi.operations.maintenance_dashboard.v1",
-      "prev_hash": "26e51cf62acd32e9b74da927277a4160afd048e0d311345d0d320c987fda2f68",
-      "entry_hash": "19f3c1e7261dc1464bb4de71c85ad3e73fe57d80c8b2704c474eed277bc5e298"
+      "prev_hash": "4a60a4b85f27b6c1541262bb48b11f65aff21b304acc55b2a0456c084d63aa10",
+      "entry_hash": "970f6b9ca48d6f717b0db4573a28e7071695c93d7a53eb81b8d3871b3b29bdaf"
     },
     {
       "index": 23,
@@ -266,8 +266,8 @@
       "source_commit": null,
       "owning_bead": "bd-oq2q5.3",
       "schema": "pi.missing_runtime_api.remediation_inventory.v1",
-      "prev_hash": "19f3c1e7261dc1464bb4de71c85ad3e73fe57d80c8b2704c474eed277bc5e298",
-      "entry_hash": "44cdae3c3729e523c11dadc8444e3f077f2e49f21b2a59f2fdd0e14b5b4eefca"
+      "prev_hash": "970f6b9ca48d6f717b0db4573a28e7071695c93d7a53eb81b8d3871b3b29bdaf",
+      "entry_hash": "47e8b974f643d2606db8bd054f4450fa651e44189d738f3743e25a9513fecd9c"
     },
     {
       "index": 24,
@@ -277,8 +277,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.incident_replay_proof_memory.closeout_gate.v1",
-      "prev_hash": "44cdae3c3729e523c11dadc8444e3f077f2e49f21b2a59f2fdd0e14b5b4eefca",
-      "entry_hash": "e84eef68edbc18da02746e2681a0781a770efe3c36fa34b5c94dd3b70bbef2b8"
+      "prev_hash": "47e8b974f643d2606db8bd054f4450fa651e44189d738f3743e25a9513fecd9c",
+      "entry_hash": "97a61b8dc2e5bafbe701f63995a1d46bba6c3cf53190dbde68ff07ecb0e2fe6a"
     },
     {
       "index": 25,
@@ -288,8 +288,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.nrun.budget_evaluation.v1",
-      "prev_hash": "e84eef68edbc18da02746e2681a0781a770efe3c36fa34b5c94dd3b70bbef2b8",
-      "entry_hash": "7e466279efb8883361f0a503c35d6c2d7a9ed35b12294008f1f0922299cc4e77"
+      "prev_hash": "97a61b8dc2e5bafbe701f63995a1d46bba6c3cf53190dbde68ff07ecb0e2fe6a",
+      "entry_hash": "df522e0dab8cd38027c7dd637cbae47399dfe9f07421ac42593aac85cf517210"
     },
     {
       "index": 26,
@@ -299,8 +299,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.nrun.measurement_series.v1",
-      "prev_hash": "7e466279efb8883361f0a503c35d6c2d7a9ed35b12294008f1f0922299cc4e77",
-      "entry_hash": "50582cf91c6a33894daf8db159b8ecf78213db5cebf5526742336e1579ea030a"
+      "prev_hash": "df522e0dab8cd38027c7dd637cbae47399dfe9f07421ac42593aac85cf517210",
+      "entry_hash": "ad701caec214721c012bb3802095a5a96bd698574364fe54476e3d2dae382fbd"
     },
     {
       "index": 27,
@@ -310,8 +310,8 @@
       "source_commit": null,
       "owning_bead": "bd-2zcs5.9",
       "schema": "pi.resource_governor.numa_lane_placement_evaluation.v1",
-      "prev_hash": "50582cf91c6a33894daf8db159b8ecf78213db5cebf5526742336e1579ea030a",
-      "entry_hash": "bd0f8d232d76b68d24ee2d2d4300201189678a0efd2d9d8d019d0b63f59b2b2e"
+      "prev_hash": "ad701caec214721c012bb3802095a5a96bd698574364fe54476e3d2dae382fbd",
+      "entry_hash": "ae3f5a83a0bd6196409d730467e798262cc4c6c3985e70ef0cb1d8139fb985a1"
     },
     {
       "index": 28,
@@ -321,8 +321,8 @@
       "source_commit": null,
       "owning_bead": "bd-63x3v.11.5",
       "schema": "pi.operator.perceived_latency_trace.v1",
-      "prev_hash": "bd0f8d232d76b68d24ee2d2d4300201189678a0efd2d9d8d019d0b63f59b2b2e",
-      "entry_hash": "4ab90c1e8598cfd2d7ef3f01259bb968a7d606488d3ec8bd1ac12e4ec9cc966a"
+      "prev_hash": "ae3f5a83a0bd6196409d730467e798262cc4c6c3985e70ef0cb1d8139fb985a1",
+      "entry_hash": "b4b5d93adbf3892ff3bbe83942a9cbbc44b62e328a717570bf6ecf6f3c1ab521"
     },
     {
       "index": 29,
@@ -332,8 +332,8 @@
       "source_commit": null,
       "owning_bead": "bd-9yq7i.5",
       "schema": "pi.operator.smoothness_slo.v1",
-      "prev_hash": "4ab90c1e8598cfd2d7ef3f01259bb968a7d606488d3ec8bd1ac12e4ec9cc966a",
-      "entry_hash": "a523fcead42400596d9c41c87d8e938d539710180190b4b12472bcc1daf3c240"
+      "prev_hash": "b4b5d93adbf3892ff3bbe83942a9cbbc44b62e328a717570bf6ecf6f3c1ab521",
+      "entry_hash": "e1b45cac75d18d1cb5c533ec744e24158e98d0bef689ada710eaa4bc9a42dae7"
     },
     {
       "index": 30,
@@ -343,8 +343,8 @@
       "source_commit": null,
       "owning_bead": "bd-9yq7i.4",
       "schema": "pi.swarm.operator_work_recommendation.v1",
-      "prev_hash": "a523fcead42400596d9c41c87d8e938d539710180190b4b12472bcc1daf3c240",
-      "entry_hash": "36c2595f0fcfe4590cc07ae32ba41affc94e5c47ab8aa0efa0de51bcb10c7936"
+      "prev_hash": "e1b45cac75d18d1cb5c533ec744e24158e98d0bef689ada710eaa4bc9a42dae7",
+      "entry_hash": "f43556cd36433f3a9b43bbc5e630fd53e180e28e57c7f6eb8609ae4cb1da6fad"
     },
     {
       "index": 31,
@@ -354,8 +354,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.perf.drift_watch.v1",
-      "prev_hash": "36c2595f0fcfe4590cc07ae32ba41affc94e5c47ab8aa0efa0de51bcb10c7936",
-      "entry_hash": "e01859e457910623745d684d007b4b4b6a5c5cb1cf2d5f95d8917e9ea03dd282"
+      "prev_hash": "f43556cd36433f3a9b43bbc5e630fd53e180e28e57c7f6eb8609ae4cb1da6fad",
+      "entry_hash": "3dcf0c4f841a965e383741b924c76ac30645d8d9ffd1704d3761d81b0ea0fb0d"
     },
     {
       "index": 32,
@@ -365,8 +365,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.predictive_operations.closeout_gate.v1",
-      "prev_hash": "e01859e457910623745d684d007b4b4b6a5c5cb1cf2d5f95d8917e9ea03dd282",
-      "entry_hash": "fd2cadcd938f31c414075d78c63234ab7063fa24c42297848412926a2c950cd4"
+      "prev_hash": "3dcf0c4f841a965e383741b924c76ac30645d8d9ffd1704d3761d81b0ea0fb0d",
+      "entry_hash": "e2ab7aa0450faef34ddab9ce744d02a76e6fcc083145ab41a475ffddf6cc7dea"
     },
     {
       "index": 33,
@@ -376,8 +376,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.predictive_telemetry_ledger.v1",
-      "prev_hash": "fd2cadcd938f31c414075d78c63234ab7063fa24c42297848412926a2c950cd4",
-      "entry_hash": "20b70e06784cd6aaa335e4f1c549f646936b56f0fb8065efb873a36234eb90bd"
+      "prev_hash": "e2ab7aa0450faef34ddab9ce744d02a76e6fcc083145ab41a475ffddf6cc7dea",
+      "entry_hash": "28860483f3caf0f9b5627134dd1d9c1f5064df31044c08caa2ba89cbcd7234e9"
     },
     {
       "index": 34,
@@ -387,8 +387,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.proof_carrying_test_fabric.closeout_gate.v1",
-      "prev_hash": "20b70e06784cd6aaa335e4f1c549f646936b56f0fb8065efb873a36234eb90bd",
-      "entry_hash": "505a537a90410c6b51b5175927f45eb03d60d9f9cde3f47fd4223e0c6f7a819a"
+      "prev_hash": "28860483f3caf0f9b5627134dd1d9c1f5064df31044c08caa2ba89cbcd7234e9",
+      "entry_hash": "1a975821c6da6c2f50995e935dbaceacfde0d99599ee6ca10af0a12384a78ebf"
     },
     {
       "index": 35,
@@ -398,8 +398,8 @@
       "source_commit": null,
       "owning_bead": "bd-cv653.7.3",
       "schema": "unknown",
-      "prev_hash": "505a537a90410c6b51b5175927f45eb03d60d9f9cde3f47fd4223e0c6f7a819a",
-      "entry_hash": "53cc936907d31757e3edd569b5400c4beaf245a61bee3b15d1de83b0a5f06537"
+      "prev_hash": "1a975821c6da6c2f50995e935dbaceacfde0d99599ee6ca10af0a12384a78ebf",
+      "entry_hash": "e5b4bbb33375df6a99f442dd2fc0e058e0260fd21800a8207d0ed3aa7fa8e5dc"
     },
     {
       "index": 36,
@@ -409,8 +409,8 @@
       "source_commit": null,
       "owning_bead": "bd-63x3v.10.5",
       "schema": "pi.swarm.provider_rpc_tui_backpressure_budget_contract.v1",
-      "prev_hash": "53cc936907d31757e3edd569b5400c4beaf245a61bee3b15d1de83b0a5f06537",
-      "entry_hash": "9651bc5257fb2e94922f02d027aca815fa2dcfb58d6b0576bd724c1ac5701c5b"
+      "prev_hash": "e5b4bbb33375df6a99f442dd2fc0e058e0260fd21800a8207d0ed3aa7fa8e5dc",
+      "entry_hash": "84a8bcb974082cf28c81ce1f1dd81565043ba64f213523fc5929bb194a7738e9"
     },
     {
       "index": 37,
@@ -420,8 +420,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.readme.claim_bindings.v1",
-      "prev_hash": "9651bc5257fb2e94922f02d027aca815fa2dcfb58d6b0576bd724c1ac5701c5b",
-      "entry_hash": "59a168ac384e9b7e90f377ce0d5669f619c34a6a8bfac90575c97711b1722386"
+      "prev_hash": "84a8bcb974082cf28c81ce1f1dd81565043ba64f213523fc5929bb194a7738e9",
+      "entry_hash": "d011d2d239d04e7a9f8eb7bbf058cf098d4d756b1debdfae3011a2af27f7232e"
     },
     {
       "index": 38,
@@ -431,8 +431,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.runtime_intelligence.closeout_gate.v1",
-      "prev_hash": "59a168ac384e9b7e90f377ce0d5669f619c34a6a8bfac90575c97711b1722386",
-      "entry_hash": "7fbd318608801ccdf1f53a6f1dacf34fb147755ddd36b7292cf148783cbf1cb9"
+      "prev_hash": "d011d2d239d04e7a9f8eb7bbf058cf098d4d756b1debdfae3011a2af27f7232e",
+      "entry_hash": "0c1a75dfe9ba168f607c9d2d4470825486ca5ee0b0c757db839f8c86a52d983b"
     },
     {
       "index": 39,
@@ -442,8 +442,8 @@
       "source_commit": null,
       "owning_bead": "bd-63x3v.11.3",
       "schema": "pi.session.semantic_compaction_quality.v1",
-      "prev_hash": "7fbd318608801ccdf1f53a6f1dacf34fb147755ddd36b7292cf148783cbf1cb9",
-      "entry_hash": "2c9dc9edd92184a49c59f230cfb54d2213ee86be89496a44303821d1bef1e846"
+      "prev_hash": "0c1a75dfe9ba168f607c9d2d4470825486ca5ee0b0c757db839f8c86a52d983b",
+      "entry_hash": "ad3b7aa5a327526d86ed288f95fc282d9f67657626369093a489ed631a8870ff"
     },
     {
       "index": 40,
@@ -453,8 +453,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.validation.semantic_route_plan.closeout_gate.v1",
-      "prev_hash": "2c9dc9edd92184a49c59f230cfb54d2213ee86be89496a44303821d1bef1e846",
-      "entry_hash": "b45dacb42f2e3a40100e0f97f900cb3cc3b903fe7438ba646ae36fd71ad71383"
+      "prev_hash": "ad3b7aa5a327526d86ed288f95fc282d9f67657626369093a489ed631a8870ff",
+      "entry_hash": "d422c43de9e30dfc4f2aeb99cd5093b6ac1cc92161e430b3f14432ec46c367c4"
     },
     {
       "index": 41,
@@ -464,8 +464,8 @@
       "source_commit": null,
       "owning_bead": "bd-4w2mw.1",
       "schema": "pi.validation.semantic_route_inventory.v1",
-      "prev_hash": "b45dacb42f2e3a40100e0f97f900cb3cc3b903fe7438ba646ae36fd71ad71383",
-      "entry_hash": "0eb0f15c74117ea24f7dad63f8fb0c482cbab23218a008a9b830fc556a303003"
+      "prev_hash": "d422c43de9e30dfc4f2aeb99cd5093b6ac1cc92161e430b3f14432ec46c367c4",
+      "entry_hash": "be4f7757872a651663cbf5f13235cc66f84a965c132c057a9e6a4628d39c6d67"
     },
     {
       "index": 42,
@@ -475,8 +475,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.sequential_gate.evaluation.v1",
-      "prev_hash": "0eb0f15c74117ea24f7dad63f8fb0c482cbab23218a008a9b830fc556a303003",
-      "entry_hash": "df9a6677fe96b549fa0a697992385be66835c9bb084325faee8c340f547303e7"
+      "prev_hash": "be4f7757872a651663cbf5f13235cc66f84a965c132c057a9e6a4628d39c6d67",
+      "entry_hash": "a8f6d6697f7f2e431ef288a67f20052493f26212d8fad3c048638765a65ea56e"
     },
     {
       "index": 43,
@@ -486,8 +486,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.runtime_autonomy.closeout_gate.v1",
-      "prev_hash": "df9a6677fe96b549fa0a697992385be66835c9bb084325faee8c340f547303e7",
-      "entry_hash": "410ea3d1c25d7a875f9d84bf4ff76f0d5cb593bfac963f852eb2dcdec945f357"
+      "prev_hash": "a8f6d6697f7f2e431ef288a67f20052493f26212d8fad3c048638765a65ea56e",
+      "entry_hash": "a4e6f43cd1ea5b6adbf21c1ec937e3852268dd2d0050c68ff88a80171f71592f"
     },
     {
       "index": 44,
@@ -497,8 +497,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.validation_hardening.closeout_gate.v1",
-      "prev_hash": "410ea3d1c25d7a875f9d84bf4ff76f0d5cb593bfac963f852eb2dcdec945f357",
-      "entry_hash": "a895f13f39a02531773e7f22b0cb57c660f1750d2e573dd5ef662edff111543f"
+      "prev_hash": "a4e6f43cd1ea5b6adbf21c1ec937e3852268dd2d0050c68ff88a80171f71592f",
+      "entry_hash": "9259d2e2be9aaf29e2a771ad2dbde71cf1e33d7241c5fb914b82293f17a4168a"
     },
     {
       "index": 45,
@@ -508,8 +508,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.perf.startup_benchmark.v1",
-      "prev_hash": "a895f13f39a02531773e7f22b0cb57c660f1750d2e573dd5ef662edff111543f",
-      "entry_hash": "387ce38cdfaf018cb5c01ab62c7622ce80037c1a07f72ce47c9953df92b92da5"
+      "prev_hash": "9259d2e2be9aaf29e2a771ad2dbde71cf1e33d7241c5fb914b82293f17a4168a",
+      "entry_hash": "b6a5713762b7c04c26e7b9f6e1340713462cdf79204f6af8a12f9a65d31ebf04"
     },
     {
       "index": 46,
@@ -519,8 +519,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.autopilot_decision_gate.v1",
-      "prev_hash": "387ce38cdfaf018cb5c01ab62c7622ce80037c1a07f72ce47c9953df92b92da5",
-      "entry_hash": "47a26be84830dcc4016cadcb9d5983c9ea06f835aeb0ec25ff0fe511d7aee918"
+      "prev_hash": "b6a5713762b7c04c26e7b9f6e1340713462cdf79204f6af8a12f9a65d31ebf04",
+      "entry_hash": "bd06335d4cce5a1015d04506670e5b2a21b087ae652379c0589b565bf7879fbc"
     },
     {
       "index": 47,
@@ -530,8 +530,8 @@
       "source_commit": null,
       "owning_bead": "bd-9yq7i.1",
       "schema": "pi.swarm.incident_corpus.v1",
-      "prev_hash": "47a26be84830dcc4016cadcb9d5983c9ea06f835aeb0ec25ff0fe511d7aee918",
-      "entry_hash": "77c75591561106dc6075fbcc34fc5f02b10bf17144fa595a20a943af2bc2e1be"
+      "prev_hash": "bd06335d4cce5a1015d04506670e5b2a21b087ae652379c0589b565bf7879fbc",
+      "entry_hash": "c530645a09ca6d01d26f254c27ba1cf73121a343d3c5d7db2e997fb25b5834dd"
     },
     {
       "index": 48,
@@ -541,8 +541,8 @@
       "source_commit": null,
       "owning_bead": "bd-9yq7i.7",
       "schema": "pi.swarm.incident_replay_e2e.v1",
-      "prev_hash": "77c75591561106dc6075fbcc34fc5f02b10bf17144fa595a20a943af2bc2e1be",
-      "entry_hash": "e6ec33a50cddaea683aa6dcd66e494ec939d17bb96d31af0d653370f8b3dc529"
+      "prev_hash": "c530645a09ca6d01d26f254c27ba1cf73121a343d3c5d7db2e997fb25b5834dd",
+      "entry_hash": "c2d412d110b1a5a2f1f3d3f378fa56445416da6703dbfbb421b75607cdf0338b"
     },
     {
       "index": 49,
@@ -552,8 +552,8 @@
       "source_commit": null,
       "owning_bead": "bd-9yq7i.2",
       "schema": "pi.swarm.incident_replay.v1",
-      "prev_hash": "e6ec33a50cddaea683aa6dcd66e494ec939d17bb96d31af0d653370f8b3dc529",
-      "entry_hash": "210874d689876994d6ee586cb8335b7743d0f1e6956ef31822c63b5865810736"
+      "prev_hash": "c2d412d110b1a5a2f1f3d3f378fa56445416da6703dbfbb421b75607cdf0338b",
+      "entry_hash": "e80c89b79eaae4baaeaf4e7b63248fb22bc561d50eee3d5b27da31bba88d13b9"
     },
     {
       "index": 50,
@@ -563,8 +563,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.progress_slo.closeout_gate.v1",
-      "prev_hash": "210874d689876994d6ee586cb8335b7743d0f1e6956ef31822c63b5865810736",
-      "entry_hash": "9b23f33d66532c3153eca1a852e70fbec77bebc660d200ab47f5ab1c59c8fabe"
+      "prev_hash": "e80c89b79eaae4baaeaf4e7b63248fb22bc561d50eee3d5b27da31bba88d13b9",
+      "entry_hash": "459366fe957278efd514c0b0d9a77d1f06b1dd2a28e9b95892c5fc31f9d63273"
     },
     {
       "index": 51,
@@ -574,8 +574,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.replay_closeout_gate.v1",
-      "prev_hash": "9b23f33d66532c3153eca1a852e70fbec77bebc660d200ab47f5ab1c59c8fabe",
-      "entry_hash": "0a500e174f1eb583f714cfc43f869e5951fbdd165929074c73c52843c8c640fc"
+      "prev_hash": "459366fe957278efd514c0b0d9a77d1f06b1dd2a28e9b95892c5fc31f9d63273",
+      "entry_hash": "7e946b06492853ef0d128dd943892ecdb9e29848f59dc3accdaa418f6ab9db1e"
     },
     {
       "index": 52,
@@ -585,8 +585,8 @@
       "source_commit": null,
       "owning_bead": "bd-wv10l",
       "schema": "pi.ubs.extension_runtime_noise_baseline.v1",
-      "prev_hash": "0a500e174f1eb583f714cfc43f869e5951fbdd165929074c73c52843c8c640fc",
-      "entry_hash": "01b0f6b1c1cbc334c999fbf794436832c882875cdc692a9736adf5d1bd043e95"
+      "prev_hash": "7e946b06492853ef0d128dd943892ecdb9e29848f59dc3accdaa418f6ab9db1e",
+      "entry_hash": "175c70c349ce4d91b94326687e72415a19134141071d2fa4aea9dae025c2f901"
     },
     {
       "index": 53,
@@ -596,8 +596,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.validation_broker.closeout_gate.v1",
-      "prev_hash": "01b0f6b1c1cbc334c999fbf794436832c882875cdc692a9736adf5d1bd043e95",
-      "entry_hash": "58a6345ffc030df12a7d4fbdf0a4a4b2672410775b3599079ba1dafdae24eb10"
+      "prev_hash": "175c70c349ce4d91b94326687e72415a19134141071d2fa4aea9dae025c2f901",
+      "entry_hash": "dba07cff67c793b9aa7cee6beaaccc01b01c71656ca9bed4e411598340b87ef9"
     },
     {
       "index": 54,
@@ -607,8 +607,8 @@
       "source_commit": null,
       "owning_bead": "bd-gusp4.9",
       "schema": "pi.validation_broker.stress_budget_report.v1",
-      "prev_hash": "58a6345ffc030df12a7d4fbdf0a4a4b2672410775b3599079ba1dafdae24eb10",
-      "entry_hash": "196b14af814ae5a5f66af4a59656c994d911f6e148c97009c80b533cc574c172"
+      "prev_hash": "dba07cff67c793b9aa7cee6beaaccc01b01c71656ca9bed4e411598340b87ef9",
+      "entry_hash": "d9e834a765ebaea8a23f4da11da1f838a11ba3e26597d2c2c8d5ff83f896de02"
     },
     {
       "index": 55,
@@ -618,8 +618,8 @@
       "source_commit": null,
       "owning_bead": "bd-9yq7i.3",
       "schema": "pi.validation.proof_memory_index.v1",
-      "prev_hash": "196b14af814ae5a5f66af4a59656c994d911f6e148c97009c80b533cc574c172",
-      "entry_hash": "d966356f7f1ff3b70a491ba24478cc6be7f33abbb59003919096fc59f87863b3"
+      "prev_hash": "d9e834a765ebaea8a23f4da11da1f838a11ba3e26597d2c2c8d5ff83f896de02",
+      "entry_hash": "29559912333ee6db7fbb6648e02dee81699b3aba3a55862799aeffa174df6209"
     },
     {
       "index": 56,
@@ -629,8 +629,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.validation_scheduler_plan.v1",
-      "prev_hash": "d966356f7f1ff3b70a491ba24478cc6be7f33abbb59003919096fc59f87863b3",
-      "entry_hash": "f6d7d7496511864060ec3ec968e349ab3f0a215125ad2caf46071a723fbeeb97"
+      "prev_hash": "29559912333ee6db7fbb6648e02dee81699b3aba3a55862799aeffa174df6209",
+      "entry_hash": "406baf873d206dfd73e1b1210b81796a5f0ac703fc116e22fd0b71368e2c2bc0"
     },
     {
       "index": 57,
@@ -640,8 +640,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.perf.variance_gate_report.v1",
-      "prev_hash": "f6d7d7496511864060ec3ec968e349ab3f0a215125ad2caf46071a723fbeeb97",
-      "entry_hash": "79378410361a048986a5ef00eee3d3f2edaa942eca75622199c92e1289f115d3"
+      "prev_hash": "406baf873d206dfd73e1b1210b81796a5f0ac703fc116e22fd0b71368e2c2bc0",
+      "entry_hash": "100b075d637e591909ad9d4aeadd3c09118fba4a98b90da984f2884115ae2e49"
     },
     {
       "index": 58,
@@ -651,8 +651,8 @@
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.waiver.ledger.v1",
-      "prev_hash": "79378410361a048986a5ef00eee3d3f2edaa942eca75622199c92e1289f115d3",
-      "entry_hash": "b54cb188d2f5a1e460dd559003ff079cd4a1d2fe53fd9626dd15313c0fc0ced3"
+      "prev_hash": "100b075d637e591909ad9d4aeadd3c09118fba4a98b90da984f2884115ae2e49",
+      "entry_hash": "ca0497df45c26dde2eb291bb9c125e70a683a134be80f71bc987b696cb873266"
     }
   ],
   "summary": {
