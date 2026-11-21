@@ -243,6 +243,7 @@ impl EvalTool {
             .map_err(before_execution_stop)??;
         let activation = self.activate_eval_session(&requested_session, &execution, &owner);
         let session_guard = CellSession::new(self.session_scope.clone(), requested_session);
+        judgments.bind_cell_session(session_guard.clone());
         if cell.reset {
             // Drop outside the short slot lock, before starting the next cell.
             // This uses the same process-tree/worker cleanup as session end.

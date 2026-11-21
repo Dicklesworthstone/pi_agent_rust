@@ -406,6 +406,7 @@ impl EvalTool {
     }
 
     /// Bridge dispatch shared by both kernels.
+    #[cfg(test)]
     async fn run_bridge_call_parts(
         &self,
         tool_name: &str,
@@ -414,7 +415,16 @@ impl EvalTool {
         // Result projection is an operation on the existing bridge, not a
         // second dispatch path or authority to call additional tools.
         let request = bridge_result::Request::parse(tool_name, input)?;
-        let tool: Box<dyn Tool> = match request.name.as_str() {
+        let tool = self.standalone_bridge_tool(&request.name)?;
+        match tool.execute("eval-bridge", request.args, None).await {
+            Ok(output) if request.structured => bridge_result::structured(&output),
+            Ok(output) => bridge_result::text(&output),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn standalone_bridge_tool(&self, name: &str) -> std::result::Result<Box<dyn Tool>, String> {
+        Ok(match name {
             "read" => Box::new(crate::tools::ReadTool::new(&self.cwd)),
             "grep" => Box::new(crate::tools::GrepTool::new(&self.cwd)),
             "find" => Box::new(crate::tools::FindTool::new(&self.cwd)),
@@ -424,12 +434,7 @@ impl EvalTool {
                     "EVAL_BRIDGE_DENIED: tool `{other}` is not on the bridge whitelist (read|grep|find|ls)"
                 ));
             }
-        };
-        match tool.execute("eval-bridge", request.args, None).await {
-            Ok(output) if request.structured => bridge_result::structured(&output),
-            Ok(output) => bridge_result::text(&output),
-            Err(err) => Err(err.to_string()),
-        }
+        })
     }
 
     /// Run one cell: writes the request line, then reads the response on a

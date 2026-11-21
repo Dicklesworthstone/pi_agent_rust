@@ -462,9 +462,9 @@ fn record_extension_hostcall_latency(latency: &SharedTurnLatencyAccumulator, dur
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ToolEffectBatch {
-    start: usize,
-    end: usize,
+pub(crate) struct ToolEffectBatch {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// Serializable evidence for one planned tool-effect batch.
@@ -500,7 +500,7 @@ pub struct ToolEffectBatchPlanEvidence {
     pub batches: Vec<ToolEffectBatchEvidence>,
 }
 
-fn plan_tool_effect_batches(effects: &[ToolEffects]) -> Vec<ToolEffectBatch> {
+pub(crate) fn plan_tool_effect_batches(effects: &[ToolEffects]) -> Vec<ToolEffectBatch> {
     let Some((&first_effects, remaining_effects)) = effects.split_first() else {
         return Vec::new();
     };
@@ -6675,7 +6675,7 @@ impl Agent {
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
     ) -> (ToolOutput, bool) {
-        self.execute_tool_in_session(tool_call, on_event, latency, None)
+        self.execute_tool_in_session(tool_call, on_event, latency, None, false)
             .await
     }
 
@@ -6710,6 +6710,7 @@ impl Agent {
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
         expected_session: Option<&str>,
+        parallel_only: bool,
     ) -> (ToolOutput, bool) {
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
@@ -6726,6 +6727,12 @@ impl Agent {
                 return (Self::xdev_text_output(&error.to_string(), true), true);
             }
         };
+
+        // A batch plan was made before secret restoration and policy awaits.
+        // Never run a reclassified mutation or ordered call beside its peers.
+        if parallel_only && !self.effects_for_call(&tool_call).parallel_safe() {
+            return (Self::parallel_tool_admission_changed(), true);
+        }
 
         // Resolve before any policy await: an invalid route must not acquire
         // an unapproved target through a callback that changes the registry.
@@ -6799,9 +6806,22 @@ impl Agent {
             (output, true)
         } else {
             let tool_started_at = Instant::now();
-            let outcome = self
-                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
-                .await;
+            let outcome = if parallel_only {
+                self.execute_tool_without_hooks_with_admission(
+                    &tool_call,
+                    Arc::clone(&on_event),
+                    expected_session,
+                    true,
+                )
+                .await
+            } else {
+                self.execute_tool_without_hooks(
+                    &tool_call,
+                    Arc::clone(&on_event),
+                    expected_session,
+                )
+                .await
+            };
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
         };
@@ -7329,6 +7349,22 @@ impl Agent {
         on_event: AgentEventHandler,
         expected_session: Option<&str>,
     ) -> (ToolOutput, bool) {
+        self.execute_tool_without_hooks_with_admission(
+            tool_call,
+            on_event,
+            expected_session,
+            false,
+        )
+        .await
+    }
+
+    async fn execute_tool_without_hooks_with_admission(
+        &self,
+        tool_call: &ToolCall,
+        on_event: AgentEventHandler,
+        expected_session: Option<&str>,
+        parallel_only: bool,
+    ) -> (ToolOutput, bool) {
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
         }
@@ -7421,6 +7457,13 @@ impl Agent {
             },
             snapshot_privacy: &snapshot_privacy,
         };
+        // Check the exact handle retained by this registry snapshot, using
+        // restored arguments, after every approval/hook/session await. There
+        // is no await between this check and execution; replacing the registry
+        // cannot swap in a writer after the check.
+        if parallel_only && !tool.effects_for_input(&tool_call.arguments).parallel_safe() {
+            return (Self::parallel_tool_admission_changed(), true);
+        }
         let outcome = tool
             .execute_with_invocation(
                 &tool_call.id,
@@ -7460,6 +7503,13 @@ impl Agent {
             details: None,
             is_error: true,
         }
+    }
+
+    fn parallel_tool_admission_changed() -> ToolOutput {
+        Self::xdev_text_output(
+            "EVAL_BRIDGE_EFFECTS_CHANGED: tool is no longer safe for parallel execution; submit it in a new batch or call it individually",
+            true,
+        )
     }
 
     fn tool_cancellation_details(tool_name: &str, reason: &str) -> Value {
@@ -7710,6 +7760,39 @@ impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
     }
 
     async fn call_tool(&self, call: ToolCall, expected_session: &str) -> Result<ToolOutput> {
+        self.execute_call(call, expected_session, false).await
+    }
+
+    fn tool_effects(&self, call: &ToolCall) -> ToolEffects {
+        if matches!(call.name.as_str(), "eval" | "xdev")
+            || call.name.starts_with("__pi_")
+            || self.agent.tools.snapshot().get(&call.name).is_none()
+        {
+            return ToolEffects::write();
+        }
+        self.agent.effects_for_call(call)
+    }
+
+    fn tool_parallelism(&self) -> usize {
+        compatible_tool_parallelism_limit()
+    }
+
+    async fn call_tool_parallel(
+        &self,
+        call: ToolCall,
+        expected_session: &str,
+    ) -> Result<ToolOutput> {
+        self.execute_call(call, expected_session, true).await
+    }
+}
+
+impl AgentToolInvocationHost<'_> {
+    async fn execute_call(
+        &self,
+        call: ToolCall,
+        expected_session: &str,
+        parallel_only: bool,
+    ) -> Result<ToolOutput> {
         // Eval owns an exclusive kernel lease. The dispatcher is unnecessary:
         // registered discoverable tools can be called by their actual names.
         // Rejecting all wrappers here also prevents xdev -> xdev -> eval.
@@ -7754,6 +7837,7 @@ impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
                 Arc::clone(&self.on_event),
                 latency,
                 Some(expected_session),
+                parallel_only,
             )
             .await;
         owner
@@ -11009,6 +11093,314 @@ mod extensions_integration_tests {
                 }),
             ])))
         }
+    }
+
+    /// Exercise registry reclassification with real native file operations.
+    /// The same published name changes from a reader to a writer at a policy
+    /// boundary; the counter proves whether the retained handle was entered.
+    struct ReclassifiedNativeTool {
+        cwd: PathBuf,
+        writes: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for ReclassifiedNativeTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+
+        fn label(&self) -> &str {
+            "read"
+        }
+
+        fn description(&self) -> &str {
+            "Native file operation replaced during admission"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        fn effects(&self) -> ToolEffects {
+            if self.writes {
+                ToolEffects::write()
+            } else {
+                ToolEffects::read()
+            }
+        }
+
+        async fn execute(
+            &self,
+            tool_call_id: &str,
+            input: Value,
+            on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.writes {
+                crate::tools::WriteTool::new(&self.cwd)
+                    .execute(tool_call_id, input, on_update)
+                    .await
+            } else {
+                crate::tools::ReadTool::new(&self.cwd)
+                    .execute(tool_call_id, input, on_update)
+                    .await
+            }
+        }
+    }
+
+    fn nested_parallel_read_call(arguments: Value) -> ToolCall {
+        ToolCall {
+            id: "parallel-native-read".into(),
+            name: "read".into(),
+            arguments,
+            thought_signature: None,
+        }
+    }
+
+    fn nested_parallel_output_text(output: &ToolOutput) -> String {
+        output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nested_parallel_calls_recheck_replacement_after_approval() {
+        use crate::tools::ToolInvocationHost;
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for parallel in [true, false] {
+                let root = tempfile::tempdir().expect("workspace");
+                let calls = Arc::new(AtomicUsize::new(0));
+                let approvals = Arc::new(AtomicUsize::new(0));
+                let mut agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    ToolRegistry::new(&["read"], root.path(), None),
+                    AgentConfig::default(),
+                );
+                let registry = agent.tools.clone();
+                let cwd = root.path().to_path_buf();
+                let entered = Arc::clone(&calls);
+                let approved = Arc::clone(&approvals);
+                agent.config.tool_approval = Some(Arc::new(move |_| {
+                    approved.fetch_add(1, Ordering::SeqCst);
+                    registry.update(|tools| {
+                        tools.push(Box::new(ReclassifiedNativeTool {
+                            cwd: cwd.clone(),
+                            writes: true,
+                            calls: Arc::clone(&entered),
+                        }));
+                    });
+                    Box::pin(async { ToolApprovalDecision::Allow })
+                }));
+                let owner = agent.job_session_scope.session_id().await.expect("owner");
+                let events = Arc::new(StdMutex::new(Vec::new()));
+                let recorded = Arc::clone(&events);
+                let host = AgentToolInvocationHost::new(
+                    &agent,
+                    Arc::new(move |event| match event {
+                        AgentEvent::ToolExecutionStart { .. } => {
+                            recorded.lock().expect("events").push(("start", false));
+                        }
+                        AgentEvent::ToolExecutionEnd { is_error, .. } => {
+                            recorded.lock().expect("events").push(("end", is_error));
+                        }
+                        _ => {}
+                    }),
+                );
+                let call = nested_parallel_read_call(
+                    json!({"path":"result.txt", "content":"native writer ran"}),
+                );
+                assert!(host.tool_effects(&call).parallel_safe());
+                let output = if parallel {
+                    host.call_tool_parallel(call, &owner).await
+                } else {
+                    host.call_tool(call, &owner).await
+                }
+                .expect("nested call outcome");
+                assert_eq!(approvals.load(Ordering::SeqCst), 1);
+                assert_eq!(output.is_error, parallel);
+                assert_eq!(
+                    *events.lock().expect("events"),
+                    [("start", false), ("end", parallel)]
+                );
+                if parallel {
+                    assert!(
+                        nested_parallel_output_text(&output)
+                            .contains("EVAL_BRIDGE_EFFECTS_CHANGED")
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert!(!root.path().join("result.txt").exists());
+                } else {
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        std::fs::read_to_string(root.path().join("result.txt"))
+                            .expect("native output"),
+                        "native writer ran"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn nested_parallel_calls_preserve_denial_and_session_rechecks() {
+        use crate::tools::ToolInvocationHost;
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for switch_session in [false, true] {
+                let root = tempfile::tempdir().expect("workspace");
+                std::fs::write(root.path().join("data.txt"), "private result")
+                    .expect("fixture");
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut tools = ToolRegistry::new(&[], root.path(), None);
+                tools.push(Box::new(ReclassifiedNativeTool {
+                    cwd: root.path().to_path_buf(),
+                    writes: false,
+                    calls: Arc::clone(&calls),
+                }));
+                let mut agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    tools,
+                    AgentConfig::default(),
+                );
+                let scope = agent.job_session_scope.clone();
+                agent.config.tool_approval = Some(Arc::new(move |_| {
+                    if switch_session {
+                        scope.bind(Arc::new(|| {
+                            Box::pin(async { Some("replacement-session".into()) })
+                        }));
+                    }
+                    Box::pin(async move {
+                        if switch_session {
+                            ToolApprovalDecision::Allow
+                        } else {
+                            ToolApprovalDecision::Deny {
+                                reason: "parallel approval denied".into(),
+                            }
+                        }
+                    })
+                }));
+                let owner = agent.job_session_scope.session_id().await.expect("owner");
+                let terminal_events = Arc::new(AtomicUsize::new(0));
+                let ended = Arc::clone(&terminal_events);
+                let host = AgentToolInvocationHost::new(
+                    &agent,
+                    Arc::new(move |event| {
+                        if let AgentEvent::ToolExecutionEnd { is_error, .. } = event {
+                            assert!(is_error);
+                            ended.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }),
+                );
+                let outcome = host
+                    .call_tool_parallel(
+                        nested_parallel_read_call(json!({"path":"data.txt"})),
+                        &owner,
+                    )
+                    .await;
+                if switch_session {
+                    assert!(
+                        outcome
+                            .expect_err("changed owner")
+                            .to_string()
+                            .contains("EVAL_SESSION_CHANGED")
+                    );
+                } else {
+                    let output = outcome.expect("denied output");
+                    assert!(output.is_error);
+                    assert!(
+                        nested_parallel_output_text(&output)
+                            .contains("parallel approval denied")
+                    );
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(terminal_events.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn nested_parallel_calls_preserve_extension_call_and_result_hooks() {
+        use crate::tools::ToolInvocationHost;
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().expect("workspace");
+            std::fs::write(root.path().join("data.txt"), "original result")
+                .expect("fixture");
+            let extension = root.path().join("parallel-policy.mjs");
+            std::fs::write(
+                &extension,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async event => {
+                    if (event.toolName === "read" && event.input.path === "blocked.txt") {
+                      return {block:true,reason:"parallel call hook veto"};
+                    }
+                  });
+                  pi.on("tool_result", async event => {
+                    if (event.toolName === "read" && !event.isError) {
+                      return {content:[{type:"text",text:"parallel result hook"}],
+                        details:{source:"parallel-policy"}};
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("extension fixture");
+            let agent = Agent::new(
+                Arc::new(NoopProvider),
+                ToolRegistry::new(&["read"], root.path(), None),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            session
+                .enable_extensions(&[], root.path(), None, &[extension])
+                .await
+                .expect("load extension");
+            let owner = session
+                .agent
+                .job_session_scope
+                .session_id()
+                .await
+                .expect("owner");
+            let host = AgentToolInvocationHost::new(&session.agent, Arc::new(|_| {}));
+            let output = host
+                .call_tool_parallel(
+                    nested_parallel_read_call(json!({"path":"data.txt"})),
+                    &owner,
+                )
+                .await
+                .expect("parallel read");
+            assert!(!output.is_error);
+            assert_eq!(nested_parallel_output_text(&output), "parallel result hook");
+            assert_eq!(
+                output.details.as_ref().expect("hook details")["source"],
+                "parallel-policy"
+            );
+            let output = host
+                .call_tool_parallel(
+                    nested_parallel_read_call(json!({"path":"blocked.txt"})),
+                    &owner,
+                )
+                .await
+                .expect("hook refusal");
+            assert!(output.is_error);
+            assert!(nested_parallel_output_text(&output).contains("parallel call hook veto"));
+        });
     }
 
     #[derive(Debug)]

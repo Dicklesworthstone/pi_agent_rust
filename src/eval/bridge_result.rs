@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::model::ContentBlock;
 use crate::tools::ToolOutput;
 
-const STRUCTURED_LIMIT: usize = 4 * 1024 * 1024;
+pub(super) const STRUCTURED_LIMIT: usize = 4 * 1024 * 1024;
 const TEXT_LIMIT: usize = 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_NODES: usize = 131_072;
@@ -108,26 +108,44 @@ fn check_json(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), 
     Ok(())
 }
 
-pub(super) fn structured(output: &ToolOutput) -> Result<String, String> {
+pub(super) fn check_value(value: &Value) -> Result<(), String> {
+    let mut remaining = MAX_NODES;
+    check_json(value, 0, &mut remaining)
+}
+
+pub(super) fn structured_envelope(output: &ToolOutput) -> Result<impl Serialize + '_, String> {
     let mut remaining = MAX_NODES;
     if let Some(details) = &output.details {
         check_json(details, 0, &mut remaining)?;
     }
-    let envelope = Envelope {
+    Ok(Envelope {
         schema: "pi.eval.tool_result.v1",
         content: &output.content,
         details: &output.details,
         is_error: output.is_error,
-    };
+    })
+}
+
+pub(super) fn encode_limited<T: Serialize>(
+    value: &T,
+    limit: usize,
+    error: &str,
+) -> Result<String, String> {
     let mut writer = BoundedWriter {
         bytes: Vec::new(),
-        limit: STRUCTURED_LIMIT,
+        limit,
     };
-    serde_json::to_writer(&mut writer, &envelope).map_err(|_| {
-        "EVAL_BRIDGE_LIMIT: structured result exceeds 4 MiB or cannot be encoded".to_string()
-    })?;
+    serde_json::to_writer(&mut writer, value).map_err(|_| error.to_string())?;
     String::from_utf8(writer.bytes)
         .map_err(|_| "EVAL_BRIDGE_PROTOCOL: result was not UTF-8".to_string())
+}
+
+pub(super) fn structured(output: &ToolOutput) -> Result<String, String> {
+    encode_limited(
+        &structured_envelope(output)?,
+        STRUCTURED_LIMIT,
+        "EVAL_BRIDGE_LIMIT: structured result exceeds 4 MiB or cannot be encoded",
+    )
 }
 
 pub(super) fn text(output: &ToolOutput) -> Result<String, String> {

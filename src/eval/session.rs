@@ -12,7 +12,7 @@ use crate::jobs::JobSessionScope;
 use crate::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Includes the active namespace. Each namespace may own one of each kernel.
 const MAX_RETAINED_SESSIONS: usize = 4;
@@ -93,18 +93,20 @@ impl OwnershipStop {
 /// switching back cannot turn already-rejected work into a successful result.
 /// This detects observed identities, not unobserved A-to-B-to-A transitions.
 /// No resolver, guest code, callback or await runs with the stop lock held.
+#[derive(Clone)]
 pub(super) struct CellSession {
     expected: String,
     scope: JobSessionScope,
-    stop: Mutex<Option<OwnershipStop>>,
+    // Runner, scalar calls and concurrent batch items share one revocation.
+    stop: Arc<Mutex<Option<OwnershipStop>>>,
 }
 
 impl CellSession {
-    pub(super) const fn new(scope: JobSessionScope, expected: String) -> Self {
+    pub(super) fn new(scope: JobSessionScope, expected: String) -> Self {
         Self {
             expected,
             scope,
-            stop: Mutex::new(None),
+            stop: Arc::new(Mutex::new(None)),
         }
     }
 

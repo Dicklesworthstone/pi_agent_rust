@@ -26,6 +26,7 @@ mod completion;
 mod drain;
 mod fallback;
 mod images;
+mod tool_batch;
 
 use fallback::BoundModels;
 
@@ -289,6 +290,7 @@ pub(super) struct Invocation<'p> {
     receipts: Vec<Value>,
     host: Option<&'p dyn ToolInvocationHost>,
     host_session: Option<String>,
+    cell_session: Option<super::session::CellSession>,
     tool_receipts: Vec<Value>,
     snapshot_privacy: Option<&'p SnapshotPrivacy<'p>>,
 }
@@ -315,6 +317,7 @@ impl<'p> Invocation<'p> {
             receipts: Vec::new(),
             host: None,
             host_session: None,
+            cell_session: None,
             tool_receipts: Vec::new(),
             snapshot_privacy: None,
         })
@@ -340,6 +343,26 @@ impl<'p> Invocation<'p> {
 
     pub(super) fn bind_host_session(&mut self, session: &str) {
         self.host_session = Some(session.to_owned());
+    }
+
+    pub(super) fn bind_cell_session(&mut self, session: super::session::CellSession) {
+        self.cell_session = Some(session);
+    }
+
+    fn cell_session(
+        &mut self,
+        tool: &super::EvalTool,
+    ) -> std::result::Result<super::session::CellSession, String> {
+        if let Some(session) = &self.cell_session {
+            return Ok(session.clone());
+        }
+        let expected = self
+            .host_session
+            .clone()
+            .ok_or("EVAL_SESSION_UNAVAILABLE: native cell owner was not captured")?;
+        let session = super::session::CellSession::new(tool.session_scope.clone(), expected);
+        self.cell_session = Some(session.clone());
+        Ok(session)
     }
 
     /// Remove the optional helper model-role selector before the ordinary
@@ -373,7 +396,9 @@ impl<'p> Invocation<'p> {
         name: &str,
         input: Value,
     ) -> std::result::Result<String, String> {
-        if name == drain::BRIDGE_NAME {
+        if name == tool_batch::BRIDGE_NAME {
+            self.call_tool_batch(tool, input).await
+        } else if name == drain::BRIDGE_NAME {
             self.drain_batch(tool, input).await
         } else if let Some(operation) = background::Operation::for_bridge(name) {
             self.start_background(tool, operation, input).await
@@ -388,7 +413,15 @@ impl<'p> Invocation<'p> {
         } else {
             // Check the raw operation before structured-result unwrapping.
             // Nested tool.result calls cannot expand the normal tool whitelist.
-            tool.run_bridge_call_parts(name, input).await
+            let request = super::bridge_result::Request::parse(name, input)?;
+            let output = self
+                .call_standalone_output(tool, request.name, request.args)
+                .await?;
+            if request.structured {
+                super::bridge_result::structured(&output)
+            } else {
+                super::bridge_result::text(&output)
+            }
         }
     }
 
@@ -418,6 +451,33 @@ impl<'p> Invocation<'p> {
         name: String,
         args: Value,
     ) -> std::result::Result<ToolOutput, String> {
+        let (index, call) = self.reserve_tool_call(name, args)?;
+        let session = self.host_session.as_deref().ok_or_else(|| {
+            "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
+        })?;
+        let outcome = async {
+            if let Some(guard) = &self.cell_session {
+                guard.check_tool().await.map_err(|err| err.to_string())?;
+            }
+            let output = host
+                .call_tool(call, session)
+                .await
+                .map_err(|err| err.to_string())?;
+            if let Some(guard) = &self.cell_session {
+                guard.check_tool().await.map_err(|err| err.to_string())?;
+            }
+            Ok(output)
+        }
+        .await;
+        self.finish_tool_receipt(index, &outcome)?;
+        outcome
+    }
+
+    fn reserve_tool_call(
+        &mut self,
+        name: String,
+        args: Value,
+    ) -> std::result::Result<(usize, crate::model::ToolCall), String> {
         if name.is_empty()
             || name.len() > 128
             || name.chars().any(char::is_control)
@@ -428,7 +488,7 @@ impl<'p> Invocation<'p> {
             );
         }
         if self.tool_receipts.len() >= MAX_TOOL_CALLS {
-            return Err("EVAL_BRIDGE_LIMIT: at most 64 host tool calls per cell".into());
+            return Err("EVAL_BRIDGE_LIMIT: at most 64 tool calls per cell".into());
         }
         let call = crate::model::ToolCall {
             id: format!("eval-{}", uuid::Uuid::new_v4().simple()),
@@ -444,10 +504,14 @@ impl<'p> Invocation<'p> {
             "tool": call.name,
             "status": "incomplete",
         }));
-        let session = self.host_session.as_deref().ok_or_else(|| {
-            "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
-        })?;
-        let outcome = host.call_tool(call, session).await;
+        Ok((index, call))
+    }
+
+    fn finish_tool_receipt(
+        &mut self,
+        index: usize,
+        outcome: &std::result::Result<ToolOutput, String>,
+    ) -> std::result::Result<(), String> {
         let receipt = self
             .tool_receipts
             .get_mut(index)
@@ -464,14 +528,40 @@ impl<'p> Invocation<'p> {
                     }),
                 );
                 receipt.insert("isError".into(), json!(output.is_error));
-                Ok(output)
             }
-            Err(error) => {
+            Err(_) => {
                 receipt.insert("status".into(), json!("failed"));
                 receipt.insert("isError".into(), json!(true));
-                Err(error.to_string())
             }
         }
+        Ok(())
+    }
+
+    async fn call_standalone_output(
+        &mut self,
+        tool: &super::EvalTool,
+        name: String,
+        args: Value,
+    ) -> std::result::Result<ToolOutput, String> {
+        // Preserve the scalar whitelist; a batch and scalar calls share one
+        // allowance even when no owning Agent supplies additional tools.
+        let native = tool.standalone_bridge_tool(&name)?;
+        let guard = self.cell_session(tool)?;
+        let (index, call) = self.reserve_tool_call(name, args)?;
+        let session = self.host_session.as_deref().ok_or_else(|| {
+            "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
+        })?;
+        let outcome = tool_batch::execute_call(
+            None,
+            Some(native.as_ref()),
+            call,
+            session,
+            &guard,
+            false,
+        )
+        .await;
+        self.finish_tool_receipt(index, &outcome)?;
+        outcome
     }
 
     pub(super) async fn evaluate(

@@ -308,6 +308,34 @@ pub trait ToolInvocationHost: Send + Sync {
         expected_session: &str,
     ) -> Result<ToolOutput>;
 
+    /// Scheduling information for an explicit batch. This is not execution
+    /// authority: the host must recheck the dispatched tool's actual effects
+    /// after policy callbacks when admitting a parallel call. Custom hosts
+    /// remain serial unless they explicitly provide a safe implementation.
+    fn tool_effects(&self, _call: &crate::model::ToolCall) -> ToolEffects {
+        ToolEffects::write()
+    }
+
+    /// Maximum compatible calls this host can execute within one invocation.
+    fn tool_parallelism(&self) -> usize {
+        1
+    }
+
+    /// Execute under a parallel-only admission requirement. The actual tool
+    /// handle and restored arguments must still be parallel-safe immediately
+    /// before execution, including after approvals and extension hooks.
+    /// Returning scheduling metadata alone does not opt a custom host in.
+    async fn call_tool_parallel(
+        &self,
+        _call: crate::model::ToolCall,
+        _expected_session: &str,
+    ) -> Result<ToolOutput> {
+        Err(Error::tool(
+            "eval",
+            "EVAL_BRIDGE_PARALLEL_UNAVAILABLE: this host does not admit parallel tool calls",
+        ))
+    }
+
     /// Capture non-secret model affinity before presenting a sampling review.
     /// Standalone or custom hosts must explicitly opt into this capability.
     fn sampling_model(&self) -> Result<ToolSamplingModel> {
