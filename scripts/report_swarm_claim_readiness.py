@@ -414,12 +414,13 @@ EVIDENCE_SPECS = (
         id="dropin_certification_verdict",
         category="dropin",
         path="docs/evidence/dropin-certification-verdict.json",
-        description="Strict drop-in release claim gate.",
-        claim_surface="release_facing",
+        description="Historical strict drop-in certification verdict (retired per AGENTS.md; non-blocking).",
+        claim_surface="historical_snapshot",
+        release_blocking=False,
+        generated=False,
         required_schema="pi.dropin.certification_verdict.v1",
-        status_path="overall_verdict",
-        ok_values=("CERTIFIED",),
-        provenance_group="dropin",
+        timestamp_paths=(),
+        provenance_paths=(),
     ),
     EvidenceSpec(
         id="dropin_contract",
@@ -3766,6 +3767,35 @@ def run_self_test() -> int:
         assert_condition(
             "stale_evidence" in operator_categories(report),
             "stale artifact blockers should have operator explanations",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        dropin_verdict_spec = next(
+            spec for spec in EVIDENCE_SPECS if spec.id == "dropin_certification_verdict"
+        )
+        dropin_payload = fixture_payload(dropin_verdict_spec, stale, "fixture-run")
+        assert dropin_payload is not None
+        dropin_payload["generated_at_utc"] = format_datetime(stale)
+        write_artifact(repo_root, dropin_verdict_spec.path, dropin_payload, mtime=stale)
+        rebind_fixture_performance_summary(repo_root)
+        report = build_report(repo_root, now=now)
+        dropin_artifact = next(
+            artifact
+            for artifact in report["artifacts"]
+            if artifact["id"] == "dropin_certification_verdict"
+        )
+        assert_condition(
+            dropin_artifact["status"] == "historical_snapshot",
+            "retired drop-in certification verdict must be classified as historical_snapshot",
+        )
+        assert_condition(
+            not any(
+                issue["path"] == dropin_verdict_spec.path
+                and issue["kind"] == "stale"
+                for issue in report["blocking_issues"]
+            ),
+            "stale historical drop-in certification verdict must not block claim readiness",
         )
 
         repo_root = fixture_root()

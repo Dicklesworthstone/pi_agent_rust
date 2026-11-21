@@ -68,14 +68,14 @@
     },
     {
       "category": "dropin",
-      "claim_surface": "release_facing",
+      "claim_surface": "historical_snapshot",
       "exists": true,
       "id": "dropin_certification_verdict",
       "issue_count": 0,
       "issue_kinds": [],
-      "release_blocking": true,
+      "release_blocking": false,
       "schema": "pi.dropin.certification_verdict.v1",
-      "status": "ready"
+      "status": "historical_snapshot"
     },
     {
       "category": "dropin",
@@ -205,8 +205,7 @@
       "category": "dropin",
       "status": "ready",
       "statuses": {
-        "historical_snapshot": 3,
-        "ready": 1,
+        "historical_snapshot": 4,
         "release_policy": 1
       }
     },

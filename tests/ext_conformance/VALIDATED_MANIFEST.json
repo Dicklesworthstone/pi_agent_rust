@@ -6131,56 +6131,40 @@
       "entry_path": "third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
         "uses_session": false,
         "is_multi_file": true,
-        "has_npm_deps": false
+        "has_npm_deps": true
       },
       "conformance_tier": 3,
       "mock_requirements": ["exec"],
       "registrations": {
         "tools": [],
-        "commands": ["sub-bar:import", "sub-bar:settings", "sub-core:settings"],
+        "commands": ["sub-bar:import", "sub-bar:settings"],
         "flags": [],
         "event_handlers": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ]
       }
     },

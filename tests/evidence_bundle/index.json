@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-28T09:26:54.643358Z",
-  "git_ref": "e178a73d4",
-  "ci_run_id": "local-bundle-fix-20260828T092654Z",
+  "generated_at": "2026-11-21T05:50:57.069503Z",
+  "git_ref": "27504a651",
+  "ci_run_id": "local-bundle-fix-20261121T055057Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,7 +13,7 @@
       "schema": "pi.ext.conformance_summary.v2",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 1058
+      "total_bytes": 1211
     },
     {
       "id": "conformance_baseline",
@@ -24,7 +24,7 @@
       "schema": "pi.ext.conformance_baseline.v2",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 5170
+      "total_bytes": 55231
     },
     {
       "id": "conformance_regression_verdict",
@@ -46,7 +46,7 @@
       "schema": "pi.ext.must_pass_gate.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 4613
+      "total_bytes": 4614
     },
     {
       "id": "provider_compat_matrix",
@@ -77,7 +77,7 @@
       "schema": "pi.ext.journey_report.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 679
+      "total_bytes": 8492
     },
     {
       "id": "conformance_pass_rate_artifact",
@@ -98,7 +98,7 @@
       "schema": "pi.ci.full_suite_gate.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 8109
+      "total_bytes": 8110
     },
     {
       "id": "certification_verdict",
@@ -109,7 +109,7 @@
       "schema": "pi.ci.certification_verdict.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 9048
+      "total_bytes": 9019
     },
     {
       "id": "certification_dossier",
@@ -120,7 +120,7 @@
       "schema": "pi.ci.certification_dossier.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 8189
+      "total_bytes": 8190
     },
     {
       "id": "perf_budget_summary",
@@ -131,7 +131,7 @@
       "schema": "pi.perf.budget_summary.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 15223
+      "total_bytes": 14775
     },
     {
       "id": "perf_phase1_matrix",
@@ -142,7 +142,7 @@
       "schema": "pi.perf.phase1_matrix_validation.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 17839
+      "total_bytes": 17719
     },
     {
       "id": "perf_idle_rss",
@@ -153,7 +153,7 @@
       "schema": "pi.perf.idle_memory_rss.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 1138
+      "total_bytes": 1139
     },
     {
       "id": "perf_binary_size",
@@ -164,7 +164,7 @@
       "schema": "pi.perf.binary_size.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 688
+      "total_bytes": 689
     },
     {
       "id": "ci_strict_gates",
@@ -185,7 +185,7 @@
       "schema": "pi.ci.cross_platform.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 4205
+      "total_bytes": 4176
     },
     {
       "id": "ci_artifact_retention",
@@ -206,7 +206,7 @@
       "schema": "pi.ci.evidence_bundle.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 10529
+      "total_bytes": 10559
     },
     {
       "id": "ci_conformance_retry",
@@ -288,7 +288,7 @@
       "schema": "pi.perf.stress_triage.v1",
       "diagnostics": null,
       "file_count": 1,
-      "total_bytes": 4829
+      "total_bytes": 3630
     },
     {
       "id": "conformance_failure_dossiers",
@@ -328,7 +328,7 @@
     "missing_sections": 12,
     "invalid_sections": 0,
     "total_artifacts": 20,
-    "total_bytes": 109438,
+    "total_bytes": 165675,
     "verdict": "partial"
   }
 }

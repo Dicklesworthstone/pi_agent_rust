@@ -1905,6 +1905,38 @@ fn find_entry_point(ext_dir: &Path, artifacts_dir: &Path) -> Option<String> {
     best.map(|(path, _)| path)
 }
 
+/// Scope manifest scanning for multi-package workspace artifacts whose executed
+/// sub-package declares a bundled `node_modules/...` extension entry that is
+/// absent from vendored git snapshots. Without scoping, scanning the workspace
+/// root pulls sibling workspace packages (e.g. `sub-core`) into the executed
+/// entry's manifest (e.g. `sub-bar`) even though runtime loading never executes
+/// those siblings.
+fn resolve_manifest_scan_root(ext_dir: &Path, entry_abs: &Path) -> PathBuf {
+    if ext_dir.join("package.json").is_file() {
+        return ext_dir.to_path_buf();
+    }
+    let mut current = entry_abs.parent();
+    while let Some(dir) = current {
+        if dir == ext_dir || !dir.starts_with(ext_dir) {
+            break;
+        }
+        let pkg_path = dir.join("package.json");
+        if pkg_path.is_file() {
+            if let Ok(bytes) = fs::read(&pkg_path)
+                && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && package_declared_entry_points(&json).iter().any(|entry| {
+                    entry.starts_with("node_modules/") || entry.contains("/node_modules/")
+                })
+            {
+                return dir.to_path_buf();
+            }
+            break;
+        }
+        current = dir.parent();
+    }
+    ext_dir.to_path_buf()
+}
+
 #[allow(clippy::too_many_lines)]
 #[test]
 fn test_generate_validated_manifest() {
@@ -1931,8 +1963,12 @@ fn test_generate_validated_manifest() {
         };
 
         let source_tier = determine_source_tier(&entry_path);
+        let entry_abs = artifacts_dir.join(&entry_path);
+        let scan_root = resolve_manifest_scan_root(ext_dir, &entry_abs);
+        let ts_files = collect_ts_files(&scan_root);
+        let has_npm_deps = has_npm_dependencies(&scan_root);
 
-        let scanner = CompatibilityScanner::new(ext_dir.clone());
+        let scanner = CompatibilityScanner::new(scan_root);
         let ledger = scanner
             .scan_root()
             .unwrap_or_else(|err| panic!("scan {id}: {err}"));
@@ -1945,7 +1981,6 @@ fn test_generate_validated_manifest() {
 
         let has_forbidden = !ledger.forbidden.is_empty();
 
-        let ts_files = collect_ts_files(ext_dir);
         let mut all_content = String::new();
         for file in &ts_files {
             if let Ok(content) = fs::read_to_string(file) {
@@ -1971,7 +2006,7 @@ fn test_generate_validated_manifest() {
             uses_ui: cap_names.contains(&"ui"),
             uses_session: cap_names.contains(&"session"),
             is_multi_file: ts_files.len() > 1,
-            has_npm_deps: has_npm_dependencies(ext_dir),
+            has_npm_deps,
         };
 
         let conformance_tier = classify_tier(&caps, has_forbidden);
@@ -2151,6 +2186,74 @@ pi.on("agent_end", () => {});
     assert_eq!(regs.tools, vec!["my_tool"]);
     assert_eq!(regs.commands, vec!["/test-cmd"]);
     assert_eq!(regs.event_handlers, vec!["agent_end", "tool_call"]);
+}
+
+#[test]
+fn test_resolve_manifest_scan_root_scopes_bundled_monorepo_subpackage() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    // Multi-package workspace without root package.json where sub-bar declares
+    // a bundled node_modules extension entry while sub-core is a sibling.
+    let mono = temp.path().join("mono");
+    let sub_bar = mono.join("sub-bar");
+    let sub_core = mono.join("sub-core");
+    fs::create_dir_all(&sub_bar).expect("mkdir sub-bar");
+    fs::create_dir_all(&sub_core).expect("mkdir sub-core");
+    fs::write(
+        sub_bar.join("package.json"),
+        r#"{"name":"@example/sub-bar","pi":{"extensions":["./index.ts","node_modules/@example/sub-core/index.ts"]}}"#,
+    )
+    .expect("write sub-bar package.json");
+    let bar_entry = sub_bar.join("index.ts");
+    fs::write(
+        &bar_entry,
+        "export default function(pi) { pi.on('session_start', () => {}); }\n",
+    )
+    .expect("write sub-bar index");
+    fs::write(
+        sub_core.join("index.ts"),
+        "export default function(pi) { pi.on('turn_end', () => {}); }\n",
+    )
+    .expect("write sub-core index");
+
+    assert_eq!(
+        resolve_manifest_scan_root(&mono, &bar_entry),
+        sub_bar,
+        "bundled monorepo sub-package must scope away sibling workspace packages"
+    );
+
+    // Negative control 1: sub-package without a bundled node_modules extension
+    // entry preserves existing workspace-root scanning behavior.
+    let plain_mono = temp.path().join("plain-mono");
+    let pkg_a = plain_mono.join("pkg-a");
+    fs::create_dir_all(&pkg_a).expect("mkdir pkg-a");
+    fs::write(
+        pkg_a.join("package.json"),
+        r#"{"name":"@example/pkg-a","pi":{"extensions":["./index.ts"]}}"#,
+    )
+    .expect("write pkg-a package.json");
+    let pkg_a_entry = pkg_a.join("index.ts");
+    fs::write(&pkg_a_entry, "export default function() {}\n").expect("write pkg-a index");
+    assert_eq!(
+        resolve_manifest_scan_root(&plain_mono, &pkg_a_entry),
+        plain_mono
+    );
+
+    // Negative control 2: presence of root package.json always scans ext_dir.
+    fs::write(mono.join("package.json"), r#"{"name":"root"}"#).expect("write root package.json");
+    assert_eq!(resolve_manifest_scan_root(&mono, &bar_entry), mono);
+
+    // Real vendored artifact check: third-party/marckrenn-pi-sub scopes to sub-bar.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let marckrenn_dir =
+        repo_root.join("tests/ext_conformance/artifacts/third-party/marckrenn-pi-sub");
+    let marckrenn_entry = marckrenn_dir.join("sub-bar/index.ts");
+    if marckrenn_entry.is_file() {
+        assert_eq!(
+            resolve_manifest_scan_root(&marckrenn_dir, &marckrenn_entry),
+            marckrenn_dir.join("sub-bar")
+        );
+    }
 }
 
 #[test]
