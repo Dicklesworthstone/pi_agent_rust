@@ -209,6 +209,10 @@ const MAX_TOTAL_RETAINED_SETTLED_JOBS: usize = 512;
 /// Bounds both owner-shutdown fence acquisition and job settlement.
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound dedicated shutdown snapshots even when callers repeatedly abandon
+/// them behind a stalled launch. There is no unbounded worker queue.
+const MAX_SESSION_SHUTDOWN_WORKERS: usize = MAX_CONCURRENT_JOBS;
+
 /// An unrelated Pi process may stall while holding the shared artifact-budget
 /// lock. Admission must not wait forever while owning the lifecycle lane.
 const ARTIFACT_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -644,6 +648,7 @@ impl TailBuffer {
 struct JobRegistry {
     jobs: HashMap<String, JobEntry>,
     shutting_down: bool,
+    shutdown_workers: usize,
     closing_owners: HashMap<String, OwnerShutdownState>,
     owner_shutdown_generations: HashMap<String, u64>,
     owner_spawns_in_flight: HashMap<String, usize>,
@@ -4164,14 +4169,92 @@ fn finish_session_shutdown_attempt(owner_session_id: &str, clear_when_safe: bool
     Ok(())
 }
 
-fn request_session_shutdown(
-    owner_session_id: &str,
-) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
-    request_session_shutdown_with_timeout(owner_session_id, SESSION_SHUTDOWN_TIMEOUT)
+struct SessionShutdownWorker;
+
+impl SessionShutdownWorker {
+    fn reserve() -> Result<Self> {
+        let mut reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        if reg.shutdown_workers >= MAX_SESSION_SHUTDOWN_WORKERS {
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_SESSION_SHUTDOWN_AT_CAPACITY: too many concurrent shutdown snapshots; retry after one completes",
+            ));
+        }
+        reg.shutdown_workers += 1;
+        drop(reg);
+        Ok(Self)
+    }
 }
 
-// Guard scope is deliberate; tightening drops would change lock-hold semantics.
-#[allow(clippy::significant_drop_tightening)]
+impl Drop for SessionShutdownWorker {
+    fn drop(&mut self) {
+        let mut reg = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reg.shutdown_workers = reg.shutdown_workers.saturating_sub(1);
+    }
+}
+
+async fn request_session_shutdown(
+    owner_session_id: &str,
+) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
+    if owner_session_id.trim().is_empty() {
+        return Err(Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable",
+        ));
+    }
+    // The uncontended path only snapshots in-memory state. Do not allocate a
+    // thread or consume the bounded waiting lane for an immediately available
+    // fence, including ordinary empty-session teardown.
+    if let Ok(lifecycle) = lifecycle_lock().try_lock() {
+        let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
+        let handles = session_shutdown_handles(owner_session_id)?;
+        drop(lifecycle);
+        return Ok((attempt, handles));
+    }
+    let worker = SessionShutdownWorker::reserve()?;
+    // Publish cancellation before the worker waits behind an unrelated launch.
+    // The attempt travels with the result: losing either the worker or its
+    // receiver leaves the same fail-closed fence as an interrupted settlement.
+    let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
+    let started = Instant::now();
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    // spawn_blocking runs inline without a runtime blocking pool. A dedicated,
+    // capacity-limited worker keeps this fence off even a current-thread
+    // executor; thread creation failure must never fall back to inline work.
+    std::thread::Builder::new()
+        .name("pi-jobs-session-shutdown".to_string())
+        .spawn(move || {
+            let result = snapshot_session_shutdown(
+                attempt,
+                started,
+                SESSION_SHUTDOWN_TIMEOUT,
+                || sender.is_canceled(),
+            );
+            let _ = sender.send(result);
+            drop(worker);
+        })
+        .map_err(|error| {
+            Error::tool(
+                "jobs",
+                format!("PI_JOBS_SESSION_SHUTDOWN_WORKER: failed to start worker: {error}"),
+            )
+        })?;
+    // Teardown remains usable after its invoking task has been cancelled.
+    // Dropping this future still closes the receiver and retires a waiting
+    // worker without clearing the cancellation fence prematurely.
+    receiver.await.map_err(|_| {
+        Error::tool(
+            "jobs",
+            "PI_JOBS_SESSION_SHUTDOWN_WORKER: worker exited without a shutdown snapshot",
+        )
+    })?
+}
+
+#[cfg(test)]
 fn request_session_shutdown_with_timeout(
     owner_session_id: &str,
     lifecycle_timeout: Duration,
@@ -4185,13 +4268,29 @@ fn request_session_shutdown_with_timeout(
     }
 
     let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
-    // Publish the closing fence before waiting for a possibly slow spawn.
-    // Spawn checks this both before OS creation and again before registry
+    snapshot_session_shutdown(attempt, Instant::now(), lifecycle_timeout, || false)
+}
+
+// Guard scope is deliberate; tightening drops would change lock-hold semantics.
+#[allow(clippy::significant_drop_tightening)]
+fn snapshot_session_shutdown(
+    attempt: SessionShutdownAttempt,
+    started: Instant,
+    lifecycle_timeout: Duration,
+    abandoned: impl Fn() -> bool,
+) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
+    let owner_session_id = attempt.owner_session_id.as_str();
+    // The caller published the closing fence before dispatching this wait.
+    // Spawn checks it both before OS creation and again before registry
     // publication, so an in-flight owner cannot escape the later snapshot.
-    let deadline = Instant::now()
-        .checked_add(lifecycle_timeout)
-        .unwrap_or_else(Instant::now);
+    let deadline = started.checked_add(lifecycle_timeout).unwrap_or(started);
     let _lifecycle = loop {
+        if abandoned() {
+            return Err(Error::tool(
+                "jobs",
+                "PI_JOBS_SESSION_SHUTDOWN_ABANDONED: shutdown snapshot receiver was dropped",
+            ));
+        }
         match lifecycle_lock().try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -4214,6 +4313,13 @@ fn request_session_shutdown_with_timeout(
             }
         }
     };
+    let handles = session_shutdown_handles(owner_session_id)?;
+    Ok((attempt, handles))
+}
+
+// Both callers hold the lifecycle fence while taking this registry snapshot.
+#[allow(clippy::significant_drop_tightening)]
+fn session_shutdown_handles(owner_session_id: &str) -> Result<Vec<JobWaitHandle>> {
     let mut reg = registry()
         .lock()
         .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
@@ -4234,7 +4340,7 @@ fn request_session_shutdown_with_timeout(
             cancel_deadline: Arc::clone(&job.cancel_deadline),
         });
     }
-    Ok((attempt, handles))
+    Ok(handles)
 }
 
 /// Kill every running background job owned by one agent session.
@@ -4248,11 +4354,11 @@ fn request_session_shutdown_with_timeout(
 /// errors, `PI_JOBS_SESSION_SHUTDOWN_LOCK_TIMEOUT` when the closing fence
 /// cannot be acquired, or `PI_JOBS_SESSION_SHUTDOWN_INCOMPLETE` when any
 /// requested job remains unsettled after the bounded cancellation window.
+/// `PI_JOBS_SESSION_SHUTDOWN_AT_CAPACITY` rejects excess concurrent snapshots
+/// before admission, and `PI_JOBS_SESSION_SHUTDOWN_WORKER` reports a worker
+/// creation or delivery failure. Both can be retried without an inline wait.
 pub async fn kill_session(owner_session_id: &str) -> Result<()> {
-    let request_owner = owner_session_id.to_string();
-    let (attempt, handles) =
-        asupersync::runtime::spawn_blocking(move || request_session_shutdown(&request_owner))
-            .await?;
+    let (attempt, handles) = request_session_shutdown(owner_session_id).await?;
     let results = futures::future::join_all(
         handles
             .iter()
@@ -6479,6 +6585,167 @@ mod tests {
         .expect_err("new owners must not reopen final shutdown");
         assert!(error.to_string().contains("PI_JOBS_SHUTTING_DOWN"));
         record_final_shutdown_fixture_completion();
+    }
+
+    fn wait_for_shutdown_workers_to_retire() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if registry()
+                .lock()
+                .expect("shutdown worker registry")
+                .shutdown_workers
+                == 0
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abandoned shutdown workers must retire without waiting for the lifecycle lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn uncontended_session_shutdown_needs_no_worker_even_at_waiter_capacity() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let _guard = process_test_guard();
+        wait_for_shutdown_workers_to_retire();
+        let workers = (0..MAX_SESSION_SHUTDOWN_WORKERS)
+            .map(|_| SessionShutdownWorker::reserve().expect("reserve waiting lane"))
+            .collect::<Vec<_>>();
+        let owner = format!("shutdown-immediate-{}", uuid::Uuid::new_v4().simple());
+        let mut shutdown = Box::pin(kill_session(&owner));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            matches!(shutdown.as_mut().poll(&mut task), Poll::Ready(Ok(()))),
+            "an available lifecycle fence must complete empty teardown on its first poll"
+        );
+        {
+            let reg = registry().lock().expect("immediate shutdown state");
+            assert_eq!(reg.shutdown_workers, MAX_SESSION_SHUTDOWN_WORKERS);
+            assert!(!reg.closing_owners.contains_key(&owner));
+            assert!(!reg.owner_shutdown_generations.contains_key(&owner));
+        }
+        drop(workers);
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn session_shutdown_yields_without_a_blocking_pool_and_fences_its_owner() {
+        use std::future::Future;
+        use std::task::Context;
+
+        let _guard = process_test_guard();
+        wait_for_shutdown_workers_to_retire();
+        let root = temp_root();
+        let owner = format!("shutdown-yield-{}", uuid::Uuid::new_v4().simple());
+        let peer = format!("shutdown-yield-peer-{}", uuid::Uuid::new_v4().simple());
+        let id = format!("job-{}", uuid::Uuid::new_v4().simple());
+        let peer_id = format!("job-{}", uuid::Uuid::new_v4().simple());
+        let mut entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, true);
+        entry.owner_session_id.clone_from(&owner);
+        let mut peer_entry =
+            synthetic_entry(&peer_id, root.join(format!("{peer_id}.log")), 1, true);
+        peer_entry.owner_session_id.clone_from(&peer);
+        {
+            let mut reg = registry().lock().expect("install shutdown fixtures");
+            reg.jobs.insert(id.clone(), entry);
+            reg.jobs.insert(peer_id.clone(), peer_entry);
+        }
+        let lifecycle = lifecycle_lock().lock().expect("pause unrelated admission");
+        let mut shutdown = Box::pin(kill_session(&owner));
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        // Poll on this thread without any runtime blocking pool. The old
+        // spawn_blocking fallback waits here until the lifecycle timeout and
+        // returns Ready(Err); this must yield while we still hold the lock.
+        assert!(
+            shutdown.as_mut().poll(&mut task).is_pending(),
+            "session teardown must yield before another task can release the lifecycle fence"
+        );
+        {
+            let reg = registry().lock().expect("observe shutdown fence");
+            assert!(reg.closing_owners.contains_key(&owner));
+            assert!(reg.jobs[&id].cancel_requested);
+            assert!(!reg.jobs[&peer_id].cancel_requested);
+            assert!(!reg.closing_owners.contains_key(&peer));
+        }
+        assert!(ensure_session_accepting_jobs(&owner).is_err());
+        settle_job_without_notice(&id, JobStatus::Killed, None, true);
+        drop(lifecycle);
+        futures::executor::block_on(shutdown).expect("owner teardown completes after release");
+        wait_for_shutdown_workers_to_retire();
+        let mut reg = registry().lock().expect("retire shutdown fixtures");
+        assert!(!reg.closing_owners.contains_key(&owner));
+        assert!(!reg.jobs[&peer_id].cancel_requested);
+        reg.jobs.remove(&id);
+        reg.jobs.remove(&peer_id);
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn abandoned_session_shutdowns_reclaim_bounded_workers_before_lifecycle_release() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let _guard = process_test_guard();
+        wait_for_shutdown_workers_to_retire();
+        let owners = (0..MAX_SESSION_SHUTDOWN_WORKERS)
+            .map(|_| format!("shutdown-drop-{}", uuid::Uuid::new_v4().simple()))
+            .collect::<Vec<_>>();
+        let lifecycle = lifecycle_lock().lock().expect("pause admission");
+        let mut shutdowns = owners
+            .iter()
+            .map(|owner| Box::pin(kill_session(owner)))
+            .collect::<Vec<_>>();
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        for shutdown in &mut shutdowns {
+            assert!(shutdown.as_mut().poll(&mut task).is_pending());
+        }
+        assert_eq!(
+            registry().lock().expect("worker capacity").shutdown_workers,
+            MAX_SESSION_SHUTDOWN_WORKERS
+        );
+        let excess_owner = format!("shutdown-excess-{}", uuid::Uuid::new_v4().simple());
+        let mut excess = Box::pin(kill_session(&excess_owner));
+        let Poll::Ready(Err(error)) = excess.as_mut().poll(&mut task) else {
+            panic!("a full worker lane must reject without allocating another thread");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("PI_JOBS_SESSION_SHUTDOWN_AT_CAPACITY")
+        );
+        {
+            let reg = registry().lock().expect("capacity rejection state");
+            assert_eq!(reg.shutdown_workers, MAX_SESSION_SHUTDOWN_WORKERS);
+            assert!(!reg.closing_owners.contains_key(&excess_owner));
+            assert!(!reg.owner_shutdown_generations.contains_key(&excess_owner));
+        }
+
+        drop(shutdowns);
+        // Keep the lock held: dropping the receivers, rather than lock release
+        // or the ten-second timeout, must be what retires all eight workers.
+        wait_for_shutdown_workers_to_retire();
+        {
+            let reg = registry().lock().expect("abandoned shutdown fences");
+            for owner in &owners {
+                assert_eq!(reg.closing_owners[owner].active_attempts, 0);
+                assert!(reg.owner_shutdown_generations.contains_key(owner));
+            }
+        }
+        for owner in &owners {
+            assert!(ensure_session_accepting_jobs(owner).is_err());
+        }
+        drop(lifecycle);
+        for owner in &owners {
+            ensure_session_accepting_jobs(owner).expect("safe abandoned-fence reconciliation");
+        }
+        futures::executor::block_on(kill_session(&excess_owner))
+            .expect("capacity becomes reusable after abandoned workers retire");
+        wait_for_shutdown_workers_to_retire();
     }
 
     #[test]
