@@ -2777,6 +2777,16 @@ pub async fn save_session(
     entries: &[SessionEntry],
     header_dirty: bool,
 ) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+    save_session_snapshot(path, header, entries, header_dirty, None).await
+}
+
+pub(crate) async fn save_session_snapshot(
+    path: &Path,
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+    header_dirty: bool,
+    snapshot: Option<&crate::session::SessionHeaderSaveSnapshot>,
+) -> Result<(SessionHeader, Vec<SessionEntry>)> {
     header
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
@@ -2805,24 +2815,25 @@ pub async fn save_session(
         // Serialize header + entries and track serialization time + bytes.
         let save_result = (|| -> Result<(SessionHeader, Vec<SessionEntry>)> {
             let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
-            let header_to_write = match read_stored_header(&conn)? {
-                Some(stored_header) => {
-                    if stored_header.id != header.id {
-                        return Err(Error::session(
-                            "SQLite session header ID does not match the in-memory session ID",
-                        ));
-                    }
-                    if header_dirty {
-                        header.clone()
-                    } else {
-                        stored_header
-                    }
-                }
-                None => header.clone(),
-            };
-            let header_json = serde_json::to_string(&header_to_write)?;
+            let stored_header = read_stored_header(&conn)?;
             let reconciled = reconcile_entries(read_stored_entries(&conn)?, entries)?;
             crate::session::validate_session_entry_graph(&reconciled.entries)?;
+            let mut header_to_write = match stored_header {
+                Some(stored_header) => crate::session::reconcile_session_header(
+                    &stored_header,
+                    header,
+                    header_dirty,
+                    snapshot,
+                    &reconciled.entries,
+                )?,
+                None => header.clone(),
+            };
+            crate::session::reconcile_saved_session_leaf(
+                &mut header_to_write,
+                &reconciled.entries,
+                snapshot,
+            )?;
+            let header_json = serde_json::to_string(&header_to_write)?;
             validate_sqlite_json_for_write("session header", &header_json)?;
             validate_sqlite_sequence_range(0, reconciled.entries.len())?;
             let mut total_json_bytes = u64::try_from(header_json.len())

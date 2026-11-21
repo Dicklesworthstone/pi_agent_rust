@@ -1522,6 +1522,7 @@ fn save_jsonl_full_rewrite_blocking(
         header,
         entries,
         header_dirty,
+        None,
         false,
     )?;
     Ok((saved_header, saved_entries))
@@ -1533,6 +1534,7 @@ fn save_jsonl_full_rewrite_with_v2_blocking(
     header: &SessionHeader,
     entries: &[SessionEntry],
     header_dirty: bool,
+    snapshot: Option<&SessionHeaderSaveSnapshot>,
     sync_v2_sidecar: bool,
 ) -> Result<(SessionHeader, Vec<SessionEntry>, Option<PathBuf>)> {
     validate_jsonl_full_rewrite_lines(header, entries)?;
@@ -1544,7 +1546,7 @@ fn save_jsonl_full_rewrite_with_v2_blocking(
     }
     let _lock = lock_session_persistence(path)?;
     let (header_to_write, entries_to_write) =
-        prepare_jsonl_full_rewrite(path, header, entries, header_dirty)?;
+        prepare_jsonl_full_rewrite(path, header, entries, header_dirty, snapshot)?;
     let index_generation = begin_session_index_namespace_change(sessions_root)?;
     persist_jsonl_snapshot_locked(path, &header_to_write, &entries_to_write)?;
     let synced_v2_root = if sync_v2_sidecar {
@@ -1858,7 +1860,6 @@ fn open_jsonl_for_append(path: &Path) -> Result<(SessionHeader, Vec<attachments:
     header
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
-    let (header, _) = normalize_loaded_header(header);
     let entries = read_jsonl_entries_for_v2(&mut reader, path).map_err(|error| {
         let invalid_source = matches!(&error, Error::Json(_) | Error::Session(_))
             || matches!(&error, Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData);
@@ -2289,13 +2290,221 @@ impl Drop for SessionPersistenceLockGuard {
     }
 }
 
+/// The last accepted header and the current writer's selected branch. Captured
+/// before dispatch, then reconciled under the same lock as transcript publication.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionHeaderSaveSnapshot {
+    base: Option<SessionHeader>,
+    leaf_id: Option<String>,
+}
+
+fn merge_session_header_field<T: Clone + PartialEq>(
+    field: &str,
+    base: &T,
+    incoming: &T,
+    stored: &T,
+) -> Result<T> {
+    if incoming == base {
+        return Ok(stored.clone());
+    }
+    if stored == base || stored == incoming {
+        return Ok(incoming.clone());
+    }
+    Err(Error::session(format!(
+        "Session header conflict in {field}: another writer changed the same metadata; reopen the session before retrying"
+    )))
+}
+
+pub(crate) fn reconcile_session_header(
+    stored: &SessionHeader,
+    incoming: &SessionHeader,
+    header_dirty: bool,
+    snapshot: Option<&SessionHeaderSaveSnapshot>,
+    entries: &[SessionEntry],
+) -> Result<SessionHeader> {
+    if stored.id != incoming.id {
+        return Err(Error::session(
+            "persisted session header ID does not match the in-memory session ID",
+        ));
+    }
+    if !header_dirty {
+        return Ok(stored.clone());
+    }
+    let Some(base) = snapshot.and_then(|snapshot| snapshot.base.as_ref()) else {
+        return Ok(incoming.clone());
+    };
+    if base.id != incoming.id {
+        return Err(Error::session(
+            "accepted session header ID does not match the in-memory session ID",
+        ));
+    }
+
+    // Branch records own model/thinking selection when present; those fields
+    // are projected from the selected ancestry after reconciling the header.
+    // Header-only sessions still need a three-way merge, with provider/model
+    // kept as one selection so a merge cannot invent a new pair.
+    let (provider, model_id) = if entries
+        .iter()
+        .any(|entry| matches!(entry, SessionEntry::ModelChange(_)))
+    {
+        (incoming.provider.clone(), incoming.model_id.clone())
+    } else {
+        merge_session_header_field(
+            "model",
+            &(base.provider.clone(), base.model_id.clone()),
+            &(incoming.provider.clone(), incoming.model_id.clone()),
+            &(stored.provider.clone(), stored.model_id.clone()),
+        )?
+    };
+    let thinking_level = if entries
+        .iter()
+        .any(|entry| matches!(entry, SessionEntry::ThinkingLevelChange(_)))
+    {
+        incoming.thinking_level.clone()
+    } else {
+        merge_session_header_field(
+            "thinking level",
+            &base.thinking_level,
+            &incoming.thinking_level,
+            &stored.thinking_level,
+        )?
+    };
+    let (fallback_provider, fallback_model_id) = merge_session_header_field(
+        "fallback model",
+        &(base.fallback_provider.clone(), base.fallback_model_id.clone()),
+        &(
+            incoming.fallback_provider.clone(),
+            incoming.fallback_model_id.clone(),
+        ),
+        &(
+            stored.fallback_provider.clone(),
+            stored.fallback_model_id.clone(),
+        ),
+    )?;
+    Ok(SessionHeader {
+        r#type: merge_session_header_field("type", &base.r#type, &incoming.r#type, &stored.r#type)?,
+        version: merge_session_header_field(
+            "version",
+            &base.version,
+            &incoming.version,
+            &stored.version,
+        )?,
+        id: incoming.id.clone(),
+        timestamp: merge_session_header_field(
+            "timestamp",
+            &base.timestamp,
+            &incoming.timestamp,
+            &stored.timestamp,
+        )?,
+        cwd: merge_session_header_field("cwd", &base.cwd, &incoming.cwd, &stored.cwd)?,
+        provider,
+        model_id,
+        thinking_level,
+        fallback_provider,
+        additional_roots: merge_session_header_field(
+            "additional roots",
+            &base.additional_roots,
+            &incoming.additional_roots,
+            &stored.additional_roots,
+        )?,
+        fallback_model_id,
+        fallback_thinking_level: merge_session_header_field(
+            "fallback thinking level",
+            &base.fallback_thinking_level,
+            &incoming.fallback_thinking_level,
+            &stored.fallback_thinking_level,
+        )?,
+        // A save records this handle's branch. Canonicalize it against the
+        // merged history, whose natural tip can belong to another writer.
+        current_leaf: incoming.current_leaf.clone(),
+        parent_session: merge_session_header_field(
+            "parent session",
+            &base.parent_session,
+            &incoming.parent_session,
+            &stored.parent_session,
+        )?,
+    })
+}
+
+pub(crate) fn reconcile_saved_session_leaf(
+    header: &mut SessionHeader,
+    entries: &[SessionEntry],
+    snapshot: Option<&SessionHeaderSaveSnapshot>,
+) -> Result<()> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    header.current_leaf = match snapshot.leaf_id.as_deref() {
+        Some(leaf_id) => {
+            if !entries
+                .iter()
+                .any(|entry| entry.base_id().is_some_and(|id| id == leaf_id))
+            {
+                return Err(Error::session(
+                    "selected session leaf is missing from the reconciled history",
+                ));
+            }
+            let natural_tip = entries.last().and_then(SessionEntry::base_id);
+            (natural_tip.map(String::as_str) != Some(leaf_id)).then(|| leaf_id.to_string())
+        }
+        None if entries.is_empty() => None,
+        None => Some(ROOT_LEAF_OVERRIDE_SENTINEL.to_string()),
+    };
+
+    let by_id = entries
+        .iter()
+        .filter_map(|entry| entry.base_id().map(|id| (id.as_str(), entry)))
+        .collect::<HashMap<_, _>>();
+    let mut selected_model = None;
+    let mut selected_thinking = None;
+    let mut current = snapshot.leaf_id.as_deref();
+    while let Some(id) = current {
+        let entry = by_id
+            .get(id)
+            .ok_or_else(|| Error::session("selected session ancestry is incomplete"))?;
+        match entry {
+            SessionEntry::ModelChange(change) if selected_model.is_none() => {
+                selected_model = Some((change.provider.clone(), change.model_id.clone()));
+            }
+            SessionEntry::ThinkingLevelChange(change) if selected_thinking.is_none() => {
+                selected_thinking = Some(change.thinking_level.clone());
+            }
+            _ => {}
+        }
+        current = entry.base().parent_id.as_deref();
+    }
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, SessionEntry::ModelChange(_)))
+    {
+        let model = selected_model.or_else(|| {
+            header
+                .fallback_provider
+                .clone()
+                .zip(header.fallback_model_id.clone())
+        });
+        (header.provider, header.model_id) = model
+            .map(|(provider, model)| (Some(provider), Some(model)))
+            .unwrap_or((None, None));
+    }
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, SessionEntry::ThinkingLevelChange(_)))
+    {
+        header.thinking_level =
+            selected_thinking.or_else(|| header.fallback_thinking_level.clone());
+    }
+    Ok(())
+}
+
 fn prepare_jsonl_full_rewrite(
     path: &Path,
     header: &SessionHeader,
     entries: &[SessionEntry],
     header_dirty: bool,
+    snapshot: Option<&SessionHeaderSaveSnapshot>,
 ) -> Result<(SessionHeader, Vec<SessionEntry>)> {
-    let mut header_to_write = header.clone();
+    let mut stored_header = None;
     let mut merged_entries =
         if session_path_try_exists(path).map_err(|e| crate::Error::Io(Box::new(e)))? {
             let (disk_session, _) = open_jsonl_blocking(path)?;
@@ -2305,14 +2514,7 @@ fn prepare_jsonl_full_rewrite(
                     path.display()
                 )));
             }
-            if disk_session.header.id != header.id {
-                return Err(Error::session(
-                    "persisted session header ID does not match the in-memory session ID",
-                ));
-            }
-            if !header_dirty {
-                header_to_write = disk_session.header;
-            }
+            stored_header = Some(disk_session.persisted_header.unwrap_or(disk_session.header));
             disk_session.entries
         } else {
             Vec::new()
@@ -2356,6 +2558,13 @@ fn prepare_jsonl_full_rewrite(
 
     ensure_session_parent_links_closed(&merged_entries)?;
     let merged_entries = stable_parent_topological_order(merged_entries)?;
+    let mut header_to_write = match stored_header.as_ref() {
+        Some(stored) => {
+            reconcile_session_header(stored, header, header_dirty, snapshot, &merged_entries)?
+        }
+        None => header.clone(),
+    };
+    reconcile_saved_session_leaf(&mut header_to_write, &merged_entries, snapshot)?;
     Ok((header_to_write, merged_entries))
 }
 
@@ -3237,6 +3446,9 @@ pub struct Session {
     pub path: Option<PathBuf>,
     /// Path against which `persisted_entry_count` was last verified on disk.
     persisted_path: Option<PathBuf>,
+    /// Exact header from the last accepted open/save receipt. Local metadata
+    /// edits merge against this baseline instead of overwriting another writer.
+    persisted_header: Option<SessionHeader>,
     /// Stable future path exposed to extensions before the first save.
     /// Reserving a name never creates a directory or a transcript file.
     reserved_path: Option<SessionPathReservation>,
@@ -3301,6 +3513,7 @@ impl Clone for Session {
             entries: self.entries.clone(),
             path: self.path.clone(),
             persisted_path: self.persisted_path.clone(),
+            persisted_header: self.persisted_header.clone(),
             reserved_path: self.reserved_path.clone(),
             leaf_id: self.leaf_id.clone(),
             session_dir: self.session_dir.clone(),
@@ -4304,6 +4517,7 @@ impl Session {
             entries: Vec::new(),
             path: None,
             persisted_path: None,
+            persisted_header: None,
             reserved_path: None,
             leaf_id: None,
             session_dir: None,
@@ -4348,6 +4562,7 @@ impl Session {
             entries: Vec::new(),
             path: None,
             persisted_path: None,
+            persisted_header: None,
             reserved_path: None,
             leaf_id: None,
             session_dir,
@@ -4926,6 +5141,7 @@ impl Session {
         header
             .validate()
             .map_err(|reason| crate::Error::session(format!("Invalid session header: {reason}")))?;
+        let persisted_header = Some(header.clone());
         let (header, normalized_header_dirty) = normalize_loaded_header(header);
         let frames = match mode {
             V2OpenMode::Full => store.read_all_entries_from_index(index)?,
@@ -5006,6 +5222,7 @@ impl Session {
                 entries,
                 path: None,
                 persisted_path: None,
+                persisted_header,
                 reserved_path: None,
                 leaf_id: leaf_id.clone(),
                 session_dir: None,
@@ -5068,6 +5285,7 @@ impl Session {
     #[cfg(feature = "sqlite-sessions")]
     async fn open_sqlite(path: &Path) -> Result<Self> {
         let (header, mut entries) = crate::session_sqlite::load_session(path).await?;
+        let persisted_header = Some(header.clone());
         let (header, normalized_header_dirty) = normalize_loaded_header(header);
         let finalized = finalize_loaded_entries(&mut entries);
         let entry_count = entries.len();
@@ -5085,6 +5303,7 @@ impl Session {
             entries,
             path: Some(path.to_path_buf()),
             persisted_path: Some(resolved_persisted_path),
+            persisted_header,
             reserved_path: None,
             leaf_id: leaf_id.clone(),
             session_dir: None,
@@ -5278,6 +5497,14 @@ impl Session {
     }
 
     fn needs_unqueued_structural_rewrite(&self) -> bool {
+        if self.header_dirty
+            || self
+                .persisted_header
+                .as_ref()
+                .is_some_and(|header| header != &self.header)
+        {
+            return true;
+        }
         if self.persisted_path.as_deref() != self.path.as_deref() {
             return true;
         }
@@ -5614,6 +5841,14 @@ impl Session {
             self.header.current_leaf = desired_leaf_override;
             self.header_dirty = true;
         }
+        if self.header.materialize_branch_fallbacks()
+            || self
+                .persisted_header
+                .as_ref()
+                .is_some_and(|header| header != &self.header)
+        {
+            self.header_dirty = true;
+        }
         self.header
             .validate()
             .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
@@ -5672,6 +5907,10 @@ impl Session {
                     let header_snapshot = self.header.clone();
                     let entries_to_save = self.entries.clone();
                     let header_dirty = self.header_dirty;
+                    let snapshot = SessionHeaderSaveSnapshot {
+                        base: self.persisted_header.clone(),
+                        leaf_id: self.leaf_id.clone(),
+                    };
                     let sync_v2_sidecar = self.v2_live_sync;
                     let path_for_task = path_clone.clone();
                     let sessions_root_for_task = sessions_root.clone();
@@ -5683,13 +5922,13 @@ impl Session {
                                 &header_snapshot,
                                 &entries_to_save,
                                 header_dirty,
+                                Some(&snapshot),
                                 sync_v2_sidecar,
                             )
                         })
                         .await?;
 
                     self.accept_persisted_state(saved_header, saved_entries);
-                    self.header_dirty = false;
                     self.appends_since_checkpoint = 0;
                     if let Some(v2_root) = synced_v2_root {
                         self.v2_sidecar_root = Some(v2_root);
@@ -5750,16 +5989,20 @@ impl Session {
                 if self.should_full_rewrite() {
                     // === Full rewrite path (first save, header change, checkpoint) ===
                     index_generation = Some(begin_session_index_namespace_change(&sessions_root)?);
+                    let snapshot = SessionHeaderSaveSnapshot {
+                        base: self.persisted_header.clone(),
+                        leaf_id: self.leaf_id.clone(),
+                    };
                     let (persisted_header, persisted_entries) =
-                        crate::session_sqlite::save_session(
+                        crate::session_sqlite::save_session_snapshot(
                             &path_clone,
                             &self.header,
                             &self.entries,
                             self.header_dirty,
+                            Some(&snapshot),
                         )
                         .await?;
                     self.accept_persisted_state(persisted_header, persisted_entries);
-                    self.header_dirty = false;
                     self.appends_since_checkpoint = 0;
                 } else {
                     // === Incremental append path ===
@@ -5804,7 +6047,10 @@ impl Session {
         // read back can carry another process's choice. Adopting that moved
         // this handle off the branch it had just extended.
         let own_leaf_override = self.header.current_leaf.clone();
+        self.persisted_header = Some(header.clone());
+        let (header, normalized_header_dirty) = normalize_loaded_header(header);
         self.header = header;
+        self.header_dirty = normalized_header_dirty;
         self.entries = entries;
         let finalized = finalize_loaded_entries(&mut self.entries);
         self.entry_ids = finalized.entry_ids;
@@ -5824,12 +6070,11 @@ impl Session {
             fallback_leaf,
             &self.entry_index,
         );
-        if self.header.current_leaf != own_leaf_override {
-            // The next rewrite records this handle's choice.
-            self.header.current_leaf = own_leaf_override;
-            self.header_dirty = true;
-        }
         self.is_linear = finalized.is_linear && self.leaf_id.eq(&finalized.leaf_id);
+        // Rebuild this handle's selected branch projection over the merged rows.
+        // Only the receipt above becomes the baseline; any local normalization
+        // or branch correction remains pending until a later successful write.
+        self.sync_navigation_state_to_header();
         self.persisted_entry_count
             .store(self.entries.len(), Ordering::SeqCst);
         self.persisted_path.clone_from(&self.path);
@@ -7716,7 +7961,7 @@ fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
 // ============================================================================
 
 /// Session file header.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
     pub r#type: String,
@@ -8898,6 +9143,7 @@ fn open_jsonl_blocking_with_entry_limit(
     header
         .validate()
         .map_err(|reason| crate::Error::session(format!("Invalid session header: {reason}")))?;
+    let persisted_header = Some(header.clone());
     let (header, normalized_header_dirty) = normalize_loaded_header(header);
 
     let mut entries = Vec::new();
@@ -9031,6 +9277,7 @@ fn open_jsonl_blocking_with_entry_limit(
             header,
             entries,
             persisted_path: Some(path_buf.clone()),
+            persisted_header,
             path: Some(path_buf),
             reserved_path: None,
             leaf_id: leaf_id.clone(),
@@ -14319,7 +14566,14 @@ mod tests {
     fn append_keeps_this_handles_leaf_when_another_process_moved_the_disk_leaf() {
         let temp = tempfile::tempdir().unwrap();
         let mut first = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        first.set_model_header(
+            Some("initial-provider".to_string()),
+            Some("initial-model".to_string()),
+            Some("low".to_string()),
+        );
         let id_a = first.append_message(make_test_message("A"));
+        first.append_model_change("branch-provider".to_string(), "branch-model".to_string());
+        first.append_thinking_level_change("high".to_string());
         first.append_message(make_test_message("B"));
         run_async(async { first.save().await }).unwrap();
         let path = first.path.clone().unwrap();
@@ -14331,9 +14585,21 @@ mod tests {
         run_async(async { first.save().await }).unwrap();
 
         let id_c = second.append_message(make_test_message("C"));
+        assert!(!second.header_dirty, "fixture must use incremental append");
         run_async(async { second.save().await }).unwrap();
         assert_eq!(second.leaf_id.as_deref(), Some(id_c.as_str()));
         assert_eq!(second.to_messages_for_current_path().len(), 3);
+        assert_eq!(second.header.provider.as_deref(), Some("branch-provider"));
+        assert_eq!(second.header.model_id.as_deref(), Some("branch-model"));
+        assert_eq!(second.header.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            second
+                .persisted_header
+                .as_ref()
+                .and_then(|header| header.provider.as_deref()),
+            Some("initial-provider"),
+            "only the actual disk header becomes the accepted baseline"
+        );
 
         // Its next save records its own leaf, so a reopen lands on C too.
         second.append_message(make_test_message("D"));
@@ -14341,6 +14607,9 @@ mod tests {
         let loaded =
             run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
         assert_eq!(loaded.to_messages_for_current_path().len(), 4);
+        assert_eq!(loaded.header.provider.as_deref(), Some("branch-provider"));
+        assert_eq!(loaded.header.model_id.as_deref(), Some("branch-model"));
+        assert_eq!(loaded.header.thinking_level.as_deref(), Some("high"));
     }
 
     #[test]
@@ -19511,6 +19780,330 @@ mod tests {
         assert!(diagnostics.skipped_entries.is_empty());
         assert_eq!(adopted_header.provider.as_deref(), Some("newer-provider"));
         assert_eq!(reloaded.header.provider.as_deref(), Some("newer-provider"));
+    }
+
+    fn header_merge_store_kinds() -> impl Iterator<Item = SessionStoreKind> {
+        [
+            SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            SessionStoreKind::Sqlite,
+        ]
+        .into_iter()
+    }
+
+    #[test]
+    fn stale_header_edits_preserve_revoked_roots_and_independent_metadata() {
+        run_async(async {
+            for store_kind in header_merge_store_kinds() {
+                let dir = tempfile::tempdir().expect("session directory");
+                let shared = dir.path().join("shared");
+                let replacement = dir.path().join("replacement");
+                let mut seed =
+                    Session::create_with_dir_and_store(Some(dir.path().to_path_buf()), store_kind);
+                seed.set_model_header(
+                    Some("original-provider".to_string()),
+                    Some("original-model".to_string()),
+                    Some("low".to_string()),
+                );
+                seed.set_additional_roots(std::slice::from_ref(&shared));
+                seed.append_message(make_test_message("original"));
+                seed.save().await.expect("seed session");
+                let path = seed.path.clone().expect("session path");
+                let path_text = path.to_string_lossy();
+                let mut stale = Session::open(&path_text).await.expect("stale handle");
+                let mut revoker = Session::open(&path_text).await.expect("revoking handle");
+
+                revoker.set_additional_roots(&[]);
+                revoker.save().await.expect("persist revocation");
+                stale.set_model_header(
+                    Some("new-provider".to_string()),
+                    Some("new-model".to_string()),
+                    Some("high".to_string()),
+                );
+                stale.append_message(make_test_message("pending local turn"));
+                stale.save().await.expect("merge independent model edit");
+
+                let reloaded = Session::open(&path_text).await.expect("reload merged session");
+                assert!(reloaded.additional_roots().is_empty());
+                assert!(stale.additional_roots().is_empty());
+                assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
+                assert_eq!(reloaded.header.thinking_level.as_deref(), Some("high"));
+
+                // This edit must compare against the newly accepted revocation,
+                // not the original header that still granted the shared root.
+                stale.set_additional_roots(std::slice::from_ref(&replacement));
+                stale.save().await.expect("advance accepted-header baseline");
+                revoker.set_branched_from(Some("source-session.jsonl".to_string()));
+                revoker.save().await.expect("merge independent provenance edit");
+                let reloaded = Session::open(&path_text).await.expect("reload second merge");
+                assert_eq!(reloaded.additional_roots(), vec![replacement]);
+                assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
+                assert_eq!(reloaded.header.thinking_level.as_deref(), Some("high"));
+                assert_eq!(
+                    reloaded.header.parent_session.as_deref(),
+                    Some("source-session.jsonl")
+                );
+                assert_eq!(reloaded.entries.len(), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn conflicting_header_edits_keep_pending_turns_retryable_without_regranting_roots() {
+        run_async(async {
+            for store_kind in header_merge_store_kinds() {
+                let dir = tempfile::tempdir().expect("session directory");
+                let shared = dir.path().join("shared");
+                let additional = dir.path().join("additional");
+                let mut seed =
+                    Session::create_with_dir_and_store(Some(dir.path().to_path_buf()), store_kind);
+                seed.set_additional_roots(std::slice::from_ref(&shared));
+                seed.append_message(make_test_message("original"));
+                seed.save().await.expect("seed session");
+                let path = seed.path.clone().expect("session path");
+                let path_text = path.to_string_lossy();
+                let mut stale = Session::open(&path_text).await.expect("stale handle");
+                let mut revoker = Session::open(&path_text).await.expect("revoking handle");
+                let accepted_before = stale.persisted_header.clone();
+
+                revoker.set_additional_roots(&[]);
+                revoker.save().await.expect("persist revocation");
+                let durable_before = Session::open(&path_text).await.expect("durable state");
+                stale.set_additional_roots(&[shared, additional]);
+                let pending_id = stale.append_message(make_test_message("must remain retryable"));
+
+                for _ in 0..2 {
+                    let error = stale.save().await.expect_err("conflicting grant must fail");
+                    assert!(error.to_string().contains("header conflict in additional roots"));
+                    assert_eq!(stale.persisted_header, accepted_before);
+                    assert!(stale.autosave_metrics().pending_mutations > 0);
+                    assert!(stale.get_entry(&pending_id).is_some());
+                    let unchanged = Session::open(&path_text).await.expect("reload refused save");
+                    assert_eq!(unchanged.header, durable_before.header);
+                    assert_eq!(
+                        serde_json::to_value(&unchanged.entries).expect("encode durable entries"),
+                        serde_json::to_value(&durable_before.entries)
+                            .expect("encode original entries")
+                    );
+                    assert!(unchanged.get_entry(&pending_id).is_none());
+                }
+
+                // Explicitly resolve the conflict in favor of the durable
+                // revocation. The pending turn can now be saved exactly once.
+                stale.set_additional_roots(&[]);
+                stale.save().await.expect("save resolved pending turn");
+                stale.save().await.expect("idempotent retry");
+                let reloaded = Session::open(&path_text).await.expect("reload resolved save");
+                assert!(reloaded.additional_roots().is_empty());
+                assert_eq!(
+                    reloaded
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.base_id() == Some(&pending_id))
+                        .count(),
+                    1
+                );
+                assert_eq!(stale.persisted_header.as_ref(), Some(&reloaded.header));
+                assert_eq!(stale.autosave_metrics().pending_mutations, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn header_only_model_conflicts_cannot_create_a_mixed_provider_model_pair() {
+        run_async(async {
+            for store_kind in header_merge_store_kinds() {
+                let dir = tempfile::tempdir().expect("session directory");
+                let mut seed =
+                    Session::create_with_dir_and_store(Some(dir.path().to_path_buf()), store_kind);
+                seed.set_model_header(
+                    Some("original-provider".to_string()),
+                    Some("original-model".to_string()),
+                    None,
+                );
+                seed.append_message(make_test_message("original"));
+                seed.save().await.expect("seed session");
+                let path = seed.path.clone().expect("session path");
+                let path_text = path.to_string_lossy();
+                let mut first = Session::open(&path_text).await.expect("first handle");
+                let mut second = Session::open(&path_text).await.expect("second handle");
+
+                first.set_model_header(
+                    Some("new-provider".to_string()),
+                    Some("new-model".to_string()),
+                    None,
+                );
+                first.save().await.expect("persist new model pair");
+                second.set_model_header(None, Some("other-model".to_string()), None);
+                let error = second.save().await.expect_err("model pair must conflict");
+                assert!(error.to_string().contains("header conflict in model"));
+                let reloaded = Session::open(&path_text).await.expect("reload model choice");
+                assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
+
+                second.set_model_header(
+                    Some("new-provider".to_string()),
+                    Some("new-model".to_string()),
+                    Some("high".to_string()),
+                );
+                second.save().await.expect("resolve pair and preserve independent edit");
+                let reloaded = Session::open(&path_text).await.expect("reload resolved pair");
+                assert_eq!(reloaded.header.provider.as_deref(), Some("new-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("new-model"));
+                assert_eq!(reloaded.header.thinking_level.as_deref(), Some("high"));
+            }
+        });
+    }
+
+    #[test]
+    fn merged_history_preserves_selected_branch_and_its_model_projection_on_reload() {
+        run_async(async {
+            for store_kind in header_merge_store_kinds() {
+                let dir = tempfile::tempdir().expect("session directory");
+                let mut seed =
+                    Session::create_with_dir_and_store(Some(dir.path().to_path_buf()), store_kind);
+                seed.set_model_header(
+                    Some("original-provider".to_string()),
+                    Some("original-model".to_string()),
+                    Some("low".to_string()),
+                );
+                seed.append_model_change(
+                    "original-provider".to_string(),
+                    "original-model".to_string(),
+                );
+                seed.append_thinking_level_change("low".to_string());
+                let original_leaf = seed.append_message(make_test_message("original"));
+                seed.save().await.expect("seed branch point");
+                let path = seed.path.clone().expect("session path");
+                let path_text = path.to_string_lossy();
+                let mut anchor = Session::open(&path_text).await.expect("anchor handle");
+                let mut left = Session::open(&path_text).await.expect("left branch");
+                let mut right = Session::open(&path_text).await.expect("right branch");
+
+                right.append_model_change("right-provider".to_string(), "right-model".to_string());
+                right.append_thinking_level_change("high".to_string());
+                let right_leaf = right.append_message(make_test_message("right turn"));
+                right.set_model_header(
+                    Some("right-provider".to_string()),
+                    Some("right-model".to_string()),
+                    Some("high".to_string()),
+                );
+                right.save().await.expect("save right branch");
+                left.append_model_change("left-provider".to_string(), "left-model".to_string());
+                left.append_thinking_level_change("medium".to_string());
+                let left_leaf = left.append_message(make_test_message("left turn"));
+                left.set_model_header(
+                    Some("left-provider".to_string()),
+                    Some("left-model".to_string()),
+                    Some("medium".to_string()),
+                );
+                left.save().await.expect("merge independent branch model selection");
+
+                let merged = Session::open(&path_text).await.expect("reload merged branches");
+                assert_eq!(merged.leaf_id(), Some(left_leaf.as_str()));
+                assert_eq!(merged.header.provider.as_deref(), Some("left-provider"));
+                assert_eq!(merged.header.model_id.as_deref(), Some("left-model"));
+                assert_eq!(merged.header.thinking_level.as_deref(), Some("medium"));
+                assert!(merged.get_entry(&right_leaf).is_some());
+
+                // The anchor still considers its own leaf the natural tip. Once
+                // the other histories are merged, that same selection needs an
+                // explicit durable leaf instead of another writer's final row.
+                anchor.set_additional_roots(&[dir.path().join("extra-root")]);
+                anchor.save().await.expect("save metadata on the original branch");
+                let mut reloaded = Session::open(&path_text).await.expect("reload original branch");
+                assert_eq!(anchor.leaf_id(), Some(original_leaf.as_str()));
+                assert_eq!(reloaded.leaf_id(), anchor.leaf_id());
+                assert_eq!(reloaded.header.provider.as_deref(), Some("original-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("original-model"));
+                assert_eq!(reloaded.header.thinking_level.as_deref(), Some("low"));
+                assert!(reloaded.navigate_to(&right_leaf));
+                assert_eq!(reloaded.header.provider.as_deref(), Some("right-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("right-model"));
+                assert_eq!(reloaded.header.thinking_level.as_deref(), Some("high"));
+                assert!(reloaded.navigate_to(&left_leaf));
+                assert_eq!(reloaded.header.provider.as_deref(), Some("left-provider"));
+                assert_eq!(reloaded.header.model_id.as_deref(), Some("left-model"));
+
+                anchor.reset_leaf();
+                anchor.save().await.expect("persist explicit empty root");
+                let reloaded = Session::open(&path_text).await.expect("reload empty root");
+                assert_eq!(reloaded.leaf_id(), None);
+                assert!(reloaded.to_messages_for_current_path().is_empty());
+                assert!(reloaded.get_entry(&left_leaf).is_some());
+                assert!(reloaded.get_entry(&right_leaf).is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn incremental_jsonl_receipt_keeps_raw_header_separate_from_pending_normalization() {
+        run_async(async {
+            let dir = tempfile::tempdir().expect("session directory");
+            let mut session = Session::create_with_dir(Some(dir.path().to_path_buf()));
+            session.set_model_header(
+                Some("original-provider".to_string()),
+                Some("original-model".to_string()),
+                None,
+            );
+            session.append_message(make_test_message("original"));
+            session.save().await.expect("seed session");
+            let path = session.path.clone().expect("session path");
+
+            // An external writer can publish a valid legacy-style header with
+            // no explicit fallback. Appending rows does not rewrite that header.
+            let mut external = session.header.clone();
+            external.provider = Some("external-provider".to_string());
+            external.model_id = Some("external-model".to_string());
+            external.fallback_provider = None;
+            external.fallback_model_id = None;
+            save_jsonl_full_rewrite_blocking(
+                &path,
+                dir.path(),
+                &external,
+                &session.entries,
+                true,
+            )
+            .expect("publish unnormalized external header");
+            session.append_message(make_test_message("incremental local turn"));
+            assert!(!session.header_dirty, "fixture must use incremental append");
+            session.save().await.expect("append without rewriting header");
+
+            let (on_disk, _) = open_jsonl_for_append(&path).expect("read exact disk header");
+            assert_eq!(on_disk, external);
+            assert_eq!(session.persisted_header.as_ref(), Some(&on_disk));
+            assert_eq!(
+                session.header.fallback_provider.as_deref(),
+                Some("external-provider")
+            );
+            assert!(session.header_dirty, "live normalization is still pending");
+
+            external.provider = Some("next-provider".to_string());
+            external.model_id = Some("next-model".to_string());
+            save_jsonl_full_rewrite_blocking(
+                &path,
+                dir.path(),
+                &external,
+                &session.entries,
+                true,
+            )
+            .expect("publish a later independent model choice");
+            session.set_additional_roots(&[dir.path().join("extra-root")]);
+            session.save().await.expect("publish pending normalization with merged metadata");
+
+            let (on_disk, _) = open_jsonl_for_append(&path).expect("read normalized disk header");
+            assert_eq!(on_disk.provider.as_deref(), Some("next-provider"));
+            assert_eq!(on_disk.model_id.as_deref(), Some("next-model"));
+            assert_eq!(on_disk.fallback_provider.as_deref(), Some("external-provider"));
+            assert_eq!(on_disk.fallback_model_id.as_deref(), Some("external-model"));
+            assert_eq!(session.persisted_header.as_ref(), Some(&on_disk));
+            assert!(!session.header_dirty);
+            let reloaded = Session::open(&path.to_string_lossy()).await.expect("reload receipt");
+            assert_eq!(reloaded.header, on_disk);
+            assert_eq!(reloaded.entries.len(), 2);
+        });
     }
 
     #[test]
