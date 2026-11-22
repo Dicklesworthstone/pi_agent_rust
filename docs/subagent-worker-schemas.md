@@ -1,10 +1,11 @@
 # Structured results from reusable workers and pools
 
-Reusable RPC workers can now enforce a frozen JSON Schema on every completed
-turn. The child retains its conversation and process; the host retains a typed
-`data` value only when that turn's complete terminal answer validates. This
-works for individual `worker_start` conversations and every member of a
-`pool_start` workpool. Independent-task schema retry behavior is unchanged.
+Reusable RPC workers can enforce a frozen JSON Schema on every completed
+logical item. The child retains its conversation and process; with a declared
+schema, the host retains `data` only when the item's complete terminal answer
+validates. This works for individual `worker_start` conversations and every
+member of a `pool_start` workpool, including grouped keyed final results.
+Independent-task schema retry behavior is unchanged.
 
 ## Launch with an explicit contract
 
@@ -163,6 +164,45 @@ pool_cursor = page['nextCursor']
 await pool.finish()
 ```
 
+### Group several assignments into one child turn
+
+Set `maxBatchSize` on native `pool_start` or JavaScript `workpool()`, or
+`max_batch_size` on Python `workpool()`, to an integer from 1 through 8.
+The default is 1. The value is frozen at launch, included in pool snapshots,
+and recovered when attaching to an existing pool. Standalone `worker_start`
+and later controls reject it. Larger values let each child take a FIFO group
+of queued assignments, bounded by the selected count and 64 KiB of combined
+task text. A child does not wait for the group to fill.
+
+For grouped mode, including a singleton group, the child returns exactly this
+kind of final envelope:
+
+```json
+{"items":[{"key":7,"data":{"findings":[]}},{"key":8,"error":"The requested file is unavailable."}]}
+```
+
+The prompt supplies the keys: they are the original internal worker turn IDs,
+which the host maps back to stable pool item IDs. Every active key must occur
+exactly once, in any order. The envelope contains only `items`; each row
+contains exactly `key` and either `data` or `error`. An error must be nonblank
+text of at most 4096 UTF-8 bytes. The complete envelope is limited to 32 KiB.
+Missing, duplicate, foreign or malformed keys and invalid row shapes fail the
+entire group before any data is accepted.
+
+After that envelope validates, `outputSchema` applies independently to each
+`data` value. One schema failure or explicit item error leaves valid peers
+available. Without an output schema, grouped data still appears as parsed
+`data`, including `null`, but has no `schemaValid` claim. Each result retains
+only its own task and output. No repair prompt or automatic replay is added.
+The default batch size of 1 keeps ordinary single-answer semantics.
+
+With worktree isolation, all items in a group carry the same cumulative patch
+against their member's original baseline. Their native result's
+`details.workerBatch` records the shared `requestId`, the item's `key`, all
+`turnIds`, and `patchScope: "cumulative_worker_batch"`. These are shared patch
+snapshots, not independent changes to apply once per item. This grouped final
+result protocol does not add an intermediate child `yield` tool.
+
 Direct `pool_result` and item-selected `pool_wait` expose the validated value
 at `details.item.result.details.results[0].data`. Drains retain the same full
 native result per item. A schema mismatch fails that item without replacing
@@ -172,8 +212,8 @@ unsuccessful. The aggregate remains a bounded summary manifest, not an array
 of full typed answers. Use item reads or `drain()` to collect those answers.
 
 Cancellation retains already accepted typed peers and returns explicit errors
-for unfinished work, never fabricated `data`. A schema-valid result changed
-by any captured batch privacy policy or the current read policy makes the
+for unfinished work, never fabricated `data`. A schema-valid or grouped data
+result changed by any captured batch privacy policy or the current read policy makes the
 individual read or entire drain fail without a new acknowledgment cursor.
 This does not erase stored data or weaken privacy to salvage a page. Summary
 manifests remain redacted descriptive views, not schema-validated answer bodies.
@@ -193,8 +233,9 @@ owned definition before process launch and appends the contract to each turn's
 prompt, including after compaction. Changing the definition file does not change
 an already-running worker's contract, model, tools, workspace, or lifetime.
 
-Validation requires exactly one JSON value. Prose wrappers, Markdown fences,
-trailing values, duplicate decoded keys, and schema mismatches fail the turn.
+Ungrouped validation requires exactly one JSON value. Prose wrappers, Markdown
+fences, trailing values, duplicate decoded keys, and schema mismatches fail the
+turn.
 No extraction heuristics, coercion, automatic repair prompt, or retry is used.
 A failed turn exposes `schemaValid: false`, `schemaRetries: 0`, a static error,
 and no `data`; its native result is unsuccessful. The process can accept later
@@ -209,15 +250,16 @@ cancelled request, or earlier turn cannot become a typed result. Schema failure
 does not roll back filesystem or tool effects performed by the child. A matching
 schema establishes structure, not factual correctness or approval to act.
 
-Schemas are limited to 16 KiB, bounded depth and nodes; answers to 32 KiB.
+Schemas are limited to 16 KiB, bounded depth and nodes; answers to 32 KiB,
+including the entire keyed envelope when grouping is enabled.
 Local definitions/references are supported. External schema retrieval is
 explicitly refused. Existing command, result-retention, turn, job-capacity,
 permission, cancellation and deadline limits remain authoritative; no budget is
 renewed. Schema compilation/validation is synchronous bounded-input work, not a
 hard CPU-time guarantee for arbitrary schemas.
 
-If privacy projection changes any part of a schema-valid native result, that
-result is withheld rather than retaining a validation claim for different data.
+If privacy projection changes any part of a schema-valid or grouped data result,
+that result is withheld rather than retaining a typed claim for different data.
 This applies at storage and on later worker reads under stricter policy. Plain
 text turns retain their existing redaction behavior. Known results do not gain
 new authority through recovery, and a host restart does not resume the worker.

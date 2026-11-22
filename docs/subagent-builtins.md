@@ -311,7 +311,10 @@ drain pages expose `workerWorkspaces` rows of
 A completed turn's native result carries `iso` with the cumulative patch
 against the original captured baseline. Later turns on the same member include
 earlier edits: these are successive snapshots, so do not apply them as
-independent patches. Different pool members retain separate worktrees and
+independent patches. When several pool items share one child prompt, each
+receives the same cumulative snapshot. Their native `details.workerBatch`
+metadata identifies that shared request and its original turn keys; do not
+apply a copy once per item. Different pool members retain separate worktrees and
 patches. A cancelled or failed turn may have only its workspace descriptor;
 inspect the retained files rather than assuming no changes occurred. Existing
 result-size limits still apply. Privacy projection cannot rewrite an actionable
@@ -348,8 +351,8 @@ interpreter is not needed to keep them running.
 ```
 
 The acknowledgment has `details.schema: "pi.subagent.pool.v1"`, a stable
-`poolId`, a carrier `jobId`, and `admittedItemIds` in input order. Item IDs are
-1-based, never reused and independent of internal worker/turn assignments.
+`poolId`, a carrier `jobId`, `maxBatchSize`, and `admittedItemIds` in input order.
+Item IDs are 1-based, never reused and independent of internal worker/turn assignments.
 The `items` manifest retains admission order and exposes each item's stable
 `workerIndex` for association with `workerContexts` and `workerWorkspaces`.
 Internal member worker handles are not published and cannot be used to cancel
@@ -377,8 +380,22 @@ When all members are busy, assignment balances pending item counts, using
 prior admissions and member order to break ties. Accepted items keep their
 assigned child and run in FIFO order. A later item has no guaranteed affinity
 to a particular earlier item's child. Failed members are not silently replaced.
-This scheduling preserves individual native turns; it does not combine queued
-items into OMP's keyed child-yield batches.
+
+Optional `maxBatchSize` on `pool_start` accepts 1–8 and defaults to 1. It is
+frozen for every member and cannot be changed by later controls. Larger values
+let a worker group queued assignments into one child prompt, bounded to that
+many items and 64 KiB of combined raw UTF-8 task text. The worker takes the
+available FIFO prefix without waiting for a full group. Pool item IDs, per-item
+privacy snapshots, dependencies, retained results and drain cursors stay separate.
+
+Grouped mode requires a keyed final envelope with exactly one `data` or
+`error` result for every supplied worker turn key. The host validates the whole
+envelope after successful terminal completion and the idle barrier before
+accepting data. Malformed envelopes fail all group members; valid per-item
+errors or schema failures preserve successful peers, without retrying work.
+See [grouped result contracts](subagent-worker-schemas.md#group-several-assignments-into-one-child-turn).
+Default pools and standalone workers retain one prompt per item. Grouping does
+not install a child `yield` tool or accept intermediate streamed answers.
 
 ### Native operations and result shapes
 
@@ -386,7 +403,7 @@ All controls use the `subagent` tool with an explicit `operation` field:
 
 | Operation | Fields and behavior |
 | --- | --- |
-| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), `cwd`, `scope`, `timeoutSeconds`, `isolation: "none" \| "worktree"`, and keep-only `isoApply`. Returns the new identity and admitted item IDs. |
+| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), frozen `maxBatchSize` (1–8, default 1), `cwd`, `scope`, `timeoutSeconds`, `isolation: "none" \| "worktree"`, and keep-only `isoApply`. Returns the new identity and admitted item IDs. |
 | `pool_push` | Requires `poolId` and a nonempty `tasks` array. Returns all newly admitted item IDs; cannot change launch settings. |
 | `pool_status` | Requires `poolId`. Returns one bounded manifest with status, counts, ordered summaries and result references. |
 | `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
@@ -398,9 +415,10 @@ All controls use the `subagent` tool with an explicit `operation` field:
 
 Pool status is `open`, `draining`, `completed`, `failed` or `cancelled`.
 `sealed` reports whether further native admission is closed. The manifest
-includes `concurrency`, `admittedItems`, `queuedItems`, `runningItems`,
-`completedItems`, `failedItems` and `remainingMs`. Failed counts include
-cancelled items. Each manifest entry has this shape:
+includes `concurrency`, `maxBatchSize`, `admittedItems`, `queuedItems`,
+`runningItems`, `completedItems`, `failedItems` and `remainingMs`. Failed counts include
+cancelled items. Counts describe logical items, so several running items may
+share one child prompt. Each manifest entry has this shape:
 
 ```json
 {"id":1,"workerIndex":1,"status":"completed","summary":"Bounded task summary…","resultRef":{"poolId":"pool-…","itemId":1}}
@@ -440,8 +458,8 @@ full results per page:
 The returned `details.schema` is `pi.subagent.pool.drain.v1`. Its `items` are
 `{id, workerIndex, status, result}` records in ascending item order among currently settled
 results. `result` is the full native `ToolOutput`. The page includes pool/job/
-agent identity, pool `status`, `sealed`, and `admittedItems`, `settledItems` and
-`pendingItems` counts.
+agent identity, pool `status`, `sealed`, `maxBatchSize`, and `admittedItems`,
+`settledItems` and `pendingItems` counts.
 
 Only advance to `nextCursor` after processing the page:
 
@@ -548,10 +566,18 @@ runtime's error result rather than a successful aggregate manifest.
 - A pool admits at most 32 items across all pushes. Each assignment is nonempty
   UTF-8 text of at most 64 KiB without NUL. Native `pool_start` accepts an empty
   initial batch; native `pool_push` does not.
+- `maxBatchSize` controls items per child prompt, independently of the 1–8
+  child-process concurrency. Groups retain the same 64 KiB combined task-text
+  ceiling and accept at most 32 KiB of keyed final JSON for the entire group.
+  It is a launch-only pool option; standalone workers reject it.
 - Eval's JavaScript and Python `workpool()` helpers additionally cap the entire
   encoded batch request at 256 KiB and validate it before dispatch. Split larger
   submissions across pushes. Each accepted guest batch uses one host call, as
   does each complete manifest observation.
+- Eval map/reduce uses an admission window of
+  `min(32, maxItems, concurrency * maxBatchSize)` with the equivalent Python
+  option names. Grouping expands the number of outstanding logical items
+  without changing the native pool's total lifetime capacity.
 - One original deadline covers discovery, startup, queueing, execution and idle
   time. The host limit defaults to 900 seconds; `timeoutSeconds` may shorten it.
   Push, finish and observation waits never renew the deadline.
@@ -559,7 +585,8 @@ runtime's error result rather than a successful aggregate manifest.
   captured at startup. Pools support Unix and Windows with `isolation: "none"`
   or `"worktree"`; isolated members preserve their worktrees with keep-only
   disposition. A launch-time `outputSchema` or schema-bearing definition applies
-  one strict output contract to every member and turn, without corrective retries.
+  one strict output contract to every member and logical item's data, including
+  grouped results, without corrective retries.
   Historical `seance` consultation remains on the ordinary delegation path.
 - Every native operation checks the current owning session and cancellation
   state. An eval request also passes its active Agent's current tool, approval,

@@ -802,6 +802,11 @@ impl Tool for EvalTool {
          or await workpool(agent=...,concurrency=...) in Python creates a lazy \
          native pool; await pool.push([prompts]) atomically admits a batch and \
          returns fixed item handles. One session job owns 1-8 reusable workers. \
+         Set maxBatchSize in JS or max_batch_size in Python to 1-8 (default 1) \
+         to group queued assignments into fewer model turns. This limit is \
+         frozen at launch. Grouped items retain separate keyed JSON results, \
+         available after the full turn settles; outputSchema / output_schema \
+         validates each item's data independently. \
          pool.items retains handles; await pool.peek() or pool.status() returns \
          one bounded summary manifest. Use item.output() or item.wait() for full \
          results. pool.drain({cursor,timeout,maxItems}) in JS or \
@@ -811,6 +816,8 @@ impl Tool for EvalTool {
          JS workpool.mapReduce(source,map,reduce,initial,options) and Python \
          workpool.map_reduce(source,map,reduce,initial,**options) consume \
          iterables with bounded admission and reduce full results as they settle. \
+         Their admission window is min(32,maxItems,concurrency*maxBatchSize), \
+         using max_items and max_batch_size in Python. \
          Put launch options in pool; errors retain pool, cursor and progress. \
          Idle workers prefer lower observed active context pressure. \
          await pool.finish() seals admission and returns the aggregate \

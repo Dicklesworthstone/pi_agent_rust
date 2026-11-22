@@ -15,6 +15,7 @@ function fixture(options = {}) {
     const pool = {
         id: null,
         concurrency: options.concurrency ?? 3,
+        maxBatchSize: options.maxBatchSize ?? 1,
         async push(tasks) {
             assert.equal(state.sealed, false);
             return tasks.map(task => {
@@ -92,6 +93,27 @@ for (const concurrency of [1, 2, 3, 8]) {
         assert.deepEqual(plain(result.cursor.itemIds), f.state.reduced);
     });
 }
+
+test('grouped ordered reduction retains every unacknowledged sibling on failure', async () => {
+    const f = fixture({concurrency:1,maxBatchSize:4,pageSize:4});
+    const cause = new Error('item two failed after receiving a grouped page');
+    const error = await f.run(['a','b','c','d'],mapTask,async (value,item)=>{
+        if (item.id===2) throw cause;
+        f.state.reduced.push(item.id);
+        return value+1;
+    },0,{ordered:true}).catch(error=>error);
+    assert.equal(f.state.highWater,4);
+    assert.equal(error.cause,cause);
+    assert.equal(error.item.id,2);
+    assert.equal(error.progress.completed,1);
+    assert.deepEqual(plain(error.cursor.itemIds),[1]);
+    assert.deepEqual(plain(error.pending.map(item=>item.itemId)),[2,3,4]);
+    assert.deepEqual(f.state.reduced,[1]);
+    assert.equal(f.state.closes,1);
+    const page=await f.pool.drain({cursor:error.cursor,timeout:1,maxItems:4});
+    assert.deepEqual(page.items.map(item=>item.id),[4,3,2]);
+    assert.equal(f.state.tasks.length,4,'recovery must not resubmit any grouped assignment');
+});
 
 test('default and explicit false preserve arrival-order reductions', async () => {
     for (const options of [{}, {ordered: false}]) {

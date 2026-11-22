@@ -26,7 +26,7 @@ const report = await workpool.mapReduce(
     }],
     [],
     {
-        pool: {agent: 'reviewer', concurrency: 3, timeoutSeconds: 120},
+        pool: {agent: 'reviewer', concurrency: 2, maxBatchSize: 2, timeoutSeconds: 120},
         timeout: 90,
         ordered: true,
         onPool: pool => { globalThis.reviewPool = pool; },
@@ -48,7 +48,8 @@ report = await workpool.map_reduce(
         'result': item['result'],
     }],
     [],
-    pool={'agent': 'reviewer', 'concurrency': 3, 'timeout_seconds': 120},
+    pool={'agent': 'reviewer', 'concurrency': 2, 'max_batch_size': 2,
+          'timeout_seconds': 120},
     timeout=90,
     ordered=True,
 )
@@ -60,11 +61,22 @@ Use the same native workpool options already accepted by each language's
 the existing factory validates and freezes native launch settings. Every
 subsequent operation still goes through the current kernel bridge.
 
+`maxBatchSize` / `max_batch_size` accepts 1–8 and defaults to 1. Values above
+1 let each native child process several queued assignments in one prompt,
+returning a separate keyed final result for every original item. The setting
+is immutable after launch and recovered from native snapshots on attachment.
+Groups may be smaller than the maximum: workers do not wait for a full group,
+and combined task text is capped at 64 KiB per prompt. Each item still has its
+own handle, schema check, status and result cursor entry.
+
 ## Admission and ordering
 
 Inputs may be synchronous or asynchronous iterables. The helper retains at
-most `pool.concurrency` mapped or admitted inputs awaiting reduction (1–8),
-rather than materializing the whole source or submitting every task at once.
+most `min(32, maxItems, concurrency * maxBatchSize)` mapped or admitted inputs
+awaiting reduction, using the corresponding Python option names there.
+The default batch size of 1 caps the window at the selected concurrency;
+larger groups can fill a window of up to 32 items without materializing the
+whole source.
 A completed result frees a slot only after its reducer returns successfully.
 
 The mapper runs in source order. By default the reducer runs sequentially in
@@ -76,7 +88,7 @@ The option must be a boolean; its default is false in both languages.
 
 At most four completed items are read per native drain call. Ordered pipelines
 buffer later results until the next source item arrives. Buffered outcomes
-still count against the original 1–8 item admission window, so a slow first
+still count against the same bounded admission window, so a slow first
 item cannot cause unbounded input pulls or result retention. The tradeoff is
 head-of-line blocking: workers can become idle behind an earlier slow task.
 Leave ordering disabled when completion-order throughput matters more. This
@@ -213,10 +225,19 @@ than assigned to the wrong source input.
 
 ## Scope and validation
 
-These helpers implement bounded streaming map/reduce over **one prompt per
-native workpool item**. They do not implement OMP's keyed intermediate child
-`yield`, export parent-kernel callback tools to children, or background an
-entire eval cell.
+These helpers implement bounded streaming map/reduce over native workpool
+items, with optional grouping of several items into one child prompt. The
+child returns the complete keyed final envelope before any group result is
+accepted; the reducer still runs once per item. A malformed envelope fails
+the group, while a valid envelope can contain independent successes and item
+errors. A schema mismatch fails only that item's value, with no automatic
+retry. This does not install an intermediate child `yield` tool, export
+parent-kernel callback tools to children, or background an entire eval cell.
+
+With worktree isolation, items from one group share the same cumulative worker
+patch. Their native `details.workerBatch` metadata identifies the shared RPC
+request and original turn keys. Do not apply those copies as independent
+patches; later groups on the same member also include earlier edits.
 
 Focused protocol regressions execute the actual JS/Python helpers with
 controlled native-pool receipts:

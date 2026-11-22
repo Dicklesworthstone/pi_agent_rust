@@ -29,7 +29,7 @@ def worker(turn=3, status='completed', **extra):
 
 def pool(states=('completed', 'running'), status='open', **extra):
     return {'schema': 'pi.subagent.pool.v1', 'poolId': 'pool-a', 'jobId': 'job-pool',
-            'agent': 'reviewer', 'concurrency': 2, 'sealed': status != 'open', 'status': status,
+            'agent': 'reviewer', 'concurrency': 2, 'maxBatchSize': 1, 'sealed': status != 'open', 'status': status,
             'items': [{'id': index + 1, 'status': state} for index, state in enumerate(states)], **extra}
 
 
@@ -97,8 +97,9 @@ def fixture():
         async def output(self):
             return await Turn(self, self._turn_id).output()
     class BasePool:
-        def __init__(self, options, name, concurrency):
+        def __init__(self, options, name, concurrency, max_batch_size=1):
             self._options, self.name, self.concurrency = options, name, concurrency
+            self.max_batch_size = max_batch_size
             self._closed, self._finish_acknowledged = False, False
             self._items, self._pool_id, self._job_id = [], None, None
         @property
@@ -109,7 +110,8 @@ def fixture():
             return self._closed
         def _adopt(self, value):
             check_pool(value, self._pool_id)
-            if value['agent'] != self._options['agent'] or value['concurrency'] != self.concurrency:
+            if (value['agent'] != self._options['agent'] or value['concurrency'] != self.concurrency
+                    or value['maxBatchSize'] != self.max_batch_size):
                 raise BridgeError('EVAL_POOL_PROTOCOL: identity changed')
             self._pool_id, self._job_id = value['poolId'], value['jobId']
             self._items = list(value['items'])

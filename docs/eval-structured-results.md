@@ -795,9 +795,12 @@ print(first['content'])
 
 The pool exposes `id` / `poolId` and `jobId` in JavaScript, or `id` / `pool_id`
 and `job_id` in Python. IDs are null/`None` until the first native admission.
+`concurrency` and `maxBatchSize` / `max_batch_size` are read-only launch limits;
+`workpool.attach()` recovers their native values without changing them.
 `pool.items` retains fixed item handles in admission order as a frozen array or
 Python tuple. Each item has `itemId` / `item_id`, `poolId` / `pool_id`, `jobId` /
-`job_id`, and `agent`; `id` is the item ID. Items expose `status()`, `done()`,
+`job_id`, `agent`, and `maxBatchSize` / `max_batch_size`; `id` is the item ID.
+Items expose `status()`, `done()`,
 `output()` and `wait(seconds=30)`. They expose no worker ID or cancellation
 method: cancellation belongs to the entire pool.
 
@@ -834,6 +837,83 @@ creates and seals a real empty carrier job. An open pool remains available
 after its current batch drains. Call `finish()` when no further work will be
 added, or `close()` to stop it. Repeated acknowledged finish/close calls do not
 replay their native mutation. Cancelling does not roll back filesystem effects.
+
+### Group queued assignments into fewer model turns
+
+Set `maxBatchSize` in JavaScript or `max_batch_size` in Python to group up to
+eight queued assignments on the same child into one model turn. This reduces
+the number of turns needed for independent tasks that can share a conversation.
+The default is **1**, preserving one assignment per turn. The limit is frozen
+when the pool is created and cannot be changed by a later push or attachment.
+
+```javascript
+globalThis.pool = await workpool({
+    agent: 'reviewer', concurrency: 2, maxBatchSize: 4,
+    outputSchema: {
+        type: 'object',
+        properties: {summary: {type: 'string'}},
+        required: ['summary'], additionalProperties: false,
+    },
+});
+globalThis.items = await pool.push([
+    'Summarize the parser error-handling risks.',
+    'Summarize the cancellation risks.',
+    'Summarize the persistence risks.',
+    'Summarize the child-process cleanup risks.',
+]);
+await pool.finish();
+const first = await items[0].wait();
+console.log(first.details.results[0].data.summary);
+```
+
+```python
+pool = await workpool(
+    agent='reviewer', concurrency=2, max_batch_size=4,
+    output_schema={
+        'type': 'object',
+        'properties': {'summary': {'type': 'string'}},
+        'required': ['summary'], 'additionalProperties': False,
+    },
+)
+items = await pool.push([
+    'Summarize the parser error-handling risks.',
+    'Summarize the cancellation risks.',
+    'Summarize the persistence risks.',
+    'Summarize the child-process cleanup risks.',
+])
+await pool.finish()
+first = await items[0].wait()
+print(first['details']['results'][0]['data']['summary'])
+```
+
+The native scheduler takes an available FIFO prefix from each child's queue,
+bounded by the configured count and **64 KiB of combined UTF-8 task text**.
+It does not delay execution to fill a group, so a turn may contain fewer items
+than the limit. Opting into grouping uses the keyed protocol even for a
+singleton. Pool item IDs and handles remain stable, and each item keeps its
+own result, dependency tracking and privacy checks.
+
+The child receives native-owned keys and returns one final JSON envelope with
+exactly one `data` or `error` row per key. The host validates the entire key set
+before accepting any member. Missing, duplicate or foreign keys, extra fields,
+or an oversized/malformed envelope fail every member of that group; the host
+does not retry the assignments. The complete envelope is limited to **32 KiB**.
+An explicit item error or a failed per-item `outputSchema` validation affects
+only that item in an otherwise valid envelope. Successful `data` values appear
+at `result.details.results[0].data`, including without an output schema.
+
+Results become available after the child finishes the entire turn and reaches
+the post-compaction idle barrier. Grouping does not expose intermediate child
+yields. For earlier individual completion or larger per-item answers, keep the
+default limit of one. The map/reduce helpers fill a window of
+`min(32, maxItems, concurrency * maxBatchSize)` logical assignments, with the
+equivalent Python option names; see [workpool pipelines](eval-workpool-pipelines.md).
+
+In worktree isolation, all members of a group share the same cumulative
+worktree outcome. `result.details.workerBatch` records the physical request,
+native turn keys and `patchScope: "cumulative_worker_batch"`. These patches
+include the member's earlier turns and must not be stacked as independent
+item patches. Cancellation still belongs to the entire pool.
 
 ### Collect completed pool items across cells
 
@@ -876,7 +956,7 @@ print({'pending': page['pendingItems'], 'hasMore': page['hasMore'], 'done': page
 ```
 
 The returned `pi.subagent.pool.drain.v1` page contains `poolId`, `jobId`,
-`agent`, `status`, `sealed`, `admittedItems`, `settledItems`, `pendingItems`,
+`agent`, `maxBatchSize`, `status`, `sealed`, `admittedItems`, `settledItems`, `pendingItems`,
 `workerWorkspaces`, `items`, `cursor`, `nextCursor`, `hasMore`, `done` and
 `timedOut`. Each item has `id`, `workerIndex`, terminal `status`, and its full
 native `result` (`content`, `details`, optional `isError`). Item failures and
@@ -1011,13 +1091,15 @@ through `jobs`. Recovery uses those direct native operations; an unacknowledged
 guest object does not automatically bind to a recovered identity. No batch is
 replayed during recovery.
 
-Pool options are `name`, `agent`, `model`, `concurrency`, `cwd`, `scope`,
+Pool options are `name`, `agent`, `model`, `concurrency`,
+`maxBatchSize` / `max_batch_size`, `cwd`, `scope`,
 `isolation: "none" | "worktree"`, `isoApply` / `iso_apply`, and
 `timeoutSeconds` / `timeout_seconds`. Names are labels for the guest object.
 Agent definition, model, child tools and working directory are captured at
 native startup and cannot be changed by later pushes. Pools support Unix and
 Windows. `outputSchema` / `output_schema` or a schema-bearing definition freezes
-one strict output contract for every member and turn; `schemaMode` /
+one strict output contract for every logical item, including each `data` value
+in a grouped turn; `schemaMode` /
 `schema_mode`, when supplied, must be `"strict"`. Historical `seance`
 consultation remains on the independent-task path.
 
@@ -1052,9 +1134,9 @@ process-local bounded retention, not a disk-backed queue, process-restart
 recovery or durable conversation storage.
 
 Native aggregate completion is delivered through the existing session job
-notice, after drain and child cleanup. OMP's keyed yield batches and custom
-child-defined eval tools remain separate work. Native pools keep one prompt
-per admitted item, explicit sealing, and fixed child lifetimes.
+notice, after drain and child cleanup. Optional grouping supplies keyed final
+results while retaining explicit sealing and fixed child lifetimes. A child
+yield tool and custom child-defined eval tools remain separate work.
 
 ## Validation
 

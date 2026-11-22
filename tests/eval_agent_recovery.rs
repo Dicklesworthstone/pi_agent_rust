@@ -53,6 +53,7 @@ impl ToolInvocationHost for Host {
                     let mut value = json!({
                         "schema":"pi.subagent.pool.v1", "poolId":"pool-a", "jobId":"job-pool",
                         "agent":"reviewer", "status":"completed", "sealed":true, "concurrency":2,
+                        "maxBatchSize":1,
                         "remainingMs":100, "admittedItems":1, "queuedItems":0, "runningItems":0,
                         "completedItems":1, "failedItems":0,
                         "items":[{"id":1, "status":"completed", "summary":"accepted",

@@ -139,7 +139,8 @@ class PoolHost:
             counts[item["status"]] += 1
         return {"schema": "pi.subagent.pool.v1", "poolId": pool["id"], "jobId": pool["jobId"],
                 "agent": pool["agent"], "status": pool["status"], "sealed": pool["sealed"],
-                "concurrency": pool["concurrency"], "admittedItems": len(pool["items"]),
+                "concurrency": pool["concurrency"], "maxBatchSize": pool["maxBatchSize"],
+                "admittedItems": len(pool["items"]),
                 "queuedItems": counts["queued"], "runningItems": counts["running"],
                 "completedItems": counts["completed"], "failedItems": counts["failed"] + counts["cancelled"],
                 "workerContexts": [{"workerIndex": index + 1, "tokens": None, "window": None}
@@ -179,7 +180,8 @@ class PoolHost:
         if operation == "pool_start":
             pool_id = f"pool-native-{len(self.pools) + 1}"
             pool = {"id": pool_id, "jobId": f"carrier-{pool_id}", "agent": args["agent"],
-                    "concurrency": args["concurrency"], "status": "open", "sealed": False, "items": []}
+                    "concurrency": args["concurrency"], "maxBatchSize": args.get("maxBatchSize", 1),
+                    "status": "open", "sealed": False, "items": []}
             self.pools[pool_id] = pool
         else:
             pool = self.pools[args["poolId"]]
@@ -1781,6 +1783,74 @@ await pool.close()
             "operation": "pool_start", "concurrency": 3, "tasks": ["inspect"], "model": {"role": "tiny"},
         })
 
+    def test_grouped_pool_limits_are_bounded_and_frozen_before_admission(self):
+        for value in ("0", "9", "-1", "1.5", "True", "None", "'4'", "float('nan')", "float('inf')"):
+            response = self.kernel.cell(f"await workpool(max_batch_size={value})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(self.kernel.calls, [])
+        self.create_pool()
+        self.assertEqual(self.value(self.kernel.cell("pool.max_batch_size, (await pool.peek())['maxBatchSize']")), (1, 1))
+        self.value(self.kernel.cell("options={'agent':'scout','concurrency':2,'max_batch_size':4}; "
+                                   "pool=await workpool(**options); options['max_batch_size']=8; pool.max_batch_size"))
+        response = self.kernel.cell("pool.max_batch_size=7")
+        self.assertFalse(response["ok"])
+        self.assertIn("AttributeError", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("pool.max_batch_size")), 4)
+        native = PoolHost(self.kernel)
+        self.assertEqual(self.value(self.kernel.cell(
+            "items=await pool.push(['one','two','three']); [(item.item_id,item.max_batch_size) for item in items]", native)),
+            [(1, 4), (2, 4), (3, 4)])
+        self.assertEqual(self.kernel.calls[0]["bridge"]["input"]["args"]["maxBatchSize"], 4)
+        self.assertEqual(self.value(self.kernel.cell("(await pool.peek())['maxBatchSize']", native)), 4)
+
+    def test_missing_or_changed_grouped_limits_reject_admission_without_replay(self):
+        for value in (None, 0, 9, True, 2):
+            with self.subTest(value=value):
+                self.value(self.kernel.cell("pool=await workpool(agent='scout',concurrency=2,max_batch_size=4); pool.max_batch_size"))
+                native = PoolHost(self.kernel)
+                def invalid(frame):
+                    snapshot = native.apply(frame)
+                    if value is None:
+                        del snapshot["maxBatchSize"]
+                    else:
+                        snapshot["maxBatchSize"] = value
+                    self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+                response = self.kernel.cell("await pool.push(['accepted once'])", invalid)
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_ADMISSION", response["error"])
+                self.assertTrue(self.value(self.kernel.cell("pool.unknown_admission and pool.closed")))
+                response = self.kernel.cell("await pool.push(['do not replay'])")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_CLOSED", response["error"])
+                self.assertEqual(native.operations, ["pool_start"])
+                self.assertEqual(len(native.pools["pool-native-1"]["items"]), 1)
+
+    def test_grouped_exchange_and_item_reads_reject_changing_the_frozen_limit(self):
+        self.value(self.kernel.cell("pool=await workpool(agent='scout',concurrency=1,max_batch_size=4); pool.max_batch_size"))
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("await pool.push(['first']); pool.id", native))
+        def changed_exchange(frame):
+            page = native.apply(frame)
+            page["snapshot"]["maxBatchSize"] = 8
+            self.kernel.reply(frame, json.dumps(envelope(page)))
+        response = self.kernel.cell("await pool.exchange(['second'])", changed_exchange)
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_ADMISSION", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("len(pool.items)")), 1)
+        response = self.kernel.cell("await pool.push(['no replay'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("len((await pool.peek())['items'])", native)), 2)
+        def changed_item(frame):
+            snapshot = native.apply(frame)
+            snapshot["maxBatchSize"] = 2
+            self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+        response = self.kernel.cell("await pool.items[0].status()", changed_item)
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_PROTOCOL", response["error"])
+        self.assertEqual(native.operations, ["pool_start", "pool_exchange", "pool_status", "pool_result"])
+
 
     def test_retained_schema_options_are_forwarded_for_native_validation(self):
         for contract in ({"output_schema": {}}, {"schema_mode": "strict"},
@@ -2272,6 +2342,54 @@ class WorkpoolBudgetTests(unittest.TestCase):
     def value(self, response):
         self.assertTrue(response["ok"], response.get("error"))
         return ast.literal_eval(response["result"])
+
+    def test_actual_facade_admits_grouped_windows_and_retains_individual_items(self):
+        for ordered in (False, True):
+            native = BudgetPoolHost(self.kernel, reverse=True)
+            result = self.value(self.kernel.cell(f"""
+report=await workpool.map_reduce(range(16), lambda value,index: f'task {{value}}',
+    lambda total,item: total+item['input'], 0,
+    pool={{'concurrency':2,'max_batch_size':3}}, ordered={ordered!r})
+(report['value'],report['completed'],report['pool'].max_batch_size,report['cursor']['itemIds'])
+""", native))
+            self.assertEqual(result, (120, 16, 3, list(range(1, 17))))
+            self.assertEqual(native.high_water, 6)
+            self.assertLessEqual(native.calls, 18)
+            self.assertEqual(native.operations.count("pool_start"), 1)
+            self.assertEqual(len(native.pools["pool-native-1"]["items"]), 16)
+
+    def test_actual_facade_recovers_grouped_limit_without_relaunch_or_mutation(self):
+        native = PoolHost(self.kernel)
+        result = self.value(self.kernel.cell("""
+pool=await workpool(concurrency=2,max_batch_size=4)
+await pool.push(['first','second'])
+recovered=await workpool.attach(pool.id)
+(recovered.max_batch_size,recovered.closed,[item.max_batch_size for item in recovered.items])
+""", native))
+        self.assertEqual(result, (4, True, [4, 4]))
+        self.assertEqual(native.operations, ["pool_start", "pool_status"])
+        response = self.kernel.cell("recovered.max_batch_size=8")
+        self.assertFalse(response["ok"])
+        self.assertIn("AttributeError", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("recovered.max_batch_size")), 4)
+        response = self.kernel.cell("await recovered.push(['no implicit resume'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
+        self.assertEqual(native.operations, ["pool_start", "pool_status"])
+
+    def test_maximum_grouped_window_preserves_request_bounds_and_64_call_ceiling(self):
+        for ordered in (False, True):
+            native = BudgetPoolHost(self.kernel, reverse=True)
+            report = self.value(self.kernel.cell(f"""
+report=await workpool.map_reduce(range(32), lambda value,index: chr(92)*65536,
+    lambda total,item: total+item['input'], 0,
+    pool={{'concurrency':8,'max_batch_size':8}}, ordered={ordered!r})
+(report['value'],report['completed'],report['cursor']['itemIds'])
+""", native))
+            self.assertEqual(report, (496, 32, list(range(1, 33))))
+            self.assertEqual(native.high_water, 32)
+            self.assertLessEqual(native.calls, 64)
+            self.assertEqual(native.operations.count("pool_start"), 1)
 
     def test_actual_facade_completes_32_items_within_64_calls_at_every_concurrency(self):
         for concurrency in (1, 2, 4, 8):

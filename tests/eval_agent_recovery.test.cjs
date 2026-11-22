@@ -18,7 +18,7 @@ const worker = (turnId = 3, status = 'completed', extra = {}) => ({
 });
 const pool = (states = ['completed','running'], status = 'open', extra = {}) => ({
     schema:'pi.subagent.pool.v1',poolId:'pool-a',jobId:'job-pool',agent:'reviewer',status,
-    sealed:status !== 'open',concurrency:2,remainingMs:12000,admittedItems:states.length,
+    sealed:status !== 'open',concurrency:2,maxBatchSize:1,remainingMs:12000,admittedItems:states.length,
     queuedItems:states.filter(s => s === 'queued').length,
     runningItems:states.filter(s => s === 'running').length,
     completedItems:states.filter(s => s === 'completed').length,

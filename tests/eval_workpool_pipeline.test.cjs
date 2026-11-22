@@ -17,6 +17,7 @@ function fixture(settings = {}) {
     const pool = {
         id: null,
         concurrency: settings.concurrency ?? 2,
+        maxBatchSize: settings.maxBatchSize ?? 1,
         async push(tasks) {
             state.events.push('push');
             assert.equal(sealed, false);
@@ -108,6 +109,42 @@ test('streams bounded async inputs and reduces out-of-order full native results'
     assert.deepEqual(plain(result.value.map(row => row.index).sort((a,b) => a-b)), [0,1,2,3,4,5,6,7,8]);
     assert.deepEqual(plain(result.cursor.itemIds), [1,2,3,4,5,6,7,8,9]);
     assert.deepEqual(f.state.options, {agent: 'reviewer', concurrency: 2});
+});
+
+test('grouped admission fills bounded worker batches without exceeding the item limit', async () => {
+    for (const [concurrency,maxBatchSize,maxItems,count,window] of [
+        [1,4,32,12,4], [2,3,32,13,6], [8,8,7,7,7], [8,8,32,32,32],
+    ]) {
+        const f = fixture({concurrency,maxBatchSize});
+        let pulled = 0;
+        async function* inputs() {
+            for (let index=0; index<count; index++) {
+                assert.ok(pulled-f.state.reduced<window,'input demand must stay inside the grouped window');
+                pulled++;
+                yield `file-${index}`;
+            }
+        }
+        const result = await f.run(inputs(),mapper,reduction(f),[],{maxItems});
+        assert.equal(f.state.highWater,window);
+        assert.equal(result.completed,count);
+        assert.equal(result.status,'completed');
+        assert.deepEqual(plain(result.cursor.itemIds),Array.from({length:count},(_,i)=>i+1));
+        assert.equal(f.state.factoryCalls,1);
+        assert.equal(f.state.closeCalls,0);
+    }
+});
+
+test('invalid native grouped limits fail before pulling or admitting an input', async () => {
+    for (const value of [0,9,true,1.5,undefined]) {
+        const f = fixture();
+        f.pool.maxBatchSize=value;
+        let pulled=0;
+        function* inputs() { pulled++; yield 'unadmitted'; }
+        const error=await f.run(inputs(),mapper,reduction(f),[]).catch(error=>error);
+        assert.match(error.cause.message,/EVAL_PIPELINE_PROTOCOL/);
+        assert.equal(pulled,0);
+        assert.equal(f.state.tasks.length,0);
+    }
 });
 
 test('empty input creates no native pool, finish request or child', async () => {

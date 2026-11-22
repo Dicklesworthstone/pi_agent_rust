@@ -23,6 +23,7 @@ def fixture(**settings):
     class Pool:
         id = None
         concurrency = settings.get("concurrency", 2)
+        max_batch_size = settings.get("max_batch_size", 1)
         sealed = False
 
         async def push(self, tasks):
@@ -121,6 +122,40 @@ def reduction(f):
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_grouped_admission_fills_bounded_batches_within_item_limit(self):
+        for concurrency, max_batch_size, max_items, count, window in (
+                (1, 4, 32, 12, 4), (2, 3, 32, 13, 6), (8, 8, 7, 7, 7), (8, 8, 32, 32, 32)):
+            with self.subTest(concurrency=concurrency, max_batch_size=max_batch_size, max_items=max_items):
+                f = fixture(concurrency=concurrency, max_batch_size=max_batch_size)
+                pulled = 0
+                async def inputs():
+                    nonlocal pulled
+                    for index in range(count):
+                        self.assertLess(pulled - f.state.reduced, window)
+                        pulled += 1
+                        yield f"file-{index}"
+                result = await f.run(inputs(), mapper, reduction(f), [], max_items=max_items)
+                self.assertEqual(f.state.high_water, window)
+                self.assertEqual(result["completed"], count)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["cursor"]["itemIds"], list(range(1, count + 1)))
+                self.assertEqual(f.state.factory_calls, 1)
+                self.assertEqual(f.state.close_calls, 0)
+
+    async def test_invalid_native_grouped_limits_fail_before_input_or_admission(self):
+        for value in (0, 9, True, 1.5, None):
+            f = fixture(max_batch_size=value)
+            pulled = 0
+            def inputs():
+                nonlocal pulled
+                pulled += 1
+                yield "unadmitted"
+            with self.assertRaises(RuntimeError) as caught:
+                await f.run(inputs(), mapper, reduction(f), [])
+            self.assertIn("EVAL_PIPELINE_PROTOCOL", str(caught.exception.__cause__))
+            self.assertEqual(pulled, 0)
+            self.assertEqual(f.state.tasks, [])
+
     async def test_streams_async_inputs_with_backpressure_and_full_results(self):
         f = fixture()
         pulled = 0

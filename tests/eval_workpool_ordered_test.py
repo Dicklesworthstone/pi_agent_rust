@@ -8,13 +8,14 @@ import unittest
 
 
 class Fixture:
-    def __init__(self, concurrency=3, page_size=1, failed=None, tick=0, choose=None):
+    def __init__(self, concurrency=3, page_size=1, failed=None, tick=0, choose=None, max_batch_size=1):
         self.tasks, self.calls, self.reduced = [], [], []
         self.closes = self.finishes = self.factories = self.high_water = 0
         self.time = 0
         self.sealed = False
         self.id = None
         self.concurrency = concurrency
+        self.max_batch_size = max_batch_size
         self.page_size, self.failed, self.tick, self.choose = page_size, failed, tick, choose
         path = Path(__file__).resolve().parents[1] / 'src/eval/python_workpool_pipeline.py'
         spec = importlib.util.spec_from_file_location('ordered_pipeline_fixture', path)
@@ -81,6 +82,29 @@ def mapper(value, index):
 
 
 class OrderedWorkpoolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_grouped_ordered_failure_keeps_all_unacknowledged_siblings(self):
+        f = Fixture(concurrency=1, max_batch_size=4, page_size=4)
+        cause = RuntimeError('item two failed after receiving a grouped page')
+        async def reduce(value, item):
+            if item['id'] == 2:
+                raise cause
+            f.reduced.append(item['id'])
+            return value + 1
+        with self.assertRaises(RuntimeError) as caught:
+            await f.run(['a', 'b', 'c', 'd'], mapper, reduce, 0, ordered=True)
+        error = caught.exception
+        self.assertEqual(f.high_water, 4)
+        self.assertIs(error.__cause__, cause)
+        self.assertEqual(error.item['id'], 2)
+        self.assertEqual(error.progress['completed'], 1)
+        self.assertEqual(error.cursor['itemIds'], [1])
+        self.assertEqual([item['itemId'] for item in error.pending], [2, 3, 4])
+        self.assertEqual(f.reduced, [1])
+        self.assertEqual(f.closes, 1)
+        page = await f.drain(cursor=error.cursor, timeout=1, max_items=4)
+        self.assertEqual([item['id'] for item in page['items']], [4, 3, 2])
+        self.assertEqual(len(f.tasks), 4)
+
     async def test_async_source_and_reducer_with_bounded_worker_windows(self):
         for concurrency in (1, 2, 3, 8):
             with self.subTest(concurrency=concurrency):

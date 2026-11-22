@@ -105,9 +105,14 @@ def install(kernel):
         try:
             carrier = await create_pool(**pool_options)
             remaining()
-            window = carrier.concurrency
-            if type(window) is not int or not 1 <= window <= 8:
+            concurrency = carrier.concurrency
+            max_batch_size = carrier.max_batch_size
+            if (type(concurrency) is not int or not 1 <= concurrency <= 8
+                    or type(max_batch_size) is not int or not 1 <= max_batch_size <= 8):
                 raise protocol()
+            # Keep enough pending assignments for native grouped turns, while
+            # only successful reduction frees admission capacity.
+            window = min(32, max_items, concurrency * max_batch_size)
             if on_pool is not None:
                 stage = "on_pool"
                 await resolve(on_pool(carrier))

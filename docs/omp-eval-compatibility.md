@@ -39,14 +39,20 @@ with queued `send()` follow-ups in the same live child conversation.
 distribute up to 32 items across 1–8 native workers, retain per-turn handles,
 and support inspection and explicit cleanup across cells. `finish()` seals
 admission, drains accepted work, reaps the children and completes one aggregate
-session job.
+session job. Optional `maxBatchSize` / `max_batch_size` (1–8, default 1) freezes
+how many queued assignments can share one child prompt. Larger values use
+keyed final results while preserving each item's identity, status and schema
+validation. Groups are also bounded to 64 KiB of task text and do not wait to
+fill; the setting survives native recovery and cannot change after launch.
 
 [Streaming map/reduce](eval-workpool-pipelines.md) is available as
 `workpool.mapReduce()` in JavaScript and `workpool.map_reduce()` in Python.
 It consumes sync/async iterables with bounded admission, reduces full native
 results as they settle, and exposes per-result recovery cursors on failure.
-It uses the existing pool limits and does not implement keyed child yields
-or background execution of an entire eval cell.
+Its admission window is `min(32, maxItems, concurrency * maxBatchSize)`, with
+equivalent Python option names. It uses the existing pool lifetime limits and
+does not add an intermediate child `yield` tool or background execution of an
+entire eval cell.
 
 [Retained model helpers](eval-structured-results.md#retained-background-model-requests)
 provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
@@ -103,11 +109,15 @@ completed, failed or cancelled full results per native call, across cells and
 without waiting for earlier unfinished items. Explicit replayable cursors
 acknowledge only processed item IDs; reads do not seal or cancel the pool.
 See [incremental pool results](eval-structured-results.md#collect-completed-pool-items-across-cells).
-OMP's keyed yield batches remain separate work: native pools execute one
-prompt per item and use explicit `finish()` for aggregate completion. Pi's
-`pool.close()` cancels running and queued work; worker lifetimes remain fixed
-from their launch. See the linked contracts for supported isolation, schemas,
-partial admission and cleanup behavior.
+Native grouped results require the complete final keyed envelope and the
+post-turn idle barrier before acceptance. A malformed envelope fails its group;
+valid per-key errors and schema failures preserve successful peers. OMP's
+child-side `yield` tool remains unimplemented. Isolated items in a group share
+one cumulative worker patch, identified by `details.workerBatch`; these are
+not independent patches to stack. Pi uses explicit `finish()` for aggregate
+completion, while `pool.close()` cancels running and queued work. Worker
+lifetimes remain fixed from launch. See the linked contracts for supported
+isolation, schemas, partial admission and cleanup behavior.
 
 ## JavaScript images
 

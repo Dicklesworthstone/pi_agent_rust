@@ -140,9 +140,14 @@
         try {
             pool = await createPool(poolOptions);
             remaining();
-            // The native pool owns its worker count, deadline, tools and model.
-            const window = pool.concurrency;
-            if (!integer(window) || window < 1 || window > 8) throw protocolError();
+            // Native grouping needs enough pending assignments to fill each
+            // worker's bounded batch. Receipt still does not free a slot: only
+            // a returned reducer does, including under ordered buffering.
+            const concurrency = pool.concurrency;
+            const maxBatchSize = pool.maxBatchSize;
+            if (!integer(concurrency) || concurrency < 1 || concurrency > 8
+                || !integer(maxBatchSize) || maxBatchSize < 1 || maxBatchSize > 8) throw protocolError();
+            const window = Math.min(32, maxItems, concurrency * maxBatchSize);
             if (onPool !== undefined) {
                 stage = 'onPool';
                 await onPool(pool);

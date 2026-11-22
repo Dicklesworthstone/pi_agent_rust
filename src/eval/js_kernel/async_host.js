@@ -903,6 +903,7 @@
             || typeof snapshot.agent !== 'string' || !snapshot.agent
             || !validPoolStatus(snapshot.status) || typeof snapshot.sealed !== 'boolean'
             || !integer(snapshot.concurrency) || snapshot.concurrency < 1 || snapshot.concurrency > 8
+            || !integer(snapshot.maxBatchSize) || snapshot.maxBatchSize < 1 || snapshot.maxBatchSize > 8
             || !isArray(snapshot.items) || snapshot.items.length > 32
             || snapshot.admittedItems !== snapshot.items.length
             || !integer(snapshot.remainingMs) || snapshot.remainingMs < 0
@@ -1015,7 +1016,8 @@
         const args = {operation,poolId:handle.poolId,itemId:handle.itemId};
         if (timeoutMs !== undefined) args.timeoutMs = timeoutMs;
         const snapshot = checkPool(await nativeResult('subagent',args),handle.poolId,handle.itemId);
-        if (snapshot.jobId !== handle.jobId || snapshot.agent !== handle.agent) {
+        if (snapshot.jobId !== handle.jobId || snapshot.agent !== handle.agent
+            || snapshot.maxBatchSize !== handle.maxBatchSize) {
             throw new ErrorType('EVAL_POOL_PROTOCOL: native pool identity changed');
         }
         return snapshot;
@@ -1040,6 +1042,7 @@
             this.poolId = pool.poolId;
             this.jobId = pool.jobId;
             this.agent = pool.agent;
+            this.maxBatchSize = pool.maxBatchSize;
             freeze(this);
         }
         async status() { return readPoolItem(this,'pool_result'); }
@@ -1076,6 +1079,7 @@
     const adoptPool = (state, snapshot) => {
         checkPool(snapshot,state.poolId ?? undefined);
         if (snapshot.agent !== state.options.agent || snapshot.concurrency !== state.concurrency
+            || snapshot.maxBatchSize !== state.maxBatchSize
             || (state.jobId !== null && snapshot.jobId !== state.jobId)
             || snapshot.items.length < state.items.length) {
             throw new ErrorType('EVAL_POOL_PROTOCOL: native pool identity or retained items changed');
@@ -1097,7 +1101,7 @@
         } : {
             schema:'pi.eval.workpool.pending.v1',poolId:null,jobId:null,agent:state.options.agent,
             status:state.unknownAdmission ? 'unavailable' : state.closed ? 'cancelled' : 'unstarted',
-            sealed:state.closed,concurrency:state.concurrency,admittedItems:0,items:[],
+            sealed:state.closed,concurrency:state.concurrency,maxBatchSize:state.maxBatchSize,admittedItems:0,items:[],
         }),
         name:state.name,closed:state.closed,interrupted:state.interrupted,
         unknownAdmission:state.unknownAdmission,lastError:state.lastError,
@@ -1120,8 +1124,8 @@
         return poolView(state);
     };
     class AgentPool {
-        constructor(options, name, concurrency) {
-            poolSet(this,{options,name,concurrency,poolId:null,jobId:null,snapshot:null,items:[],
+        constructor(options, name, concurrency, maxBatchSize) {
+            poolSet(this,{options,name,concurrency,maxBatchSize,poolId:null,jobId:null,snapshot:null,items:[],
                 closed:false,interrupted:false,finishAcknowledged:false,closeAcknowledged:false,
                 unknownAdmission:false,admissionPending:false,lastError:null,recovered:false,
                 tail:resolvedPromise(),busy:false,generation:cellGeneration});
@@ -1132,6 +1136,7 @@
         get jobId() { return poolGet(this).jobId; }
         get name() { return poolGet(this).name; }
         get concurrency() { return poolGet(this).concurrency; }
+        get maxBatchSize() { return poolGet(this).maxBatchSize; }
         get closed() { return poolGet(this).closed; }
         get unknownAdmission() { return poolGet(this).unknownAdmission; }
         get recovered() { return poolGet(this).recovered; }
@@ -1248,7 +1253,8 @@
                     const snapshot = checkPool(page.snapshot,state.poolId);
                     const ids = page.admittedItemIds;
                     if (snapshot.jobId !== state.jobId || snapshot.agent !== state.options.agent
-                        || snapshot.concurrency !== state.concurrency || snapshot.admittedItems < previous
+                        || snapshot.concurrency !== state.concurrency || snapshot.maxBatchSize !== state.maxBatchSize
+                        || snapshot.admittedItems < previous
                         || !isArray(ids) || ids.length !== batch.length || ids.some((id,index) =>
                             !validTurnId(id) || id <= previous || id > snapshot.admittedItems
                             || (index > 0 && id !== ids[index - 1] + 1))
@@ -1343,6 +1349,7 @@
         const native = {agent:'task'};
         let name = 'workpool';
         let concurrency = 4;
+        let maxBatchSize = 1;
         for (const key of keys(options)) {
             const value = options[key];
             if (key === 'name') {
@@ -1351,6 +1358,10 @@
             } else if (key === 'concurrency') {
                 if (!integer(value) || value < 1 || value > 8) throw new RangeErrorType('EVAL_POOL_INPUT: concurrency must be an integer from 1 to 8');
                 concurrency = value;
+            } else if (key === 'maxBatchSize') {
+                if (!integer(value) || value < 1 || value > 8) throw new RangeErrorType('EVAL_POOL_INPUT: maxBatchSize must be an integer from 1 to 8');
+                maxBatchSize = value;
+                native.maxBatchSize = value;
             } else if (key === 'agent') {
                 if (!boundedText(value,128)) throw new TypeErrorType('EVAL_POOL_INPUT: agent must be nonempty text of at most 128 UTF-8 bytes without NUL');
                 native.agent = value;
@@ -1378,7 +1389,7 @@
             throw new TypeErrorType('EVAL_POOL_INPUT: isoApply requires worktree isolation');
         }
         poolBatchArgs({options:native,poolId:null,concurrency},[]);
-        return new AgentPool(freeze(native),name,concurrency);
+        return new AgentPool(freeze(native),name,concurrency,maxBatchSize);
     };
     workpool.attach = async (id, options = {}) => {
         recoveryOptions(id, options, 'allowPush');
@@ -1389,7 +1400,7 @@
         }
         // No pool_start, task replay, launch options or renewed timeout. A
         // known ID suffices because further pushes use the native frozen policy.
-        const pool = new AgentPool(freeze({agent:snapshot.agent}),'recovered-workpool',snapshot.concurrency);
+        const pool = new AgentPool(freeze({agent:snapshot.agent}),'recovered-workpool',snapshot.concurrency,snapshot.maxBatchSize);
         const state = poolGet(pool);
         adoptPool(state,snapshot);
         state.recovered = true;
