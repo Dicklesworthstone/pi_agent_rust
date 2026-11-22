@@ -14291,8 +14291,8 @@ const __pi_vfs = (() => {
     }
   }
 
-  function resetState() {
-    __pi_reset_file_watchers();
+  function resetState(secret) {
+    __pi_reset_file_watchers(secret);
     const clearMap = globalThis.__pi_map_clear_primordial;
     const clearSet = globalThis.__pi_set_clear_primordial;
     const addSet = globalThis.__pi_set_add_primordial;
@@ -14366,7 +14366,7 @@ const __pi_vfs = (() => {
       if (typeof matches !== "function" || !matches(secret)) {
         throw new Error("PiJS VFS reset denied");
       }
-      resetState();
+      resetState(secret);
     },
     writable: false,
     configurable: false,
@@ -15086,19 +15086,20 @@ const __pi_file_watchers = (() => {
     }
     if (event === "error" && !handled) throw current;
   }
-  function deactivate(entry) {
+  function deactivate(entry, resetSecret) {
     if (!entry.active) return;
     entry.active = false;
     if (entry.before) entry.before.next = entry.next; else first = entry.next;
     if (entry.next) entry.next.before = entry.before;
     entry.before = entry.next = null;
     count--;
-    bridge.clear(entry.timer);
+    if (resetSecret === undefined) bridge.clear(entry.timer);
+    else bridge.clearForReset(entry.timer, resetSecret);
     entry.timer = null;
   }
-  function close(entry, error, notify = true) {
+  function close(entry, error, notify = true, resetSecret) {
     if (!entry.active) return;
-    deactivate(entry);
+    deactivate(entry, resetSecret);
     try {
       if (notify) {
         if (error) emit(entry, "error", error);
@@ -15173,7 +15174,7 @@ const __pi_file_watchers = (() => {
     return null;
   }
   __pi_file_watcher_count = () => count;
-  __pi_reset_file_watchers = () => { while (first) close(first, null, false); };
+  __pi_reset_file_watchers = (secret) => { while (first) close(first, null, false, secret); };
   return {
     watchFile(path, options, listener) {
       if (typeof options === "function") { listener = options; options = {}; }
@@ -24573,6 +24574,11 @@ for (const [name, value] of Object.entries({
 }
 
 const __pi_secret_matches = globalThis.__pi_bridge_secret_matches_native;
+// Keep raw timer authority inside this closure. Guest-visible entrypoints are
+// secret-authenticated below, so guessing a native id cannot cancel a peer's
+// timer or a filesystem poll behind its owner-checked public handle.
+const __pi_set_timeout_native = globalThis.__pi_set_timeout_native;
+const __pi_clear_timeout_native = globalThis.__pi_clear_timeout_native;
 function __pi_require_bridge_secret(candidate) {
     if (typeof __pi_secret_matches !== 'function' || !__pi_secret_matches(candidate)) {
         throw new Error('PiJS privileged bridge entrypoint denied');
@@ -29937,6 +29943,11 @@ const __pi_timer_runtime = (() => {
     function stateOf(handle) {
         const state = getState(states, handle);
         if (!state) throw new TypeError('Invalid Timeout receiver');
+        if (state.owner !== __pi_get_current_extension_id()) {
+            const error = new Error('Timer belongs to another extension');
+            error.code = 'EACCES';
+            throw error;
+        }
         return state;
     }
     function disarm(state) {
@@ -29946,8 +29957,7 @@ const __pi_timer_runtime = (() => {
             state.nativeId = null;
         }
     }
-    function cancel(handle) {
-        const state = stateOf(handle);
+    function cancelState(state) {
         if (state.epoch !== epoch || state.cancelled) return;
         disarm(state);
         deleteActive(active, state.id);
@@ -29957,6 +29967,7 @@ const __pi_timer_runtime = (() => {
         state.args = null;
         state.schedule = null;
     }
+    function cancel(handle) { cancelState(stateOf(handle)); }
     function arm(handle, state) {
         disarm(state);
         const version = ++state.version;
@@ -30032,11 +30043,15 @@ const __pi_timer_runtime = (() => {
         setTimeout: (callback, delay, ...args) => create(callback, delay, false, args),
         setInterval: (callback, delay, ...args) => create(callback, delay, true, args),
         clear,
+        clearForReset(handle, secret) {
+            __pi_require_bridge_secret(secret);
+            if (handle && hasState(states, handle)) cancelState(getState(states, handle));
+        },
         reference(handle, value) { stateOf(handle).referenced = value; },
         count: () => activeCount(active),
         reset(secret) {
             if (!__pi_bridge_secret_matches_native(secret)) throw new Error('Timer reset denied');
-            forEachActive(active, (handle) => cancel(handle));
+            forEachActive(active, (handle) => cancelState(getState(states, handle)));
             epoch++;
             clearActive(active);
         },
@@ -30050,6 +30065,7 @@ Object.defineProperty(globalThis, '__pi_fs_watch_runtime', {
     value: Object.freeze({
         interval: __pi_timer_runtime.setInterval,
         clear: __pi_timer_runtime.clear,
+        clearForReset: __pi_timer_runtime.clearForReset,
         reference: __pi_timer_runtime.reference,
         owner: () => __pi_get_current_extension_id() || '',
         apply: __pi_reflect_apply_primordial,
@@ -30854,6 +30870,8 @@ __pi_export_privileged(
 );
 
 for (const [name, fn] of Object.entries({
+    __pi_set_timeout_native,
+    __pi_clear_timeout_native,
     __pi_runtime_registry_snapshot,
     __pi_get_registered_tools,
     __pi_complete_hostcall,
@@ -31087,16 +31105,19 @@ mod tests {
     /// bytes for bounded stat-polling `fs.watchFile`, explicit `fs.watch`
     /// rejection, and descriptor-scoped metadata) against exact decompressed
     /// source bytes.
+    /// Timer owner isolation adds 932 bridge bytes and 159 filesystem bytes.
+    /// Raw timer authority is host-authenticated, and privileged VFS teardown
+    /// forwards that authority without weakening public timer owner checks.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            270_146,
-            "d2728f92c5f23d54ca8e78d2e41459d505dcc9e0bfbfbeb797141f7fbbf2c77f",
+            271_078,
+            "f6fed530461ab1a55231d425943c4ac72378e72824ead975d6d0e6de9a8fd4ea",
         ),
         (
             "node:fs",
-            82_817,
-            "6e4defaf0ac6431686f45ff53c4e3b015127e585320094c4453f143795aedab7",
+            82_976,
+            "716025605d6ebf012817f9da6e54ec4d8236162a715af71c9e164ba41e0bcdbb",
         ),
         (
             "@mariozechner/pi-ai",
@@ -33255,6 +33276,250 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             assert!(!runtime.has_pending(), "closed handles must not re-arm");
             let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
             assert_eq!(snapshot["timerHandles"], 0);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn timer_handles_reject_foreign_owners_and_native_cancellation_bypass() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    globalThis.timerOwnerScope = { denied: {}, native: {}, fired: [], error: null };
+                    const result = globalThis.timerOwnerScope;
+                    __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        globalThis.ownedTimeout = setTimeout(function() {
+                            result.fired.push(['timeout', __pi_get_current_extension_id(), this === ownedTimeout]);
+                        }, 10);
+                        globalThis.ownedInterval = setInterval(function() {
+                            result.fired.push(['interval', __pi_get_current_extension_id(), this === ownedInterval]);
+                            clearTimeout(this);
+                        }, 10);
+                        result.timeoutId = Number(ownedTimeout);
+                        result.intervalId = Number(ownedInterval);
+                    }).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {
+                        const attempts = [
+                            ['ref', () => ownedTimeout.ref()],
+                            ['unref', () => ownedTimeout.unref()],
+                            ['hasRef', () => ownedTimeout.hasRef()],
+                            ['refresh', () => ownedTimeout.refresh()],
+                            ['close', () => ownedTimeout.close()],
+                            ['primitive', () => Number(ownedTimeout)],
+                            ['clearTimeoutHandle', () => clearTimeout(ownedTimeout)],
+                            ['clearIntervalHandle', () => clearInterval(ownedInterval)],
+                            ['clearTimeoutNumber', () => clearTimeout(result.timeoutId)],
+                            ['clearIntervalString', () => clearInterval(String(result.intervalId))],
+                        ];
+                        if (typeof Symbol.dispose === 'symbol') {
+                            attempts.push(['dispose', () => ownedTimeout[Symbol.dispose]()]);
+                        }
+                        for (const [name, operation] of attempts) {
+                            try { operation(); result.denied[name] = 'allowed'; }
+                            catch (error) { result.denied[name] = error.code; }
+                        }
+                        for (const [name, operation] of [
+                            ['nativeClear', () => __pi_clear_timeout_native(result.timeoutId)],
+                            ['nativeCreate', () => __pi_set_timeout_native(10)],
+                            ['resetClear', () => __pi_fs_watch_runtime.clearForReset(ownedTimeout, 'forged')],
+                        ]) {
+                            try { operation(); result.native[name] = 'allowed'; }
+                            catch (error) { result.native[name] = error.message; }
+                        }
+                        const own = setTimeout(() => result.fired.push('cancelled-b'), 10);
+                        result.sameOwner = own.unref().ref() === own && own.hasRef();
+                        clearInterval(String(Number(own)));
+                        own.refresh();
+                        clearTimeout(987654321);
+                        clearInterval('not-a-timer');
+                    })).catch(error => { result.error = String(error); })
+                        .finally(() => { result.done = true; });
+                    ",
+                ))
+                .await
+                .expect("attempt foreign timer operations");
+            let result = runtime.read_global_json("timerOwnerScope").await.unwrap();
+            assert_eq!(result["error"], serde_json::Value::Null);
+            assert_eq!(result["done"], true);
+            assert_eq!(result["sameOwner"], true);
+            let denials = result["denied"].as_object().expect("operation denials");
+            assert!(denials.len() >= 10, "all public operations were exercised");
+            for (operation, outcome) in denials {
+                assert_eq!(outcome.as_str(), Some("EACCES"), "{operation}");
+            }
+            for operation in ["nativeClear", "nativeCreate", "resetClear"] {
+                assert_eq!(
+                    result["native"][operation],
+                    "PiJS privileged bridge entrypoint denied",
+                    "{operation}"
+                );
+            }
+            clock.set(10);
+            for _ in 0..2 {
+                runtime.tick().await.expect("fire original owner timer");
+            }
+            assert_eq!(
+                runtime.read_global_json("timerOwnerScope").await.unwrap()["fired"],
+                json!([["timeout", "ext.a", true], ["interval", "ext.a", true]])
+            );
+            assert!(!runtime.has_pending(), "foreign attempts cannot add timers");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        ownedTimeout.refresh().unref().ref();
+                    });
+                    ",
+                ))
+                .await
+                .expect("owner can refresh a fired timeout");
+            clock.set(20);
+            runtime.tick().await.expect("fire owner-refreshed timeout");
+            assert_eq!(
+                runtime.read_global_json("timerOwnerScope").await.unwrap()["fired"],
+                json!([
+                    ["timeout", "ext.a", true],
+                    ["interval", "ext.a", true],
+                    ["timeout", "ext.a", true]
+                ])
+            );
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        ownedTimeout.close().refresh();
+                        ownedInterval.close().refresh();
+                    });
+                    ",
+                ))
+                .await
+                .expect("owner can close inactive handles");
+            assert!(!runtime.has_pending());
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn file_polls_survive_foreign_timer_clears_and_host_reset_drains_all_owners() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let root_a = temp_dir.path().join("ext-a");
+            let root_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&root_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&root_b).expect("mkdir ext-b");
+            let path_a = root_a.join("watched.txt");
+            let path_b = root_b.join("watched.txt");
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                Arc::clone(&clock),
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..PiJsRuntimeConfig::default()
+                },
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(root_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(root_b, Some("ext.b"));
+            let script = format!(
+                r"
+                globalThis.timerResetScope = {{
+                    a: 0, b: 0, interval: 0, stopped: 0, denied: 0, owners: true, error: null,
+                }};
+                const result = globalThis.timerResetScope;
+                import('node:fs').then(fs =>
+                    __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        fs.writeFileSync({path_a:?}, 'aa');
+                        globalThis.resetWatchA = fs.watchFile({path_a:?}, {{ interval: 10 }}, () => {{
+                            result.a++;
+                            result.owners &&= __pi_get_current_extension_id() === 'ext.a';
+                        }});
+                        resetWatchA.on('stop', () => result.stopped++);
+                        globalThis.resetIntervalA = setInterval(() => {{
+                            result.interval++;
+                            result.owners &&= __pi_get_current_extension_id() === 'ext.a';
+                        }}, 10);
+                        result.lastAId = Number(resetIntervalA);
+                    }}).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {{
+                        // Guess every earlier id, including the private polling
+                        // timer; cancelling an unknown id remains a no-op.
+                        for (let id = 0; id <= result.lastAId; id++) {{
+                            try {{ clearTimeout(id); }}
+                            catch (error) {{ if (error.code === 'EACCES') result.denied++; else throw error; }}
+                        }}
+                        fs.writeFileSync({path_b:?}, 'bb');
+                        globalThis.resetWatchB = fs.watchFile({path_b:?}, {{ interval: 10 }}, () => {{
+                            result.b++;
+                            result.owners &&= __pi_get_current_extension_id() === 'ext.b';
+                        }});
+                        resetWatchB.on('close', () => result.stopped++);
+                        globalThis.resetTimeoutB = setTimeout(() => result.stopped++, 100);
+                        fs.writeFileSync({path_b:?}, 'cc');
+                    }})).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {{
+                        fs.writeFileSync({path_a:?}, 'dd');
+                    }}))
+                ).catch(error => {{ result.error = String(error); }})
+                    .finally(() => {{ result.done = true; }});
+                "
+            );
+            runtime
+                .eval(&privileged_test_script(&runtime, &script))
+                .await
+                .expect("create polling and timer work for both owners");
+            let result = runtime.read_global_json("timerResetScope").await.unwrap();
+            assert_eq!(result["error"], serde_json::Value::Null);
+            assert_eq!(result["done"], true);
+            assert_eq!(result["denied"], 2, "both earlier timers reject cancellation");
+            clock.set(10);
+            for _ in 0..4 {
+                runtime.tick().await.expect("poll under original owners");
+            }
+            let result = runtime.read_global_json("timerResetScope").await.unwrap();
+            assert_eq!(result["a"], 1);
+            assert_eq!(result["b"], 1);
+            assert_eq!(result["interval"], 1);
+            assert_eq!(result["owners"], true);
+            let reset = call_global_fn_json(&runtime, "__pi_reset_extension_runtime_state").await;
+            for registry in ["vfsWatchers", "timerHandles", "pendingTimers"] {
+                assert_eq!(reset["after"][registry], 0, "{registry}");
+            }
+            assert_eq!(runtime.scheduler.borrow().next_timer_deadline(), None);
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r"
+                    __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        resetIntervalA.refresh();
+                        timerResetScope.closedWatcher = !resetWatchA.ref().unref().hasRef();
+                    }).then(() => __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {
+                        resetTimeoutB.refresh();
+                        try { resetIntervalA.refresh(); timerResetScope.staleForeign = 'allowed'; }
+                        catch (error) { timerResetScope.staleForeign = error.code; }
+                    }));
+                    ",
+                ))
+                .await
+                .expect("held pre-reset handles cannot restart work");
+            clock.set(1000);
+            assert!(!runtime.tick().await.expect("tick after reset").ran_macrotask);
+            assert!(!runtime.has_pending());
+            let result = runtime.read_global_json("timerResetScope").await.unwrap();
+            assert_eq!(result["stopped"], 0, "host reset never calls guest cleanup");
+            assert_eq!(result["closedWatcher"], true);
+            assert_eq!(result["staleForeign"], "EACCES");
+            assert_eq!(result["a"], 1);
+            assert_eq!(result["b"], 1);
+            assert_eq!(result["interval"], 1);
         });
     }
 
@@ -36684,20 +36949,33 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .copied()
                 .expect("hostcall timeout should have a watchdog timer");
 
+            let clear_script = format!(
+                r"
+                try {{
+                    __pi_clear_timeout_native({watchdog_timer_id});
+                    globalThis.watchdogClearDenied = false;
+                }} catch (error) {{
+                    globalThis.watchdogClearDenied =
+                        error.message === 'PiJS privileged bridge entrypoint denied';
+                }}
+                globalThis.watchdogHostClearAttempt =
+                    __pi_clear_timeout_native(__pi_test_secret, {watchdog_timer_id});
+                clearTimeout({watchdog_timer_id});
+                "
+            );
             runtime
-                .eval(&format!(
-                    r"
-                    globalThis.watchdogClearAttempt =
-                        __pi_clear_timeout_native({watchdog_timer_id});
-                    clearTimeout({watchdog_timer_id});
-                    "
-                ))
+                .eval(&privileged_test_script(&runtime, &clear_script))
                 .await
                 .expect("attempt to cancel hostcall watchdog");
             assert_eq!(
-                get_global_json(&runtime, "watchdogClearAttempt").await,
+                get_global_json(&runtime, "watchdogClearDenied").await,
+                serde_json::json!(true),
+                "extensions cannot invoke raw timer authority"
+            );
+            assert_eq!(
+                get_global_json(&runtime, "watchdogHostClearAttempt").await,
                 serde_json::json!(false),
-                "extension-visible timer cancellation must not clear hostcall watchdogs"
+                "even authenticated timer cancellation must not clear hostcall watchdogs"
             );
 
             clock.set(50);
