@@ -5535,8 +5535,7 @@ impl ExtensionManager {
 
             #[cfg(feature = "wasm-host")]
             let response = if has_hook_wasm
-                && (event != ExtensionEventName::UserBash
-                    || response.as_ref().is_none_or(Value::is_null))
+                && should_dispatch_wasm_event(&event_name, response.as_ref())
             {
                 let timeout_ms = if event == ExtensionEventName::UserBash {
                     user_bash_remaining_timeout(timeout_ms, started_at)?
@@ -5617,10 +5616,9 @@ impl ExtensionManager {
         // carries its own `Arc<AsyncMutex<Instance>>`, so these futures
         // don't share a lock.
         //
-        // Results are still aggregated with "last-wins" semantics (in
-        // stable iteration order over the filtered extension list), so
-        // behavior matches the prior sequential loop when extensions
-        // return a response deterministically.
+        // Aggregate in stable subscription order. Session before-events
+        // retain the first veto; other events keep last-response semantics.
+        // All started handlers still settle and report their errors.
         let calls = extensions
             .iter()
             .filter(|ext| ext.event_hooks().iter().any(|hook| hook == event_name))
@@ -5648,7 +5646,7 @@ impl ExtensionManager {
             match result {
                 Ok(Some(value)) => {
                     if first_err.is_none() {
-                        response = Some(value);
+                        merge_wasm_event_response(event_name, &mut response, value);
                     }
                 }
                 Ok(None) => {}
@@ -5858,15 +5856,7 @@ impl ExtensionManager {
             return Ok(false);
         };
 
-        Ok(response.as_bool() == Some(false)
-            || response
-                .get("cancelled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || response
-                .get("cancel")
-                .and_then(Value::as_bool)
-                .unwrap_or(false))
+        Ok(event_response_cancels(&response))
     }
 
     /// Dispatch multiple fire-and-forget events to subscribed runtimes.
@@ -6272,6 +6262,24 @@ impl ExtensionManager {
     }
 }
 
+#[cfg(any(feature = "wasm-host", test))]
+fn should_dispatch_wasm_event(event_name: &str, response: Option<&Value>) -> bool {
+    response.is_none_or(|value| {
+        !session_event_response_cancels(event_name, value)
+            && (event_name != "user_bash" || value.is_null())
+    })
+}
+
+#[cfg(any(feature = "wasm-host", test))]
+fn merge_wasm_event_response(event_name: &str, response: &mut Option<Value>, value: Value) {
+    if !response
+        .as_ref()
+        .is_some_and(|current| session_event_response_cancels(event_name, current))
+    {
+        *response = Some(value);
+    }
+}
+
 #[cfg(feature = "wasm-host")]
 fn user_bash_remaining_timeout(timeout_ms: u64, started_at: Instant) -> Result<u64> {
     let remaining = Duration::from_millis(timeout_ms)
@@ -6380,6 +6388,88 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         truncation: None,
         capture,
     })
+}
+
+#[cfg(test)]
+mod session_event_veto_tests {
+    use super::{merge_wasm_event_response, should_dispatch_wasm_event};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn wasm_session_aggregation_preserves_the_first_veto_and_stops_runtime_handoff() {
+        for event_name in [
+            "session_before_switch",
+            "session_before_fork",
+            "session_before_compact",
+            "session_before_tree",
+        ] {
+            for veto in [
+                json!(false),
+                json!({"cancel": true, "reason": "first veto"}),
+                json!({"cancelled": true, "reason": "first veto"}),
+            ] {
+                let mut response = None;
+                for value in [
+                    json!(true),
+                    json!({"cancel": 1, "cancelled": "true"}),
+                    veto.clone(),
+                    json!({"cancel": false, "cancelled": false}),
+                    json!({"cancelled": true, "reason": "later veto"}),
+                    Value::Null,
+                ] {
+                    merge_wasm_event_response(event_name, &mut response, value);
+                }
+                assert_eq!(response, Some(veto), "{event_name} must retain the first veto");
+                assert!(
+                    !should_dispatch_wasm_event(event_name, response.as_ref()),
+                    "{event_name} must not reach another runtime after a veto"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wasm_session_aggregation_keeps_strict_flags_and_other_event_semantics() {
+        for event_name in [
+            "session_before_switch",
+            "session_before_fork",
+            "session_before_compact",
+            "session_before_tree",
+        ] {
+            let mut response = None;
+            for value in [
+                json!(true),
+                json!({"cancel": 1}),
+                json!({"cancel": "true"}),
+                json!({"cancelled": [true]}),
+                json!({"cancelled": false, "reason": "allowed"}),
+            ] {
+                assert!(should_dispatch_wasm_event(event_name, Some(&value)));
+                merge_wasm_event_response(event_name, &mut response, value);
+            }
+            assert_eq!(
+                response,
+                Some(json!({"cancelled": false, "reason": "allowed"}))
+            );
+        }
+
+        for event_name in ["session_start", "session_before_custom", "tool_result"] {
+            let mut response = None;
+            merge_wasm_event_response(event_name, &mut response, json!(false));
+            merge_wasm_event_response(event_name, &mut response, json!({"cancel": true}));
+            merge_wasm_event_response(event_name, &mut response, json!({"last": true}));
+            assert_eq!(response, Some(json!({"last": true})));
+            assert!(should_dispatch_wasm_event(event_name, response.as_ref()));
+        }
+
+        assert!(should_dispatch_wasm_event("user_bash", None));
+        assert!(should_dispatch_wasm_event("user_bash", Some(&Value::Null)));
+        assert!(!should_dispatch_wasm_event("user_bash", Some(&json!(false))));
+        assert!(!should_dispatch_wasm_event(
+            "user_bash",
+            Some(&json!({"result": {"output": "already executed"}}))
+        ));
+    }
 }
 
 #[cfg(test)]

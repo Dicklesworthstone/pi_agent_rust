@@ -27135,7 +27135,12 @@ const __pi_tool_result_json = globalThis.__pi_tool_result_json_native;
         if (eventName === 'tool_call' && value && typeof value === 'object' && value.block) {
             return value;
         }
-        if (eventName.startsWith('session_before_') && value && typeof value === 'object' && value.cancel) {
+        // Match the host's strict veto forms before a later handler can
+        // replace them, including across direct and event-bus phases.
+        if ((eventName === 'session_before_switch' || eventName === 'session_before_fork' ||
+             eventName === 'session_before_compact' || eventName === 'session_before_tree') &&
+            (value === false || (value && typeof value === 'object' &&
+             (value.cancel === true || value.cancelled === true)))) {
             return value;
         }
     }
@@ -31108,11 +31113,13 @@ mod tests {
     /// Timer owner isolation adds 932 bridge bytes and 159 filesystem bytes.
     /// Raw timer authority is host-authenticated, and privileged VFS teardown
     /// forwards that authority without weakening public timer owner checks.
+    /// Session veto aggregation adds 364 bridge bytes. The strict boolean
+    /// forms stop later handlers before they can erase an earlier veto.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            271_078,
-            "f6fed530461ab1a55231d425943c4ac72378e72824ead975d6d0e6de9a8fd4ea",
+            271_442,
+            "1d90f2b0398f5cb6ab4ccc060c48cf6d87df9bddaf37d01c92606f805fd34c22",
         ),
         (
             "node:fs",

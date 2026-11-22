@@ -213,6 +213,9 @@ impl NativeRustRuntimeState {
             }
 
             if let Some(explicit) = extension.event_responses.get(event_name) {
+                if super::session_event_response_cancels(event_name, explicit) {
+                    return explicit.clone();
+                }
                 response = explicit.clone();
                 continue;
             }
@@ -1202,6 +1205,92 @@ mod event_ownership_tests {
             command_outputs: HashMap::new(),
             shortcut_outputs: HashMap::new(),
             provider_streams: HashMap::new(),
+        }
+    }
+
+    fn session_extension(
+        id: &str,
+        event_name: &str,
+        response: Option<Value>,
+    ) -> NativeRustLoadedExtension {
+        let mut extension = extension(id, None);
+        extension.snapshot.event_hooks.push(event_name.to_string());
+        if let Some(response) = response {
+            extension
+                .event_responses
+                .insert(event_name.to_string(), response);
+        }
+        extension
+    }
+
+    #[test]
+    fn native_session_before_events_preserve_first_veto() {
+        for event_name in [
+            "session_before_switch",
+            "session_before_fork",
+            "session_before_compact",
+            "session_before_tree",
+        ] {
+            for veto in [
+                json!(false),
+                json!({"cancel": true, "reason": "first veto"}),
+                json!({"cancelled": true, "reason": "first veto"}),
+            ] {
+                let mut state = NativeRustRuntimeState::default();
+                state.load_extensions(vec![
+                    session_extension("allow", event_name, Some(json!(true))),
+                    session_extension("first-veto", event_name, Some(veto.clone())),
+                    session_extension("later-allow", event_name, Some(json!({"cancelled": false}))),
+                    session_extension(
+                        "later-veto",
+                        event_name,
+                        Some(json!({"cancel": true, "reason": "later veto"})),
+                    ),
+                    session_extension("observer", event_name, None),
+                ]);
+                assert_eq!(
+                    state.dispatch_event(event_name, &Value::Null, &Value::Null),
+                    veto,
+                    "{event_name} must retain the first veto"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_session_vetoes_require_boolean_flags_and_known_before_events() {
+        for event_name in [
+            "session_before_switch",
+            "session_before_fork",
+            "session_before_compact",
+            "session_before_tree",
+        ] {
+            let mut state = NativeRustRuntimeState::default();
+            state.load_extensions(vec![
+                session_extension(
+                    "nonboolean",
+                    event_name,
+                    Some(json!({"cancel": 1, "cancelled": "true"})),
+                ),
+                session_extension("allow", event_name, Some(json!({"cancel": false}))),
+            ]);
+            assert_eq!(
+                state.dispatch_event(event_name, &Value::Null, &Value::Null),
+                json!({"cancel": false})
+            );
+        }
+
+        for event_name in ["session_start", "session_before_custom"] {
+            let mut state = NativeRustRuntimeState::default();
+            state.load_extensions(vec![
+                session_extension("first", event_name, Some(json!(false))),
+                session_extension("last", event_name, Some(json!({"cancelled": false}))),
+            ]);
+            assert_eq!(
+                state.dispatch_event(event_name, &Value::Null, &Value::Null),
+                json!({"cancelled": false}),
+                "{event_name} keeps last-response semantics"
+            );
         }
     }
 
