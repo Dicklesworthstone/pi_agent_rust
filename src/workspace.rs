@@ -784,7 +784,7 @@ mod tests {
         assert!(read_child_workspace_roots(&canonical).is_err());
         let root_link = canonical.join("root-link");
         symlink(&canonical, &root_link).expect("root symlink");
-        assert!(encode_child_workspace_roots(&[root_link.clone()]).is_err());
+        assert!(encode_child_workspace_roots(std::slice::from_ref(&root_link)).is_err());
         let linked_root = serde_json::to_vec(&serde_json::json!({
             "schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[root_link]
         }))
@@ -847,7 +847,9 @@ mod tests {
             vec![second.clone(), first.clone(), third.clone()]
         ));
         assert!(workspace.contains_additional_root_grants(&original));
-        assert!(!workspace.replace_additional_roots_if_unchanged(&[first.clone()], vec![]));
+        assert!(
+            !workspace.replace_additional_roots_if_unchanged(std::slice::from_ref(&first), vec![])
+        );
         assert!(workspace.contains_additional_root_grants(&original));
         let expected = workspace.additional_roots();
         assert!(workspace.replace_additional_roots_if_unchanged(&expected, vec![second.clone()]));

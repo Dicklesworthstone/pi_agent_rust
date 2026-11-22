@@ -3400,7 +3400,7 @@ MEASUREMENT_CONTROL_SOURCE_PATTERNS = {
     "binary_size_release": re.compile(
         r".+#control=release_binary_v1;control_sha256=(?P<control_sha256>[0-9a-f]{64});"
         r"binary_sha256=(?P<binary_sha256>[0-9a-f]{64});"
-        r"size_bytes=(?P<size_bytes>[1-9][0-9]*);profile=release;opt_level=z;strip=true"
+        r"size_bytes=(?P<size_bytes>[1-9][0-9]*);profile=release;opt_level=3;strip=true"
     ),
     "idle_memory_rss": re.compile(
         r".+#control=idle_rss_v1;control_sha256=(?P<control_sha256>[0-9a-f]{64});"

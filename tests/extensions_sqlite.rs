@@ -1111,7 +1111,7 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
                 &format!(
                     r#"
                 const db = new sqlite.Database({source_json});
-                db.exec("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('durable')");
+                db.exec("PRAGMA journal_mode = WAL; CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('durable')");
                 db.close();
                 globalThis.sqliteResult = true;
             "#
@@ -1122,11 +1122,15 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
         );
         drop(seed);
 
-        // Both are ordinary database copies, not adversarial symlinks. The
-        // first keeps stale native file-identity records; the second has no
-        // namespace records. The engine repairs the stale records during open
-        // even when its main pager is read-only. File capability admission is
-        // conservative and does not depend on which companions exist today.
+        // Both are ordinary WAL database copies, not adversarial symlinks. The
+        // first keeps stale native file-identity records plus an uninitialized
+        // 3-byte WAL-index `-shm` beside an empty `-wal` (GH#528 first-attacher
+        // shape); the second has no namespace or WAL sidecars. In fsqlite 0.5.1
+        // (GH#535 / bd-j2dtf), a quiescent read-only open leaves copied
+        // `-fsqlite-ns-use` records untouched, while still rebuilding the
+        // uninitialized `-shm` index in place to 32 KiB. File capability
+        // admission is conservative and does not depend on which companions
+        // exist today.
         std::fs::copy(&source, &copied).expect("copy main database");
         std::fs::copy(&source, &main_only).expect("copy without namespace");
         for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
@@ -1136,6 +1140,10 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
             )
             .expect("copy native namespace sidecar");
         }
+        let copied_wal = storage.join("copied.db-wal");
+        let copied_shm = storage.join("copied.db-shm");
+        std::fs::write(&copied_wal, []).expect("empty WAL sidecar");
+        std::fs::write(&copied_shm, [0_u8; 3]).expect("uninitialized WAL-index sidecar");
         let snapshot = || {
             std::fs::read_dir(&storage)
                 .expect("storage entries")
@@ -1189,9 +1197,11 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
         );
         drop(restricted);
 
-        // Positive control: the very same copied database opens with the
-        // appropriate capability, repairs its identity, and remains SQL
-        // read-only. This proves the fixture reaches a real native repair.
+        // Positive control: the very same copied WAL database opens with the
+        // appropriate capability, leaves the stale `-fsqlite-ns-use` record
+        // unchanged per fsqlite 0.5.1 (GH#535), rebuilds the uninitialized
+        // `-shm` index to 32 KiB in place (GH#528), and remains SQL read-only.
+        // This proves the fixture reaches a real native coordination-file write.
         let namespace = storage.join("copied.db-fsqlite-ns-use");
         let copied_identity = std::fs::read(&namespace).expect("copied identity");
         let allowed = runtime(&root, "owner", None).await;
@@ -1218,10 +1228,20 @@ fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair(
             result,
             json!({"rows":[{"value":"durable"}], "writeDenied":true})
         );
-        assert_ne!(
-            std::fs::read(namespace).expect("rebound native identity"),
+        assert_eq!(
+            std::fs::read(&namespace).expect("unchanged copied native identity"),
             copied_identity,
-            "permitted read-only open must rebind the copied native namespace"
+            "fsqlite 0.5.1 quiescent read-only open must leave copied namespace records unchanged"
+        );
+        let rebuilt_shm = std::fs::read(&copied_shm).expect("rebuilt WAL-index sidecar");
+        assert_eq!(
+            rebuilt_shm.len(),
+            32 * 1024,
+            "permitted read-only open must rebuild the uninitialized WAL-index sidecar to 32 KiB"
+        );
+        assert_ne!(
+            rebuilt_shm, [0_u8; 3],
+            "rebuilt WAL-index sidecar must differ from the 3-byte uninitialized fixture"
         );
     });
 }

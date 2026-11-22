@@ -879,7 +879,7 @@ mod tests {
         ] {
             assert!(yield_receipt("native-call", input).is_err());
         }
-        for call in ["".to_string(), "bad\0call".to_string(), "x".repeat(257)] {
+        for call in [String::new(), "bad\0call".to_string(), "x".repeat(257)] {
             assert!(
                 yield_receipt(&call, json!({"requestId":"warm-2", "key":1, "data":null})).is_err()
             );

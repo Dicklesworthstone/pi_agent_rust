@@ -510,10 +510,11 @@ fn authorize_database(
     policy: Option<&ExtensionPolicy>,
     readonly: bool,
 ) -> Result<PathBuf> {
-    // A read-only main pager still enters FrankenSQLite's native namespace
-    // protocol. Opening an existing or copied database can create or repair
-    // coordination files before query_only is enabled. Require authority for
-    // those writes before entering the worker, including on read-only opens.
+    // A read-only main pager still enters FrankenSQLite's native coordination
+    // protocol. Opening an existing or copied WAL database can rebuild an
+    // uninitialized `-shm` index or touch lock/coordination files before
+    // query_only is enabled. Require authority for those writes before entering
+    // the worker, including on read-only opens.
     for capability in ["read", "write"] {
         if policy.is_some_and(|policy| {
             policy.evaluate_for(capability, owner).decision != PolicyDecision::Allow
