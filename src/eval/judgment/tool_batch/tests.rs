@@ -156,7 +156,10 @@ fn settle_fixture_inner<F: Future>(future: F) -> F::Output {
     panic!("native fixture did not settle within its bounded polling allowance");
 }
 
-async fn invocation<'a>(tool: &EvalTool, host: Option<&'a dyn ToolInvocationHost>) -> Invocation<'a> {
+async fn invocation<'a>(
+    tool: &EvalTool,
+    host: Option<&'a dyn ToolInvocationHost>,
+) -> Invocation<'a> {
     let mut invocation = Invocation::new(None, &json!({}), None)
         .unwrap()
         .with_host(host);
@@ -280,7 +283,10 @@ fn compatible_reads_overlap_but_mutations_are_ordered_barriers() {
         .unwrap();
         let reply: Value = serde_json::from_str(&reply).unwrap();
         for (index, expected) in [0, 0, 1, 1, 1].into_iter().enumerate() {
-            assert_eq!(reply["items"][index]["result"]["details"]["value"], expected);
+            assert_eq!(
+                reply["items"][index]["result"]["details"]["value"],
+                expected
+            );
         }
         let state = host.state();
         assert_eq!(state.peak, 2);

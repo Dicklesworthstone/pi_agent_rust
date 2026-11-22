@@ -6815,12 +6815,8 @@ impl Agent {
                 )
                 .await
             } else {
-                self.execute_tool_without_hooks(
-                    &tool_call,
-                    Arc::clone(&on_event),
-                    expected_session,
-                )
-                .await
+                self.execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
+                    .await
             };
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
@@ -7349,13 +7345,8 @@ impl Agent {
         on_event: AgentEventHandler,
         expected_session: Option<&str>,
     ) -> (ToolOutput, bool) {
-        self.execute_tool_without_hooks_with_admission(
-            tool_call,
-            on_event,
-            expected_session,
-            false,
-        )
-        .await
+        self.execute_tool_without_hooks_with_admission(tool_call, on_event, expected_session, false)
+            .await
     }
 
     async fn execute_tool_without_hooks_with_admission(
@@ -11257,8 +11248,7 @@ mod extensions_integration_tests {
         runtime.block_on(async {
             for switch_session in [false, true] {
                 let root = tempfile::tempdir().expect("workspace");
-                std::fs::write(root.path().join("data.txt"), "private result")
-                    .expect("fixture");
+                std::fs::write(root.path().join("data.txt"), "private result").expect("fixture");
                 let calls = Arc::new(AtomicUsize::new(0));
                 let mut tools = ToolRegistry::new(&[], root.path(), None);
                 tools.push(Box::new(ReclassifiedNativeTool {
@@ -11266,11 +11256,7 @@ mod extensions_integration_tests {
                     writes: false,
                     calls: Arc::clone(&calls),
                 }));
-                let mut agent = Agent::new(
-                    Arc::new(NoopProvider),
-                    tools,
-                    AgentConfig::default(),
-                );
+                let mut agent = Agent::new(Arc::new(NoopProvider), tools, AgentConfig::default());
                 let scope = agent.job_session_scope.clone();
                 agent.config.tool_approval = Some(Arc::new(move |_| {
                     if switch_session {
@@ -11317,8 +11303,7 @@ mod extensions_integration_tests {
                     let output = outcome.expect("denied output");
                     assert!(output.is_error);
                     assert!(
-                        nested_parallel_output_text(&output)
-                            .contains("parallel approval denied")
+                        nested_parallel_output_text(&output).contains("parallel approval denied")
                     );
                 }
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -11334,8 +11319,7 @@ mod extensions_integration_tests {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
             let root = tempfile::tempdir().expect("workspace");
-            std::fs::write(root.path().join("data.txt"), "original result")
-                .expect("fixture");
+            std::fs::write(root.path().join("data.txt"), "original result").expect("fixture");
             let extension = root.path().join("parallel-policy.mjs");
             std::fs::write(
                 &extension,

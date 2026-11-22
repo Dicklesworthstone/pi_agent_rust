@@ -51,10 +51,14 @@ fn parse(input: Value) -> Result<Request, String> {
             || call.name.chars().any(char::is_control)
             || !call.args.is_object()
         {
-            return Err("EVAL_TOOL_BATCH_INPUT: expected a bounded tool name and object args".into());
+            return Err(
+                "EVAL_TOOL_BATCH_INPUT: expected a bounded tool name and object args".into(),
+            );
         }
         if matches!(call.name.as_str(), "eval" | "xdev") || call.name.starts_with("__pi_") {
-            return Err("EVAL_BRIDGE_RECURSION: batches cannot call eval or dispatch wrappers".into());
+            return Err(
+                "EVAL_BRIDGE_RECURSION: batches cannot call eval or dispatch wrappers".into(),
+            );
         }
     }
     Ok(request)
@@ -145,9 +149,7 @@ impl Reply {
         self.bytes = self.bytes.saturating_add(item.len());
         if self.bytes > bridge_result::STRUCTURED_LIMIT {
             self.oversized = true;
-            for item in &mut self.items {
-                *item = None;
-            }
+            self.items.fill(None);
         } else {
             self.items[index] = Some(item);
         }
@@ -206,7 +208,9 @@ impl Invocation<'_> {
     ) -> Result<String, String> {
         let request = parse(input)?;
         if request.calls.len() > MAX_TOOL_CALLS.saturating_sub(self.tool_receipts.len()) {
-            return Err("EVAL_BRIDGE_LIMIT: batch exceeds the remaining 64 tool calls per cell".into());
+            return Err(
+                "EVAL_BRIDGE_LIMIT: batch exceeds the remaining 64 tool calls per cell".into(),
+            );
         }
         let expected_session = self
             .host_session
@@ -249,7 +253,7 @@ impl Invocation<'_> {
             })
             .collect::<Vec<_>>();
         let parallelism = host
-            .map_or(MAX_PARALLEL, |host| host.tool_parallelism())
+            .map_or(MAX_PARALLEL, ToolInvocationHost::tool_parallelism)
             .clamp(1, MAX_PARALLEL);
         let mut reply = Reply::new(calls.len());
         for batch in crate::agent::plan_tool_effect_batches(&effects) {

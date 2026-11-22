@@ -517,22 +517,19 @@ impl<'p> Invocation<'p> {
             .get_mut(index)
             .and_then(Value::as_object_mut)
             .ok_or_else(|| "EVAL_TOOL_RECEIPT: native call receipt was unavailable".to_string())?;
-        match outcome {
-            Ok(output) => {
-                receipt.insert(
-                    "status".into(),
-                    json!(if output.is_error {
-                        "failed"
-                    } else {
-                        "completed"
-                    }),
-                );
-                receipt.insert("isError".into(), json!(output.is_error));
-            }
-            Err(_) => {
-                receipt.insert("status".into(), json!("failed"));
-                receipt.insert("isError".into(), json!(true));
-            }
+        if let Ok(output) = outcome {
+            receipt.insert(
+                "status".into(),
+                json!(if output.is_error {
+                    "failed"
+                } else {
+                    "completed"
+                }),
+            );
+            receipt.insert("isError".into(), json!(output.is_error));
+        } else {
+            receipt.insert("status".into(), json!("failed"));
+            receipt.insert("isError".into(), json!(true));
         }
         Ok(())
     }
@@ -551,15 +548,9 @@ impl<'p> Invocation<'p> {
         let session = self.host_session.as_deref().ok_or_else(|| {
             "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
         })?;
-        let outcome = tool_batch::execute_call(
-            None,
-            Some(native.as_ref()),
-            call,
-            session,
-            &guard,
-            false,
-        )
-        .await;
+        let outcome =
+            tool_batch::execute_call(None, Some(native.as_ref()), call, session, &guard, false)
+                .await;
         self.finish_tool_receipt(index, &outcome)?;
         outcome
     }
