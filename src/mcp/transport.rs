@@ -5184,6 +5184,9 @@ pub(crate) mod tests {
     /// a response template with `Content-Length` must be reframed after the
     /// substitution. Chunked responses have no such header and pass through.
     fn render_scripted_response(response: &str, request_id: &str) -> String {
+        if !response.contains("__ECHO_ID__") {
+            return response.to_string();
+        }
         let mut rendered = response.replace("__ECHO_ID__", request_id);
         let Some(headers_end) = rendered.find("\r\n\r\n") else {
             return rendered;

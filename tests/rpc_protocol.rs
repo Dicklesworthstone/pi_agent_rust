@@ -391,35 +391,56 @@ fn rpc_dispatch_arms_match_docs_rpc_inventory() {
     let dispatch_block = &dispatch_tail[..dispatch_end];
 
     let mut dispatch_commands = BTreeSet::new();
+    let mut pending_pattern: Option<String> = None;
     for line in dispatch_block.lines() {
-        let Some(rest) = line.strip_prefix("            \"") else {
-            continue;
-        };
-        if !rest.contains("=>") {
-            continue;
-        }
-        let pattern_part = rest.split("=>").next().unwrap_or_default();
-        for piece in pattern_part.split('|') {
-            let trimmed = piece.trim().trim_matches('"');
-            if !trimmed.is_empty() {
-                dispatch_commands.insert(trimmed.to_string());
+        let fragment = if let Some(rest) = line.strip_prefix("            \"") {
+            pending_pattern = Some(format!("\"{rest}"));
+            pending_pattern.as_deref()
+        } else if let Some(existing) = pending_pattern.as_mut() {
+            if let Some(rest) = line.strip_prefix("            |") {
+                existing.push(' ');
+                existing.push('|');
+                existing.push_str(rest);
+                Some(existing.as_str())
+            } else {
+                pending_pattern = None;
+                None
             }
+        } else {
+            None
+        };
+        if let Some(arm) = fragment
+            && arm.contains("=>")
+        {
+            let pattern_part = arm.split("=>").next().unwrap_or_default();
+            for piece in pattern_part.split('|') {
+                let trimmed = piece.trim().trim_matches('"');
+                if !trimmed.is_empty() {
+                    dispatch_commands.insert(trimmed.to_string());
+                }
+            }
+            pending_pattern = None;
         }
     }
 
     let docs_rpc = std::fs::read_to_string("docs/rpc.md").expect("read docs/rpc.md");
     let mut documented_commands = BTreeSet::new();
     for line in docs_rpc.lines() {
-        if let Some(rest) = line.trim().strip_prefix("- **")
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("- **")
             && let Some((cmd, _)) = rest.split_once("**:")
+        {
+            documented_commands.insert(cmd.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("| **")
+            && let Some((cmd, _)) = rest.split_once("** |")
         {
             documented_commands.insert(cmd.trim().to_string());
         }
     }
 
     assert!(
-        dispatch_commands.len() >= 43,
-        "expected at least 43 RPC commands in src/rpc.rs, found {}",
+        dispatch_commands.len() >= 46,
+        "expected at least 46 RPC commands in src/rpc.rs, found {}",
         dispatch_commands.len()
     );
     assert!(

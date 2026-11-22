@@ -273,7 +273,10 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
                 }
                 let error = response["error"].as_str().unwrap_or_default().to_string();
                 assert!(
-                    error.contains("wait before running") || error.contains("currently streaming"),
+                    error.contains("wait before running")
+                        || error.contains("currently streaming")
+                        || error.contains("Plan control requires an idle RPC session")
+                        || error.contains("PLAN_SESSION_BUSY"),
                     "{id} rejected for a reason that is not the turn handoff: {response}"
                 );
                 std::thread::sleep(Duration::from_millis(100));
@@ -283,8 +286,59 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
                 rpc_output_tail(&stdout_capture)
             );
         };
+    let review = send_until_accepted(&mut stdin, "c2-get", &|attempt_id| {
+        format!(r#"{{"id":"{attempt_id}","type":"get_plan"}}"#)
+    });
+    assert_eq!(
+        review["data"]["planMode"], "pending_approval",
+        "get_plan must expose pending_approval before approval: {review}"
+    );
+    let review_id = review["data"]["reviewId"]
+        .as_str()
+        .expect("get_plan must issue an opaque reviewId for pending approval")
+        .to_string();
+
+    // Negative control: bare approve_plan without reviewId must fail closed.
+    send(
+        &mut stdin,
+        r#"{"id":"c2-missing-review","type":"approve_plan"}"#,
+    );
+    let missing_review = loop {
+        let found = stdout_capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value["type"] == "response" && value["id"] == "c2-missing-review");
+        if let Some(value) = found {
+            break value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no response for c2-missing-review; last RPC output lines:\n{}",
+            rpc_output_tail(&stdout_capture)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        missing_review["success"], false,
+        "approve_plan without reviewId must fail closed: {missing_review}"
+    );
+    assert!(
+        missing_review["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PLAN_REVIEW_REQUIRED"),
+        "expected PLAN_REVIEW_REQUIRED without reviewId: {missing_review}"
+    );
+
     let approval = send_until_accepted(&mut stdin, "c2", &|attempt_id| {
-        format!(r#"{{"id":"{attempt_id}","type":"approve_plan"}}"#)
+        serde_json::json!({
+            "id": attempt_id,
+            "type": "approve_plan",
+            "reviewId": review_id,
+        })
+        .to_string()
     });
     assert_eq!(
         approval["data"]["approved"], true,

@@ -22507,7 +22507,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "__pi_bridge_secret_matches_native",
                     Func::from({
                         let bridge_secret = self.bridge_secret.clone();
-                        move |candidate: String| candidate == bridge_secret
+                        move |candidate: rquickjs::Value<'_>| {
+                            candidate
+                                .as_string()
+                                .and_then(|s| s.to_string().ok())
+                                .is_some_and(|s| s == bridge_secret)
+                        }
                     }),
                 )?;
                 global.set(
