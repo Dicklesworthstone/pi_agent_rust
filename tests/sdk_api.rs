@@ -969,6 +969,179 @@ fn sdk_rpc_shutdown_and_drop_stop_live_and_reaped_root_descendants() {
     }
 }
 
+
+#[test]
+fn sdk_rpc_plan_reviews_bind_the_displayed_submission_and_require_complete_state() {
+    let mut state: sdk::RpcPlanState = serde_json::from_value(json!({
+        "planMode": "pending_approval",
+        "plan": "Inspect the source, implement the change, then verify the result.",
+        "reviewId": "p1-first",
+    }))
+    .expect("complete pending state");
+    let first = state.pending_review().unwrap().unwrap();
+    state.review_id = Some("p1-second".to_string());
+    let second = state.pending_review().unwrap().unwrap();
+    assert_eq!(first.text(), second.text());
+    assert_ne!(first, second, "identical text is not the same submission");
+
+    for (text, id) in [
+        (None, Some("p1-valid".to_string())),
+        (Some("  ".to_string()), Some("p1-valid".to_string())),
+        (Some("é".repeat(128 * 1024 + 1)), Some("p1-valid".to_string())),
+        (Some("proposal".to_string()), None),
+        (Some("proposal".to_string()), Some(" ".to_string())),
+        (Some("proposal".to_string()), Some("x".repeat(65))),
+        (Some("proposal".to_string()), Some("bad\0id".to_string())),
+    ] {
+        state.plan = text;
+        state.review_id = id;
+        assert!(state.pending_review().is_err());
+    }
+    state.plan_mode = sdk::RpcPlanMode::Approved;
+    assert!(state.pending_review().unwrap().is_none());
+    assert!(serde_json::from_value::<sdk::RpcPlanState>(json!({
+        "planMode": "approve_on_resume", "plan": null, "reviewId": null,
+    })).is_err());
+}
+
+#[test]
+fn sdk_rpc_plan_changes_preserve_committed_decisions_and_persistence_uncertainty() {
+    let change: sdk::RpcPlanChange = serde_json::from_value(json!({
+        "planMode": "approved", "plan": null, "reviewId": null,
+        "changed": true, "approved": true,
+        "persistence": {"status": "unconfirmed", "reason": "save interrupted"},
+        "stateError": "snapshot busy",
+    }))
+    .expect("live approval with an unconfirmed save remains a successful change");
+    assert!(change.changed);
+    assert_eq!(change.state.plan_mode, sdk::RpcPlanMode::Approved);
+    assert_eq!(change.state_error.as_deref(), Some("snapshot busy"));
+    assert_eq!(change.persistence, sdk::RpcPlanPersistence::Unconfirmed {
+        reason: "save interrupted".to_string(),
+    });
+    for persistence in [
+        json!({"status": "unconfirmed"}),
+        json!({"status": "eventually_saved"}),
+    ] {
+        assert!(serde_json::from_value::<sdk::RpcPlanChange>(json!({
+            "planMode": "approved", "plan": "proposal", "reviewId": null,
+            "changed": true, "persistence": persistence,
+        })).is_err(), "unknown or incomplete durability must never be treated as saved");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_plan_controls_preserve_review_identity_and_use_save_only_recovery() {
+    let directory = tempfile::tempdir().expect("protocol fixture directory");
+    let mut client = rpc_pipe_fixture(
+        r#"
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"set_plan_mode","success":true,"data":{"planMode":"planning","plan":null,"reviewId":null,"changed":true,"persistence":{"status":"memory_only"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"get_plan","success":true,"data":{"planMode":"pending_approval","plan":"same reviewed text","reviewId":"p1-first"}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-3","command":"get_plan","success":true,"data":{"planMode":"pending_approval","plan":"same reviewed text","reviewId":"p1-second"}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-4","command":"approve_plan","success":false,"error":"PLAN_REVIEW_STALE"}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-5","command":"reject_plan","success":true,"data":{"planMode":"planning","plan":"same reviewed text","reviewId":null,"changed":true,"rejected":true,"persistence":{"status":"unconfirmed","reason":"save interrupted"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-6","command":"save_plan","success":true,"data":{"planMode":"planning","plan":"same reviewed text","reviewId":null,"changed":false,"persistence":{"status":"saved"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-7","command":"restore_plan","success":true,"data":{"planMode":"pending_approval","plan":"same reviewed text","reviewId":"p1-restored","changed":true,"persistence":{"status":"memory_only"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-8","command":"approve_plan","success":true,"data":{"planMode":"approved","plan":"same reviewed text","reviewId":null,"changed":true,"approved":true,"persistence":{"status":"unconfirmed","reason":"disk unavailable"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-9","command":"set_plan_mode","success":true,"data":{"planMode":"off","plan":null,"reviewId":null,"changed":true,"persistence":{"status":"saved"}}}'
+"#,
+        Some(directory.path().to_path_buf()),
+    );
+    futures::executor::block_on(async {
+        let entered = client.set_plan_mode(true).await.expect("enter planning");
+        assert_eq!(entered.persistence, sdk::RpcPlanPersistence::MemoryOnly);
+        let first = client
+            .get_plan()
+            .await
+            .unwrap()
+            .pending_review()
+            .unwrap()
+            .unwrap();
+        let second = client
+            .get_plan()
+            .await
+            .unwrap()
+            .pending_review()
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        let stale = client.approve_plan_review(&first).await.unwrap_err();
+        assert!(stale.to_string().contains("PLAN_REVIEW_STALE"));
+        let rejected = client
+            .reject_plan_review(&second)
+            .await
+            .expect("reject current review");
+        assert_eq!(rejected.state.plan_mode, sdk::RpcPlanMode::Planning);
+        assert!(matches!(
+            rejected.persistence,
+            sdk::RpcPlanPersistence::Unconfirmed { .. }
+        ));
+        let saved = client
+            .checkpoint_plan()
+            .await
+            .expect("save without repeating rejection");
+        assert!(!saved.changed);
+        assert_eq!(saved.persistence, sdk::RpcPlanPersistence::Saved);
+        let restored = client
+            .restore_plan_checkpoint()
+            .await
+            .expect("restore for fresh review");
+        let review = restored.state.pending_review().unwrap().unwrap();
+        assert_ne!(review, second);
+        let approved = client
+            .approve_plan_review(&review)
+            .await
+            .expect("committed approval");
+        assert_eq!(approved.state.plan_mode, sdk::RpcPlanMode::Approved);
+        assert_eq!(approved.state.plan.as_deref(), Some(review.text()));
+        assert!(matches!(
+            approved.persistence,
+            sdk::RpcPlanPersistence::Unconfirmed { .. }
+        ));
+        let exited = client.set_plan_mode(false).await.expect("exit and unpin");
+        assert_eq!(exited.state.plan_mode, sdk::RpcPlanMode::Off);
+    });
+    let recorded = std::fs::read_to_string(directory.path().join("frames.jsonl")).unwrap();
+    let frames: Vec<serde_json::Value> = recorded
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames,
+        vec![
+            json!({"type":"set_plan_mode", "id":"rpc-1", "mode":"on"}),
+            json!({"type":"get_plan", "id":"rpc-2"}),
+            json!({"type":"get_plan", "id":"rpc-3"}),
+            json!({"type":"approve_plan", "id":"rpc-4", "reviewId":"p1-first"}),
+            json!({"type":"reject_plan", "id":"rpc-5", "reviewId":"p1-second"}),
+            json!({"type":"save_plan", "id":"rpc-6"}),
+            json!({"type":"restore_plan", "id":"rpc-7"}),
+            json!({"type":"approve_plan", "id":"rpc-8", "reviewId":"p1-restored"}),
+            json!({"type":"set_plan_mode", "id":"rpc-9", "mode":"off"}),
+        ]
+    );
+    client.shutdown().expect("shutdown protocol fixture");
+}
+
 #[test]
 fn sdk_is_only_public_root_module_and_basic_sdk_imports_exclusively_from_sdk() {
     fn unhidden_root_pub_mods(lib_source: &str) -> Vec<String> {

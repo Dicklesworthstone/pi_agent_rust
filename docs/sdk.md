@@ -695,6 +695,50 @@ fn main() -> pi::sdk::Result<()> {
 }
 ```
 
+### Durable plan review over RPC
+
+`RpcTransportClient` uses the same guarded plan lifecycle as in-process sessions.
+Enter planning with `set_plan_mode(true)`, let the model submit its proposal,
+then call `get_plan()` and `pending_review()` to capture an immutable
+`RpcPlanReview`. Present its complete `text()` and keep that same value while
+the user decides. Pass it to `approve_plan_review()` or `reject_plan_review()`;
+a newer submission, session replacement, or checkpoint restoration makes an
+older review stale, even when its text is identical.
+
+```rust
+let state = rpc.get_plan().await?;
+if let Some(review) = state.pending_review()? {
+    // Present review.text() and retain review until the user makes a decision.
+    // After an explicit approval:
+    let change = rpc.approve_plan_review(&review).await?;
+    match &change.persistence {
+        pi::sdk::RpcPlanPersistence::Saved => { /* saved successfully */ }
+        pi::sdk::RpcPlanPersistence::MemoryOnly => { /* saving is disabled */ }
+        pi::sdk::RpcPlanPersistence::Unchanged => { /* no transition needed */ }
+        pi::sdk::RpcPlanPersistence::Unconfirmed { reason } => {
+            eprintln!("Plan changed, but saving was not confirmed: {reason}");
+            // Retry rpc.checkpoint_plan(), not the already-applied approval.
+        }
+    }
+}
+```
+
+`RpcPlanChange.changed` describes the live decision; `persistence` describes
+its independent save outcome. An unconfirmed save is returned as a successful
+live transition, so repeating an old approval is not a recovery strategy.
+`checkpoint_plan()` retries persistence without repeating the decision.
+`state_error` reports when the post-transition snapshot was unavailable; it
+also does not roll back the committed decision.
+
+After reopening or selecting a saved session, `restore_plan_checkpoint()`
+restores the selected branch's saved state, provided no live proposal or owned
+prompt pin is present. Saved pending and approved proposals require **fresh
+review**; off and planning checkpoints retain their respective modes. A saved
+approval does not authorize execution in the new connection.
+`set_plan_mode(false)` exits planning and removes only the owned approved-plan
+context. These operations require an idle session and do not start a provider
+turn.
+
 ## Recipe 7: Unified Transport Adapter (In-Process or RPC)
 
 ```rust

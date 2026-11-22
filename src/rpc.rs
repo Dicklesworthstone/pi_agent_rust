@@ -364,6 +364,9 @@ fn normalize_command_type(command_type: &str) -> &str {
     match command_type {
         "follow-up" | "followUp" | "queue-follow-up" | "queueFollowUp" => "follow_up",
         "get-state" | "getState" => "get_state",
+        "get-plan" | "getPlan" => "get_plan",
+        "save-plan" | "savePlan" => "save_plan",
+        "restore-plan" | "restorePlan" => "restore_plan",
         "set-output-mode" | "setOutputMode" => "set_output_mode",
         "get-attachment" | "getAttachment" => "get_attachment",
         "set-model" | "setModel" => "set_model",
@@ -388,6 +391,8 @@ fn command_can_advance_rpc_session(command_type: &str) -> bool {
             | "goal"
             | "approve_plan"
             | "reject_plan"
+            | "save_plan"
+            | "restore_plan"
             | "set_model"
             | "cycle_model"
             | "set_thinking_level"
@@ -3326,7 +3331,7 @@ async fn run_with_input(
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        let initial_plan_mode = {
+        let (initial_plan_mode, unpinned_prompt) = {
             let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                 .await
                 .map_err(|err| Error::session(format!("shared state lock failed: {err}")))?;
@@ -3340,11 +3345,15 @@ async fn run_with_input(
                 options.config.failover_cooldown_secs(),
                 chrono::Utc::now(),
             );
-            replayed_plan_mode(&inner)
+            (
+                replayed_plan_mode(&inner),
+                crate::plan::replacement_system_prompt(&guard.agent, &guard.session, &inner)?,
+            )
         };
         // `--prewalk-into` armed this same session before the server started.
         // The reset clears it with the other session-scoped state, so re-arm it.
         let armed_prewalk = guard.agent.prewalk_target().cloned();
+        guard.agent.set_system_prompt(unpinned_prompt);
         guard.agent.reset_session_scoped_state(initial_plan_mode);
         if let Some(target) = armed_prewalk {
             guard.arm_prewalk(target).await?;
@@ -3581,6 +3590,7 @@ async fn run_with_input(
     let mut pending_bg_commands = Vec::new();
     let mut in_flight_fork = None;
     let mut input_error = None;
+    let mut plan_control = crate::plan::rpc::RpcPlanControl::default();
 
     while let Some(frame) = input.recv(&cx).await {
         let line = match frame.and_then(|line| {
@@ -3623,6 +3633,7 @@ async fn run_with_input(
         if !matches!(
             command_type,
             "get_state"
+                | "get_plan"
                 | "get_session_stats"
                 | "get_messages"
                 | "get_fork_messages"
@@ -3668,6 +3679,13 @@ async fn run_with_input(
         } else {
             Vec::new()
         };
+
+        if crate::plan::rpc::RpcPlanControl::handles(command_type)
+            && let Err(err) = crate::plan::rpc::RpcPlanControl::validate(command_type, &parsed)
+        {
+            let _ = out_tx.send(response_error_with_hints(id, command_type, &err));
+            continue;
+        }
 
         if command_type == "handoff"
             && let Err(err) = parse_handoff_focus(&parsed)
@@ -4356,100 +4374,44 @@ async fn run_with_input(
                 }
             }
 
-            "set_plan_mode" => {
-                // bd-cv653.3.5: enable/disable plan mode. mode: "on"|"off".
-                let mode = parsed
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("on")
-                    .to_ascii_lowercase();
-                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
-                    let _ = out_tx.send(response_error(id, "set_plan_mode", "session lock failed"));
-                    continue;
-                };
-                let plan_state = guard.agent.plan_state();
-                let enabled = !matches!(mode.as_str(), "off" | "false" | "0");
-                let Ok(mut inner) = guard.session.lock(cx.cx()).await else {
-                    let _ = out_tx.send(response_error(id, "set_plan_mode", "session busy"));
-                    continue;
-                };
-                if enabled {
-                    plan_state.enter_planning();
-                    inner.append_custom_entry(
-                        "plan_mode".to_string(),
-                        Some(json!({"mode": "planning"})),
-                    );
-                } else {
-                    plan_state.exit();
-                    inner
-                        .append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "off"})));
-                }
-                drop(inner);
-                drop(guard);
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "set_plan_mode",
-                    Some(json!({"planMode": if enabled { "planning" } else { "off" }})),
-                ));
-            }
-
-            "approve_plan" => {
-                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
-                    let _ = out_tx.send(response_error(id, "approve_plan", "session lock failed"));
-                    continue;
-                };
-                let plan_state = guard.agent.plan_state();
-                match plan_state.approve() {
-                    Some(plan) => {
-                        if let Ok(mut inner) = guard.session.lock(cx.cx()).await {
-                            inner.append_custom_entry(
-                                "plan_mode".to_string(),
-                                Some(json!({"mode": "approved"})),
-                            );
-                        }
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "approve_plan",
-                            Some(json!({"approved": true, "plan": plan})),
-                        ));
-                    }
-                    None => {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "approve_plan",
-                            "no submitted plan to approve",
-                        ));
-                    }
-                }
-            }
-
-            "reject_plan" => {
-                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
-                    let _ = out_tx.send(response_error(id, "reject_plan", "session lock failed"));
-                    continue;
-                };
-                let plan_state = guard.agent.plan_state();
-                if plan_state.reject() {
-                    if let Ok(mut inner) = guard.session.lock(cx.cx()).await {
-                        inner.append_custom_entry(
-                            "plan_mode".to_string(),
-                            Some(json!({"mode": "rejected"})),
-                        );
-                    }
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "reject_plan",
-                        Some(json!({"rejected": true})),
-                    ));
-                } else {
+            "get_plan" | "set_plan_mode" | "approve_plan" | "reject_plan" | "save_plan"
+            | "restore_plan" => {
+                // Never park the sole RPC reader behind a turn or hook that
+                // may need an abort or UI response from this same connection.
+                let bash_running = bash_state
+                    .try_lock()
+                    .map_or(true, |running| running.is_some());
+                if bash_running
+                    || rpc_turn_phase(&is_streaming, &is_compacting) != RpcTurnPhase::Idle
+                {
                     let _ = out_tx.send(response_error(
                         id,
-                        "reject_plan",
-                        "no submitted plan to reject",
+                        command_type,
+                        "Plan control requires an idle RPC session",
                     ));
+                    continue;
+                }
+                let Ok(mut guard) = session.try_lock_owned() else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        command_type,
+                        "[PLAN_SESSION_BUSY] Session busy; retry plan control when idle",
+                    ));
+                    continue;
+                };
+                let result = plan_control
+                    .command(&mut guard, &cx, command_type, &parsed)
+                    .await;
+                drop(guard);
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, command_type, Some(data)));
+                    }
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(id, command_type, &error));
+                    }
                 }
             }
-
             "set_output_mode" => {
                 let compact = match parsed.get("mode").and_then(Value::as_str) {
                     Some("full") => false,
@@ -6023,6 +5985,7 @@ async fn run_with_input(
                     .await?;
                     guard.invalidate_background_compaction();
                     state.provider_admission.ensure_allowed()?;
+                    let unpinned_prompt;
                     {
                         let session_store = Arc::clone(&guard.session);
                         let mut inner_session = OwnedMutexGuard::lock(session_store, &cx)
@@ -6032,25 +5995,37 @@ async fn run_with_input(
                             })?;
                         let service_owner =
                             guard.agent.service_owner(inner_session.header.id.as_str());
-                        if let Some(budget) = guard.agent.cost_budget() {
-                            let prepared = prepare_rpc_cost_handoff(
-                                budget,
-                                &mut inner_session,
-                                guard.save_enabled(),
-                                &guard.provider_admission_gate(),
-                                AutosaveFlushTrigger::Manual,
-                                cx.cx(),
+                        let retirement = if let Some(budget) = guard.agent.cost_budget() {
+                            Some(
+                                prepare_rpc_cost_handoff(
+                                    budget,
+                                    &mut inner_session,
+                                    guard.save_enabled(),
+                                    &guard.provider_admission_gate(),
+                                    AutosaveFlushTrigger::Manual,
+                                    cx.cx(),
+                                )
+                                .await?,
                             )
-                            .await?;
-                            if guard.save_enabled() {
-                                prepared.retire_session(&inner_session, cx.cx())?;
-                            }
+                        } else {
+                            None
+                        };
+                        unpinned_prompt = crate::plan::replacement_system_prompt(
+                            &guard.agent,
+                            &guard.session,
+                            &inner_session,
+                        )?;
+                        if guard.save_enabled()
+                            && let Some(prepared) = retirement
+                        {
+                            prepared.retire_session(&inner_session, cx.cx())?;
                         }
                         *inner_session = new_session;
                         session_transition_permit.commit_session_change();
                         state.output.clear_session();
                         service_shutdown = Some(crate::hub::begin_session_shutdown(&service_owner));
                     }
+                    guard.agent.set_system_prompt(unpinned_prompt);
                     guard.agent.set_cost_budget(cost_budget);
                     guard.agent.clear_messages();
                     crate::app::rebind_stream_options_session(
@@ -6330,6 +6305,11 @@ async fn run_with_input(
                             let messages = new_session.to_messages_for_current_path();
                             let session_id = new_session.header.id.clone();
 
+                            let unpinned_prompt = crate::plan::replacement_system_prompt(
+                                &guard.agent,
+                                &guard.session,
+                                &inner_session,
+                            )?;
                             if retiring_session
                                 && guard.save_enabled()
                                 && let Some(budget) = &retiring_budget
@@ -6347,6 +6327,7 @@ async fn run_with_input(
                             service_shutdown =
                                 service_owner.as_ref().map(crate::hub::begin_session_shutdown);
                             drop(inner_session);
+                            guard.agent.set_system_prompt(unpinned_prompt);
                             guard.agent.set_cost_budget(cost_budget);
                             guard.agent.replace_messages(messages);
                             crate::app::rebind_stream_options_session(
@@ -6533,6 +6514,10 @@ async fn run_with_input(
                                     .thinking_level
                                     .clone_from(&header_snapshot.thinking_level);
                                 new_session.init_from_fork_plan(fork_plan);
+                                crate::plan::inherit_fork_checkpoint(
+                                    &mut new_session,
+                                    &header_snapshot.id,
+                                )?;
                                 crate::session_workdir::check_session_workdir(
                                     &new_session,
                                     &runtime_cwd_for_fork,
@@ -6669,6 +6654,11 @@ async fn run_with_input(
 
                             let session_id = new_session.header.id.clone();
                             let service_owner = guard.agent.service_owner(inner.header.id.as_str());
+                            let unpinned_prompt = crate::plan::replacement_system_prompt(
+                                &guard.agent,
+                                &guard.session,
+                                &inner,
+                            )?;
                             if save_enabled && let Some(budget) = &cost_budget {
                                 budget.retire_session(&inner, cx_for_fork.cx())?;
                             }
@@ -6683,6 +6673,7 @@ async fn run_with_input(
                             service_shutdown =
                                 Some(crate::hub::begin_session_shutdown(&service_owner));
                             drop(inner);
+                            guard.agent.set_system_prompt(unpinned_prompt);
                             guard.agent.set_cost_budget(cost_budget);
                             guard.agent.replace_messages(messages);
                             crate::app::rebind_stream_options_session(
@@ -21042,6 +21033,245 @@ mod tests {
             runtime_handle: handle.clone(),
             ask_tool: None,
         }
+    }
+
+    #[test]
+    fn rpc_plan_commands_persist_exact_reviews_and_reject_stale_decisions() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("plan.jsonl");
+            let mut stored = Session::in_memory();
+            stored.path = Some(path.clone());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                first_call_entered: Mutex::new(None),
+                first_call_gate: Mutex::new(None),
+                calls: Arc::clone(&calls),
+            });
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig {
+                    system_prompt: Some("base instructions".to_string()),
+                    ..AgentConfig::default()
+                },
+            );
+            let plan_state = agent.plan_state();
+            let inner = Arc::new(asupersync::sync::Mutex::new(stored));
+            let session = AgentSession::new(
+                agent,
+                Arc::clone(&inner),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let entered = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"enter","type":"set_plan_mode","mode":"on"}"#,
+                    "enter durable plan mode",
+                )
+                .await;
+                assert_ok(&entered, "set_plan_mode");
+                assert_eq!(entered["data"]["persistence"]["status"], "saved");
+                let text = "Goal: repair the reader. Steps: adjust decoding. Verify round trips.";
+                assert!(plan_state.submit_plan(text.to_string()));
+                let view = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"view","type":"getPlan"}"#,
+                    "display exact proposal",
+                )
+                .await;
+                assert_ok(&view, "get_plan");
+                assert_eq!(view["data"]["plan"], text);
+                let first = view["data"]["reviewId"].clone();
+                assert!(plan_state.reject());
+                assert!(plan_state.submit_plan(text.to_string()));
+                let stale = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &json!({
+                        "id": "stale",
+                        "type": "approve_plan",
+                        "reviewId": first,
+                    })
+                    .to_string(),
+                    "reject replaced review",
+                )
+                .await;
+                assert_err(&stale, "approve_plan");
+                assert!(
+                    stale["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("PLAN_REVIEW_STALE")
+                );
+                let current = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"current","type":"get_plan"}"#,
+                    "refresh review",
+                )
+                .await;
+                assert_ne!(current["data"]["reviewId"], first);
+                let approved = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &json!({
+                        "id": "approve",
+                        "type": "approvePlan",
+                        "reviewId": current["data"]["reviewId"],
+                    })
+                    .to_string(),
+                    "approve exact review",
+                )
+                .await;
+                assert_ok(&approved, "approve_plan");
+                assert_eq!(approved["data"]["plan"], text);
+                assert_eq!(approved["data"]["planMode"], "approved");
+                assert_eq!(approved["data"]["persistence"]["status"], "saved");
+                let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert!(reopened.entries_for_current_path().iter().any(|entry| {
+                    matches!(entry, SessionEntry::Custom(custom)
+                        if custom.custom_type == "plan_checkpoint"
+                            && custom.data.as_ref().is_some_and(|data|
+                                data["mode"] == "approved" && data["plan"] == text))
+                }));
+                assert!(calls.lock().unwrap().is_empty());
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(session, options, in_rx, out_tx)), client).await;
+            result.unwrap();
+        }));
+    }
+
+    #[test]
+    fn rpc_new_session_removes_the_previous_sessions_approved_prompt_pin() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                first_call_entered: Mutex::new(None),
+                first_call_gate: Mutex::new(None),
+                calls: Arc::clone(&calls),
+            });
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig {
+                    system_prompt: Some("unrelated session base".to_string()),
+                    ..AgentConfig::default()
+                },
+            );
+            let plan_state = agent.plan_state();
+            let session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let entered = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"enter","type":"set_plan_mode","mode":"on"}"#,
+                    "enter plan",
+                )
+                .await;
+                assert_ok(&entered, "set_plan_mode");
+                assert!(plan_state.submit_plan(
+                    "An approved proposal that belongs only to the old session".to_string(),
+                ));
+                let view = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"view","type":"get_plan"}"#,
+                    "view old plan",
+                )
+                .await;
+                assert_ok(&view, "get_plan");
+                let approved = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &json!({
+                        "id": "approve",
+                        "type": "approve_plan",
+                        "reviewId": view["data"]["reviewId"],
+                    })
+                    .to_string(),
+                    "approve old plan",
+                )
+                .await;
+                assert_ok(&approved, "approve_plan");
+                let replaced = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"new","type":"new_session"}"#,
+                    "replace session",
+                )
+                .await;
+                assert_ok(&replaced, "new_session");
+                let view = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"new-plan","type":"get_plan"}"#,
+                    "inspect replacement",
+                )
+                .await;
+                assert_ok(&view, "get_plan");
+                assert_eq!(view["data"]["planMode"], "off");
+                assert!(view["data"]["plan"].is_null());
+                let prompted = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"prompt","type":"prompt","message":"new work"}"#,
+                    "prompt replacement",
+                )
+                .await;
+                assert_ok(&prompted, "prompt");
+                loop {
+                    let frame = recv_line(&out_rx, "replacement terminal event")
+                        .await
+                        .unwrap();
+                    let event: Value = serde_json::from_str(&frame).unwrap();
+                    if event["type"] == "agent_end" {
+                        break;
+                    }
+                }
+                {
+                    let captured = calls.lock().unwrap();
+                    assert_eq!(captured.len(), 1);
+                    assert_eq!(
+                        captured[0].system_prompt.as_deref(),
+                        Some("unrelated session base")
+                    );
+                }
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(session, options, in_rx, out_tx)), client).await;
+            result.unwrap();
+        }));
     }
 
     #[cfg(unix)]

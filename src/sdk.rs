@@ -1032,6 +1032,97 @@ pub struct RpcSessionState {
     pub durability_mode: String,
 }
 
+/// Plan state reported by the RPC session. Restored approvals require fresh review.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcPlanMode {
+    Off,
+    Planning,
+    PendingApproval,
+    Approved,
+}
+
+/// The exact proposal shown to the host, with its connection-bound review ID.
+/// Keep this value while awaiting a decision instead of fetching a newer plan.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RpcPlanReview {
+    review_id: String,
+    text: String,
+}
+
+impl RpcPlanReview {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Debug for RpcPlanReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcPlanReview")
+            .field("bytes", &self.text.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read-only plan snapshot. A review ID refers to one live submission on one
+/// connection; matching text alone never grants approval of a newer submission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPlanState {
+    pub plan_mode: RpcPlanMode,
+    pub plan: Option<String>,
+    pub review_id: Option<String>,
+}
+
+impl RpcPlanState {
+    /// Capture the complete pending proposal before presenting an approval UI.
+    /// Invalid pending snapshots are errors rather than empty or implicit approvals.
+    pub fn pending_review(&self) -> Result<Option<RpcPlanReview>> {
+        if self.plan_mode != RpcPlanMode::PendingApproval {
+            return Ok(None);
+        }
+        let text = self
+            .plan
+            .as_ref()
+            .filter(|text| !text.trim().is_empty() && text.len() <= crate::plan::MAX_PLAN_BYTES)
+            .ok_or_else(|| Error::api("RPC pending plan did not include reviewable text"))?;
+        let review_id = self
+            .review_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty() && id.len() <= 64 && !id.contains('\0'))
+            .ok_or_else(|| Error::api("RPC pending plan did not include a valid review ID"))?;
+        Ok(Some(RpcPlanReview {
+            review_id: review_id.clone(),
+            text: text.clone(),
+        }))
+    }
+}
+
+/// Persistence is independent of the live plan decision. Unconfirmed means the
+/// decision already took effect; retry `checkpoint_plan`, not the old approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RpcPlanPersistence {
+    Unchanged,
+    MemoryOnly,
+    Saved,
+    Unconfirmed { reason: String },
+}
+
+/// A completed RPC plan operation. A successful decision can still have an
+/// unconfirmed save or an unavailable post-transition state snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPlanChange {
+    #[serde(flatten)]
+    pub state: RpcPlanState,
+    pub changed: bool,
+    pub persistence: RpcPlanPersistence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_error: Option<String>,
+}
+
 /// Goal operation accepted by RPC `goal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcGoalOp {
@@ -1885,6 +1976,54 @@ impl RpcTransportClient {
 
     pub async fn get_session_stats(&mut self) -> Result<RpcSessionStats> {
         self.request_typed("get_session_stats", Map::new()).await
+    }
+
+    /// Read the current proposal without changing the plan or starting a turn.
+    pub async fn get_plan(&mut self) -> Result<RpcPlanState> {
+        self.request_typed("get_plan", Map::new()).await
+    }
+
+    /// Enter read-only planning or exit it and remove the owned approved-plan pin.
+    /// A pending proposal must be explicitly rejected or exited before re-entry.
+    pub async fn set_plan_mode(&mut self, enabled: bool) -> Result<RpcPlanChange> {
+        let mut payload = Map::new();
+        payload.insert(
+            "mode".to_string(),
+            Value::String(if enabled { "on" } else { "off" }.to_string()),
+        );
+        self.request_typed("set_plan_mode", payload).await
+    }
+
+    /// Approve the exact proposal previously displayed. Stale reviews are
+    /// rejected by the server; this never fetches or substitutes a newer review.
+    pub async fn approve_plan_review(&mut self, review: &RpcPlanReview) -> Result<RpcPlanChange> {
+        let mut payload = Map::new();
+        payload.insert(
+            "reviewId".to_string(),
+            Value::String(review.review_id.clone()),
+        );
+        self.request_typed("approve_plan", payload).await
+    }
+
+    /// Reject the displayed proposal while retaining read-only planning.
+    pub async fn reject_plan_review(&mut self, review: &RpcPlanReview) -> Result<RpcPlanChange> {
+        let mut payload = Map::new();
+        payload.insert(
+            "reviewId".to_string(),
+            Value::String(review.review_id.clone()),
+        );
+        self.request_typed("reject_plan", payload).await
+    }
+
+    /// Retry saving the live plan without repeating an approval or rejection.
+    pub async fn checkpoint_plan(&mut self) -> Result<RpcPlanChange> {
+        self.request_typed("save_plan", Map::new()).await
+    }
+
+    /// Restore the selected branch's checkpoint for fresh review. Saved approval
+    /// never transfers execution authority into this connection.
+    pub async fn restore_plan_checkpoint(&mut self) -> Result<RpcPlanChange> {
+        self.request_typed("restore_plan", Map::new()).await
     }
 
     /// Read or mutate the persistent goal attached to the current RPC session.
