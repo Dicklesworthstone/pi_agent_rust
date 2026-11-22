@@ -187,7 +187,10 @@ Without a hint Pi waits one second; hints below 100 milliseconds use a
 100-millisecond minimum to prevent tight polling. Invalid hints leave the last
 valid delay in place. Waiting stops immediately when the transport is aborted
 or its protocol session changes, and large hints cannot extend a pending
-request's original deadline.
+request's original deadline. If a continuation connection fails with a transient
+transport error, Pi retries that GET with the same checkpoint and pacing.
+Authentication failures, expired sessions, malformed responses, and servers
+that decline continuation stop reconnection.
 
 Individual POST responses retain their 10 MiB aggregate body limit across all
 continuations, including SSE notifications preceding the result. Reopening

@@ -3255,8 +3255,7 @@ impl HttpTransport {
         let mut stream = response.bytes_stream();
         let mut decoder = BoundedHttpSseDecoder::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read SSE body: {err}")))?;
+            let chunk = chunk.map_err(|error| http_sse_read_error(error, "read SSE body"))?;
             // Reopening HTTP must not reset a logical request's body quota.
             cursor.charge_response_bytes(chunk.len())?;
             for event in decoder.feed(&chunk)? {
@@ -3447,12 +3446,8 @@ impl HttpTransport {
         let mut stream = response.bytes_stream();
         let mut decoder = BoundedHttpSseDecoder::for_server_events();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|err| {
-                tool_err(
-                    "MCP_TRANSPORT_IO",
-                    format!("read server event stream: {err}"),
-                )
-            })?;
+            let chunk =
+                chunk.map_err(|error| http_sse_read_error(error, "read server event stream"))?;
             for event in decoder.feed(&chunk)? {
                 if cursor.accept(&event)? {
                     self.handle_server_stream_event(event, wire_state).await?;
@@ -3705,6 +3700,23 @@ fn is_retryable_http_continuation_error(error: &Error) -> bool {
         }
         _ => error.is_transient(),
     }
+}
+
+/// Malformed HTTP chunk framing is not a dropped SSE connection. Preserve the
+/// native I/O cause before flattening it so a safe checkpoint cannot turn a
+/// protocol failure into an endless continuation loop.
+fn http_sse_read_error(error: std::io::Error, description: &str) -> Error {
+    // The native body-idle timer predates typed timeout errors. Its exact,
+    // host-owned marker remains recoverable; arbitrary Other errors do not.
+    let idle_timeout = error.kind() == std::io::ErrorKind::Other
+        && error.to_string() == "Request timed out reading body stream";
+    let error = Error::from(error);
+    let code = if idle_timeout || is_retryable_http_continuation_error(&error) {
+        "MCP_TRANSPORT_IO"
+    } else {
+        "MCP_PROTOCOL"
+    };
+    tool_err(code, format!("{description}: {error}"))
 }
 
 fn is_transport_io(error: &Error) -> bool {
@@ -5775,6 +5787,13 @@ pub(crate) mod tests {
         )
     }
 
+    fn http_chunked_event_stream(first_chunk: &str, tail: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{first_chunk}\r\n{tail}",
+            first_chunk.len()
+        )
+    }
+
     async fn wait_for_requests(server: &ScriptedHttpServer, expected: usize) {
         for _ in 0..200 {
             if server.captured().len() >= expected {
@@ -7428,6 +7447,117 @@ for line in sys.stdin:
         assert!(!is_retryable_http_continuation_error(&Error::auth(
             "connection refused during authentication"
         )));
+    }
+
+    #[test]
+    fn streamable_http_malformed_post_chunk_framing_does_not_resume() {
+        for tail in ["not-a-size\r\n", "2\r\nxx!!"] {
+            let server = ScriptedHttpServer::start(vec![
+                http_chunked_event_stream("id: request:1\ndata:\n\nretry: 1\n\n", tail),
+                http_event_stream(concat!(
+                    "id: request:2\n",
+                    "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+                )),
+            ]);
+            let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+            let error = runtime_for_tests()
+                .block_on(transport.request(
+                    "tools/call",
+                    serde_json::json!({"name": "side_effect", "arguments": {}}),
+                    Duration::from_secs(5),
+                ))
+                .expect_err("malformed HTTP framing is terminal even with an SSE checkpoint");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+            assert!(error.to_string().contains("invalid chunk"), "{error}");
+            assert_eq!(
+                server.request_lines(),
+                vec!["POST /mcp HTTP/1.1"],
+                "a protocol failure must not consume the continuation sentinel"
+            );
+            assert!(!transport.is_alive());
+        }
+    }
+
+    #[test]
+    fn streamable_http_malformed_get_chunk_framing_does_not_reconnect() {
+        for tail in ["not-a-size\r\n", "2\r\nxx!!"] {
+            let server = ScriptedHttpServer::start(vec![
+                http_chunked_event_stream("id: events:1\ndata:\n\nretry: 1\n\n", tail),
+                http_empty(405, "Method Not Allowed"),
+            ]);
+            let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+            let wire_state = transport.wire_state();
+            let error = runtime_for_tests().block_on(async {
+                let opened = transport
+                    .open_event_stream(&wire_state, None, Some(Duration::from_secs(5)))
+                    .await
+                    .expect("valid SSE headers");
+                let HttpEventStreamOpen::Stream(response) = opened else {
+                    panic!("expected the established SSE stream");
+                };
+                HttpTransport::run_with_deadline(
+                    transport.run_server_event_listener(&wire_state, response),
+                    Duration::from_secs(5),
+                    "malformed body fixture",
+                )
+                .await
+                .expect_err("malformed framing cannot turn into repeated GET recovery")
+            });
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+            assert!(error.to_string().contains("invalid chunk"), "{error}");
+            assert_eq!(
+                server.request_lines(),
+                vec!["GET /mcp HTTP/1.1"],
+                "a malformed stream must not consume the reconnect sentinel"
+            );
+            transport.abort();
+        }
+    }
+
+    #[test]
+    fn streamable_http_truncated_chunk_body_still_resumes_without_post_replay() {
+        let server = ScriptedHttpServer::start(vec![
+            // No terminal chunk: native HTTP reports a typed UnexpectedEof.
+            http_chunked_event_stream("id: request:1\ndata:\n\nretry: 1\n\n", ""),
+            http_event_stream(concat!(
+                "id: request:2\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            )),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let result = runtime_for_tests()
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("a truncated transport remains safely resumable");
+        assert_eq!(result, serde_json::json!({"tools": []}));
+        assert_eq!(
+            server.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "GET /mcp HTTP/1.1"]
+        );
+        assert!(server.captured()[1].0.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("Last-Event-ID") && value == "request:1"
+        }));
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_body_timeout_marker_is_exact() {
+        assert!(is_transport_io(&http_sse_read_error(
+            std::io::Error::other("Request timed out reading body stream"),
+            "read SSE body",
+        )));
+        for message in [
+            "invalid chunk size",
+            "invalid chunk CRLF",
+            "server said Request timed out reading body stream",
+        ] {
+            let error = http_sse_read_error(std::io::Error::other(message), "read SSE body");
+            assert!(!is_transport_io(&error), "{error}");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        }
     }
 
     #[test]
