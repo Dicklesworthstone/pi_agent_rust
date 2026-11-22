@@ -23,6 +23,7 @@ mod exchange;
 const SCHEMA: &str = "pi.subagent.pool.v1";
 const MAX_POOLS: usize = 16;
 const MAX_CHILDREN: u64 = 8;
+const MAX_BATCH_SIZE: u64 = 8;
 const MAX_ITEMS: usize = 32;
 const SUMMARY_BYTES: usize = 2048;
 const MAX_SNAPSHOT_BYTES: usize = 768 * 1024;
@@ -45,6 +46,7 @@ struct PoolState {
     job_id: String,
     agent: String,
     deadline: Deadline,
+    max_batch_size: usize,
     acknowledged: bool,
     sealed: bool,
     closing: bool,
@@ -141,7 +143,7 @@ fn tasks(input: &Value, allow_empty: bool) -> Result<Vec<String>> {
         .collect()
 }
 
-fn worker(owner: &str, agent: &str, deadline: Deadline) -> Shared {
+fn worker(owner: &str, agent: &str, deadline: Deadline, max_batch_size: usize) -> Shared {
     Arc::new(Mutex::new(WorkerState {
         owner: owner.to_string(),
         id: format!("pool-member-{}", uuid::Uuid::new_v4().simple()),
@@ -156,6 +158,7 @@ fn worker(owner: &str, agent: &str, deadline: Deadline) -> Shared {
         closed: false,
         failed: false,
         latest: 0,
+        max_batch_size,
         queue: VecDeque::new(),
         turns: BTreeMap::new(),
         result_bytes: 0,
@@ -179,6 +182,7 @@ async fn start(
             "tasks",
             "model",
             "concurrency",
+            "maxBatchSize",
             "cwd",
             "scope",
             "timeoutSeconds",
@@ -213,6 +217,9 @@ async fn start(
     let concurrency =
         usize::try_from(optional_integer(&input, "concurrency", 1, MAX_CHILDREN)?.unwrap_or(4))
             .map_err(|_| invalid("concurrency must be from 1 to 8"))?;
+    let max_batch_size =
+        usize::try_from(optional_integer(&input, "maxBatchSize", 1, MAX_BATCH_SIZE)?.unwrap_or(1))
+            .map_err(|_| invalid("maxBatchSize must be from 1 to 8"))?;
     let timeout = optional_integer(&input, "timeoutSeconds", 1, 86_400)?;
     let scope: AgentScope = input.get("scope").map_or_else(
         || Ok(AgentScope::default()),
@@ -270,7 +277,7 @@ async fn start(
     let isolation = super::isolation::Capture::prepare(&input, &cwd, &privacy)?;
     recheck_owner(tool, &owner, &owner_id, deadline).await?;
     let workers: Vec<_> = (0..concurrency)
-        .map(|_| worker(&owner_id, &name, deadline))
+        .map(|_| worker(&owner_id, &name, deadline, max_batch_size))
         .collect();
     let id = format!("pool-{}", uuid::Uuid::new_v4().simple());
     let pool = Arc::new(Mutex::new(PoolState {
@@ -279,6 +286,7 @@ async fn start(
         job_id: String::new(),
         agent: name,
         deadline,
+        max_batch_size,
         acknowledged: false,
         sealed: false,
         closing: false,
@@ -904,6 +912,7 @@ fn drain_snapshot(
         let value = json!({
             "schema":DRAIN_SCHEMA,"poolId":state.id,"jobId":state.job_id,"agent":state.agent,
             "status":status(&state,false),"sealed":state.sealed,
+            "maxBatchSize":state.max_batch_size,
             "admittedItems":state.items.len(),"settledItems":settled,
             "pendingItems":state.items.len() - settled,
             "cursor":drain_cursor(&state.id,&request.acknowledged),
@@ -935,6 +944,7 @@ fn project_drain_snapshot(
         "agent",
         "status",
         "sealed",
+        "maxBatchSize",
         "admittedItems",
         "settledItems",
         "pendingItems",
@@ -1162,6 +1172,7 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
     let mut value = json!({
         "schema":SCHEMA, "poolId":state.id, "jobId":state.job_id, "agent":state.agent,
         "status":status(state, terminal), "sealed":state.sealed, "concurrency":state.workers.len(),
+        "maxBatchSize":state.max_batch_size,
         "admittedItems":state.items.len(), "queuedItems":queued, "runningItems":running,
         "completedItems":completed, "failedItems":failed, "items":items,
         "remainingMs":u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
@@ -1210,6 +1221,7 @@ fn projected_snapshot_with(
         "status",
         "sealed",
         "concurrency",
+        "maxBatchSize",
         "admittedItems",
         "queuedItems",
         "runningItems",
@@ -2062,6 +2074,180 @@ done
     }
 
     #[test]
+    fn pool_batch_size_is_validated_frozen_and_retained_in_every_observation() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        runtime().block_on(async {
+            for value in [
+                Value::Null,
+                json!(false),
+                json!("2"),
+                json!(1.5),
+                json!(0),
+                json!(9),
+            ] {
+                let error = fixture
+                    .tool
+                    .execute(
+                        "invalid-batch-size",
+                        json!({"operation":"pool_start","agent":"worker","maxBatchSize":value}),
+                        None,
+                    )
+                    .await
+                    .expect_err("invalid frozen batch size");
+                assert!(error.to_string().contains("maxBatchSize"));
+            }
+            assert!(
+                crate::jobs::list(&fixture.owner)
+                    .expect("owned jobs")
+                    .is_empty()
+            );
+            assert!(!fixture.root.path().join("launches").exists());
+
+            let started = fixture
+                .call(json!({"operation":"pool_start","agent":"worker","concurrency":2,"maxBatchSize":8}))
+                .await;
+            let pool = field(&started, "poolId");
+            assert_eq!(started["maxBatchSize"], 8);
+            let shared = lookup(&fixture.owner, &pool).expect("owned native pool");
+            {
+                let state = shared.lock().expect("pool state");
+                assert_eq!(state.max_batch_size, 8);
+                for worker in &state.workers {
+                    assert_eq!(worker.lock().expect("pool member").max_batch_size, 8);
+                }
+            }
+            for operation in ["pool_push", "pool_exchange", "pool_finish", "pool_status"] {
+                let error = fixture
+                    .tool
+                    .execute(
+                        "frozen-batch-size",
+                        json!({"operation":operation,"poolId":pool,"tasks":["must not execute"],"maxBatchSize":2}),
+                        None,
+                    )
+                    .await
+                    .expect_err("a control cannot change the frozen batch size");
+                assert!(error.to_string().contains("maxBatchSize"));
+            }
+            for operation in ["pool_status", "pool_drain", "pool_exchange"] {
+                let observed = fixture
+                    .call(json!({"operation":operation,"poolId":pool}))
+                    .await;
+                assert_eq!(observed["maxBatchSize"], 8);
+                assert_eq!(observed["admittedItems"], 0);
+                if operation == "pool_exchange" {
+                    assert_eq!(observed["snapshot"]["maxBatchSize"], 8);
+                }
+            }
+            let closed = fixture
+                .call(json!({"operation":"pool_close","poolId":pool}))
+                .await;
+            assert_eq!(closed["maxBatchSize"], 8);
+            let page = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool}))
+                .await;
+            assert_eq!(page["maxBatchSize"], 8);
+            assert_eq!(page["done"], true);
+            assert_eq!(page["nextCursor"]["itemIds"], json!([]));
+            if fixture.root.path().join("launches").exists() {
+                fixture.assert_reaped();
+            }
+        });
+    }
+
+    #[test]
+    fn grouped_pool_preserves_item_capacity_and_cancellation_cursor_identities() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(
+            r#"
+printf '%s\n' "$$" >> launches
+while IFS= read -r line; do
+    id=${line#*\"id\":\"}
+    id=${id%%\"*}
+    case "$line" in
+        *'"type":"get_state"'*)
+            printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}}\n' "$id"
+            ;;
+        *'"type":"prompt"'*)
+            printf '%s\n' "$line" >> prompts
+            printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+            printf '%s\n' '{"type":"agent_start"}'
+            while :; do sleep 0.02; done
+            ;;
+    esac
+done
+"#,
+        );
+        runtime().block_on(async {
+            let started = fixture
+                .call(json!({"operation":"pool_start","agent":"worker","concurrency":2,"maxBatchSize":4,"tasks":vec!["hold";32]}))
+                .await;
+            let pool = field(&started, "poolId");
+            assert_eq!(started["maxBatchSize"], 4);
+            assert_eq!(
+                started["admittedItemIds"]
+                    .as_array()
+                    .expect("item identities")
+                    .len(),
+                32
+            );
+            let since = Instant::now();
+            loop {
+                let observed = fixture
+                    .call(json!({"operation":"pool_status","poolId":pool}))
+                    .await;
+                if observed["runningItems"] == 8 {
+                    assert_eq!(observed["queuedItems"], 24);
+                    break;
+                }
+                assert!(
+                    since.elapsed() < Duration::from_secs(5),
+                    "two grouped turns did not start"
+                );
+                AgentCx::for_request().time().sleep(POLL_INTERVAL).await;
+            }
+            assert!(lookup("another-session", &pool).is_err());
+            assert!(
+                fixture
+                    .tool
+                    .execute(
+                        "grouped-over-capacity",
+                        json!({"operation":"pool_push","poolId":pool,"tasks":["overflow"]}),
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            let closed = fixture
+                .call(json!({"operation":"pool_close","poolId":pool}))
+                .await;
+            fixture.assert_reaped();
+            assert_eq!(closed["admittedItems"], 32);
+            assert_eq!(closed["failedItems"], 32);
+            assert_eq!(closed["maxBatchSize"], 4);
+            let first = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool,"maxItems":4}))
+                .await;
+            assert_eq!(first["nextCursor"]["itemIds"], json!([1, 2, 3, 4]));
+            assert!(
+                first["items"]
+                    .as_array()
+                    .expect("cancelled page")
+                    .iter()
+                    .all(|item| item["status"] == "cancelled")
+            );
+            let replay = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool,"cursor":first["cursor"]}))
+                .await;
+            assert_eq!(replay["items"], first["items"]);
+            let next = fixture
+                .call(json!({"operation":"pool_drain","poolId":pool,"cursor":first["nextCursor"]}))
+                .await;
+            assert_eq!(next["nextCursor"]["itemIds"], json!([1, 2, 3, 4, 5, 6, 7, 8]));
+        });
+    }
+
+    #[test]
     fn invalid_and_over_capacity_batches_admit_no_prefix() {
         let _guard = crate::jobs::process_test_guard();
         let fixture = Fixture::new(RPC_CHILD);
@@ -2211,6 +2397,7 @@ done
             let started = fixture
                 .call(json!({"operation":"pool_start","agent":"worker","concurrency":1,"tasks":[]}))
                 .await;
+            assert_eq!(started["maxBatchSize"], 1);
             let pool = field(&started, "poolId");
             let job = field(&started, "jobId");
             assert_eq!(started.get("admittedItemIds"), Some(&json!([]))); // ubs:ignore[rust.panic.assert-macros] -- Empty start creates identity without inventing an accepted assignment.

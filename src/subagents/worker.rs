@@ -39,6 +39,11 @@ pub(super) struct PendingTurn {
     pub(super) task: String,
 }
 
+pub(super) struct PendingBatch {
+    pub(super) turns: Vec<PendingTurn>,
+    pub(super) keyed: bool,
+}
+
 struct Turn {
     status: &'static str,
     result: Option<ToolOutput>,
@@ -61,6 +66,7 @@ pub(super) struct WorkerState {
     closed: bool,
     failed: bool,
     latest: u64,
+    max_batch_size: usize,
     queue: VecDeque<PendingTurn>,
     turns: BTreeMap<u64, Turn>,
     result_bytes: usize,
@@ -96,6 +102,11 @@ fn error_output(message: &str) -> ToolOutput {
 }
 
 pub(super) fn requested(input: &Value) -> Result<bool> {
+    if input.get("maxBatchSize").is_some()
+        && input.get("operation").and_then(Value::as_str) != Some("pool_start")
+    {
+        return Err(invalid("maxBatchSize is only accepted by pool_start"));
+    }
     match input.get("operation") {
         None => Ok(false),
         Some(Value::String(operation))
@@ -384,6 +395,7 @@ async fn start(
         closed: false,
         failed: false,
         latest: 1,
+        max_batch_size: 1,
         queue: VecDeque::from([PendingTurn { id: 1, task }]),
         turns: BTreeMap::from([(
             1,
@@ -779,21 +791,45 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
     })
 }
 
-pub(super) fn next_turn(shared: &Shared) -> Option<PendingTurn> {
+/// Select one bounded FIFO group without changing the logical item identities.
+/// A grouped worker retains its keyed contract even for a singleton group.
+pub(super) fn next_batch(shared: &Shared) -> Option<PendingBatch> {
     let mut state = shared.lock().ok()?;
     if state.closed
         || state.closing
         || !state.acknowledged
         || state.job_id.is_empty()
         || state.deadline.check().is_err()
+        || state.turns.values().any(|turn| turn.status == "running")
     {
         return None;
     }
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    for turn in state.queue.iter().take(state.max_batch_size) {
+        if bytes.saturating_add(turn.task.len()) > MAX_PROMPT_BYTES {
+            break;
+        }
+        if state.turns.get(&turn.id)?.status != "queued" {
+            return None;
+        }
+        bytes += turn.task.len();
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let turns: Vec<_> = state.queue.drain(..count).collect();
+    for turn in &turns {
+        // Every record was checked under this same lock before dequeueing.
+        if let Some(record) = state.turns.get_mut(&turn.id) {
+            record.status = "running";
+        }
+    }
     state.started = true;
-    let turn = state.queue.pop_front()?;
-    state.turns.get_mut(&turn.id)?.status = "running";
+    let keyed = state.max_batch_size > 1;
     drop(state);
-    Some(turn)
+    Some(PendingBatch { turns, keyed })
 }
 
 pub(super) fn should_close(shared: &Shared) -> bool {
@@ -939,6 +975,203 @@ mod tests {
     use super::*;
     use crate::text_completion::AuxiliaryPrivacy;
 
+    fn queued_worker(max_batch_size: usize, assignments: &[&str]) -> Shared {
+        let privacy =
+            AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
+        let mut queue = VecDeque::new();
+        let mut turns = BTreeMap::new();
+        for (index, task) in assignments.iter().enumerate() {
+            let id = u64::try_from(index + 1).expect("bounded test item id");
+            queue.push_back(PendingTurn {
+                id,
+                task: (*task).to_string(),
+            });
+            turns.insert(
+                id,
+                Turn {
+                    status: "queued",
+                    result: None,
+                    privacy: Some(privacy.clone()),
+                    dependency: crate::agent_hub::ResultDependency::new(None),
+                },
+            );
+        }
+        Arc::new(Mutex::new(WorkerState {
+            owner: "batch-owner".to_string(),
+            id: "batch-worker".to_string(),
+            job_id: "batch-job".to_string(),
+            hub_id: None,
+            agent: "reviewer".to_string(),
+            deadline: Deadline::for_request(Some(Duration::from_secs(60)), None)
+                .expect("bounded test deadline"),
+            emit_notices: false,
+            acknowledged: true,
+            started: false,
+            closing: false,
+            closed: false,
+            failed: false,
+            latest: u64::try_from(assignments.len()).expect("bounded test item count"),
+            max_batch_size,
+            queue,
+            turns,
+            result_bytes: 0,
+            context_tokens: Some(321),
+            context_window: Some(4096),
+            workspace: None,
+        }))
+    }
+
+    fn settle_selected(state: &Shared, batch: &PendingBatch) {
+        let mut state = state.lock().expect("worker fixture");
+        for turn in &batch.turns {
+            state.turns.get_mut(&turn.id).expect("selected item").status = "completed";
+        }
+    }
+
+    #[test]
+    fn grouped_dispatch_keeps_fifo_identities_privacy_and_dependencies() {
+        let shared = queued_worker(2, &["first", "second", "third"]);
+        let secrets = ["first-private-group-marker", "second-private-group-marker"];
+        {
+            let mut state = shared.lock().expect("worker fixture");
+            for (id, secret) in [1_u64, 2].into_iter().zip(secrets) {
+                state.turns.get_mut(&id).expect("queued item").privacy =
+                    Some(private_projection(secret));
+            }
+        }
+        let dependencies: Vec<_> = shared
+            .lock()
+            .expect("worker fixture")
+            .turns
+            .values()
+            .map(|turn| Arc::clone(&turn.dependency))
+            .collect();
+        let batch = next_batch(&shared).expect("first group");
+        assert!(batch.keyed);
+        assert_eq!(
+            batch.turns.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            batch
+                .turns
+                .iter()
+                .map(|turn| turn.task.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        {
+            let state = shared.lock().expect("worker fixture");
+            assert_eq!(state.queue.front().expect("remaining item").id, 3);
+            assert_eq!(state.queue.len(), 1);
+            assert_eq!(state.latest, 3);
+            assert_eq!(state.context_tokens, Some(321));
+            assert_eq!(state.context_window, Some(4096));
+            for (index, turn) in state.turns.values().enumerate() {
+                assert_eq!(turn.status, if index < 2 { "running" } else { "queued" });
+                assert!(turn.privacy.is_some());
+                assert!(Arc::ptr_eq(&turn.dependency, &dependencies[index]));
+                if let Some(secret) = secrets.get(index) {
+                    let projected = turn
+                        .privacy
+                        .as_ref()
+                        .expect("captured item privacy")
+                        .project_json(&json!({"value":secret}))
+                        .expect("privacy projection");
+                    assert_ne!(projected["value"], json!(secret));
+                }
+            }
+        }
+        // A second dispatcher cannot overlap the group's borrowed conversation.
+        assert!(next_batch(&shared).is_none());
+        settle_selected(&shared, &batch);
+        let singleton = next_batch(&shared).expect("remaining singleton");
+        assert!(singleton.keyed);
+        assert_eq!(singleton.turns.len(), 1);
+        assert_eq!(singleton.turns[0].id, 3);
+        assert_eq!(singleton.turns[0].task, "third");
+    }
+
+    #[test]
+    fn default_dispatch_retains_one_plain_assignment_per_turn() {
+        let shared = queued_worker(1, &["first", "second"]);
+        let first = next_batch(&shared).expect("first ordinary turn");
+        assert!(!first.keyed);
+        assert_eq!(first.turns.len(), 1);
+        assert_eq!(first.turns[0].id, 1);
+        settle_selected(&shared, &first);
+        let second = next_batch(&shared).expect("second ordinary turn");
+        assert!(!second.keyed);
+        assert_eq!(second.turns.len(), 1);
+        assert_eq!(second.turns[0].id, 2);
+        settle_selected(&shared, &second);
+        assert!(next_batch(&shared).is_none());
+    }
+
+    #[test]
+    fn grouped_dispatch_bounds_combined_utf8_bytes_without_skipping_fifo_items() {
+        let near_limit = "雪".repeat((MAX_PROMPT_BYTES - 1) / 3);
+        let shared = queued_worker(8, &[&near_limit, "ab", "x"]);
+        let first = next_batch(&shared).expect("bounded first group");
+        assert_eq!(first.turns.len(), 1);
+        assert_eq!(first.turns[0].task.len(), MAX_PROMPT_BYTES - 1);
+        assert_eq!(shared.lock().expect("worker fixture").queue.len(), 2);
+        settle_selected(&shared, &first);
+        let tail = next_batch(&shared).expect("remaining group");
+        assert_eq!(
+            tail.turns.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let full = "x".repeat(MAX_PROMPT_BYTES);
+        let shared = queued_worker(8, &[&full, "tail"]);
+        assert_eq!(next_batch(&shared).expect("full first item").turns.len(), 1);
+        assert_eq!(shared.lock().expect("worker fixture").queue.len(), 1);
+
+        let half = "x".repeat(MAX_PROMPT_BYTES / 2);
+        let shared = queued_worker(8, &[&half, &half, "tail"]);
+        assert_eq!(
+            next_batch(&shared).expect("exact byte boundary").turns.len(),
+            2
+        );
+        assert_eq!(shared.lock().expect("worker fixture").queue.len(), 1);
+    }
+
+    #[test]
+    fn grouped_dispatch_obeys_lifecycle_and_validates_the_complete_prefix() {
+        for boundary in [
+            "unacknowledged",
+            "unowned",
+            "closing",
+            "closed",
+            "missing",
+            "settled",
+        ] {
+            let shared = queued_worker(2, &["first", "second"]);
+            {
+                let mut state = shared.lock().expect("worker fixture");
+                match boundary {
+                    "unacknowledged" => state.acknowledged = false,
+                    "unowned" => state.job_id.clear(),
+                    "closing" => state.closing = true,
+                    "closed" => state.closed = true,
+                    "missing" => {
+                        state.turns.remove(&2);
+                    }
+                    "settled" => {
+                        state.turns.get_mut(&2).expect("second item").status = "completed";
+                    }
+                    _ => unreachable!("controlled fixture boundary"),
+                }
+            }
+            assert!(next_batch(&shared).is_none(), "{boundary}");
+            let state = shared.lock().expect("worker fixture");
+            assert_eq!(state.queue.len(), 2, "{boundary}");
+            assert_eq!(state.turns[&1].status, "queued", "{boundary}");
+            assert!(!state.started, "{boundary}");
+        }
+    }
+
     fn private_projection(secret: &str) -> AuxiliaryPrivacySnapshot {
         let mut vault = crate::secrets::SecretVault::default();
         let pattern =
@@ -949,6 +1182,21 @@ mod tests {
 
     #[test]
     fn malformed_controls_never_downgrade_to_ordinary_delegation() {
+        for operation in [
+            None,
+            Some("worker_start"),
+            Some("worker_send"),
+            Some("pool_push"),
+            Some("pool_exchange"),
+            Some("pool_status"),
+        ] {
+            let mut input = json!({"maxBatchSize":2});
+            if let Some(operation) = operation {
+                input["operation"] = json!(operation);
+            }
+            assert!(requested(&input).is_err());
+        }
+        assert!(requested(&json!({"operation":"pool_start","maxBatchSize":2})).unwrap());
         for operation in [Value::Null, json!(true), json!("worker_restart"), json!({})] {
             assert!(requested(&json!({"operation":operation})).is_err()); // ubs:ignore[rust.panic.assert-macros] -- Explicit malformed control must not launch an unrelated one-shot task.
         }

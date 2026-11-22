@@ -367,10 +367,6 @@ impl Actor {
         let id = format!("warm-{}", self.request_sequence);
         let mut request = json!({"id": id, "type": command});
         if let Some(message) = message {
-            let message = self
-                .output_contract
-                .as_ref()
-                .map_or_else(|| message.to_owned(), |contract| contract.prompt(message));
             request["message"] = json!(format!("Task: {message}"));
         }
         let mut bytes =
@@ -505,13 +501,30 @@ impl Actor {
         }
     }
 
-    async fn turn(&mut self, pending: crate::subagents::worker::PendingTurn) -> Result<()> {
+    async fn collect_turn(&mut self, message: &str) -> Result<(String, String)> {
         self.diagnostic.clear();
-        let id = self.queue("prompt", Some(&pending.task))?;
-        let mut reply = TurnReply::new(id);
+        let id = self.queue("prompt", Some(message))?;
+        let mut reply = TurnReply::new(id.clone());
+        let mut output = String::new();
+        loop {
+            self.tick(|line, sent| reply.ingest(line, sent, &mut output))?;
+            if reply.complete {
+                break;
+            }
+            self.owner.time().sleep(POLL_INTERVAL).await;
+        }
+        // The entire group stays running until the correlated post-turn
+        // persistence/compaction barrier. Cancellation before this point lets
+        // Drop reap the process and settle every original item as unfinished.
+        self.idle_barrier().await?;
+        self.check()?;
+        Ok((id, output))
+    }
+
+    fn completed_result(&self, assignment: String) -> SubagentResult {
         let mut result = SubagentResult::starting(
             &self.agent,
-            task(&self.agent, pending.task),
+            task(&self.agent, assignment),
             None,
             &self.runner.child_binary,
             &self.runner.cwd,
@@ -520,48 +533,89 @@ impl Actor {
         result.pid = self.lifecycle.pid;
         result.hub_id.clone_from(&self.lifecycle.hub_id);
         result.session_isolation = "persistent_rpc_worker";
-        result.status = SubagentStatus::Running;
-        let outcome = async {
-            loop {
-                self.tick(|line, sent| reply.ingest(line, sent, &mut result.output))?;
-                if reply.complete {
-                    break;
-                }
-                self.owner.time().sleep(POLL_INTERVAL).await;
-            }
-            self.idle_barrier().await?;
-            self.check()?;
-            Ok::<(), Error>(())
-        }
-        .await;
-        // Failed turns remain owned by the actor until Drop reaps the child.
-        // The facade's finish path then settles the active and queued turns.
-        outcome?;
         result.status = SubagentStatus::Completed;
         result.stderr.clone_from(&self.diagnostic);
-        if let Some(contract) = &self.output_contract {
-            // Only a complete, fresh answer after post-turn persistence and
-            // compaction reaches validation. Failure settles this turn without
-            // repeating its effects or discarding the reusable conversation.
-            contract.validate(&mut result);
+        result
+    }
+
+    async fn turn(&mut self, pending: crate::subagents::worker::PendingBatch) -> Result<()> {
+        use crate::subagents::worker::output_contract::{batch_answers, batch_prompt};
+
+        let first = pending
+            .turns
+            .first()
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        if !pending.keyed && pending.turns.len() != 1 {
+            return Err(Error::tool("subagent", INVALID_RPC));
         }
-        if let Some(handle) = &self.isolation {
-            match crate::subagents::worker::isolation::outcome(handle) {
-                Ok(outcome) => result.iso = Some(outcome),
-                Err(error) => result.fail(format!(
-                    "Failed to collect cumulative worktree diff; files are preserved: {error}"
-                )),
+        let ids = pending.turns.iter().map(|turn| turn.id).collect::<Vec<_>>();
+        let message = if pending.keyed {
+            let assignments = pending
+                .turns
+                .iter()
+                .map(|turn| (turn.id, turn.task.as_str()))
+                .collect::<Vec<_>>();
+            batch_prompt(&assignments, self.output_contract.as_ref())?
+        } else {
+            self.output_contract.as_ref().map_or_else(
+                || first.task.clone(),
+                |contract| contract.prompt(&first.task),
+            )
+        };
+        let (request_id, mut output) = self.collect_turn(&message).await?;
+        // Validate every envelope row and its key before accepting any item.
+        // A malformed group fails all its members without retaining a raw
+        // prefix; valid data/error rows are then evaluated independently.
+        let mut answers = pending.keyed.then(|| {
+            batch_answers(&output, &ids)
+                .map(Vec::into_iter)
+                .map_err(|error| error.to_string())
+        });
+        let isolation = self
+            .isolation
+            .as_ref()
+            .map(crate::subagents::worker::isolation::outcome);
+        self.check()?;
+        for turn in pending.turns {
+            let mut result = self.completed_result(turn.task);
+            if let Some(answers) = &mut answers {
+                match answers {
+                    Ok(answers) => answers
+                        .next()
+                        .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?
+                        .apply(&mut result, self.output_contract.as_ref()),
+                    Err(error) => result.fail(error.clone()),
+                }
+            } else {
+                result.output = std::mem::take(&mut output);
+                if let Some(contract) = &self.output_contract {
+                    contract.validate(&mut result);
+                }
             }
-            // Snapshot collection consumes the original job budget. A late
-            // snapshot cannot publish success after cancellation or expiry.
-            self.check()?;
+            if let Some(isolation) = &isolation {
+                match isolation {
+                    Ok(outcome) => result.iso = Some(outcome.clone()),
+                    Err(error) => result.fail(format!(
+                        "Failed to collect cumulative worktree diff; files are preserved: {error}"
+                    )),
+                }
+            }
+            let mut output = result_output(&[result], "worker", false);
+            if let Some(details) = output.details.as_mut() {
+                details["sessionIsolation"] = json!("persistent_rpc_worker");
+                details["turnId"] = json!(turn.id);
+                if pending.keyed {
+                    details["workerBatch"] = json!({
+                        "schema":"pi.subagent.worker.batch.v1",
+                        "requestId":request_id, "key":turn.id, "turnIds":ids,
+                        "patchScope":"cumulative_worker_batch",
+                    });
+                }
+            }
+            // Each original ID keeps its own privacy projection, dependency,
+            // retention budget and cancellation-linearized publication fence.
+            crate::subagents::worker::complete_turn(&self.state, turn.id, Ok(output));
         }
-        let mut output = result_output(&[result], "worker", false);
-        if let Some(details) = output.details.as_mut() {
-            details["sessionIsolation"] = json!("persistent_rpc_worker");
-            details["turnId"] = json!(pending.id);
-        }
-        crate::subagents::worker::complete_turn(&self.state, pending.id, Ok(output));
         Ok(())
     }
 
@@ -575,8 +629,8 @@ impl Actor {
             if crate::subagents::worker::should_close(&self.state) {
                 break;
             }
-            if let Some(turn) = crate::subagents::worker::next_turn(&self.state) {
-                self.turn(turn).await?;
+            if let Some(batch) = crate::subagents::worker::next_batch(&self.state) {
+                self.turn(batch).await?;
             } else {
                 self.tick(|line, _| idle_event(line))?;
                 self.owner.time().sleep(POLL_INTERVAL).await;
@@ -908,6 +962,217 @@ while IFS= read -r line; do
     esac
 done
 "#;
+
+    const GROUPED_RPC_CHILD: &str = r#"
+printf '%s\n' "$$" >> launches
+count=0
+while IFS= read -r line; do
+    id=${line#*\"id\":\"}
+    id=${id%%\"*}
+    case "$line" in
+        *'"type":"get_state"'*)
+            if [ "$count" -eq 1 ] && [ ! -f release-idle ]; then
+                printf ready > idle-blocked
+                printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":true}}\n' "$id"
+            else
+                printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"contextTokens":42,"contextWindow":1000}}\n' "$id"
+            fi
+            ;;
+        *'"type":"prompt"'*)
+            count=$((count + 1))
+            printf '%s\n' "$line" >> prompts
+            printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+            printf '%s\n' '{"type":"agent_start"}'
+            case "$count" in
+                1) answer='{"items":[{"key":2,"data":{"value":"second"}},{"key":1,"data":{"value":"first"}}]}' ;;
+                2) answer='{"items":[{"key":4,"data":{"value":"fourth"}},{"key":3,"error":"intentional-item-error"}]}' ;;
+                3) answer='{"items":[{"key":5,"data":{"value":7}}]}' ;;
+                *) answer='{"items":[{"key":6,"data":{"value":"sixth"}}]}' ;;
+            esac
+            escaped=$(printf '%s' "$answer" | sed 's/"/\\"/g')
+            printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"%s"}]}]}\n' "$escaped"
+            ;;
+    esac
+done
+"#;
+
+    fn pool_native_result(value: &Value) -> &Value {
+        value
+            .pointer("/item/result/details/results/0")
+            .expect("original pool item must retain its own native result")
+    }
+
+    #[test]
+    fn grouped_pool_turns_preserve_item_results_errors_and_the_idle_barrier() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(GROUPED_RPC_CHILD);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({
+                "operation":"pool_start", "agent":"worker", "concurrency":1,
+                "maxBatchSize":2, "tasks":["first-task", "second-task", "third-task", "fourth-task", "fifth-task"],
+                "outputSchema":{"type":"object", "required":["value"],
+                    "additionalProperties":false, "properties":{"value":{"type":"string"}}}
+            })).await;
+            let pool = field(&started, "poolId");
+            fixture.await_file("idle-blocked").await;
+            let blocked = fixture.call(json!({"operation":"pool_status", "poolId":pool})).await;
+            assert_eq!(blocked["completedItems"], 0);
+            assert_eq!(blocked["runningItems"], 2);
+            assert_eq!(blocked["queuedItems"], 3);
+            assert_eq!(blocked["maxBatchSize"], 2);
+            std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
+            let fifth = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "itemId":5, "timeoutMs":5000})).await;
+            assert_eq!(fifth["item"]["status"], "failed");
+            assert_eq!(pool_native_result(&fifth)["schemaValid"], false);
+            assert_eq!(pool_native_result(&fifth)["schemaRetries"], 0);
+            assert_eq!(pool_native_result(&fifth)["task"], "fifth-task");
+
+            let appended = fixture.call(json!({"operation":"pool_push", "poolId":pool,
+                "tasks":["sixth-task"]})).await;
+            assert_eq!(appended["admittedItemIds"], json!([6]));
+            fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+            let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":5000})).await;
+            assert_eq!(settled["status"], "failed");
+            assert_eq!(settled["completedItems"], 4);
+            assert_eq!(settled["failedItems"], 2);
+            for (id, expected) in [(1, "first"), (2, "second"), (4, "fourth"), (6, "sixth")] {
+                let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":id})).await;
+                let result = pool_native_result(&item);
+                assert_eq!(result["data"], json!({"value":expected}));
+                assert_eq!(result["schemaValid"], true);
+                assert_eq!(result["task"], format!("{expected}-task"));
+                assert_eq!(item["item"]["result"]["details"]["workerBatch"]["key"], id);
+                assert!(!result["output"].as_str().unwrap().contains("\"items\""));
+            }
+            let failed = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                "itemId":3})).await;
+            assert_eq!(failed["item"]["status"], "failed");
+            assert_eq!(pool_native_result(&failed)["error"], "intentional-item-error");
+            assert!(pool_native_result(&failed).get("data").is_none());
+
+            let page = fixture.call(json!({"operation":"pool_drain", "poolId":pool,
+                "timeoutMs":0})).await;
+            assert_eq!(page["items"].as_array().unwrap().iter()
+                .map(|item| item["id"].as_u64().unwrap()).collect::<Vec<_>>(), vec![1,2,3,4]);
+            let replay = fixture.call(json!({"operation":"pool_drain", "poolId":pool,
+                "timeoutMs":0})).await;
+            assert_eq!(page["items"], replay["items"]);
+            let tail = fixture.call(json!({"operation":"pool_drain", "poolId":pool,
+                "cursor":page["nextCursor"], "timeoutMs":0})).await;
+            assert_eq!(tail["items"].as_array().unwrap().iter()
+                .map(|item| item["id"].as_u64().unwrap()).collect::<Vec<_>>(), vec![5,6]);
+
+            let prompts = std::fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+            let prompts: Vec<Value> = prompts.lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(prompts.len(), 4, "six logical items must use four physical prompts");
+            let first = prompts[0]["message"].as_str().unwrap();
+            assert!(first.contains("\"key\":1") && first.contains("\"key\":2"));
+            assert!(first.contains("first-task") && first.contains("second-task"));
+            assert!(!first.contains("third-task"));
+            assert!(!first.contains("Output contract for this turn:"));
+            assert!(prompts[2]["message"].as_str().unwrap().contains("\"key\":5"));
+            assert!(prompts[3]["message"].as_str().unwrap().contains("\"key\":6"));
+            assert_eq!(std::fs::read_to_string(fixture.root.path().join("launches"))
+                .unwrap().lines().count(), 1);
+        });
+    }
+
+    #[test]
+    fn malformed_grouped_reply_fails_every_member_without_replaying_the_turn() {
+        let _guard = crate::jobs::process_test_guard();
+        for answer in [
+            json!({"items":[{"key":1,"data":"unaccepted-canary"}]}),
+            json!({"items":[{"key":1,"data":"unaccepted-canary"},{"key":1,"data":false}]}),
+            json!({"items":[{"key":1,"data":"unaccepted-canary"},{"key":3,"data":false}]}),
+        ] {
+            let frame = json!({"type":"agent_end", "messages":[{
+                "role":"assistant", "stopReason":"stop", "content":[{
+                    "type":"text", "text":serde_json::to_string(&answer).unwrap()
+                }]
+            }]}).to_string();
+            let script = format!(r#"
+while IFS= read -r line; do
+    id=${{line#*\"id\":\"}}
+    id=${{id%%\"*}}
+    case "$line" in
+        *'"type":"get_state"'*)
+            printf '{{"type":"response","id":"%s","command":"get_state","success":true,"data":{{"isStreaming":false,"isCompacting":false}}}}\n' "$id"
+            ;;
+        *'"type":"prompt"'*)
+            printf '%s\n' "$line" >> prompts
+            printf '{{"type":"response","id":"%s","command":"prompt","success":true}}\n' "$id"
+            printf '%s\n' '{{"type":"agent_start"}}'
+            printf '%s\n' '{frame}'
+            ;;
+    esac
+done
+"#);
+            let fixture = Fixture::new(&script);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                    "concurrency":1, "maxBatchSize":2, "tasks":["left-task", "right-task"]})).await;
+                let pool = field(&started, "poolId");
+                fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+                let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                    "timeoutMs":5000})).await;
+                assert_eq!(settled["completedItems"], 0);
+                assert_eq!(settled["failedItems"], 2);
+                for id in [1,2] {
+                    let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                        "itemId":id})).await;
+                    let result = pool_native_result(&item);
+                    assert!(result["error"].as_str().unwrap().contains("PI_SUBAGENT_WORKER_BATCH_OUTPUT"));
+                    assert!(result.get("data").is_none());
+                    assert!(!item.to_string().contains("unaccepted-canary"));
+                }
+                assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
+                    .unwrap().lines().count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn cancelling_a_group_at_the_idle_barrier_retains_no_terminal_prefix() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(GROUPED_RPC_CHILD);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                "concurrency":1, "maxBatchSize":2, "tasks":["first-task", "second-task", "third-task"]})).await;
+            let pool = field(&started, "poolId");
+            fixture.await_file("idle-blocked").await;
+            let pid = std::fs::read_to_string(fixture.root.path().join("launches"))
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .unwrap();
+            assert!(rustix::process::test_kill_process(pid).is_ok());
+            let closed = fixture.call(json!({"operation":"pool_close", "poolId":pool})).await;
+            assert_eq!(closed["status"], "cancelled");
+            assert_eq!(closed["completedItems"], 0);
+            assert_eq!(closed["failedItems"], 3);
+            for id in [1,2,3] {
+                let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":id})).await;
+                assert_eq!(item["item"]["status"], "cancelled");
+                assert!(item["item"]["result"]["isError"].as_bool().unwrap());
+                assert!(!item.to_string().contains("\"value\":\"first\""));
+            }
+            assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
+                .unwrap().lines().count(), 1);
+            assert!(rustix::process::test_kill_process(pid).is_err());
+        });
+    }
 
     #[test]
     fn large_definition_snapshots_survive_worker_and_pool_reuse_then_retire() {
