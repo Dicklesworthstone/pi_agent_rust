@@ -219,6 +219,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/eval/judgment/images.rs` | Invocation-owned image evidence for judgments and one-shot completions | `src/eval/judgment/images/tests.rs` (12 tests). |
 | `src/eval/judgment/images/tests.rs` | Native image bridge fixtures; no external files or live model requests | Test module (12 tests). |
 | `src/eval/judgment/tests.rs` | Native eval/kernel integrations with a controlled provider, not live-model acceptance | Test module (12 tests). |
+| `src/eval/judgment/tool_batch.rs` | Invocation-owned bounded native tool batches (`__pi_tool_batch`) with mutation barriers and shared call budget | `src/eval/judgment/tool_batch/tests.rs` (9 tests). |
+| `src/eval/judgment/tool_batch/tests.rs` | Concurrency, mutation barriers, authority changes, bounds, cancellation, and session revocation tests | Test module (9 tests). |
 | `src/eval/lifecycle.rs` | Exclusive cell admission and explicit, language-scoped kernel reset | Unit (24 in-module tests). |
 | `src/eval/lifecycle/source.rs` | Shared bounded file admission for scripts, ES modules and text assets | Unit (6 in-module tests). |
 | `src/eval/lifecycle/source/typescript.rs` | TypeScript preparation using the project's existing SWC stack | Unit (10 in-module tests). |
