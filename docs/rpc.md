@@ -404,13 +404,86 @@ in-memory content; session resume still hydrates saved sidecar payloads.
   - Params: `name` (optional; defaults to the latest checkpoint).
 - **fresh**: Mint a fresh provider-cache session ID and reset stream bookkeeping without discarding transcript history.
 
+### Interactive session hooks
+
+`new_session`, `switch_session`, and `fork` keep control replies flowing while
+extensions await interactive lifecycle hooks. Reply with
+`extension_ui_response` or `ask_response`, preserving the original request
+correlation; `abort` can interrupt a pending hook. Other commands consumed by a
+hook wait receive a busy error, so they cannot block a later UI reply.
+A competing mutation already waiting behind a fork is rejected if that wait
+is aborted; the accepted fork still receives its own terminal response.
+
+A before-hook veto returns a successful response with `cancelled: true`.
+A before-hook error or timeout fails the command before session replacement.
+An error or interruption in an after-hook emits this diagnostic and preserves
+the already-committed transition's successful response:
+
+```json
+{"type":"session_transition_hook_error","id":"switch-1","command":"switch_session","phase":"after","committed":true,"error":"..."}
+```
+
+Treat the terminal response as the transition outcome. An abort after the
+session change commits cannot roll it back. End-of-input dismisses unanswered
+dialogs while allowing already-accepted noninteractive work to drain.
+
 ### Plan Mode & Goals
+
 - **goal**: Inspect or mutate the active session objective (`op: "get"` works while busy or idle; lifecycle mutations require an idle session).
   - Params: `op` (`"get"`, `"set"`, `"clear"`, etc.) plus operation-specific goal fields.
-- **set_plan_mode**: Enter or exit read-only planning mode.
-  - Params: `mode` (`"on"` or `"off"`).
-- **approve_plan**: Approve the currently submitted plan and persist the approval record.
-- **reject_plan**: Reject the currently submitted plan and persist the rejection record.
+
+Plan commands use the same guarded lifecycle as the SDK and require an idle
+session, including no active Bash command. They never start a provider turn.
+
+| Command | Parameters | Behavior |
+|---|---|---|
+| **get_plan** | None | Return the current `planMode`, complete `plan` text, and opaque `reviewId` when a proposal is pending. |
+| **set_plan_mode** | `mode`: `"on"` (default) or `"off"` | Enter read-only planning or exit and remove the owned approved-plan prompt context. Other values and types are rejected. |
+| **approve_plan** | `reviewId` from the displayed proposal | Approve that exact submission, install its text in the agent prompt, and checkpoint the decision. |
+| **reject_plan** | `reviewId` from the displayed proposal | Reject that exact submission and keep mutations blocked while it is revised. |
+| **save_plan** | None | Retry checkpoint persistence without repeating a decision. |
+| **restore_plan** | None | Restore the selected branch's saved proposal for fresh review. Previously approved plans return to pending approval. |
+
+Unknown payload fields are rejected before session recovery can mutate history.
+Aliases such as `getPlan`, `get-plan`, `approvePlan`, and `restorePlan` normalize
+to the canonical command names shown above.
+
+Present the entire plan returned by `get_plan` and retain its `reviewId` while
+awaiting the user's decision. Approval and rejection require that receipt;
+fetching a newer receipt to process an older click would approve a different
+submission. Receipts are scoped to the connection, session incarnation, and
+exact live proposal. Same-text resubmission, session replacement, and recovery
+all invalidate the old decision. Re-entering planning while a proposal is
+pending also fails; explicitly reject or exit first.
+
+```json
+{"id":"plan-view","type":"get_plan"}
+{"type":"response","id":"plan-view","command":"get_plan","success":true,"data":{"planMode":"pending_approval","plan":"The complete proposal shown to the user...","reviewId":"p1-opaque-review-id"}}
+{"id":"plan-approve","type":"approve_plan","reviewId":"p1-opaque-review-id"}
+```
+
+Mutations return the state fields plus `changed` and `persistence`:
+
+```json
+{"planMode":"approved","plan":"The complete proposal shown to the user...","reviewId":null,"approved":true,"changed":true,"persistence":{"status":"saved"}}
+```
+
+`persistence.status` is `saved`, `memory_only`, `unchanged`, or `unconfirmed`.
+An `unconfirmed` result includes `reason` and still means the live transition
+already happened. Retry `save_plan` to flush it; do not repeat the approval.
+`changed: false` on `save_plan` refers to the live decision, not whether saving
+performed I/O. If the post-transition snapshot was unavailable, `stateError`
+reports that separately while preserving a successful committed decision.
+
+After a session is reopened, switched, or forked, call `restore_plan` when you
+want to recover its saved checkpoint. Restore refuses an active proposal or
+owned prompt pin. Saved pending and approved proposals return to pending
+approval and require fresh review; off and planning checkpoints retain their
+respective modes. Forks rebind the selected branch's copied checkpoints to their
+own session identity without inheriting approval, including later forks of
+older inherited history. Exiting or replacing a session removes only its owned
+plan context; unrelated system instructions are retained.
+
 
 ### Manual compaction progress
 

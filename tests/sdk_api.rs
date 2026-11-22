@@ -970,6 +970,366 @@ fn sdk_rpc_shutdown_and_drop_stop_live_and_reaped_root_descendants() {
 }
 
 #[test]
+fn sdk_rpc_plan_reviews_bind_the_displayed_submission_and_require_complete_state() {
+    let mut state: sdk::RpcPlanState = serde_json::from_value(json!({
+        "planMode": "pending_approval",
+        "plan": "Inspect the source, implement the change, then verify the result.",
+        "reviewId": "p1-first",
+    }))
+    .expect("complete pending state");
+    let first = state.pending_review().unwrap().unwrap();
+    state.review_id = Some("p1-second".to_string());
+    let second = state.pending_review().unwrap().unwrap();
+    assert_eq!(first.text(), second.text());
+    assert_ne!(first, second, "identical text is not the same submission");
+
+    for (text, id) in [
+        (None, Some("p1-valid".to_string())),
+        (Some("  ".to_string()), Some("p1-valid".to_string())),
+        (
+            Some("é".repeat(128 * 1024 + 1)),
+            Some("p1-valid".to_string()),
+        ),
+        (Some("proposal".to_string()), None),
+        (Some("proposal".to_string()), Some(" ".to_string())),
+        (Some("proposal".to_string()), Some("x".repeat(65))),
+        (Some("proposal".to_string()), Some("bad\0id".to_string())),
+    ] {
+        state.plan = text;
+        state.review_id = id;
+        assert!(state.pending_review().is_err());
+    }
+    state.plan_mode = sdk::RpcPlanMode::Approved;
+    assert!(state.pending_review().unwrap().is_none());
+    assert!(
+        serde_json::from_value::<sdk::RpcPlanState>(json!({
+            "planMode": "approve_on_resume", "plan": null, "reviewId": null,
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn sdk_rpc_plan_changes_preserve_committed_decisions_and_persistence_uncertainty() {
+    let change: sdk::RpcPlanChange = serde_json::from_value(json!({
+        "planMode": "approved", "plan": null, "reviewId": null,
+        "changed": true, "approved": true,
+        "persistence": {"status": "unconfirmed", "reason": "save interrupted"},
+        "stateError": "snapshot busy",
+    }))
+    .expect("live approval with an unconfirmed save remains a successful change");
+    assert!(change.changed);
+    assert_eq!(change.state.plan_mode, sdk::RpcPlanMode::Approved);
+    assert_eq!(change.state_error.as_deref(), Some("snapshot busy"));
+    assert_eq!(
+        change.persistence,
+        sdk::RpcPlanPersistence::Unconfirmed {
+            reason: "save interrupted".to_string(),
+        }
+    );
+    for persistence in [
+        json!({"status": "unconfirmed"}),
+        json!({"status": "eventually_saved"}),
+    ] {
+        assert!(
+            serde_json::from_value::<sdk::RpcPlanChange>(json!({
+                "planMode": "approved", "plan": "proposal", "reviewId": null,
+                "changed": true, "persistence": persistence,
+            }))
+            .is_err(),
+            "unknown or incomplete durability must never be treated as saved"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_plan_controls_preserve_review_identity_and_use_save_only_recovery() {
+    let directory = tempfile::tempdir().expect("protocol fixture directory");
+    let mut client = rpc_pipe_fixture(
+        r#"
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"set_plan_mode","success":true,"data":{"planMode":"planning","plan":null,"reviewId":null,"changed":true,"persistence":{"status":"memory_only"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"get_plan","success":true,"data":{"planMode":"pending_approval","plan":"same reviewed text","reviewId":"p1-first"}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-3","command":"get_plan","success":true,"data":{"planMode":"pending_approval","plan":"same reviewed text","reviewId":"p1-second"}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-4","command":"approve_plan","success":false,"error":"PLAN_REVIEW_STALE"}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-5","command":"reject_plan","success":true,"data":{"planMode":"planning","plan":"same reviewed text","reviewId":null,"changed":true,"rejected":true,"persistence":{"status":"unconfirmed","reason":"save interrupted"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-6","command":"save_plan","success":true,"data":{"planMode":"planning","plan":"same reviewed text","reviewId":null,"changed":false,"persistence":{"status":"saved"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-7","command":"restore_plan","success":true,"data":{"planMode":"pending_approval","plan":"same reviewed text","reviewId":"p1-restored","changed":true,"persistence":{"status":"memory_only"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-8","command":"approve_plan","success":true,"data":{"planMode":"approved","plan":"same reviewed text","reviewId":null,"changed":true,"approved":true,"persistence":{"status":"unconfirmed","reason":"disk unavailable"}}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-9","command":"set_plan_mode","success":true,"data":{"planMode":"off","plan":null,"reviewId":null,"changed":true,"persistence":{"status":"saved"}}}'
+"#,
+        Some(directory.path().to_path_buf()),
+    );
+    futures::executor::block_on(async {
+        let entered = client.set_plan_mode(true).await.expect("enter planning");
+        assert_eq!(entered.persistence, sdk::RpcPlanPersistence::MemoryOnly);
+        let first = client
+            .get_plan()
+            .await
+            .unwrap()
+            .pending_review()
+            .unwrap()
+            .unwrap();
+        let second = client
+            .get_plan()
+            .await
+            .unwrap()
+            .pending_review()
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        let stale = client.approve_plan_review(&first).await.unwrap_err();
+        assert!(stale.to_string().contains("PLAN_REVIEW_STALE"));
+        let rejected = client
+            .reject_plan_review(&second)
+            .await
+            .expect("reject current review");
+        assert_eq!(rejected.state.plan_mode, sdk::RpcPlanMode::Planning);
+        assert!(matches!(
+            rejected.persistence,
+            sdk::RpcPlanPersistence::Unconfirmed { .. }
+        ));
+        let saved = client
+            .checkpoint_plan()
+            .await
+            .expect("save without repeating rejection");
+        assert!(!saved.changed);
+        assert_eq!(saved.persistence, sdk::RpcPlanPersistence::Saved);
+        let restored = client
+            .restore_plan_checkpoint()
+            .await
+            .expect("restore for fresh review");
+        let review = restored.state.pending_review().unwrap().unwrap();
+        assert_ne!(review, second);
+        let approved = client
+            .approve_plan_review(&review)
+            .await
+            .expect("committed approval");
+        assert_eq!(approved.state.plan_mode, sdk::RpcPlanMode::Approved);
+        assert_eq!(approved.state.plan.as_deref(), Some(review.text()));
+        assert!(matches!(
+            approved.persistence,
+            sdk::RpcPlanPersistence::Unconfirmed { .. }
+        ));
+        let exited = client.set_plan_mode(false).await.expect("exit and unpin");
+        assert_eq!(exited.state.plan_mode, sdk::RpcPlanMode::Off);
+    });
+    let recorded = std::fs::read_to_string(directory.path().join("frames.jsonl")).unwrap();
+    let frames: Vec<serde_json::Value> = recorded
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames,
+        vec![
+            json!({"type":"set_plan_mode", "id":"rpc-1", "mode":"on"}),
+            json!({"type":"get_plan", "id":"rpc-2"}),
+            json!({"type":"get_plan", "id":"rpc-3"}),
+            json!({"type":"approve_plan", "id":"rpc-4", "reviewId":"p1-first"}),
+            json!({"type":"reject_plan", "id":"rpc-5", "reviewId":"p1-second"}),
+            json!({"type":"save_plan", "id":"rpc-6"}),
+            json!({"type":"restore_plan", "id":"rpc-7"}),
+            json!({"type":"approve_plan", "id":"rpc-8", "reviewId":"p1-restored"}),
+            json!({"type":"set_plan_mode", "id":"rpc-9", "mode":"off"}),
+        ]
+    );
+    client.shutdown().expect("shutdown protocol fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_session_transitions_deliver_ui_events_without_stealing_terminal_responses() {
+    let directory = tempfile::tempdir().expect("session protocol fixture directory");
+    let mut client = rpc_pipe_fixture(
+        r#"
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"extension_ui_request","id":"ui-new","requestGeneration":11,"method":"confirm","title":"Create session?"}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-2","command":"extension_ui_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-1","command":"new_session","success":true,"data":{"cancelled":false}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"ask_request","id":"ask-switch","questions":[{"id":"switch-choice","question":"Keep the current session?","options":[{"label":"Keep"},{"label":"Switch"}]}]}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-4","command":"ask_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-3","command":"switch_session","success":true,"data":{"cancelled":true}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"extension_ui_request","id":"ui-fork","requestGeneration":42,"method":"confirm","title":"Inspect fork?"}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-6","command":"extension_ui_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"session_transition_hook_error","id":"rpc-5","command":"fork","phase":"after","committed":true,"error":"after-hook failed"}'
+printf '%s\n' '{"type":"response","id":"rpc-5","command":"fork","success":true,"data":{"text":"selected text","cancelled":false}}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"ask_request","id":"ask-content","questions":[{"id":"review","question":"Review the selected input?","options":[{"label":"Now"},{"label":"Later"}]}]}'
+IFS= read -r frame || exit 1
+printf '%s\n' "$frame" >> frames.jsonl
+printf '%s\n' '{"type":"response","id":"rpc-8","command":"ask_response","success":true,"data":{"resolved":true}}'
+printf '%s\n' '{"type":"response","id":"rpc-7","command":"fork","success":true,"data":{"text":"native text","content":[{"type":"text","text":"native text"},{"type":"image","data":"AQ==","mimeType":"image/png"}],"cancelled":false}}'
+"#,
+        Some(directory.path().to_path_buf()),
+    );
+    let control = client.control_handle();
+    futures::executor::block_on(async {
+        let mut new_events = Vec::new();
+        let created = client
+            .new_session_with_events(Some(std::path::Path::new("parent.jsonl")), |event| {
+                assert_eq!(event["type"], "extension_ui_request");
+                control
+                    .extension_ui_response(
+                        event["id"].as_str().unwrap(),
+                        event["requestGeneration"].as_u64().unwrap(),
+                        sdk::RpcExtensionUiResponse::Confirmed { confirmed: true },
+                    )
+                    .expect("reply during new-session hook");
+                new_events.push(event);
+            })
+            .await
+            .expect("new-session terminal response");
+        assert!(!created.cancelled);
+        assert_eq!(new_events.len(), 1);
+
+        let mut switch_events = Vec::new();
+        let switched = client
+            .switch_session_with_events(std::path::Path::new("target.jsonl"), |event| {
+                assert_eq!(event["type"], "ask_request");
+                control
+                    .ask_response(
+                        event["id"].as_str().unwrap(),
+                        sdk::AskResponse {
+                            answers: vec![sdk::AskAnswer {
+                                question_id: "switch-choice".to_string(),
+                                selected: vec!["Keep".to_string()],
+                                other: None,
+                            }],
+                            dismissed: false,
+                        },
+                    )
+                    .expect("reply during switch hook");
+                switch_events.push(event);
+            })
+            .await
+            .expect("cancelled switch is a successful protocol response");
+        assert!(switched.cancelled);
+        assert_eq!(switch_events.len(), 1);
+
+        let mut fork_events = Vec::new();
+        let forked = client
+            .fork_with_events("entry-text", |event| {
+                if event["type"] == "extension_ui_request" {
+                    control
+                        .extension_ui_response(
+                            event["id"].as_str().unwrap(),
+                            event["requestGeneration"].as_u64().unwrap(),
+                            sdk::RpcExtensionUiResponse::Confirmed { confirmed: true },
+                        )
+                        .expect("reply during fork hook");
+                }
+                fork_events.push(event);
+            })
+            .await
+            .expect("after-hook diagnostic does not undo committed fork");
+        assert!(!forked.cancelled);
+        assert_eq!(forked.text, "selected text");
+        assert_eq!(fork_events.len(), 2);
+        assert_eq!(
+            fork_events[1],
+            json!({
+                "type": "session_transition_hook_error",
+                "id": "rpc-5",
+                "command": "fork",
+                "phase": "after",
+                "committed": true,
+                "error": "after-hook failed",
+            })
+        );
+
+        let mut content_events = Vec::new();
+        let native = client
+            .fork_with_content_and_events("entry-native", |event| {
+                assert_eq!(event["type"], "ask_request");
+                control
+                    .ask_response(
+                        event["id"].as_str().unwrap(),
+                        sdk::AskResponse {
+                            answers: Vec::new(),
+                            dismissed: true,
+                        },
+                    )
+                    .expect("dismiss live ask card");
+                content_events.push(event);
+            })
+            .await
+            .expect("native fork terminal response");
+        assert!(!native.cancelled);
+        assert_eq!(native.text, "native text");
+        assert_eq!(content_events.len(), 1);
+        assert_eq!(
+            serde_json::to_value(native.content.expect("selected attachments")).unwrap(),
+            json!([
+                {"type":"text","text":"native text"},
+                {"type":"image","data":"AQ==","mimeType":"image/png"},
+            ])
+        );
+    });
+    let recorded = std::fs::read_to_string(directory.path().join("frames.jsonl")).unwrap();
+    let frames: Vec<serde_json::Value> = recorded
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames,
+        vec![
+            json!({"type":"new_session","id":"rpc-1","parentSession":"parent.jsonl"}),
+            json!({
+                "type":"extension_ui_response","id":"rpc-2",
+                "requestId":"ui-new","requestGeneration":11,"confirmed":true,
+            }),
+            json!({"type":"switch_session","id":"rpc-3","sessionPath":"target.jsonl"}),
+            json!({
+                "type":"ask_response","id":"rpc-4","requestId":"ask-switch",
+                "answers":[{"questionId":"switch-choice","selected":["Keep"]}],
+            }),
+            json!({"type":"fork","id":"rpc-5","entryId":"entry-text"}),
+            json!({
+                "type":"extension_ui_response","id":"rpc-6",
+                "requestId":"ui-fork","requestGeneration":42,"confirmed":true,
+            }),
+            json!({"type":"fork","id":"rpc-7","entryId":"entry-native"}),
+            json!({
+                "type":"ask_response","id":"rpc-8","requestId":"ask-content","dismissed":true,
+            }),
+        ]
+    );
+    client
+        .shutdown()
+        .expect("shutdown session protocol fixture");
+}
+
+#[test]
 fn sdk_is_only_public_root_module_and_basic_sdk_imports_exclusively_from_sdk() {
     fn unhidden_root_pub_mods(lib_source: &str) -> Vec<String> {
         let mut unhidden = Vec::new();

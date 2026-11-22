@@ -2516,6 +2516,49 @@ fn hostcall_marshalling_superinstruction_hits_after_trace_warmup() {
 }
 
 #[test]
+fn hostcall_marshalling_superinstruction_promotes_and_hits_trace_jit() {
+    let _guard = superinstruction_test_lock();
+    reset_hostcall_superinstruction_state_for_tests();
+
+    let get_state = json!({ "op": "get_state" });
+    let mut saw_jit_hit = false;
+    let mut jit_cost_delta = 0;
+
+    // Warm up past both superinstruction compilation (16 obs) and default
+    // trace-JIT promotion threshold (16 plan executions).
+    for _ in 0..48 {
+        let artifacts = HostcallPayloadArena::new(
+            "session",
+            &get_state,
+            Some(CommonHostcallOpcode::SessionGetState),
+        )
+        .marshal();
+        if artifacts.telemetry.superinstruction_jit_hit {
+            saw_jit_hit = true;
+            jit_cost_delta = artifacts.telemetry.superinstruction_jit_cost_delta;
+            break;
+        }
+    }
+
+    assert!(
+        saw_jit_hit,
+        "repeated hot fast-opcode hostcalls must promote and hit tier-2 trace-JIT"
+    );
+    assert!(
+        jit_cost_delta > 0,
+        "tier-2 trace-JIT hit must report positive improvement delta"
+    );
+    let snap = crate::extensions::trace_jit_telemetry_snapshot().expect("jit telemetry snapshot");
+    assert!(snap.jit_hits > 0, "expected jit_hits > 0, got {snap:?}");
+    assert_eq!(
+        snap.deopts, 0,
+        "valid hot traces must not deoptimize on MinSupportCount guard: {snap:?}"
+    );
+
+    reset_hostcall_superinstruction_state_for_tests();
+}
+
+#[test]
 fn runtime_hostcall_telemetry_records_marshalling_fallback_reason_and_counter() {
     let _guard = superinstruction_test_lock();
     reset_hostcall_superinstruction_state_for_tests();

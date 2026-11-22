@@ -1099,11 +1099,11 @@ impl SessionTransport {
 }
 
 impl RpcControlHandle {
-    /// Answer an extension's UI request while an RPC prompt is still streaming.
+    /// Answer an extension's UI request during an RPC prompt or session hook.
     ///
-    /// Clone the control handle before starting the prompt, then use it from
-    /// the live event callback or a separate UI thread. The prompt remains the
-    /// only stdout reader. Echo the exact request ID and `requestGeneration`
+    /// Clone the control handle before starting the operation, then use it from
+    /// its live event callback or a separate UI thread. The active operation
+    /// remains the only stdout reader. Echo the exact request ID and `requestGeneration`
     /// from the response-bearing `extension_ui_request`; this method neither
     /// selects a default answer nor substitutes the current generation.
     ///
@@ -1137,8 +1137,9 @@ impl RpcControlHandle {
         self.send("extension_ui_response", payload)
     }
 
-    /// Answer or dismiss a live `ask_request` without borrowing the prompt's
-    /// stdout reader. This also supports host permission cards that use `ask`.
+    /// Answer or dismiss a live `ask_request` without borrowing the active
+    /// operation's stdout reader. This also supports session hooks and host
+    /// permission cards that use `ask`.
     ///
     /// Answers retain their exact question IDs, selected labels and free text.
     /// Explicit dismissal takes precedence and sends no stale answers. No

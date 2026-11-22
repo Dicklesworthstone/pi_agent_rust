@@ -46,6 +46,7 @@ pub use crate::agent::{
 };
 pub use crate::agent_cx::AgentCx;
 pub use crate::approval::{ApprovalMode, ApprovalState};
+pub use crate::ask::{AskAnswer, AskResponse};
 pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
@@ -1032,6 +1033,97 @@ pub struct RpcSessionState {
     pub durability_mode: String,
 }
 
+/// Plan state reported by the RPC session. Restored approvals require fresh review.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcPlanMode {
+    Off,
+    Planning,
+    PendingApproval,
+    Approved,
+}
+
+/// The exact proposal shown to the host, with its connection-bound review ID.
+/// Keep this value while awaiting a decision instead of fetching a newer plan.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RpcPlanReview {
+    review_id: String,
+    text: String,
+}
+
+impl RpcPlanReview {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Debug for RpcPlanReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcPlanReview")
+            .field("bytes", &self.text.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read-only plan snapshot. A review ID refers to one live submission on one
+/// connection; matching text alone never grants approval of a newer submission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPlanState {
+    pub plan_mode: RpcPlanMode,
+    pub plan: Option<String>,
+    pub review_id: Option<String>,
+}
+
+impl RpcPlanState {
+    /// Capture the complete pending proposal before presenting an approval UI.
+    /// Invalid pending snapshots are errors rather than empty or implicit approvals.
+    pub fn pending_review(&self) -> Result<Option<RpcPlanReview>> {
+        if self.plan_mode != RpcPlanMode::PendingApproval {
+            return Ok(None);
+        }
+        let text = self
+            .plan
+            .as_ref()
+            .filter(|text| !text.trim().is_empty() && text.len() <= crate::plan::MAX_PLAN_BYTES)
+            .ok_or_else(|| Error::api("RPC pending plan did not include reviewable text"))?;
+        let review_id = self
+            .review_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty() && id.len() <= 64 && !id.contains('\0'))
+            .ok_or_else(|| Error::api("RPC pending plan did not include a valid review ID"))?;
+        Ok(Some(RpcPlanReview {
+            review_id: review_id.clone(),
+            text: text.clone(),
+        }))
+    }
+}
+
+/// Persistence is independent of the live plan decision. Unconfirmed means the
+/// decision already took effect; retry `checkpoint_plan`, not the old approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RpcPlanPersistence {
+    Unchanged,
+    MemoryOnly,
+    Saved,
+    Unconfirmed { reason: String },
+}
+
+/// A completed RPC plan operation. A successful decision can still have an
+/// unconfirmed save or an unavailable post-transition state snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcPlanChange {
+    #[serde(flatten)]
+    pub state: RpcPlanState,
+    pub changed: bool,
+    pub persistence: RpcPlanPersistence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_error: Option<String>,
+}
+
 /// Goal operation accepted by RPC `goal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcGoalOp {
@@ -1869,6 +1961,16 @@ impl RpcTransportClient {
         &mut self,
         parent_session: Option<&Path>,
     ) -> Result<RpcCancelledResult> {
+        self.new_session_with_events(parent_session, |_| {}).await
+    }
+
+    /// Create a session while forwarding extension hook events to the host.
+    /// Clone a control handle first to answer UI requests from the callback.
+    pub async fn new_session_with_events(
+        &mut self,
+        parent_session: Option<&Path>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCancelledResult> {
         let mut payload = Map::new();
         if let Some(parent_session) = parent_session {
             payload.insert(
@@ -1876,7 +1978,10 @@ impl RpcTransportClient {
                 Value::String(parent_session.display().to_string()),
             );
         }
-        self.request_typed("new_session", payload).await
+        let data = self
+            .request_with_events("new_session", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "new_session")
     }
 
     pub async fn get_state(&mut self) -> Result<RpcSessionState> {
@@ -1885,6 +1990,54 @@ impl RpcTransportClient {
 
     pub async fn get_session_stats(&mut self) -> Result<RpcSessionStats> {
         self.request_typed("get_session_stats", Map::new()).await
+    }
+
+    /// Read the current proposal without changing the plan or starting a turn.
+    pub async fn get_plan(&mut self) -> Result<RpcPlanState> {
+        self.request_typed("get_plan", Map::new()).await
+    }
+
+    /// Enter read-only planning or exit it and remove the owned approved-plan pin.
+    /// A pending proposal must be explicitly rejected or exited before re-entry.
+    pub async fn set_plan_mode(&mut self, enabled: bool) -> Result<RpcPlanChange> {
+        let mut payload = Map::new();
+        payload.insert(
+            "mode".to_string(),
+            Value::String(if enabled { "on" } else { "off" }.to_string()),
+        );
+        self.request_typed("set_plan_mode", payload).await
+    }
+
+    /// Approve the exact proposal previously displayed. Stale reviews are
+    /// rejected by the server; this never fetches or substitutes a newer review.
+    pub async fn approve_plan_review(&mut self, review: &RpcPlanReview) -> Result<RpcPlanChange> {
+        let mut payload = Map::new();
+        payload.insert(
+            "reviewId".to_string(),
+            Value::String(review.review_id.clone()),
+        );
+        self.request_typed("approve_plan", payload).await
+    }
+
+    /// Reject the displayed proposal while retaining read-only planning.
+    pub async fn reject_plan_review(&mut self, review: &RpcPlanReview) -> Result<RpcPlanChange> {
+        let mut payload = Map::new();
+        payload.insert(
+            "reviewId".to_string(),
+            Value::String(review.review_id.clone()),
+        );
+        self.request_typed("reject_plan", payload).await
+    }
+
+    /// Retry saving the live plan without repeating an approval or rejection.
+    pub async fn checkpoint_plan(&mut self) -> Result<RpcPlanChange> {
+        self.request_typed("save_plan", Map::new()).await
+    }
+
+    /// Restore the selected branch's checkpoint for fresh review. Saved approval
+    /// never transfers execution authority into this connection.
+    pub async fn restore_plan_checkpoint(&mut self) -> Result<RpcPlanChange> {
+        self.request_typed("restore_plan", Map::new()).await
     }
 
     /// Read or mutate the persistent goal attached to the current RPC session.
@@ -2129,20 +2282,44 @@ impl RpcTransportClient {
     }
 
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<RpcCancelledResult> {
+        self.switch_session_with_events(session_path, |_| {}).await
+    }
+
+    /// Switch sessions while forwarding hook dialogs and diagnostics.
+    /// A failed after-hook is reported as an event after the switch commits.
+    pub async fn switch_session_with_events(
+        &mut self,
+        session_path: &Path,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCancelledResult> {
         let mut payload = Map::new();
         payload.insert(
             "sessionPath".to_string(),
             Value::String(session_path.display().to_string()),
         );
-        self.request_typed("switch_session", payload).await
+        let data = self
+            .request_with_events("switch_session", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "switch_session")
     }
 
     /// Fork and return the selected prompt's editable text without submitting it.
     /// Use [`Self::fork_with_content`] to retain native attachments as well.
     pub async fn fork(&mut self, entry_id: impl Into<String>) -> Result<RpcForkResult> {
+        self.fork_with_events(entry_id, |_| {}).await
+    }
+
+    /// Fork editable text while forwarding interactive lifecycle events.
+    /// The selected prompt is returned without being submitted.
+    pub async fn fork_with_events(
+        &mut self,
+        entry_id: impl Into<String>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcForkResult> {
         let mut payload = Map::new();
         payload.insert("entryId".to_string(), Value::String(entry_id.into()));
-        self.request_typed("fork", payload).await
+        let data = self.request_with_events("fork", payload, on_event).await?;
+        Self::parse_response_data(data, "fork")
     }
 
     /// Fork and retain the selected prompt's ordered native attachments.
@@ -2153,9 +2330,20 @@ impl RpcTransportClient {
         &mut self,
         entry_id: impl Into<String>,
     ) -> Result<RpcForkContentResult> {
+        self.fork_with_content_and_events(entry_id, |_| {}).await
+    }
+
+    /// Fork native selected input while forwarding interactive lifecycle events.
+    /// Attachments retain their original order and the prompt remains unsent.
+    pub async fn fork_with_content_and_events(
+        &mut self,
+        entry_id: impl Into<String>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcForkContentResult> {
         let mut payload = Map::new();
         payload.insert("entryId".to_string(), Value::String(entry_id.into()));
-        self.request_typed("fork", payload).await
+        let data = self.request_with_events("fork", payload, on_event).await?;
+        Self::parse_response_data(data, "fork")
     }
 
     pub async fn get_fork_messages(&mut self) -> Result<Vec<RpcForkMessage>> {

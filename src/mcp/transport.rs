@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::{FutureExt as _, StreamExt as _};
@@ -48,6 +48,11 @@ const HTTP_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-logical-stream event-id budget. Exhaustion fails closed rather than
 /// forgetting old ids and risking duplicate server-request side effects.
 const MAX_HTTP_SSE_EVENT_IDS: usize = 4096;
+/// Avoid tight polling when a server omits its retry hint or supplies zero.
+const HTTP_SSE_DEFAULT_RETRY: Duration = Duration::from_secs(1);
+const HTTP_SSE_MIN_RETRY: Duration = Duration::from_millis(100);
+/// Slice untrusted retry values to avoid overflowing the runtime's timer.
+const HTTP_SSE_RETRY_SLICE: Duration = Duration::from_secs(60);
 /// Preferred MCP protocol revision, matching OMP's current handshake.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 /// Revisions whose shared handshake, tools, resources, and prompts we support.
@@ -2073,10 +2078,39 @@ struct HttpSseCursor {
     seen_ids: HashSet<String>,
     last_event_id: Option<String>,
     resume_safe: bool,
+    retry_ms: Option<u64>,
+    response_bytes: usize,
 }
 
 impl HttpSseCursor {
+    fn observe_retry(&mut self, retry_ms: Option<u64>) {
+        if retry_ms.is_some() {
+            self.retry_ms = retry_ms;
+        }
+    }
+
+    fn reconnect_delay(&self) -> Duration {
+        self.retry_ms
+            .map_or(HTTP_SSE_DEFAULT_RETRY, Duration::from_millis)
+            .max(HTTP_SSE_MIN_RETRY)
+    }
+
+    fn charge_response_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.response_bytes = self
+            .response_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| tool_err("MCP_PROTOCOL", "SSE response byte count overflowed"))?;
+        if self.response_bytes > MAX_HTTP_BODY {
+            return Err(tool_err(
+                "MCP_PROTOCOL",
+                format!("SSE response exceeded {MAX_HTTP_BODY} bytes across resumptions"),
+            ));
+        }
+        Ok(())
+    }
+
     fn accept(&mut self, event: &crate::sse::SseEvent) -> Result<bool> {
+        self.observe_retry(event.retry);
         let Some(event_id) = event.id.as_deref().filter(|_| event.id_was_explicit) else {
             // Without an id there is no checkpoint beyond this event. If it
             // contains a server request, resuming from an earlier id could
@@ -2222,7 +2256,11 @@ impl BoundedHttpSseDecoder {
         Ok(events)
     }
 
-    fn finish(mut self) -> Result<Vec<crate::sse::SseEvent>> {
+    fn retry_interval_ms(&self) -> Option<u64> {
+        self.parser.retry_interval_ms()
+    }
+
+    fn finish(&mut self) -> Result<Vec<crate::sse::SseEvent>> {
         let mut events = Vec::new();
         if !self.pending_utf8.is_empty() {
             let text = std::str::from_utf8(&self.pending_utf8).map_err(|err| {
@@ -2627,6 +2665,9 @@ impl HttpTransport {
         kind: HttpRoundTripKind<'_>,
         wire_state_override: Option<&HttpWireState>,
     ) -> Result<Value> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| tool_err("MCP_TRANSPORT_IO", "HTTP request deadline is out of range"))?;
         let mut request = self
             .client
             .post(&self.url)
@@ -2781,7 +2822,7 @@ impl HttpTransport {
         };
         let result = match media_type {
             HttpResponseMediaType::EventStream => {
-                self.receive_sse_response(response, expected_id, timeout, &response_wire_state)
+                self.receive_sse_response(response, expected_id, deadline, &response_wire_state)
                     .await
             }
             HttpResponseMediaType::Json => match response.text_limited(MAX_HTTP_BODY).await {
@@ -3009,10 +3050,16 @@ impl HttpTransport {
                     request = request.try_header("Authorization", value)?;
                 }
                 let response = request.no_timeout().send().await.map_err(|err| {
-                    tool_err(
-                        "MCP_TRANSPORT_IO",
-                        format!("open server event stream: {err}"),
-                    )
+                    // Preserve initial activation's error classification.
+                    // Only identified continuations gain transport retries.
+                    let code = if last_event_id.is_none()
+                        || is_retryable_http_continuation_error(&err)
+                    {
+                        "MCP_TRANSPORT_IO"
+                    } else {
+                        "MCP_HTTP_STREAM_OPEN"
+                    };
+                    tool_err(code, format!("open server event stream: {err}"))
                 })?;
                 let status = response.status();
                 self.check_authentication_status(status)?;
@@ -3208,8 +3255,9 @@ impl HttpTransport {
         let mut stream = response.bytes_stream();
         let mut decoder = BoundedHttpSseDecoder::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|err| tool_err("MCP_TRANSPORT_IO", format!("read SSE body: {err}")))?;
+            let chunk = chunk.map_err(|error| http_sse_read_error(error, "read SSE body"))?;
+            // Reopening HTTP must not reset a logical request's body quota.
+            cursor.charge_response_bytes(chunk.len())?;
             for event in decoder.feed(&chunk)? {
                 if !cursor.accept(&event)? {
                     continue;
@@ -3221,6 +3269,8 @@ impl HttpTransport {
                     return Ok(Some(result));
                 }
             }
+            // A retry-only control frame does not dispatch an SSE event.
+            cursor.observe_retry(decoder.retry_interval_ms());
         }
         for event in decoder.finish()? {
             if !cursor.accept(&event)? {
@@ -3233,71 +3283,159 @@ impl HttpTransport {
                 return Ok(Some(result));
             }
         }
+        cursor.observe_retry(decoder.retry_interval_ms());
         Ok(None)
+    }
+
+    async fn wait_for_sse_resume(
+        &self,
+        cursor: &HttpSseCursor,
+        wire_state: &HttpWireState,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let wait = async {
+            let mut remaining = cursor.reconnect_delay();
+            while !remaining.is_zero() {
+                let mut delay = remaining.min(HTTP_SSE_RETRY_SLICE);
+                if let Some(deadline) = deadline {
+                    let budget = deadline.saturating_duration_since(Instant::now());
+                    if budget.is_zero() {
+                        return Err(tool_err(
+                            "MCP_DELIVERY_INDETERMINATE",
+                            "SSE request deadline expired while waiting to resume; the original request was not replayed",
+                        ));
+                    }
+                    delay = delay.min(budget);
+                }
+                let now = asupersync::Cx::current()
+                    .and_then(|cx| cx.timer_driver())
+                    .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+                asupersync::time::sleep(now, delay).await;
+                remaining = remaining.saturating_sub(delay);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(tool_err(
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "SSE request deadline expired before resumption; the original request was not replayed",
+                ));
+            }
+            Ok(())
+        };
+        self.run_until_abort(self.run_until_session_change(wire_state.generation, wait))
+            .await?
+            .ok_or_else(|| {
+                tool_err(
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "protocol session changed while waiting to resume SSE; the original request was not replayed",
+                )
+            })
+    }
+
+    /// Continue only an identified logical stream. A failed GET establishes
+    /// no new checkpoint, so retry it with the same session and event id.
+    async fn resume_event_stream(
+        &self,
+        cursor: &HttpSseCursor,
+        wire_state: &HttpWireState,
+        deadline: Option<Instant>,
+    ) -> Result<HttpEventStreamOpen> {
+        let last_event_id = cursor.resume_id().ok_or_else(|| {
+            tool_err(
+                "MCP_DELIVERY_INDETERMINATE",
+                "cannot resume SSE without a safe event checkpoint",
+            )
+        })?;
+        loop {
+            self.wait_for_sse_resume(cursor, wire_state, deadline)
+                .await?;
+            let remaining = deadline
+                .map(|deadline| {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        Err(tool_err(
+                            "MCP_DELIVERY_INDETERMINATE",
+                            "SSE request deadline expired before resumption; the original request was not replayed",
+                        ))
+                    } else {
+                        Ok(remaining)
+                    }
+                })
+                .transpose()?;
+            let opened = self
+                .run_until_abort(self.run_until_session_change(
+                    wire_state.generation,
+                    self.open_event_stream(wire_state, Some(last_event_id), remaining),
+                ))
+                .await;
+            match opened {
+                Ok(Some(opened)) => return Ok(opened),
+                Ok(None) => {
+                    return Err(tool_err(
+                        "MCP_DELIVERY_INDETERMINATE",
+                        "protocol session changed while establishing SSE continuation; the original request was not replayed",
+                    ));
+                }
+                // Only transport failures qualify. Authentication, malformed
+                // responses, session expiry, and Unsupported stay terminal.
+                Err(error) if is_transport_io(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn receive_sse_response(
         &self,
-        response: crate::http::client::Response,
+        mut response: crate::http::client::Response,
         expected_id: u64,
-        timeout: Duration,
+        deadline: Instant,
         wire_state: &HttpWireState,
     ) -> Result<Value> {
         let mut cursor = HttpSseCursor::default();
-        match self
-            .receive_request_sse_stream(response, expected_id, &mut cursor, wire_state)
-            .await
-        {
-            Ok(Some(result)) => return Ok(result),
-            Ok(None) => {}
-            Err(error) if is_transport_io(&error) && cursor.resume_id().is_some() => {}
-            Err(error) => return Err(error),
-        }
-        let Some(last_event_id) = cursor.resume_id().map(str::to_string) else {
-            return Err(tool_err(
-                "MCP_DELIVERY_INDETERMINATE",
-                "SSE request stream ended before its JSON-RPC response and supplied no resumable event id",
-            ));
-        };
-        let resumed = match self
-            .open_event_stream(wire_state, Some(&last_event_id), Some(timeout))
-            .await
-            .map_err(|error| {
-                if super::manager::is_authentication_error(&error) {
-                    tool_err(
+        loop {
+            match self
+                .receive_request_sse_stream(response, expected_id, &mut cursor, wire_state)
+                .await
+            {
+                Ok(Some(result)) => return Ok(result),
+                Ok(None) => {}
+                Err(error) if is_transport_io(&error) && cursor.resume_id().is_some() => {}
+                Err(error) => return Err(error),
+            }
+            if cursor.resume_id().is_none() {
+                return Err(tool_err(
+                    "MCP_DELIVERY_INDETERMINATE",
+                    "SSE request stream ended before its JSON-RPC response and supplied no resumable event id",
+                ));
+            }
+            response = match self
+                .resume_event_stream(&cursor, wire_state, Some(deadline))
+                .await
+                .map_err(|error| {
+                    if super::manager::is_authentication_error(&error) {
+                        tool_err(
+                            "MCP_DELIVERY_INDETERMINATE",
+                            "authentication failed while resuming an already-accepted SSE request; the original request may have completed and was not replayed",
+                        )
+                    } else {
+                        error
+                    }
+                })?
+            {
+                HttpEventStreamOpen::Stream(response) => response,
+                HttpEventStreamOpen::Unsupported => {
+                    return Err(tool_err(
                         "MCP_DELIVERY_INDETERMINATE",
-                        "authentication failed while resuming an already-accepted SSE request; the original request may have completed and was not replayed",
-                    )
-                } else {
-                    error
+                        "SSE request stream ended before its response and the server rejected resumption",
+                    ));
                 }
-            })?
-        {
-            HttpEventStreamOpen::Stream(response) => response,
-            HttpEventStreamOpen::Unsupported => {
-                return Err(tool_err(
-                    "MCP_DELIVERY_INDETERMINATE",
-                    "SSE request stream ended before its response and the server rejected one-shot resumption with HTTP 405",
-                ));
-            }
-            HttpEventStreamOpen::SessionExpired => {
-                return Err(tool_err(
-                    "MCP_DELIVERY_INDETERMINATE",
-                    "HTTP session expired after the server accepted a request; refusing to replay it in a new session",
-                ));
-            }
-        };
-        self.receive_request_sse_stream(resumed, expected_id, &mut cursor, wire_state)
-            .await?
-            .map_or_else(
-                || {
-                    Err(tool_err(
+                HttpEventStreamOpen::SessionExpired => {
+                    return Err(tool_err(
                         "MCP_DELIVERY_INDETERMINATE",
-                        "one-shot SSE resumption ended before the pending JSON-RPC response",
-                    ))
-                },
-                Ok,
-            )
+                        "HTTP session expired after the server accepted a request; refusing to replay it in a new session",
+                    ));
+                }
+            };
+        }
     }
 
     async fn receive_server_event_stream(
@@ -3309,60 +3447,53 @@ impl HttpTransport {
         let mut stream = response.bytes_stream();
         let mut decoder = BoundedHttpSseDecoder::for_server_events();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|err| {
-                tool_err(
-                    "MCP_TRANSPORT_IO",
-                    format!("read server event stream: {err}"),
-                )
-            })?;
+            let chunk =
+                chunk.map_err(|error| http_sse_read_error(error, "read server event stream"))?;
             for event in decoder.feed(&chunk)? {
                 if cursor.accept(&event)? {
                     self.handle_server_stream_event(event, wire_state).await?;
                 }
             }
+            cursor.observe_retry(decoder.retry_interval_ms());
         }
         for event in decoder.finish()? {
             if cursor.accept(&event)? {
                 self.handle_server_stream_event(event, wire_state).await?;
             }
         }
+        cursor.observe_retry(decoder.retry_interval_ms());
         Ok(())
     }
 
     async fn run_server_event_listener(
         &self,
         wire_state: &HttpWireState,
-        first: crate::http::client::Response,
+        mut response: crate::http::client::Response,
     ) -> Result<()> {
         let mut cursor = HttpSseCursor::default();
-        let first_result = self
-            .receive_server_event_stream(first, &mut cursor, wire_state)
-            .await;
-        if let Err(error) = first_result
-            && (!is_transport_io(&error) || cursor.resume_id().is_none())
-        {
-            return Err(error);
-        }
-        let Some(last_event_id) = cursor.resume_id().map(str::to_string) else {
-            return Ok(());
-        };
-        let resumed = match self
-            .open_event_stream(wire_state, Some(&last_event_id), None)
-            .await?
-        {
-            HttpEventStreamOpen::Unsupported => return Ok(()),
-            HttpEventStreamOpen::SessionExpired => {
-                return Err(tool_err(
-                    "MCP_SESSION_EXPIRED",
-                    "server rejected the active GET stream session during resumption",
-                ));
+        loop {
+            let result = self
+                .receive_server_event_stream(response, &mut cursor, wire_state)
+                .await;
+            if let Err(error) = result
+                && (!is_transport_io(&error) || cursor.resume_id().is_none())
+            {
+                return Err(error);
             }
-            HttpEventStreamOpen::Stream(response) => response,
-        };
-        // Exactly one resume attempt per logical GET stream. A second
-        // disconnect ends this optional receive channel instead of looping.
-        self.receive_server_event_stream(resumed, &mut cursor, wire_state)
-            .await
+            if cursor.resume_id().is_none() {
+                return Ok(());
+            }
+            response = match self.resume_event_stream(&cursor, wire_state, None).await? {
+                HttpEventStreamOpen::Unsupported => return Ok(()),
+                HttpEventStreamOpen::SessionExpired => {
+                    return Err(tool_err(
+                        "MCP_SESSION_EXPIRED",
+                        "server rejected the active GET stream session during resumption",
+                    ));
+                }
+                HttpEventStreamOpen::Stream(response) => response,
+            };
+        }
     }
 
     async fn run_server_event_supervisor(
@@ -3393,9 +3524,9 @@ impl HttpTransport {
                     }
                 };
                 if listener_result == Some(()) {
-                    // The optional channel ended or exhausted its single
-                    // resume. Stay dormant until a newly initialized
-                    // session supplies a fresh, cursor-free stream.
+                    // No safe checkpoint remained or the server declined
+                    // continuation. Wait for a newly initialized session
+                    // to supply a fresh, cursor-free stream.
                     let _ = self
                         .run_until_session_change(
                             wire_state.generation,
@@ -3545,6 +3676,48 @@ fn redacted_origin(url: &str) -> String {
         || format!("{}://{host}", parsed.scheme()),
         |port| format!("{}://{host}:{port}", parsed.scheme()),
     )
+}
+
+/// Reopening an identified SSE stream never replays its original POST.
+/// Decide from typed errors before the HTTP layer's message is flattened.
+fn is_retryable_http_continuation_error(error: &Error) -> bool {
+    match error {
+        Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            false
+        }
+        // A previously live server can stop accepting briefly during restart.
+        Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => true,
+        // The native HTTP reader uses this exact marker for pre-header EOF.
+        // Other Api strings include malformed HTTP and permanent TLS failures.
+        Error::Api(message) => {
+            message == "HTTP connection closed before headers (transient connection drop)"
+        }
+        _ => error.is_transient(),
+    }
+}
+
+/// Malformed HTTP chunk framing is not a dropped SSE connection. Preserve the
+/// native I/O cause before flattening it so a safe checkpoint cannot turn a
+/// protocol failure into an endless continuation loop.
+fn http_sse_read_error(error: std::io::Error, description: &str) -> Error {
+    // The native body-idle timer predates typed timeout errors. Its exact,
+    // host-owned marker remains recoverable; arbitrary Other errors do not.
+    let idle_timeout = error.kind() == std::io::ErrorKind::Other
+        && error.to_string() == "Request timed out reading body stream";
+    let error = Error::from(error);
+    let code = if idle_timeout || is_retryable_http_continuation_error(&error) {
+        "MCP_TRANSPORT_IO"
+    } else {
+        "MCP_PROTOCOL"
+    };
+    tool_err(code, format!("{description}: {error}"))
 }
 
 fn is_transport_io(error: &Error) -> bool {
@@ -5033,7 +5206,8 @@ pub(crate) mod tests {
     /// order, captures each request's headers/body, and replaces the
     /// __ECHO_ID__ token with the captured request's JSON-RPC id so scripted
     /// results always satisfy the exact-id rule regardless of transport
-    /// id allocation.
+    /// id allocation. An empty response closes the accepted connection before
+    /// sending any HTTP headers, exercising native establishment failures.
     struct ScriptedHttpServer {
         addr: std::net::SocketAddr,
         captured: CapturedRequests,
@@ -5611,6 +5785,13 @@ pub(crate) mod tests {
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
+        )
+    }
+
+    fn http_chunked_event_stream(first_chunk: &str, tail: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{first_chunk}\r\n{tail}",
+            first_chunk.len()
         )
     }
 
@@ -6838,6 +7019,683 @@ for line in sys.stdin:
             3,
             "initialization must happen once initially and once per expired call"
         );
+    }
+
+    #[test]
+    fn streamable_http_post_sse_survives_repeated_disconnects_without_replay() {
+        let server = ScriptedHttpServer::start(vec![
+            http_event_stream("id: request:1\ndata:\n\nretry: 1\n\n"),
+            http_event_stream(concat!(
+                "id: request:1\ndata:\n\n",
+                "id: request:2\ndata:\n\nretry: 1\n\n",
+            )),
+            http_event_stream(concat!(
+                "id: request:3\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n\n",
+            )),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-repeated-post".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture session");
+        let result = runtime_for_tests()
+            .block_on(transport.request(
+                "tools/call",
+                serde_json::json!({"name": "side_effect", "arguments": {}}),
+                Duration::from_secs(5),
+            ))
+            .expect("response after two resumptions");
+        assert_eq!(result["content"][0]["text"], "done");
+        assert_eq!(
+            server.request_lines(),
+            vec![
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+            ]
+        );
+        let captured = server.captured();
+        for (index, checkpoint) in [(1, "request:1"), (2, "request:2")] {
+            assert!(captured[index].1.is_empty());
+            for (name, expected) in [
+                ("Last-Event-ID", checkpoint),
+                ("Mcp-Session-Id", "sid-repeated-post"),
+                ("Mcp-Protocol-Version", MCP_PROTOCOL_VERSION),
+            ] {
+                assert!(
+                    captured[index]
+                        .0
+                        .iter()
+                        .any(|(key, value)| key.eq_ignore_ascii_case(name) && value == expected)
+                );
+            }
+        }
+        assert!(transport.is_alive());
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_get_survives_repeated_disconnects_and_deduplicates_requests() {
+        let event = |sequence: usize| {
+            format!(
+                "id: events:{sequence}\nretry: 1\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"ping-{sequence}\",\"method\":\"ping\"}}\n\n"
+            )
+        };
+        let server = ScriptedHttpServer::start(vec![
+            http_event_stream(&event(1)),
+            http_empty(202, "Accepted"),
+            http_event_stream(&format!("{}{}", event(1), event(2))),
+            http_empty(202, "Accepted"),
+            http_event_stream(&format!("{}{}{}", event(1), event(2), event(3))),
+            http_empty(202, "Accepted"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-repeated-get".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture session");
+        runtime_for_tests().block_on(async {
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .await
+                .expect("activate GET stream");
+            wait_for_requests(&server, 6).await;
+            transport.abort();
+        });
+        assert_eq!(
+            server.request_lines(),
+            vec![
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+            ]
+        );
+        let captured = server.captured();
+        for (index, checkpoint) in [(2, "events:1"), (4, "events:2")] {
+            for (name, expected) in [
+                ("Last-Event-ID", checkpoint),
+                ("Mcp-Session-Id", "sid-repeated-get"),
+            ] {
+                assert!(
+                    captured[index]
+                        .0
+                        .iter()
+                        .any(|(key, value)| key.eq_ignore_ascii_case(name) && value == expected)
+                );
+            }
+        }
+        for sequence in 1..=3 {
+            let id = format!("ping-{sequence}");
+            let replies = captured
+                .iter()
+                .filter_map(|(_, body)| serde_json::from_str::<Value>(body).ok())
+                .filter(|frame| frame["id"].as_str() == Some(id.as_str()))
+                .count();
+            assert_eq!(replies, 1, "each server request is answered exactly once");
+        }
+    }
+
+    #[test]
+    fn streamable_http_post_sse_retries_dropped_continuation_headers_without_post_replay() {
+        let server = ScriptedHttpServer::start(vec![
+            http_event_stream("id: request:1\ndata:\n\nretry: 1\n\n"),
+            String::new(),
+            String::new(),
+            http_event_stream(concat!(
+                "id: request:2\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"recovered\"}]}}\n\n",
+            )),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-retry-post".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture session");
+        let result = runtime_for_tests()
+            .block_on(transport.request(
+                "tools/call",
+                serde_json::json!({"name": "side_effect", "arguments": {}}),
+                Duration::from_secs(5),
+            ))
+            .expect("resume after two connections close before headers");
+        assert_eq!(result["content"][0]["text"], "recovered");
+        assert_eq!(
+            server.request_lines(),
+            vec![
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+            ]
+        );
+        let captured = server.captured();
+        for (headers, body) in &captured[1..] {
+            assert!(body.is_empty());
+            for (name, expected) in [
+                ("Last-Event-ID", "request:1"),
+                ("Mcp-Session-Id", "sid-retry-post"),
+                ("Mcp-Protocol-Version", MCP_PROTOCOL_VERSION),
+            ] {
+                assert!(
+                    headers
+                        .iter()
+                        .any(|(key, value)| key.eq_ignore_ascii_case(name) && value == expected)
+                );
+            }
+        }
+        assert!(transport.is_alive());
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_get_retries_dropped_continuation_headers_without_duplicate_replies() {
+        let first = concat!(
+            "id: events:1\nretry: 1\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"ping-1\",\"method\":\"ping\"}\n\n",
+        );
+        let recovered = concat!(
+            "id: events:1\nretry: 1\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"ping-1\",\"method\":\"ping\"}\n\n",
+            "id: events:2\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":\"ping-2\",\"method\":\"ping\"}\n\n",
+        );
+        let server = ScriptedHttpServer::start(vec![
+            http_event_stream(first),
+            http_empty(202, "Accepted"),
+            String::new(),
+            String::new(),
+            http_event_stream(recovered),
+            http_empty(202, "Accepted"),
+        ]);
+        let transport =
+            std::sync::Arc::new(HttpTransport::new(&server.url(), Vec::new()).expect("transport"));
+        transport
+            .capture_initialize_state(
+                &initialize_success_body(),
+                Some("sid-retry-get".to_string()),
+                &serde_json::json!({"params": {}}),
+            )
+            .expect("capture session");
+        runtime_for_tests().block_on(async {
+            std::sync::Arc::clone(&transport)
+                .activate()
+                .await
+                .expect("activate GET stream");
+            wait_for_requests(&server, 6).await;
+            assert!(transport.is_alive());
+            transport.abort();
+        });
+        assert_eq!(
+            server.request_lines(),
+            vec![
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "GET /mcp HTTP/1.1",
+                "POST /mcp HTTP/1.1",
+            ]
+        );
+        let captured = server.captured();
+        for index in [2, 3, 4] {
+            for (name, expected) in [
+                ("Last-Event-ID", "events:1"),
+                ("Mcp-Session-Id", "sid-retry-get"),
+            ] {
+                assert!(
+                    captured[index]
+                        .0
+                        .iter()
+                        .any(|(key, value)| key.eq_ignore_ascii_case(name) && value == expected)
+                );
+            }
+        }
+        for id in ["ping-1", "ping-2"] {
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter_map(|(_, body)| serde_json::from_str::<Value>(body).ok())
+                    .filter(|frame| frame["id"].as_str() == Some(id))
+                    .count(),
+                1,
+                "replayed server requests must not receive a second reply"
+            );
+        }
+    }
+
+    #[test]
+    fn streamable_http_continuation_header_retries_keep_the_original_deadline() {
+        let mut responses = vec![http_event_stream("id: deadline:1\ndata:\n\nretry: 1\n\n")];
+        responses.extend(std::iter::repeat_n(String::new(), 32));
+        let server = ScriptedHttpServer::start(responses);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let error = runtime_for_tests()
+            .block_on(transport.round_trip(
+                &frame,
+                Duration::from_secs(1),
+                HttpRoundTripKind::Request {
+                    expected_id: 1,
+                    method: "tools/list",
+                },
+            ))
+            .expect_err("repeated header failures cannot reset the request deadline");
+        assert!(error.to_string().contains("deadline"), "{error}");
+        let lines = server.request_lines();
+        assert!(
+            lines.len() >= 2,
+            "a continuation must actually be attempted"
+        );
+        assert!(
+            lines.len() < 33,
+            "the deadline must stop the retry sequence"
+        );
+        assert_eq!(lines[0], "POST /mcp HTTP/1.1");
+        assert!(lines[1..].iter().all(|line| line == "GET /mcp HTTP/1.1"));
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_abort_stops_continuation_header_retries() {
+        let server = ScriptedHttpServer::start(vec![
+            http_event_stream("id: abort:1\ndata:\n\nretry: 1\n\n"),
+            String::new(),
+            http_empty(405, "Method Not Allowed"),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let error = runtime_for_tests().block_on(async {
+            let request = transport.round_trip(
+                &frame,
+                Duration::from_secs(5),
+                HttpRoundTripKind::Request {
+                    expected_id: 1,
+                    method: "tools/list",
+                },
+            );
+            let abort = async {
+                wait_for_requests(&server, 2).await;
+                transport.abort();
+            };
+            let (result, ()) = futures::join!(request, abort);
+            result.expect_err("abort must stop recovery after a failed continuation")
+        });
+        assert!(is_transport_closed(&error), "{error}");
+        assert_eq!(
+            server.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "GET /mcp HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn streamable_http_continuation_rejects_terminal_http_failures_without_retry() {
+        let terminal_responses = [
+            (http_empty(401, "Unauthorized"), "MCP_DELIVERY_INDETERMINATE"),
+            (http_empty(403, "Forbidden"), "MCP_DELIVERY_INDETERMINATE"),
+            (http_empty(404, "Not Found"), "MCP_DELIVERY_INDETERMINATE"),
+            (
+                http_empty(405, "Method Not Allowed"),
+                "MCP_DELIVERY_INDETERMINATE",
+            ),
+            (
+                http_empty(503, "Service Unavailable"),
+                "MCP_DELIVERY_INDETERMINATE",
+            ),
+            (
+                http_ok_plain("1", serde_json::json!({"tools": []})),
+                "MCP_DELIVERY_INDETERMINATE",
+            ),
+            (
+                "HTTP/1.1 invalid\r\ncontent-length: 0\r\n\r\n".to_string(),
+                "MCP_HTTP_STREAM_OPEN",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: invalid\r\n\r\n"
+                    .to_string(),
+                "MCP_HTTP_STREAM_OPEN",
+            ),
+        ];
+        for (terminal, expected_code) in terminal_responses {
+            let server = ScriptedHttpServer::start(vec![
+                http_event_stream("id: terminal:1\ndata:\n\nretry: 1\n\n"),
+                terminal,
+                http_event_stream(concat!(
+                    "id: terminal:2\n",
+                    "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+                )),
+            ]);
+            let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+            transport
+                .capture_initialize_state(
+                    &initialize_success_body(),
+                    Some("sid-terminal".to_string()),
+                    &serde_json::json!({"params": {}}),
+                )
+                .expect("capture session");
+            let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+            let error = runtime_for_tests()
+                .block_on(transport.round_trip(
+                    &frame,
+                    Duration::from_secs(5),
+                    HttpRoundTripKind::Request {
+                        expected_id: 1,
+                        method: "tools/list",
+                    },
+                ))
+                .expect_err("terminal failure must not consume the recovery sentinel");
+            assert!(error.to_string().contains(expected_code), "{error}");
+            assert_eq!(
+                server.request_lines(),
+                vec!["POST /mcp HTTP/1.1", "GET /mcp HTTP/1.1"],
+                "terminal failures must not retry GET or replay POST"
+            );
+            transport.abort();
+        }
+    }
+
+    #[test]
+    fn streamable_http_continuation_error_classification_is_narrow() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = Error::from(std::io::Error::new(kind, "native connect/read failure"));
+            assert!(is_retryable_http_continuation_error(&error), "{kind:?}");
+        }
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = Error::from(std::io::Error::new(
+                kind,
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "nested reset"),
+            ));
+            assert!(
+                !is_retryable_http_continuation_error(&error),
+                "terminal outer kind {kind:?} must override a transient inner cause"
+            );
+        }
+        for message in [
+            "TLS configuration error: invalid certificate",
+            "TLS connect failed (origin): connection refused",
+            "TLS connect failed (origin): certificate rejected (transient connection drop)",
+            "Invalid HTTP status code",
+            "HTTP response headers too large",
+            "HTTP connection closed before headers",
+        ] {
+            assert!(
+                !is_retryable_http_continuation_error(&Error::api(message)),
+                "{message}"
+            );
+        }
+        assert!(is_retryable_http_continuation_error(&Error::api(
+            "HTTP connection closed before headers (transient connection drop)"
+        )));
+        assert!(!is_retryable_http_continuation_error(&Error::auth(
+            "connection refused during authentication"
+        )));
+    }
+
+    #[test]
+    fn streamable_http_malformed_post_chunk_framing_does_not_resume() {
+        for tail in ["not-a-size\r\n", "2\r\nxx!!"] {
+            let server = ScriptedHttpServer::start(vec![
+                http_chunked_event_stream("id: request:1\ndata:\n\nretry: 1\n\n", tail),
+                http_event_stream(concat!(
+                    "id: request:2\n",
+                    "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+                )),
+            ]);
+            let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+            let error = runtime_for_tests()
+                .block_on(transport.request(
+                    "tools/call",
+                    serde_json::json!({"name": "side_effect", "arguments": {}}),
+                    Duration::from_secs(5),
+                ))
+                .expect_err("malformed HTTP framing is terminal even with an SSE checkpoint");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+            assert!(error.to_string().contains("invalid chunk"), "{error}");
+            assert_eq!(
+                server.request_lines(),
+                vec!["POST /mcp HTTP/1.1"],
+                "a protocol failure must not consume the continuation sentinel"
+            );
+            assert!(!transport.is_alive());
+        }
+    }
+
+    #[test]
+    fn streamable_http_malformed_get_chunk_framing_does_not_reconnect() {
+        for tail in ["not-a-size\r\n", "2\r\nxx!!"] {
+            let server = ScriptedHttpServer::start(vec![
+                http_chunked_event_stream("id: events:1\ndata:\n\nretry: 1\n\n", tail),
+                http_empty(405, "Method Not Allowed"),
+            ]);
+            let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+            let wire_state = transport.wire_state();
+            let error = runtime_for_tests().block_on(async {
+                let opened = transport
+                    .open_event_stream(&wire_state, None, Some(Duration::from_secs(5)))
+                    .await
+                    .expect("valid SSE headers");
+                let HttpEventStreamOpen::Stream(response) = opened else {
+                    panic!("expected the established SSE stream");
+                };
+                HttpTransport::run_with_deadline(
+                    transport.run_server_event_listener(&wire_state, response),
+                    Duration::from_secs(5),
+                    "malformed body fixture",
+                )
+                .await
+                .expect_err("malformed framing cannot turn into repeated GET recovery")
+            });
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+            assert!(error.to_string().contains("invalid chunk"), "{error}");
+            assert_eq!(
+                server.request_lines(),
+                vec!["GET /mcp HTTP/1.1"],
+                "a malformed stream must not consume the reconnect sentinel"
+            );
+            transport.abort();
+        }
+    }
+
+    #[test]
+    fn streamable_http_truncated_chunk_body_still_resumes_without_post_replay() {
+        let server = ScriptedHttpServer::start(vec![
+            // No terminal chunk: native HTTP reports a typed UnexpectedEof.
+            http_chunked_event_stream("id: request:1\ndata:\n\nretry: 1\n\n", ""),
+            http_event_stream(concat!(
+                "id: request:2\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            )),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let result = runtime_for_tests()
+            .block_on(transport.request(
+                "tools/list",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ))
+            .expect("a truncated transport remains safely resumable");
+        assert_eq!(result, serde_json::json!({"tools": []}));
+        assert_eq!(
+            server.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "GET /mcp HTTP/1.1"]
+        );
+        assert!(server.captured()[1].0.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("Last-Event-ID") && value == "request:1"
+        }));
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_body_timeout_marker_is_exact() {
+        assert!(is_transport_io(&http_sse_read_error(
+            std::io::Error::other("Request timed out reading body stream"),
+            "read SSE body",
+        )));
+        for message in [
+            "invalid chunk size",
+            "invalid chunk CRLF",
+            "server said Request timed out reading body stream",
+        ] {
+            let error = http_sse_read_error(std::io::Error::other(message), "read SSE body");
+            assert!(!is_transport_io(&error), "{error}");
+            assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn streamable_http_retry_control_frames_preserve_pacing_across_connections() {
+        let mut cursor = HttpSseCursor::default();
+        assert_eq!(cursor.reconnect_delay(), Duration::from_secs(1));
+        for (body, expected) in [
+            ("retry: 2500\n\n", 2500),
+            ("retry: nonsense\n\n", 2500),
+            ("retry: 0\n\n", 100),
+            ("retry: 300\n\nretry: +1\n\n", 300),
+        ] {
+            let mut decoder = BoundedHttpSseDecoder::new();
+            assert!(
+                decoder
+                    .feed(body.as_bytes())
+                    .expect("control frame")
+                    .is_empty()
+            );
+            cursor.observe_retry(decoder.retry_interval_ms());
+            assert_eq!(cursor.reconnect_delay(), Duration::from_millis(expected));
+        }
+        cursor.observe_retry(Some(u64::MAX));
+        assert_eq!(cursor.reconnect_delay(), Duration::from_millis(u64::MAX));
+    }
+
+    #[test]
+    fn streamable_http_oversized_retry_does_not_extend_request_deadline_or_send_get() {
+        let server = ScriptedHttpServer::start(vec![http_event_stream(concat!(
+            "id: request:1\ndata:\n\n",
+            "retry: 18446744073709551615\n\n",
+        ))]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "side_effect", "arguments": {}},
+        });
+        let error = runtime_for_tests()
+            .block_on(transport.round_trip(
+                &frame,
+                Duration::from_millis(150),
+                HttpRoundTripKind::Request {
+                    expected_id: 1,
+                    method: "tools/call",
+                },
+            ))
+            .expect_err("retry cannot extend the original request deadline");
+        assert!(error.to_string().contains("deadline"), "{error}");
+        assert_eq!(server.request_lines(), vec!["POST /mcp HTTP/1.1"]);
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_retry_wait_stops_on_abort() {
+        let transport =
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("transport");
+        let mut cursor = HttpSseCursor::default();
+        cursor.observe_retry(Some(u64::MAX));
+        let wire_state = transport.wire_state();
+        runtime_for_tests().block_on(async {
+            let mut waiting = Box::pin(transport.wait_for_sse_resume(&cursor, &wire_state, None));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            transport.abort();
+            let error = waiting.await.expect_err("abort cancels the retry timer");
+            assert!(is_transport_closed(&error), "{error}");
+        });
+    }
+
+    #[test]
+    fn streamable_http_retry_wait_stops_when_session_is_replaced() {
+        let transport =
+            HttpTransport::new("http://127.0.0.1:1/mcp", Vec::new()).expect("transport");
+        let mut cursor = HttpSseCursor::default();
+        cursor.observe_retry(Some(u64::MAX));
+        let wire_state = transport.wire_state();
+        runtime_for_tests().block_on(async {
+            let mut waiting = Box::pin(transport.wait_for_sse_resume(&cursor, &wire_state, None));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            transport
+                .capture_initialize_state(
+                    &initialize_success_body(),
+                    Some("replacement".to_string()),
+                    &serde_json::json!({"params": {}}),
+                )
+                .expect("publish replacement session");
+            let error = waiting
+                .await
+                .expect_err("replacement cancels the retry timer");
+            assert!(is_delivery_indeterminate(&error), "{error}");
+        });
+        assert!(transport.is_alive());
+        assert_eq!(
+            transport.wire_state().session_id.as_deref(),
+            Some("replacement")
+        );
+        transport.abort();
+    }
+
+    #[test]
+    fn streamable_http_resumptions_share_the_post_response_byte_budget() {
+        let prefix = format!(
+            ": {}\n\nid: request:1\ndata:\n\nretry: 1\n\n",
+            "x".repeat(MAX_HTTP_BODY / 2)
+        );
+        let continuation = format!(
+            ": {}\n\nid: request:2\ndata:\n\n",
+            "x".repeat(MAX_HTTP_BODY / 2)
+        );
+        let server = ScriptedHttpServer::start(vec![
+            http_event_stream(&prefix),
+            http_event_stream(&continuation),
+        ]);
+        let transport = HttpTransport::new(&server.url(), Vec::new()).expect("transport");
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let error = runtime_for_tests()
+            .block_on(transport.round_trip(
+                &frame,
+                Duration::from_secs(5),
+                HttpRoundTripKind::Request {
+                    expected_id: 1,
+                    method: "tools/list",
+                },
+            ))
+            .expect_err("resumption must not renew the logical response quota");
+        assert!(error.to_string().contains("MCP_PROTOCOL"), "{error}");
+        assert!(error.to_string().contains("across resumptions"), "{error}");
+        assert_eq!(
+            server.request_lines(),
+            vec!["POST /mcp HTTP/1.1", "GET /mcp HTTP/1.1"]
+        );
+        transport.abort();
     }
 
     /// The optional GET channel is activated after the handshake, answers

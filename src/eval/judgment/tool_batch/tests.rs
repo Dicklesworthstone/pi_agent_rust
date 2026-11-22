@@ -540,3 +540,51 @@ fn observed_session_change_remains_sticky_after_returning_to_original_owner() {
         assert_eq!(host.state().started, 1);
     });
 }
+
+#[test]
+fn unbound_host_scalar_call_fails_before_recording_incomplete_receipt() {
+    run_test(async {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = EvalTool::new(dir.path());
+        let host = Host::new(1);
+        let mut unbound = Invocation::new(None, &json!({}), None)
+            .unwrap()
+            .with_host(Some(&host));
+        let error = unbound
+            .dispatch(&tool, "read", json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("EVAL_SESSION_UNAVAILABLE"));
+        assert_eq!(host.state().started, 0);
+        assert!(
+            unbound.tool_receipts.is_empty(),
+            "unbound scalar host calls must not consume call budget or record incomplete receipts"
+        );
+    });
+}
+
+#[test]
+fn empty_host_error_is_normalized_to_non_empty_batch_item_error() {
+    let call = ToolCall {
+        id: "eval-empty-err".to_string(),
+        name: "fail".to_string(),
+        arguments: json!({}),
+        thought_signature: None,
+    };
+    let encoded = encode_outcome(0, &call, &Err(String::new())).expect("encode empty error");
+    let parsed: Result<Value, _> = serde_json::from_str(&encoded);
+    assert!(
+        parsed.is_ok(),
+        "batch failure item must be valid JSON: {encoded}"
+    );
+    if let Ok(item) = parsed {
+        assert_eq!(item["index"], 0);
+        assert_eq!(item["name"], "fail");
+        assert_eq!(item["toolCallId"], "eval-empty-err");
+        let err_str = item["error"].as_str().unwrap_or_default();
+        assert!(
+            !err_str.is_empty(),
+            "batch item error must stay non-empty so JS/Python protocol validators accept the batch"
+        );
+    }
+}

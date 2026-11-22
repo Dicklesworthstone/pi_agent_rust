@@ -14,8 +14,10 @@
 use crate::tools::ToolEffects;
 use std::sync::{Arc, RwLock};
 
+pub(crate) mod rpc;
 mod session;
 pub use session::{PlanChange, PlanPersistence, SessionPlanReview};
+pub(crate) use session::{inherit_fork_checkpoint, replacement_system_prompt};
 
 /// Replay the saved plan-mode transitions on the active Session branch.
 /// The caller resets the live PlanState, which keeps approved/pending plans

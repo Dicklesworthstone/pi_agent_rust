@@ -2312,8 +2312,9 @@ class BudgetPoolHost(PoolHost):
         if self.calls > 64:
             self.kernel.reply(frame, error="EVAL_TOOL_LIMIT:64")
             return
-        request = frame["bridge"]["input"]
-        if request["name"] != "subagent":
+        bridge = frame["bridge"]
+        request = bridge["input"]
+        if bridge.get("tool") != "__pi_tool_result" or request.get("name") != "subagent":
             self.kernel.reply(frame, "callback")
             return
         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

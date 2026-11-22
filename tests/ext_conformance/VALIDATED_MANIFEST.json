@@ -12,16 +12,6 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "SIGINT",
-          "SIGTERM",
-          "agent_end",
-          "agent_start",
-          "close",
-          "connect",
-          "data",
-          "error",
-          "exit",
-          "session_shutdown",
           "tool_call"
         ],
         "uses_exec": true,
@@ -32,22 +22,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 5,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["AskUserQuestion", "session_query"],
-        "commands": ["handoff"],
+        "tools": [
+          "AskUserQuestion",
+          "session_query"
+        ],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
         "event_handlers": [
-          "SIGINT",
-          "SIGTERM",
-          "agent_end",
-          "agent_start",
-          "close",
-          "connect",
-          "data",
-          "error",
-          "exit",
-          "session_shutdown",
           "tool_call"
         ]
       }
@@ -72,7 +59,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["generate_image"],
+        "tools": [
+          "generate_image"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -87,7 +76,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown"],
+        "subscribes_events": [
+          "session_shutdown"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -96,12 +87,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_shutdown"]
+        "event_handlers": [
+          "session_shutdown"
+        ]
       }
     },
     {
@@ -113,7 +108,9 @@
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": true,
-        "subscribes_events": ["agent_start"],
+        "subscribes_events": [
+          "agent_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -124,10 +121,21 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["broken", "echo", "greet", "no-handler", "orphan", "pi_ai_contract"],
-        "commands": ["ping"],
+        "tools": [
+          "broken",
+          "echo",
+          "greet",
+          "no-handler",
+          "orphan",
+          "pi_ai_contract"
+        ],
+        "commands": [
+          "ping"
+        ],
         "flags": [],
-        "event_handlers": ["agent_start"]
+        "event_handlers": [
+          "agent_start"
+        ]
       }
     },
     {
@@ -150,7 +158,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "bash"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -177,7 +187,10 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["bookmark", "unbookmark"],
+        "commands": [
+          "bookmark",
+          "unbookmark"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -191,7 +204,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "session_start"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -205,7 +221,10 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_agent_start", "session_start"]
+        "event_handlers": [
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -217,7 +236,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end"],
+        "subscribes_events": [
+          "agent_end"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -226,12 +247,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_end"]
+        "event_handlers": [
+          "agent_end"
+        ]
       }
     },
     {
@@ -254,7 +279,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["copy_to_clipboard"],
+        "tools": [
+          "copy_to_clipboard"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -281,7 +308,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["cost"],
+        "commands": [
+          "cost"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -307,7 +336,10 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["flicker-corp", "signature-flicker"],
+        "commands": [
+          "flicker-corp",
+          "signature-flicker"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -321,7 +353,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "agent_start"],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -333,9 +368,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["fun-working"],
+        "commands": [
+          "fun-working"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "agent_start"]
+        "event_handlers": [
+          "agent_end",
+          "agent_start"
+        ]
       }
     },
     {
@@ -359,7 +399,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["handoff"],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -389,10 +431,19 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["signal_loop_success"],
-        "commands": ["loop"],
+        "tools": [
+          "signal_loop_success"
+        ],
+        "commands": [
+          "loop"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "session_before_compact", "session_start", "session_switch"]
+        "event_handlers": [
+          "agent_end",
+          "session_before_compact",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -416,7 +467,10 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["mem", "remember"],
+        "commands": [
+          "mem",
+          "remember"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -442,7 +496,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["oracle"],
+        "commands": [
+          "oracle"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -456,7 +512,12 @@
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "session_start", "session_switch", "tool_call"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -467,10 +528,21 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["plan"],
-        "commands": ["plan"],
-        "flags": [],
-        "event_handlers": ["before_agent_start", "session_start", "session_switch", "tool_call"]
+        "tools": [
+          "plan"
+        ],
+        "commands": [
+          "plan"
+        ],
+        "flags": [
+          "plan"
+        ],
+        "event_handlers": [
+          "before_agent_start",
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ]
       }
     },
     {
@@ -482,7 +554,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -494,9 +569,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["resistance"],
+        "commands": [
+          "resistance"
+        ],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -517,10 +597,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["speedread"],
+        "commands": [
+          "speedread"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -534,7 +618,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -546,9 +633,15 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["status", "status-refresh"],
+        "commands": [
+          "status",
+          "status-refresh"
+        ],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -578,7 +671,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["ultrathink"],
+        "commands": [
+          "ultrathink"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_start",
@@ -607,10 +702,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["usage"],
+        "commands": [
+          "usage"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -624,7 +723,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error", "session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -633,12 +734,22 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["canvas_calendar", "canvas_document", "canvas_flights"],
-        "commands": ["calendar"],
+        "tools": [
+          "canvas_calendar",
+          "canvas_document",
+          "canvas_flights"
+        ],
+        "commands": [
+          "calendar"
+        ],
         "flags": [],
-        "event_handlers": ["close", "data", "error", "session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -662,7 +773,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["answer"],
+        "commands": [
+          "answer"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -677,9 +790,6 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
-          "connect",
-          "data",
-          "error",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -695,13 +805,17 @@
       "conformance_tier": 5,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["list_sessions", "send_to_session"],
-        "commands": ["control-sessions"],
-        "flags": [],
+        "tools": [
+          "list_sessions",
+          "send_to_session"
+        ],
+        "commands": [
+          "control-sessions"
+        ],
+        "flags": [
+          "session-control"
+        ],
         "event_handlers": [
-          "connect",
-          "data",
-          "error",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -718,7 +832,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "session_switch"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -732,7 +849,10 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch"]
+        "event_handlers": [
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -753,10 +873,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["files"],
+        "commands": [
+          "files"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -786,10 +910,19 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["signal_loop_success"],
-        "commands": ["loop"],
+        "tools": [
+          "signal_loop_success"
+        ],
+        "commands": [
+          "loop"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "session_before_compact", "session_start", "session_switch"]
+        "event_handlers": [
+          "agent_end",
+          "session_before_compact",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -801,7 +934,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end"],
+        "subscribes_events": [
+          "agent_end"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -815,7 +950,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_end"]
+        "event_handlers": [
+          "agent_end"
+        ]
       }
     },
     {
@@ -827,7 +964,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "session_switch", "session_tree"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch",
+          "session_tree"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -836,12 +977,21 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["end-review", "review"],
+        "commands": [
+          "end-review",
+          "review"
+        ],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch", "session_tree"]
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "session_tree"
+        ]
       }
     },
     {
@@ -853,7 +1003,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -864,10 +1016,16 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["todo"],
-        "commands": ["todos"],
+        "tools": [
+          "todo"
+        ],
+        "commands": [
+          "todos"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -879,7 +1037,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -890,10 +1050,14 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "bash"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -905,7 +1069,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["turn_end", "turn_start"],
+        "subscribes_events": [
+          "turn_end",
+          "turn_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -919,7 +1086,10 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["turn_end", "turn_start"]
+        "event_handlers": [
+          "turn_end",
+          "turn_start"
+        ]
       }
     },
     {
@@ -931,7 +1101,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start", "session_switch"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -942,10 +1116,19 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": ["attach", "dismiss"],
+        "tools": [
+          "interactive_shell"
+        ],
+        "commands": [
+          "attach",
+          "dismiss"
+        ],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start", "session_switch"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -957,7 +1140,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["data", "end", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": true,
@@ -966,12 +1149,17 @@
         "has_npm_deps": false
       },
       "conformance_tier": 4,
-      "mock_requirements": ["exec", "ui"],
+      "mock_requirements": [
+        "exec",
+        "ui"
+      ],
       "registrations": {
-        "tools": ["interview"],
+        "tools": [
+          "interview"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["data", "end", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -983,7 +1171,10 @@
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
-        "subscribes_events": ["close", "error", "session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -992,12 +1183,24 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["mcp"],
-        "commands": ["mcp", "mcp-auth"],
-        "flags": [],
-        "event_handlers": ["close", "error", "session_shutdown", "session_start"]
+        "tools": [
+          "mcp"
+        ],
+        "commands": [
+          "mcp",
+          "mcp-auth"
+        ],
+        "flags": [
+          "mcp-config"
+        ],
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -1013,9 +1216,6 @@
           "agent_end",
           "agent_start",
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "session_start",
           "tool_call",
           "tool_result",
@@ -1030,18 +1230,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["powerline", "vibe"],
+        "commands": [
+          "powerline",
+          "vibe"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
           "agent_start",
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "session_start",
           "tool_call",
           "tool_result",
@@ -1075,7 +1277,9 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
@@ -1101,10 +1305,6 @@
         "registers_providers": false,
         "subscribes_events": [
           "async_subagent:complete",
-          "close",
-          "data",
-          "end",
-          "error",
           "session_branch",
           "session_shutdown",
           "session_start",
@@ -1122,17 +1322,18 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "subagent",
+          "subagent_status"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": [
           "async_subagent:complete",
-          "close",
-          "data",
-          "end",
-          "error",
           "session_branch",
           "session_shutdown",
           "session_start",
@@ -1153,7 +1354,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1162,12 +1365,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -1180,9 +1387,6 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "close",
-          "data",
-          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -1198,15 +1402,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
         "event_handlers": [
-          "close",
-          "data",
-          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -1228,9 +1431,6 @@
         "subscribes_events": [
           "agent_end",
           "agent_start",
-          "data",
-          "error",
-          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -1247,17 +1447,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["lsp"],
-        "commands": ["lsp"],
+        "tools": [
+          "lsp"
+        ],
+        "commands": [
+          "lsp"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
           "agent_start",
-          "data",
-          "error",
-          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -1277,7 +1480,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "tool_call"],
+        "subscribes_events": [
+          "session_start",
+          "tool_call"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1286,12 +1492,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["permission", "permission-mode"],
+        "commands": [
+          "permission",
+          "permission-mode"
+        ],
         "flags": [],
-        "event_handlers": ["session_start", "tool_call"]
+        "event_handlers": [
+          "session_start",
+          "tool_call"
+        ]
       }
     },
     {
@@ -1303,7 +1517,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1312,9 +1526,13 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["ralph_loop"],
+        "tools": [
+          "ralph_loop"
+        ],
         "commands": [
           "ralph-clear",
           "ralph-follow",
@@ -1325,7 +1543,7 @@
           "ralph-stop"
         ],
         "flags": [],
-        "event_handlers": ["close", "data", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -1346,10 +1564,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["repeat"],
+        "commands": [
+          "repeat"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1383,7 +1605,13 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch", "tool_call", "turn_end", "turn_start"]
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "turn_end",
+          "turn_start"
+        ]
       }
     },
     {
@@ -1395,7 +1623,12 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "agent_start", "session_start", "tool_result"],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "session_start",
+          "tool_result"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1416,7 +1649,12 @@
           "notify-threshold"
         ],
         "flags": [],
-        "event_handlers": ["agent_end", "agent_start", "session_start", "tool_result"]
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "session_start",
+          "tool_result"
+        ]
       }
     },
     {
@@ -1428,7 +1666,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "turn_end"],
+        "subscribes_events": [
+          "agent_end",
+          "turn_end"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1440,9 +1681,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["compact-config"],
+        "commands": [
+          "compact-config"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "turn_end"]
+        "event_handlers": [
+          "agent_end",
+          "turn_end"
+        ]
       }
     },
     {
@@ -1454,7 +1700,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "close", "data", "error", "session_start"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1463,7 +1712,9 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [
           "scip_find_definition",
@@ -1475,7 +1726,10 @@
         ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_agent_start", "close", "data", "error", "session_start"]
+        "event_handlers": [
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -1487,7 +1741,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "tool_call"],
+        "subscribes_events": [
+          "session_start",
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1499,9 +1756,16 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["safegit", "safegit-level", "safegit-status"],
+        "commands": [
+          "safegit",
+          "safegit-level",
+          "safegit-status"
+        ],
         "flags": [],
-        "event_handlers": ["session_start", "tool_call"]
+        "event_handlers": [
+          "session_start",
+          "tool_call"
+        ]
       }
     },
     {
@@ -1513,7 +1777,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_call"],
+        "subscribes_events": [
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1534,7 +1800,9 @@
           "saferm-toggle"
         ],
         "flags": [],
-        "event_handlers": ["tool_call"]
+        "event_handlers": [
+          "tool_call"
+        ]
       }
     },
     {
@@ -1546,7 +1814,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["resize", "session_start", "session_switch"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1558,9 +1829,18 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["color", "color-char", "color-config", "color-next", "color-set"],
+        "commands": [
+          "color",
+          "color-char",
+          "color-config",
+          "color-next",
+          "color-set"
+        ],
         "flags": [],
-        "event_handlers": ["resize", "session_start", "session_switch"]
+        "event_handlers": [
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -1572,7 +1852,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_start", "session_start", "session_switch"],
+        "subscribes_events": [
+          "agent_start",
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1584,9 +1868,18 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["emoji", "emoji-config", "emoji-history", "emoji-set"],
+        "commands": [
+          "emoji",
+          "emoji-config",
+          "emoji-history",
+          "emoji-set"
+        ],
         "flags": [],
-        "event_handlers": ["agent_start", "session_start", "session_switch"]
+        "event_handlers": [
+          "agent_start",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -1598,7 +1891,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start"],
+        "subscribes_events": [
+          "before_agent_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1612,7 +1907,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_agent_start"]
+        "event_handlers": [
+          "before_agent_start"
+        ]
       }
     },
     {
@@ -1636,7 +1933,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["mario-not"],
+        "commands": [
+          "mario-not"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1662,7 +1961,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["picman"],
+        "commands": [
+          "picman"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1688,7 +1989,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["ping"],
+        "commands": [
+          "ping"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1714,7 +2017,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["spice-invaders"],
+        "commands": [
+          "spice-invaders"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1740,7 +2045,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["tetris"],
+        "commands": [
+          "tetris"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1763,10 +2070,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["code"],
+        "commands": [
+          "code"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1780,7 +2091,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "session_switch", "tool_result"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch",
+          "tool_result"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1789,12 +2104,22 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["diff", "readfiles", "review"],
+        "commands": [
+          "diff",
+          "readfiles",
+          "review"
+        ],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch", "tool_result"]
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "tool_result"
+        ]
       }
     },
     {
@@ -1822,10 +2147,21 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["ralph_done", "ralph_start"],
-        "commands": ["ralph", "ralph-stop"],
+        "tools": [
+          "ralph_done",
+          "ralph_start"
+        ],
+        "commands": [
+          "ralph",
+          "ralph-stop"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "before_agent_start", "session_shutdown", "session_start"]
+        "event_handlers": [
+          "agent_end",
+          "before_agent_start",
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -1837,7 +2173,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1849,9 +2187,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["paste"],
+        "commands": [
+          "paste"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -1863,7 +2205,17 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "tool_result",
+          "turn_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1871,13 +2223,23 @@
         "is_multi_file": false,
         "has_npm_deps": false
       },
-      "conformance_tier": 1,
+      "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "tool_result",
+          "turn_start"
+        ]
       }
     },
     {
@@ -1901,7 +2263,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["usage"],
+        "commands": [
+          "usage"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1915,7 +2279,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_before_fork", "session_before_switch"],
+        "subscribes_events": [
+          "session_before_fork",
+          "session_before_switch"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1929,7 +2296,10 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_before_fork", "session_before_switch"]
+        "event_handlers": [
+          "session_before_fork",
+          "session_before_switch"
+        ]
       }
     },
     {
@@ -1941,7 +2311,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_before_compact"],
+        "subscribes_events": [
+          "session_before_compact"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -1955,7 +2327,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_before_compact"]
+        "event_handlers": [
+          "session_before_compact"
+        ]
       }
     },
     {
@@ -1979,7 +2353,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["footer"],
+        "commands": [
+          "footer"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -1993,7 +2369,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2005,9 +2383,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["builtin-header"],
+        "commands": [
+          "builtin-header"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -2106,10 +2488,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["diff"],
+        "commands": [
+          "diff"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -2123,7 +2509,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_before_fork", "session_before_switch"],
+        "subscribes_events": [
+          "session_before_fork",
+          "session_before_switch"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2132,12 +2521,17 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_before_fork", "session_before_switch"]
+        "event_handlers": [
+          "session_before_fork",
+          "session_before_switch"
+        ]
       }
     },
     {
@@ -2158,10 +2552,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["doom-overlay"],
+        "commands": [
+          "doom-overlay"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -2175,7 +2573,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["resources_discover"],
+        "subscribes_events": [
+          "resources_discover"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2189,7 +2589,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["resources_discover"]
+        "event_handlers": [
+          "resources_discover"
+        ]
       }
     },
     {
@@ -2201,7 +2603,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["my:notification", "session_start"],
+        "subscribes_events": [
+          "my:notification",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2213,9 +2618,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["emit"],
+        "commands": [
+          "emit"
+        ],
         "flags": [],
-        "event_handlers": ["my:notification", "session_start"]
+        "event_handlers": [
+          "my:notification",
+          "session_start"
+        ]
       }
     },
     {
@@ -2227,7 +2637,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2241,7 +2653,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -2262,10 +2676,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["files"],
+        "commands": [
+          "files"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -2279,7 +2697,12 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "session_before_fork", "tool_result", "turn_start"],
+        "subscribes_events": [
+          "agent_end",
+          "session_before_fork",
+          "tool_result",
+          "turn_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2288,12 +2711,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_end", "session_before_fork", "tool_result", "turn_start"]
+        "event_handlers": [
+          "agent_end",
+          "session_before_fork",
+          "tool_result",
+          "turn_start"
+        ]
       }
     },
     {
@@ -2317,7 +2747,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["handoff"],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -2342,7 +2774,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["hello"],
+        "tools": [
+          "hello"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -2357,7 +2791,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["input"],
+        "subscribes_events": [
+          "input"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2366,12 +2802,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["input"]
+        "event_handlers": [
+          "input"
+        ]
       }
     },
     {
@@ -2383,7 +2823,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["input"],
+        "subscribes_events": [
+          "input"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2397,7 +2839,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["input"]
+        "event_handlers": [
+          "input"
+        ]
       }
     },
     {
@@ -2409,7 +2853,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["user_bash"],
+        "subscribes_events": [
+          "user_bash"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2418,12 +2864,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["user_bash"]
+        "event_handlers": [
+          "user_bash"
+        ]
       }
     },
     {
@@ -2435,7 +2885,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2444,12 +2897,17 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -2473,7 +2931,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["status"],
+        "commands": [
+          "status"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -2487,7 +2947,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2501,7 +2963,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -2513,7 +2977,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["model_select"],
+        "subscribes_events": [
+          "model_select"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2527,7 +2993,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["model_select"]
+        "event_handlers": [
+          "model_select"
+        ]
       }
     },
     {
@@ -2539,7 +3007,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session:start"],
+        "subscribes_events": [
+          "session:start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2548,12 +3018,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["try-exec", "try-session"],
+        "tools": [
+          "try-exec",
+          "try-session"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session:start"]
+        "event_handlers": [
+          "session:start"
+        ]
       }
     },
     {
@@ -2565,7 +3042,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end"],
+        "subscribes_events": [
+          "agent_end"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2579,7 +3058,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_end"]
+        "event_handlers": [
+          "agent_end"
+        ]
       }
     },
     {
@@ -2613,7 +3094,7 @@
       "entry_path": "npm/aliou-pi-extension-dev/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -2628,8 +3109,15 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": ["extensions:update"],
+        "tools": [
+          "detect_package_manager",
+          "pi_changelog",
+          "pi_docs",
+          "pi_version"
+        ],
+        "commands": [
+          "extensions:update"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -2643,7 +3131,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_call"],
+        "subscribes_events": [
+          "tool_call"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -2652,12 +3142,16 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["tool_call"]
+        "event_handlers": [
+          "tool_call"
+        ]
       }
     },
     {
@@ -2669,7 +3163,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2680,10 +3174,16 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["linkup_web_answer", "linkup_web_fetch", "linkup_web_search"],
-        "commands": ["linkup:balance"],
+        "tools": [
+          "linkup_web_answer",
+          "linkup_web_fetch",
+          "linkup_web_search"
+        ],
+        "commands": [
+          "linkup:balance"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": []
       }
     },
     {
@@ -2691,15 +3191,11 @@
       "entry_path": "npm/aliou-pi-processes/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "close",
-          "data",
-          "error",
-          "event",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -2714,16 +3210,18 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": [],
-        "commands": ["processes"],
+        "tools": [
+          "processes"
+        ],
+        "commands": [
+          "processes"
+        ],
         "flags": [],
         "event_handlers": [
-          "close",
-          "data",
-          "error",
-          "event",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -2741,7 +3239,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": true,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2753,9 +3253,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["synthetic:quotas"],
+        "commands": [
+          "synthetic:quotas"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -2767,7 +3271,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_call"],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2778,10 +3282,12 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "bash"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["tool_call"]
+        "event_handlers": []
       }
     },
     {
@@ -2793,7 +3299,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "resources_discover"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2801,13 +3309,15 @@
         "is_multi_file": false,
         "has_npm_deps": false
       },
-      "conformance_tier": 1,
+      "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "resources_discover"
+        ]
       }
     },
     {
@@ -2830,7 +3340,10 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["generate_image", "image_quota"],
+        "tools": [
+          "generate_image",
+          "image_quota"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -2845,7 +3358,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": true,
-        "subscribes_events": ["model_select", "session_start"],
+        "subscribes_events": [
+          "model_select",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2857,9 +3373,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["synthetic-models"],
+        "commands": [
+          "synthetic-models"
+        ],
         "flags": [],
-        "event_handlers": ["model_select", "session_start"]
+        "event_handlers": [
+          "model_select",
+          "session_start"
+        ]
       }
     },
     {
@@ -2872,9 +3393,6 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "close",
-          "data",
-          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -2890,15 +3408,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
         "event_handlers": [
-          "close",
-          "data",
-          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -2917,7 +3434,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2928,10 +3447,18 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["understand_image", "web_search"],
-        "commands": ["minimax-configure", "minimax-status"],
+        "tools": [
+          "understand_image",
+          "web_search"
+        ],
+        "commands": [
+          "minimax-configure",
+          "minimax-status"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -2940,10 +3467,12 @@
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,
-        "registers_commands": false,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "pi-extension-settings:register"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2955,9 +3484,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [],
+        "commands": [
+          "extension-settings"
+        ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "pi-extension-settings:register"
+        ]
       }
     },
     {
@@ -2966,10 +3499,14 @@
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,
-        "registers_commands": false,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2981,9 +3518,15 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [],
+        "commands": [
+          "files"
+        ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ]
       }
     },
     {
@@ -2992,10 +3535,13 @@
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,
-        "registers_commands": false,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3007,9 +3553,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [],
+        "commands": [
+          "gob"
+        ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -3024,17 +3575,13 @@
         "subscribes_events": [
           "agent_end",
           "agent_start",
-          "data",
-          "error",
-          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
           "session_switch",
           "session_tree",
           "tool_call",
-          "tool_result",
-          "uncaughtException"
+          "tool_result"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -3044,25 +3591,27 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["lsp"],
-        "commands": ["lsp"],
+        "tools": [
+          "lsp"
+        ],
+        "commands": [
+          "lsp"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
           "agent_start",
-          "data",
-          "error",
-          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
           "session_switch",
           "session_tree",
           "tool_call",
-          "tool_result",
-          "uncaughtException"
+          "tool_result"
         ]
       }
     },
@@ -3092,10 +3641,15 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["sub-bar:import", "sub-bar:settings"],
+        "commands": [
+          "sub-bar:import",
+          "sub-bar:settings"
+        ],
         "flags": [],
         "event_handlers": [
           "model_select",
@@ -3113,7 +3667,7 @@
       "entry_path": "npm/marckrenn-pi-sub-core/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3138,10 +3692,14 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["sub-core:settings"],
+        "commands": [
+          "sub-core:settings"
+        ],
         "flags": [],
         "event_handlers": [
           "model_select",
@@ -3169,9 +3727,6 @@
         "registers_providers": false,
         "subscribes_events": [
           "agent_end",
-          "connect",
-          "data",
-          "error",
           "session_before_compact",
           "session_shutdown",
           "session_start",
@@ -3188,9 +3743,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 5,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["list_sessions", "send_to_session", "signal_loop_success", "todo"],
+        "tools": [
+          "list_sessions",
+          "send_to_session",
+          "signal_loop_success",
+          "todo"
+        ],
         "commands": [
           "answer",
           "control-sessions",
@@ -3204,9 +3766,6 @@
         "flags": [],
         "event_handlers": [
           "agent_end",
-          "connect",
-          "data",
-          "error",
           "session_before_compact",
           "session_shutdown",
           "session_start",
@@ -3226,7 +3785,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["data", "end", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3235,12 +3794,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["sketch"],
+        "commands": [
+          "sketch"
+        ],
         "flags": [],
-        "event_handlers": ["data", "end", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -3252,7 +3815,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error", "session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3261,12 +3826,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["close", "data", "error", "session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -3278,7 +3847,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "tool_call"],
+        "subscribes_events": [
+          "session_start",
+          "tool_call"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3287,12 +3859,20 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["permission", "permission-mode"],
+        "commands": [
+          "permission",
+          "permission-mode"
+        ],
         "flags": [],
-        "event_handlers": ["session_start", "tool_call"]
+        "event_handlers": [
+          "session_start",
+          "tool_call"
+        ]
       }
     },
     {
@@ -3304,7 +3884,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_before_compact"],
+        "subscribes_events": [
+          "session_before_compact"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3318,7 +3900,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_before_compact"]
+        "event_handlers": [
+          "session_before_compact"
+        ]
       }
     },
     {
@@ -3341,8 +3925,12 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["session_query"],
-        "commands": ["handoff"],
+        "tools": [
+          "session_query"
+        ],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -3356,7 +3944,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "connect", "data", "error"],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3367,10 +3955,14 @@
       "conformance_tier": 5,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["annotate"],
-        "commands": ["annotate"],
+        "tools": [
+          "annotate"
+        ],
+        "commands": [
+          "annotate"
+        ],
         "flags": [],
-        "event_handlers": ["close", "connect", "data", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -3382,7 +3974,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["data", "end", "error", "session_start", "timeout", "tool_call"],
+        "subscribes_events": [
+          "session_start",
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3403,7 +3998,10 @@
           "test-unsafe-patterns"
         ],
         "flags": [],
-        "event_handlers": ["data", "end", "error", "session_start", "timeout", "tool_call"]
+        "event_handlers": [
+          "session_start",
+          "tool_call"
+        ]
       }
     },
     {
@@ -3415,7 +4013,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "context", "turn_end"],
+        "subscribes_events": [
+          "before_agent_start",
+          "context",
+          "turn_end"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3426,10 +4028,19 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["brave_grounding", "brave_search"],
-        "commands": ["ws"],
+        "tools": [
+          "brave_grounding",
+          "brave_search"
+        ],
+        "commands": [
+          "ws"
+        ],
         "flags": [],
-        "event_handlers": ["before_agent_start", "context", "turn_end"]
+        "event_handlers": [
+          "before_agent_start",
+          "context",
+          "turn_end"
+        ]
       }
     },
     {
@@ -3453,7 +4064,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["command-center"],
+        "commands": [
+          "command-center"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -3467,7 +4080,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start", "session_tree"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start",
+          "session_tree"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3476,12 +4093,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["ephemeral"],
+        "commands": [
+          "ephemeral"
+        ],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start", "session_tree"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start",
+          "session_tree"
+        ]
       }
     },
     {
@@ -3509,9 +4134,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["ralph_done", "ralph_start"],
+        "tools": [
+          "ralph_done",
+          "ralph_start"
+        ],
         "commands": [
           "code",
           "diff",
@@ -3547,7 +4177,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3556,12 +4188,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -3573,7 +4209,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start", "session_switch"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3582,12 +4222,21 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["attach", "dismiss"],
+        "commands": [
+          "attach",
+          "dismiss"
+        ],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start", "session_switch"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -3599,7 +4248,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["data", "end", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": true,
@@ -3608,12 +4257,17 @@
         "has_npm_deps": false
       },
       "conformance_tier": 4,
-      "mock_requirements": ["exec", "ui"],
+      "mock_requirements": [
+        "exec",
+        "ui"
+      ],
       "registrations": {
-        "tools": ["interview"],
+        "tools": [
+          "interview"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["data", "end", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -3625,7 +4279,10 @@
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
-        "subscribes_events": ["close", "error", "session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3634,12 +4291,22 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["mcp"],
-        "commands": ["mcp", "mcp-auth"],
+        "tools": [
+          "mcp"
+        ],
+        "commands": [
+          "mcp",
+          "mcp-auth"
+        ],
         "flags": [],
-        "event_handlers": ["close", "error", "session_shutdown", "session_start"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -3660,10 +4327,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["md"],
+        "commands": [
+          "md"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -3677,7 +4348,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "input"],
+        "subscribes_events": [
+          "agent_end",
+          "input"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3689,9 +4363,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["pi-mermaid"],
+        "commands": [
+          "pi-mermaid"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "input"]
+        "event_handlers": [
+          "agent_end",
+          "input"
+        ]
       }
     },
     {
@@ -3705,9 +4384,6 @@
         "registers_providers": false,
         "subscribes_events": [
           "agent_end",
-          "close",
-          "data",
-          "error",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -3725,16 +4401,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["pi_messenger"],
-        "commands": ["messenger"],
+        "tools": [
+          "pi_messenger"
+        ],
+        "commands": [
+          "messenger"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
-          "close",
-          "data",
-          "error",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -3766,7 +4445,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["switch_model"],
+        "tools": [
+          "switch_model"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -3807,7 +4488,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": true,
-        "subscribes_events": ["session_start", "session_switch"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3816,12 +4500,21 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["multicodex-login", "multicodex-status", "multicodex-use"],
+        "commands": [
+          "multicodex-login",
+          "multicodex-status",
+          "multicodex-use"
+        ],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch"]
+        "event_handlers": [
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -3833,7 +4526,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end"],
+        "subscribes_events": [
+          "agent_end"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3842,12 +4537,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_end"]
+        "event_handlers": [
+          "agent_end"
+        ]
       }
     },
     {
@@ -3855,11 +4554,22 @@
       "entry_path": "npm/pi-package-test/extensions/confirm-destructive.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
-        "registers_flags": false,
+        "registers_flags": true,
         "registers_providers": false,
-        "subscribes_events": ["session_before_fork", "session_before_switch"],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "session_before_compact",
+          "session_before_fork",
+          "session_before_switch",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3870,10 +4580,45 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": ["footer"],
-        "flags": [],
-        "event_handlers": ["session_before_fork", "session_before_switch"]
+        "tools": [
+          "copy_to_clipboard",
+          "plan",
+          "signal_loop_success"
+        ],
+        "commands": [
+          "cost",
+          "flicker-corp",
+          "footer",
+          "fun-working",
+          "handoff",
+          "loop",
+          "mem",
+          "oracle",
+          "plan",
+          "remember",
+          "resistance",
+          "signature-flicker",
+          "speedread",
+          "status",
+          "status-refresh",
+          "ultrathink",
+          "usage"
+        ],
+        "flags": [
+          "plan"
+        ],
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "session_before_compact",
+          "session_before_fork",
+          "session_before_switch",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ]
       }
     },
     {
@@ -3885,7 +4630,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "agent_start", "session_start"],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3894,12 +4643,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["notify"],
+        "commands": [
+          "notify"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "agent_start", "session_start"]
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -3915,9 +4672,6 @@
           "agent_end",
           "agent_start",
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "session_start",
           "tool_call",
           "tool_result",
@@ -3932,18 +4686,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["powerline", "vibe"],
+        "commands": [
+          "powerline",
+          "vibe"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
           "agent_start",
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "session_start",
           "tool_call",
           "tool_result",
@@ -3961,7 +4717,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "before_agent_start", "session_start"],
+        "subscribes_events": [
+          "agent_end",
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3973,9 +4733,15 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [],
+        "commands": [
+          "model-mode"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "before_agent_start", "session_start"]
+        "event_handlers": [
+          "agent_end",
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -4001,12 +4767,23 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["rp"],
-        "commands": ["rp"],
+        "tools": [
+          "rp"
+        ],
+        "commands": [
+          "rp"
+        ],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start", "session_switch", "session_tree"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree"
+        ]
       }
     },
     {
@@ -4035,7 +4812,9 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["review_loop"],
+        "tools": [
+          "review_loop"
+        ],
         "commands": [
           "review-auto",
           "review-exit",
@@ -4046,7 +4825,13 @@
           "review-status"
         ],
         "flags": [],
-        "event_handlers": ["agent_end", "before_agent_start", "context", "input", "session_start"]
+        "event_handlers": [
+          "agent_end",
+          "before_agent_start",
+          "context",
+          "input",
+          "session_start"
+        ]
       }
     },
     {
@@ -4058,7 +4843,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["input"],
+        "subscribes_events": [
+          "input"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4067,12 +4854,19 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["ss", "ss-clear"],
+        "commands": [
+          "ss",
+          "ss-clear"
+        ],
         "flags": [],
-        "event_handlers": ["input"]
+        "event_handlers": [
+          "input"
+        ]
       }
     },
     {
@@ -4084,7 +4878,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error", "line"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4093,12 +4887,21 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["local_embedding_search", "search_agent", "semantic_index", "semantic_search"],
-        "commands": ["semantic"],
+        "tools": [
+          "local_embedding_search",
+          "search_agent",
+          "semantic_index",
+          "semantic_search"
+        ],
+        "commands": [
+          "semantic"
+        ],
         "flags": [],
-        "event_handlers": ["close", "data", "error", "line"]
+        "event_handlers": []
       }
     },
     {
@@ -4110,7 +4913,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "context"],
+        "subscribes_events": [
+          "before_agent_start",
+          "context"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -4121,10 +4927,18 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["session_ask", "session_lineage"],
-        "commands": ["session-ask"],
+        "tools": [
+          "session_ask",
+          "session_lineage"
+        ],
+        "commands": [
+          "session-ask"
+        ],
         "flags": [],
-        "event_handlers": ["before_agent_start", "context"]
+        "event_handlers": [
+          "before_agent_start",
+          "context"
+        ]
       }
     },
     {
@@ -4137,13 +4951,8 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end",
           "session_shutdown",
-          "session_start",
-          "tool_call",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "session_start"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -4153,19 +4962,21 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["mc", "mc-widget", "mission-control", "shadow-git"],
+        "commands": [
+          "mc",
+          "mc-widget",
+          "mission-control",
+          "shadow-git"
+        ],
         "flags": [],
         "event_handlers": [
-          "agent_end",
           "session_shutdown",
-          "session_start",
-          "tool_call",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "session_start"
         ]
       }
     },
@@ -4178,7 +4989,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4187,12 +5000,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -4204,7 +5021,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start"],
+        "subscribes_events": [
+          "before_agent_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -4216,9 +5035,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["skill"],
+        "commands": [
+          "skill"
+        ],
         "flags": [],
-        "event_handlers": ["before_agent_start"]
+        "event_handlers": [
+          "before_agent_start"
+        ]
       }
     },
     {
@@ -4230,7 +5053,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "session_switch", "tool_result"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch",
+          "tool_result"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -4244,7 +5071,11 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch", "tool_result"]
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "tool_result"
+        ]
       }
     },
     {
@@ -4256,7 +5087,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["input", "session_start"],
+        "subscribes_events": [
+          "input",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4265,12 +5099,21 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["scurl", "scurl-history", "scurl-log"],
+        "commands": [
+          "scurl",
+          "scurl-history",
+          "scurl-log"
+        ],
         "flags": [],
-        "event_handlers": ["input", "session_start"]
+        "event_handlers": [
+          "input",
+          "session_start"
+        ]
       }
     },
     {
@@ -4305,10 +5148,15 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec", "session"],
+      "mock_requirements": [
+        "exec",
+        "session"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["open-jaeger-trace"],
+        "commands": [
+          "open-jaeger-trace"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -4347,7 +5195,10 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["find_threads", "read_thread"],
+        "tools": [
+          "find_threads",
+          "read_thread"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -4362,7 +5213,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "session_start"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -4374,9 +5228,14 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["vog"],
+        "commands": [
+          "vog"
+        ],
         "flags": [],
-        "event_handlers": ["before_agent_start", "session_start"]
+        "event_handlers": [
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -4388,7 +5247,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_result", "turn_start"],
+        "subscribes_events": [
+          "tool_result",
+          "turn_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4397,12 +5259,17 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["tool_result", "turn_start"]
+        "event_handlers": [
+          "tool_result",
+          "turn_start"
+        ]
       }
     },
     {
@@ -4415,15 +5282,10 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
-          "add",
           "agent_end",
           "agent_start",
-          "change",
-          "error",
-          "ready",
           "session_shutdown",
-          "session_start",
-          "unlink"
+          "session_start"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -4437,17 +5299,14 @@
       "registrations": {
         "tools": [],
         "commands": [],
-        "flags": [],
+        "flags": [
+          "watch"
+        ],
         "event_handlers": [
-          "add",
           "agent_end",
           "agent_start",
-          "change",
-          "error",
-          "ready",
           "session_shutdown",
-          "session_start",
-          "unlink"
+          "session_start"
         ]
       }
     },
@@ -4461,7 +5320,6 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -4476,13 +5334,20 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["fetch_content", "get_search_content", "web_search"],
-        "commands": ["search"],
+        "tools": [
+          "fetch_content",
+          "get_search_content",
+          "web_search"
+        ],
+        "commands": [
+          "search"
+        ],
         "flags": [],
         "event_handlers": [
-          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -4496,11 +5361,14 @@
       "entry_path": "npm/qualisero-pi-agent-scip/dist/index.d.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -4511,10 +5379,20 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "scip_find_definition",
+          "scip_find_references",
+          "scip_list_symbols",
+          "scip_project_tree",
+          "scip_reindex",
+          "scip_search_symbols"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -4526,7 +5404,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4535,9 +5413,13 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["ralph_loop"],
+        "tools": [
+          "ralph_loop"
+        ],
         "commands": [
           "ralph-clear",
           "ralph-follow",
@@ -4548,7 +5430,7 @@
           "ralph-stop"
         ],
         "flags": [],
-        "event_handlers": ["close", "data", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -4569,10 +5451,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["repeat"],
+        "commands": [
+          "repeat"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -4604,9 +5490,15 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["copy_to_clipboard", "plan", "signal_loop_success"],
+        "tools": [
+          "copy_to_clipboard",
+          "plan",
+          "signal_loop_success"
+        ],
         "commands": [
           "cost",
           "flicker-corp",
@@ -4659,7 +5551,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["mario-not", "picman", "ping", "spice-invaders", "tetris"],
+        "commands": [
+          "mario-not",
+          "picman",
+          "ping",
+          "spice-invaders",
+          "tetris"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -4693,7 +5591,13 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch", "tool_call", "turn_end", "turn_start"]
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "turn_end",
+          "turn_start"
+        ]
       }
     },
     {
@@ -4708,9 +5612,6 @@
         "subscribes_events": [
           "agent_end",
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "model_select",
           "session_shutdown",
           "session_start",
@@ -4727,17 +5628,24 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["mcp_exec", "mcp_inspect", "mcp_invoke", "mcp_list", "subagent"],
-        "commands": ["powerline"],
+        "tools": [
+          "mcp_exec",
+          "mcp_inspect",
+          "mcp_invoke",
+          "mcp_list",
+          "subagent"
+        ],
+        "commands": [
+          "powerline"
+        ],
         "flags": [],
         "event_handlers": [
           "agent_end",
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "model_select",
           "session_shutdown",
           "session_start",
@@ -4757,7 +5665,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4766,12 +5677,22 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["mcp_exec", "mcp_inspect", "mcp_invoke", "mcp_list"],
+        "tools": [
+          "mcp_exec",
+          "mcp_inspect",
+          "mcp_invoke",
+          "mcp_list"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_shutdown", "session_start"]
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -4783,7 +5704,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "close", "data", "error", "session_start"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4792,12 +5716,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["subagent"],
+        "tools": [
+          "subagent"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_agent_start", "close", "data", "error", "session_start"]
+        "event_handlers": [
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -4820,7 +5751,10 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["web-fetch", "web-search"],
+        "tools": [
+          "web-fetch",
+          "web-search"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -4861,7 +5795,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4870,12 +5804,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["bash"],
+        "tools": [
+          "bash"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["close", "data"]
+        "event_handlers": []
       }
     },
     {
@@ -4896,9 +5834,13 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["vega_chart"],
+        "tools": [
+          "vega_chart"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -4922,9 +5864,13 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["graphviz_chart"],
+        "tools": [
+          "graphviz_chart"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -4939,7 +5885,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["context", "session_start"],
+        "subscribes_events": [
+          "context",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -4961,7 +5910,10 @@
           "dcp-tools"
         ],
         "flags": [],
-        "event_handlers": ["context", "session_start"]
+        "event_handlers": [
+          "context",
+          "session_start"
+        ]
       }
     },
     {
@@ -4973,7 +5925,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4982,7 +5934,9 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [
@@ -4998,7 +5952,7 @@
           "overlay-toggle"
         ],
         "flags": [],
-        "event_handlers": ["close", "data"]
+        "event_handlers": []
       }
     },
     {
@@ -5022,7 +5976,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["overlay-test"],
+        "commands": [
+          "overlay-test"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5036,7 +5992,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_call"],
+        "subscribes_events": [
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5050,7 +6008,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["tool_call"]
+        "event_handlers": [
+          "tool_call"
+        ]
       }
     },
     {
@@ -5073,7 +6033,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["pi_ai_contract"],
+        "tools": [
+          "pi_ai_contract"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -5099,7 +6061,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["pi_ai_provider_bridge"],
+        "tools": [
+          "pi_ai_provider_bridge"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -5114,7 +6078,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start"],
+        "subscribes_events": [
+          "before_agent_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5126,9 +6092,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["pirate"],
+        "commands": [
+          "pirate"
+        ],
         "flags": [],
-        "event_handlers": ["before_agent_start"]
+        "event_handlers": [
+          "before_agent_start"
+        ]
       }
     },
     {
@@ -5159,8 +6129,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["plan", "todos"],
-        "flags": [],
+        "commands": [
+          "plan",
+          "todos"
+        ],
+        "flags": [
+          "plan"
+        ],
         "event_handlers": [
           "agent_end",
           "before_agent_start",
@@ -5180,7 +6155,11 @@
         "registers_commands": true,
         "registers_flags": true,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "session_start", "turn_start"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start",
+          "turn_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5192,9 +6171,17 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["preset"],
-        "flags": [],
-        "event_handlers": ["before_agent_start", "session_start", "turn_start"]
+        "commands": [
+          "preset"
+        ],
+        "flags": [
+          "preset"
+        ],
+        "event_handlers": [
+          "before_agent_start",
+          "session_start",
+          "turn_start"
+        ]
       }
     },
     {
@@ -5206,7 +6193,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "session_start", "session_switch"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5215,12 +6206,18 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_agent_start", "session_start", "session_switch"]
+        "event_handlers": [
+          "before_agent_start",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -5232,7 +6229,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_call"],
+        "subscribes_events": [
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5246,7 +6245,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["tool_call"]
+        "event_handlers": [
+          "tool_call"
+        ]
       }
     },
     {
@@ -5270,7 +6271,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["qna"],
+        "commands": [
+          "qna"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5295,7 +6298,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["question"],
+        "tools": [
+          "question"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -5321,7 +6326,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["questionnaire"],
+        "tools": [
+          "questionnaire"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -5336,7 +6343,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5350,7 +6359,9 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -5374,7 +6385,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["tui"],
+        "commands": [
+          "tui"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5407,7 +6420,11 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["rpc-editor", "rpc-input", "rpc-prefill"],
+        "commands": [
+          "rpc-editor",
+          "rpc-input",
+          "rpc-prefill"
+        ],
         "flags": [],
         "event_handlers": [
           "session_before_switch",
@@ -5429,9 +6446,6 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
-          "close",
-          "data",
-          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -5444,15 +6458,20 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": [],
-        "commands": ["sandbox"],
-        "flags": [],
+        "tools": [
+          "bash"
+        ],
+        "commands": [
+          "sandbox"
+        ],
+        "flags": [
+          "no-sandbox"
+        ],
         "event_handlers": [
-          "close",
-          "data",
-          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -5480,7 +6499,12 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["ask", "askwith", "followup", "steer"],
+        "commands": [
+          "ask",
+          "askwith",
+          "followup",
+          "steer"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5506,7 +6530,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["session-name"],
+        "commands": [
+          "session-name"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5531,8 +6557,13 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["deploy_and_exit", "finish_and_exit"],
-        "commands": ["quit"],
+        "tools": [
+          "deploy_and_exit",
+          "finish_and_exit"
+        ],
+        "commands": [
+          "quit"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5558,7 +6589,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["snake"],
+        "commands": [
+          "snake"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5584,7 +6617,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["invaders"],
+        "commands": [
+          "invaders"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5600,9 +6635,6 @@
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "session_start",
           "user_bash"
         ],
@@ -5614,16 +6646,22 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "bash",
+          "edit",
+          "read",
+          "write"
+        ],
         "commands": [],
-        "flags": [],
+        "flags": [
+          "ssh"
+        ],
         "event_handlers": [
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "session_start",
           "user_bash"
         ]
@@ -5638,7 +6676,12 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "session_switch", "turn_end", "turn_start"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch",
+          "turn_end",
+          "turn_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5652,7 +6695,12 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch", "turn_end", "turn_start"]
+        "event_handlers": [
+          "session_start",
+          "session_switch",
+          "turn_end",
+          "turn_start"
+        ]
       }
     },
     {
@@ -5664,7 +6712,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5673,12 +6721,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["subagent"],
+        "tools": [
+          "subagent"
+        ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["close", "data", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -5702,7 +6754,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["summarize"],
+        "commands": [
+          "summarize"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -5716,7 +6770,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_start", "session_shutdown"],
+        "subscribes_events": [
+          "agent_start",
+          "session_shutdown"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5730,7 +6787,10 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_start", "session_shutdown"]
+        "event_handlers": [
+          "agent_start",
+          "session_shutdown"
+        ]
       }
     },
     {
@@ -5745,20 +6805,12 @@
         "subscribes_events": [
           "agent_end",
           "agent_start",
-          "before_agent_start",
-          "close",
-          "data",
-          "error",
-          "event",
-          "model_select",
-          "session_before_switch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "tool_call",
           "tool_result",
-          "turn_end",
-          "turn_start"
+          "turn_end"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -5768,20 +6820,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["nvim_context"],
+        "tools": [
+          "get_current_time",
+          "read"
+        ],
         "commands": [
           "ad-name",
-          "dumb-zone-status",
-          "extensions:update",
-          "plan:list",
-          "plan:save",
-          "processes",
-          "providers:toggle-widget",
-          "providers:usage",
-          "session:copy-id",
-          "session:copy-path",
           "system-prompt",
           "theme"
         ],
@@ -5789,20 +6837,12 @@
         "event_handlers": [
           "agent_end",
           "agent_start",
-          "before_agent_start",
-          "close",
-          "data",
-          "error",
-          "event",
-          "model_select",
-          "session_before_switch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "tool_call",
           "tool_result",
-          "turn_end",
-          "turn_start"
+          "turn_end"
         ]
       }
     },
@@ -5811,11 +6851,13 @@
       "entry_path": "third-party/ben-vargas-pi-packages/pi-ancestor-discovery/extensions/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": true,
-        "registers_commands": true,
-        "registers_flags": true,
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
         "registers_providers": true,
-        "subscribes_events": ["model_select", "session_start"],
+        "subscribes_events": [
+          "resources_discover"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5826,10 +6868,12 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["generate_image", "get_code_context_exa", "image_quota", "web_search_exa"],
-        "commands": ["synthetic-models"],
+        "tools": [],
+        "commands": [],
         "flags": [],
-        "event_handlers": ["model_select", "session_start"]
+        "event_handlers": [
+          "resources_discover"
+        ]
       }
     },
     {
@@ -5843,9 +6887,6 @@
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "model_select",
           "session_before_compact",
           "session_compact",
@@ -5859,16 +6900,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["subagent"],
-        "commands": ["subagent"],
+        "tools": [
+          "subagent"
+        ],
+        "commands": [
+          "subagent"
+        ],
         "flags": [],
         "event_handlers": [
           "before_agent_start",
-          "close",
-          "data",
-          "error",
           "model_select",
           "session_before_compact",
           "session_compact",
@@ -5885,7 +6929,10 @@
         "registers_commands": false,
         "registers_flags": true,
         "registers_providers": false,
-        "subscribes_events": ["session_shutdown", "session_start"],
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5894,12 +6941,27 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["bash"],
+        "tools": [
+          "bash"
+        ],
         "commands": [],
-        "flags": [],
-        "event_handlers": ["session_shutdown", "session_start"]
+        "flags": [
+          "ssh-command",
+          "ssh-cwd",
+          "ssh-host",
+          "ssh-no-mount",
+          "ssh-port",
+          "ssh-strict-host-key",
+          "ssh-timeout"
+        ],
+        "event_handlers": [
+          "session_shutdown",
+          "session_start"
+        ]
       }
     },
     {
@@ -5911,7 +6973,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["input"],
+        "subscribes_events": [
+          "input"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5920,12 +6984,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["ss", "ss-clear"],
+        "commands": [
+          "ss",
+          "ss-clear"
+        ],
         "flags": [],
-        "event_handlers": ["input"]
+        "event_handlers": [
+          "input"
+        ]
       }
     },
     {
@@ -5937,7 +7008,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["input", "session_start"],
+        "subscribes_events": [
+          "input",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5946,12 +7020,21 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["scurl", "scurl-history", "scurl-log"],
+        "commands": [
+          "scurl",
+          "scurl-history",
+          "scurl-log"
+        ],
         "flags": [],
-        "event_handlers": ["input", "session_start"]
+        "event_handlers": [
+          "input",
+          "session_start"
+        ]
       }
     },
     {
@@ -5963,7 +7046,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start"],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5974,10 +7059,18 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["canvas_calendar", "canvas_document", "canvas_flights"],
-        "commands": ["calendar"],
+        "tools": [
+          "canvas_calendar",
+          "canvas_document",
+          "canvas_flights"
+        ],
+        "commands": [
+          "calendar"
+        ],
         "flags": [],
-        "event_handlers": ["session_start"]
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -5986,21 +7079,12 @@
       "source_tier": "third-party-github",
       "capabilities": {
         "registers_tools": true,
-        "registers_commands": true,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "SIGINT",
-          "SIGTERM",
           "before_agent_start",
-          "close",
-          "connection",
-          "data",
-          "end",
-          "error",
-          "session_start",
-          "tool_call",
-          "tool_result"
+          "session_start"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -6010,23 +7094,18 @@
         "has_npm_deps": false
       },
       "conformance_tier": 5,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["apply_patch"],
-        "commands": ["assistant", "codemap", "skill"],
+        "tools": [
+          "apply_patch"
+        ],
+        "commands": [],
         "flags": [],
         "event_handlers": [
-          "SIGINT",
-          "SIGTERM",
           "before_agent_start",
-          "close",
-          "connection",
-          "data",
-          "end",
-          "error",
-          "session_start",
-          "tool_call",
-          "tool_result"
+          "session_start"
         ]
       }
     },
@@ -6040,11 +7119,6 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end",
-          "agent_start",
-          "close",
-          "data",
-          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -6057,17 +7131,20 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": [],
-        "commands": ["sandbox"],
-        "flags": [],
+        "tools": [
+          "bash"
+        ],
+        "commands": [
+          "sandbox"
+        ],
+        "flags": [
+          "sandbox"
+        ],
         "event_handlers": [
-          "agent_end",
-          "agent_start",
-          "close",
-          "data",
-          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -6083,7 +7160,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_provider_request", "session_before_compact", "session_start"],
+        "subscribes_events": [
+          "before_provider_request",
+          "session_before_compact",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6092,12 +7173,18 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_provider_request", "session_before_compact", "session_start"]
+        "event_handlers": [
+          "before_provider_request",
+          "session_before_compact",
+          "session_start"
+        ]
       }
     },
     {
@@ -6109,7 +7196,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "data", "end", "error", "session_start", "timeout"],
+        "subscribes_events": [
+          "agent_end",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6118,12 +7208,19 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["notify"],
+        "commands": [
+          "notify"
+        ],
         "flags": [],
-        "event_handlers": ["agent_end", "data", "end", "error", "session_start", "timeout"]
+        "event_handlers": [
+          "agent_end",
+          "session_start"
+        ]
       }
     },
     {
@@ -6152,10 +7249,15 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["sub-bar:import", "sub-bar:settings"],
+        "commands": [
+          "sub-bar:import",
+          "sub-bar:settings"
+        ],
         "flags": [],
         "event_handlers": [
           "model_select",
@@ -6215,7 +7317,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["data", "end", "error"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6224,12 +7326,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["sketch"],
+        "commands": [
+          "sketch"
+        ],
         "flags": [],
-        "event_handlers": ["data", "end", "error"]
+        "event_handlers": []
       }
     },
     {
@@ -6241,7 +7347,7 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "session_start", "session_switch"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6250,12 +7356,16 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["diff", "files", "tui"],
+        "commands": [
+          "diff"
+        ],
         "flags": [],
-        "event_handlers": ["before_agent_start", "session_start", "session_switch"]
+        "event_handlers": []
       }
     },
     {
@@ -6278,8 +7388,12 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["session_query"],
-        "commands": ["handoff"],
+        "tools": [
+          "session_query"
+        ],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -6293,7 +7407,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["before_agent_start", "close", "data", "error", "session_start"],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6302,7 +7419,9 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [
           "scip_find_definition",
@@ -6314,7 +7433,10 @@
         ],
         "commands": [],
         "flags": [],
-        "event_handlers": ["before_agent_start", "close", "data", "error", "session_start"]
+        "event_handlers": [
+          "before_agent_start",
+          "session_start"
+        ]
       }
     },
     {
@@ -6335,10 +7457,14 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["reddit"],
+        "commands": [
+          "reddit"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -6352,7 +7478,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error", "session_start", "tool_result"],
+        "subscribes_events": [
+          "session_start",
+          "tool_result"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6361,12 +7490,17 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["close", "data", "error", "session_start", "tool_result"]
+        "event_handlers": [
+          "session_start",
+          "tool_result"
+        ]
       }
     },
     {
@@ -6389,7 +7523,9 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["questionnaire"],
+        "tools": [
+          "questionnaire"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -6404,7 +7540,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["tool_call"],
+        "subscribes_events": [
+          "tool_call"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6413,12 +7551,18 @@
         "has_npm_deps": true
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
-        "commands": ["slow-mode"],
+        "commands": [
+          "slow-mode"
+        ],
         "flags": [],
-        "event_handlers": ["tool_call"]
+        "event_handlers": [
+          "tool_call"
+        ]
       }
     },
     {
@@ -6430,7 +7574,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["close", "data", "error", "tool_result"],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": true,
@@ -6438,13 +7582,16 @@
         "is_multi_file": true,
         "has_npm_deps": false
       },
-      "conformance_tier": 4,
-      "mock_requirements": ["exec", "ui"],
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec",
+        "ui"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["close", "data", "error", "tool_result"]
+        "event_handlers": []
       }
     },
     {
@@ -6452,39 +7599,12 @@
       "entry_path": "third-party/w-winter-dot314/agentic-compaction/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": true,
-        "registers_commands": true,
-        "registers_flags": true,
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end",
-          "agent_start",
-          "async_subagent:complete",
-          "before_agent_start",
-          "close",
-          "context",
-          "data",
-          "end",
-          "error",
-          "input",
-          "session_before_compact",
-          "session_before_fork",
-          "session_before_switch",
-          "session_before_tree",
-          "session_branch",
-          "session_fork",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "session_tree",
-          "subagent:complete",
-          "subagent:started",
-          "subagent_enhanced:complete",
-          "tool_call",
-          "tool_result",
-          "turn_end",
-          "turn_start",
-          "user_bash"
+          "session_before_compact"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -6494,81 +7614,15 @@
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": [
-          "brave_grounding",
-          "brave_search",
-          "questionnaire",
-          "rp",
-          "rp_bind",
-          "rp_exec",
-          "session_ask",
-          "session_lineage",
-          "todo"
-        ],
-        "commands": [
-          "ask",
-          "askwith",
-          "branch",
-          "code",
-          "command-center",
-          "end-review",
-          "ephemeral",
-          "files",
-          "followup",
-          "md",
-          "model-sysprompt-appendix",
-          "notify",
-          "oracle",
-          "plan",
-          "preset",
-          "review",
-          "rp",
-          "rp-tools-lock",
-          "rpbind",
-          "sandbox",
-          "session-ask",
-          "skill",
-          "speedread",
-          "steer",
-          "todos",
-          "tools",
-          "ultrathink",
-          "usage",
-          "vog",
-          "ws"
-        ],
+        "tools": [],
+        "commands": [],
         "flags": [],
         "event_handlers": [
-          "agent_end",
-          "agent_start",
-          "async_subagent:complete",
-          "before_agent_start",
-          "close",
-          "context",
-          "data",
-          "end",
-          "error",
-          "input",
-          "session_before_compact",
-          "session_before_fork",
-          "session_before_switch",
-          "session_before_tree",
-          "session_branch",
-          "session_fork",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "session_tree",
-          "subagent:complete",
-          "subagent:started",
-          "subagent_enhanced:complete",
-          "tool_call",
-          "tool_result",
-          "turn_end",
-          "turn_start",
-          "user_bash"
+          "session_before_compact"
         ]
       }
     },
@@ -6581,7 +7635,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["context", "session_start"],
+        "subscribes_events": [
+          "context",
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -6603,7 +7660,10 @@
           "dcp-tools"
         ],
         "flags": [],
-        "event_handlers": ["context", "session_start"]
+        "event_handlers": [
+          "context",
+          "session_start"
+        ]
       }
     },
     {
@@ -6627,7 +7687,11 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["timed", "timed-select", "timed-signal"],
+        "commands": [
+          "timed",
+          "timed-select",
+          "timed-signal"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -6641,7 +7705,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["agent_end", "agent_start", "session_shutdown"],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "session_shutdown"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -6655,7 +7723,11 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["agent_end", "agent_start", "session_shutdown"]
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "session_shutdown"
+        ]
       }
     },
     {
@@ -6667,7 +7739,12 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_fork", "session_start", "session_switch", "session_tree"],
+        "subscribes_events": [
+          "session_fork",
+          "session_start",
+          "session_switch",
+          "session_tree"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -6678,10 +7755,19 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["todo"],
-        "commands": ["todos"],
+        "tools": [
+          "todo"
+        ],
+        "commands": [
+          "todos"
+        ],
         "flags": [],
-        "event_handlers": ["session_fork", "session_start", "session_switch", "session_tree"]
+        "event_handlers": [
+          "session_fork",
+          "session_start",
+          "session_switch",
+          "session_tree"
+        ]
       }
     },
     {
@@ -6704,8 +7790,12 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["read"],
-        "commands": ["read-log"],
+        "tools": [
+          "read"
+        ],
+        "commands": [
+          "read-log"
+        ],
         "flags": [],
         "event_handlers": []
       }
@@ -6719,7 +7809,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_fork", "session_start", "session_tree"],
+        "subscribes_events": [
+          "session_fork",
+          "session_start",
+          "session_tree"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -6731,9 +7825,15 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["tools"],
+        "commands": [
+          "tools"
+        ],
         "flags": [],
-        "event_handlers": ["session_fork", "session_start", "session_tree"]
+        "event_handlers": [
+          "session_fork",
+          "session_start",
+          "session_tree"
+        ]
       }
     },
     {
@@ -6745,7 +7845,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["turn_end"],
+        "subscribes_events": [
+          "turn_end"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -6757,9 +7859,13 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": ["trigger-compact"],
+        "commands": [
+          "trigger-compact"
+        ],
         "flags": [],
-        "event_handlers": ["turn_end"]
+        "event_handlers": [
+          "turn_end"
+        ]
       }
     },
     {
@@ -6780,9 +7886,13 @@
         "has_npm_deps": false
       },
       "conformance_tier": 2,
-      "mock_requirements": ["exec"],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
-        "tools": ["rg"],
+        "tools": [
+          "rg"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -6797,7 +7907,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": ["session_start", "session_switch"],
+        "subscribes_events": [
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -6811,7 +7924,10 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": ["session_start", "session_switch"]
+        "event_handlers": [
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -6834,7 +7950,9 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": ["parse_duration"],
+        "tools": [
+          "parse_duration"
+        ],
         "commands": [],
         "flags": [],
         "event_handlers": []

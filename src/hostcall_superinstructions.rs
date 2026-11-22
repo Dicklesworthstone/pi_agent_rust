@@ -42,6 +42,15 @@ impl HostcallSuperinstructionPlan {
                 .zip(self.opcode_window.iter())
                 .all(|(left, right)| left == right)
     }
+
+    #[must_use]
+    pub fn matches_str_prefix(&self, trace: &[&str]) -> bool {
+        trace.len() >= self.opcode_window.len()
+            && trace
+                .iter()
+                .zip(self.opcode_window.iter())
+                .all(|(left, right)| *left == right.as_str())
+    }
 }
 
 /// Deterministic compiler for recurring opcode motifs.
@@ -168,6 +177,117 @@ impl HostcallSuperinstructionCompiler {
                 .then_with(|| left.plan_id.cmp(&right.plan_id))
         });
         plans
+    }
+
+    /// Borrowed-slice variant of [`Self::compile_plans`] for hot telemetry paths
+    /// that already hold `&str` opcode identifiers. Avoids allocating per-window
+    /// `Vec<String>` clones until a motif actually meets `min_support`, and tracks
+    /// `(support_count, last_trace_idx, next_valid_start)` in a single table with
+    /// FNV-1a hashing to eliminate redundant per-width hash maps and SipHash overhead.
+    #[must_use]
+    pub fn compile_plans_str(&self, traces: &[&[&str]]) -> Vec<HostcallSuperinstructionPlan> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut windows: HashMap<&[&str], (u32, usize, usize), FnvBuildHasher> =
+            HashMap::with_hasher(FnvBuildHasher);
+        for (trace_idx, &trace) in traces.iter().enumerate() {
+            let trace_len = trace.len();
+            if trace_len < 2 {
+                continue;
+            }
+            let has_blank = trace.iter().any(|opcode| opcode.trim().is_empty());
+            let max_width = self.max_window.min(trace_len);
+            for width in 2..=max_width {
+                for start in 0..=trace_len - width {
+                    let window_slice = &trace[start..start + width];
+                    if has_blank && window_slice.iter().any(|opcode| opcode.trim().is_empty()) {
+                        continue;
+                    }
+
+                    let entry = windows.entry(window_slice).or_insert((0, trace_idx, 0));
+                    if entry.1 != trace_idx {
+                        entry.1 = trace_idx;
+                        entry.2 = 0;
+                    }
+                    if start >= entry.2 {
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.2 = start + width;
+                    }
+                }
+            }
+        }
+
+        let mut plans = windows
+            .into_iter()
+            .filter_map(|(window_slice, (support_count, _, _))| {
+                if support_count < self.min_support {
+                    return None;
+                }
+                let estimated_cost_baseline = estimated_baseline_cost(window_slice.len());
+                let estimated_cost_fused = estimated_fused_cost(window_slice.len());
+                let expected_cost_delta =
+                    estimated_cost_baseline.saturating_sub(estimated_cost_fused);
+                if expected_cost_delta <= 0 {
+                    return None;
+                }
+
+                let trace_signature = opcode_window_signature_str(window_slice);
+                let plan_id = format!("fuse_{trace_signature}");
+                let opcode_window = window_slice
+                    .iter()
+                    .map(|opcode| (*opcode).to_string())
+                    .collect();
+                Some(HostcallSuperinstructionPlan {
+                    schema: HOSTCALL_SUPERINSTRUCTION_SCHEMA_VERSION.to_string(),
+                    version: HOSTCALL_SUPERINSTRUCTION_PLAN_VERSION,
+                    plan_id,
+                    trace_signature,
+                    opcode_window,
+                    support_count,
+                    estimated_cost_baseline,
+                    estimated_cost_fused,
+                    expected_cost_delta,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        plans.sort_by(|left, right| {
+            right
+                .expected_cost_delta
+                .cmp(&left.expected_cost_delta)
+                .then_with(|| right.support_count.cmp(&left.support_count))
+                .then_with(|| right.width().cmp(&left.width()))
+                .then_with(|| left.opcode_window.cmp(&right.opcode_window))
+                .then_with(|| left.plan_id.cmp(&right.plan_id))
+        });
+        plans
+    }
+}
+
+#[derive(Default)]
+struct FnvBuildHasher;
+
+impl std::hash::BuildHasher for FnvBuildHasher {
+    type Hasher = FnvHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        FnvHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+struct FnvHasher(u64);
+
+impl std::hash::Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
@@ -307,7 +427,65 @@ fn estimated_fused_cost(width: usize) -> i64 {
         .saturating_add(width_units.saturating_mul(FUSED_OPCODE_STEP_COST_UNITS))
 }
 
+/// Zero-allocation best-plan lookup over `&[&str]` matching the exact ranking
+/// and top-rank ambiguity rules of [`select_plan_for_trace`].
+pub(crate) fn select_best_plan_for_str_slice<'a>(
+    trace: &[&str],
+    plans: &'a [HostcallSuperinstructionPlan],
+) -> Result<&'a HostcallSuperinstructionPlan, &'static str> {
+    if trace.is_empty() {
+        return Err("empty_trace");
+    }
+
+    let mut best: Option<&'a HostcallSuperinstructionPlan> = None;
+    let mut best_tied = false;
+
+    for plan in plans {
+        if !plan.matches_str_prefix(trace) {
+            continue;
+        }
+        let cand_rank = (plan.expected_cost_delta, plan.support_count, plan.width());
+        if let Some(current) = best {
+            let best_rank = (
+                current.expected_cost_delta,
+                current.support_count,
+                current.width(),
+            );
+            match cand_rank.cmp(&best_rank) {
+                std::cmp::Ordering::Greater => {
+                    best = Some(plan);
+                    best_tied = false;
+                }
+                std::cmp::Ordering::Equal => {
+                    best_tied = true;
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        } else {
+            best = Some(plan);
+        }
+    }
+
+    if best_tied {
+        return Err("ambiguous_top_plan");
+    }
+    best.ok_or("no_matching_plan")
+}
+
 fn opcode_window_signature(window: &[String]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for opcode in window {
+        for byte in opcode.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
+        }
+        hash ^= u64::from(b'|');
+        hash = hash.wrapping_mul(0x0100_0000_01b3_u64);
+    }
+    format!("{hash:016x}")
+}
+
+pub(crate) fn opcode_window_signature_str(window: &[&str]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for opcode in window {
         for byte in opcode.as_bytes() {
@@ -855,5 +1033,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn str_slice_compile_and_select_match_owned_api_exactly() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 3, 4);
+        let raw = [
+            "session.get_name",
+            "session.get_model",
+            "tool.read",
+            "session.get_name",
+            "session.get_model",
+            "tool.read",
+            "session.get_name",
+            "session.get_model",
+            "tool.read",
+            "session.get_name",
+            "session.get_model",
+        ];
+        let owned_trace = opcode_trace(&raw);
+        let owned_plans = compiler.compile_plans(&[owned_trace]);
+        let str_plans = compiler.compile_plans_str(&[&raw]);
+        assert_eq!(str_plans, owned_plans);
+        assert!(!str_plans.is_empty());
+
+        // Multi-trace and blank-opcode parity with compile_plans.
+        let raw_with_blanks = [
+            "tool.read",
+            "tool.write",
+            " ",
+            "tool.read",
+            "tool.write",
+            "tool.read",
+            "tool.write",
+        ];
+        let owned_multi =
+            compiler.compile_plans(&[opcode_trace(&raw), opcode_trace(&raw_with_blanks)]);
+        let str_multi = compiler.compile_plans_str(&[&raw, &raw_with_blanks]);
+        assert_eq!(str_multi, owned_multi);
+
+        for window in [
+            &["session.get_name", "session.get_model", "tool.read"][..],
+            &["session.get_model", "tool.read"][..],
+            &["unknown.op", "other.op"][..],
+            &[][..],
+        ] {
+            let owned_window = opcode_trace(window);
+            let owned_sel = select_plan_for_trace(&owned_window, &owned_plans);
+            let str_sig = opcode_window_signature_str(window);
+            assert_eq!(str_sig, owned_sel.trace_signature);
+            match select_best_plan_for_str_slice(window, &str_plans) {
+                Ok(plan) => {
+                    assert_eq!(
+                        owned_sel.selected_plan_id.as_deref(),
+                        Some(plan.plan_id.as_str())
+                    );
+                    assert_eq!(owned_sel.expected_cost_delta, plan.expected_cost_delta);
+                    assert!(owned_sel.deopt_reason.is_none());
+                }
+                Err(reason) => {
+                    assert!(owned_sel.selected_plan_id.is_none());
+                    assert_eq!(owned_sel.deopt_reason, Some(reason));
+                }
+            }
+        }
+
+        // Ambiguity tie must also match select_plan_for_trace exactly.
+        let tied_a = HostcallSuperinstructionPlan {
+            schema: HOSTCALL_SUPERINSTRUCTION_SCHEMA_VERSION.to_string(),
+            version: HOSTCALL_SUPERINSTRUCTION_PLAN_VERSION,
+            plan_id: "fuse_a".to_string(),
+            trace_signature: "aaaa".to_string(),
+            opcode_window: opcode_trace(&["tool.read", "tool.write"]),
+            support_count: 5,
+            estimated_cost_baseline: 20,
+            estimated_cost_fused: 10,
+            expected_cost_delta: 10,
+        };
+        let mut tied_b = tied_a.clone();
+        tied_b.plan_id = "fuse_b".to_string();
+        let tied_plans = vec![tied_a, tied_b];
+        assert_eq!(
+            select_best_plan_for_str_slice(&["tool.read", "tool.write"], &tied_plans),
+            Err("ambiguous_top_plan")
+        );
     }
 }

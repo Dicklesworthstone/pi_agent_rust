@@ -19,7 +19,7 @@
 mod common;
 
 use pi::extensions::{
-    ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    ExtensionManager, ExtensionPolicy, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
     resolve_conformance_extension_specs,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
@@ -1006,6 +1006,20 @@ fn hermetic_conformance_env(cwd: &Path) -> std::collections::HashMap<String, Str
     ])
 }
 
+/// Hermetic conformance policy: keeps `exec` denied and all default policy
+/// guardrails intact while explicitly permitting `env` so `PiJsRuntime`
+/// honors `hermetic_conformance_env(&cwd)` (sandboxed `HOME`, `TMPDIR`, and
+/// deterministic dummy keys) instead of forcing `deny_env = true` and falling
+/// back to host `HOME`.
+fn hermetic_conformance_policy() -> ExtensionPolicy {
+    let mut policy = ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "env");
+    if !policy.default_caps.iter().any(|cap| cap == "env") {
+        policy.default_caps.push("env".to_string());
+    }
+    policy
+}
+
 fn conformance_work_dir(name: impl AsRef<str>) -> PathBuf {
     let dir = std::env::temp_dir().join(name.as_ref());
     std::fs::create_dir_all(&dir).expect("create conformance work dir");
@@ -1106,9 +1120,14 @@ fn run_conformance_test(ext_id: &str) {
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
         async move {
-            JsExtensionRuntimeHandle::start(js_config, tools, manager)
-                .await
-                .expect("start JS runtime")
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+            .expect("start JS runtime")
         }
     });
     manager.set_js_runtime(runtime);
@@ -1308,9 +1327,14 @@ fn load_provider_mirror_probe(entry_file: &Path, cwd: &Path) -> Result<Extension
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
         async move {
-            JsExtensionRuntimeHandle::start(js_config, tools, manager)
-                .await
-                .expect("start JS runtime")
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+            .expect("start JS runtime")
         }
     });
     manager.set_js_runtime(runtime);
@@ -1429,9 +1453,14 @@ fn load_extension_runtime_for_journey(
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
         async move {
-            JsExtensionRuntimeHandle::start(js_config, tools, manager)
-                .await
-                .expect("start JS runtime")
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+            .expect("start JS runtime")
         }
     });
     manager.set_js_runtime(runtime.clone());
@@ -1966,7 +1995,15 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
     let runtime_result = common::run_async({
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
-        async move { JsExtensionRuntimeHandle::start(js_config, tools, manager).await }
+        async move {
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+        }
     });
     let runtime = match runtime_result {
         Ok(rt) => rt,
@@ -3061,7 +3098,15 @@ fn try_conformance_detailed(
     let runtime_result = common::run_async({
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
-        async move { JsExtensionRuntimeHandle::start(js_config, tools, manager).await }
+        async move {
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+        }
     });
     let runtime = match runtime_result {
         Ok(rt) => rt,
@@ -4598,7 +4643,15 @@ fn try_conformance_with_env(
     let runtime_result = common::run_async({
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
-        async move { JsExtensionRuntimeHandle::start(js_config, tools, manager).await }
+        async move {
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+        }
     });
     let runtime = match runtime_result {
         Ok(rt) => rt,
@@ -5276,7 +5329,15 @@ fn run_category_journey(
     let runtime_result = common::run_async({
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
-        async move { JsExtensionRuntimeHandle::start(js_config, tools, manager).await }
+        async move {
+            JsExtensionRuntimeHandle::start_with_policy(
+                js_config,
+                tools,
+                manager,
+                hermetic_conformance_policy(),
+            )
+            .await
+        }
     });
     let runtime = match runtime_result {
         Ok(rt) => rt,
@@ -6948,9 +7009,14 @@ mod multi_entry_conformance_loading_tests {
             let manager = manager.clone();
             let tools = Arc::clone(&tools);
             async move {
-                JsExtensionRuntimeHandle::start(js_config, tools, manager)
-                    .await
-                    .map_err(|err| err.to_string())
+                JsExtensionRuntimeHandle::start_with_policy(
+                    js_config,
+                    tools,
+                    manager,
+                    hermetic_conformance_policy(),
+                )
+                .await
+                .map_err(|err| err.to_string())
             }
         })?;
         manager.set_js_runtime(runtime);

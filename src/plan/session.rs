@@ -9,6 +9,7 @@
 //! Send future. The synchronous plan-state guard never crosses an await.
 
 use super::{PlanMode, PlanReview, PlanState, PlanStateInner};
+use crate::agent::AgentSession;
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::sdk::AgentSessionHandle;
@@ -170,14 +171,8 @@ fn prompt_changed() -> Error {
     )
 }
 
-fn check_plan_tools(handle: &AgentSessionHandle) -> Result<()> {
-    if handle
-        .session()
-        .agent
-        .shared_tools()
-        .snapshot()
-        .builtins_disabled()
-    {
+fn check_plan_tools(handle: &AgentSession) -> Result<()> {
+    if handle.agent.shared_tools().snapshot().builtins_disabled() {
         return Err(control_error(
             "PLAN_TOOLS_DISABLED",
             "plan mode is unavailable while built-in tools are disabled",
@@ -230,11 +225,71 @@ fn reviewed(inner: &PlanStateInner, review: &SessionPlanReview) -> Result<()> {
 }
 
 #[derive(Clone, Copy)]
-enum Change<'a> {
+pub(super) enum Change<'a> {
     Enter,
     Approve(&'a SessionPlanReview),
     Reject(&'a SessionPlanReview),
     Exit,
+}
+
+/// One coherent view of the proposal, its gate and its session incarnation.
+pub(super) struct PlanSnapshot {
+    pub mode: PlanMode,
+    pub plan: Option<Arc<str>>,
+    pub review: Option<SessionPlanReview>,
+}
+
+pub(super) fn snapshot(handle: &AgentSession) -> Result<PlanSnapshot> {
+    let store = Arc::clone(&handle.session);
+    let session = store
+        .try_lock()
+        .map_err(|_| control_error("PLAN_SESSION_BUSY", "session busy; retry taking the review"))?;
+    let state = handle.agent.plan_state();
+    let inner = state
+        .inner
+        .try_read()
+        .map_err(|_| control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable"))?;
+    pin_owner(&inner, &store, &session)?;
+    let review = if inner.mode == PlanMode::PendingApproval {
+        let plan = Arc::clone(inner.plan.as_ref().ok_or_else(|| {
+            control_error(
+                "PLAN_TEXT_UNAVAILABLE",
+                "pending plan has no reviewable text",
+            )
+        })?);
+        Some(SessionPlanReview {
+            proposal: PlanReview { plan },
+            store: Arc::downgrade(&store),
+            session_id: session.header.id.clone(),
+        })
+    } else {
+        None
+    };
+    Ok(PlanSnapshot {
+        mode: inner.mode,
+        plan: inner.plan.clone(),
+        review,
+    })
+}
+
+/// Prepare the source session's unpinned prompt before installing another
+/// session. Nothing changes on error, and no fallible cleanup follows the
+/// replacement. Callers retain their outer session authority until installation.
+pub fn replacement_system_prompt(
+    agent: &crate::agent::Agent,
+    store: &Arc<Store>,
+    session: &Session,
+) -> Result<Option<String>> {
+    let state = agent.plan_state();
+    let inner = state
+        .inner
+        .try_read()
+        .map_err(|_| control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable"))?;
+    pin_owner(&inner, store, session)?;
+    match &inner.session_pin {
+        Some(pin) => pin.remove(agent.system_prompt()),
+        None => Ok(agent.system_prompt().map(str::to_string)),
+    }
 }
 
 impl AgentSessionHandle {
@@ -242,32 +297,7 @@ impl AgentSessionHandle {
     /// This performs no I/O, does not mark a plan reviewed, and never waits for
     /// a busy session. Present text() in full before accepting a decision.
     pub fn pending_plan_review(&self) -> Result<Option<SessionPlanReview>> {
-        let store = self.session_store();
-        let session = store.try_lock().map_err(|_| {
-            control_error("PLAN_SESSION_BUSY", "session busy; retry taking the review")
-        })?;
-        let state = self.session().agent.plan_state();
-        let inner = state.inner.try_read().map_err(|_| {
-            control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
-        })?;
-        pin_owner(&inner, &store, &session)?;
-        if inner.mode != PlanMode::PendingApproval {
-            return Ok(None);
-        }
-        let plan = Arc::clone(inner.plan.as_ref().ok_or_else(|| {
-            control_error(
-                "PLAN_TEXT_UNAVAILABLE",
-                "pending plan has no reviewable text",
-            )
-        })?);
-        drop(inner);
-        let session_id = session.header.id.clone();
-        drop(session);
-        Ok(Some(SessionPlanReview {
-            proposal: PlanReview { plan },
-            store: Arc::downgrade(&store),
-            session_id,
-        }))
+        snapshot(self.session()).map(|view| view.review)
     }
 
     /// Enter read-only planning with the current model. A pending proposal
@@ -277,8 +307,7 @@ impl AgentSessionHandle {
     /// replacing any tool with that reserved name. This also repairs an already
     /// Planning session's binding without adding a redundant mode journal entry.
     pub async fn enter_plan_mode(&mut self, owner: &AgentCx) -> Result<PlanChange> {
-        check_plan_tools(self)?;
-        change(self, owner, Change::Enter).await
+        change(self.session_mut(), owner, Change::Enter).await
     }
 
     /// Approve exactly the proposal that was presented, pin it into the live
@@ -294,7 +323,7 @@ impl AgentSessionHandle {
         owner: &AgentCx,
         review: &SessionPlanReview,
     ) -> Result<PlanChange> {
-        change(self, owner, Change::Approve(review)).await
+        change(self.session_mut(), owner, Change::Approve(review)).await
     }
 
     /// Reject only the displayed submission, keeping mutations blocked while
@@ -304,7 +333,7 @@ impl AgentSessionHandle {
         owner: &AgentCx,
         review: &SessionPlanReview,
     ) -> Result<PlanChange> {
-        change(self, owner, Change::Reject(review)).await
+        change(self.session_mut(), owner, Change::Reject(review)).await
     }
 
     /// Exit planning and remove only this API's uniquely identified prompt pin.
@@ -312,18 +341,21 @@ impl AgentSessionHandle {
     /// raw PlanState APIs operate only on the gate; use this method for cleanup
     /// after approving through the SDK, even if a raw caller already set Off.
     pub async fn exit_plan_mode(&mut self, owner: &AgentCx) -> Result<PlanChange> {
-        change(self, owner, Change::Exit).await
+        change(self.session_mut(), owner, Change::Exit).await
     }
 }
 
-async fn change(
-    handle: &mut AgentSessionHandle,
+pub(super) async fn change(
+    handle: &mut AgentSession,
     owner: &AgentCx,
     action: Change<'_>,
 ) -> Result<PlanChange> {
-    let save_enabled = handle.session().save_enabled();
+    if matches!(action, Change::Enter) {
+        check_plan_tools(handle)?;
+    }
+    let save_enabled = handle.save_enabled();
     check_owner(owner, save_enabled)?;
-    let store = handle.session_store();
+    let store = Arc::clone(&handle.session);
     // Borrowed asupersync guards are thread-affine. The owned guard keeps the
     // same nonblocking/exclusive admission contract while allowing migration
     // during persistence; dropping the future still releases the store.
@@ -333,12 +365,12 @@ async fn change(
             "session busy; no plan transition was applied",
         )
     })?;
-    let state = handle.session().agent.plan_state();
+    let state = handle.agent.plan_state();
     let (mode, journal_mode) = apply_change(handle, &state, &store, &mut session, owner, action)?;
     if journal_mode.is_none() {
         return Ok(PlanChange::unchanged(mode));
     }
-    handle.session_mut().invalidate_background_compaction();
+    handle.invalidate_background_compaction();
     // The mode and checkpoint were appended together under the decision lock.
     let persistence = persist(&mut session, owner, save_enabled).await;
     Ok(PlanChange {
@@ -350,7 +382,7 @@ async fn change(
 
 // Deliberately synchronous: never retain a std::sync guard across an await.
 fn apply_change(
-    handle: &mut AgentSessionHandle,
+    handle: &mut AgentSession,
     state: &PlanState,
     store: &Arc<Store>,
     session: &mut Session,
@@ -373,9 +405,9 @@ fn apply_change(
     }
     // Recheck after acquiring both locks. All fallible context preparation is
     // before the live transition; no error after it masquerades as a rollback.
-    check_owner(owner, handle.session().save_enabled())?;
-    let save_enabled = handle.session().save_enabled();
-    let agent = &mut handle.session_mut().agent;
+    check_owner(owner, handle.save_enabled())?;
+    let save_enabled = handle.save_enabled();
+    let agent = &mut handle.agent;
     let result = match action {
         Change::Approve(review) => {
             if inner.session_pin.is_some() {
@@ -549,7 +581,99 @@ fn decode_plan_checkpoint(data: &serde_json::Value, session_id: &str) -> Result<
     })
 }
 
+/// Carry content across an intentional native fork, never approval authority.
+/// Call only on the freshly copied target before saving or installing it.
+/// Rebind every selected checkpoint so a later fork can select old inherited
+/// history before this fork's tip without encountering a foreign identity.
+pub fn inherit_fork_checkpoint(session: &mut Session, source_id: &str) -> Result<()> {
+    if session.header.id == source_id {
+        return Err(checkpoint_error(
+            "fork target must have a fresh session identity",
+        ));
+    }
+    let current = latest_plan_checkpoint_for(session, source_id)?;
+    let mut rebound_modes = std::collections::HashMap::new();
+    {
+        let mut cursor = session.leaf_id();
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..MAX_CHECKPOINT_ANCESTORS {
+            let Some(id) = cursor else { break };
+            if !visited.insert(id) {
+                return Err(checkpoint_error("copied fork ancestry contains a cycle"));
+            }
+            let entry = session
+                .get_entry(id)
+                .ok_or_else(|| checkpoint_error("copied fork has a missing ancestor"))?;
+            if let crate::session::SessionEntry::Custom(custom) = entry
+                && custom.custom_type == PLAN_CHECKPOINT_TYPE
+            {
+                let data = custom
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| checkpoint_error("copied checkpoint has no data"))?;
+                let checkpoint = decode_plan_checkpoint(data, source_id)?;
+                let mode = match checkpoint.mode {
+                    PlanMode::Approved | PlanMode::PendingApproval => PlanMode::PendingApproval,
+                    PlanMode::Off | PlanMode::Planning => checkpoint.mode,
+                };
+                rebound_modes.insert(id.to_string(), mode);
+            }
+            cursor = entry.base().parent_id.as_deref();
+        }
+        if cursor.is_some() {
+            return Err(checkpoint_error(
+                "copied fork exceeds the checkpoint ancestry budget",
+            ));
+        }
+    }
+    // No fallible validation follows the first edit. Only the copied target
+    // changes; the selected record identities, text and ancestry stay intact.
+    let target_id = session.header.id.clone();
+    for entry in &mut session.entries {
+        let crate::session::SessionEntry::Custom(custom) = entry else {
+            continue;
+        };
+        let Some(mode) = custom.base.id.as_ref().and_then(|id| rebound_modes.get(id)) else {
+            continue;
+        };
+        if let Some(data) = custom.data.as_mut() {
+            data["sessionId"] = serde_json::json!(target_id);
+            data["mode"] = serde_json::json!(mode.as_str());
+        }
+    }
+    // A newer raw mode record supersedes older content even though that
+    // content was rebound for any future selection of an earlier ancestor.
+    let Some(checkpoint) = current else {
+        return Ok(());
+    };
+    let mode = match checkpoint.mode {
+        PlanMode::Approved | PlanMode::PendingApproval => PlanMode::PendingApproval,
+        PlanMode::Off | PlanMode::Planning => checkpoint.mode,
+    };
+    session.append_custom_entry(
+        "plan_mode".to_string(),
+        Some(serde_json::json!({"mode": mode.as_str()})),
+    );
+    session.append_custom_entry(
+        PLAN_CHECKPOINT_TYPE.to_string(),
+        Some(serde_json::json!({
+            "schema": PLAN_CHECKPOINT_SCHEMA,
+            "sessionId": target_id,
+            "mode": mode.as_str(),
+            "plan": checkpoint.plan.as_deref(),
+        })),
+    );
+    Ok(())
+}
+
 fn latest_plan_checkpoint(session: &Session) -> Result<Option<PlanCheckpoint>> {
+    latest_plan_checkpoint_for(session, &session.header.id)
+}
+
+fn latest_plan_checkpoint_for(
+    session: &Session,
+    expected_session_id: &str,
+) -> Result<Option<PlanCheckpoint>> {
     let mut cursor = session.leaf_id();
     for _ in 0..MAX_CHECKPOINT_ANCESTORS {
         let Some(id) = cursor else { return Ok(None) };
@@ -562,7 +686,7 @@ fn latest_plan_checkpoint(session: &Session) -> Result<Option<PlanCheckpoint>> {
                     .data
                     .as_ref()
                     .ok_or_else(|| checkpoint_error("checkpoint has no data"))?;
-                return decode_plan_checkpoint(data, &session.header.id).map(Some);
+                return decode_plan_checkpoint(data, expected_session_id).map(Some);
             }
             // Older clients journal only mode changes. Such a newer change
             // supersedes a previous checkpoint; never resurrect its proposal.
@@ -584,35 +708,7 @@ impl AgentSessionHandle {
     /// retrying a previously unconfirmed save without replaying an approval.
     /// Identical checkpoints are not appended again, but persistence is retried.
     pub async fn checkpoint_plan(&mut self, owner: &AgentCx) -> Result<PlanPersistence> {
-        let save_enabled = self.session().save_enabled();
-        check_owner(owner, save_enabled)?;
-        let store = self.session_store();
-        let mut session = store.try_lock_owned().map_err(|_| {
-            control_error(
-                "PLAN_SESSION_BUSY",
-                "session busy; no checkpoint was appended",
-            )
-        })?;
-        let previous = latest_plan_checkpoint(&session)?;
-        let state = self.session().agent.plan_state();
-        {
-            let inner = state.inner.try_read().map_err(|_| {
-                control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
-            })?;
-            pin_owner(&inner, &store, &session)?;
-            if !valid_checkpoint_plan(inner.mode, inner.plan.as_deref()) {
-                return Err(checkpoint_error("live plan state cannot be checkpointed"));
-            }
-            check_owner(owner, save_enabled)?;
-            let same = previous.as_ref().is_some_and(|old| {
-                old.mode == inner.mode && old.plan.as_deref() == inner.plan.as_deref()
-            });
-            if !same {
-                append_plan_checkpoint(&mut session, &inner);
-            }
-            drop(inner);
-        }
-        Ok(persist(&mut session, owner, save_enabled).await)
+        checkpoint_plan(self.session_mut(), owner).await
     }
 
     /// Recover a saved proposal after opening a session. This is opt-in, not
@@ -625,38 +721,80 @@ impl AgentSessionHandle {
     /// superseded or off-branch checkpoints are not used. On Err no state was
     /// changed; callers must not continue execution as though recovery succeeded.
     pub async fn restore_plan_checkpoint(&mut self, owner: &AgentCx) -> Result<PlanChange> {
-        check_plan_tools(self)?;
-        let save_enabled = self.session().save_enabled();
-        check_owner(owner, save_enabled)?;
-        let store = self.session_store();
-        let mut session = store.try_lock_owned().map_err(|_| {
-            control_error(
-                "PLAN_SESSION_BUSY",
-                "session busy; no checkpoint was restored",
-            )
-        })?;
-        let checkpoint = latest_plan_checkpoint(&session)?.ok_or_else(|| {
-            control_error(
-                "PLAN_CHECKPOINT_MISSING",
-                "this branch has no current recoverable plan checkpoint",
-            )
-        })?;
-        let state = self.session().agent.plan_state();
-        let mode =
-            restore_checkpoint_in_memory(self, &state, &store, &mut session, owner, checkpoint)?;
-        self.session_mut().invalidate_background_compaction();
-        let persistence = persist(&mut session, owner, save_enabled).await;
-        Ok(PlanChange {
-            mode,
-            changed: true,
-            persistence,
-        })
+        restore_plan_checkpoint(self.session_mut(), owner).await
     }
+}
+
+pub(super) async fn checkpoint_plan(
+    handle: &mut AgentSession,
+    owner: &AgentCx,
+) -> Result<PlanPersistence> {
+    let save_enabled = handle.save_enabled();
+    check_owner(owner, save_enabled)?;
+    let store = Arc::clone(&handle.session);
+    let mut session = store.try_lock_owned().map_err(|_| {
+        control_error(
+            "PLAN_SESSION_BUSY",
+            "session busy; no checkpoint was appended",
+        )
+    })?;
+    let previous = latest_plan_checkpoint(&session)?;
+    let state = handle.agent.plan_state();
+    {
+        let inner = state.inner.try_read().map_err(|_| {
+            control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
+        })?;
+        pin_owner(&inner, &store, &session)?;
+        if !valid_checkpoint_plan(inner.mode, inner.plan.as_deref()) {
+            return Err(checkpoint_error("live plan state cannot be checkpointed"));
+        }
+        check_owner(owner, save_enabled)?;
+        let same = previous.as_ref().is_some_and(|old| {
+            old.mode == inner.mode && old.plan.as_deref() == inner.plan.as_deref()
+        });
+        if !same {
+            append_plan_checkpoint(&mut session, &inner);
+        }
+        drop(inner);
+    }
+    Ok(persist(&mut session, owner, save_enabled).await)
+}
+
+pub(super) async fn restore_plan_checkpoint(
+    handle: &mut AgentSession,
+    owner: &AgentCx,
+) -> Result<PlanChange> {
+    check_plan_tools(handle)?;
+    let save_enabled = handle.save_enabled();
+    check_owner(owner, save_enabled)?;
+    let store = Arc::clone(&handle.session);
+    let mut session = store.try_lock_owned().map_err(|_| {
+        control_error(
+            "PLAN_SESSION_BUSY",
+            "session busy; no checkpoint was restored",
+        )
+    })?;
+    let checkpoint = latest_plan_checkpoint(&session)?.ok_or_else(|| {
+        control_error(
+            "PLAN_CHECKPOINT_MISSING",
+            "this branch has no current recoverable plan checkpoint",
+        )
+    })?;
+    let state = handle.agent.plan_state();
+    let mode =
+        restore_checkpoint_in_memory(handle, &state, &store, &mut session, owner, checkpoint)?;
+    handle.invalidate_background_compaction();
+    let persistence = persist(&mut session, owner, save_enabled).await;
+    Ok(PlanChange {
+        mode,
+        changed: true,
+        persistence,
+    })
 }
 
 // The write guard stays in this synchronous helper, never across saving.
 fn restore_checkpoint_in_memory(
-    handle: &mut AgentSessionHandle,
+    handle: &mut AgentSession,
     state: &PlanState,
     store: &Arc<Store>,
     session: &mut Session,
@@ -673,19 +811,13 @@ fn restore_checkpoint_in_memory(
             "cannot restore over a live plan or its owned context",
         ));
     }
-    let save_enabled = handle.session().save_enabled();
+    let save_enabled = handle.save_enabled();
     check_owner(owner, save_enabled)?;
     let mode = match checkpoint.mode {
         PlanMode::PendingApproval | PlanMode::Approved => PlanMode::PendingApproval,
         PlanMode::Off | PlanMode::Planning => checkpoint.mode,
     };
-    install_checkpointed_submit(
-        &mut handle.session_mut().agent,
-        state,
-        store,
-        session,
-        save_enabled,
-    );
+    install_checkpointed_submit(&mut handle.agent, state, store, session, save_enabled);
     inner.mode = mode;
     // Decoding allocated new text; persisted data cannot reconstruct a live
     // PlanReview capability even when resuming through the very same store.

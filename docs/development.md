@@ -188,16 +188,14 @@ This produces three output files in `tests/ext_conformance/reports/`:
 - `conformance_summary.json` - machine-readable summary with per-tier breakdowns
 - `conformance_events.jsonl` - one line per extension with full metrics
 
-#### CI Integration
+#### Quality & Conformance Automation (DSR Authority)
 
-| Trigger | Suite | Command |
-|---------|-------|---------|
-| Every PR | Fast (5 official + negative + generated) | `conformance.yml` / `conformance-fast` |
-| Nightly | Full official + scenarios + schema + artifacts | `conformance.yml` / `conformance-full` + `conformance-full-scenario` |
-| Weekly | Community + npm + third-party | `conformance.yml` / `conformance-weekly` |
-| Every push | All non-feature-gated tests | `ci.yml` / `cargo test --all-targets` |
-
-CI uploads conformance logs and reports as downloadable artifacts.
+GitHub Actions workflows (`ci.yml`, `conformance.yml`) are retained in the tree
+only as historical reference and are **permanently disabled and non-authoritative**
+(`AGENTS.md`). Do not enable, dispatch, rerun, or cite GitHub Actions runs as
+verification evidence. All authoritative quality checks run through
+`dsr quality --tool pi_agent_rust`, and extended conformance sweeps run through
+the documented `--features ext-conformance` commands above routed via `rch`.
 
 ### Performance Report Smoke Tests
 

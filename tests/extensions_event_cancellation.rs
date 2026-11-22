@@ -23,9 +23,18 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 fn load_js_extension(harness: &common::TestHarness, source: &str) -> ExtensionManager {
+    load_js_extensions(harness, &[("ext", source)])
+}
+
+fn load_js_extensions(harness: &common::TestHarness, sources: &[(&str, &str)]) -> ExtensionManager {
     let cwd = harness.temp_dir().to_path_buf();
-    let ext_entry_path = harness.create_file("extensions/ext.mjs", source.as_bytes());
-    let spec = JsExtensionLoadSpec::from_entry_path(&ext_entry_path).expect("load spec");
+    let specs = sources
+        .iter()
+        .map(|(name, source)| {
+            let path = harness.create_file(format!("extensions/{name}.mjs"), source.as_bytes());
+            JsExtensionLoadSpec::from_entry_path(&path).expect("load spec")
+        })
+        .collect();
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
@@ -49,7 +58,7 @@ fn load_js_extension(harness: &common::TestHarness, source: &str) -> ExtensionMa
         let manager = manager.clone();
         async move {
             manager
-                .load_js_extensions(vec![spec])
+                .load_js_extensions(specs)
                 .await
                 .expect("load extension");
         }
@@ -283,6 +292,193 @@ fn session_before_compact_not_cancelled_when_true() {
     });
 
     assert!(!cancelled, "Should not cancel when handler returns true");
+}
+
+fn assert_session_veto_chain(manager: &ExtensionManager, phase: &str) {
+    common::run_async({
+        let manager = manager.clone();
+        let phase = phase.to_string();
+        async move {
+            for event_name in [
+                ExtensionEventName::SessionBeforeSwitch,
+                ExtensionEventName::SessionBeforeFork,
+                ExtensionEventName::SessionBeforeCompact,
+                ExtensionEventName::SessionBeforeTree,
+            ] {
+                for veto in [
+                    json!(false),
+                    json!({"cancel": true, "reason": "first veto"}),
+                    json!({"cancelled": true, "reason": "first veto"}),
+                ] {
+                    let payload = json!({"phase": phase, "veto": veto});
+                    let response = manager
+                        .dispatch_event_with_response(event_name, Some(payload.clone()), 5000)
+                        .await
+                        .expect("a veto must stop later handlers");
+                    assert_eq!(
+                        response,
+                        Some(veto),
+                        "{event_name} must retain the first {phase} veto"
+                    );
+                    assert!(
+                        manager
+                            .dispatch_cancellable_event(event_name, Some(payload), 5000)
+                            .await
+                            .expect("dispatch cancellable chain"),
+                        "{event_name} must expose the {phase} veto to its caller"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn session_before_vetoes_stop_later_handlers_in_the_same_realm() {
+    let harness =
+        common::TestHarness::new("session_before_vetoes_stop_later_handlers_in_the_same_realm");
+    let manager = load_js_extension(
+        &harness,
+        r#"
+export default function init(pi) {
+    for (const name of [
+        "session_before_switch", "session_before_fork",
+        "session_before_compact", "session_before_tree",
+    ]) {
+        for (const [phase, register] of [
+            ["direct", handler => pi.on(name, handler)],
+            ["event_bus", handler => pi.events.on(name, handler)],
+        ]) {
+            register(event => event.phase === phase ? true : undefined);
+            register(async event => event.phase === phase ? event.veto : undefined);
+            register(event => {
+                if (event.phase === phase) {
+                    throw new Error("A later handler ran after the first veto");
+                }
+            });
+        }
+    }
+}
+"#,
+    );
+
+    assert_session_veto_chain(&manager, "direct");
+    assert_session_veto_chain(&manager, "event_bus");
+}
+
+#[test]
+fn session_before_vetoes_stop_later_realms_and_event_bus_phases() {
+    let harness =
+        common::TestHarness::new("session_before_vetoes_stop_later_realms_and_event_bus_phases");
+    let manager = load_js_extensions(
+        &harness,
+        &[
+            (
+                "first",
+                r#"
+export default function init(pi) {
+    for (const name of [
+        "session_before_switch", "session_before_fork",
+        "session_before_compact", "session_before_tree",
+    ]) {
+        pi.on(name, event => event.phase === "direct" ? event.veto : undefined);
+        pi.events.on(name, event => event.phase === "event_bus" ? event.veto : undefined);
+    }
+}
+"#,
+            ),
+            (
+                "later",
+                r#"
+export default function init(pi) {
+    for (const name of [
+        "session_before_switch", "session_before_fork",
+        "session_before_compact", "session_before_tree",
+    ]) {
+        pi.on(name, event => {
+            if (event.phase === "direct") throw new Error("A later realm ran after a veto");
+            return true;
+        });
+        pi.events.on(name, () => {
+            throw new Error("A later event-bus realm ran after a veto");
+        });
+    }
+}
+"#,
+            ),
+        ],
+    );
+
+    assert_session_veto_chain(&manager, "direct");
+    assert_session_veto_chain(&manager, "event_bus");
+}
+
+#[test]
+fn session_before_nonboolean_flags_do_not_hide_later_vetoes() {
+    let harness =
+        common::TestHarness::new("session_before_nonboolean_flags_do_not_hide_later_vetoes");
+    let manager = load_js_extension(
+        &harness,
+        r#"
+export default function init(pi) {
+    for (const name of [
+        "session_before_switch", "session_before_fork",
+        "session_before_compact", "session_before_tree",
+    ]) {
+        for (const [phase, register] of [
+            ["direct", handler => pi.on(name, handler)],
+            ["event_bus", handler => pi.events.on(name, handler)],
+        ]) {
+            for (const value of [
+                true, null, {}, { cancel: false, cancelled: false },
+                { cancel: 1 }, { cancel: "true" }, { cancelled: [true] },
+            ]) {
+                register(event => event.phase === phase ? value : undefined);
+            }
+            register(event => event.phase === phase ? event.veto : undefined);
+        }
+    }
+}
+"#,
+    );
+
+    assert_session_veto_chain(&manager, "direct");
+    assert_session_veto_chain(&manager, "event_bus");
+}
+
+#[test]
+fn session_before_handler_errors_still_fail_before_a_later_veto() {
+    let harness =
+        common::TestHarness::new("session_before_handler_errors_still_fail_before_a_later_veto");
+    let manager = load_js_extension(
+        &harness,
+        r#"
+export default function init(pi) {
+    for (const name of [
+        "session_before_switch", "session_before_fork",
+        "session_before_compact", "session_before_tree",
+    ]) {
+        pi.on(name, () => true);
+        pi.on(name, () => { throw new Error("session veto precondition failed"); });
+        pi.on(name, () => ({ cancelled: true }));
+    }
+}
+"#,
+    );
+
+    common::run_async(async move {
+        for event_name in [
+            ExtensionEventName::SessionBeforeSwitch,
+            ExtensionEventName::SessionBeforeFork,
+            ExtensionEventName::SessionBeforeCompact,
+            ExtensionEventName::SessionBeforeTree,
+        ] {
+            manager
+                .dispatch_cancellable_event(event_name, None, 5000)
+                .await
+                .expect_err("handler errors must not become successful cancellation responses");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

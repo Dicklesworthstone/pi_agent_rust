@@ -451,16 +451,16 @@ impl<'p> Invocation<'p> {
         name: String,
         args: Value,
     ) -> std::result::Result<ToolOutput, String> {
-        let (index, call) = self.reserve_tool_call(name, args)?;
-        let session = self.host_session.as_deref().ok_or_else(|| {
+        let session = self.host_session.clone().ok_or_else(|| {
             "EVAL_SESSION_UNAVAILABLE: native cell owner was not captured".to_string()
         })?;
+        let (index, call) = self.reserve_tool_call(name, args)?;
         let outcome = async {
             if let Some(guard) = &self.cell_session {
                 guard.check_tool().await.map_err(|err| err.to_string())?;
             }
             let output = host
-                .call_tool(call, session)
+                .call_tool(call, &session)
                 .await
                 .map_err(|err| err.to_string())?;
             if let Some(guard) = &self.cell_session {

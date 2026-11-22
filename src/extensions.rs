@@ -20,7 +20,8 @@ use crate::hostcall_rewrite::{
     HostcallRewriteEngine, HostcallRewritePlan, HostcallRewritePlanKind,
 };
 use crate::hostcall_superinstructions::{
-    HostcallSuperinstructionCompiler, HostcallSuperinstructionPlan, execute_with_superinstruction,
+    HostcallSuperinstructionCompiler, HostcallSuperinstructionPlan, opcode_window_signature_str,
+    select_best_plan_for_str_slice,
 };
 use crate::hostcall_trace_jit::{GuardContext, TraceJitCompiler};
 use crate::permissions::{PermissionStore, PersistedDecision};
@@ -16590,6 +16591,26 @@ fn remaining_js_task_timeout(deadline: Instant, operation: &str) -> Result<Durat
         })
 }
 
+fn is_session_before_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "session_before_switch"
+            | "session_before_fork"
+            | "session_before_compact"
+            | "session_before_tree"
+    )
+}
+
+fn event_response_cancels(response: &Value) -> bool {
+    response.as_bool() == Some(false)
+        || response.get("cancel").and_then(Value::as_bool) == Some(true)
+        || response.get("cancelled").and_then(Value::as_bool) == Some(true)
+}
+
+fn session_event_response_cancels(event_name: &str, response: &Value) -> bool {
+    is_session_before_event(event_name) && event_response_cancels(response)
+}
+
 fn json_value_is_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -17184,8 +17205,7 @@ async fn dispatch_extension_event_across_shards_until(
             }
             let should_stop = (event_name == "tool_call"
                 && value.get("block").is_some_and(json_value_is_truthy))
-                || (event_name.starts_with("session_before_")
-                    && value.get("cancel").is_some_and(json_value_is_truthy));
+                || session_event_response_cancels(event_name, &value);
             last = Some(value);
             if should_stop {
                 return Ok(last.expect("value assigned above"));
