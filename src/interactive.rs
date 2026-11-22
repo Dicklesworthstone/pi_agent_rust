@@ -2520,6 +2520,13 @@ pub enum PiMsg {
     },
     /// Extension UI request (select/confirm/input/editor/custom/notify).
     ExtensionUiRequest(ExtensionUiRequest),
+    /// A driver-owned request with an authority token checked before input.
+    ExtensionUiRequestTracked {
+        request: ExtensionUiRequest,
+        pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// A response-bearing extension request no longer has a live waiter.
+    ExtensionUiRequestRetired { id: String },
     /// Periodic redraw or final deadline wake for one capability prompt.
     ///
     /// Carries request, prompt, and timer generations so late or duplicated

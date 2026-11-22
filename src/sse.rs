@@ -112,6 +112,13 @@ impl SseParser {
         Self::default()
     }
 
+    /// Latest valid reconnection hint, including retry-only control frames
+    /// that do not dispatch an event.
+    #[must_use]
+    pub(crate) fn retry_interval_ms(&self) -> Option<u64> {
+        self.current.retry
+    }
+
     /// Create a parser with a custom per-event data cap (for testing).
     #[cfg(test)]
     fn with_max_event_data_bytes(limit: usize) -> Self {
@@ -226,7 +233,13 @@ impl SseParser {
                     current.id = Some(value.to_string());
                     current.id_was_explicit = true;
                 }
-                "retry" => current.retry = Self::parse_retry(value),
+                "retry" => {
+                    // Invalid fields are ignored; they must not erase a
+                    // previously accepted reconnection delay.
+                    if let Some(retry) = Self::parse_retry(value) {
+                        current.retry = Some(retry);
+                    }
+                }
                 _ => {} // Unknown field - ignore
             }
         } else {
@@ -1195,6 +1208,34 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_only_control_frames_update_hint_without_events() {
+        let mut parser = SseParser::new();
+        assert_eq!(parser.retry_interval_ms(), None);
+        assert!(parser.feed("retry: 3000\n\n").is_empty());
+        assert_eq!(parser.retry_interval_ms(), Some(3000));
+        assert!(parser.feed("retry: 12").is_empty());
+        assert_eq!(parser.retry_interval_ms(), Some(3000));
+        assert!(parser.feed("50\r\n\r\n").is_empty());
+        assert_eq!(parser.retry_interval_ms(), Some(1250));
+        assert!(parser.feed("retry: 6000").is_empty());
+        assert!(parser.flush().is_none());
+        assert_eq!(parser.retry_interval_ms(), Some(6000));
+    }
+
+    #[test]
+    fn test_invalid_retry_fields_preserve_last_valid_hint() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed("retry: 3000\n\n").is_empty());
+        for invalid in ["", "+1", "-1", "1x", "18446744073709551616"] {
+            assert!(parser.feed(&format!("retry: {invalid}\n\n")).is_empty());
+            assert_eq!(parser.retry_interval_ms(), Some(3000));
+        }
+        let events = parser.feed("data: response\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].retry, Some(3000));
+    }
+
+    #[test]
     fn test_retry_hint_persists_across_dispatched_events() {
         let mut parser = SseParser::new();
         let events = parser.feed("retry: 3000\ndata: first\n\ndata: second\n\n");
@@ -1854,7 +1895,7 @@ data: {"type":"message_stop"}
         }
 
         #[test]
-        fn sse_retry_field_fuzz_last_assignment_wins(
+        fn sse_retry_field_fuzz_last_valid_assignment_wins(
             retry_values in prop::collection::vec(retry_field_strategy(), 1..6),
             data in ascii_line(),
         ) {
@@ -1868,7 +1909,7 @@ data: {"type":"message_stop"}
             let events = parse_all(&input);
             prop_assert_eq!(events.len(), 1);
 
-            let expected_retry = retry_values.last().and_then(|value| {
+            let expected_retry = retry_values.iter().rev().find_map(|value| {
                 if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
                     value.parse::<u64>().ok()
                 } else {

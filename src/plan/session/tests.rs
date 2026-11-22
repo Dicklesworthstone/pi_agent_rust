@@ -857,4 +857,90 @@ mod wire {
     fn manual_entry_rebinds_a_foreign_auto_approving_helper_even_when_already_planning() {
         lifecycle(true);
     }
+
+    #[test]
+    fn rpc_plan_controls_reach_the_provider_context_and_native_write_gate() {
+        let peer = Peer::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut handle = peer.handle(temp.path());
+        let mut control = crate::plan::rpc::RpcPlanControl::default();
+        run(async {
+            let owner = AgentCx::for_current_or_request();
+            handle.prompt("warm schema cache", |_| {}).await.unwrap();
+            control
+                .command(
+                    handle.session_mut(),
+                    &owner,
+                    "set_plan_mode",
+                    &json!({"mode": "on"}),
+                )
+                .await
+                .unwrap();
+            handle.prompt("prepare a plan", |_| {}).await.unwrap();
+            assert!(
+                !temp.path().join("result.txt").exists(),
+                "the real write tool must be blocked while planning"
+            );
+            let view = control
+                .command(handle.session_mut(), &owner, "get_plan", &json!({}))
+                .await
+                .unwrap();
+            let plan = view["plan"].as_str().unwrap();
+            assert!(plan.contains("Files: [\"result.txt\"]"));
+            {
+                let requests = peer.requests.lock().unwrap();
+                assert_eq!(requests.len(), 4);
+                assert!(has_submit_schema(&requests[1]));
+                assert!(requests[2].to_string().contains("PLAN_MODE_BLOCKED"));
+            }
+            let approved = control
+                .command(
+                    handle.session_mut(),
+                    &owner,
+                    "approve_plan",
+                    &json!({"reviewId": view["reviewId"]}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(approved["plan"], plan);
+            assert_eq!(peer.requests.lock().unwrap().len(), 4);
+            handle
+                .prompt("execute reviewed work", |_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(temp.path().join("result.txt")).unwrap(),
+                b"approved mutation"
+            );
+            {
+                let requests = peer.requests.lock().unwrap();
+                assert_eq!(requests.len(), 6);
+                assert!(
+                    requests[4]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| {
+                            matches!(message["role"].as_str(), Some("system" | "developer"))
+                                && message["content"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains(plan))
+                        })
+                );
+            }
+            control
+                .command(
+                    handle.session_mut(),
+                    &owner,
+                    "set_plan_mode",
+                    &json!({"mode": "off"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                handle.session().agent.system_prompt(),
+                Some("base instructions")
+            );
+        });
+    }
 }

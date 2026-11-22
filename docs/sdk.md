@@ -695,6 +695,80 @@ fn main() -> pi::sdk::Result<()> {
 }
 ```
 
+### Interactive RPC session transitions
+
+Session lifecycle hooks can ask the host to confirm a change or answer an
+Ask card. Use the event-forwarding methods when those hooks are installed:
+
+| Operation | Method | Result |
+|---|---|---|
+| Create a session | `new_session_with_events(parent, on_event)` | Cancellation state |
+| Switch sessions | `switch_session_with_events(path, on_event)` | Cancellation state |
+| Fork editable text | `fork_with_events(entry_id, on_event)` | Selected text and cancellation state |
+| Fork native input | `fork_with_content_and_events(entry_id, on_event)` | Selected text, ordered attachments, and cancellation state |
+
+Clone `rpc.control_handle()` before starting the operation. The callback or a
+separate UI thread can use that handle's `extension_ui_response()` and
+`ask_response()` while the operation owns the response reader. Echo the exact
+UI request ID, plus `requestGeneration` for extension UI replies; choose
+answers through the host's UI.
+`AskAnswer` and `AskResponse` are exported through `pi::sdk`. Control reply
+acknowledgements are kept separate from the operation's terminal response.
+
+A hook veto returns `cancelled: true`. A before-hook error fails the operation.
+If an after-hook fails after the session change commits, the callback receives
+`session_transition_hook_error` with `phase: "after"` and `committed: true`,
+followed by the successful operation result. That event does not mean the
+session change rolled back. Forked input remains unsent, including when a
+post-transition diagnostic is delivered.
+
+Existing convenience methods keep their signatures and discard intermediate
+events; use the methods above when the host needs to answer hook dialogs.
+
+### Durable plan review over RPC
+
+`RpcTransportClient` uses the same guarded plan lifecycle as in-process sessions.
+Enter planning with `set_plan_mode(true)`, let the model submit its proposal,
+then call `get_plan()` and `pending_review()` to capture an immutable
+`RpcPlanReview`. Present its complete `text()` and keep that same value while
+the user decides. Pass it to `approve_plan_review()` or `reject_plan_review()`;
+a newer submission, session replacement, or checkpoint restoration makes an
+older review stale, even when its text is identical.
+
+```rust
+let state = rpc.get_plan().await?;
+if let Some(review) = state.pending_review()? {
+    // Present review.text() and retain review until the user makes a decision.
+    // After an explicit approval:
+    let change = rpc.approve_plan_review(&review).await?;
+    match &change.persistence {
+        pi::sdk::RpcPlanPersistence::Saved => { /* saved successfully */ }
+        pi::sdk::RpcPlanPersistence::MemoryOnly => { /* saving is disabled */ }
+        pi::sdk::RpcPlanPersistence::Unchanged => { /* no transition needed */ }
+        pi::sdk::RpcPlanPersistence::Unconfirmed { reason } => {
+            eprintln!("Plan changed, but saving was not confirmed: {reason}");
+            // Retry rpc.checkpoint_plan(), not the already-applied approval.
+        }
+    }
+}
+```
+
+`RpcPlanChange.changed` describes the live decision; `persistence` describes
+its independent save outcome. An unconfirmed save is returned as a successful
+live transition, so repeating an old approval is not a recovery strategy.
+`checkpoint_plan()` retries persistence without repeating the decision.
+`state_error` reports when the post-transition snapshot was unavailable; it
+also does not roll back the committed decision.
+
+After reopening or selecting a saved session, `restore_plan_checkpoint()`
+restores the selected branch's saved state, provided no live proposal or owned
+prompt pin is present. Saved pending and approved proposals require **fresh
+review**; off and planning checkpoints retain their respective modes. A saved
+approval does not authorize execution in the new connection.
+`set_plan_mode(false)` exits planning and removes only the owned approved-plan
+context. These operations require an idle session and do not start a provider
+turn.
+
 ## Recipe 7: Unified Transport Adapter (In-Process or RPC)
 
 ```rust

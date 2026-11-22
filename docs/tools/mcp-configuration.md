@@ -175,9 +175,27 @@ Keepalive comments do not produce model content. An oversized event or invalid
 UTF-8 still stops the transport rather than truncating or dropping part of a
 server request.
 
-Individual POST responses retain their 10 MiB aggregate body limit, including
-SSE notifications preceding the result. Request deadlines, protocol-session
-checks, and replay-ID admission remain the same for both receive paths.
+A resumable stream can close repeatedly before its logical work is complete,
+as allowed by [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#resumability-and-redelivery). Pi continues with GET requests using the last
+accepted event ID and the original protocol session. Replayed event IDs are
+deduplicated across every continuation, including server requests that have
+already received a response. A stream without a safe event checkpoint cannot
+resume, and the original POST is never replayed.
+
+Reconnections respect SSE `retry:` hints, including standalone control frames.
+Without a hint Pi waits one second; hints below 100 milliseconds use a
+100-millisecond minimum to prevent tight polling. Invalid hints leave the last
+valid delay in place. Waiting stops immediately when the transport is aborted
+or its protocol session changes, and large hints cannot extend a pending
+request's original deadline. If a continuation connection fails with a transient
+transport error, Pi retries that GET with the same checkpoint and pacing.
+Authentication failures, expired sessions, malformed responses, and servers
+that decline continuation stop reconnection.
+
+Individual POST responses retain their 10 MiB aggregate body limit across all
+continuations, including SSE notifications preceding the result. Reopening
+HTTP does not reset the request deadline or the replay-ID safety budget.
+The optional connection-owned GET stream retains its per-event body limit.
 
 ## Task-augmented tools
 
