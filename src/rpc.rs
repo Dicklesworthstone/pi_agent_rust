@@ -1430,7 +1430,6 @@ impl RpcInput {
     }
 }
 
-
 /// The command reader remains the sole consumer of input. While an extension
 /// lifecycle hook is awaiting a dialog, service its control replies in place;
 /// competing commands get a bounded busy response instead of a hidden queue.
@@ -1475,7 +1474,9 @@ impl RpcTransitionControls {
                         ));
                     }
                     Err(message) => {
-                        let _ = self.out_tx.send(response_error(id, "ask_response", message));
+                        let _ = self
+                            .out_tx
+                            .send(response_error(id, "ask_response", message));
                     }
                 }
                 true
@@ -1491,7 +1492,9 @@ impl RpcTransitionControls {
     fn extension_response(&self, parsed: &Value, id: Option<String>) {
         let (Some(manager), Some(ui_state)) = (self.manager.as_ref(), self.ui_state.as_ref())
         else {
-            let _ = self.out_tx.send(response_ok(id, "extension_ui_response", None));
+            let _ = self
+                .out_tx
+                .send(response_ok(id, "extension_ui_response", None));
             return;
         };
         let Some(request_id) = rpc_parse_extension_ui_response_id(parsed) else {
@@ -1547,11 +1550,9 @@ impl RpcTransitionControls {
             let response = match rpc_parse_extension_ui_response(parsed, &active.request) {
                 Ok(response) => response,
                 Err(message) => {
-                    let _ = self.out_tx.send(response_error(
-                        id,
-                        "extension_ui_response",
-                        message,
-                    ));
+                    let _ = self
+                        .out_tx
+                        .send(response_error(id, "extension_ui_response", message));
                     return;
                 }
             };
@@ -1732,11 +1733,9 @@ impl RpcTransitionControls {
                 }
             };
             let Some(command) = parsed.get("type").and_then(Value::as_str) else {
-                let _ = self.out_tx.send(response_error(
-                    None,
-                    "parse",
-                    "Missing command type",
-                ));
+                let _ = self
+                    .out_tx
+                    .send(response_error(None, "parse", "Missing command type"));
                 continue;
             };
             if self.route_response(&parsed) {
@@ -1878,11 +1877,17 @@ struct RpcForkHookCancellation(std::sync::Mutex<bool>);
 
 impl RpcForkHookCancellation {
     fn is_cancelled(&self) -> bool {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn set_cancelled(&self, cancelled: bool) {
-        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cancelled;
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cancelled;
     }
 }
 
@@ -3573,10 +3578,7 @@ impl RpcUiBridgeState {
         next
     }
 
-    fn prune_stale(
-        &mut self,
-        mut pending: impl FnMut(&str) -> bool,
-    ) -> Option<RpcUiBridgeRequest> {
+    fn prune_stale(&mut self, mut pending: impl FnMut(&str) -> bool) -> Option<RpcUiBridgeRequest> {
         self.queue.retain(|queued| {
             let live = pending(&queued.request.id);
             if !live {
@@ -10391,8 +10393,7 @@ mod ui_bridge_tests {
             let (late_request, late_pending) = pending_rpc_ui_test_request(
                 &manager,
                 &mut ui_rx,
-                ExtensionUiRequest::new("reused", "confirm", json!({}))
-                    .with_timeout_ms(30_000),
+                ExtensionUiRequest::new("reused", "confirm", json!({})).with_timeout_ms(30_000),
             )
             .await;
             // Abort sees no published card. Its delivery then arrives before
@@ -10439,8 +10440,7 @@ mod ui_bridge_tests {
             let (replacement_request, replacement_pending) = pending_rpc_ui_test_request(
                 &manager,
                 &mut ui_rx,
-                ExtensionUiRequest::new("reused", "confirm", json!({}))
-                    .with_timeout_ms(30_000),
+                ExtensionUiRequest::new("reused", "confirm", json!({})).with_timeout_ms(30_000),
             )
             .await;
             let (promoted, replacement) = {
@@ -10539,12 +10539,7 @@ mod ui_bridge_tests {
                 .send("already full".to_string())
                 .expect("fixture fills the output channel");
 
-            rpc_publish_extension_ui_request(
-                Arc::clone(&state),
-                manager,
-                out_tx,
-                first,
-            );
+            rpc_publish_extension_ui_request(Arc::clone(&state), manager, out_tx, first);
 
             {
                 let guard = state.lock().expect("bridge lock");
@@ -10553,7 +10548,11 @@ mod ui_bridge_tests {
             }
             for pending in [first_pending, second_pending] {
                 assert!(
-                    pending.await.expect("closed delivery").expect("response").cancelled,
+                    pending
+                        .await
+                        .expect("closed delivery")
+                        .expect("response")
+                        .cancelled,
                     "backpressure dismisses the real manager waiter"
                 );
             }
@@ -10572,11 +10571,7 @@ mod ui_bridge_tests {
             let (request, pending) = pending_rpc_ui_test_request(
                 &manager,
                 &mut ui_rx,
-                ExtensionUiRequest::new(
-                    "already-expired",
-                    "confirm",
-                    json!({"title": "too late"}),
-                ),
+                ExtensionUiRequest::new("already-expired", "confirm", json!({"title": "too late"})),
             )
             .await;
             // Place a real manager delivery precisely at its bridge deadline.
@@ -10589,12 +10584,7 @@ mod ui_bridge_tests {
             let state = Arc::new(std::sync::Mutex::new(bridge));
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel(4);
 
-            rpc_publish_extension_ui_request(
-                Arc::clone(&state),
-                manager,
-                out_tx,
-                active,
-            );
+            rpc_publish_extension_ui_request(Arc::clone(&state), manager, out_tx, active);
 
             assert!(
                 out_rx.try_recv().is_err(),
@@ -10602,7 +10592,11 @@ mod ui_bridge_tests {
             );
             assert!(state.lock().expect("bridge lock").active.is_none());
             assert!(
-                pending.await.expect("expired delivery").expect("response").cancelled,
+                pending
+                    .await
+                    .expect("expired delivery")
+                    .expect("response")
+                    .cancelled,
                 "bridge expiry resolves the real pending waiter"
             );
         });
@@ -10856,7 +10850,11 @@ mod ui_bridge_tests {
             join_bridge_timer(queued_timer, "terminal-close queued request").await;
             for pending in [active_pending, queued_pending] {
                 assert!(
-                    pending.await.expect("terminal close").expect("response").cancelled,
+                    pending
+                        .await
+                        .expect("terminal close")
+                        .expect("response")
+                        .cancelled,
                     "close dismisses every real manager waiter"
                 );
             }
@@ -17124,7 +17122,10 @@ mod retry_tests {
                     .await
                     .expect("send stale approval");
                 let stale = collect_transition_responses(&out_rx, &["stale"]).await;
-                assert_err(transition_response(&stale, "stale"), "extension_ui_response");
+                assert_err(
+                    transition_response(&stale, "stale"),
+                    "extension_ui_response",
+                );
                 assert_eq!(
                     inner_session
                         .lock(&AgentCx::for_request())
@@ -17191,11 +17192,17 @@ mod retry_tests {
                 ))
                 .await
                 .expect("RPC shutdown");
-                let frames: Vec<Value> = out_rx.try_iter().map(|line| parse_response(&line)).collect();
+                let frames: Vec<Value> = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect();
                 let response = transition_response(&frames, "1");
                 assert_err(response, command);
                 assert!(
-                    response["error"].as_str().unwrap().contains("transition hook failed"),
+                    response["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("transition hook failed"),
                     "{response}"
                 );
                 assert_eq!(
@@ -17282,7 +17289,10 @@ mod retry_tests {
                 );
                 send_transition_confirmation(&in_tx, &second, "reply", true).await;
                 let frames = collect_transition_responses(&out_rx, &["reply"]).await;
-                assert_ok(transition_response(&frames, "reply"), "extension_ui_response");
+                assert_ok(
+                    transition_response(&frames, "reply"),
+                    "extension_ui_response",
+                );
                 let response = next_dialog
                     .await
                     .expect("independent dialog")
@@ -17348,13 +17358,10 @@ mod retry_tests {
                             .expect("send framing failure");
                     }
                     drop(in_tx);
-                    let result = asupersync::time::timeout(
-                        wall_now(),
-                        Duration::from_secs(2),
-                        server,
-                    )
-                    .await
-                    .expect("disconnected approval must not wait for its timeout");
+                    let result =
+                        asupersync::time::timeout(wall_now(), Duration::from_secs(2), server)
+                            .await
+                            .expect("disconnected approval must not wait for its timeout");
                     assert_eq!(result.is_err(), framing_failure, "{result:?}");
                     let frames: Vec<Value> = out_rx
                         .lock()
@@ -17437,7 +17444,11 @@ mod retry_tests {
                     let frames = collect_transition_responses(&out_rx, &["control", "1"]).await;
                     assert_ok(
                         transition_response(&frames, "control"),
-                        if abort { "abort" } else { "extension_ui_response" },
+                        if abort {
+                            "abort"
+                        } else {
+                            "extension_ui_response"
+                        },
                     );
                     let response = transition_response(&frames, "1");
                     assert_ok(response, command);

@@ -5534,29 +5534,28 @@ impl ExtensionManager {
             };
 
             #[cfg(feature = "wasm-host")]
-            let response = if has_hook_wasm
-                && should_dispatch_wasm_event(&event_name, response.as_ref())
-            {
-                let timeout_ms = if event == ExtensionEventName::UserBash {
-                    user_bash_remaining_timeout(timeout_ms, started_at)?
+            let response =
+                if has_hook_wasm && should_dispatch_wasm_event(&event_name, response.as_ref()) {
+                    let timeout_ms = if event == ExtensionEventName::UserBash {
+                        user_bash_remaining_timeout(timeout_ms, started_at)?
+                    } else {
+                        timeout_ms
+                    };
+                    let mut wasm_payload = event_payload;
+                    if let Value::Object(map) = &mut wasm_payload {
+                        map.insert("ctx".into(), (*ctx_payload).clone());
+                    }
+                    Self::dispatch_wasm_event_value(
+                        &wasm_extensions,
+                        &event_name,
+                        &wasm_payload,
+                        timeout_ms,
+                    )
+                    .await?
+                    .or(response)
                 } else {
-                    timeout_ms
+                    response
                 };
-                let mut wasm_payload = event_payload;
-                if let Value::Object(map) = &mut wasm_payload {
-                    map.insert("ctx".into(), (*ctx_payload).clone());
-                }
-                Self::dispatch_wasm_event_value(
-                    &wasm_extensions,
-                    &event_name,
-                    &wasm_payload,
-                    timeout_ms,
-                )
-                .await?
-                .or(response)
-            } else {
-                response
-            };
 
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
@@ -6419,7 +6418,11 @@ mod session_event_veto_tests {
                 ] {
                     merge_wasm_event_response(event_name, &mut response, value);
                 }
-                assert_eq!(response, Some(veto), "{event_name} must retain the first veto");
+                assert_eq!(
+                    response,
+                    Some(veto),
+                    "{event_name} must retain the first veto"
+                );
                 assert!(
                     !should_dispatch_wasm_event(event_name, response.as_ref()),
                     "{event_name} must not reach another runtime after a veto"
@@ -6464,7 +6467,10 @@ mod session_event_veto_tests {
 
         assert!(should_dispatch_wasm_event("user_bash", None));
         assert!(should_dispatch_wasm_event("user_bash", Some(&Value::Null)));
-        assert!(!should_dispatch_wasm_event("user_bash", Some(&json!(false))));
+        assert!(!should_dispatch_wasm_event(
+            "user_bash",
+            Some(&json!(false))
+        ));
         assert!(!should_dispatch_wasm_event(
             "user_bash",
             Some(&json!({"result": {"output": "already executed"}}))

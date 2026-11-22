@@ -172,12 +172,7 @@ fn prompt_changed() -> Error {
 }
 
 fn check_plan_tools(handle: &AgentSession) -> Result<()> {
-    if handle
-        .agent
-        .shared_tools()
-        .snapshot()
-        .builtins_disabled()
-    {
+    if handle.agent.shared_tools().snapshot().builtins_disabled() {
         return Err(control_error(
             "PLAN_TOOLS_DISABLED",
             "plan mode is unavailable while built-in tools are disabled",
@@ -246,17 +241,21 @@ pub(super) struct PlanSnapshot {
 
 pub(super) fn snapshot(handle: &AgentSession) -> Result<PlanSnapshot> {
     let store = Arc::clone(&handle.session);
-    let session = store.try_lock().map_err(|_| {
-        control_error("PLAN_SESSION_BUSY", "session busy; retry taking the review")
-    })?;
+    let session = store
+        .try_lock()
+        .map_err(|_| control_error("PLAN_SESSION_BUSY", "session busy; retry taking the review"))?;
     let state = handle.agent.plan_state();
-    let inner = state.inner.try_read().map_err(|_| {
-        control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
-    })?;
+    let inner = state
+        .inner
+        .try_read()
+        .map_err(|_| control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable"))?;
     pin_owner(&inner, &store, &session)?;
     let review = if inner.mode == PlanMode::PendingApproval {
         let plan = Arc::clone(inner.plan.as_ref().ok_or_else(|| {
-            control_error("PLAN_TEXT_UNAVAILABLE", "pending plan has no reviewable text")
+            control_error(
+                "PLAN_TEXT_UNAVAILABLE",
+                "pending plan has no reviewable text",
+            )
         })?);
         Some(SessionPlanReview {
             proposal: PlanReview { plan },
@@ -282,9 +281,10 @@ pub(crate) fn replacement_system_prompt(
     session: &Session,
 ) -> Result<Option<String>> {
     let state = agent.plan_state();
-    let inner = state.inner.try_read().map_err(|_| {
-        control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable")
-    })?;
+    let inner = state
+        .inner
+        .try_read()
+        .map_err(|_| control_error("PLAN_STATE_UNAVAILABLE", "plan state busy or unavailable"))?;
     pin_owner(&inner, store, session)?;
     match &inner.session_pin {
         Some(pin) => pin.remove(agent.system_prompt()),
@@ -587,7 +587,9 @@ fn decode_plan_checkpoint(data: &serde_json::Value, session_id: &str) -> Result<
 /// history before this fork's tip without encountering a foreign identity.
 pub(crate) fn inherit_fork_checkpoint(session: &mut Session, source_id: &str) -> Result<()> {
     if session.header.id == source_id {
-        return Err(checkpoint_error("fork target must have a fresh session identity"));
+        return Err(checkpoint_error(
+            "fork target must have a fresh session identity",
+        ));
     }
     let current = latest_plan_checkpoint_for(session, source_id)?;
     let mut rebound_modes = std::collections::HashMap::new();
@@ -619,7 +621,9 @@ pub(crate) fn inherit_fork_checkpoint(session: &mut Session, source_id: &str) ->
             cursor = entry.base().parent_id.as_deref();
         }
         if cursor.is_some() {
-            return Err(checkpoint_error("copied fork exceeds the checkpoint ancestry budget"));
+            return Err(checkpoint_error(
+                "copied fork exceeds the checkpoint ancestry budget",
+            ));
         }
     }
     // No fallible validation follows the first edit. Only the copied target
@@ -629,12 +633,7 @@ pub(crate) fn inherit_fork_checkpoint(session: &mut Session, source_id: &str) ->
         let crate::session::SessionEntry::Custom(custom) = entry else {
             continue;
         };
-        let Some(mode) = custom
-            .base
-            .id
-            .as_ref()
-            .and_then(|id| rebound_modes.get(id))
-        else {
+        let Some(mode) = custom.base.id.as_ref().and_then(|id| rebound_modes.get(id)) else {
             continue;
         };
         if let Some(data) = custom.data.as_mut() {
@@ -818,13 +817,7 @@ fn restore_checkpoint_in_memory(
         PlanMode::PendingApproval | PlanMode::Approved => PlanMode::PendingApproval,
         PlanMode::Off | PlanMode::Planning => checkpoint.mode,
     };
-    install_checkpointed_submit(
-        &mut handle.agent,
-        state,
-        store,
-        session,
-        save_enabled,
-    );
+    install_checkpointed_submit(&mut handle.agent, state, store, session, save_enabled);
     inner.mode = mode;
     // Decoding allocated new text; persisted data cannot reconstruct a live
     // PlanReview capability even when resuming through the very same store.

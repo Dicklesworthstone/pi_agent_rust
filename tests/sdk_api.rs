@@ -969,7 +969,6 @@ fn sdk_rpc_shutdown_and_drop_stop_live_and_reaped_root_descendants() {
     }
 }
 
-
 #[test]
 fn sdk_rpc_plan_reviews_bind_the_displayed_submission_and_require_complete_state() {
     let mut state: sdk::RpcPlanState = serde_json::from_value(json!({
@@ -987,7 +986,10 @@ fn sdk_rpc_plan_reviews_bind_the_displayed_submission_and_require_complete_state
     for (text, id) in [
         (None, Some("p1-valid".to_string())),
         (Some("  ".to_string()), Some("p1-valid".to_string())),
-        (Some("é".repeat(128 * 1024 + 1)), Some("p1-valid".to_string())),
+        (
+            Some("é".repeat(128 * 1024 + 1)),
+            Some("p1-valid".to_string()),
+        ),
         (Some("proposal".to_string()), None),
         (Some("proposal".to_string()), Some(" ".to_string())),
         (Some("proposal".to_string()), Some("x".repeat(65))),
@@ -999,9 +1001,12 @@ fn sdk_rpc_plan_reviews_bind_the_displayed_submission_and_require_complete_state
     }
     state.plan_mode = sdk::RpcPlanMode::Approved;
     assert!(state.pending_review().unwrap().is_none());
-    assert!(serde_json::from_value::<sdk::RpcPlanState>(json!({
-        "planMode": "approve_on_resume", "plan": null, "reviewId": null,
-    })).is_err());
+    assert!(
+        serde_json::from_value::<sdk::RpcPlanState>(json!({
+            "planMode": "approve_on_resume", "plan": null, "reviewId": null,
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -1016,17 +1021,24 @@ fn sdk_rpc_plan_changes_preserve_committed_decisions_and_persistence_uncertainty
     assert!(change.changed);
     assert_eq!(change.state.plan_mode, sdk::RpcPlanMode::Approved);
     assert_eq!(change.state_error.as_deref(), Some("snapshot busy"));
-    assert_eq!(change.persistence, sdk::RpcPlanPersistence::Unconfirmed {
-        reason: "save interrupted".to_string(),
-    });
+    assert_eq!(
+        change.persistence,
+        sdk::RpcPlanPersistence::Unconfirmed {
+            reason: "save interrupted".to_string(),
+        }
+    );
     for persistence in [
         json!({"status": "unconfirmed"}),
         json!({"status": "eventually_saved"}),
     ] {
-        assert!(serde_json::from_value::<sdk::RpcPlanChange>(json!({
-            "planMode": "approved", "plan": "proposal", "reviewId": null,
-            "changed": true, "persistence": persistence,
-        })).is_err(), "unknown or incomplete durability must never be treated as saved");
+        assert!(
+            serde_json::from_value::<sdk::RpcPlanChange>(json!({
+                "planMode": "approved", "plan": "proposal", "reviewId": null,
+                "changed": true, "persistence": persistence,
+            }))
+            .is_err(),
+            "unknown or incomplete durability must never be treated as saved"
+        );
     }
 }
 
@@ -1312,7 +1324,9 @@ printf '%s\n' '{"type":"response","id":"rpc-7","command":"fork","success":true,"
             }),
         ]
     );
-    client.shutdown().expect("shutdown session protocol fixture");
+    client
+        .shutdown()
+        .expect("shutdown session protocol fixture");
 }
 
 #[test]

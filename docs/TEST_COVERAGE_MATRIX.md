@@ -515,6 +515,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/permissions.rs` | Capability permissions | Unit; `tests/capability_policy_model.rs`, `tests/capability_policy_scoped.rs`, `tests/capability_denial_matrix.rs`. |
 | `src/pi_wasm.rs` | PiWasm runtime | Unit; `tests/lab_runtime_extensions.rs`; unsupported imports fail closed, with bounded Emscripten compatibility stubs covered by source tests. |
 | `src/plan.rs` | Plan mode | `tests/e2e_plan_mode.rs`. |
+| `src/plan/rpc.rs` | RPC plan control (`get_plan`, `set_plan_mode`, `approve_plan`, `reject_plan`, `save_plan`, `restore_plan`) | Unit & RPC contract tests in `src/rpc.rs` + `src/plan/session/tests.rs`. |
 | `src/plan/session.rs` | SDK plan review, prompt ownership and journaled lifecycle | Unit; `src/plan/session/tests.rs` exercises real SDK handles and provider/tool loops. Added, not executed: DSR unavailable. |
 | `src/plan/session/tests.rs` | SDK plan lifecycle contract and wire tests | Test module; 26 tests for submission identity, policy separation, prompt cleanup, persistence and actual tool dispatch. Added, not executed: DSR unavailable. |
 | `src/platform.rs` | Platform helpers | Unit. |
