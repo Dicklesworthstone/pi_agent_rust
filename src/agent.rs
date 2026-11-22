@@ -1112,9 +1112,9 @@ impl QueuedAgentMessage {
 pub type MessageFetcher =
     Arc<dyn Fn() -> BoxFuture<'static, Vec<QueuedAgentMessage>> + Send + Sync + 'static>;
 
-/// One additive message source. Permanent RPC/extension sources carry no
-/// lifetime; turn-scoped SDK sources carry a weak lease and are removed before
-/// the next poll once their owning turn retires.
+/// One additive message source. Permanent host sources carry no lifetime;
+/// scoped SDK and extension sources carry a weak lease and are removed before
+/// the next poll once their owning turn or extension activation retires.
 struct RegisteredMessageFetcher {
     fetcher: MessageFetcher,
     lifetime: Option<Weak<()>>,
@@ -3019,17 +3019,18 @@ impl Agent {
         }
     }
 
-    /// Register message sources whose lifetime is owned by one SDK turn.
+    /// Register message sources whose lifetime is owned by a turn or activation.
     ///
     /// The Agent keeps the closures only until their lease expires. This keeps
     /// long-lived sessions from accumulating inert readers while leaving
-    /// permanent RPC/extension sources additive.
+    /// permanent host sources additive.
     pub(crate) fn register_scoped_message_fetchers(
         &mut self,
         lifetime: &Arc<()>,
         steering: Option<MessageFetcher>,
         follow_up: Option<MessageFetcher>,
     ) {
+        self.prune_expired_message_fetchers();
         if let Some(fetcher) = steering {
             self.steering_fetchers
                 .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
@@ -3038,6 +3039,13 @@ impl Agent {
             self.follow_up_fetchers
                 .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
         }
+    }
+
+    fn prune_expired_message_fetchers(&mut self) {
+        self.steering_fetchers
+            .retain(RegisteredMessageFetcher::is_live);
+        self.follow_up_fetchers
+            .retain(RegisteredMessageFetcher::is_live);
     }
 
     pub(crate) fn register_scoped_yield_check(
@@ -7994,6 +8002,9 @@ pub struct AgentSession {
     extensions_pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
     extension_queue_modes: Option<Arc<StdMutex<ExtensionQueueModeState>>>,
     extension_injected_queue: Option<Arc<StdMutex<ExtensionInjectedQueue>>>,
+    /// Only the installed activation may supply automatic queued inputs.
+    /// Public handles to retired runtimes must not retain this lease.
+    extension_message_fetcher_lifetime: Option<Arc<()>>,
     extension_ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
     compaction_settings: ResolvedCompactionSettings,
     compaction_runtime: Option<Runtime>,
@@ -12241,6 +12252,285 @@ mod extensions_integration_tests {
                 "empty extension list should clear injected extension queues"
             );
         });
+    }
+
+    fn extension_activation_test_session(cwd: &Path) -> AgentSession {
+        let agent = Agent::new(
+            Arc::new(NoopProvider),
+            ToolRegistry::new(&[], cwd, None),
+            AgentConfig::default(),
+        );
+        AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(Session::in_memory())),
+            false,
+            ResolvedCompactionSettings::default(),
+        )
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_activation_failure_preserves_installed_queues() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let installed = temp.path().join("installed.native.json");
+            std::fs::write(&installed, "{}").expect("write installed extension");
+            let candidate = temp.path().join("candidate.mjs");
+            std::fs::write(
+                &candidate,
+                r#"
+                export default async function init(pi) {
+                  pi.registerFlag("candidate-enabled", {
+                    type: "boolean",
+                    default: false
+                  });
+                  await pi.events("sendUserMessage", {
+                    text: "candidate startup input"
+                  });
+                }
+                "#,
+            )
+            .expect("write candidate extension");
+
+            let mut session = extension_activation_test_session(temp.path());
+            session
+                .enable_extensions(&[], temp.path(), None, &[installed])
+                .await
+                .expect("enable installed extension");
+            let installed_queue = Arc::clone(session.extension_injected_queue.as_ref().unwrap());
+            let installed_modes = Arc::clone(session.extension_queue_modes.as_ref().unwrap());
+            let installed_idle = Arc::clone(&session.extensions_pending_idle_actions);
+            let installed_lifetime =
+                Arc::downgrade(session.extension_message_fetcher_lifetime.as_ref().unwrap());
+            installed_queue
+                .lock()
+                .unwrap()
+                .push_steering(user_message("installed steering"));
+            installed_queue
+                .lock()
+                .unwrap()
+                .push_follow_up(user_message("installed follow-up"));
+            installed_idle
+                .lock()
+                .unwrap()
+                .push_back(PendingIdleAction::UserText("installed idle".to_string()));
+
+            // The factory queues work successfully, then flag coercion rejects
+            // the candidate. This exercises failure after host actions exist.
+            let err = session
+                .enable_extensions_with_policy(
+                    &[],
+                    temp.path(),
+                    None,
+                    std::slice::from_ref(&candidate),
+                    None,
+                    None,
+                    None,
+                    ExtensionHostConfiguration {
+                        cli_flags: vec![crate::cli::ExtensionCliFlag {
+                            name: "candidate-enabled".to_string(),
+                            value: Some("invalid".to_string()),
+                        }],
+                        ..ExtensionHostConfiguration::default()
+                    },
+                )
+                .await
+                .expect_err("invalid registered flag must reject candidate");
+            assert!(err.to_string().contains("Invalid boolean value"));
+            assert!(installed_lifetime.upgrade().is_some());
+            assert!(Arc::ptr_eq(
+                &installed_queue,
+                session.extension_injected_queue.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &installed_modes,
+                session.extension_queue_modes.as_ref().unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &installed_idle,
+                &session.extensions_pending_idle_actions
+            ));
+            assert_eq!(session.agent.steering_fetchers.len(), 1);
+            assert_eq!(session.agent.follow_up_fetchers.len(), 1);
+            let steering = session.agent.drain_steering_messages().await;
+            assert_eq!(steering.len(), 1);
+            assert_eq!(steering[0].text_for_display(), Some("installed steering"));
+            session.agent.fetch_additive_follow_up_messages().await;
+            let follow_up = session.agent.message_queue.pop_follow_up();
+            assert_eq!(follow_up.len(), 1);
+            assert_eq!(follow_up[0].text_for_display(), Some("installed follow-up"));
+            let idle = session.take_pending_idle_actions();
+            assert!(
+                matches!(idle.as_slice(), [PendingIdleAction::UserText(text)] if text == "installed idle")
+            );
+
+            // Accepted startup work remains deliverable, exactly once.
+            session
+                .enable_extensions(&[], temp.path(), None, &[candidate])
+                .await
+                .expect("accept candidate with its valid default flag");
+            assert!(installed_lifetime.upgrade().is_none());
+            let idle = session.take_pending_idle_actions();
+            assert!(
+                matches!(idle.as_slice(), [PendingIdleAction::UserText(text)] if text == "candidate startup input")
+            );
+            assert!(!session.has_pending_extension_idle_actions());
+            assert_eq!(session.agent.steering_fetchers.len(), 1);
+            assert_eq!(session.agent.follow_up_fetchers.len(), 1);
+        }));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_replacement_and_disable_retire_only_their_sources() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("queues.native.json");
+            std::fs::write(&entry, "{}").expect("write extension");
+
+            for disable in [false, true] {
+                let mut session = extension_activation_test_session(temp.path());
+                session.set_queue_modes(QueueMode::All, QueueMode::All);
+                session.agent.register_message_fetchers(
+                    Some(Arc::new(|| {
+                        Box::pin(async { vec![queued_user_message("host steering")] })
+                    })),
+                    Some(Arc::new(|| {
+                        Box::pin(async { vec![queued_user_message("host follow-up")] })
+                    })),
+                );
+                session
+                    .enable_extensions(&[], temp.path(), None, std::slice::from_ref(&entry))
+                    .await
+                    .expect("enable extension");
+                // External runtime handles may outlive the installed activation.
+                let _retired_manager = session.extensions.as_ref().unwrap().manager().clone();
+                let retired_queue = Arc::clone(session.extension_injected_queue.as_ref().unwrap());
+                let retired_idle = Arc::clone(&session.extensions_pending_idle_actions);
+                let retired_lifetime =
+                    Arc::downgrade(session.extension_message_fetcher_lifetime.as_ref().unwrap());
+                retired_queue
+                    .lock()
+                    .unwrap()
+                    .push_steering(user_message("retired early steering"));
+                retired_queue
+                    .lock()
+                    .unwrap()
+                    .push_follow_up(user_message("retired early follow-up"));
+                retired_idle
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingIdleAction::UserText("retired early idle".to_string()));
+                // Already accepted authored input belongs to the Agent, not
+                // to the extension source being retired.
+                session.agent.queue_steering(user_message("authored steering"));
+                session.agent.queue_follow_up(user_message("authored follow-up"));
+
+                let entries = if disable {
+                    Vec::new()
+                } else {
+                    vec![entry.clone()]
+                };
+                session
+                    .enable_extensions(&[], temp.path(), None, &entries)
+                    .await
+                    .expect("replace or disable extension");
+                assert!(retired_lifetime.upgrade().is_none());
+                assert!(!Arc::ptr_eq(
+                    &retired_idle,
+                    &session.extensions_pending_idle_actions
+                ));
+                retired_queue
+                    .lock()
+                    .unwrap()
+                    .push_steering(user_message("retired late steering"));
+                retired_queue
+                    .lock()
+                    .unwrap()
+                    .push_follow_up(user_message("retired late follow-up"));
+                retired_idle
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingIdleAction::UserText("retired late idle".to_string()));
+
+                let mut expected_steering = vec!["authored steering", "host steering"];
+                let mut expected_follow_up = vec!["authored follow-up", "host follow-up"];
+                if !disable {
+                    let active = session.extension_injected_queue.as_ref().unwrap();
+                    active
+                        .lock()
+                        .unwrap()
+                        .push_steering(user_message("active steering"));
+                    active
+                        .lock()
+                        .unwrap()
+                        .push_follow_up(user_message("active follow-up"));
+                    session
+                        .extensions_pending_idle_actions
+                        .lock()
+                        .unwrap()
+                        .push_back(PendingIdleAction::UserText("active idle".to_string()));
+                    expected_steering.push("active steering");
+                    expected_follow_up.push("active follow-up");
+                }
+                let steering = session.agent.drain_steering_messages().await;
+                assert_eq!(
+                    steering
+                        .iter()
+                        .map(|message| message.text_for_display().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected_steering
+                );
+                session.agent.fetch_additive_follow_up_messages().await;
+                let follow_up = session.agent.message_queue.pop_follow_up();
+                assert_eq!(
+                    follow_up
+                        .iter()
+                        .map(|message| message.text_for_display().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected_follow_up
+                );
+                let idle = session.take_pending_idle_actions();
+                if disable {
+                    assert!(idle.is_empty());
+                } else {
+                    assert!(
+                        matches!(idle.as_slice(), [PendingIdleAction::UserText(text)] if text == "active idle")
+                    );
+                }
+                let expected_sources = if disable { 1 } else { 2 };
+                assert_eq!(session.agent.steering_fetchers.len(), expected_sources);
+                assert_eq!(session.agent.follow_up_fetchers.len(), expected_sources);
+            }
+        }));
+    }
+
+    #[test]
+    fn extension_reload_prunes_retired_fetchers_without_polling() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(Box::pin(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("reload.native.json");
+            std::fs::write(&entry, "{}").expect("write extension");
+            let mut session = extension_activation_test_session(temp.path());
+            for _ in 0..4 {
+                session
+                    .enable_extensions(&[], temp.path(), None, std::slice::from_ref(&entry))
+                    .await
+                    .expect("enable extension");
+                assert_eq!(session.agent.steering_fetchers.len(), 1);
+                assert_eq!(session.agent.follow_up_fetchers.len(), 1);
+            }
+            session
+                .enable_extensions(&[], temp.path(), None, &[])
+                .await
+                .expect("disable extensions");
+            assert!(session.agent.steering_fetchers.is_empty());
+            assert!(session.agent.follow_up_fetchers.is_empty());
+            assert!(session.extension_message_fetcher_lifetime.is_none());
+        }));
     }
 
     #[test]
@@ -19937,6 +20227,7 @@ impl AgentSession {
             extensions_pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
             extension_queue_modes: None,
             extension_injected_queue: None,
+            extension_message_fetcher_lifetime: None,
             extension_ai_completion,
             compaction_settings,
             compaction_runtime: None,
@@ -24028,6 +24319,9 @@ impl AgentSession {
             self.agent.extensions = None;
             self.extension_queue_modes = None;
             self.extension_injected_queue = None;
+            self.extension_message_fetcher_lifetime = None;
+            self.agent.prune_expired_message_fetchers();
+            self.extensions_pending_idle_actions = Arc::new(StdMutex::new(VecDeque::new()));
             return Ok(());
         }
 
@@ -24038,6 +24332,9 @@ impl AgentSession {
             self.agent.extensions = None;
             self.extension_queue_modes = None;
             self.extension_injected_queue = None;
+            self.extension_message_fetcher_lifetime = None;
+            self.agent.prune_expired_message_fetchers();
+            self.extensions_pending_idle_actions = Arc::new(StdMutex::new(VecDeque::new()));
             return Ok(());
         }
 
@@ -24248,53 +24545,21 @@ impl AgentSession {
             steering_mode,
             follow_up_mode,
         )));
+        // Factories and startup hooks can enqueue work before activation has
+        // succeeded. Publish their queues only after catalog acceptance; failed
+        // candidates must not replace the installed activation's message sources.
+        let pending_idle_actions = Arc::new(StdMutex::new(VecDeque::new()));
         let host_actions = AgentSessionHostActions {
             session: Arc::clone(&self.session),
             injected: Arc::clone(&injected),
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_turn_active: Arc::clone(&self.extensions_turn_active),
-            pending_idle_actions: Arc::clone(&self.extensions_pending_idle_actions),
+            pending_idle_actions: Arc::clone(&pending_idle_actions),
             ai_completion: Arc::clone(&self.extension_ai_completion),
             provider_admission: self.provider_admission.clone(),
             session_action_admission: self.session_action_admission.clone(),
         };
-        self.extension_queue_modes = Some(Arc::clone(&queue_modes));
-        self.extension_injected_queue = Some(Arc::clone(&injected));
         manager.set_host_actions(Arc::new(host_actions));
-        {
-            let steering_queue = Arc::clone(&injected);
-            let follow_up_queue = Arc::clone(&injected);
-            let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                let steering_queue = Arc::clone(&steering_queue);
-                Box::pin(async move {
-                    let Ok(mut queue) = steering_queue.lock() else {
-                        return Vec::new();
-                    };
-                    queue
-                        .pop_steering()
-                        .into_iter()
-                        .map(QueuedAgentMessage::generated)
-                        .collect()
-                })
-            };
-            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                let follow_up_queue = Arc::clone(&follow_up_queue);
-                Box::pin(async move {
-                    let Ok(mut queue) = follow_up_queue.lock() else {
-                        return Vec::new();
-                    };
-                    queue
-                        .pop_follow_up()
-                        .into_iter()
-                        .map(QueuedAgentMessage::generated)
-                        .collect()
-                })
-            };
-            self.agent.register_message_fetchers(
-                Some(Arc::new(steering_fetcher)),
-                Some(Arc::new(follow_up_fetcher)),
-            );
-        }
         if !js_specs.is_empty() {
             manager.load_js_extensions(js_specs).await?;
         }
@@ -24412,6 +24677,43 @@ impl AgentSession {
         // publication did not replace; caller-installed overrides stay intact.
         self.agent.extension_tool_catalog.clear(&self.agent.tools);
         self.agent.extension_tool_catalog = catalog;
+        let lifetime = Arc::new(());
+        self.extension_message_fetcher_lifetime = Some(Arc::clone(&lifetime));
+        self.extension_queue_modes = Some(queue_modes);
+        self.extension_injected_queue = Some(Arc::clone(&injected));
+        self.extensions_pending_idle_actions = pending_idle_actions;
+        let steering_queue = Arc::clone(&injected);
+        let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
+            let steering_queue = Arc::clone(&steering_queue);
+            Box::pin(async move {
+                let Ok(mut queue) = steering_queue.lock() else {
+                    return Vec::new();
+                };
+                queue
+                    .pop_steering()
+                    .into_iter()
+                    .map(QueuedAgentMessage::generated)
+                    .collect()
+            })
+        };
+        let follow_up_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
+            let follow_up_queue = Arc::clone(&injected);
+            Box::pin(async move {
+                let Ok(mut queue) = follow_up_queue.lock() else {
+                    return Vec::new();
+                };
+                queue
+                    .pop_follow_up()
+                    .into_iter()
+                    .map(QueuedAgentMessage::generated)
+                    .collect()
+            })
+        };
+        self.agent.register_scoped_message_fetchers(
+            &lifetime,
+            Some(Arc::new(steering_fetcher)),
+            Some(Arc::new(follow_up_fetcher)),
+        );
         self.agent.extensions = Some(manager.clone());
         self.extensions = Some(ExtensionRegion::new(manager));
         self.extension_startup_timeout_ms = extension_startup_timeout_ms;
