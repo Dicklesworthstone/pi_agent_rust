@@ -51,6 +51,7 @@ fn test_tan_child_configuration_and_completion_formatting() {
         output: "Updated CHANGELOG.md with recent release notes.".to_string(),
         error: None,
         is_error: false,
+        workspace_roots: None,
     };
 
     let card_text = completion.card_text();
@@ -66,6 +67,7 @@ fn test_tan_child_configuration_and_completion_formatting() {
         output: String::new(),
         error: Some("Execution timed out".to_string()),
         is_error: true,
+        workspace_roots: None,
     };
     let fail_card = failed_completion.card_text();
     assert!(fail_card.starts_with("(/tan failed)"));

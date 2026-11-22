@@ -80,6 +80,8 @@ pub struct TanCompletion {
     pub output: String,
     pub error: Option<String>,
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_roots: Option<Value>,
 }
 
 impl TanCompletion {
@@ -92,6 +94,7 @@ impl TanCompletion {
             output: result.output,
             error: result.error,
             is_error: result.is_error,
+            workspace_roots: result.workspace_roots.map(|roots| json!(roots)),
         }
     }
 
@@ -125,6 +128,7 @@ impl TanCompletion {
 }
 
 /// A native tool that delegates bounded work to isolated Pi child processes.
+#[derive(Clone)]
 pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
@@ -132,7 +136,7 @@ pub struct SubagentTool {
     project_trusted: bool,
     /// A captured launch decision is authoritative over the standalone flag.
     workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
-    /// Shared admission policy for saved sessions and task files, including live roots.
+    /// Shared admission policy and revocable grants for delegated work.
     workspace: crate::workspace::WorkspaceHandle,
     child_binary: PathBuf,
     structured_results: bool,
@@ -154,6 +158,8 @@ pub struct SubagentTool {
     /// Fallback policy for direct SDK calls; live Agent execution supplies its
     /// own projection so discoveries stay scoped to the invoking session.
     privacy: Option<crate::text_completion::AuxiliaryPrivacy>,
+    /// Owned invocation privacy for executable child workspace disclosures.
+    workspace_privacy: Option<crate::text_completion::AuxiliaryPrivacySnapshot>,
     /// The same native owner identity used by jobs list/wait/cancel.
     job_session_scope: crate::jobs::JobSessionScope,
 }
@@ -177,6 +183,7 @@ pub(crate) struct RevivalSpec {
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
     cost_budget: Option<crate::cost::CostBudget>,
+    workspace_roots: Option<workspace::CapturedRoots>,
 }
 
 impl RevivalSpec {
@@ -246,6 +253,7 @@ pub(crate) async fn revive_child(
     )
     .with_parent_model(launch.parent_model.clone())
     .with_cost_budget(launch.cost_budget.clone())
+    .with_workspace_roots(launch.workspace_roots.clone())
     .with_task_limit(launch.max_task_bytes)
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
@@ -291,12 +299,14 @@ impl SubagentTool {
             parent_model: None,
             timeout: None,
             privacy: None,
+            workspace_privacy: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
 
-    /// Share the owning agent's live additional roots with saved-session
-    /// consultation. Changes to this handle apply to subsequent admission checks.
+    /// Share the owning agent's additional roots with delegated work and
+    /// saved-session consultation. Delegation freezes grants at admission;
+    /// removal revokes queued and running children at their native checkpoints.
     #[must_use]
     pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
         self.workspace = workspace;
@@ -411,6 +421,17 @@ impl SubagentTool {
             .map_or_else(|| self.parent_model.clone(), ToolModelScope::current)
     }
 
+    fn capture_workspace_roots(&self) -> Result<Option<workspace::CapturedRoots>> {
+        let privacy = self.workspace_privacy.clone().unwrap_or_else(|| {
+            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+                self.privacy.clone().unwrap_or_else(|| {
+                    crate::text_completion::AuxiliaryPrivacy::from_settings(None)
+                }),
+            )
+        });
+        workspace::CapturedRoots::capture(&self.workspace, privacy)
+    }
+
     /// Set the host's request-wide execution ceiling (1 ms through 24 hours).
     /// Without this override, `PI_SUBAGENT_TIMEOUT_SECS` supplies the ceiling,
     /// defaulting to 900 seconds. A model's `timeoutSeconds` can only shorten it.
@@ -453,6 +474,7 @@ impl SubagentTool {
         }
 
         let deadline = Deadline::for_request(self.timeout, None)?;
+        let workspace_roots = self.capture_workspace_roots()?;
         let definition = tan_agent_definition();
         let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
         let mut request = SubagentTask {
@@ -481,6 +503,7 @@ impl SubagentTool {
         .into_background()
         .with_parent_model(self.capture_parent_model())
         .with_cost_budget(self.cost_scope.current())
+        .with_workspace_roots(workspace_roots)
         .run_one(&agents, request, None, None)
         .await;
         Ok(TanCompletion::from_result(result))
@@ -510,6 +533,7 @@ impl SubagentTool {
             parent_model: None,
             timeout: None,
             privacy: None,
+            workspace_privacy: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
@@ -551,6 +575,7 @@ impl SubagentTool {
         deadline: Deadline,
     ) -> Result<PreparedRequest> {
         let parent_model = self.capture_parent_model();
+        let workspace_roots = self.capture_workspace_roots()?;
         let mut mode = request.mode()?;
         let agents = self.discover(request.scope)?;
         match &mut mode {
@@ -583,6 +608,7 @@ impl SubagentTool {
             )
             .with_parent_model(parent_model)
             .with_cost_budget(self.cost_scope.current())
+            .with_workspace_roots(workspace_roots)
             .with_launch_admission(launch_admission),
             agents,
             mode,
@@ -738,24 +764,19 @@ impl Tool for SubagentTool {
             .privacy
             .clone()
             .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
+        let snapshot =
+            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy.clone());
+        let mut invocation_tool = self.clone();
+        invocation_tool.workspace_privacy = Some(snapshot.clone());
         if worker::requested(&input)? {
-            return worker::execute(
-                self,
-                input,
-                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
-            )
-            .await;
+            return worker::execute(&invocation_tool, input, snapshot).await;
         }
         if background::requested(&input)? {
-            return background::start(
-                self,
-                input,
-                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
-            )
-            .await;
+            return background::start(&invocation_tool, input, snapshot).await;
         }
         let protect = |parts: &[&str]| crate::text_completion::redact_inputs(parts, &privacy);
-        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect)
+        invocation_tool
+            .execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect)
             .await
     }
 
@@ -766,13 +787,17 @@ impl Tool for SubagentTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         context: ToolInvocationContext<'_>,
     ) -> Result<ToolOutput> {
+        let privacy = (context.snapshot_privacy)();
+        let mut invocation_tool = self.clone();
+        invocation_tool.workspace_privacy = Some(privacy.clone());
         if worker::requested(&input)? {
-            return worker::execute(self, input, (context.snapshot_privacy)()).await;
+            return worker::execute(&invocation_tool, input, privacy).await;
         }
         if background::requested(&input)? {
-            return background::start(self, input, (context.snapshot_privacy)()).await;
+            return background::start(&invocation_tool, input, privacy).await;
         }
-        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+        invocation_tool
+            .execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
             .await
     }
 
@@ -826,6 +851,13 @@ impl Tool for SubagentTool {
             }
             return seance::execute(self, input, on_update.map(Arc::from), protect).await;
         }
+        if self.workspace_privacy.is_none() && !self.workspace.additional_roots().is_empty() {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_WORKSPACE_PRIVACY: delegated roots require an owned invocation privacy snapshot; use execute_with_invocation or standalone execute",
+            ));
+        }
+        workspace::protect_source_roots(&self.workspace, protect)?;
         if let Some(plan) = workflow::Plan::parse(&input)? {
             return plan.execute(self, on_update.map(Arc::from)).await;
         }
@@ -1750,6 +1782,9 @@ struct SubagentResult {
     /// and patches remain inspectable even when the final attempt succeeds.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     preserved_worktrees: Vec<crate::worktree_iso::IsoOutcome>,
+    /// Actual inherited, remapped and excluded additional-root grants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_roots: Option<workspace::InheritedRoots>,
     session_isolation: &'static str,
     /// Agent-hub run id (bd-cv653.5.3) when the registry tracked this run.
     /// Serialized as `hubId`: callers revive, steer and correlate runs from
@@ -1798,6 +1833,7 @@ impl SubagentResult {
             schema_retries: None,
             iso: None,
             preserved_worktrees: Vec::new(),
+            workspace_roots: None,
             session_isolation: "ephemeral_no_session",
             hub_id: None,
             is_error: false,
@@ -1831,6 +1867,7 @@ impl SubagentResult {
             schema_retries: None,
             iso: None,
             preserved_worktrees: Vec::new(),
+            workspace_roots: None,
             session_isolation: "ephemeral_no_session",
             hub_id: None,
             is_error: true,

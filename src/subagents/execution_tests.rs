@@ -56,6 +56,203 @@ fn request() -> Value {
     json!({"agent":"worker","task":"produce a result"})
 }
 
+const CAPTURE_ROOT_TRANSPORT: &str = r#"set -eu
+printf 'launched\n' >> root-launches
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --workspace-roots-file)
+            shift
+            test -f "$1"
+            printf '%s\n' "$1" >> root-manifest-paths
+            cat "$1" >> root-manifests
+            printf '\n' >> root-manifests
+            ;;
+        --append-system-prompt)
+            shift
+            cat "$1" >> root-system-prompts
+            printf '\n' >> root-system-prompts
+            ;;
+    esac
+    shift
+done
+"#;
+
+#[test]
+fn workspace_grants_are_frozen_through_queue_retry_and_revival_then_stay_revoked() {
+    let script = format!(
+        "{CAPTURE_ROOT_TRANSPORT}\nif [ -f retried ]; then\n{}else\ntouch retried\n{}fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("retry required", "stop")]),
+    );
+    let (root, mut tool) = fixture(&script);
+    let additional = tempfile::tempdir().expect("additional repository");
+    let later = tempfile::tempdir().expect("later root");
+    let mut workspace = crate::workspace::WorkspaceHandle::single(root.path());
+    workspace.add_root(additional.path());
+    tool.workspace = workspace.clone();
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "agent":"worker","task":"produce typed evidence",
+        "outputSchema":{"type":"object","required":["accepted"]},"schemaMode":"strict"
+    }))
+    .expect("strict request");
+    let prepared = tool.prepare_request(&request).expect("capture root grants");
+    workspace.add_root(later.path());
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("native runtime")
+        .block_on(prepared.run(None));
+    assert!(!results[0].is_error, "{:?}", results[0]);
+    assert_eq!(results[0].schema_retries, Some(1));
+    let first_id = results[0].hub_id.as_deref().expect("accepted child ID");
+    let revived = revive_through_hub(root.path(), first_id);
+    assert!(!revived.is_error, "{revived:?}");
+    let canonical = crate::extensions::safe_canonicalize(additional.path());
+    let expected = json!([canonical]);
+    let manifests = std::fs::read_to_string(root.path().join("root-manifests"))
+        .expect("three actual child manifests");
+    assert_eq!(manifests.lines().count(), 3);
+    for line in manifests.lines() {
+        let value: Value = serde_json::from_str(line).expect("bounded JSON manifest");
+        assert_eq!(value["roots"], expected);
+    }
+    let prompt = std::fs::read_to_string(root.path().join("root-system-prompts"))
+        .expect("actual child instructions");
+    assert!(prompt.contains("Delegated workspace access"));
+    assert!(!prompt.contains(later.path().to_str().expect("UTF-8 fixture")));
+    for path in std::fs::read_to_string(root.path().join("root-manifest-paths"))
+        .expect("private manifest lifetimes")
+        .lines()
+    {
+        assert!(!Path::new(path).exists(), "reaped child retained a manifest");
+    }
+    assert!(workspace.remove_root(additional.path()));
+    workspace.add_root(additional.path());
+    let refused = revive_through_hub(root.path(), revived_id(&revived));
+    assert!(refused.is_error, "{refused:?}");
+    assert!(
+        refused
+            .details
+            .unwrap()
+            .to_string()
+            .contains("PI_SUBAGENT_WORKSPACE_REVOKED")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("root-launches"))
+            .expect("no replacement process")
+            .lines()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn revoked_workspace_grants_refuse_launch_or_reap_the_live_child() {
+    for boundary in ["starting", "running"] {
+        let (root, mut tool) = fixture("sleep 30");
+        let additional = tempfile::tempdir().expect("additional root");
+        let mut workspace = crate::workspace::WorkspaceHandle::single(root.path());
+        workspace.add_root(additional.path());
+        tool.workspace = workspace.clone();
+        let path = additional.path().to_path_buf();
+        let output = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime")
+            .block_on(tool.execute(
+                "root-revocation",
+                request(),
+                Some(Box::new(move |update| {
+                    if update.details.as_ref().and_then(|details| {
+                        details.pointer("/result/status").and_then(Value::as_str)
+                    }) == Some(boundary)
+                    {
+                        let mut workspace = workspace.clone();
+                        workspace.remove_root(&path);
+                        workspace.add_root(&path);
+                    }
+                })),
+            ))
+            .expect("native failure result");
+        assert!(output.is_error, "{boundary}: {output:?}");
+        let record = result(&output);
+        assert!(
+            record["error"]
+                .as_str()
+                .unwrap()
+                .contains("PI_SUBAGENT_WORKSPACE_REVOKED")
+        );
+        if boundary == "starting" {
+            assert!(record["pid"].is_null());
+        } else {
+            let pid = i32::try_from(record["pid"].as_u64().expect("native process")).unwrap();
+            let pid = rustix::process::Pid::from_raw(pid).expect("positive process ID");
+            assert!(rustix::process::test_kill_process(pid).is_err());
+        }
+    }
+}
+
+#[test]
+fn workflow_and_tan_children_receive_the_same_admitted_workspace() {
+    let script = format!(
+        "{CAPTURE_ROOT_TRANSPORT}\n{}",
+        emit(&[ended("finished", "stop")])
+    );
+    let (root, mut tool) = fixture(&script);
+    let additional = tempfile::tempdir().expect("additional repository");
+    let mut workspace = crate::workspace::WorkspaceHandle::single(root.path());
+    workspace.add_root(additional.path());
+    tool.workspace = workspace;
+    let output = run(
+        &tool,
+        json!({"workflow":[
+            {"id":"inspect","call":{"agent":"worker","task":"inspect sibling"}},
+            {"id":"follow","needs":["inspect"],"call":{"agent":"worker","task":"use sibling"}}
+        ]}),
+    );
+    assert!(!output.is_error, "{output:?}");
+    let tan = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("native runtime")
+        .block_on(tool.run_background_tan("inspect sibling independently"))
+        .expect("background tan");
+    assert!(!tan.is_error, "{tan:?}");
+    assert_eq!(
+        tan.workspace_roots.unwrap()["inherited"],
+        json!([crate::extensions::safe_canonicalize(additional.path())])
+    );
+    let manifests = std::fs::read_to_string(root.path().join("root-manifests"))
+        .expect("workflow and tan manifests");
+    assert_eq!(manifests.lines().count(), 3);
+    for line in manifests.lines() {
+        let manifest: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            manifest["roots"],
+            json!([crate::extensions::safe_canonicalize(additional.path())])
+        );
+    }
+}
+
+#[test]
+fn borrowed_privacy_callbacks_cannot_authorize_persistent_workspace_disclosures() {
+    let (root, mut tool) = fixture("touch unexpectedly-launched");
+    let additional = tempfile::tempdir().unwrap();
+    let mut workspace = crate::workspace::WorkspaceHandle::single(root.path());
+    workspace.add_root(additional.path());
+    tool.workspace = workspace;
+    let protect = |parts: &[&str]| Ok(parts.iter().map(|part| (*part).to_string()).collect());
+    let error = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(tool.execute_with_auxiliary_privacy(
+            "borrowed-root-policy",
+            request(),
+            None,
+            &protect,
+        ))
+        .expect_err("generated child mappings need an owned policy");
+    assert!(error.to_string().contains("PI_SUBAGENT_WORKSPACE_PRIVACY"));
+    assert!(!root.path().join("unexpectedly-launched").exists());
+}
+
 #[test]
 fn file_tasks_reach_real_child_stdin_beyond_argv_limits_with_source_provenance() {
     use sha2::{Digest as _, Sha256};

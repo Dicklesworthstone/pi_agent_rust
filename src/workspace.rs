@@ -13,11 +13,55 @@
 //! stale copy. The [`WorkspaceHandle::default`] identity handle preserves
 //! legacy single-cwd behavior byte-for-byte (see [`WorkspaceHandle::snapshot_or`]).
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, Result};
 use crate::extensions::safe_canonicalize;
+use crate::file_identity::FileIdentity;
+
+/// Native child launch manifest; this is not project configuration or trust.
+#[doc(hidden)]
+pub const CHILD_WORKSPACE_ROOTS_SCHEMA: &str = "pi.child_workspace_roots.v1";
+#[doc(hidden)]
+pub const CHILD_WORKSPACE_ROOTS_MAX_ROOTS: usize = 128;
+#[doc(hidden)]
+pub const CHILD_WORKSPACE_ROOTS_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildWorkspaceRoots {
+    schema: String,
+    roots: Vec<String>,
+}
+
+/// A live grant, pinned by snapshots so a removed and re-added path cannot
+/// revive authority captured by an earlier child. Pointer identity cannot be
+/// reused while a snapshot still owns its token; there is no wrapping counter.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceRootGrant {
+    path: PathBuf,
+    token: Arc<()>,
+}
+
+impl WorkspaceRootGrant {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            token: Arc::new(()),
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.path == other.path && Arc::ptr_eq(&self.token, &other.token)
+    }
+}
 
 /// Shared workspace root set (multi-root confinement, bd-cv653.3.12).
 ///
@@ -26,7 +70,7 @@ use crate::extensions::safe_canonicalize;
 #[derive(Debug, Default)]
 pub struct WorkspaceHandle {
     primary: Option<PathBuf>,
-    additional: Arc<RwLock<Vec<PathBuf>>>,
+    additional: Arc<RwLock<Vec<WorkspaceRootGrant>>>,
 }
 
 impl Clone for WorkspaceHandle {
@@ -74,8 +118,8 @@ impl WorkspaceHandle {
             .additional
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !guard.contains(&canonical) {
-            guard.push(canonical);
+        if !guard.iter().any(|grant| grant.path == canonical) {
+            guard.push(WorkspaceRootGrant::new(canonical));
         }
     }
 
@@ -89,7 +133,7 @@ impl WorkspaceHandle {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = guard.len();
-        guard.retain(|existing| existing != &canonical);
+        guard.retain(|grant| grant.path != canonical);
         before != guard.len()
     }
 
@@ -108,10 +152,55 @@ impl WorkspaceHandle {
     /// Canonical additional roots in insertion order (primary excluded).
     #[must_use]
     pub fn additional_roots(&self) -> Vec<PathBuf> {
-        self.additional.read().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |guard| guard.clone(),
-        )
+        self.additional
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|grant| grant.path.clone())
+            .collect()
+    }
+
+    pub(crate) fn additional_root_grants(&self) -> Vec<WorkspaceRootGrant> {
+        self.additional
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn contains_additional_root_grants(&self, expected: &[WorkspaceRootGrant]) -> bool {
+        let roots = self
+            .additional
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        expected
+            .iter()
+            .all(|grant| roots.iter().any(|current| current.matches(grant)))
+    }
+
+    /// Install a native parent's bounded manifest only after every entry has
+    /// passed validation. Root strings are already canonical: do not resolve
+    /// them again during publication and accidentally adopt a replacement link.
+    /// This grants path access only; it never loads instructions or trusts
+    /// executable configuration from an additional directory.
+    ///
+    /// # Errors
+    /// Refuses malformed, replaced, oversized or non-regular manifests and
+    /// any missing, non-absolute or noncanonical root without changing state.
+    #[doc(hidden)]
+    pub fn load_child_workspace_roots(&mut self, path: &Path) -> Result<()> {
+        let roots = read_child_workspace_roots(path)?;
+        let mut guard = self
+            .additional
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for root in roots {
+            if self.primary.as_ref() != Some(&root)
+                && !guard.iter().any(|grant| grant.path == root)
+            {
+                guard.push(WorkspaceRootGrant::new(root));
+            }
+        }
+        Ok(())
     }
 
     /// Publish an already validated canonical root set without resolving paths
@@ -127,10 +216,19 @@ impl WorkspaceHandle {
             .additional
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.as_slice() != expected {
+        if !guard.iter().map(|grant| &grant.path).eq(expected.iter()) {
             return false;
         }
-        *guard = roots;
+        *guard = roots
+            .into_iter()
+            .map(|path| {
+                guard
+                    .iter()
+                    .find(|grant| grant.path == path)
+                    .cloned()
+                    .unwrap_or_else(|| WorkspaceRootGrant::new(path))
+            })
+            .collect();
         true
     }
 
@@ -163,6 +261,148 @@ impl WorkspaceHandle {
             additional: self.additional_roots(),
         }
     }
+}
+
+fn child_roots_error(message: impl std::fmt::Display) -> Error {
+    Error::validation(format!("PI_CHILD_WORKSPACE_ROOTS: {message}"))
+}
+
+fn validate_child_root(root: &Path) -> Result<()> {
+    let text = root
+        .to_str()
+        .ok_or_else(|| child_roots_error("root paths must be UTF-8"))?;
+    if text.is_empty()
+        || text.len() > CHILD_WORKSPACE_ROOTS_MAX_BYTES
+        || text.contains('\0')
+        || !root.is_absolute()
+    {
+        return Err(child_roots_error("root paths must be bounded absolute paths"));
+    }
+    let canonical = std::fs::canonicalize(root)
+        .map(crate::extensions::strip_unc_prefix)
+        .map_err(|_| child_roots_error("every root must be an existing directory"))?;
+    if canonical.as_os_str() != root.as_os_str() || !canonical.is_dir() {
+        return Err(child_roots_error(
+            "every root must name its exact canonical directory",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_child_workspace_roots(bytes: &[u8]) -> Result<Vec<PathBuf>> {
+    if bytes.len() > CHILD_WORKSPACE_ROOTS_MAX_BYTES {
+        return Err(child_roots_error("manifest exceeds 256 KiB"));
+    }
+    let manifest: ChildWorkspaceRoots = serde_json::from_slice(bytes)
+        .map_err(|_| child_roots_error("expected a strict schema and roots JSON object"))?;
+    if manifest.schema != CHILD_WORKSPACE_ROOTS_SCHEMA
+        || manifest.roots.len() > CHILD_WORKSPACE_ROOTS_MAX_ROOTS
+    {
+        return Err(child_roots_error("unsupported schema or more than 128 roots"));
+    }
+    let mut roots = Vec::with_capacity(manifest.roots.len());
+    for text in manifest.roots {
+        let root = PathBuf::from(text);
+        validate_child_root(&root)?;
+        if roots.contains(&root) {
+            return Err(child_roots_error("duplicate root paths"));
+        }
+        roots.push(root);
+    }
+    Ok(roots)
+}
+
+/// Encode the same strict manifest accepted by native child startup.
+///
+/// # Errors
+/// Refuses unsupported path encodings, noncanonical or missing directories,
+/// duplicate roots, or a manifest exceeding its count/byte limits.
+#[doc(hidden)]
+pub fn encode_child_workspace_roots(roots: &[PathBuf]) -> Result<Vec<u8>> {
+    if roots.len() > CHILD_WORKSPACE_ROOTS_MAX_ROOTS {
+        return Err(child_roots_error("manifest exceeds 128 roots"));
+    }
+    let mut strings = Vec::with_capacity(roots.len());
+    let mut text_bytes = 0_usize;
+    for root in roots {
+        validate_child_root(root)?;
+        let text = root
+            .to_str()
+            .ok_or_else(|| child_roots_error("root paths must be UTF-8"))?;
+        text_bytes = text_bytes.saturating_add(text.len());
+        if text_bytes > CHILD_WORKSPACE_ROOTS_MAX_BYTES {
+            return Err(child_roots_error("manifest exceeds 256 KiB"));
+        }
+        if strings.iter().any(|existing| existing == text) {
+            return Err(child_roots_error("duplicate root paths"));
+        }
+        strings.push(text.to_string());
+    }
+    let bytes = serde_json::to_vec(&ChildWorkspaceRoots {
+        schema: CHILD_WORKSPACE_ROOTS_SCHEMA.to_string(),
+        roots: strings,
+    })
+    .map_err(|_| child_roots_error("could not encode manifest"))?;
+    if bytes.len() > CHILD_WORKSPACE_ROOTS_MAX_BYTES {
+        return Err(child_roots_error("manifest exceeds 256 KiB"));
+    }
+    Ok(bytes)
+}
+
+fn read_child_workspace_roots(path: &Path) -> Result<Vec<PathBuf>> {
+    let io_error = |_| child_roots_error("manifest is unavailable or changed during reading");
+    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.is_file() || metadata.len() > CHILD_WORKSPACE_ROOTS_MAX_BYTES as u64 {
+        return Err(child_roots_error(
+            "manifest must be a regular non-symlink file of at most 256 KiB",
+        ));
+    }
+    let identity = FileIdentity::of_path_nofollow(path).map_err(io_error)?;
+    #[cfg(unix)]
+    let mut file = File::from(
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .map_err(io_error)?,
+    );
+    #[cfg(windows)]
+    let mut file: File = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(path)
+            .map_err(io_error)?
+    };
+    #[cfg(not(any(unix, windows)))]
+    let mut file = File::open(path).map_err(io_error)?;
+    let opened = file.metadata().map_err(io_error)?;
+    if !opened.is_file()
+        || opened.len() != metadata.len()
+        || FileIdentity::of_open_file(&file).map_err(io_error)? != identity
+    {
+        return Err(child_roots_error("manifest changed while opening"));
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(CHILD_WORKSPACE_ROOTS_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    let after = file.metadata().map_err(io_error)?;
+    if after.len() != opened.len()
+        || after.modified().map_err(io_error)? != opened.modified().map_err(io_error)?
+        || bytes.len() as u64 != opened.len()
+        || FileIdentity::of_path_nofollow(path).map_err(io_error)? != identity
+    {
+        return Err(child_roots_error("manifest changed while reading"));
+    }
+    parse_child_workspace_roots(&bytes)
 }
 
 /// An immutable root-set snapshot for one confinement check.
@@ -396,5 +636,221 @@ mod tests {
             validate_new_root(&primary).expect("valid dir"),
             safe_canonicalize(&primary)
         );
+    }
+
+    #[test]
+    fn child_manifest_round_trip_installs_shared_roots_without_reissuing_grants() {
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let primary = temporary.path().join("primary");
+        let extra = temporary.path().join("extra root 雪");
+        std::fs::create_dir(&primary).expect("primary");
+        std::fs::create_dir(&extra).expect("additional root");
+        let primary = safe_canonicalize(&primary);
+        let extra = safe_canonicalize(&extra);
+        let manifest = temporary.path().join("roots.json");
+        let encoded = encode_child_workspace_roots(&[primary.clone(), extra.clone()])
+            .expect("canonical manifest");
+        std::fs::write(&manifest, &encoded).expect("manifest");
+        let mut workspace = WorkspaceHandle::single(&primary);
+        let cloned = workspace.clone();
+        workspace
+            .load_child_workspace_roots(&manifest)
+            .expect("install parent roots");
+        let grants = workspace.additional_root_grants();
+        assert_eq!(cloned.additional_roots(), vec![extra.clone()]);
+        assert_eq!(grants[0].path(), extra);
+        workspace
+            .load_child_workspace_roots(&manifest)
+            .expect("duplicate installation is idempotent");
+        assert!(cloned.contains_additional_root_grants(&grants));
+        assert_eq!(workspace.roots(), vec![primary, extra]);
+        assert_eq!(std::fs::read(&manifest).expect("unmodified source"), encoded);
+    }
+
+    #[test]
+    fn child_manifest_invalid_later_entry_never_installs_a_valid_prefix() {
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let primary = safe_canonicalize(temporary.path());
+        let existing = primary.join("existing");
+        let proposed = primary.join("proposed");
+        std::fs::create_dir(&existing).expect("existing root");
+        std::fs::create_dir(&proposed).expect("proposed root");
+        let ordinary_file = primary.join("ordinary.txt");
+        std::fs::write(&ordinary_file, "not a directory").expect("ordinary file");
+        let manifest = primary.join("roots.json");
+        let mut workspace = WorkspaceHandle::single(&primary);
+        workspace.add_root(&existing);
+        let grants = workspace.additional_root_grants();
+        let cases = [
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,"relative"]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,""]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,"bad\u{0}root"]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,primary.join("missing")]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,ordinary_file]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,proposed]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed,12]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[proposed],"trust":true}),
+            serde_json::json!({"schema":"pi.child_workspace_roots.v2","roots":[proposed]}),
+            serde_json::json!({"schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":proposed}),
+        ];
+        for case in cases {
+            std::fs::write(&manifest, serde_json::to_vec(&case).expect("fixture JSON"))
+                .expect("manifest");
+            let error = workspace
+                .load_child_workspace_roots(&manifest)
+                .expect_err("invalid manifest must fail as one operation");
+            assert!(error.to_string().contains("PI_CHILD_WORKSPACE_ROOTS"));
+            assert_eq!(workspace.additional_roots(), vec![existing.clone()]);
+            assert!(workspace.contains_additional_root_grants(&grants));
+        }
+    }
+
+    #[test]
+    fn child_manifest_parser_rejects_ambiguous_json_and_noncanonical_paths() {
+        for bytes in [
+            b"".as_slice(),
+            b"null".as_slice(),
+            b"[]".as_slice(),
+            b"{}".as_slice(),
+            br#"{"schema":"pi.child_workspace_roots.v1","roots":[],"roots":[]}"#.as_slice(),
+            br#"{"schema":"pi.child_workspace_roots.v1","schema":"pi.child_workspace_roots.v1","roots":[]}"#.as_slice(),
+            br#"{"schema":"pi.child_workspace_roots.v1","roots":[]} {}"#.as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            assert!(parse_child_workspace_roots(bytes).is_err());
+        }
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let canonical = safe_canonicalize(temporary.path());
+        let noncanonical = canonical.join(".");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[noncanonical]
+        }))
+        .expect("fixture JSON");
+        assert!(parse_child_workspace_roots(&bytes).is_err());
+        assert!(encode_child_workspace_roots(&[noncanonical]).is_err());
+        assert!(encode_child_workspace_roots(&[canonical.clone(), canonical]).is_err());
+    }
+
+    #[test]
+    fn child_manifest_count_and_encoded_byte_boundaries_are_exact() {
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let mut roots = Vec::new();
+        for index in 0..=CHILD_WORKSPACE_ROOTS_MAX_ROOTS {
+            let path = temporary.path().join(index.to_string());
+            std::fs::create_dir(&path).expect("bounded root fixture");
+            roots.push(safe_canonicalize(&path));
+        }
+        let accepted = &roots[..CHILD_WORKSPACE_ROOTS_MAX_ROOTS];
+        let encoded = encode_child_workspace_roots(accepted).expect("128 roots accepted");
+        assert_eq!(parse_child_workspace_roots(&encoded).unwrap(), accepted);
+        assert!(encode_child_workspace_roots(&roots).is_err());
+        let oversized_count = serde_json::to_vec(&serde_json::json!({
+            "schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":roots
+        }))
+        .unwrap();
+        assert!(parse_child_workspace_roots(&oversized_count).is_err());
+
+        let mut exact = encode_child_workspace_roots(&[]).expect("empty manifest");
+        exact.resize(CHILD_WORKSPACE_ROOTS_MAX_BYTES, b' ');
+        let manifest = temporary.path().join("roots.json");
+        std::fs::write(&manifest, &exact).expect("maximum-size JSON");
+        assert!(read_child_workspace_roots(&manifest).unwrap().is_empty());
+        exact.push(b' ');
+        assert!(parse_child_workspace_roots(&exact).is_err());
+        std::fs::write(&manifest, &exact).expect("oversized JSON");
+        assert!(read_child_workspace_roots(&manifest).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn child_manifest_refuses_symlinks_special_files_and_non_utf8_roots() {
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let canonical = safe_canonicalize(temporary.path());
+        let manifest = canonical.join("roots.json");
+        std::fs::write(&manifest, encode_child_workspace_roots(&[]).unwrap())
+            .expect("valid manifest");
+        let file_link = canonical.join("manifest-link");
+        symlink(&manifest, &file_link).expect("manifest symlink");
+        assert!(read_child_workspace_roots(&file_link).is_err());
+        assert!(read_child_workspace_roots(&canonical).is_err());
+        let root_link = canonical.join("root-link");
+        symlink(&canonical, &root_link).expect("root symlink");
+        assert!(encode_child_workspace_roots(&[root_link.clone()]).is_err());
+        let linked_root = serde_json::to_vec(&serde_json::json!({
+            "schema":CHILD_WORKSPACE_ROOTS_SCHEMA,"roots":[root_link]
+        }))
+        .unwrap();
+        assert!(parse_child_workspace_roots(&linked_root).is_err());
+        let fifo = canonical.join("manifest-fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("FIFO fixture");
+        assert!(read_child_workspace_roots(&fifo).is_err());
+        let non_utf8 = canonical.join(std::ffi::OsString::from_vec(vec![b'x', 0xff]));
+        std::fs::create_dir(&non_utf8).expect("non-UTF-8 directory");
+        assert!(encode_child_workspace_roots(&[non_utf8]).is_err());
+    }
+
+    #[test]
+    fn workspace_grants_survive_unrelated_changes_but_not_remove_and_readd() {
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let mut workspace = WorkspaceHandle::single(temporary.path());
+        let first = temporary.path().join("first");
+        let other = temporary.path().join("other");
+        std::fs::create_dir(&first).expect("first root");
+        std::fs::create_dir(&other).expect("other root");
+        workspace.add_root(&first);
+        let grants = workspace.additional_root_grants();
+        let mut cloned = workspace.clone();
+        cloned.add_root(&other);
+        assert!(workspace.contains_additional_root_grants(&grants));
+        cloned.add_root(&first);
+        assert!(workspace.contains_additional_root_grants(&grants));
+        assert!(cloned.remove_root(&first));
+        cloned.add_root(&first);
+        assert!(!workspace.contains_additional_root_grants(&grants));
+        let renewed = workspace.additional_root_grants();
+        assert!(cloned.contains_additional_root_grants(&renewed));
+        assert_eq!(renewed.len(), 2);
+    }
+
+    #[test]
+    fn conditional_root_replacement_preserves_only_unrevoked_grants() {
+        let temporary = tempfile::tempdir().expect("workspace fixture");
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        let third = temporary.path().join("third");
+        for path in [&first, &second, &third] {
+            std::fs::create_dir(path).expect("root fixture");
+        }
+        let first = safe_canonicalize(&first);
+        let second = safe_canonicalize(&second);
+        let third = safe_canonicalize(&third);
+        let mut workspace = WorkspaceHandle::single(temporary.path());
+        workspace.add_root(&first);
+        workspace.add_root(&second);
+        let original = workspace.additional_root_grants();
+        assert!(workspace.replace_additional_roots_if_unchanged(
+            &[first.clone(), second.clone()],
+            vec![second.clone(), first.clone(), third.clone()]
+        ));
+        assert!(workspace.contains_additional_root_grants(&original));
+        assert!(!workspace.replace_additional_roots_if_unchanged(&[first.clone()], vec![]));
+        assert!(workspace.contains_additional_root_grants(&original));
+        let expected = workspace.additional_roots();
+        assert!(workspace.replace_additional_roots_if_unchanged(&expected, vec![second.clone()]));
+        let expected = workspace.additional_roots();
+        assert!(workspace.replace_additional_roots_if_unchanged(
+            &expected,
+            vec![first, second, third]
+        ));
+        assert!(!workspace.contains_additional_root_grants(&original));
+        assert!(workspace.contains_additional_root_grants(&original[1..]));
     }
 }

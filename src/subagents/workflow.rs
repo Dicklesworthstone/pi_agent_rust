@@ -444,6 +444,7 @@ impl Plan {
         deadline: Deadline,
     ) -> Result<PreparedWorkflow> {
         let parent_model = tool.capture_parent_model();
+        let workspace_roots = tool.capture_workspace_roots()?;
         let owner = AgentCx::for_current_or_request();
         check_authority(&owner)?;
         deadline
@@ -478,6 +479,7 @@ impl Plan {
         .with_parent_model(parent_model)
         .with_task_limit(MAX_TASK_BYTES)
         .with_cost_budget(tool.cost_scope.current())
+        .with_workspace_roots(workspace_roots)
         .with_launch_admission(launch_admission);
         check_authority(&owner)?;
         deadline

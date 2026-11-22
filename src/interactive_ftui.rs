@@ -10669,6 +10669,8 @@ async fn run_tan_command(
     let parent_model = tools.model_scope().current();
     let cost_budget = tools.cost_scope().current();
     let tool = crate::subagents::SubagentTool::new(cwd)
+        .with_workspace(handle.workspace().unwrap_or_default())
+        .with_secrets_settings(config.secrets.as_ref())
         .with_role_model_selection(role_selection)
         .with_model_config(Some(config))
         .with_parent_model(parent_model)

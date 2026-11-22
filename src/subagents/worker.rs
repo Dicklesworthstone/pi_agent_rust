@@ -78,6 +78,7 @@ pub(super) struct WorkerState {
     // Recovery identity survives process retirement, including a cancelled turn
     // that never produced a complete cumulative patch.
     workspace: Option<Value>,
+    workspace_roots: Option<Value>,
 }
 
 fn registry() -> &'static Mutex<VecDeque<Shared>> {
@@ -253,6 +254,15 @@ pub(super) fn bind_workspace(state: &Shared, descriptor: Value) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn bind_workspace_roots(state: &Shared, descriptor: Value) -> Result<()> {
+    let mut state = state.lock().map_err(|_| stopped())?;
+    if state.workspace_roots.is_some() {
+        return Err(stopped());
+    }
+    state.workspace_roots = Some(descriptor);
+    Ok(())
+}
+
 fn hold_results(
     results: Arc<crate::agent_hub::ResultDependencies>,
     acknowledged: Vec<u64>,
@@ -336,6 +346,7 @@ async fn start(
     let admission = crate::jobs::admit_owned_task(&owner_id)?;
     let parent_model = tool.capture_parent_model();
     let cost_budget = tool.cost_scope.current();
+    let workspace_roots = workspace::CapturedRoots::capture(&tool.workspace, privacy.clone())?;
     let mut definitions = tool.discover(scope)?;
     let mut agent = definitions
         .remove(&name)
@@ -410,6 +421,7 @@ async fn start(
         context_tokens: None,
         context_window: None,
         workspace: None,
+        workspace_roots: None,
     }));
     register(Arc::clone(&state))?;
     let runner = ChildRunner::new(
@@ -422,6 +434,7 @@ async fn start(
     )
     .with_parent_model(parent_model)
     .with_cost_budget(cost_budget)
+    .with_workspace_roots(workspace_roots)
     .with_worker_model_selection(model_selection)
     .with_worker_fallback_policy(fallback_policy)
     .with_worker_isolation(isolation);
@@ -712,6 +725,7 @@ fn snapshot(
             "admittedTurns": state.latest, "queuedTurns": state.queue.len(),
             "contextTokens": state.context_tokens, "contextWindow": state.context_window,
             "workspace": state.workspace,
+            "workspaceRoots": state.workspace_roots,
             "remainingMs": u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
         })
     };
@@ -1017,6 +1031,7 @@ mod tests {
             context_tokens: Some(321),
             context_window: Some(4096),
             workspace: None,
+            workspace_roots: None,
         }))
     }
 
