@@ -47,6 +47,7 @@ struct PoolState {
     agent: String,
     deadline: Deadline,
     max_batch_size: usize,
+    yield_results: bool,
     acknowledged: bool,
     sealed: bool,
     closing: bool,
@@ -143,7 +144,13 @@ fn tasks(input: &Value, allow_empty: bool) -> Result<Vec<String>> {
         .collect()
 }
 
-fn worker(owner: &str, agent: &str, deadline: Deadline, max_batch_size: usize) -> Shared {
+fn worker(
+    owner: &str,
+    agent: &str,
+    deadline: Deadline,
+    max_batch_size: usize,
+    yield_results: bool,
+) -> Shared {
     Arc::new(Mutex::new(WorkerState {
         owner: owner.to_string(),
         id: format!("pool-member-{}", uuid::Uuid::new_v4().simple()),
@@ -159,6 +166,8 @@ fn worker(owner: &str, agent: &str, deadline: Deadline, max_batch_size: usize) -
         failed: false,
         latest: 0,
         max_batch_size,
+        yield_results,
+        active_batch: false,
         queue: VecDeque::new(),
         turns: BTreeMap::new(),
         result_bytes: 0,
@@ -184,6 +193,7 @@ async fn start(
             "model",
             "concurrency",
             "maxBatchSize",
+            "yieldResults",
             "cwd",
             "scope",
             "timeoutSeconds",
@@ -221,6 +231,19 @@ async fn start(
     let max_batch_size =
         usize::try_from(optional_integer(&input, "maxBatchSize", 1, MAX_BATCH_SIZE)?.unwrap_or(1))
             .map_err(|_| invalid("maxBatchSize must be from 1 to 8"))?;
+    let yield_results = match input.get("yieldResults") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err(invalid("yieldResults must be a boolean")),
+    };
+    if yield_results
+        && (max_batch_size == 1
+            || input.get("isolation").and_then(Value::as_str) == Some("worktree"))
+    {
+        return Err(invalid(
+            "yieldResults requires maxBatchSize greater than 1 and no worktree isolation",
+        ));
+    }
     let timeout = optional_integer(&input, "timeoutSeconds", 1, 86_400)?;
     let scope: AgentScope = input.get("scope").map_or_else(
         || Ok(AgentScope::default()),
@@ -279,7 +302,7 @@ async fn start(
     let isolation = super::isolation::Capture::prepare(&input, &cwd, &privacy)?;
     recheck_owner(tool, &owner, &owner_id, deadline).await?;
     let workers: Vec<_> = (0..concurrency)
-        .map(|_| worker(&owner_id, &name, deadline, max_batch_size))
+        .map(|_| worker(&owner_id, &name, deadline, max_batch_size, yield_results))
         .collect();
     let id = format!("pool-{}", uuid::Uuid::new_v4().simple());
     let pool = Arc::new(Mutex::new(PoolState {
@@ -289,6 +312,7 @@ async fn start(
         agent: name,
         deadline,
         max_batch_size,
+        yield_results,
         acknowledged: false,
         sealed: false,
         closing: false,
@@ -446,7 +470,8 @@ fn prepare_batch(
                     .turns
                     .values()
                     .filter(|turn| pending(turn.status))
-                    .count();
+                    .count()
+                    .max(usize::from(worker.active_batch));
                 Ok(WorkerLoad {
                     index,
                     active,
@@ -916,6 +941,7 @@ fn drain_snapshot(
             "schema":DRAIN_SCHEMA,"poolId":state.id,"jobId":state.job_id,"agent":state.agent,
             "status":status(&state,false),"sealed":state.sealed,
             "maxBatchSize":state.max_batch_size,
+            "yieldResults":state.yield_results,
             "admittedItems":state.items.len(),"settledItems":settled,
             "pendingItems":state.items.len() - settled,
             "cursor":drain_cursor(&state.id,&request.acknowledged),
@@ -924,6 +950,7 @@ fn drain_snapshot(
             "timedOut":expired && items.is_empty() && !done,"items":items,
             "workerWorkspaces":workers.iter().enumerate().map(|(index, worker)| json!({
                 "workerIndex":index + 1, "workspace":worker.workspace, "closed":worker.closed,
+                "yieldResults":worker.yield_results,
                 "workspaceRoots":worker.workspace_roots,
             })).collect::<Vec<_>>(),
         });
@@ -949,6 +976,7 @@ fn project_drain_snapshot(
         "status",
         "sealed",
         "maxBatchSize",
+        "yieldResults",
         "admittedItems",
         "settledItems",
         "pendingItems",
@@ -1177,6 +1205,7 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
         "schema":SCHEMA, "poolId":state.id, "jobId":state.job_id, "agent":state.agent,
         "status":status(state, terminal), "sealed":state.sealed, "concurrency":state.workers.len(),
         "maxBatchSize":state.max_batch_size,
+        "yieldResults":state.yield_results,
         "admittedItems":state.items.len(), "queuedItems":queued, "runningItems":running,
         "completedItems":completed, "failedItems":failed, "items":items,
         "remainingMs":u64::try_from(state.deadline.remaining().as_millis()).unwrap_or(u64::MAX),
@@ -1185,6 +1214,7 @@ fn manifest(state: &PoolState, selected: Option<u64>, terminal: bool) -> Result<
         })).collect::<Vec<_>>(),
         "workerWorkspaces":workers.iter().enumerate().map(|(index, worker)| json!({
             "workerIndex":index + 1, "workspace":worker.workspace, "closed":worker.closed,
+            "yieldResults":worker.yield_results,
             "workspaceRoots":worker.workspace_roots,
         })).collect::<Vec<_>>(),
     });
@@ -1227,6 +1257,7 @@ fn projected_snapshot_with(
         "sealed",
         "concurrency",
         "maxBatchSize",
+        "yieldResults",
         "admittedItems",
         "queuedItems",
         "runningItems",
@@ -1404,7 +1435,7 @@ impl PoolRun {
                     .turns
                     .values()
                     .any(|turn| matches!(turn.status, "failed" | "cancelled"));
-            if state.sealed && !pending {
+            if state.sealed && !pending && !worker.active_batch {
                 worker.closing = true;
             }
             all_closed &= worker.closed;
@@ -2114,6 +2145,7 @@ done
                 .await;
             let pool = field(&started, "poolId");
             assert_eq!(started["maxBatchSize"], 8);
+            assert_eq!(started["yieldResults"], false);
             let shared = lookup(&fixture.owner, &pool).expect("owned native pool");
             {
                 let state = shared.lock().expect("pool state");
@@ -2139,6 +2171,7 @@ done
                     .call(json!({"operation":operation,"poolId":pool}))
                     .await;
                 assert_eq!(observed["maxBatchSize"], 8);
+                assert_eq!(observed["yieldResults"], false);
                 assert_eq!(observed["admittedItems"], 0);
                 if operation == "pool_exchange" {
                     assert_eq!(observed["snapshot"]["maxBatchSize"], 8);
@@ -2158,6 +2191,162 @@ done
                 fixture.assert_reaped();
             }
         });
+    }
+
+    #[test]
+    fn yield_results_is_validated_before_admission_and_frozen_in_recovery() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(RPC_CHILD);
+        runtime().block_on(async {
+            for value in [Value::Null, json!(1), json!("true"), json!([]), json!({})] {
+                let error = fixture
+                    .tool
+                    .execute(
+                        "invalid-yield-control",
+                        json!({"operation":"pool_start","agent":"unknown-before-discovery",
+                            "maxBatchSize":2,"yieldResults":value}),
+                        None,
+                    )
+                    .await
+                    .expect_err("yieldResults requires an exact boolean");
+                assert!(error.to_string().contains("yieldResults"));
+            }
+            for controls in [
+                json!({}),
+                json!({"maxBatchSize":1}),
+                json!({"maxBatchSize":2,"isolation":"worktree"}),
+                json!({"maxBatchSize":8,"isolation":"worktree","isoApply":"keep"}),
+            ] {
+                let mut input = json!({"operation":"pool_start","agent":"unknown-before-discovery",
+                    "yieldResults":true});
+                input
+                    .as_object_mut()
+                    .expect("native start object")
+                    .extend(controls.as_object().expect("controlled option map").clone());
+                let error = fixture
+                    .tool
+                    .execute("unsupported-yield-configuration", input, None)
+                    .await
+                    .expect_err("unsupported yield configuration");
+                assert!(error.to_string().contains("yieldResults"));
+            }
+            assert!(crate::jobs::list(&fixture.owner).expect("owned jobs").is_empty());
+            assert!(!fixture.root.path().join("launches").exists());
+
+            let started = fixture.call(json!({"operation":"pool_start","agent":"worker",
+                "concurrency":2,"maxBatchSize":2,"yieldResults":true,"isolation":"none"})).await;
+            let pool = field(&started, "poolId");
+            assert_eq!(started["yieldResults"], true);
+            let shared = lookup(&fixture.owner, &pool).expect("owned native pool");
+            {
+                let state = shared.lock().expect("pool state");
+                assert!(state.yield_results);
+                for member in &state.workers {
+                    assert!(super::super::yield_results(member));
+                }
+            }
+            for operation in ["pool_push", "pool_exchange", "pool_finish", "pool_status"] {
+                let error = fixture
+                    .tool
+                    .execute(
+                        "frozen-yield-configuration",
+                        json!({"operation":operation,"poolId":pool,"yieldResults":false}),
+                        None,
+                    )
+                    .await
+                    .expect_err("a control cannot change the frozen yield mode");
+                assert!(error.to_string().contains("yieldResults"));
+            }
+            for operation in ["pool_status", "pool_drain", "pool_exchange", "pool_finish", "pool_close"] {
+                let observed = fixture.call(json!({"operation":operation,"poolId":pool})).await;
+                assert_eq!(observed["yieldResults"], true);
+                for member in observed["workerWorkspaces"].as_array().expect("member receipts") {
+                    assert_eq!(member["yieldResults"], true);
+                }
+                if operation == "pool_exchange" {
+                    assert_eq!(observed["snapshot"]["yieldResults"], true);
+                }
+            }
+            let drained = fixture.call(json!({"operation":"pool_drain","poolId":pool})).await;
+            assert_eq!(drained["yieldResults"], true);
+            assert_eq!(drained["done"], true);
+            if fixture.root.path().join("launches").exists() {
+                fixture.assert_reaped();
+            }
+        });
+    }
+
+    #[test]
+    fn all_yielded_worker_remains_busy_for_placement_and_sealed_retirement() {
+        let privacy = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
+        let deadline = Deadline::for_request(Some(Duration::from_secs(60)), None)
+            .expect("bounded pool fixture");
+        let busy = worker("yield-owner", "reviewer", deadline, 2, true);
+        let idle = worker("yield-owner", "reviewer", deadline, 2, true);
+        {
+            let mut state = busy.lock().expect("busy member");
+            state.acknowledged = true;
+            state.started = true;
+            state.active_batch = true;
+            state.latest = 1;
+            state.context_tokens = Some(0);
+            state.context_window = Some(1000);
+            state.turns.insert(
+                1,
+                Turn {
+                    status: "completed",
+                    result: Some(ToolOutput {
+                        content: vec![ContentBlock::Text(TextContent::new("accepted early"))],
+                        details: None,
+                        is_error: false,
+                    }),
+                    privacy: None,
+                    dependency: crate::agent_hub::ResultDependency::new(None),
+                },
+            );
+        }
+        {
+            let mut state = idle.lock().expect("idle member");
+            state.context_tokens = Some(900);
+            state.context_window = Some(1000);
+        }
+        let pool = Arc::new(Mutex::new(PoolState {
+            owner: "yield-owner".to_string(),
+            id: "yield-pool".to_string(),
+            job_id: "yield-job".to_string(),
+            agent: "reviewer".to_string(),
+            deadline,
+            max_batch_size: 2,
+            yield_results: true,
+            acknowledged: true,
+            sealed: false,
+            closing: false,
+            closed: false,
+            failed: false,
+            workers: vec![Arc::clone(&busy), Arc::clone(&idle)],
+            items: vec![Item { worker: 0, turn: 1 }],
+            dependencies: crate::agent_hub::ResultDependencies::new(Vec::new()),
+            privacy: vec![privacy.clone()],
+        }));
+        let prepared = prepare_batch(&pool, 1, &privacy, false).expect("new work placement");
+        // The lower-context member is still physically busy even though its
+        // only logical result is ready. The actually idle member wins.
+        assert_eq!(prepared.placements, vec![(1, 1)]);
+        pool.lock().expect("pool state").sealed = true;
+        let controller = PoolRun {
+            pool,
+            actors: Some(FuturesUnordered::new()),
+            settled: false,
+        };
+        assert!(!controller.monitor().expect("sealed pool monitoring"));
+        assert!(!busy.lock().expect("busy member").closing);
+        assert!(idle.lock().expect("idle member").closing);
+        super::super::finish_batch(&busy).expect("physical turn reached idle");
+        assert!(!controller.monitor().expect("retirement after idle"));
+        assert!(busy.lock().expect("busy member").closing);
+        super::super::finish(&busy, None);
+        super::super::finish(&idle, None);
+        assert!(controller.monitor().expect("all physical children reaped"));
     }
 
     #[test]

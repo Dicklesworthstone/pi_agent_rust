@@ -1842,6 +1842,8 @@ def _pool_snapshot(snapshot, pool_id=None, item_id=None):
             or type(snapshot.get("sealed")) is not bool
             or type(snapshot.get("concurrency")) is not int or not 1 <= snapshot["concurrency"] <= 8
             or type(snapshot.get("maxBatchSize")) is not int or not 1 <= snapshot["maxBatchSize"] <= 8
+            or ("yieldResults" in snapshot and type(snapshot["yieldResults"]) is not bool)
+            or (snapshot.get("yieldResults", False) and snapshot["maxBatchSize"] < 2)
             or type(snapshot.get("items")) is not list or len(snapshot["items"]) > 32
             or type(snapshot.get("admittedItems")) is not int
             or snapshot["admittedItems"] != len(snapshot["items"])
@@ -1923,6 +1925,8 @@ def _pool_check_drain(page, pool, previous, maximum):
     if (type(page) is not dict or page.get("schema") != "pi.subagent.pool.drain.v1"
             or page.get("poolId") != pool.pool_id or page.get("jobId") != pool.job_id
             or page.get("agent") != pool._options["agent"]
+            or ("yieldResults" in page and type(page["yieldResults"]) is not bool)
+            or page.get("yieldResults", False) is not pool.yield_results
             or page.get("status") not in ("open", "draining", "completed", "failed", "cancelled")
             or type(page.get("sealed")) is not bool or (page["status"] == "open") == page["sealed"]
             or type(page.get("admittedItems")) is not int or not len(pool._items) <= page["admittedItems"] <= 32
@@ -1968,7 +1972,8 @@ async def _pool_read_item(handle, operation, timeout_ms=None):
         arguments["timeoutMs"] = timeout_ms
     snapshot = _pool_snapshot(await _agent_native_result("subagent", arguments), handle.pool_id, handle.item_id)
     if (snapshot["jobId"] != handle.job_id or snapshot["agent"] != handle.agent
-            or snapshot["maxBatchSize"] != handle.max_batch_size):
+            or snapshot["maxBatchSize"] != handle.max_batch_size
+            or snapshot.get("yieldResults", False) is not handle.yield_results):
         raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity changed")
     return snapshot
 
@@ -1986,7 +1991,7 @@ async def _pool_wait_item(handle, timeout_ms, raise_errors):
 class _AgentPoolItem:
     """One immutable native pool item. Only the pool can cancel its carrier."""
 
-    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent", "_max_batch_size")
+    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent", "_max_batch_size", "_yield_results")
 
     def __init__(self, pool, item_id):
         self._pool_id = pool["poolId"]
@@ -1994,6 +1999,7 @@ class _AgentPoolItem:
         self._job_id = pool["jobId"]
         self._agent = pool["agent"]
         self._max_batch_size = pool["maxBatchSize"]
+        self._yield_results = pool.get("yieldResults", False)
 
     @property
     def id(self):
@@ -2019,6 +2025,10 @@ class _AgentPoolItem:
     def max_batch_size(self):
         return self._max_batch_size
 
+    @property
+    def yield_results(self):
+        return self._yield_results
+
     async def status(self):
         return await _pool_read_item(self, "pool_result")
 
@@ -2038,15 +2048,16 @@ class _AgentPoolItem:
 class _AgentPool:
     """One native pool carrier; finish drains, close cancels running and queued work."""
 
-    __slots__ = ("_options", "_name", "_concurrency", "_max_batch_size", "_pool_id", "_job_id", "_snapshot", "_items",
+    __slots__ = ("_options", "_name", "_concurrency", "_max_batch_size", "_yield_results", "_pool_id", "_job_id", "_snapshot", "_items",
                  "_closed", "_last_error", "_unknown_admission", "_admission_pending",
                  "_finish_acknowledged", "_close_acknowledged", "_lock")
 
-    def __init__(self, options, name, concurrency, max_batch_size=1):
+    def __init__(self, options, name, concurrency, max_batch_size=1, yield_results=False):
         self._options = options
         self._name = name
         self._concurrency = concurrency
         self._max_batch_size = max_batch_size
+        self._yield_results = yield_results
         self._pool_id = None
         self._job_id = None
         self._snapshot = None
@@ -2084,6 +2095,10 @@ class _AgentPool:
         return self._max_batch_size
 
     @property
+    def yield_results(self):
+        return self._yield_results
+
+    @property
     def closed(self):
         return self._closed
 
@@ -2099,6 +2114,7 @@ class _AgentPool:
         _pool_snapshot(snapshot, self._pool_id)
         if (snapshot["agent"] != self._options["agent"] or snapshot["concurrency"] != self._concurrency
                 or snapshot["maxBatchSize"] != self._max_batch_size
+                or snapshot.get("yieldResults", False) is not self._yield_results
                 or (self._job_id is not None and snapshot["jobId"] != self._job_id)
                 or len(snapshot["items"]) < len(self._items)):
             raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity or retained items changed")
@@ -2117,6 +2133,7 @@ class _AgentPool:
                         "agent": self._options["agent"], "status": "unavailable" if self._unknown_admission
                         else "cancelled" if self._closed else "unstarted", "sealed": self._closed,
                         "concurrency": self._concurrency, "maxBatchSize": self._max_batch_size,
+                        "yieldResults": self._yield_results,
                         "admittedItems": 0, "items": []}
         else:
             snapshot = {**self._snapshot, "items": [{**item, "resultRef": dict(item["resultRef"])}
@@ -2276,6 +2293,7 @@ class _AgentPool:
                 if (snapshot["jobId"] != self._job_id or snapshot["agent"] != self._options["agent"]
                         or snapshot["concurrency"] != self._concurrency
                         or snapshot["maxBatchSize"] != self._max_batch_size or snapshot["admittedItems"] < previous
+                        or snapshot.get("yieldResults", False) is not self._yield_results
                         or type(ids) is not list or len(ids) != len(batch)
                         or any(type(item_id) is not int or not previous < item_id <= snapshot["admittedItems"]
                                or (index > 0 and item_id != ids[index - 1] + 1)
@@ -2380,6 +2398,7 @@ async def _workpool(**options):
     name = "workpool"
     concurrency = 4
     max_batch_size = 1
+    yield_results = False
     for key, value in options.items():
         if key == "name":
             if not _pool_bounded_text(value, 128):
@@ -2394,6 +2413,11 @@ async def _workpool(**options):
                 raise ValueError("EVAL_POOL_INPUT: max_batch_size must be an integer from 1 to 8")
             max_batch_size = value
             native["maxBatchSize"] = value
+        elif key == "yield_results":
+            if type(value) is not bool:
+                raise TypeError("EVAL_POOL_INPUT: yield_results must be a boolean")
+            yield_results = value
+            native["yieldResults"] = value
         elif key == "agent":
             if not _pool_bounded_text(value, 128):
                 raise TypeError("EVAL_POOL_INPUT: agent must be nonempty text of at most 128 UTF-8 bytes without NUL")
@@ -2428,7 +2452,9 @@ async def _workpool(**options):
             raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
     if "isoApply" in native and native.get("isolation") != "worktree":
         raise TypeError("EVAL_POOL_INPUT: iso_apply requires worktree isolation")
-    pool = _AgentPool(native, name, concurrency, max_batch_size)
+    if yield_results and (max_batch_size < 2 or native.get("isolation") == "worktree"):
+        raise TypeError("EVAL_POOL_INPUT: yield_results requires max_batch_size above 1 and no worktree isolation")
+    pool = _AgentPool(native, name, concurrency, max_batch_size, yield_results)
     pool._batch_arguments([])
     return pool
 

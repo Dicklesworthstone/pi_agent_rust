@@ -208,6 +208,70 @@ test('attach pool reconstructs the complete ordered manifest without starting or
     assert.equal(h.calls.length,1);
 });
 
+test('yielding pools validate their complete launch policy before any host admission', async () => {
+    const h = host(async () => {throw new Error('must not dispatch');});
+    for (const options of [
+        {yieldResults:1,maxBatchSize:2}, {yieldResults:'true',maxBatchSize:2},
+        {yieldResults:null,maxBatchSize:2}, {yieldResults:true},
+        {yieldResults:true,maxBatchSize:1},
+        {yieldResults:true,maxBatchSize:2,isolation:'worktree'},
+    ]) {
+        await assert.rejects(h.run(`return workpool(${JSON.stringify(options)});`),/EVAL_POOL_INPUT/);
+    }
+    assert.equal(h.calls.length,0);
+});
+
+test('yield mode is frozen in a fresh pool and every item identity', async () => {
+    const h = host(async (_,args) => pool(['running','running'],'open',{
+        maxBatchSize:4,yieldResults:true,admittedItemIds:[1,2],
+    }));
+    const before = plain(await h.run(`
+        const options = {agent:'reviewer',concurrency:2,maxBatchSize:4,yieldResults:true};
+        globalThis.p = await workpool(options);
+        options.yieldResults = false;
+        return [p.yieldResults,(await p.peek()).yieldResults,p.items.length];
+    `));
+    assert.deepEqual(before,[true,true,0]);
+    assert.equal(h.calls.length,0);
+    const after = plain(await h.run("const items = await p.push(['first','second']); return items.map(i=>[i.itemId,i.maxBatchSize,i.yieldResults,Object.isFrozen(i)]);"));
+    assert.deepEqual(after,[[1,4,true,true],[2,4,true,true]]);
+    assert.deepEqual(h.calls[0].args,{agent:'reviewer',maxBatchSize:4,yieldResults:true,
+        operation:'pool_start',concurrency:2,tasks:['first','second']});
+});
+
+test('recovery preserves early terminal results while the same pool remains busy', async () => {
+    const early = output('ready while sibling runs');
+    early.details.workerBatch = {yielded:true,requestId:'warm-2',key:1};
+    const h = host(async (_,args) => pool(['completed','running'],'open',{
+        maxBatchSize:4,yieldResults:true,
+        ...(args.itemId === undefined ? {} : {itemId:1,item:{id:1,status:'completed',result:early}}),
+    }));
+    const value = plain(await h.run(`
+        globalThis.p = await workpool.attach('pool-a');
+        const result = await p.items[0].wait(0);
+        return [p.yieldResults,p.items[0].yieldResults,result.details.workerBatch.yielded,
+            (await p.peek()).runningItems,result.details.answer];
+    `));
+    assert.deepEqual(value,[true,true,true,1,'ready while sibling runs']);
+    assert.deepEqual(h.calls.map(c=>c.args.operation),['pool_status','pool_wait','pool_status']);
+    h.respond = async (_,args) => pool(['completed','running'],'open',{
+        maxBatchSize:4,yieldResults:false,
+        ...(args.itemId === undefined ? {} : {itemId:1,item:{id:1,status:'completed',result:early}}),
+    });
+    await assert.rejects(h.run('return p.items[0].output();'),/PROTOCOL/);
+    await assert.rejects(h.run('return p.peek();'),/PROTOCOL/);
+});
+
+test('recovered yield settings reject malformed descriptors and default older hosts to false', async () => {
+    for (const extra of [{yieldResults:1,maxBatchSize:4},{yieldResults:'true',maxBatchSize:4},
+        {yieldResults:null,maxBatchSize:4},{yieldResults:true,maxBatchSize:1}]) {
+        const h = host(async () => pool([], 'open',extra));
+        await assert.rejects(h.run("return workpool.attach('pool-a');"),/PROTOCOL/);
+    }
+    const h = host(async () => pool());
+    assert.deepEqual(plain(await h.run("const p = await workpool.attach('pool-a'); return [p.yieldResults,p.items[0].yieldResults];")),[false,false]);
+});
+
 test('recovered pool items use the existing typed result and mixed wait path', async () => {
     const h = host(async (_,args) => args.itemId === undefined ? pool(['completed','completed'])
         : pool(['completed','completed'],'open',{itemId:args.itemId,item:{id:args.itemId,status:'completed',result:output(`item-${args.itemId}`)}}));

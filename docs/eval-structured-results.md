@@ -795,11 +795,13 @@ print(first['content'])
 
 The pool exposes `id` / `poolId` and `jobId` in JavaScript, or `id` / `pool_id`
 and `job_id` in Python. IDs are null/`None` until the first native admission.
-`concurrency` and `maxBatchSize` / `max_batch_size` are read-only launch limits;
+`concurrency`, `maxBatchSize` / `max_batch_size`, and `yieldResults` /
+`yield_results` are read-only launch settings;
 `workpool.attach()` recovers their native values without changing them.
 `pool.items` retains fixed item handles in admission order as a frozen array or
 Python tuple. Each item has `itemId` / `item_id`, `poolId` / `pool_id`, `jobId` /
-`job_id`, `agent`, and `maxBatchSize` / `max_batch_size`; `id` is the item ID.
+`job_id`, `agent`, `maxBatchSize` / `max_batch_size`, and `yieldResults` /
+`yield_results`; `id` is the item ID.
 Items expose `status()`, `done()`,
 `output()` and `wait(seconds=30)`. They expose no worker ID or cancellation
 method: cancellation belongs to the entire pool.
@@ -893,7 +895,7 @@ than the limit. Opting into grouping uses the keyed protocol even for a
 singleton. Pool item IDs and handles remain stable, and each item keeps its
 own result, dependency tracking and privacy checks.
 
-The child receives native-owned keys and returns one final JSON envelope with
+By default, the child receives native-owned keys and returns one final JSON envelope with
 exactly one `data` or `error` row per key. The host validates the entire key set
 before accepting any member. Missing, duplicate or foreign keys, extra fields,
 or an oversized/malformed envelope fail every member of that group; the host
@@ -902,10 +904,10 @@ An explicit item error or a failed per-item `outputSchema` validation affects
 only that item in an otherwise valid envelope. Successful `data` values appear
 at `result.details.results[0].data`, including without an output schema.
 
-Results become available after the child finishes the entire turn and reaches
-the post-compaction idle barrier. Grouping does not expose intermediate child
-yields. For earlier individual completion or larger per-item answers, keep the
-default limit of one. The map/reduce helpers fill a window of
+In this default mode, results become available after the child finishes the
+entire turn and reaches the post-compaction idle barrier. Opt into early item
+publication below, or keep the default group limit of one for ordinary
+single-answer semantics and larger per-item answers. The map/reduce helpers fill a window of
 `min(32, maxItems, concurrency * maxBatchSize)` logical assignments, with the
 equivalent Python option names; see [workpool pipelines](eval-workpool-pipelines.md).
 
@@ -914,6 +916,62 @@ worktree outcome. `result.details.workerBatch` records the physical request,
 native turn keys and `patchScope: "cumulative_worker_batch"`. These patches
 include the member's earlier turns and must not be stacked as independent
 item patches. Cancellation still belongs to the entire pool.
+
+### Publish completed items before a grouped turn ends
+
+Set `yieldResults: true` in JavaScript, `yield_results=True` in Python, or
+`yieldResults: true` on native `pool_start`. It requires `maxBatchSize` /
+`max_batch_size` above 1 and shared-workspace execution (`isolation: "none"`
+or omitted). Worktree isolation is rejected before admission because an early
+item cannot provide a settled cumulative patch. The option defaults to false
+and is frozen in native snapshots, pool handles, item handles and recovered
+handles.
+
+```javascript
+const pool = await workpool({
+    agent: 'reviewer', concurrency: 2, maxBatchSize: 4, yieldResults: true,
+});
+const items = await pool.push(['Review parsing.', 'Review persistence.']);
+await pool.finish();
+const page = await pool.drain({timeout: 20});
+console.log(page.items, page.pendingItems, page.done);
+```
+
+```python
+pool = await workpool(
+    agent='reviewer', concurrency=2, max_batch_size=4, yield_results=True,
+)
+items = await pool.push(['Review parsing.', 'Review persistence.'])
+await pool.finish()
+page = await pool.drain(timeout=20)
+print(page['items'], page['pendingItems'], page['done'])
+```
+
+The child receives a native `yield` tool and its current request ID and item
+keys in the grouped assignment. It can call, for example,
+`yield({requestId: "warm-2", key: 7, data: {summary: "Reviewed"}})`, or supply
+`error` instead of `data`. The native tool adds its own call identity; model
+text, progress updates and arbitrary JSON do not publish results. Each receipt
+is limited to 32 KiB and is checked against the active request, pending keys,
+frozen schema, ownership, privacy and retention budget before acceptance.
+
+An accepted yield is a terminal result for that item, available immediately
+through its handle, `drain()`, `exchange()` and map/reduce. Its
+`details.workerBatch.yielded` is true. The child continues the remaining work;
+its final `{"items":[...]}` envelope contains only unyielded keys, or
+`{"items":[]}` if all items were submitted. Each key may be published once.
+An explicit error or schema-invalid payload fails only that item. A malformed,
+duplicate or foreign successful receipt terminates the worker; already
+accepted results remain available, and unfinished work fails without replay.
+Cancellation and later transport or final-answer failures likewise preserve
+accepted items.
+
+Item completion does not make the physical child idle. Even after every key
+has yielded, the pool remains draining until the child finishes and reaches
+its correlated persistence/compaction idle barrier. Only then may that child
+start another batch or be reaped by `finish()`. A failed carrier still reports
+aggregate failure even when some or all item results were accepted earlier.
+This option does not suspend a worker or background an entire eval cell.
 
 ### Collect completed pool items across cells
 
@@ -1092,7 +1150,7 @@ guest object does not automatically bind to a recovered identity. No batch is
 replayed during recovery.
 
 Pool options are `name`, `agent`, `model`, `concurrency`,
-`maxBatchSize` / `max_batch_size`, `cwd`, `scope`,
+`maxBatchSize` / `max_batch_size`, `yieldResults` / `yield_results`, `cwd`, `scope`,
 `isolation: "none" | "worktree"`, `isoApply` / `iso_apply`, and
 `timeoutSeconds` / `timeout_seconds`. Names are labels for the guest object.
 Agent definition, model, child tools and working directory are captured at
@@ -1134,9 +1192,9 @@ process-local bounded retention, not a disk-backed queue, process-restart
 recovery or durable conversation storage.
 
 Native aggregate completion is delivered through the existing session job
-notice, after drain and child cleanup. Optional grouping supplies keyed final
-results while retaining explicit sealing and fixed child lifetimes. A child
-yield tool and custom child-defined eval tools remain separate work.
+notice, after drain and child cleanup. Optional grouping supplies keyed results,
+including opt-in early terminal yields, while retaining explicit sealing and
+fixed child lifetimes. Custom child-defined eval tools remain separate work.
 
 ## Validation
 

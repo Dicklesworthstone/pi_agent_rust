@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 pub(super) mod isolation;
 pub(super) mod output_contract;
 mod pool;
+pub(super) mod yield_tool;
 
 const SCHEMA: &str = "pi.subagent.worker.v1";
 const MAX_WORKERS: usize = 32;
@@ -42,6 +43,7 @@ pub(super) struct PendingTurn {
 pub(super) struct PendingBatch {
     pub(super) turns: Vec<PendingTurn>,
     pub(super) keyed: bool,
+    pub(super) yield_results: bool,
 }
 
 struct Turn {
@@ -67,6 +69,10 @@ pub(super) struct WorkerState {
     failed: bool,
     latest: u64,
     max_batch_size: usize,
+    yield_results: bool,
+    // Logical items may settle before their shared RPC turn reaches idle.
+    // Keep that physical conversation leased until its correlated barrier.
+    active_batch: bool,
     queue: VecDeque<PendingTurn>,
     turns: BTreeMap<u64, Turn>,
     result_bytes: usize,
@@ -103,10 +109,12 @@ fn error_output(message: &str) -> ToolOutput {
 }
 
 pub(super) fn requested(input: &Value) -> Result<bool> {
-    if input.get("maxBatchSize").is_some()
-        && input.get("operation").and_then(Value::as_str) != Some("pool_start")
-    {
-        return Err(invalid("maxBatchSize is only accepted by pool_start"));
+    for field in ["maxBatchSize", "yieldResults"] {
+        if input.get(field).is_some()
+            && input.get("operation").and_then(Value::as_str) != Some("pool_start")
+        {
+            return Err(invalid(&format!("{field} is only accepted by pool_start")));
+        }
     }
     match input.get("operation") {
         None => Ok(false),
@@ -407,6 +415,8 @@ async fn start(
         failed: false,
         latest: 1,
         max_batch_size: 1,
+        yield_results: false,
+        active_batch: false,
         queue: VecDeque::from([PendingTurn { id: 1, task }]),
         turns: BTreeMap::from([(
             1,
@@ -709,10 +719,11 @@ fn snapshot(
             if state.failed { "failed" } else { "closed" }
         } else if !state.started {
             "starting"
-        } else if state
-            .turns
-            .values()
-            .any(|turn| matches!(turn.status, "queued" | "running"))
+        } else if state.active_batch
+            || state
+                .turns
+                .values()
+                .any(|turn| matches!(turn.status, "queued" | "running"))
         {
             "running"
         } else {
@@ -723,6 +734,7 @@ fn snapshot(
             "status": status, "turnId": turn_id,
             "turn": {"id": turn_id, "status": turn.status, "result": turn.result},
             "admittedTurns": state.latest, "queuedTurns": state.queue.len(),
+            "yieldResults": state.yield_results,
             "contextTokens": state.context_tokens, "contextWindow": state.context_window,
             "workspace": state.workspace,
             "workspaceRoots": state.workspace_roots,
@@ -760,6 +772,7 @@ fn projected_snapshot(value: Value, privacy: &AuxiliaryPrivacySnapshot) -> Resul
         "/turnId",
         "/turn/id",
         "/turn/status",
+        "/yieldResults",
         "/contextTokens",
         "/contextWindow",
         "/workspace",
@@ -811,6 +824,7 @@ pub(super) fn next_batch(shared: &Shared) -> Option<PendingBatch> {
     let mut state = shared.lock().ok()?;
     if state.closed
         || state.closing
+        || state.active_batch
         || !state.acknowledged
         || state.job_id.is_empty()
         || state.deadline.check().is_err()
@@ -841,9 +855,35 @@ pub(super) fn next_batch(shared: &Shared) -> Option<PendingBatch> {
         }
     }
     state.started = true;
+    state.active_batch = true;
     let keyed = state.max_batch_size > 1;
+    let yield_results = state.yield_results;
     drop(state);
-    Some(PendingBatch { turns, keyed })
+    Some(PendingBatch {
+        turns,
+        keyed,
+        yield_results,
+    })
+}
+
+pub(super) fn yield_results(shared: &Shared) -> bool {
+    shared.lock().is_ok_and(|state| state.yield_results)
+}
+
+/// Release the physical turn only after the actor observes its correlated idle
+/// barrier and checks its owner. Early item publication cannot release it.
+pub(super) fn finish_batch(shared: &Shared) -> Result<()> {
+    let mut state = shared.lock().map_err(|_| stopped())?;
+    if state.closed
+        || state.closing
+        || !state.active_batch
+        || state.deadline.check().is_err()
+        || state.turns.values().any(|turn| turn.status == "running")
+    {
+        return Err(stopped());
+    }
+    state.active_batch = false;
+    Ok(())
 }
 
 pub(super) fn should_close(shared: &Shared) -> bool {
@@ -883,16 +923,31 @@ fn protected_result(result: Result<ToolOutput>, privacy: &AuxiliaryPrivacySnapsh
     projected.unwrap_or_else(|| error_output(WITHHELD))
 }
 
-pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>) {
+pub(super) fn complete_turn(
+    shared: &Shared,
+    id: u64,
+    result: Result<ToolOutput>,
+    workspace_roots: Option<&workspace::CapturedRoots>,
+) -> bool {
     let admission = {
         let mut state = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed
+            || state.closing
+            || !state.active_batch
+            || state.deadline.check().is_err()
+        {
+            return false;
+        }
         let Some(turn) = state.turns.get_mut(&id) else {
-            return;
+            return false;
         };
+        if turn.status != "running" {
+            return false;
+        }
         let Some(privacy) = turn.privacy.take() else {
-            return;
+            return false;
         };
         (state.owner.clone(), state.job_id.clone(), privacy)
     };
@@ -918,6 +973,12 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
         let mut state = shared.lock().map_err(|_| stopped())?;
         if state.closed || state.closing || state.deadline.check().is_err() {
             return Err(stopped());
+        }
+        // Recheck after schema/privacy work, at the same acceptance boundary
+        // as cancellation. Root mutations hold only their own short lock and
+        // never enter jobs or worker state, so this lock order cannot reverse.
+        if let Some(roots) = workspace_roots {
+            roots.check()?;
         }
         let over_budget =
             state.result_bytes.saturating_add(size) > MAX_WORKER_RESULT_BYTES - ERROR_RESERVE_BYTES;
@@ -958,6 +1019,7 @@ pub(super) fn complete_turn(shared: &Shared, id: u64, result: Result<ToolOutput>
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closing = true;
     }
+    accepted.is_ok()
 }
 
 /// Called only after the actor's process and pipes have been retired. The
@@ -971,6 +1033,7 @@ pub(super) fn finish(shared: &Shared, error: Option<&str>) {
         return;
     }
     state.closed = true;
+    state.active_batch = false;
     state.failed = error.is_some() && !state.closing;
     let status = if state.failed { "failed" } else { "cancelled" };
     state.queue.clear();
@@ -1025,6 +1088,8 @@ mod tests {
             failed: false,
             latest: u64::try_from(assignments.len()).expect("bounded test item count"),
             max_batch_size,
+            yield_results: false,
+            active_batch: false,
             queue,
             turns,
             result_bytes: 0,
@@ -1035,11 +1100,14 @@ mod tests {
         }))
     }
 
-    fn settle_selected(state: &Shared, batch: &PendingBatch) {
-        let mut state = state.lock().expect("worker fixture");
-        for turn in &batch.turns {
-            state.turns.get_mut(&turn.id).expect("selected item").status = "completed";
+    fn settle_selected(shared: &Shared, batch: &PendingBatch) {
+        {
+            let mut state = shared.lock().expect("worker fixture");
+            for turn in &batch.turns {
+                state.turns.get_mut(&turn.id).expect("selected item").status = "completed";
+            }
         }
+        finish_batch(shared).expect("simulated post-turn idle barrier");
     }
 
     #[test]
@@ -1111,6 +1179,7 @@ mod tests {
         let shared = queued_worker(1, &["first", "second"]);
         let first = next_batch(&shared).expect("first ordinary turn");
         assert!(!first.keyed);
+        assert!(!first.yield_results);
         assert_eq!(first.turns.len(), 1);
         assert_eq!(first.turns[0].id, 1);
         settle_selected(&shared, &first);
@@ -1120,6 +1189,213 @@ mod tests {
         assert_eq!(second.turns[0].id, 2);
         settle_selected(&shared, &second);
         assert!(next_batch(&shared).is_none());
+    }
+
+    #[test]
+    fn early_results_keep_the_physical_batch_running_until_its_idle_barrier() {
+        let shared = queued_worker(2, &["first", "second"]);
+        shared.lock().expect("worker fixture").yield_results = true;
+        assert!(yield_results(&shared));
+        let batch = next_batch(&shared).expect("yield-enabled batch");
+        assert!(batch.yield_results && batch.keyed);
+        assert!(finish_batch(&shared).is_err());
+        {
+            let mut state = shared.lock().expect("worker fixture");
+            for turn in state.turns.values_mut() {
+                turn.status = "completed";
+                turn.privacy = None;
+            }
+        }
+        let privacy = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
+        let observed = snapshot(&shared, Some(1), &privacy)
+            .expect("early result observation")
+            .details
+            .expect("native worker receipt");
+        assert_eq!(observed["status"], "running");
+        assert_eq!(observed["turn"]["status"], "completed");
+        assert_eq!(observed["yieldResults"], true);
+        assert!(shared.lock().expect("worker fixture").active_batch);
+
+        // Newly admitted work cannot reuse the conversation while the child
+        // is still producing its terminal response or compacting history.
+        {
+            let mut state = shared.lock().expect("worker fixture");
+            state.latest = 3;
+            state.queue.push_back(PendingTurn {
+                id: 3,
+                task: "later".to_string(),
+            });
+            state.turns.insert(
+                3,
+                Turn {
+                    status: "queued",
+                    result: None,
+                    privacy: Some(privacy),
+                    dependency: crate::agent_hub::ResultDependency::new(None),
+                },
+            );
+        }
+        assert!(next_batch(&shared).is_none());
+        finish_batch(&shared).expect("correlated idle barrier");
+        assert!(finish_batch(&shared).is_err());
+        let later = next_batch(&shared).expect("dispatch after idle");
+        assert_eq!(later.turns.len(), 1);
+        assert_eq!(later.turns[0].id, 3);
+        assert!(later.yield_results && later.keyed);
+    }
+
+    #[test]
+    fn yielded_result_commits_are_immutable_and_obey_owner_cancellation() {
+        let _guard = crate::jobs::process_test_guard();
+        let artifacts = tempfile::tempdir().expect("owned result fixture artifacts");
+        let owner = format!("yield-result-fixture-{}", uuid::Uuid::new_v4().simple());
+        let privacy = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
+        let job = crate::jobs::spawn_owned_task(
+            crate::jobs::admit_owned_task(&owner).expect("native task admission"),
+            "yield result publication fixture",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(artifacts.path()),
+            privacy,
+            futures::future::pending(),
+        )
+        .expect("live publication owner");
+        let shared = queued_worker(4, &["first", "large", "invalid", "cancelled", "queued"]);
+        {
+            let mut state = shared.lock().expect("worker fixture");
+            state.owner.clone_from(&owner);
+            state.job_id.clone_from(&job.id);
+            state.yield_results = true;
+        }
+        next_batch(&shared).expect("active native batch");
+        let accepted = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("accepted answer"))],
+            details: Some(json!({"value":"first"})),
+            is_error: false,
+        };
+        assert!(complete_turn(&shared, 1, Ok(accepted.clone()), None));
+        assert!(!complete_turn(&shared, 1, Err(stopped()), None));
+        assert!(!complete_turn(&shared, 5, Err(stopped()), None));
+        assert!(!complete_turn(&shared, 99, Err(stopped()), None));
+        {
+            let state = shared.lock().expect("worker fixture");
+            assert!(!state.closing);
+            assert!(state.turns[&5].privacy.is_some());
+        }
+        assert!(complete_turn(
+            &shared,
+            2,
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "oversized-yield-marker".repeat(MAX_TURN_RESULT_BYTES / 8),
+                ))],
+                details: None,
+                is_error: false,
+            }),
+            None,
+        ));
+        assert!(complete_turn(
+            &shared,
+            3,
+            Err(Error::tool("subagent", "invalid typed answer")),
+            None,
+        ));
+        {
+            let state = shared.lock().expect("worker fixture");
+            assert_eq!(state.turns[&2].status, "failed");
+            assert_eq!(state.turns[&3].status, "failed");
+            let withheld = serde_json::to_string(&state.turns[&2].result)
+                .expect("withheld yield result");
+            assert!(withheld.contains(WITHHELD));
+            assert!(!withheld.contains("oversized-yield-marker"));
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native cancellation runtime");
+        runtime
+            .block_on(crate::jobs::cancel_async(&owner, &job.id))
+            .expect("cancel publication owner");
+        assert!(!complete_turn(&shared, 4, Ok(accepted.clone()), None));
+        assert!(finish_batch(&shared).is_err());
+        finish(&shared, None);
+        let state = shared.lock().expect("worker fixture");
+        assert!(state.closed && !state.active_batch);
+        assert_eq!(state.turns[&1].status, "completed");
+        assert_eq!(
+            serde_json::to_value(&state.turns[&1].result).expect("retained accepted answer"),
+            serde_json::to_value(Some(accepted)).expect("original accepted answer"),
+        );
+        assert_eq!(state.turns[&4].status, "cancelled");
+        assert_eq!(state.turns[&5].status, "cancelled");
+        assert!(state.turns.values().all(|turn| turn.privacy.is_none()));
+    }
+
+    #[test]
+    fn result_publication_rechecks_root_grants_and_preserves_accepted_prefix() {
+        let _guard = crate::jobs::process_test_guard();
+        let artifacts = tempfile::tempdir().expect("root lease publication artifacts");
+        let delegated = tempfile::tempdir().expect("delegated workspace root");
+        let mut workspace = crate::workspace::WorkspaceHandle::single(artifacts.path());
+        workspace.add_root(delegated.path());
+        let privacy = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
+        let roots = workspace::CapturedRoots::capture(&workspace, privacy.clone())
+            .expect("capture live workspace grants")
+            .expect("one delegated grant");
+        let owner = format!("yield-roots-fixture-{}", uuid::Uuid::new_v4().simple());
+        let job = crate::jobs::spawn_owned_task(
+            crate::jobs::admit_owned_task(&owner).expect("native task admission"),
+            "yield workspace publication fixture",
+            AgentCx::for_request(),
+            Duration::from_secs(30),
+            Some(artifacts.path()),
+            privacy,
+            futures::future::pending(),
+        )
+        .expect("live publication owner");
+        let shared = queued_worker(2, &["accepted", "revoked"]);
+        {
+            let mut state = shared.lock().expect("worker fixture");
+            state.owner.clone_from(&owner);
+            state.job_id.clone_from(&job.id);
+            state.yield_results = true;
+        }
+        next_batch(&shared).expect("active native batch");
+        let output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("accepted before revocation"))],
+            details: Some(json!({"value":"retained"})),
+            is_error: false,
+        };
+        assert!(complete_turn(&shared, 1, Ok(output.clone()), Some(&roots)));
+        assert!(workspace.remove_root(delegated.path()));
+        workspace.add_root(delegated.path());
+        assert_eq!(workspace.additional_roots().len(), 1);
+        assert!(!complete_turn(&shared, 2, Ok(output.clone()), Some(&roots)));
+        // This owner is still live. Refusal comes from the old captured grant,
+        // even though the same path was granted again before publication.
+        crate::jobs::with_owned_task_progress(&owner, &job.id, || Ok(((), None)))
+            .expect("owner remains live after root revocation");
+        {
+            let state = shared.lock().expect("worker fixture");
+            assert!(state.closing);
+            assert_eq!(state.turns[&1].status, "completed");
+            assert_eq!(state.turns[&2].status, "running");
+            assert!(state.turns[&2].result.is_none());
+            assert_eq!(
+                serde_json::to_value(&state.turns[&1].result).expect("accepted prefix"),
+                serde_json::to_value(Some(output)).expect("original accepted result"),
+            );
+        }
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native cancellation runtime");
+        runtime
+            .block_on(crate::jobs::cancel_async(&owner, &job.id))
+            .expect("retire fixture owner");
+        finish(&shared, None);
+        let state = shared.lock().expect("worker fixture");
+        assert!(state.closed && !state.active_batch);
+        assert_eq!(state.turns[&1].status, "completed");
+        assert_eq!(state.turns[&2].status, "cancelled");
     }
 
     #[test]
@@ -1207,13 +1483,17 @@ mod tests {
             Some("pool_exchange"),
             Some("pool_status"),
         ] {
-            let mut input = json!({"maxBatchSize":2});
-            if let Some(operation) = operation {
-                input["operation"] = json!(operation);
+            for (field, value) in [("maxBatchSize", json!(2)), ("yieldResults", json!(true))] {
+                let mut input = json!({});
+                input[field] = value;
+                if let Some(operation) = operation {
+                    input["operation"] = json!(operation);
+                }
+                assert!(requested(&input).is_err());
             }
-            assert!(requested(&input).is_err());
         }
         assert!(requested(&json!({"operation":"pool_start","maxBatchSize":2})).unwrap());
+        assert!(requested(&json!({"operation":"pool_start","yieldResults":true})).unwrap());
         for operation in [Value::Null, json!(true), json!("worker_restart"), json!({})] {
             assert!(requested(&json!({"operation":operation})).is_err()); // ubs:ignore[rust.panic.assert-macros] -- Explicit malformed control must not launch an unrelated one-shot task.
         }

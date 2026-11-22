@@ -44,15 +44,20 @@ how many queued assignments can share one child prompt. Larger values use
 keyed final results while preserving each item's identity, status and schema
 validation. Groups are also bounded to 64 KiB of task text and do not wait to
 fill; the setting survives native recovery and cannot change after launch.
+Grouped shared-workspace pools may also opt into `yieldResults: true` /
+`yield_results=True`: the child receives a native `yield` tool that publishes
+individual terminal results while it continues the remaining assignments.
+Accepted results survive later child failure; physical reuse still waits for
+the normal RPC idle barrier. Worktree pools keep final-only acceptance.
 
 [Streaming map/reduce](eval-workpool-pipelines.md) is available as
 `workpool.mapReduce()` in JavaScript and `workpool.map_reduce()` in Python.
 It consumes sync/async iterables with bounded admission, reduces full native
 results as they settle, and exposes per-result recovery cursors on failure.
 Its admission window is `min(32, maxItems, concurrency * maxBatchSize)`, with
-equivalent Python option names. It uses the existing pool lifetime limits and
-does not add an intermediate child `yield` tool or background execution of an
-entire eval cell.
+equivalent Python option names. It consumes early terminal yields when the
+pool explicitly enables them, within the existing pool lifetime limits.
+Background execution of an entire eval cell remains separate work.
 
 [Retained model helpers](eval-structured-results.md#retained-background-model-requests)
 provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
@@ -109,10 +114,12 @@ completed, failed or cancelled full results per native call, across cells and
 without waiting for earlier unfinished items. Explicit replayable cursors
 acknowledge only processed item IDs; reads do not seal or cancel the pool.
 See [incremental pool results](eval-structured-results.md#collect-completed-pool-items-across-cells).
-Native grouped results require the complete final keyed envelope and the
-post-turn idle barrier before acceptance. A malformed envelope fails its group;
-valid per-key errors and schema failures preserve successful peers. OMP's
-child-side `yield` tool remains unimplemented. Isolated items in a group share
+Native grouped results default to a complete final keyed envelope and the
+post-turn idle barrier before acceptance. Opt-in `yieldResults` permits
+authenticated native tool receipts to settle individual items earlier; the
+final envelope then covers only remaining keys. A malformed receipt or final
+envelope fails unfinished work while preserving earlier accepted items;
+valid per-key errors and schema failures preserve successful peers. Isolated items in a group share
 one cumulative worker patch, identified by `details.workerBatch`; these are
 not independent patches to stack. Pi uses explicit `finish()` for aggregate
 completion, while `pool.close()` cancels running and queued work. Worker

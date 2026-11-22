@@ -121,6 +121,7 @@ def pool_drain_page(pool, arguments=None):
     done = pool["status"] not in ("open", "draining") and len(item_ids) == len(pool["items"])
     return {"schema": "pi.subagent.pool.drain.v1", "poolId": pool["id"], "jobId": pool["jobId"],
             "agent": pool["agent"], "status": pool["status"], "sealed": pool["sealed"],
+            "yieldResults": pool.get("yieldResults", False),
             "admittedItems": len(pool["items"]), "settledItems": len(settled),
             "pendingItems": len(pool["items"]) - len(settled), "items": items, "cursor": cursor,
             "nextCursor": {**cursor, "itemIds": item_ids}, "hasMore": len(settled) > len(item_ids),
@@ -140,6 +141,7 @@ class PoolHost:
         return {"schema": "pi.subagent.pool.v1", "poolId": pool["id"], "jobId": pool["jobId"],
                 "agent": pool["agent"], "status": pool["status"], "sealed": pool["sealed"],
                 "concurrency": pool["concurrency"], "maxBatchSize": pool["maxBatchSize"],
+                "yieldResults": pool.get("yieldResults", False),
                 "admittedItems": len(pool["items"]),
                 "queuedItems": counts["queued"], "runningItems": counts["running"],
                 "completedItems": counts["completed"], "failedItems": counts["failed"] + counts["cancelled"],
@@ -181,6 +183,7 @@ class PoolHost:
             pool_id = f"pool-native-{len(self.pools) + 1}"
             pool = {"id": pool_id, "jobId": f"carrier-{pool_id}", "agent": args["agent"],
                     "concurrency": args["concurrency"], "maxBatchSize": args.get("maxBatchSize", 1),
+                    "yieldResults": args.get("yieldResults", False),
                     "status": "open", "sealed": False, "items": []}
             self.pools[pool_id] = pool
         else:
@@ -1448,6 +1451,64 @@ await sent
     def create_pool(self, concurrency=2):
         response = self.kernel.cell(f"pool = await workpool(agent='scout', concurrency={concurrency}); pool.concurrency")
         self.assertEqual(self.value(response), concurrency)
+
+    def test_yielding_pool_validates_launch_policy_before_dispatch(self):
+        for options in ({"yield_results": 1, "max_batch_size": 2},
+                        {"yield_results": "true", "max_batch_size": 2},
+                        {"yield_results": None, "max_batch_size": 2},
+                        {"yield_results": True},
+                        {"yield_results": True, "max_batch_size": 1},
+                        {"yield_results": True, "max_batch_size": 4, "isolation": "worktree"}):
+            with self.subTest(options=options):
+                response = self.kernel.cell(f"await workpool(**{options!r})")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_INPUT", response["error"])
+                self.assertEqual(self.kernel.calls, [])
+
+    def test_yielding_pool_publishes_early_results_and_freezes_native_mode(self):
+        native = PoolHost(self.kernel)
+        self.assertEqual(self.value(self.kernel.cell("""
+options = dict(agent='scout', concurrency=2, max_batch_size=4, yield_results=True)
+pool = await workpool(**options)
+options['yield_results'] = False
+(pool.yield_results, (await pool.peek())['yieldResults'])
+""")), (True, True))
+        self.assertEqual(self.kernel.calls, [])
+        self.assertEqual(self.value(self.kernel.cell("""
+items = await pool.push(['first', 'second'])
+[(item.item_id, item.max_batch_size, item.yield_results) for item in items]
+""", native)), [(1, 4, True), (2, 4, True)])
+        self.assertTrue(self.kernel.calls[0]["bridge"]["input"]["args"]["yieldResults"])
+        state = native.pools["pool-native-1"]
+        early = turn_result(1)
+        early["details"]["workerBatch"] = {"yielded": True, "requestId": "warm-2", "key": 1}
+        native.complete(state, 1, early)
+        self.assertEqual(self.value(self.kernel.cell("""
+page = await pool.drain()
+result = await items[0].wait(0)
+(page['done'], page['pendingItems'], result['details']['workerBatch']['yielded'])
+""", native)), (False, 1, True))
+        state["yieldResults"] = False
+        for code in ("await items[0].output()", "await pool.peek()", "await pool.drain()"):
+            response = self.kernel.cell(code, native)
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_PROTOCOL", response["error"])
+
+    def test_yielding_pool_recovers_in_a_fresh_kernel_without_replay(self):
+        native = PoolHost(self.kernel)
+        self.assertEqual(self.value(self.kernel.cell("pool = await workpool(agent='scout', max_batch_size=4, yield_results=True); len(await pool.push(['ready', 'busy']))", native)), 2)
+        native.complete(native.pools["pool-native-1"], 1)
+        fresh = Kernel(with_pipeline=True)
+        self.addCleanup(fresh.close)
+        native.kernel = fresh
+        before = len(native.operations)
+        response = fresh.cell("""
+recovered = await workpool.attach('pool-native-1')
+result = await recovered.items[0].wait(0)
+(recovered.yield_results, recovered.items[0].yield_results, result['details']['turn'])
+""", native)
+        self.assertEqual(self.value(response), (True, True, 1))
+        self.assertEqual(native.operations[before:], ["pool_status", "pool_wait"])
 
     def test_pool_drain_pages_out_of_order_results_and_acknowledges_only_explicit_cursors(self):
         self.create_pool()

@@ -1161,6 +1161,12 @@ fn main_impl() -> Result<()> {
         )
         .into());
     }
+    if cli.worker_yield && early_mode != "rpc" {
+        return Err(pi::error::Error::validation(
+            "--worker-yield requires RPC mode",
+        )
+        .into());
+    }
     if cli.command.is_none()
         && cli.fetch_models.is_none()
         && cli.list_models.is_none()
@@ -2422,6 +2428,9 @@ async fn run(
         registry.promote_tools(&cli.explicit_tools());
         registry
     });
+    if cli.worker_yield {
+        pi::subagents::install_worker_yield_tool(&shared_tools)?;
+    }
     let startup_cost_budget = startup_session
         .as_ref()
         .map(|session| {

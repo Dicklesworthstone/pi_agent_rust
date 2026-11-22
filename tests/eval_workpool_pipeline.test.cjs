@@ -212,6 +212,37 @@ test('carrier failure cannot become success just because all items have results'
     assert.equal(error.progress.completed, 1);
 });
 
+test('early reductions wait for physical completion and preserve a later carrier failure', async () => {
+    for (const carrierFailure of [false,true]) {
+        const f = fixture({maxBatchSize:4,carrierFailure});
+        const drain = f.pool.drain.bind(f.pool);
+        f.pool.drain = async options => {
+            const page = await drain(options);
+            if (page.items.length) {
+                page.items[0].result.details.workerBatch = {yielded:true};
+                return {...page,done:false,status:'draining'};
+            }
+            assert.equal(f.state.reduced,1,'reduce before physical completion');
+            return page;
+        };
+        const value = await f.run(['ready'],mapper,reduction(f),[],{
+            pool:{maxBatchSize:4,yieldResults:true},
+        }).catch(error=>error);
+        assert.equal(f.state.drains.length,2,'all yielded items still owe a terminal carrier result');
+        assert.equal(f.state.reduced,1,'terminal polling must not reduce an item again');
+        assert.deepEqual(f.state.options,{maxBatchSize:4,yieldResults:true});
+        if (carrierFailure) {
+            assert.match(value.cause.message,/POOL_FAILED/);
+            assert.equal(value.progress.completed,1);
+            assert.deepEqual(plain(value.cursor.itemIds),[1]);
+        } else {
+            assert.equal(value.status,'completed');
+            assert.equal(value.completed,1);
+            assert.equal(f.state.closeCalls,0);
+        }
+    }
+});
+
 test('exact source capacity succeeds after bounded lookahead', async () => {
     const f = fixture();
     function* inputs() { yield 'a'; yield 'b'; yield 'c'; }

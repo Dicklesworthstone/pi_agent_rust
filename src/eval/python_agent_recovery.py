@@ -95,8 +95,8 @@ def install(kernel):
     class AgentPool(base_pool):
         __slots__ = ("_recovered",)
 
-        def __init__(self, options, name, concurrency, max_batch_size=1):
-            super().__init__(options, name, concurrency, max_batch_size)
+        def __init__(self, options, name, concurrency, max_batch_size=1, yield_results=False):
+            super().__init__(options, name, concurrency, max_batch_size, yield_results)
             self._recovered = False
 
         @property
@@ -128,7 +128,8 @@ def install(kernel):
         if not identifier(snapshot["jobId"]) or not kernel._pool_bounded_text(snapshot["agent"], 128):
             raise error_type("EVAL_POOL_PROTOCOL: invalid recovered pool identity")
         pool = AgentPool({"agent": snapshot["agent"]}, "recovered-workpool",
-                         snapshot["concurrency"], snapshot["maxBatchSize"])
+                         snapshot["concurrency"], snapshot["maxBatchSize"],
+                         snapshot.get("yieldResults", False))
         pool._adopt(snapshot)
         pool._recovered = True
         pool._closed |= not allow_push

@@ -174,7 +174,7 @@ and later controls reject it. Larger values let each child take a FIFO group
 of queued assignments, bounded by the selected count and 64 KiB of combined
 task text. A child does not wait for the group to fill.
 
-For grouped mode, including a singleton group, the child returns exactly this
+By default, for grouped mode including a singleton group, the child returns exactly this
 kind of final envelope:
 
 ```json
@@ -200,8 +200,41 @@ With worktree isolation, all items in a group carry the same cumulative patch
 against their member's original baseline. Their native result's
 `details.workerBatch` records the shared `requestId`, the item's `key`, all
 `turnIds`, and `patchScope: "cumulative_worker_batch"`. These are shared patch
-snapshots, not independent changes to apply once per item. This grouped final
-result protocol does not add an intermediate child `yield` tool.
+snapshots, not independent changes to apply once per item. Worktree execution
+retains final-only acceptance.
+
+#### Optional early terminal yields
+
+`yieldResults: true` on native `pool_start` / JavaScript `workpool()`, or
+`yield_results=True` on Python `workpool()`, enables a native child `yield`
+tool. It requires a group limit above 1 and rejects worktree isolation before
+admission. The boolean defaults to false, freezes at launch, and is retained
+in pool/member snapshots and recovered handles. Standalone `worker_start` and
+later controls reject the option.
+
+The grouped prompt supplies the current `requestId` and pending keys. A tool
+call supplies exactly `requestId`, `key` and either `data` or nonblank `error`.
+The native helper adds schema `pi.subagent.worker.yield.v1` and the actual
+`toolCallId`; guest-supplied receipt identity is rejected. IDs are bounded to
+256 UTF-8 bytes without NUL, errors to 4096 bytes, and receipts to 32 KiB.
+The parent requires a matching native tool-start/end pair from the active
+acknowledged RPC turn. Text output and partial tool updates never settle keys.
+
+Each accepted receipt passes the same per-item schema, ownership, privacy and
+retention checks and becomes immediately available in ordinary item results
+and drain pages. It adds `details.workerBatch.yielded: true`. A schema-invalid
+payload or explicit error fails that key only. A duplicate, foreign or
+malformed successful receipt fails the worker while preserving earlier
+accepted items. A failed local tool call publishes nothing and can be
+corrected by the child.
+
+The final keyed envelope covers exactly the still-unyielded keys; if none
+remain it must be `{"items":[]}`. Prior accepted rows are immutable through
+later cancellation, EOF, invalid final output or timeout. The physical worker
+remains busy until its final persistence/compaction idle barrier, so all keys
+can be terminal while the pool is still draining. Carrier failure still makes
+the aggregate fail. There is no implicit suspension, resumed assignment,
+replay or renewed deadline.
 
 Direct `pool_result` and item-selected `pool_wait` expose the validated value
 at `details.item.result.details.results[0].data`. Drains retain the same full

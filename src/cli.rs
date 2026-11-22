@@ -534,6 +534,10 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["mode", "print"])]
     pub rpc: bool,
 
+    /// Install the native grouped-worker receipt helper in RPC mode.
+    #[arg(long, hide = true)]
+    pub worker_yield: bool,
+
     /// Start in ACP (Agent Client Protocol) mode for Zed editor integration.
     /// Reads JSON-RPC 2.0 requests from stdin and writes responses to stdout.
     #[arg(long)]

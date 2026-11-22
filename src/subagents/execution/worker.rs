@@ -57,7 +57,9 @@ use {
     crate::subagents::{
         SchemaMode, SubagentResult, SubagentStatus, SubagentTask, protocol, result_output,
     },
+    crate::subagents::worker::output_contract::{BatchAnswer, OutputContract},
     serde_json::{Value, json},
+    std::collections::{BTreeMap, BTreeSet},
     std::future::Future,
     std::io,
     std::process::{Command, Stdio},
@@ -281,6 +283,9 @@ impl Actor {
         )?;
         if let Some(transport) = &self.workspace_transport {
             transport.append_args(&mut args)?;
+        }
+        if crate::subagents::worker::yield_results(&self.state) {
+            args.push("--worker-yield".into());
         }
         let mut command = Command::new(&self.runner.child_binary);
         crate::agent_hub::ipc::ChildChannel::configure_child(&mut command, channel.as_ref());
@@ -529,24 +534,46 @@ impl Actor {
         }
     }
 
-    async fn collect_turn(&mut self, message: &str) -> Result<(String, String)> {
+    async fn collect_turn(
+        &mut self,
+        message: &str,
+        yield_keys: Option<(&str, &[u64])>,
+        mut on_yield: impl FnMut(&str, u64, BatchAnswer) -> Result<()>,
+    ) -> Result<(String, String, Option<Vec<u64>>)> {
         self.diagnostic.clear();
         let id = self.queue("prompt", Some(message))?;
         let mut reply = TurnReply::new(id.clone());
+        if let Some((request_id, keys)) = yield_keys {
+            if request_id != id {
+                return Err(Error::tool("subagent", INVALID_RPC));
+            }
+            reply.yields = Some(YieldReplies {
+                remaining: keys.to_vec(),
+                calls: BTreeSet::new(),
+            });
+        }
         let mut output = String::new();
         loop {
-            self.tick(|line, sent| reply.ingest(line, sent, &mut output))?;
+            self.tick(|line, sent| {
+                if let Some((key, answer)) = reply.ingest(line, sent, &mut output)? {
+                    // Publish in frame order, before the same read batch can
+                    // observe a later protocol failure or cancellation.
+                    on_yield(&id, key, answer)?;
+                    reply.accept_yield(key)?;
+                }
+                Ok(())
+            })?;
             if reply.complete {
                 break;
             }
             self.owner.time().sleep(POLL_INTERVAL).await;
         }
-        // The entire group stays running until the correlated post-turn
-        // persistence/compaction barrier. Cancellation before this point lets
-        // Drop reap the process and settle every original item as unfinished.
+        // The physical group stays active through persistence/compaction even
+        // when every logical item has already yielded. Cancellation preserves
+        // accepted yields and settles only the remaining unfinished items.
         self.idle_barrier().await?;
         self.check()?;
-        Ok((id, output))
+        Ok((id, output, reply.yields.map(|yields| yields.remaining)))
     }
 
     fn completed_result(&self, assignment: String) -> SubagentResult {
@@ -570,7 +597,22 @@ impl Actor {
     }
 
     async fn turn(&mut self, pending: crate::subagents::worker::PendingBatch) -> Result<()> {
-        use crate::subagents::worker::output_contract::{batch_answers, batch_prompt};
+        // The validator is owned outside the mutable actor borrow so receipt
+        // publication can run synchronously inside the pipe-draining callback.
+        let contract = self.output_contract.take();
+        let result = self.turn_with_contract(pending, contract.as_ref()).await;
+        self.output_contract = contract;
+        result
+    }
+
+    async fn turn_with_contract(
+        &mut self,
+        pending: crate::subagents::worker::PendingBatch,
+        contract: Option<&OutputContract>,
+    ) -> Result<()> {
+        use crate::subagents::worker::output_contract::{
+            batch_answers, batch_prompt, remaining_answers, yield_prompt,
+        };
 
         let first = pending
             .turns
@@ -579,47 +621,133 @@ impl Actor {
         if !pending.keyed && pending.turns.len() != 1 {
             return Err(Error::tool("subagent", INVALID_RPC));
         }
+        if pending.yield_results && (!pending.keyed || self.isolation.is_some()) {
+            return Err(Error::tool("subagent", INVALID_RPC));
+        }
         let ids = pending.turns.iter().map(|turn| turn.id).collect::<Vec<_>>();
+        // queue() consumes this exact next sequence synchronously before the
+        // first await. Native turn keys and this request ID cannot be supplied
+        // or changed by the child.
+        let yield_request = pending
+            .yield_results
+            .then(|| {
+                self.request_sequence
+                    .checked_add(1)
+                    .map(|sequence| format!("warm-{sequence}"))
+                    .ok_or_else(|| Error::tool("subagent", INVALID_RPC))
+            })
+            .transpose()?;
         let message = if pending.keyed {
             let assignments = pending
                 .turns
                 .iter()
                 .map(|turn| (turn.id, turn.task.as_str()))
                 .collect::<Vec<_>>();
-            batch_prompt(&assignments, self.output_contract.as_ref())?
+            if let Some(request_id) = &yield_request {
+                yield_prompt(&assignments, contract, request_id)?
+            } else {
+                batch_prompt(&assignments, contract)?
+            }
         } else {
-            self.output_contract.as_ref().map_or_else(
+            contract.map_or_else(
                 || first.task.clone(),
                 |contract| contract.prompt(&first.task),
             )
         };
-        let (request_id, mut output) = self.collect_turn(&message).await?;
+        let templates = if pending.yield_results {
+            pending
+                .turns
+                .iter()
+                .map(|turn| {
+                    let mut result = self.completed_result(turn.task.clone());
+                    // The new prompt has not begun yet. Never copy a prior
+                    // physical turn's diagnostics into an early result.
+                    result.stderr.clear();
+                    (turn.id, result)
+                })
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        let state = self.state.clone();
+        let workspace_lease = self
+            .workspace_transport
+            .as_ref()
+            .map(|transport| transport.lease.clone());
+        let (request_id, mut output, remaining) = self
+            .collect_turn(
+                &message,
+                yield_request
+                    .as_deref()
+                    .map(|request_id| (request_id, ids.as_slice())),
+                |request_id, key, answer| {
+                    let mut result = templates
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+                    answer.apply(&mut result, contract);
+                    let mut output = turn_output(result, key, Some((request_id, &ids)));
+                    if let Some(details) = output.details.as_mut() {
+                        details["workerBatch"]["yielded"] = json!(true);
+                    }
+                    if let Some(lease) = &workspace_lease {
+                        lease.check()?;
+                    }
+                    if !crate::subagents::worker::complete_turn(
+                        &state,
+                        key,
+                        Ok(output),
+                        workspace_lease.as_ref(),
+                    ) {
+                        return Err(Error::tool("subagent", CANCELLED));
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        let remaining = remaining.as_deref().unwrap_or(&ids);
         // Validate every envelope row and its key before accepting any item.
         // A malformed group fails all its members without retaining a raw
-        // prefix; valid data/error rows are then evaluated independently.
+        // prefix. In yield mode earlier accepted rows are immutable; only the
+        // final fallback's remaining keys belong to this envelope.
         let mut answers = pending.keyed.then(|| {
-            batch_answers(&output, &ids)
+            let answers = if pending.yield_results {
+                remaining_answers(&output, remaining)
+            } else {
+                batch_answers(&output, &ids)
+            };
+            answers
                 .map(Vec::into_iter)
                 .map_err(|error| error.to_string())
         });
+        if pending.yield_results
+            && let Some(Err(error)) = &answers
+        {
+            // Even an all-yielded batch still owes a valid terminal response
+            // and idle barrier. A bad tail fails its carrier, not old results.
+            return Err(Error::tool("subagent", error.clone()));
+        }
         let isolation = self
             .isolation
             .as_ref()
             .map(crate::subagents::worker::isolation::outcome);
         self.check()?;
         for turn in pending.turns {
+            if !remaining.contains(&turn.id) {
+                continue;
+            }
             let mut result = self.completed_result(turn.task);
             if let Some(answers) = &mut answers {
                 match answers {
                     Ok(answers) => answers
                         .next()
                         .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?
-                        .apply(&mut result, self.output_contract.as_ref()),
+                        .apply(&mut result, contract),
                     Err(error) => result.fail(error.clone()),
                 }
             } else {
                 result.output = std::mem::take(&mut output);
-                if let Some(contract) = &self.output_contract {
+                if let Some(contract) = contract {
                     contract.validate(&mut result);
                 }
             }
@@ -631,26 +759,26 @@ impl Actor {
                     )),
                 }
             }
-            let mut output = result_output(&[result], "worker", false);
-            if let Some(details) = output.details.as_mut() {
-                details["sessionIsolation"] = json!("persistent_rpc_worker");
-                details["turnId"] = json!(turn.id);
-                if pending.keyed {
-                    details["workerBatch"] = json!({
-                        "schema":"pi.subagent.worker.batch.v1",
-                        "requestId":request_id, "key":turn.id, "turnIds":ids,
-                        "patchScope":"cumulative_worker_batch",
-                    });
-                }
-            }
+            let output = turn_output(
+                result,
+                turn.id,
+                pending.keyed.then_some((request_id.as_str(), ids.as_slice())),
+            );
             // Each original ID keeps its own privacy projection, dependency,
             // retention budget and cancellation-linearized publication fence.
-            if let Some(transport) = &self.workspace_transport {
-                transport.lease.check()?;
+            if let Some(lease) = &workspace_lease {
+                lease.check()?;
             }
-            crate::subagents::worker::complete_turn(&self.state, turn.id, Ok(output));
+            if !crate::subagents::worker::complete_turn(
+                &self.state,
+                turn.id,
+                Ok(output),
+                workspace_lease.as_ref(),
+            ) {
+                return Err(Error::tool("subagent", CANCELLED));
+            }
         }
-        Ok(())
+        crate::subagents::worker::finish_batch(&self.state)
     }
 
     async fn execute(&mut self) -> Result<ToolOutput> {
@@ -678,6 +806,27 @@ impl Actor {
             is_error: false,
         })
     }
+}
+
+#[cfg(any(unix, windows))]
+fn turn_output(
+    result: SubagentResult,
+    key: u64,
+    batch: Option<(&str, &[u64])>,
+) -> ToolOutput {
+    let mut output = result_output(&[result], "worker", false);
+    if let Some(details) = output.details.as_mut() {
+        details["sessionIsolation"] = json!("persistent_rpc_worker");
+        details["turnId"] = json!(key);
+        if let Some((request_id, ids)) = batch {
+            details["workerBatch"] = json!({
+                "schema":"pi.subagent.worker.batch.v1",
+                "requestId":request_id, "key":key, "turnIds":ids,
+                "patchScope":"cumulative_worker_batch",
+            });
+        }
+    }
+    output
 }
 
 #[cfg(any(unix, windows))]
@@ -819,12 +968,21 @@ fn context_metric(event: &Value, field: &str, allow_zero: bool) -> Result<Option
 }
 
 #[cfg(any(unix, windows))]
+struct YieldReplies {
+    remaining: Vec<u64>,
+    // Starts may be emitted for an entire tool batch before any end event.
+    // Retire each entry on its end so invalid calls cannot grow retention.
+    calls: BTreeSet<String>,
+}
+
+#[cfg(any(unix, windows))]
 struct TurnReply {
     id: String,
     acknowledged: bool,
     started: bool,
     complete: bool,
     protocol: protocol::ChildProtocol,
+    yields: Option<YieldReplies>,
 }
 
 #[cfg(any(unix, windows))]
@@ -836,10 +994,16 @@ impl TurnReply {
             started: false,
             complete: false,
             protocol: protocol::ChildProtocol::default(),
+            yields: None,
         }
     }
 
-    fn ingest(&mut self, line: &str, sent: bool, output: &mut String) -> Result<()> {
+    fn ingest(
+        &mut self,
+        line: &str,
+        sent: bool,
+        output: &mut String,
+    ) -> Result<Option<(u64, BatchAnswer)>> {
         let event = frame(line)?;
         let kind = event
             .get("type")
@@ -858,7 +1022,7 @@ impl TurnReply {
                 ));
             }
             self.acknowledged = true;
-            return Ok(());
+            return Ok(None);
         }
         if turn_event(kind) && (!self.acknowledged || self.complete) {
             return Err(Error::tool("subagent", INVALID_RPC));
@@ -869,6 +1033,15 @@ impl TurnReply {
         if kind == "agent_end" && !self.started {
             return Err(Error::tool("subagent", INVALID_RPC));
         }
+        if kind == "agent_end"
+            && self
+                .yields
+                .as_ref()
+                .is_some_and(|yields| !yields.calls.is_empty())
+        {
+            return Err(Error::tool("subagent", INVALID_RPC));
+        }
+        let yielded = self.yield_event(line, &event)?;
         self.protocol
             .ingest(line, output)
             .map_err(|error| Error::tool("subagent", error))?;
@@ -878,6 +1051,73 @@ impl TurnReply {
                 .map_err(|error| Error::tool("subagent", error))?;
             self.complete = true;
         }
+        Ok(yielded)
+    }
+
+    fn yield_event(&mut self, line: &str, event: &Value) -> Result<Option<(u64, BatchAnswer)>> {
+        use crate::subagents::worker::output_contract::{MAX_YIELD_EVENT_BYTES, yield_answer};
+
+        let Some(yields) = &mut self.yields else {
+            return Ok(None);
+        };
+        if event.get("toolName").and_then(Value::as_str) != Some("yield") {
+            return Ok(None);
+        }
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(kind, "tool_execution_start" | "tool_execution_end") {
+            return Ok(None);
+        }
+        if !self.started {
+            return Err(Error::tool("subagent", INVALID_RPC));
+        }
+        let call_id = event
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && id.len() <= 256 && !id.contains('\0'))
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        if kind == "tool_execution_start" {
+            if yields.calls.len() >= 32 || !yields.calls.insert(call_id.to_string()) {
+                return Err(Error::tool("subagent", INVALID_RPC));
+            }
+            return Ok(None);
+        }
+        if !yields.calls.remove(call_id) {
+            return Err(Error::tool("subagent", INVALID_RPC));
+        }
+        let failed = event
+            .get("isError")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        if failed {
+            return Ok(None);
+        }
+        // Parsing the complete bounded success frame again rejects duplicate
+        // JSON fields, including inside data, before its typed claim is used.
+        let event = crate::judgment::decode_bounded_json(line, MAX_YIELD_EVENT_BYTES)
+            .map_err(|_| Error::tool("subagent", INVALID_RPC))?;
+        if event
+            .pointer("/result/isError")
+            .is_some_and(|value| value != &Value::Bool(false))
+        {
+            return Err(Error::tool("subagent", INVALID_RPC));
+        }
+        let receipt = event
+            .pointer("/result/details")
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        yield_answer(receipt, &self.id, call_id, &yields.remaining).map(Some)
+    }
+
+    fn accept_yield(&mut self, key: u64) -> Result<()> {
+        let yields = self
+            .yields
+            .as_mut()
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        let index = yields
+            .remaining
+            .iter()
+            .position(|candidate| *candidate == key)
+            .ok_or_else(|| Error::tool("subagent", INVALID_RPC))?;
+        yields.remaining.remove(index);
         Ok(())
     }
 }
@@ -1031,10 +1271,309 @@ while IFS= read -r line; do
 done
 "#;
 
+    const YIELD_RPC_CHILD: &str = r#"
+printf '%s\n' "$$" >> launches
+printf '%s\n' "$@" > arguments
+count=0
+while IFS= read -r line; do
+    id=${line#*\"id\":\"}
+    id=${id%%\"*}
+    case "$line" in
+        *'"type":"get_state"'*)
+            if [ "$count" -gt 0 ] && [ -f bad-idle ]; then
+                printf '%s\n' '{"type":"response","id":"foreign","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false}}'
+            elif [ "$count" -eq 1 ] && [ ! -f release-idle ]; then
+                printf ready > idle-blocked
+                printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":true}}\n' "$id"
+            else
+                printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"isStreaming":false,"isCompacting":false,"contextTokens":42,"contextWindow":1000}}\n' "$id"
+            fi
+            ;;
+        *'"type":"prompt"'*)
+            count=$((count + 1))
+            printf '%s\n' "$line" >> prompts
+            printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+            printf '%s\n' '{"type":"agent_start"}'
+            if [ "$count" -eq 1 ]; then
+                value='{"value":"first"}'
+                if [ -f schema-error ]; then value='{"value":7}'; fi
+                if [ -f private-data ]; then value='{"value":"yield-privacy-secret"}'; fi
+                printf '%s\n' '{"type":"tool_execution_start","toolName":"yield","toolCallId":"yield-1","args":{}}'
+                printf '{"type":"tool_execution_end","toolName":"yield","toolCallId":"yield-1","isError":false,"result":{"content":[],"details":{"schema":"pi.subagent.worker.yield.v1","requestId":"%s","key":1,"data":%s,"toolCallId":"yield-1"}}}\n' "$id" "$value"
+                if [ -f yield-all ]; then
+                    printf '%s\n' '{"type":"tool_execution_start","toolName":"yield","toolCallId":"yield-2","args":{}}'
+                    printf '{"type":"tool_execution_end","toolName":"yield","toolCallId":"yield-2","isError":false,"result":{"content":[],"details":{"schema":"pi.subagent.worker.yield.v1","requestId":"%s","key":2,"data":{"value":"second"},"toolCallId":"yield-2"}}}\n' "$id"
+                fi
+                printf ready > yielded
+                while [ ! -f release-tail ]; do sleep 0.02; done
+                if [ -f fail-after-yield ]; then
+                    printf '%s\n' '{"type":"agent_end","error":"intentional late failure","messages":[]}'
+                    continue
+                fi
+                if [ -f duplicate-tail ]; then
+                    printf '%s\n' '{"type":"tool_execution_start","toolName":"yield","toolCallId":"yield-duplicate","args":{}}'
+                    printf '{"type":"tool_execution_end","toolName":"yield","toolCallId":"yield-duplicate","isError":false,"result":{"content":[],"details":{"schema":"pi.subagent.worker.yield.v1","requestId":"%s","key":1,"data":{"value":"replacement-canary"},"toolCallId":"yield-duplicate"}}}\n' "$id"
+                    continue
+                fi
+                if [ -f yield-all ]; then
+                    answer='{"items":[]}'
+                else
+                    answer='{"items":[{"key":2,"data":{"value":"second"}}]}'
+                fi
+                if [ -f malformed-final ]; then answer='{"items":[{"key":1,"data":"replacement-canary"}]}'; fi
+            else
+                answer='{"items":[{"key":3,"data":{"value":"third"}}]}'
+            fi
+            escaped=$(printf '%s' "$answer" | sed 's/"/\\"/g')
+            printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"%s"}]}]}\n' "$escaped"
+            ;;
+    esac
+done
+"#;
+
     fn pool_native_result(value: &Value) -> &Value {
         value
             .pointer("/item/result/details/results/0")
             .expect("original pool item must retain its own native result")
+    }
+
+    #[test]
+    fn yielded_item_drains_before_terminal_answer_and_remaining_items_wait_for_idle() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(YIELD_RPC_CHILD);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({
+                "operation":"pool_start", "agent":"worker", "concurrency":1,
+                "maxBatchSize":2, "yieldResults":true,
+                "tasks":["first-task", "second-task", "third-task"],
+                "outputSchema":{"type":"object", "required":["value"],
+                    "additionalProperties":false, "properties":{"value":{"type":"string"}}}
+            })).await;
+            let pool = field(&started, "poolId");
+            let page = fixture.call(json!({"operation":"pool_drain", "poolId":pool,
+                "timeoutMs":5000})).await;
+            assert_eq!(page["items"].as_array().unwrap().len(), 1);
+            assert_eq!(page["items"][0]["id"], 1);
+            assert_eq!(page["items"][0]["result"]["details"]["results"][0]["data"],
+                json!({"value":"first"}));
+            assert_eq!(page["items"][0]["result"]["details"]["workerBatch"]["yielded"], true);
+            assert_eq!(page["done"], false);
+            assert!(!fixture.root.path().join("release-tail").exists());
+            let busy = fixture.call(json!({"operation":"pool_status", "poolId":pool})).await;
+            assert_eq!(busy["completedItems"], 1);
+            assert_eq!(busy["runningItems"], 1);
+            assert_eq!(busy["queuedItems"], 1);
+            fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+            std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
+            fixture.await_file("idle-blocked").await;
+            let waiting = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                "itemId":2})).await;
+            assert_eq!(waiting["item"]["status"], "running");
+            assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
+                .unwrap().lines().count(), 1);
+            std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
+            let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":5000})).await;
+            assert_eq!(settled["status"], "completed");
+            assert_eq!(settled["completedItems"], 3);
+            for (id, expected) in [(1, "first"), (2, "second"), (3, "third")] {
+                let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":id})).await;
+                assert_eq!(pool_native_result(&item)["data"], json!({"value":expected}));
+                assert_eq!(pool_native_result(&item)["schemaValid"], true);
+                assert_eq!(pool_native_result(&item)["task"], format!("{expected}-task"));
+            }
+            let prompts = std::fs::read_to_string(fixture.root.path().join("prompts"))
+                .unwrap();
+            let prompts: Vec<Value> = prompts.lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert_eq!(prompts.len(), 2);
+            assert!(prompts[0]["message"].as_str().unwrap().contains("native yield tool"));
+            let arguments = std::fs::read_to_string(fixture.root.path().join("arguments"))
+                .unwrap();
+            assert!(arguments.lines().any(|argument| argument == "--worker-yield"));
+        });
+    }
+
+    #[test]
+    fn all_yielded_items_do_not_close_a_sealed_worker_before_terminal_and_idle() {
+        let _guard = crate::jobs::process_test_guard();
+        let fixture = Fixture::new(YIELD_RPC_CHILD);
+        std::fs::write(fixture.root.path().join("yield-all"), "ready").unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                "concurrency":1, "maxBatchSize":2, "yieldResults":true,
+                "tasks":["first-task", "second-task"]})).await;
+            let pool = field(&started, "poolId");
+            let second = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "itemId":2, "timeoutMs":5000})).await;
+            assert_eq!(second["item"]["status"], "completed");
+            let pid = std::fs::read_to_string(fixture.root.path().join("launches"))
+                .unwrap().trim().parse::<i32>().ok()
+                .and_then(rustix::process::Pid::from_raw).unwrap();
+            let sealed = fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+            assert_eq!(sealed["status"], "draining");
+            let still_running = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":40})).await;
+            assert_eq!(still_running["status"], "draining");
+            assert_eq!(still_running["completedItems"], 2);
+            assert!(rustix::process::test_kill_process(pid).is_ok());
+            std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
+            fixture.await_file("idle-blocked").await;
+            let compacting = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":40})).await;
+            assert_eq!(compacting["status"], "draining");
+            assert!(rustix::process::test_kill_process(pid).is_ok());
+            std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
+            let completed = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                "timeoutMs":5000})).await;
+            assert_eq!(completed["status"], "completed");
+            assert_eq!(completed["completedItems"], 2);
+            assert!(rustix::process::test_kill_process(pid).is_err());
+        });
+    }
+
+    #[test]
+    fn late_failure_duplicate_receipt_and_cancellation_preserve_accepted_yields() {
+        let _guard = crate::jobs::process_test_guard();
+        for failure in ["cancel", "fail-after-yield", "duplicate-tail", "malformed-final"] {
+            let fixture = Fixture::new(YIELD_RPC_CHILD);
+            std::fs::write(fixture.root.path().join(failure), "ready").unwrap();
+            std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                    "concurrency":1, "maxBatchSize":2, "yieldResults":true,
+                    "tasks":["first-task", "second-task", "third-task"]})).await;
+                let pool = field(&started, "poolId");
+                let first = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                    "itemId":1, "timeoutMs":5000})).await;
+                assert_eq!(first["item"]["status"], "completed");
+                let original = first["item"]["result"].clone();
+                let settled = if failure == "cancel" {
+                    fixture.call(json!({"operation":"pool_close", "poolId":pool})).await
+                } else {
+                    std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
+                    fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                        "timeoutMs":5000})).await
+                };
+                assert_eq!(settled["status"], if failure == "cancel" { "cancelled" } else { "failed" });
+                assert_eq!(settled["completedItems"], 1);
+                assert_eq!(settled["failedItems"], 2);
+                let retained = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":1})).await;
+                assert_eq!(retained["item"]["result"], original);
+                for id in [2, 3] {
+                    let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                        "itemId":id})).await;
+                    assert!(matches!(item["item"]["status"].as_str(), Some("failed" | "cancelled")));
+                    assert!(!item.to_string().contains("replacement-canary"));
+                }
+                assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
+                    .unwrap().lines().count(), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn all_yielded_successes_survive_a_failed_carrier_tail() {
+        let _guard = crate::jobs::process_test_guard();
+        for failure in ["bad-idle", "malformed-final"] {
+            let fixture = Fixture::new(YIELD_RPC_CHILD);
+            for marker in ["yield-all", "release-idle", failure] {
+                std::fs::write(fixture.root.path().join(marker), "ready").unwrap();
+            }
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
+                    "concurrency":1, "maxBatchSize":2, "yieldResults":true,
+                    "tasks":["first-task", "second-task"]})).await;
+                let pool = field(&started, "poolId");
+                let second = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                    "itemId":2, "timeoutMs":5000})).await;
+                assert_eq!(second["item"]["status"], "completed");
+                fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+                std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
+                let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                    "timeoutMs":5000})).await;
+                assert_eq!(settled["status"], "failed");
+                assert_eq!(settled["completedItems"], 2);
+                assert_eq!(settled["failedItems"], 0);
+                for id in [1, 2] {
+                    let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                        "itemId":id})).await;
+                    assert_eq!(item["item"]["status"], "completed");
+                    assert!(!item.to_string().contains("replacement-canary"));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn yielded_schema_and_privacy_failures_settle_only_their_original_item() {
+        let _guard = crate::jobs::process_test_guard();
+        for failure in ["schema-error", "private-data"] {
+            let fixture = Fixture::new(YIELD_RPC_CHILD);
+            std::fs::write(fixture.root.path().join(failure), "ready").unwrap();
+            std::fs::write(fixture.root.path().join("release-idle"), "ready").unwrap();
+            let mut vault = crate::secrets::SecretVault::default();
+            if failure == "private-data" {
+                let secret = "yield-privacy-secret";
+                crate::secrets::obfuscate(
+                    secret,
+                    &mut vault,
+                    &[regex::Regex::new(secret).unwrap()],
+                );
+            }
+            let privacy = crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+                crate::text_completion::AuxiliaryPrivacy::from_settings(None),
+                &vault,
+            );
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let started = crate::subagents::worker::execute(&fixture.tool, json!({
+                    "operation":"pool_start", "agent":"worker", "concurrency":1,
+                    "maxBatchSize":2, "yieldResults":true,
+                    "tasks":["first-task", "second-task"],
+                    "outputSchema":{"type":"object", "required":["value"],
+                        "additionalProperties":false, "properties":{"value":{"type":"string"}}}
+                }), privacy).await.unwrap().details.unwrap();
+                let pool = field(&started, "poolId");
+                let failed = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                    "itemId":1, "timeoutMs":5000})).await;
+                assert_eq!(failed["item"]["status"], "failed");
+                assert!(!failed.to_string().contains("yield-privacy-secret"));
+                if failure == "schema-error" {
+                    assert_eq!(pool_native_result(&failed)["schemaValid"], false);
+                    assert_eq!(pool_native_result(&failed)["schemaRetries"], 0);
+                } else {
+                    assert!(failed.to_string().contains("PI_SUBAGENT_WORKER_RESULT_WITHHELD"));
+                }
+                fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
+                std::fs::write(fixture.root.path().join("release-tail"), "ready").unwrap();
+                let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
+                    "timeoutMs":5000})).await;
+                assert_eq!(settled["status"], "failed");
+                assert_eq!(settled["completedItems"], 1);
+                assert_eq!(settled["failedItems"], 1);
+                let second = fixture.call(json!({"operation":"pool_result", "poolId":pool,
+                    "itemId":2})).await;
+                assert_eq!(second["item"]["status"], "completed");
+                assert_eq!(pool_native_result(&second)["data"], json!({"value":"second"}));
+            });
+        }
     }
 
     #[test]
@@ -1749,6 +2288,111 @@ exec sleep 30
             "content":[{"type":"text", "text":text}]
         }]})
         .to_string()
+    }
+
+    fn yielding_reply() -> TurnReply {
+        let mut reply = TurnReply::new("warm-2".to_string());
+        reply.yields = Some(YieldReplies {
+            remaining: vec![1, 2],
+            calls: BTreeSet::new(),
+        });
+        reply
+            .ingest(&acknowledged("warm-2"), true, &mut String::new())
+            .unwrap();
+        reply
+            .ingest(r#"{"type":"agent_start"}"#, true, &mut String::new())
+            .unwrap();
+        reply
+    }
+
+    fn yield_started(call: &str) -> String {
+        json!({"type":"tool_execution_start", "toolName":"yield",
+            "toolCallId":call, "args":{}})
+        .to_string()
+    }
+
+    fn yield_ended(call: &str, input: Value) -> String {
+        let receipt = crate::subagents::worker::output_contract::yield_receipt(call, input)
+            .unwrap();
+        json!({"type":"tool_execution_end", "toolName":"yield", "toolCallId":call,
+            "isError":false, "result":{"content":[], "details":receipt}})
+        .to_string()
+    }
+
+    #[test]
+    fn yield_protocol_uses_successful_correlated_end_events_and_keeps_failed_calls_pending() {
+        let mut reply = yielding_reply();
+        let mut output = String::new();
+        for call in ["one", "two"] {
+            assert!(reply.ingest(&yield_started(call), true, &mut output).unwrap().is_none());
+        }
+        let update = json!({"type":"tool_execution_update", "toolName":"yield", "toolCallId":"one",
+            "partialResult":{"details":{"schema":"pi.subagent.worker.yield.v1",
+                "requestId":"warm-2", "key":1, "data":"preview-canary", "toolCallId":"one"}}});
+        assert!(reply.ingest(&update.to_string(), true, &mut output).unwrap().is_none());
+        let result = reply.ingest(&yield_ended("one", json!({
+            "requestId":"warm-2", "key":1, "data":null
+        })), true, &mut output).unwrap();
+        assert_eq!(result, Some((1, BatchAnswer::Data(Value::Null))));
+        // Validation alone cannot release the key before the native owner
+        // confirms its cancellation-linearized acceptance.
+        assert_eq!(reply.yields.as_ref().unwrap().remaining, vec![1, 2]);
+        reply.accept_yield(1).unwrap();
+        let failed = json!({"type":"tool_execution_end", "toolName":"yield", "toolCallId":"two",
+            "isError":true, "result":{"content":[], "isError":true}});
+        assert!(reply.ingest(&failed.to_string(), true, &mut output).unwrap().is_none());
+        assert_eq!(reply.yields.as_ref().unwrap().remaining, vec![2]);
+        reply.ingest(&ended(r#"{"items":[{"key":2,"data":false}]}"#), true, &mut output)
+            .unwrap();
+        assert!(reply.complete);
+        assert!(!output.contains("preview-canary"));
+    }
+
+    #[test]
+    fn yield_protocol_rejects_stale_foreign_duplicate_and_unstarted_receipts() {
+        for input in [
+            json!({"requestId":"old-request", "key":1, "data":true}),
+            json!({"requestId":"warm-2", "key":3, "data":true}),
+        ] {
+            let mut reply = yielding_reply();
+            reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+            assert!(reply.ingest(&yield_ended("one", input), true, &mut String::new()).is_err());
+        }
+        let mut reply = yielding_reply();
+        let receipt = yield_ended("one", json!({"requestId":"warm-2", "key":1, "data":true}));
+        assert!(reply.ingest(&receipt, true, &mut String::new()).is_err());
+
+        let mut reply = yielding_reply();
+        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+        reply.ingest(&receipt, true, &mut String::new()).unwrap();
+        reply.accept_yield(1).unwrap();
+        reply.ingest(&yield_started("another"), true, &mut String::new()).unwrap();
+        assert!(reply.ingest(&yield_ended("another", json!({
+            "requestId":"warm-2", "key":1, "data":"replacement-canary"
+        })), true, &mut String::new()).is_err());
+        assert_eq!(reply.yields.as_ref().unwrap().remaining, vec![2]);
+
+        let mut reply = yielding_reply();
+        reply.started = false;
+        assert!(reply.ingest(&yield_started("one"), true, &mut String::new()).is_err());
+        let mut reply = yielding_reply();
+        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+        assert!(reply.ingest(&ended(r#"{"items":[]}"#), true, &mut String::new()).is_err());
+    }
+
+    #[test]
+    fn yield_protocol_rejects_duplicate_json_fields_and_conflicting_result_error_flags() {
+        let mut reply = yielding_reply();
+        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+        let duplicate = r#"{"type":"tool_execution_end","toolName":"yield","toolCallId":"one","isError":false,"result":{"content":[],"details":{"schema":"pi.subagent.worker.yield.v1","requestId":"warm-2","key":1,"data":{"n":1,"n":2},"toolCallId":"one"}}}"#;
+        assert!(reply.ingest(duplicate, true, &mut String::new()).is_err());
+        let mut reply = yielding_reply();
+        reply.ingest(&yield_started("one"), true, &mut String::new()).unwrap();
+        let mut conflicting: Value = serde_json::from_str(&yield_ended("one", json!({
+            "requestId":"warm-2", "key":1, "data":true
+        }))).unwrap();
+        conflicting["result"]["isError"] = json!(true);
+        assert!(reply.ingest(&conflicting.to_string(), true, &mut String::new()).is_err());
     }
 
     #[test]

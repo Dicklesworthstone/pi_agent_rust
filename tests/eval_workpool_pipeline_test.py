@@ -247,6 +247,35 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("POOL_FAILED", str(caught.exception.__cause__))
         self.assertEqual(caught.exception.progress["completed"], 1)
 
+    async def test_early_reductions_wait_for_physical_completion_and_late_failure(self):
+        for carrier_failure in (False, True):
+            with self.subTest(carrier_failure=carrier_failure):
+                f = fixture(max_batch_size=4, carrier_failure=carrier_failure)
+                drain = f.pool.drain
+                async def early_drain(**options):
+                    page = await drain(**options)
+                    if page["items"]:
+                        page["items"][0]["result"]["details"]["workerBatch"] = {"yielded": True}
+                        return {**page, "done": False, "status": "draining"}
+                    self.assertEqual(f.state.reduced, 1)
+                    return page
+                f.pool.drain = early_drain
+                try:
+                    result = await f.run(["ready"], mapper, reduction(f), [],
+                                         pool={"max_batch_size": 4, "yield_results": True})
+                except RuntimeError as error:
+                    self.assertTrue(carrier_failure)
+                    self.assertIn("POOL_FAILED", str(error.__cause__))
+                    self.assertEqual(error.progress["completed"], 1)
+                    self.assertEqual(error.cursor["itemIds"], [1])
+                else:
+                    self.assertFalse(carrier_failure)
+                    self.assertEqual((result["status"], result["completed"]), ("completed", 1))
+                    self.assertEqual(f.state.close_calls, 0)
+                self.assertEqual(len(f.state.drains), 2)
+                self.assertEqual(f.state.reduced, 1)
+                self.assertEqual(f.state.options, {"max_batch_size": 4, "yield_results": True})
+
     async def test_exact_generator_capacity_succeeds(self):
         f = fixture()
         result = await f.run((value for value in ["a", "b", "c"]), mapper, reduction(f), [], max_items=3)

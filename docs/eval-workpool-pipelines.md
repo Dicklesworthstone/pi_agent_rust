@@ -69,6 +69,17 @@ Groups may be smaller than the maximum: workers do not wait for a full group,
 and combined task text is capped at 64 KiB per prompt. Each item still has its
 own handle, schema check, status and result cursor entry.
 
+For grouped shared-workspace pools, set `pool.yieldResults: true` in JavaScript
+or `pool={'yield_results': True, 'max_batch_size': 4, ...}` in Python. This
+enables the child's native `yield` tool to publish completed items while it
+continues the batch. The reducer can consume those terminal results through
+the same drain/exchange path and acknowledge them with the existing cursor.
+Later worker failure preserves accepted results and successful reductions;
+the pipeline still reports a failed carrier truthfully. Physical workers are
+not reused or reaped until their final RPC idle barrier, even if every item
+has yielded. The option requires a group limit above 1, defaults to false,
+and rejects worktree isolation. See [early item publication](eval-structured-results.md#publish-completed-items-before-a-grouped-turn-ends).
+
 ## Admission and ordering
 
 Inputs may be synchronous or asynchronous iterables. The helper retains at

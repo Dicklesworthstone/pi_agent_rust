@@ -97,9 +97,10 @@ def fixture():
         async def output(self):
             return await Turn(self, self._turn_id).output()
     class BasePool:
-        def __init__(self, options, name, concurrency, max_batch_size=1):
+        def __init__(self, options, name, concurrency, max_batch_size=1, yield_results=False):
             self._options, self.name, self.concurrency = options, name, concurrency
             self.max_batch_size = max_batch_size
+            self.yield_results = yield_results
             self._closed, self._finish_acknowledged = False, False
             self._items, self._pool_id, self._job_id = [], None, None
         @property
@@ -337,6 +338,16 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         k.respond = invalid
         with self.assertRaisesRegex(k.ToolBridgeError, 'PROTOCOL'):
             await k._workpool.attach('pool-a')
+
+    async def test_pool_recovery_restores_frozen_yield_mode_without_restarting(self):
+        k = fixture()
+        async def yielding(name, args):
+            return pool(maxBatchSize=4, yieldResults=True)
+        k.respond = yielding
+        p = await k._workpool.attach('pool-a')
+        self.assertTrue(p.yield_results)
+        self.assertEqual(p.max_batch_size, 4)
+        self.assertEqual([args['operation'] for _, args in k.calls], ['pool_status'])
 
     async def test_installation_is_once_and_new_factories_use_concrete_types(self):
         k = fixture()
