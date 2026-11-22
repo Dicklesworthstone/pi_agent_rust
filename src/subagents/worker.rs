@@ -976,8 +976,7 @@ mod tests {
     use crate::text_completion::AuxiliaryPrivacy;
 
     fn queued_worker(max_batch_size: usize, assignments: &[&str]) -> Shared {
-        let privacy =
-            AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
+        let privacy = AuxiliaryPrivacySnapshot::from_privacy(AuxiliaryPrivacy::from_settings(None));
         let mut queue = VecDeque::new();
         let mut turns = BTreeMap::new();
         for (index, task) in assignments.iter().enumerate() {
@@ -1131,7 +1130,10 @@ mod tests {
         let half = "x".repeat(MAX_PROMPT_BYTES / 2);
         let shared = queued_worker(8, &[&half, &half, "tail"]);
         assert_eq!(
-            next_batch(&shared).expect("exact byte boundary").turns.len(),
+            next_batch(&shared)
+                .expect("exact byte boundary")
+                .turns
+                .len(),
             2
         );
         assert_eq!(shared.lock().expect("worker fixture").queue.len(), 1);

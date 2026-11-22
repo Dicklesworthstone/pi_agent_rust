@@ -1552,7 +1552,15 @@ struct ValidatedManifest {
     extensions: Vec<ManifestEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
+struct CommittedValidatedManifest {
+    schema: String,
+    #[allow(dead_code)]
+    generated_at: String,
+    extensions: Vec<ManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestEntry {
     id: String,
     entry_path: String,
@@ -1564,7 +1572,7 @@ struct ManifestEntry {
 }
 
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestCapabilities {
     registers_tools: bool,
     registers_commands: bool,
@@ -1579,12 +1587,60 @@ struct ManifestCapabilities {
     has_npm_deps: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManifestRegistrations {
     tools: Vec<String>,
     commands: Vec<String>,
     flags: Vec<String>,
     event_handlers: Vec<String>,
+}
+
+/// Node.js stream, process, socket, and watcher EventEmitter callback names
+/// that static `.on(...)` scanning must never mistake for Pi extension
+/// lifecycle hooks (`pi.on(...)` / `pi.events.on(...)`).
+const NON_PI_NODE_EVENTS: &[&str] = &[
+    "SIGHUP",
+    "SIGINT",
+    "SIGKILL",
+    "SIGTERM",
+    "add",
+    "beforeExit",
+    "change",
+    "close",
+    "connect",
+    "connection",
+    "data",
+    "drain",
+    "end",
+    "error",
+    "event",
+    "exit",
+    "finish",
+    "line",
+    "listening",
+    "open",
+    "pause",
+    "pipe",
+    "readable",
+    "ready",
+    "resize",
+    "resume",
+    "timeout",
+    "uncaughtException",
+    "unhandledRejection",
+    "unlink",
+    "unpipe",
+];
+
+fn is_non_pi_node_event(name: &str) -> bool {
+    NON_PI_NODE_EVENTS.contains(&name)
+}
+
+fn is_sorted_unique_nonempty(values: &[String]) -> bool {
+    values.iter().all(|v| !v.is_empty())
+        && values
+            .windows(2)
+            .all(|pair| matches!(pair, [a, b] if a < b))
 }
 
 fn determine_source_tier(rel_path: &str) -> &'static str {
@@ -1645,7 +1701,8 @@ fn extract_registrations(content: &str) -> ManifestRegistrations {
 
     for (idx, _) in content.match_indices("registerFlag(") {
         let window = safe_window(content, idx, 500);
-        if let Some(name) = extract_quoted_after(window, "name:")
+        if let Some(name) = extract_first_string_arg(window, "registerFlag(")
+            .or_else(|| extract_quoted_after(window, "name:"))
             && !flags.contains(&name)
         {
             flags.push(name);
@@ -1655,6 +1712,7 @@ fn extract_registrations(content: &str) -> ManifestRegistrations {
     for (idx, _) in content.match_indices(".on(") {
         let window = safe_window(content, idx, 100);
         if let Some(name) = extract_first_string_arg(window, ".on(")
+            && !is_non_pi_node_event(&name)
             && !event_handlers.contains(&name)
         {
             event_handlers.push(name);
@@ -1953,7 +2011,28 @@ fn test_generate_validated_manifest() {
         ext_dirs.len()
     );
 
+    let manifest_path = std::env::var("PI_TEST_MANIFEST_PATH").map_or_else(
+        |_| repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json"),
+        PathBuf::from,
+    );
+    let generate = matches!(
+        std::env::var("PI_GENERATE_VALIDATED_MANIFEST").as_deref(),
+        Ok("1")
+    );
+    let existing_by_id: BTreeMap<String, ManifestEntry> = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<CommittedValidatedManifest>(&raw).ok())
+        .map(|existing| {
+            existing
+                .extensions
+                .into_iter()
+                .map(|entry| (entry.id.clone(), entry))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut entries = Vec::new();
+    let mut forbidden_by_id: BTreeMap<String, bool> = BTreeMap::new();
     let mut missing_entry_points = Vec::new();
 
     for (id, ext_dir) in &ext_dirs {
@@ -1980,6 +2059,7 @@ fn test_generate_validated_manifest() {
             .collect();
 
         let has_forbidden = !ledger.forbidden.is_empty();
+        forbidden_by_id.insert(id.clone(), has_forbidden);
 
         let mut all_content = String::new();
         for file in &ts_files {
@@ -1989,16 +2069,38 @@ fn test_generate_validated_manifest() {
             }
         }
 
-        let registrations = extract_registrations(&all_content);
+        let static_registrations = extract_registrations(&all_content);
+        // Preserve committed runtime-observed registrations when regenerating
+        // static corpus metadata so dynamic registrations (factory helpers,
+        // loops, sub-extension entry scoping) are never clobbered by static
+        // regex heuristics.
+        let registrations = existing_by_id
+            .get(id)
+            .filter(|prev| {
+                !prev
+                    .registrations
+                    .event_handlers
+                    .iter()
+                    .any(|ev| is_non_pi_node_event(ev))
+            })
+            .map_or(static_registrations, |prev| prev.registrations.clone());
 
         let caps = ManifestCapabilities {
-            registers_tools: cap_names.contains(&"tool")
-                || !registrations.tools.is_empty()
-                || all_content.contains("registerTool("),
+            registers_tools: !registrations.tools.is_empty()
+                || existing_by_id.get(id).map_or_else(
+                    || cap_names.contains(&"tool") || all_content.contains("registerTool("),
+                    |prev| prev.capabilities.registers_tools,
+                ),
             registers_commands: !registrations.commands.is_empty()
-                || all_content.contains("registerCommand("),
+                || existing_by_id.get(id).map_or_else(
+                    || all_content.contains("registerCommand("),
+                    |prev| prev.capabilities.registers_commands,
+                ),
             registers_flags: !registrations.flags.is_empty()
-                || all_content.contains("registerFlag("),
+                || existing_by_id.get(id).map_or_else(
+                    || all_content.contains("registerFlag("),
+                    |prev| prev.capabilities.registers_flags,
+                ),
             registers_providers: all_content.contains("registerProvider("),
             subscribes_events: registrations.event_handlers.clone(),
             uses_exec: cap_names.contains(&"exec"),
@@ -2029,16 +2131,8 @@ fn test_generate_validated_manifest() {
         extensions: entries,
     };
 
-    let manifest_path = std::env::var("PI_TEST_MANIFEST_PATH").map_or_else(
-        |_| repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json"),
-        PathBuf::from,
-    );
-    let json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
-    let generate = matches!(
-        std::env::var("PI_GENERATE_VALIDATED_MANIFEST").as_deref(),
-        Ok("1")
-    );
     if generate {
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
         // Enforce tree completeness before writing the manifest (bd-s7hzz)
         pi::conformance::snapshot::verify_tree_completeness(
             repo_root,
@@ -2049,16 +2143,130 @@ fn test_generate_validated_manifest() {
     } else {
         let committed_json =
             fs::read_to_string(&manifest_path).expect("read committed VALIDATED_MANIFEST.json");
-        let committed: serde_json::Value =
+        let committed: CommittedValidatedManifest =
             serde_json::from_str(&committed_json).expect("parse committed VALIDATED_MANIFEST.json");
-        let computed: serde_json::Value =
-            serde_json::from_str(&json).expect("parse computed VALIDATED_MANIFEST.json");
         assert_eq!(
-            committed, computed,
-            "committed validated manifest is stale; regenerate explicitly with \
-             PI_GENERATE_VALIDATED_MANIFEST=1 cargo test \
+            committed.schema, manifest.schema,
+            "committed VALIDATED_MANIFEST.json schema mismatch"
+        );
+        let committed_ids: Vec<&str> = committed
+            .extensions
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let computed_ids: Vec<&str> = manifest
+            .extensions
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(
+            committed_ids, computed_ids,
+            "committed VALIDATED_MANIFEST.json extension inventory drifted from disk; \
+             regenerate explicitly with PI_GENERATE_VALIDATED_MANIFEST=1 cargo test \
              --test ext_conformance_artifacts test_generate_validated_manifest -- --exact"
         );
+
+        for (committed_entry, computed_entry) in
+            committed.extensions.iter().zip(manifest.extensions.iter())
+        {
+            let id = &committed_entry.id;
+            assert_eq!(
+                committed_entry.entry_path, computed_entry.entry_path,
+                "{id}: entry_path drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.source_tier, computed_entry.source_tier,
+                "{id}: source_tier drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.is_multi_file,
+                computed_entry.capabilities.is_multi_file,
+                "{id}: capabilities.is_multi_file drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.has_npm_deps, computed_entry.capabilities.has_npm_deps,
+                "{id}: capabilities.has_npm_deps drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.uses_exec, computed_entry.capabilities.uses_exec,
+                "{id}: capabilities.uses_exec drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.uses_http, computed_entry.capabilities.uses_http,
+                "{id}: capabilities.uses_http drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.uses_ui, computed_entry.capabilities.uses_ui,
+                "{id}: capabilities.uses_ui drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.uses_session, computed_entry.capabilities.uses_session,
+                "{id}: capabilities.uses_session drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.capabilities.registers_providers,
+                computed_entry.capabilities.registers_providers,
+                "{id}: capabilities.registers_providers drifted from disk"
+            );
+            assert_eq!(
+                committed_entry.mock_requirements,
+                determine_mock_requirements(&committed_entry.capabilities),
+                "{id}: mock_requirements inconsistent with capabilities"
+            );
+            let has_forbidden = forbidden_by_id.get(id).copied().unwrap_or(false);
+            assert_eq!(
+                committed_entry.conformance_tier,
+                classify_tier(&committed_entry.capabilities, has_forbidden),
+                "{id}: conformance_tier inconsistent with capabilities"
+            );
+            assert!(
+                is_sorted_unique_nonempty(&committed_entry.registrations.tools),
+                "{id}: registrations.tools must be sorted, unique, and non-empty"
+            );
+            assert!(
+                is_sorted_unique_nonempty(&committed_entry.registrations.commands),
+                "{id}: registrations.commands must be sorted, unique, and non-empty"
+            );
+            assert!(
+                is_sorted_unique_nonempty(&committed_entry.registrations.flags),
+                "{id}: registrations.flags must be sorted, unique, and non-empty"
+            );
+            assert!(
+                is_sorted_unique_nonempty(&committed_entry.registrations.event_handlers),
+                "{id}: registrations.event_handlers must be sorted, unique, and non-empty"
+            );
+            assert_eq!(
+                committed_entry.capabilities.subscribes_events,
+                committed_entry.registrations.event_handlers,
+                "{id}: capabilities.subscribes_events must match registrations.event_handlers"
+            );
+            assert!(
+                committed_entry.registrations.tools.is_empty()
+                    || committed_entry.capabilities.registers_tools,
+                "{id}: capabilities.registers_tools must be true when registrations.tools is non-empty"
+            );
+            assert!(
+                committed_entry.registrations.commands.is_empty()
+                    || committed_entry.capabilities.registers_commands,
+                "{id}: capabilities.registers_commands must be true when registrations.commands is non-empty"
+            );
+            assert!(
+                committed_entry.registrations.flags.is_empty()
+                    || committed_entry.capabilities.registers_flags,
+                "{id}: capabilities.registers_flags must be true when registrations.flags is non-empty"
+            );
+            let polluted_events: Vec<&str> = committed_entry
+                .registrations
+                .event_handlers
+                .iter()
+                .map(String::as_str)
+                .filter(|ev| is_non_pi_node_event(ev))
+                .collect();
+            assert!(
+                polluted_events.is_empty(),
+                "{id}: registrations.event_handlers contains non-Pi Node/stream events: {polluted_events:?}"
+            );
+        }
     }
 
     eprintln!("=== Validated Manifest Summary ===");
@@ -2125,6 +2333,17 @@ fn test_manifest_spot_check_known_extensions() {
         "hello.ts should register 'hello' tool, got: {:?}",
         regs.tools
     );
+
+    let sample = r#"
+        pi.registerFlag("plan-mode", { description: "Enable plan mode", type: "boolean" });
+        pi.on("tool_call", () => {});
+        child.stdout.on("data", () => {});
+        child.on("close", () => {});
+        process.on("SIGINT", () => {});
+    "#;
+    let parsed = extract_registrations(sample);
+    assert_eq!(parsed.flags, vec!["plan-mode"]);
+    assert_eq!(parsed.event_handlers, vec!["tool_call"]);
 
     let plan_dir = artifacts_dir.join("plan-mode");
     let plan_entry = find_entry_point(&plan_dir, &artifacts_dir);

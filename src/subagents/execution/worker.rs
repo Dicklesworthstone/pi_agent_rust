@@ -1096,8 +1096,10 @@ done
                 "role":"assistant", "stopReason":"stop", "content":[{
                     "type":"text", "text":serde_json::to_string(&answer).unwrap()
                 }]
-            }]}).to_string();
-            let script = format!(r#"
+            }]})
+            .to_string();
+            let script = format!(
+                r#"
 while IFS= read -r line; do
     id=${{line#*\"id\":\"}}
     id=${{id%%\"*}}
@@ -1113,28 +1115,49 @@ while IFS= read -r line; do
             ;;
     esac
 done
-"#);
+"#
+            );
             let fixture = Fixture::new(&script);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
             runtime.block_on(async {
-                let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
-                    "concurrency":1, "maxBatchSize":2, "tasks":["left-task", "right-task"]})).await;
+                let started = fixture
+                    .call(json!({"operation":"pool_start", "agent":"worker",
+                    "concurrency":1, "maxBatchSize":2, "tasks":["left-task", "right-task"]}))
+                    .await;
                 let pool = field(&started, "poolId");
-                fixture.call(json!({"operation":"pool_finish", "poolId":pool})).await;
-                let settled = fixture.call(json!({"operation":"pool_wait", "poolId":pool,
-                    "timeoutMs":5000})).await;
+                fixture
+                    .call(json!({"operation":"pool_finish", "poolId":pool}))
+                    .await;
+                let settled = fixture
+                    .call(json!({"operation":"pool_wait", "poolId":pool,
+                    "timeoutMs":5000}))
+                    .await;
                 assert_eq!(settled["completedItems"], 0);
                 assert_eq!(settled["failedItems"], 2);
-                for id in [1,2] {
-                    let item = fixture.call(json!({"operation":"pool_result", "poolId":pool,
-                        "itemId":id})).await;
+                for id in [1, 2] {
+                    let item = fixture
+                        .call(json!({"operation":"pool_result", "poolId":pool,
+                        "itemId":id}))
+                        .await;
                     let result = pool_native_result(&item);
-                    assert!(result["error"].as_str().unwrap().contains("PI_SUBAGENT_WORKER_BATCH_OUTPUT"));
+                    assert!(
+                        result["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("PI_SUBAGENT_WORKER_BATCH_OUTPUT")
+                    );
                     assert!(result.get("data").is_none());
                     assert!(!item.to_string().contains("unaccepted-canary"));
                 }
-                assert_eq!(std::fs::read_to_string(fixture.root.path().join("prompts"))
-                    .unwrap().lines().count(), 1);
+                assert_eq!(
+                    std::fs::read_to_string(fixture.root.path().join("prompts"))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1
+                );
             });
         }
     }
@@ -1143,7 +1166,9 @@ done
     fn cancelling_a_group_at_the_idle_barrier_retains_no_terminal_prefix() {
         let _guard = crate::jobs::process_test_guard();
         let fixture = Fixture::new(GROUPED_RPC_CHILD);
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let started = fixture.call(json!({"operation":"pool_start", "agent":"worker",
                 "concurrency":1, "maxBatchSize":2, "tasks":["first-task", "second-task", "third-task"]})).await;

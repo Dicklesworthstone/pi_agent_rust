@@ -10937,6 +10937,28 @@ fn render_print_tty_image(
     )
 }
 
+fn collect_print_tty_inline_images(
+    message: &AssistantMessage,
+    show_images: bool,
+    max_cols: usize,
+    protocol: pi::terminal_images::ImageProtocol,
+) -> Vec<String> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(image) => Some(render_print_tty_image(
+                &image.data,
+                &image.mime_type,
+                show_images,
+                max_cols,
+                protocol,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 fn finish_print_text_response(
     message: &AssistantMessage,
     stream_state: PrintTextStreamState,
@@ -10947,35 +10969,25 @@ fn finish_print_text_response(
         return ensure_print_command_response(message);
     }
 
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&io::stdout());
     if stream_state.should_render_final_message() {
         // When stdout is a terminal, render markdown with formatting.
         // When piped, emit plain text via output_final_text to avoid escape codes.
-        if std::io::IsTerminal::is_terminal(&io::stdout()) {
+        if stdout_is_tty {
             let show_images = config.terminal_show_images();
             let max_cols = print_tty_image_max_cols();
             let protocol = pi::terminal_images::detect_protocol();
             let mut markdown = String::new();
-            let mut inline_images = Vec::new();
             for block in &message.content {
-                match block {
-                    ContentBlock::Text(text) => {
-                        markdown.push_str(&text.text);
-                        if !markdown.ends_with('\n') {
-                            markdown.push('\n');
-                        }
+                if let ContentBlock::Text(text) = block {
+                    markdown.push_str(&text.text);
+                    if !markdown.ends_with('\n') {
+                        markdown.push('\n');
                     }
-                    ContentBlock::Image(image) => {
-                        inline_images.push(render_print_tty_image(
-                            &image.data,
-                            &image.mime_type,
-                            show_images,
-                            max_cols,
-                            protocol,
-                        ));
-                    }
-                    _ => {}
                 }
             }
+            let inline_images =
+                collect_print_tty_inline_images(message, show_images, max_cols, protocol);
 
             if !markdown.is_empty() {
                 let console = PiConsole::new();
@@ -10992,6 +11004,20 @@ fn finish_print_text_response(
     }
 
     emit_trailing_print_newline(stream_state)?;
+    // Even when text deltas already streamed live, any image blocks attached to
+    // the completed assistant message still need to be rendered on a TTY so
+    // multimodal replies do not silently drop inline images.
+    if stdout_is_tty {
+        let inline_images = collect_print_tty_inline_images(
+            message,
+            config.terminal_show_images(),
+            print_tty_image_max_cols(),
+            pi::terminal_images::detect_protocol(),
+        );
+        for rendered in inline_images {
+            emit_text_delta(&format!("{rendered}\n"))?;
+        }
+    }
     Ok(())
 }
 
@@ -19565,5 +19591,59 @@ mod tests {
         );
         assert!(!unsupported.contains('\x1b'));
         assert_eq!(unsupported, "[image: image/png, 1x1]");
+
+        // Multimodal assistant replies (text + image) must collect inline images
+        // even when text deltas already streamed live, while honoring show_images.
+        let multimodal = AssistantMessage {
+            content: vec![
+                ContentBlock::Text(pi::model::TextContent::new("streamed caption")),
+                ContentBlock::Image(pi::model::ImageContent {
+                    data: png_b64,
+                    mime_type: "image/png".to_string(),
+                }),
+            ],
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            usage: pi::model::Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        let shown = collect_print_tty_inline_images(
+            &multimodal,
+            true,
+            90,
+            pi::terminal_images::ImageProtocol::Kitty,
+        );
+        assert_eq!(shown.len(), 1);
+        assert!(
+            shown
+                .first()
+                .is_some_and(|s| s.starts_with("\x1b_Ga=T,f=100,c=90,")),
+            "expected Kitty escape sequence for streamed multimodal reply, got {shown:?}"
+        );
+
+        let suppressed = collect_print_tty_inline_images(
+            &multimodal,
+            false,
+            90,
+            pi::terminal_images::ImageProtocol::Kitty,
+        );
+        assert_eq!(suppressed, vec!["[image: image/png, 1x1]".to_string()]);
+
+        let text_only = AssistantMessage {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new("plain"))],
+            ..multimodal
+        };
+        assert!(
+            collect_print_tty_inline_images(
+                &text_only,
+                true,
+                90,
+                pi::terminal_images::ImageProtocol::Kitty,
+            )
+            .is_empty()
+        );
     }
 }
