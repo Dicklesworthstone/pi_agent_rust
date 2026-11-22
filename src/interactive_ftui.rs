@@ -2424,6 +2424,7 @@ pub struct PiFtuiModel {
     /// queue behind it, mirroring the bubbletea active/queue pair.
     active_ext: Option<ExtensionUiRequest>,
     ext_queue: VecDeque<ExtensionUiRequest>,
+    ext_request_liveness: std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
     /// User draft captured when the first response-bearing card takes over the
     /// editor. Successor cards share the snapshot; the last terminal path
     /// restores it only after clearing card-owned input.
@@ -2981,6 +2982,7 @@ impl PiFtuiModel {
             active_ask: None,
             active_ext: None,
             ext_queue: VecDeque::new(),
+            ext_request_liveness: std::collections::HashMap::new(),
             card_draft_snapshot: None,
             pending_input_restores: VecDeque::new(),
             pending_goal_inputs: VecDeque::new(),
@@ -4658,7 +4660,30 @@ impl PiFtuiModel {
                     });
                 }
             }
+            PiMsg::ExtensionUiRequestTracked { request, pending } => {
+                let id = request.id.clone();
+                self.ext_request_liveness.insert(id.clone(), pending);
+                let cmd = self.handle_agent(PiMsg::ExtensionUiRequest(request));
+                if self
+                    .active_ext
+                    .as_ref()
+                    .is_none_or(|request| request.id != id)
+                    && !self.ext_queue.iter().any(|request| request.id == id)
+                {
+                    // Queries and custom polls settle immediately. Their
+                    // liveness tokens must not accumulate between frames.
+                    self.ext_request_liveness.remove(&id);
+                }
+                return cmd;
+            }
+            PiMsg::ExtensionUiRequestRetired { id } => {
+                self.retire_extension_request(&id);
+            }
             PiMsg::ExtensionUiRequest(request) => {
+                if request.expects_response() && !self.extension_request_is_pending(&request.id) {
+                    self.ext_request_liveness.remove(&request.id);
+                    return Cmd::none();
+                }
                 // `ctx.ui.custom` polls are answered at once. As ordinary
                 // requests they each became a prompt card, and the component
                 // never got a key.
@@ -8223,6 +8248,56 @@ impl PiFtuiModel {
         dismissed
     }
 
+    fn extension_request_is_pending(&self, id: &str) -> bool {
+        self.ext_request_liveness
+            .get(id)
+            .is_none_or(|active| active.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Release only the modal whose host waiter ended. A delayed retirement
+    /// must not clear another request's answer or the restored editor draft.
+    fn retire_extension_request(&mut self, id: &str) {
+        let queued_before = self.ext_queue.len();
+        self.ext_queue.retain(|request| request.id != id);
+        let removed_queued = self.ext_queue.len() != queued_before;
+        let released = self
+            .active_ext
+            .as_ref()
+            .is_some_and(|request| request.id == id);
+        if released {
+            self.active_ext = None;
+            self.input.set_text("");
+            self.push_entry(EntryRole::Ask, String::from("  (request ended)"));
+            self.scroll_from_tail = 0;
+        }
+        self.ext_request_liveness.remove(id);
+        if released {
+            self.maybe_activate_queued_ext();
+        }
+        if released || removed_queued {
+            self.restore_card_draft_after_cards_settle();
+        }
+    }
+
+    /// The waiter can end before its retirement event reaches this queue.
+    /// Prune against its shared authority before interpreting keyboard input.
+    fn prune_expired_extension_cards(&mut self) -> bool {
+        let expired: Vec<_> = self
+            .ext_request_liveness
+            .iter()
+            .filter(|(_, active)| !active.load(std::sync::atomic::Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let released = self
+            .active_ext
+            .as_ref()
+            .is_some_and(|request| expired.contains(&request.id));
+        for id in expired {
+            self.retire_extension_request(&id);
+        }
+        released
+    }
+
     /// Snapshot the pre-card editor exactly once per contiguous card burst.
     /// Card answers own the editor until the burst settles, so the draft is
     /// cleared before the first card becomes reachable.
@@ -8361,11 +8436,14 @@ impl PiFtuiModel {
         if self.active_ask.is_some() || self.active_ext.is_some() {
             return;
         }
-        if let Some(next) = self.ext_queue.pop_front() {
-            self.activate_ext_request(next);
-        } else {
-            self.restore_card_draft_after_cards_settle();
+        while let Some(next) = self.ext_queue.pop_front() {
+            if self.extension_request_is_pending(&next.id) {
+                self.activate_ext_request(next);
+                return;
+            }
+            self.ext_request_liveness.remove(&next.id);
         }
+        self.restore_card_draft_after_cards_settle();
     }
 
     /// Cancel the active extension prompt (escape path).
@@ -9014,7 +9092,9 @@ impl Model for PiFtuiModel {
         // updates after transiently handing ownership to the terminal.
         self.discard_stale_image_pastes();
         self.close_stale_autocomplete();
-        if self.prune_expired_ask_card()
+        let released_ask = self.prune_expired_ask_card();
+        let released_extension = self.prune_expired_extension_cards();
+        if (released_ask || released_extension)
             && matches!(
                 &msg,
                 PiFtuiMsg::Term(Event::Key(_) | Event::Paste(_) | Event::Mouse(_))
@@ -9057,8 +9137,10 @@ impl Model for PiFtuiModel {
                 | PiFtuiMsg::Agent(PiMsg::SetEditorText { .. })
         ) || matches!(
             &msg,
-            PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(request))
-                if request.method == "set_editor_text"
+            PiFtuiMsg::Agent(
+                PiMsg::ExtensionUiRequest(request)
+                    | PiMsg::ExtensionUiRequestTracked { request, .. }
+            ) if request.method == "set_editor_text"
         );
         let mut cmd = match msg {
             PiFtuiMsg::Term(event) => {
@@ -9951,8 +10033,34 @@ const INLINE_MAX_HEIGHT: u16 = 15;
 /// Default budget for an extension UI prompt when the request carries none.
 const EXT_UI_TIMEOUT_MS: u64 = 300_000;
 
+struct FtuiPendingUiRequest {
+    caller_id: String,
+    sender: Option<asupersync::channel::oneshot::Sender<ExtensionUiResponse>>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FtuiPendingUiRequest {
+    fn new(
+        caller_id: String,
+        sender: asupersync::channel::oneshot::Sender<ExtensionUiResponse>,
+    ) -> Self {
+        Self {
+            caller_id,
+            sender: Some(sender),
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+}
+
+impl Drop for FtuiPendingUiRequest {
+    fn drop(&mut self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Driver-side extension UI surface (bd-1eoh4): forwards requests to the UI
-/// as `PiMsg::ExtensionUiRequest` and awaits the typed reply routed back over
+/// as `PiMsg::ExtensionUiRequestTracked` and awaits the typed reply routed back over
 /// the extension reply channel — the same oneshot-pending shape as
 /// `AskTool::install_channel_ui`.
 struct FtuiExtensionUiHandler {
@@ -9961,12 +10069,7 @@ struct FtuiExtensionUiHandler {
     // this reference weak so the routing slot cannot create an owner cycle.
     command_registry: std::sync::Weak<Mutex<Option<crate::extensions::ExtensionManager>>>,
     reply_channel_open: std::sync::atomic::AtomicBool,
-    pending: Mutex<
-        std::collections::HashMap<
-            String,
-            asupersync::channel::oneshot::Sender<ExtensionUiResponse>,
-        >,
-    >,
+    pending: Mutex<std::collections::HashMap<String, FtuiPendingUiRequest>>,
 }
 
 impl FtuiExtensionUiHandler {
@@ -9996,23 +10099,37 @@ impl FtuiExtensionUiHandler {
         }
     }
 
-    fn resolve(&self, response: ExtensionUiResponse) {
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let sender = self
+    fn take_pending(&self, id: &str) -> Option<FtuiPendingUiRequest> {
+        let mut pending = self
             .pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&response.id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending
+            .get(id)?
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        pending.remove(id)
+    }
+
+    fn resolve(&self, mut response: ExtensionUiResponse) {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let sender = self.take_pending(&response.id).and_then(|mut pending| {
+            response.id.clone_from(&pending.caller_id);
+            pending.sender.take()
+        });
         if let Some(sender) = sender {
             let _ = sender.send(cx.cx(), response);
         }
     }
 
     fn drop_pending(&self, id: &str) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+        if self.take_pending(id).is_some() {
+            // The registry guard is gone before notifying the UI. Resolved
+            // requests were already removed and need no retirement event.
+            let _ = self
+                .agent_tx
+                .send(PiMsg::ExtensionUiRequestRetired { id: id.to_string() });
+        }
     }
 
     fn cancel_all_pending(&self) -> usize {
@@ -10023,12 +10140,20 @@ impl FtuiExtensionUiHandler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.reply_channel_open
                 .store(false, std::sync::atomic::Ordering::Release);
+            for request in pending.values() {
+                request
+                    .active
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
             std::mem::take(&mut *pending)
         };
         let count = pending.len();
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        for (id, sender) in pending {
-            let _ = sender.send(cx.cx(), Self::cancelled_response(id));
+        for (id, mut request) in pending {
+            if let Some(sender) = request.sender.take() {
+                let _ = sender.send(cx.cx(), Self::cancelled_response(request.caller_id.clone()));
+            }
+            let _ = self.agent_tx.send(PiMsg::ExtensionUiRequestRetired { id });
         }
         count
     }
@@ -10067,6 +10192,14 @@ impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
         }
         let timeout_ms = request.timeout_ms.unwrap_or(EXT_UI_TIMEOUT_MS);
         let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
+        let caller_id = id;
+        // Callers can reuse IDs. Replies and lease retirement must identify
+        // this exact incarnation without changing the caller-visible ID.
+        let id = format!("ftui-ui-{}", uuid::Uuid::new_v4());
+        let mut request = request;
+        request.id.clone_from(&id);
+        let pending_request = FtuiPendingUiRequest::new(caller_id.clone(), reply_tx);
+        let active = Arc::clone(&pending_request.active);
         {
             let mut pending = self
                 .pending
@@ -10076,22 +10209,34 @@ impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
                 .reply_channel_open
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                return Ok(Some(Self::cancelled_response(id)));
+                return Ok(Some(Self::cancelled_response(caller_id)));
             }
-            pending.insert(id.clone(), reply_tx);
-            if self
-                .agent_tx
-                .send(PiMsg::ExtensionUiRequest(request))
-                .is_err()
-            {
-                pending.remove(&id);
-                return Ok(None);
-            }
+            pending.insert(id.clone(), pending_request);
         }
         let _pending_reply = FtuiPendingUiLease {
             handler: self,
             id: id.clone(),
         };
+        if self
+            .agent_tx
+            .send(PiMsg::ExtensionUiRequestTracked {
+                request,
+                pending: active,
+            })
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if !self
+            .reply_channel_open
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Shutdown can retire admission before this publication. Repeat
+            // retirement afterward so a late request cannot reopen its card.
+            let _ = self
+                .agent_tx
+                .send(PiMsg::ExtensionUiRequestRetired { id: id.clone() });
+        }
         let waited = asupersync::time::timeout(
             asupersync::time::wall_now(),
             std::time::Duration::from_millis(timeout_ms),
@@ -10103,8 +10248,7 @@ impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
         } else {
             // UI gone or user never answered: report a cancel so the
             // extension gets a definitive answer instead of hanging.
-            self.drop_pending(&id);
-            Ok(Some(Self::cancelled_response(id)))
+            Ok(Some(Self::cancelled_response(caller_id)))
         }
     }
 }
@@ -22245,6 +22389,15 @@ mod tests {
             .with_extension_id(Some(String::from("demo-ext")))
     }
 
+    fn take_tracked_ext_request(
+        receiver: &Receiver<PiMsg>,
+    ) -> (ExtensionUiRequest, Arc<std::sync::atomic::AtomicBool>) {
+        match receiver.try_recv().expect("published extension request") {
+            PiMsg::ExtensionUiRequestTracked { request, pending } => (request, pending),
+            _ => panic!("expected a tracked extension request"),
+        }
+    }
+
     fn send_ui_effect(
         sim: &mut ProgramSimulator<PiFtuiModel>,
         method: &str,
@@ -22844,7 +22997,10 @@ mod tests {
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(String::from("startup-prompt"), pending_tx);
+            .insert(
+                String::from("startup-prompt"),
+                FtuiPendingUiRequest::new(String::from("startup-prompt"), pending_tx),
+            );
         let (ext_reply_tx, ext_reply_rx) = mpsc::channel::<ExtensionUiResponse>();
         drop(ext_reply_tx);
 
@@ -22872,6 +23028,10 @@ mod tests {
             .expect("pending prompt receives cancellation");
         assert_eq!(cancelled.id, "startup-prompt");
         assert!(cancelled.cancelled);
+        assert!(matches!(
+            agent_rx.try_recv(),
+            Ok(PiMsg::ExtensionUiRequestRetired { id }) if id == "startup-prompt"
+        ));
 
         let mut late_request = ext_request(
             "late-prompt",
@@ -22944,11 +23104,9 @@ mod tests {
                 &handler, request,
             ));
             assert!(futures::poll!(attempt.as_mut()).is_pending());
-            assert!(matches!(
-                agent_rx.try_recv(),
-                Ok(PiMsg::ExtensionUiRequest(request))
-                    if request.id == "cancelled-ftui-request"
-            ));
+            let (request, active) = take_tracked_ext_request(&agent_rx);
+            assert_ne!(request.id, "cancelled-ftui-request");
+            assert!(active.load(std::sync::atomic::Ordering::Acquire));
             assert_eq!(
                 handler
                     .pending
@@ -22968,6 +23126,166 @@ mod tests {
                     .is_empty(),
                 "cancelling the outer future must release its pending lease"
             );
+            assert!(
+                !active.load(std::sync::atomic::Ordering::Acquire),
+                "dropping the future revokes keyboard authority immediately"
+            );
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::ExtensionUiRequestRetired { id }) if id == request.id
+            ));
+            handler.resolve(ExtensionUiResponse {
+                id: request.id,
+                value: Some(serde_json::Value::Bool(true)),
+                cancelled: false,
+            });
+            assert!(
+                agent_rx.try_recv().is_err(),
+                "a late reply cannot reopen the request"
+            );
+        });
+    }
+
+    #[test]
+    fn ftui_extension_timeout_retires_the_published_request() {
+        asupersync::test_utils::run_test(|| async {
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let handler = FtuiExtensionUiHandler::new(agent_tx);
+            let mut request = ext_request(
+                "expired-ftui-request",
+                "input",
+                serde_json::json!({"title": "Expired question"}),
+            );
+            request.timeout_ms = Some(0);
+
+            let response = crate::sdk::ExtensionUiHandler::request_ui(&handler, request)
+                .await
+                .expect("timeout returns a typed response")
+                .expect("timeout returns cancellation");
+            assert_eq!(response.id, "expired-ftui-request");
+            assert!(response.cancelled);
+            assert!(
+                handler
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            );
+            let (request, active) = take_tracked_ext_request(&agent_rx);
+            assert_ne!(request.id, response.id);
+            assert!(
+                !active.load(std::sync::atomic::Ordering::Acquire),
+                "timeout revokes keyboard authority before retirement delivery"
+            );
+            assert!(matches!(
+                agent_rx.try_recv(),
+                Ok(PiMsg::ExtensionUiRequestRetired { id }) if id == request.id
+            ));
+            assert!(agent_rx.try_recv().is_err(), "retirement is emitted once");
+        });
+    }
+
+    #[test]
+    fn ftui_extension_resolved_request_restores_its_caller_id() {
+        asupersync::test_utils::run_test(|| async {
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let handler = FtuiExtensionUiHandler::new(agent_tx);
+            let request = ext_request(
+                "resolved-ftui-request",
+                "confirm",
+                serde_json::json!({"title": "Continue?"}),
+            );
+            let mut attempt = Box::pin(crate::sdk::ExtensionUiHandler::request_ui(
+                &handler, request,
+            ));
+            assert!(futures::poll!(attempt.as_mut()).is_pending());
+            let (request, active) = take_tracked_ext_request(&agent_rx);
+            assert_ne!(request.id, "resolved-ftui-request");
+            assert_eq!(request.extension_id.as_deref(), Some("demo-ext"));
+            handler.resolve(ExtensionUiResponse {
+                id: request.id,
+                value: Some(serde_json::Value::Bool(true)),
+                cancelled: false,
+            });
+            assert!(!active.load(std::sync::atomic::Ordering::Acquire));
+            let response = attempt
+                .await
+                .expect("resolved request")
+                .expect("typed answer");
+            assert_eq!(response.id, "resolved-ftui-request");
+            assert!(!response.cancelled);
+            assert_eq!(response.value, Some(serde_json::Value::Bool(true)));
+            assert!(
+                agent_rx.try_recv().is_err(),
+                "normal replies and custom polls need no extra UI events"
+            );
+        });
+    }
+
+    #[test]
+    fn reused_extension_caller_id_isolates_old_leases_and_late_replies() {
+        asupersync::test_utils::run_test(|| async {
+            let (agent_tx, agent_rx) = mpsc::channel();
+            let handler = FtuiExtensionUiHandler::new(agent_tx);
+            let request = || {
+                ext_request(
+                    "reused-caller-id",
+                    "confirm",
+                    serde_json::json!({"title": "Continue?"}),
+                )
+            };
+            let mut first = Box::pin(crate::sdk::ExtensionUiHandler::request_ui(
+                &handler,
+                request(),
+            ));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            let (first_request, first_active) = take_tracked_ext_request(&agent_rx);
+            handler.resolve(ExtensionUiResponse {
+                id: first_request.id.clone(),
+                value: Some(serde_json::Value::Bool(true)),
+                cancelled: false,
+            });
+            assert!(!first_active.load(std::sync::atomic::Ordering::Acquire));
+
+            // The old future has received its reply but has not been polled
+            // to completion. A new incarnation is admitted before its lease drops.
+            let mut second = Box::pin(crate::sdk::ExtensionUiHandler::request_ui(
+                &handler,
+                request(),
+            ));
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            let (second_request, second_active) = take_tracked_ext_request(&agent_rx);
+            assert_ne!(first_request.id, second_request.id);
+            drop(first);
+            for id in [first_request.id, String::from("reused-caller-id")] {
+                handler.resolve(ExtensionUiResponse {
+                    id,
+                    value: Some(serde_json::Value::Bool(false)),
+                    cancelled: true,
+                });
+            }
+            assert!(second_active.load(std::sync::atomic::Ordering::Acquire));
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert_eq!(
+                handler
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                1
+            );
+            assert!(agent_rx.try_recv().is_err());
+
+            handler.resolve(ExtensionUiResponse {
+                id: second_request.id,
+                value: Some(serde_json::Value::Bool(true)),
+                cancelled: false,
+            });
+            let response = second.await.expect("second result").expect("second answer");
+            assert_eq!(response.id, "reused-caller-id");
+            assert!(!response.cancelled);
+            assert_eq!(response.value, Some(serde_json::Value::Bool(true)));
+            assert!(!second_active.load(std::sync::atomic::Ordering::Acquire));
         });
     }
 
@@ -23042,6 +23360,301 @@ mod tests {
         assert!(!reply.cancelled);
         assert_eq!(reply.value, Some(serde_json::Value::Bool(true)));
         assert!(sim.model().active_ext.is_none());
+    }
+
+    #[test]
+    fn extension_retirement_advances_dialog_and_preserves_the_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "saved extension draft");
+        for id in ["expired", "live", "expired-queued"] {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                id,
+                "confirm",
+                serde_json::json!({"title": id}),
+            ))));
+        }
+        type_str(&mut sim, "partial expired answer");
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+            id: "expired".to_string(),
+        }));
+
+        assert_eq!(
+            sim.model()
+                .active_ext
+                .as_ref()
+                .map(|request| request.id.as_str()),
+            Some("live")
+        );
+        assert!(sim.model().input.text().is_empty());
+        assert_eq!(
+            sim.model().card_draft_snapshot.as_deref(),
+            Some("saved extension draft")
+        );
+        assert!(
+            ext_rx.try_recv().is_err(),
+            "retirement sends no stale answer"
+        );
+
+        type_str(&mut sim, "yes");
+        for id in ["expired-queued", "expired", "unknown"] {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+                id: id.to_string(),
+            }));
+        }
+        assert!(sim.model().ext_queue.is_empty());
+        assert_eq!(sim.model().input.text(), "yes");
+        assert_eq!(
+            sim.model()
+                .active_ext
+                .as_ref()
+                .map(|request| request.id.as_str()),
+            Some("live")
+        );
+
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let response = ext_rx.try_recv().expect("live dialog receives its answer");
+        assert_eq!(response.id, "live");
+        assert!(!response.cancelled);
+        assert_eq!(response.value, Some(serde_json::Value::Bool(true)));
+        assert_eq!(sim.model().input.text(), "saved extension draft");
+        assert!(sim.model().card_draft_snapshot.is_none());
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+            id: "live".to_string(),
+        }));
+        assert_eq!(sim.model().input.text(), "saved extension draft");
+        assert!(ext_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unknown_extension_retirement_does_not_restore_a_parked_draft() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.model_mut().card_draft_snapshot = Some(String::from("parked draft"));
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+            id: String::from("unrelated-request"),
+        }));
+
+        assert!(sim.model().input.text().is_empty());
+        assert_eq!(
+            sim.model().card_draft_snapshot.as_deref(),
+            Some("parked draft")
+        );
+    }
+
+    #[test]
+    fn queued_extension_retirement_does_not_disturb_an_active_ask() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel::<AskUiReply>();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx)
+            .with_ask_reply_channel(ask_tx)
+            .with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "saved ask draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "active-ask",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        for id in ["expired-queued", "live-queued"] {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+                id,
+                "confirm",
+                serde_json::json!({"title": id}),
+            ))));
+        }
+        type_str(&mut sim, "1");
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+            id: "expired-queued".to_string(),
+        }));
+
+        assert_eq!(sim.model().input.text(), "1");
+        assert!(sim.model().active_ask.is_some());
+        assert!(sim.model().active_ext.is_none());
+        assert_eq!(sim.model().ext_queue.len(), 1);
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            ask_rx.try_recv().expect("original ask answer").request_id,
+            "active-ask"
+        );
+        assert_eq!(
+            sim.model()
+                .active_ext
+                .as_ref()
+                .map(|request| request.id.as_str()),
+            Some("live-queued")
+        );
+        assert!(sim.model().input.text().is_empty());
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+            id: "live-queued".to_string(),
+        }));
+        assert!(sim.model().active_ext.is_none());
+        assert_eq!(sim.model().input.text(), "saved ask draft");
+        assert!(ext_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn expired_extension_card_consumes_the_key_before_queued_retirement_arrives() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "saved keyboard draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestTracked {
+            request: ext_request(
+                "dead-on-arrival",
+                "confirm",
+                serde_json::json!({"title": "Never show this"}),
+            ),
+            pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        assert!(sim.model().active_ext.is_none());
+        assert_eq!(sim.model().input.text(), "saved keyboard draft");
+
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let queued = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        for (id, pending) in [
+            ("expired-active", Arc::clone(&expired)),
+            ("expired-queued", Arc::clone(&queued)),
+            (
+                "live-next",
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ),
+        ] {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestTracked {
+                request: ext_request(id, "confirm", serde_json::json!({"title": id})),
+                pending,
+            }));
+        }
+        type_str(&mut sim, "yes");
+        expired.store(false, std::sync::atomic::Ordering::Release);
+        queued.store(false, std::sync::atomic::Ordering::Release);
+
+        // No retirement message has been delivered: this key belonged to
+        // the expired card and must not answer the newly promoted dialog.
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert!(ext_rx.try_recv().is_err());
+        assert!(sim.model().input.text().is_empty());
+        assert!(sim.model().ext_queue.is_empty());
+        assert_eq!(
+            sim.model()
+                .active_ext
+                .as_ref()
+                .map(|request| request.id.as_str()),
+            Some("live-next")
+        );
+        assert_eq!(
+            sim.model().card_draft_snapshot.as_deref(),
+            Some("saved keyboard draft")
+        );
+        for id in ["expired-active", "expired-queued"] {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired {
+                id: id.to_string(),
+            }));
+        }
+        type_str(&mut sim, "yes");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(ext_rx.try_recv().expect("live reply").id, "live-next");
+        assert_eq!(sim.model().input.text(), "saved keyboard draft");
+    }
+
+    #[test]
+    fn expired_queued_extension_does_not_consume_the_active_ask_answer() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, ask_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(rx).with_ask_reply_channel(ask_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "saved ask keyboard draft");
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "live-ask",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestTracked {
+            request: ext_request(
+                "expired-queued",
+                "confirm",
+                serde_json::json!({"title": "Expired"}),
+            ),
+            pending: Arc::clone(&expired),
+        }));
+        type_str(&mut sim, "1");
+        expired.store(false, std::sync::atomic::Ordering::Release);
+
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+
+        assert_eq!(
+            ask_rx.try_recv().expect("live ask reply").request_id,
+            "live-ask"
+        );
+        assert!(sim.model().active_ask.is_none());
+        assert!(sim.model().active_ext.is_none());
+        assert!(sim.model().ext_queue.is_empty());
+        assert_eq!(sim.model().input.text(), "saved ask keyboard draft");
+    }
+
+    #[test]
+    fn retired_queries_preserve_custom_keys_and_live_polls_do_not_accumulate() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        send_ui_effect(
+            &mut sim,
+            "setWidget",
+            serde_json::json!({"widgetKey": EXT_CUSTOM_OVERLAY_KEY, "lines": ["component"]}),
+        );
+        sim.inject_event(key(KeyCode::Char('x'), Modifiers::empty()));
+        let entries = sim.model().transcript.len();
+        for (id, method, payload) in [
+            ("dead-poll", "custom", serde_json::json!({"mode": "poll"})),
+            ("dead-close", "custom", serde_json::json!({"mode": "close"})),
+            (
+                "dead-theme",
+                "setTheme",
+                serde_json::json!({"name": "light"}),
+            ),
+        ] {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestTracked {
+                request: ext_request(id, method, payload),
+                pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }));
+        }
+        assert!(ext_rx.try_recv().is_err());
+        assert_eq!(sim.model().transcript.len(), entries);
+        assert!(sim.model().custom_overlay_open());
+        assert!(sim.model().ext_request_liveness.is_empty());
+
+        for index in 0..32 {
+            let id = format!("live-poll-{index}");
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestTracked {
+                request: ext_request(&id, "custom", serde_json::json!({"mode": "poll"})),
+                pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }));
+            let reply = ext_rx.try_recv().expect("live custom poll");
+            assert_eq!(reply.id, id);
+            if index == 0 {
+                assert_eq!(reply.value.as_ref().unwrap()["key"], serde_json::json!("x"));
+            }
+            assert!(sim.model().ext_request_liveness.is_empty());
+            sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequestRetired { id }));
+            assert!(sim.model().custom_overlay_open());
+        }
     }
 
     #[test]

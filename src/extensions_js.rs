@@ -33361,8 +33361,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             }
             for operation in ["nativeClear", "nativeCreate", "resetClear"] {
                 assert_eq!(
-                    result["native"][operation],
-                    "PiJS privileged bridge entrypoint denied",
+                    result["native"][operation], "PiJS privileged bridge entrypoint denied",
                     "{operation}"
                 );
             }
@@ -33486,7 +33485,10 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             let result = runtime.read_global_json("timerResetScope").await.unwrap();
             assert_eq!(result["error"], serde_json::Value::Null);
             assert_eq!(result["done"], true);
-            assert_eq!(result["denied"], 2, "both earlier timers reject cancellation");
+            assert_eq!(
+                result["denied"], 2,
+                "both earlier timers reject cancellation"
+            );
             clock.set(10);
             for _ in 0..4 {
                 runtime.tick().await.expect("poll under original owners");
@@ -33518,7 +33520,13 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("held pre-reset handles cannot restart work");
             clock.set(1000);
-            assert!(!runtime.tick().await.expect("tick after reset").ran_macrotask);
+            assert!(
+                !runtime
+                    .tick()
+                    .await
+                    .expect("tick after reset")
+                    .ran_macrotask
+            );
             assert!(!runtime.has_pending());
             let result = runtime.read_global_json("timerResetScope").await.unwrap();
             assert_eq!(result["stopped"], 0, "host reset never calls guest cleanup");

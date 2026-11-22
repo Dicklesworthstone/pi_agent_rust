@@ -1166,7 +1166,9 @@ impl PiApp {
             return None;
         }
         match msg {
-            PiMsg::HandoffFinished { .. }
+            PiMsg::ExtensionUiRequestTracked { .. }
+            | PiMsg::ExtensionUiRequestRetired { .. }
+            | PiMsg::HandoffFinished { .. }
             | PiMsg::CompactionFinished { .. }
             | PiMsg::McpAuthFinished { .. }
             | PiMsg::GoalFinished { .. }

@@ -2665,9 +2665,9 @@ impl HttpTransport {
         kind: HttpRoundTripKind<'_>,
         wire_state_override: Option<&HttpWireState>,
     ) -> Result<Value> {
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            tool_err("MCP_TRANSPORT_IO", "HTTP request deadline is out of range")
-        })?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| tool_err("MCP_TRANSPORT_IO", "HTTP request deadline is out of range"))?;
         let mut request = self
             .client
             .post(&self.url)
@@ -3346,7 +3346,8 @@ impl HttpTransport {
             )
         })?;
         loop {
-            self.wait_for_sse_resume(cursor, wire_state, deadline).await?;
+            self.wait_for_sse_resume(cursor, wire_state, deadline)
+                .await?;
             let remaining = deadline
                 .map(|deadline| {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -7295,8 +7296,14 @@ for line in sys.stdin:
             .expect_err("repeated header failures cannot reset the request deadline");
         assert!(error.to_string().contains("deadline"), "{error}");
         let lines = server.request_lines();
-        assert!(lines.len() >= 2, "a continuation must actually be attempted");
-        assert!(lines.len() < 33, "the deadline must stop the retry sequence");
+        assert!(
+            lines.len() >= 2,
+            "a continuation must actually be attempted"
+        );
+        assert!(
+            lines.len() < 33,
+            "the deadline must stop the retry sequence"
+        );
         assert_eq!(lines[0], "POST /mcp HTTP/1.1");
         assert!(lines[1..].iter().all(|line| line == "GET /mcp HTTP/1.1"));
         transport.abort();
@@ -7662,7 +7669,10 @@ for line in sys.stdin:
             ": {}\n\nid: request:1\ndata:\n\nretry: 1\n\n",
             "x".repeat(MAX_HTTP_BODY / 2)
         );
-        let continuation = format!(": {}\n\nid: request:2\ndata:\n\n", "x".repeat(MAX_HTTP_BODY / 2));
+        let continuation = format!(
+            ": {}\n\nid: request:2\ndata:\n\n",
+            "x".repeat(MAX_HTTP_BODY / 2)
+        );
         let server = ScriptedHttpServer::start(vec![
             http_event_stream(&prefix),
             http_event_stream(&continuation),

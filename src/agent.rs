@@ -12366,7 +12366,10 @@ mod extensions_integration_tests {
                 .await
                 .expect_err("reject malformed registered flag");
             assert!(error.to_string().contains("Invalid boolean value"));
-            assert!(Arc::ptr_eq(&installed_state, &session.extension_ai_completion));
+            assert!(Arc::ptr_eq(
+                &installed_state,
+                &session.extension_ai_completion
+            ));
             {
                 // Inspect before a read refresh could hide an early reset.
                 let state = installed_state.lock().expect("installed state");
@@ -12378,10 +12381,12 @@ mod extensions_integration_tests {
                     state.compaction_models.provider_revision,
                     before.extension_revision,
                 );
-                assert!(state
-                    .compaction_models
-                    .provider_manager
-                    .same_manager(&installed_manager.handle()));
+                assert!(
+                    state
+                        .compaction_models
+                        .provider_manager
+                        .same_manager(&installed_manager.handle())
+                );
             }
             let visible = retained.snapshot().expect("retained frontend catalog");
             assert!(visible.find("installed", "chat").is_some());
@@ -12508,14 +12513,23 @@ mod extensions_integration_tests {
                 .enable_extensions(&[], temp.path(), None, &[second])
                 .await
                 .expect("replacement activation");
-            assert!(!Arc::ptr_eq(&retired_state, &session.extension_ai_completion));
-            let after = retained.snapshot().expect("retained handle follows replacement");
+            assert!(!Arc::ptr_eq(
+                &retired_state,
+                &session.extension_ai_completion
+            ));
+            let after = retained
+                .snapshot()
+                .expect("retained handle follows replacement");
             assert_eq!(after.extension_revision, before.extension_revision);
             assert_eq!(after.active_provider_revision, None);
             assert!(after.active_extension_model);
             assert!(Arc::ptr_eq(&retired_provider, &after.active_provider));
             assert_eq!(
-                after.find("test-provider", "test-model").unwrap().model.name,
+                after
+                    .find("test-provider", "test-model")
+                    .unwrap()
+                    .model
+                    .name,
                 "Replacement model",
             );
 
@@ -12529,14 +12543,19 @@ mod extensions_integration_tests {
                 Some("replacement-catalog-test-key"),
             );
             assert!(!Arc::ptr_eq(&retired_provider, &selected.active_provider));
-            assert_eq!(selected.active_provider_revision, selected.extension_revision);
+            assert_eq!(
+                selected.active_provider_revision,
+                selected.extension_revision
+            );
 
             retired_manager
                 .register_provider(extension_catalog_test_provider("retired-late", "chat"));
             let active_manager = session.extensions.as_ref().unwrap().manager().clone();
             active_manager
                 .register_provider(extension_catalog_test_provider("active-late", "chat"));
-            let refreshed = retained.snapshot().expect("accepted runtime refresh stays live");
+            let refreshed = retained
+                .snapshot()
+                .expect("accepted runtime refresh stays live");
             assert!(refreshed.find("active-late", "chat").is_some());
             assert!(refreshed.find("retired-late", "chat").is_none());
             let native = session
@@ -12590,8 +12609,13 @@ mod extensions_integration_tests {
                 .await
                 .expect_err("a candidate must not load into the installed manager");
             assert!(error.to_string().contains("already installed"));
-            assert!(Arc::ptr_eq(&installed_state, &session.extension_ai_completion));
-            let after = retained.snapshot().expect("installed activation remains live");
+            assert!(Arc::ptr_eq(
+                &installed_state,
+                &session.extension_ai_completion
+            ));
+            let after = retained
+                .snapshot()
+                .expect("installed activation remains live");
             assert!(Arc::ptr_eq(
                 before.registry.as_ref().unwrap(),
                 after.registry.as_ref().unwrap(),
@@ -12623,7 +12647,13 @@ mod extensions_integration_tests {
                 .expect("installed activation");
             let retired_manager = session.extensions.as_ref().unwrap().manager().clone();
             retired_manager.register_provider(extension_catalog_test_provider("retired", "chat"));
-            assert!(retained.snapshot().unwrap().find("retired", "chat").is_some());
+            assert!(
+                retained
+                    .snapshot()
+                    .unwrap()
+                    .find("retired", "chat")
+                    .is_some()
+            );
 
             session
                 .enable_extensions(&[], temp.path(), None, &[])
