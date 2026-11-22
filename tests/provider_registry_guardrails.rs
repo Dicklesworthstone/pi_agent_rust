@@ -277,7 +277,7 @@ fn estimate_registry_footprint_bytes() -> usize {
 
 fn process_rss_mb() -> f64 {
     let pid = Pid::from_u32(std::process::id());
-    let mut system = System::new();
+    let mut system = System::new().expect("initialize sysinfo");
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,

@@ -1282,7 +1282,7 @@ mod tests {
         let pid = sysinfo::Pid::from_u32(pid);
         let started = Instant::now();
         loop {
-            let mut system = sysinfo::System::new();
+            let mut system = sysinfo::System::new().expect("initialize sysinfo");
             system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
             if system.process(pid).is_none() {
                 return true;

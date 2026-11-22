@@ -119,7 +119,7 @@ fn sha256_hex(input: &str) -> String {
 /// Collect the full environment fingerprint.
 #[must_use]
 pub fn collect_fingerprint() -> BenchEnvFingerprint {
-    let mut system = System::new();
+    let mut system = System::new().expect("initialize sysinfo");
     system.refresh_cpu_all();
     system.refresh_memory();
 
@@ -143,7 +143,7 @@ pub fn collect_fingerprint() -> BenchEnvFingerprint {
     let noise_score = compute_noise_score(&governor, &turbo_boost, &thp, &aslr);
 
     BenchEnvFingerprint {
-        os: System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string()),
+        os: System::long_os_version().unwrap_or_else(|_| std::env::consts::OS.to_string()),
         arch: std::env::consts::ARCH,
         cpu_brand,
         cpu_cores: system.cpus().len(),

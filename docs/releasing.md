@@ -250,7 +250,7 @@ release-facing size, idle-RSS, and Criterion cold-load value must prove what was
 measured:
 
 - The size record hashes the exact `pi` file and records its byte length plus
-  Cargo `release` provenance (`opt-level = "z"`, `strip = true`).
+  Cargo `release` provenance (`opt-level = 3`, `strip = true`).
 - The idle-RSS record names the measured PID, `pi` process, allocator, idle
   boundary, executable hash, and RSS byte count. The test runner's own RSS is
   never an admissible substitute.

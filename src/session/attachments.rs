@@ -721,7 +721,6 @@ pub fn decode_entry(source: Option<&Path>, json: &str) -> Result<SessionEntry> {
 /// SQLite must apply the same native-envelope validation as JSONL before
 /// hydrating a `Value`, which otherwise collapses duplicate member names.
 /// Opaque tool arguments and custom data retain their usual JSON semantics.
-#[cfg(feature = "sqlite-sessions")]
 pub fn validate_native_attachment_references(json: &str) -> Result<()> {
     let spans = native_reference_spans(json)?;
     if !spans.is_empty() {

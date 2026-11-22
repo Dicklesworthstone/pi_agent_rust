@@ -699,7 +699,7 @@ impl RssReader for ProcSelfRssReader {
             // Sampling is interval-gated by MemoryMonitor, so the refresh
             // cost stays off the hot path.
             let pid = sysinfo::Pid::from_u32(std::process::id());
-            let mut system = sysinfo::System::new();
+            let mut system = sysinfo::System::new().ok()?;
             system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
             let rss = system.process(pid)?.memory();
             usize::try_from(rss).ok()

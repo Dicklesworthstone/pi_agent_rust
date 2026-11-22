@@ -235,7 +235,7 @@ struct EnvFingerprint {
 }
 
 fn collect_fingerprint() -> EnvFingerprint {
-    let mut system = System::new();
+    let mut system = System::new().expect("initialize sysinfo");
     system.refresh_cpu_all();
     system.refresh_memory();
 
@@ -245,7 +245,7 @@ fn collect_fingerprint() -> EnvFingerprint {
         .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
     let cpu_cores = system.cpus().len() as u32;
     let mem_total_mb = system.total_memory() / (1024 * 1024);
-    let os = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
+    let os = System::long_os_version().unwrap_or_else(|_| std::env::consts::OS.to_string());
     let arch = std::env::consts::ARCH.to_string();
     let build_profile = perf_build::detect_build_profile();
     let allocator = perf_build::resolve_bench_allocator();
@@ -730,7 +730,7 @@ fn memory_sustained_load_growth() {
 
     // Measure test-process RSS before and after allocating + processing data
     let pid = sysinfo::Pid::from_u32(std::process::id());
-    let mut system = System::new();
+    let mut system = System::new().expect("initialize sysinfo");
 
     // Baseline RSS
     system.refresh_processes_specifics(

@@ -16,8 +16,8 @@ pub const BENCH_BUILD_PROFILE_ENV: &str = "PI_BENCH_BUILD_PROFILE";
 /// Environment variable that requests an allocator label for benchmark runs.
 pub const BENCH_ALLOCATOR_ENV: &str = "PI_BENCH_ALLOCATOR";
 
-/// Release binary-size budget (MB) retained for historical `[profile.release]`
-/// (`opt-level = "z"`) perf-budget schema checks (`tests/perf_budgets.rs`).
+/// Release binary-size budget (MB) retained for `[profile.release]`
+/// (`opt-level = 3`, LTO + strip) perf-budget schema checks (`tests/perf_budgets.rs`).
 ///
 /// Shipping binaries are built by DSR with `[profile.dist]` (`opt-level = 3`,
 /// LTO + strip) with no arbitrary shipping binary-size ceiling per operator
@@ -721,13 +721,13 @@ pub fn verify_binary_size_measurement_control_with_relocated_artifact(
     )?;
     if control.cargo_profile != "release"
         || control.compiled_profile_family != "release"
-        || control.compiled_opt_level != "z"
+        || control.compiled_opt_level != "3"
         || !control.strip
         || control.profile_source != "Cargo.toml#profile.release"
         || control.build_command != "cargo build --bin pi --release"
     {
         return Err(MeasurementControlError::Invalid(
-            "release binary must prove profile=release, opt-level=z, strip=true, and the canonical build command"
+            "release binary must prove profile=release, opt-level=3, strip=true, and the canonical build command"
                 .to_string(),
         ));
     }
@@ -1239,7 +1239,7 @@ mod tests {
             "size_bytes": 23,
             "cargo_profile": "release",
             "compiled_profile_family": "release",
-            "compiled_opt_level": "z",
+            "compiled_opt_level": "3",
             "strip": true,
             "profile_source": "Cargo.toml#profile.release",
             "build_command": "cargo build --bin pi --release"

@@ -327,7 +327,8 @@ struct StressOutcome {
 fn run_stress_loop(manager: &ExtensionManager, params: &StressParams) -> StressOutcome {
     let pid = get_current_pid().expect("get pid");
     let refresh = ProcessRefreshKind::nothing().with_memory();
-    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh))
+        .expect("initialize sysinfo");
 
     let rss_baseline_kb = measure_rss_kb(&mut system, pid, refresh);
     let ps = page_size_bytes();

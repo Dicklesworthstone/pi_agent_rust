@@ -2700,7 +2700,7 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
             "size_bytes": binary_size,
             "cargo_profile": "release",
             "compiled_profile_family": "release",
-            "compiled_opt_level": "z",
+            "compiled_opt_level": "3",
             "strip": true,
             "profile_source": "Cargo.toml#profile.release",
             "build_command": "cargo build --bin pi --release"

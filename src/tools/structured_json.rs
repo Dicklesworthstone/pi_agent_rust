@@ -452,6 +452,7 @@ pub(super) fn set_worker_limits() -> io::Result<()> {
         // Darwin 22 (macOS 13) and newer enforce it in the VM map allocator.
         #[cfg(target_vendor = "apple")]
         if !sysinfo::System::kernel_version()
+            .ok()
             .and_then(|version| version.split('.').next()?.parse::<u32>().ok())
             .is_some_and(|major| major >= 22)
         {

@@ -105,7 +105,7 @@ fn assert_adapter_reaped(root: &Path) {
     let pid = sysinfo::Pid::from_u32(pid);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let mut system = sysinfo::System::new();
+        let mut system = sysinfo::System::new().expect("initialize sysinfo");
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         if system.process(pid).is_none() {
             break;

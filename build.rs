@@ -1,7 +1,7 @@
 use flate2::{Compression, GzBuilder};
 use std::fmt::Write as _;
 use std::io::Write;
-use vergen_gix::{Build, Cargo, Emitter, Gix, Rustc};
+use vergen::{Build, Cargo, Emitter, Rustc};
 
 struct EmbeddedTextAsset {
     source: &'static str,
@@ -153,9 +153,21 @@ fn resolve_repo_git_sha() -> Option<String> {
     normalize_canonical_git_sha(stdout)
 }
 
-fn emit_git_build_metadata(
-    emitter: &mut Emitter,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+fn resolve_repo_git_dirty() -> Option<bool> {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(!output.stdout.is_empty())
+}
+
+fn emit_git_build_metadata() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=PI_BUILD_GIT_SHA");
     println!("cargo:rerun-if-env-changed=VERGEN_GIT_SHA");
     println!("cargo:rerun-if-env-changed=VERGEN_GIT_DIRTY");
@@ -188,21 +200,17 @@ fn emit_git_build_metadata(
             .filter(|value| matches!(value.trim(), "true" | "false"))
             .unwrap_or_else(|| "false".to_string());
         println!("cargo:rustc-env=VERGEN_GIT_DIRTY={dirty}");
-        return Ok(None);
+        return Ok(());
     }
 
     if let Some(repo_sha) = resolve_repo_git_sha() {
-        // `Gix::builder().sha(short: bool)` -- the bool selects SHORT, it does not
-        // enable the variable (vergen-gix 9.1.0, src/gix/mod.rs:280; unchanged in
-        // 10.0, where `sha` is `with = |short: bool| ...`). Passing `.sha(false)`
-        // emits the full 40-hex SHA required by `is_full_git_sha` in perf records,
-        // while `pi --version` abbreviates it for display.
-        let gix = Gix::builder().sha(false).dirty(true).build();
-        emitter.add_instructions(&gix)?;
-        // Return the verified 40-hex repo SHA so we emit it after `emitter.emit()`
-        // as an authoritative guarantee even in linked worktrees/gitfiles where
-        // `vergen-gix` can fall back to `"unknown"`.
-        return Ok(Some(repo_sha));
+        println!("cargo:rustc-env=VERGEN_GIT_SHA={repo_sha}");
+        let dirty = match resolve_repo_git_dirty() {
+            Some(false) => "false",
+            Some(true) | None => "true",
+        };
+        println!("cargo:rustc-env=VERGEN_GIT_DIRTY={dirty}");
+        return Ok(());
     }
 
     if require_git_sha {
@@ -214,10 +222,10 @@ fn emit_git_build_metadata(
     }
 
     // Crates.io source tarballs and other non-git builds without PI_REQUIRE_GIT_SHA=1
-    // keep vergen-gix's quiet fallback behavior so `cargo install` continues to succeed.
-    let gix = Gix::builder().sha(false).dirty(true).build();
-    emitter.add_instructions(&gix)?;
-    Ok(None)
+    // fall back quietly so `cargo install` continues to succeed.
+    println!("cargo:rustc-env=VERGEN_GIT_SHA=VERGEN_IDEMPOTENT_OUTPUT");
+    println!("cargo:rustc-env=VERGEN_GIT_DIRTY=VERGEN_IDEMPOTENT_OUTPUT");
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -229,19 +237,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rustc = Rustc::builder().semver(true).build();
 
     let mut emitter = Emitter::default();
-    // Offloaded builds can temporarily miss git objects and trigger fallback warnings.
-    // Keep default env fallbacks unless PI_REQUIRE_GIT_SHA=1 is set, and suppress
-    // warning noise in build output.
     emitter
         .quiet()
         .add_instructions(&build)?
         .add_instructions(&cargo)?
         .add_instructions(&rustc)?;
-    let authoritative_repo_sha = emit_git_build_metadata(&mut emitter)?;
     emitter.emit()?;
-    if let Some(repo_sha) = authoritative_repo_sha {
-        println!("cargo:rustc-env=VERGEN_GIT_SHA={repo_sha}");
-    }
+    emit_git_build_metadata()?;
 
     Ok(())
 }

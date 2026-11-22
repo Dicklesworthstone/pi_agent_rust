@@ -1967,7 +1967,7 @@ mod fixture_lanes {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let target = sysinfo::Pid::from_u32(pid);
-            let mut system = sysinfo::System::new();
+            let mut system = sysinfo::System::new().expect("initialize sysinfo");
             system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
             if system.process(target).is_none() {
                 return true;

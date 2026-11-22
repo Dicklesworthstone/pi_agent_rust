@@ -21,10 +21,6 @@ serde = { version = "1", features = ["derive"] }
 [workspace]
 members = ["."]
 
-[build-dependencies]
-vergen-gix = { version = "=9.1.0" }
-vergen = { version = "=9.1.0" }
-
 [profile.release]
 debug = 1
 

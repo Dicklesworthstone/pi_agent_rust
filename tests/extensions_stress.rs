@@ -1893,7 +1893,8 @@ fn run_stress_loop(
 ) -> StressResult {
     let pid = get_current_pid().expect("get current PID");
     let refresh = ProcessRefreshKind::nothing().with_memory();
-    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh))
+        .expect("initialize sysinfo");
 
     // Initial RSS measurement
     system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh);
@@ -3055,7 +3056,8 @@ fn stress_extension_load_unload_cycle() {
 
     let pid = get_current_pid().expect("get PID");
     let refresh = ProcessRefreshKind::nothing().with_memory();
-    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh))
+        .expect("initialize sysinfo");
 
     system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh);
     let run_cycle = |label: &str| {

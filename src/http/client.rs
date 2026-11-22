@@ -500,73 +500,79 @@ impl<'a> RequestBuilder<'a> {
         Ok(self)
     }
 
-    pub async fn send(self) -> Result<Response> {
-        let RequestBuilder {
-            client,
-            method,
-            url,
-            headers,
-            body,
-            timeout,
-        } = self;
+    pub fn send(
+        self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response>> + Send + 'a>> {
+        Box::pin(async move {
+            let RequestBuilder {
+                client,
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+            } = self;
 
-        if let Some(recorder) = client.vcr() {
-            let recorded_request = build_recorded_request(method, &url, &headers, &body);
-            let recorded = recorder
-                .request_streaming_with(recorded_request, || async {
-                    let (status, response_headers, stream) =
-                        send_parts(client, method, &url, &headers, &body).await?;
-                    Ok((status, response_headers, stream))
-                })
-                .await?;
-            let status = recorded.status;
-            let response_headers = recorded.headers.clone();
-            let stream = recorded.into_byte_stream();
-            return Ok(Response {
+            if let Some(recorder) = client.vcr() {
+                let recorded_request = build_recorded_request(method, &url, &headers, &body);
+                let recorded = recorder
+                    .request_streaming_with(recorded_request, || async {
+                        let (status, response_headers, stream) =
+                            send_parts(client, method, &url, &headers, &body).await?;
+                        Ok((status, response_headers, stream))
+                    })
+                    .await?;
+                let status = recorded.status;
+                let response_headers = recorded.headers.clone();
+                let stream = recorded.into_byte_stream();
+                return Ok(Response {
+                    status,
+                    headers: response_headers,
+                    stream,
+                    timeout_info: None,
+                });
+            }
+
+            let send_fut = send_parts(client, method, &url, &headers, &body);
+            let resolved_timeout = resolve_timeout(timeout, &url);
+
+            let (status, response_headers, stream, timeout_info) = if let Some(duration) =
+                resolved_timeout
+            {
+                use asupersync::time::{sleep, wall_now};
+                use futures::future::{Either, FutureExt, select};
+
+                let asupersync_now = asupersync::Cx::current()
+                    .and_then(|cx| cx.timer_driver())
+                    .map_or_else(wall_now, |timer| timer.now());
+
+                let sleep_fut = sleep(asupersync_now, duration).fuse();
+                let send_fut = send_fut.fuse();
+                futures::pin_mut!(sleep_fut, send_fut);
+
+                let (status, response_headers, stream) = match select(send_fut, sleep_fut).await {
+                    Either::Left((res, _)) => res?,
+                    Either::Right(_) => {
+                        return Err(Error::api(timeout_error_message(&url, duration)));
+                    }
+                };
+                (
+                    status,
+                    response_headers,
+                    stream,
+                    Some((asupersync_now, duration)),
+                )
+            } else {
+                let (status, response_headers, stream) = send_fut.await?;
+                (status, response_headers, stream, None)
+            };
+
+            Ok(Response {
                 status,
                 headers: response_headers,
                 stream,
-                timeout_info: None,
-            });
-        }
-
-        let send_fut = send_parts(client, method, &url, &headers, &body);
-        let resolved_timeout = resolve_timeout(timeout, &url);
-
-        let (status, response_headers, stream, timeout_info) = if let Some(duration) =
-            resolved_timeout
-        {
-            use asupersync::time::{sleep, wall_now};
-            use futures::future::{Either, FutureExt, select};
-
-            let asupersync_now = asupersync::Cx::current()
-                .and_then(|cx| cx.timer_driver())
-                .map_or_else(wall_now, |timer| timer.now());
-
-            let sleep_fut = sleep(asupersync_now, duration).fuse();
-            let send_fut = send_fut.fuse();
-            futures::pin_mut!(sleep_fut, send_fut);
-
-            let (status, response_headers, stream) = match select(send_fut, sleep_fut).await {
-                Either::Left((res, _)) => res?,
-                Either::Right(_) => return Err(Error::api(timeout_error_message(&url, duration))),
-            };
-            (
-                status,
-                response_headers,
-                stream,
-                Some((asupersync_now, duration)),
-            )
-        } else {
-            let (status, response_headers, stream) = send_fut.await?;
-            (status, response_headers, stream, None)
-        };
-
-        Ok(Response {
-            status,
-            headers: response_headers,
-            stream,
-            timeout_info,
+                timeout_info,
+            })
         })
     }
 }

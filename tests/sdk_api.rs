@@ -889,7 +889,7 @@ printf '{"type":"response","id":"%s","command":"%s","success":"false"}\n' "$id" 
 
 #[cfg(unix)]
 fn rpc_fixture_process_status(pid: u32) -> Option<sysinfo::ProcessStatus> {
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().expect("initialize sysinfo");
     system.refresh_processes(
         sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
         true,

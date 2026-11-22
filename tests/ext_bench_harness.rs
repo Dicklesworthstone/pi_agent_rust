@@ -153,7 +153,8 @@ fn collect_env_fingerprint() -> EnvFingerprint {
     let sys = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing()
             .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
-    );
+    )
+    .expect("initialize sysinfo");
     let mem_total_mb = sys.total_memory() / (1024 * 1024);
 
     let build_profile = perf_build::detect_build_profile();

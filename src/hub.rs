@@ -2204,7 +2204,9 @@ pub(crate) fn send_signal_for_request(
 
 fn signal_pid_tree(pid: u32, signal: sysinfo::Signal) {
     let root = sysinfo::Pid::from_u32(pid);
-    let mut sys = sysinfo::System::new();
+    let Ok(mut sys) = sysinfo::System::new() else {
+        return;
+    };
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut children: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
     for (pid_key, proc_) in sys.processes() {

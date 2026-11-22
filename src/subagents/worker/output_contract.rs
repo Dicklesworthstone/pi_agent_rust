@@ -141,7 +141,10 @@ pub(in crate::subagents) fn batch_prompt(
 /// Answers follow native admission order, independent of model row order.
 /// Item schema validation happens afterward, so one invalid data value cannot
 /// discard peers from an otherwise valid, completely accounted-for group.
-pub(in crate::subagents) fn batch_answers(text: &str, expected: &[u64]) -> Result<Vec<BatchAnswer>> {
+pub(in crate::subagents) fn batch_answers(
+    text: &str,
+    expected: &[u64],
+) -> Result<Vec<BatchAnswer>> {
     if !valid_batch_keys(expected) {
         return Err(Error::tool("subagent", BATCH_OUTPUT));
     }
@@ -295,7 +298,8 @@ pub(super) fn preserves_typed_result(original: &Value, projected: &Value) -> boo
         .and_then(Value::as_array)
         .is_some_and(|results| {
             results.iter().any(|result| {
-                result.get("schemaValid") == Some(&Value::Bool(true)) || result.get("data").is_some()
+                result.get("schemaValid") == Some(&Value::Bool(true))
+                    || result.get("data").is_some()
             })
         });
     !typed || original == projected

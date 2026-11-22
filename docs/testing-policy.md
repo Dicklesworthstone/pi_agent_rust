@@ -457,7 +457,7 @@ missing, but it must never compare the unproven number with a threshold.
 
 - `binary_size_release` requires a `pi.perf.binary_size_measurement.v1` record
   that binds the exact binary path, SHA-256, and byte length to Cargo profile
-  `release`, profile family `release`, `opt-level = "z"`, and `strip = true`.
+  `release`, profile family `release`, `opt-level = 3`, and `strip = true`.
 - `idle_memory_rss` requires a `pi.perf.idle_rss_measurement.v1` record with the
   Cargo release build command, allocator (`system` or `jemalloc`), measured
   executable path and SHA-256, and at least five distinct interactive `pi`

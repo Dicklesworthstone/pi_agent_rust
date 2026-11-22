@@ -1712,13 +1712,11 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
         return;
     };
 
-    let opt_level = release
-        .get("opt-level")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("");
+    let opt_level = release.get("opt-level").and_then(toml::Value::as_integer);
     assert_eq!(
-        opt_level, "z",
-        "shipping release profile must stay size-budgeted"
+        opt_level,
+        Some(3),
+        "shipping release profile must optimize for speed (opt-level = 3)"
     );
     assert_eq!(
         release.get("lto").and_then(toml::Value::as_bool),
@@ -1747,7 +1745,7 @@ fn agent_release_profile_guidance_matches_cargo_and_readme() {
     let readme = require_text("README.md");
     let release_profile_tokens = [
         "[profile.release]",
-        "opt-level = \"z\"",
+        "opt-level = 3",
         "lto = true",
         "codegen-units = 1",
         "panic = \"abort\"",
@@ -2900,7 +2898,7 @@ fn validate_perf_measurement_control_source(
             if fields.len() != 7
                 || fields[0] != "release_binary_v1"
                 || fields[4] != "profile=release"
-                || fields[5] != "opt_level=z"
+                || fields[5] != "opt_level=3"
                 || fields[6] != "strip=true"
             {
                 return Err("binary_size_release has a malformed measurement proof".to_string());
@@ -4381,7 +4379,7 @@ fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
         match result["budget_name"].as_str() {
             Some("binary_size_release") => {
                 result["source"] = json!(format!(
-                    "fixture://release/pi#control=release_binary_v1;control_sha256={proof_hash};binary_sha256={proof_hash};size_bytes=50331648;profile=release;opt_level=z;strip=true"
+                    "fixture://release/pi#control=release_binary_v1;control_sha256={proof_hash};binary_sha256={proof_hash};size_bytes=50331648;profile=release;opt_level=3;strip=true"
                 ));
             }
             Some("idle_memory_rss") => {

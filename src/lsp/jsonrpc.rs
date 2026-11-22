@@ -1616,7 +1616,7 @@ mod tests {
     #[cfg(unix)]
     fn fixture_process_status(pid: u32) -> Option<sysinfo::ProcessStatus> {
         let pid = sysinfo::Pid::from_u32(pid);
-        let mut system = sysinfo::System::new();
+        let mut system = sysinfo::System::new().expect("initialize sysinfo");
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         system.process(pid).map(sysinfo::Process::status)
     }

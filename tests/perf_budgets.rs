@@ -4495,7 +4495,7 @@ fn read_binary_size(root: &Path) -> (Option<f64>, String) {
         Err(error) => return (None, error.to_string()),
     };
     let source = format!(
-        "{}#control=release_binary_v1;control_sha256={};binary_sha256={};size_bytes={};profile=release;opt_level=z;strip=true",
+        "{}#control=release_binary_v1;control_sha256={};binary_sha256={};size_bytes={};profile=release;opt_level=3;strip=true",
         display_source_path(root, &verified.control_path),
         verified.control_sha256,
         verified.binary_sha256,
@@ -6928,7 +6928,7 @@ fn write_binary_size_control_fixture(root: &Path, source_dirty: bool) -> PathBuf
         "size_bytes": 18,
         "cargo_profile": "release",
         "compiled_profile_family": "release",
-        "compiled_opt_level": "z",
+        "compiled_opt_level": "3",
         "strip": true,
         "profile_source": "Cargo.toml#profile.release",
         "build_command": "cargo build --bin pi --release"
@@ -6949,7 +6949,7 @@ fn binary_size_budget_requires_hash_bound_release_control() {
     let (actual, source) = read_binary_size(tmp.path());
     assert_eq!(actual, Some(18.0 / 1024.0 / 1024.0));
     assert!(source.contains("#control=release_binary_v1;"));
-    assert!(source.contains("profile=release;opt_level=z;strip=true"));
+    assert!(source.contains("profile=release;opt_level=3;strip=true"));
 
     write_binary_size_control_fixture(tmp.path(), true);
     let (actual, source) = read_binary_size(tmp.path());

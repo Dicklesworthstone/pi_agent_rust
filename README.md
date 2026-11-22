@@ -227,7 +227,7 @@ If you want full details, see:
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
 | **Startup** | Native single-binary path (Fresh comparative measurement pending; historical pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
-| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
+| **Binary size** | Speed-optimized release profile (LTO, strip, `opt-level = 3`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
 | **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
@@ -1694,7 +1694,7 @@ Provider-count rule: Pi has 11 native provider implementation modules. Those mod
 2. **Streaming-first**: Custom SSE parser, no blocking on responses
 3. **Process tree management**: `sysinfo` crate ensures no orphaned processes
 4. **Structured errors**: `thiserror` with specific error types per component
-5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for the size budget; published binaries use the speed-optimized `dist` profile (`opt-level = 3`)
+5. **Speed-optimized release profile**: LTO + strip + `opt-level = 3` across both `release` and `dist` profiles
 
 ### asupersync Context vs TypeScript Pi (pi-mono)
 
@@ -2760,11 +2760,11 @@ Optimization spans algorithms, execution lanes, memory movement, queue disciplin
 
 ### Release and Distribution Profiles
 
-`Cargo.toml` defines `[profile.release]` (`opt-level = "z"`) for size-oriented local builds and perf-budget schema harnesses, while DSR builds published shipping binaries with `[profile.dist]` (`opt-level = 3`):
+`Cargo.toml` defines `[profile.release]` (`opt-level = 3`) so both `cargo build --release` / `cargo install` and DSR's `[profile.dist]` shipping builds optimize for runtime speed:
 
 ```toml
 [profile.release]
-opt-level = "z"      # Optimize generated code for size
+opt-level = 3        # Optimize generated code for runtime speed
 lto = true           # Link-time optimization across all crates
 codegen-units = 1    # Single codegen unit (slower compile, better optimization)
 panic = "abort"      # No unwinding machinery

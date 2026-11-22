@@ -2873,7 +2873,7 @@ pub(crate) mod windows_job_pipe {
             if std::env::var_os(CHILD).is_some() {
                 reactor().expect("warm shared reactor");
                 let pid = sysinfo::get_current_pid().expect("current process");
-                let mut system = sysinfo::System::new();
+                let mut system = sysinfo::System::new().expect("initialize sysinfo");
                 system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
                 let process = system.process(pid).expect("current process handle");
                 let baseline = process.open_files().expect("Windows handle count");

@@ -9,22 +9,18 @@ pause, and record completion after reviewing the results.
 
 ## Availability
 
-**The published `v0.8.0` release does not include `/goal`.** The terminal
-command was [added on `main` after that release](https://github.com/Dicklesworthstone/pi_agent_rust/commit/6f5d50224eb5c893139aae64ea8d6d21b3a5f8a4).
-Installing or updating to `v0.8.0` will not add it. The
-[v0.8.0 release notes](https://github.com/Dicklesworthstone/pi_agent_rust/releases/tag/v0.8.0)
-describe that release; this page describes current `main`.
+`/goal` shipped starting in **`v0.9.0`** across both terminal interfaces. Earlier releases (`v0.8.0` and `v0.7.1`) predate the command and do not include it.
 
 | Build and interface | Can I use `/goal`? | What to do |
 | --- | --- | --- |
-| Current `main`, default FrankenTUI (`pi`, `pi --ftui`, or `pi --inline`) | Yes | Enter `/goal status` in Pi's message editor while idle |
-| Current `main`, classic terminal (`pi --classic`) | Yes | Enter `/goal status` while idle |
-| Current `main` built without the `ftui` feature | Yes | Use `/goal` in the classic terminal |
-| Published `v0.8.0` or `v0.7.1`, either terminal | No | Use the matching release docs; these releases predate the command |
+| `v0.9.0` and later, default FrankenTUI (`pi`, `pi --ftui`, or `pi --inline`) | Yes | Enter `/goal status` in Pi's message editor while idle |
+| `v0.9.0` and later, classic terminal (`pi --classic`) | Yes | Enter `/goal status` while idle |
+| `v0.9.0` and later built without the `ftui` feature | Yes | Use `/goal` in the classic terminal |
+| Published `v0.8.0` or `v0.7.1`, either terminal | No | Upgrade (`pi self-update` or `install.sh`); these releases predate `/goal` |
 
 If you cannot find the command, run `pi --version` in your shell and retain the
 **full output, including the commit hash**, along with the command you use to
-launch Pi. Some newer `main` builds still report package version `0.8.0`.
+launch Pi.
 In a supported build, `/help` and completion for `/go` show the command.
 Contributor build instructions are in [development](development.md).
 

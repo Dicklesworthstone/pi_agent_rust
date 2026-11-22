@@ -368,7 +368,6 @@ pub mod session_metrics;
 pub mod session_picker;
 #[doc(hidden)]
 pub mod session_recovery;
-#[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;
 #[doc(hidden)]

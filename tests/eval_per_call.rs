@@ -58,7 +58,7 @@ fn gone(pid: u32, descendant: bool) {
     let pid = sysinfo::Pid::from_u32(pid);
     let end = Instant::now() + Duration::from_secs(5);
     loop {
-        let mut processes = sysinfo::System::new();
+        let mut processes = sysinfo::System::new().expect("initialize sysinfo");
         processes.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
         if processes.process(pid).is_none_or(|process| {
             descendant && cfg!(unix) && process.status() == sysinfo::ProcessStatus::Zombie

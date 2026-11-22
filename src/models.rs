@@ -1515,6 +1515,119 @@ fn legacy_generated_models() -> &'static [LegacyGeneratedModel] {
         .as_slice()
 }
 
+/// Built-in model pricing lookup (USD per million tokens) from Pi's embedded catalog.
+///
+/// Prefers an exact `(provider, id)` entry with non-zero pricing, then falls back
+/// to the canonical provider's entry for `id` (skipping zero-cost subscription
+/// aliases such as `github-copilot`). Performs no network I/O.
+pub(crate) fn builtin_model_cost(provider: Option<&str>, model_id: &str) -> Option<ModelCost> {
+    static BUILTIN_COST_INDEX: OnceLock<(
+        HashMap<(String, String), ModelCost>,
+        HashMap<String, (u8, ModelCost)>,
+    )> = OnceLock::new();
+
+    let (by_provider_id, by_id) = BUILTIN_COST_INDEX.get_or_init(|| {
+        let mut by_provider_id: HashMap<(String, String), ModelCost> = HashMap::new();
+        let mut by_id: HashMap<String, (u8, ModelCost)> = HashMap::new();
+
+        let mut insert_entry = |prov: &str, id: &str, cost: ModelCost| {
+            if cost.input <= 0.0 && cost.output <= 0.0 {
+                return;
+            }
+            let prov_lower = prov.trim().to_ascii_lowercase();
+            let id_lower = id.trim().to_ascii_lowercase();
+            if prov_lower.is_empty() || id_lower.is_empty() {
+                return;
+            }
+            by_provider_id
+                .entry((prov_lower.clone(), id_lower.clone()))
+                .or_insert_with(|| cost.clone());
+            let is_canonical = (id_lower.starts_with("claude") && prov_lower == "anthropic")
+                || ((id_lower.starts_with("gpt-")
+                    || id_lower.starts_with("o1")
+                    || id_lower.starts_with("o3")
+                    || id_lower.starts_with("o4"))
+                    && prov_lower == "openai")
+                || (id_lower.starts_with("gemini") && prov_lower == "google")
+                || (id_lower.starts_with("command") && prov_lower == "cohere")
+                || (id_lower.starts_with("grok") && prov_lower == "xai")
+                || (id_lower.starts_with("deepseek") && prov_lower == "deepseek");
+            let priority = u8::from(!is_canonical);
+            match by_id.get(&id_lower) {
+                Some((existing_prio, _)) if *existing_prio <= priority => {}
+                _ => {
+                    by_id.insert(id_lower, (priority, cost));
+                }
+            }
+        };
+
+        for legacy in legacy_generated_models() {
+            if let Some(cost) = legacy.cost.clone() {
+                insert_entry(&legacy.provider, &legacy.id, cost);
+            }
+        }
+
+        // Seeded post-snapshot built-in models with explicit list pricing.
+        for (prov, id, input, output, cache_read, cache_write) in [
+            ("openai", "gpt-5.6", 5.0, 30.0, 0.5, 6.25),
+            ("openai", "gpt-5.6-sol", 5.0, 30.0, 0.5, 6.25),
+            ("openai-codex", "gpt-5.6-sol", 5.0, 30.0, 0.5, 0.0),
+            ("openai", "gpt-5.6-terra", 2.0, 12.0, 0.2, 2.5),
+            ("openai-codex", "gpt-5.6-terra", 2.0, 12.0, 0.2, 0.0),
+            ("openai", "gpt-5.6-luna", 0.2, 1.2, 0.02, 0.25),
+            ("openai-codex", "gpt-5.6-luna", 0.2, 1.2, 0.02, 0.0),
+            ("openai", "gpt-audio-1.5", 2.5, 10.0, 0.0, 0.0),
+        ] {
+            insert_entry(
+                prov,
+                id,
+                ModelCost {
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                    audio: None,
+                },
+            );
+        }
+
+        (by_provider_id, by_id)
+    });
+
+    let raw_id = model_id.trim();
+    if raw_id.is_empty() {
+        return None;
+    }
+    let id_lower = raw_id.to_ascii_lowercase();
+    let stripped_id = id_lower
+        .rsplit_once('/')
+        .map_or(id_lower.as_str(), |(_, tail)| tail);
+
+    if let Some(prov) = provider.map(str::trim).filter(|p| !p.is_empty()) {
+        let prov_lower = canonical_provider_id(prov)
+            .unwrap_or(prov)
+            .to_ascii_lowercase();
+        if let Some(cost) = by_provider_id.get(&(prov_lower.clone(), id_lower.clone())) {
+            return Some(cost.clone());
+        }
+        if stripped_id != id_lower
+            && let Some(cost) = by_provider_id.get(&(prov_lower, stripped_id.to_string()))
+        {
+            return Some(cost.clone());
+        }
+    }
+
+    if let Some((_, cost)) = by_id.get(&id_lower) {
+        return Some(cost.clone());
+    }
+    if stripped_id != id_lower
+        && let Some((_, cost)) = by_id.get(stripped_id)
+    {
+        return Some(cost.clone());
+    }
+    None
+}
+
 fn parse_upstream_provider_model_ids() -> HashMap<String, Vec<String>> {
     let parsed: HashMap<String, Vec<String>> =
         match serde_json::from_str(&crate::embedded_assets::provider_upstream_model_ids_json()) {

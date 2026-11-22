@@ -186,31 +186,99 @@ struct CostProbe {
     total: f64,
 }
 
-/// Model pricing fallback ($/MTok in, out) applied only when a session's
-/// recorded cost is zero but tokens exist (older sessions). Versioned
-/// in-tree; longest-prefix match wins. Cache read/write tokens are not
-/// priced here (rates are provider-specific), so the fallback undercounts
-/// cache-heavy sessions — recorded costs always win when present.
-const PRICING: &[(&str, f64, f64)] = &[
-    ("claude-opus-4", 15.0, 75.0),
-    ("claude-opus-3", 15.0, 75.0),
-    ("claude-sonnet-4", 3.0, 15.0),
-    ("claude-sonnet-3", 3.0, 15.0),
-    ("claude-haiku", 0.80, 4.0),
-    ("gpt-4o-mini", 0.15, 0.60),
-    ("gpt-4o", 2.50, 10.0),
-    ("gpt-4.1-mini", 0.40, 1.60),
-    ("gpt-4.1", 2.00, 8.00),
-    ("o3-mini", 1.10, 4.40),
-    ("o3", 2.00, 8.00),
+/// Model pricing fallback table (`prefix`, `input`, `output`, `cache_read`,
+/// `cache_write` in USD per million tokens) applied when a session's recorded
+/// cost is zero, tokens exist, and the model is not found in Pi's embedded
+/// built-in catalog. Longest-prefix match wins; recorded costs always win when
+/// present.
+const PRICING: &[(&str, f64, f64, f64, f64)] = &[
+    // Anthropic Claude 4.5+ Opus ($5/$25) must precede the broader claude-opus-4 ($15/$75) prefix.
+    ("claude-opus-4-8", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4.8", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-7", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4.7", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-6", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4.6", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-5", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4.5", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4", 15.0, 75.0, 1.50, 18.75),
+    ("claude-opus-3", 15.0, 75.0, 1.50, 18.75),
+    ("claude-sonnet-4", 3.0, 15.0, 0.30, 3.75),
+    ("claude-sonnet-3", 3.0, 15.0, 0.30, 3.75),
+    ("claude-haiku-4-5", 1.0, 5.0, 0.10, 1.25),
+    ("claude-haiku-4.5", 1.0, 5.0, 0.10, 1.25),
+    ("claude-haiku-4", 1.0, 5.0, 0.10, 1.25),
+    ("claude-3-5-haiku", 0.80, 4.0, 0.08, 1.0),
+    ("claude-haiku", 0.80, 4.0, 0.08, 1.0),
+    // OpenAI GPT-5 / GPT-4 / o-series
+    ("gpt-5.6-luna", 0.20, 1.20, 0.02, 0.25),
+    ("gpt-5.6-terra", 2.00, 12.0, 0.20, 2.50),
+    ("gpt-5.6", 5.00, 30.0, 0.50, 6.25),
+    ("gpt-5-nano", 0.05, 0.40, 0.005, 0.0),
+    ("gpt-5-mini", 0.25, 2.00, 0.025, 0.0),
+    ("gpt-5-pro", 15.0, 120.0, 0.0, 0.0),
+    ("gpt-5", 1.25, 10.0, 0.125, 0.0),
+    ("gpt-4o-mini", 0.15, 0.60, 0.075, 0.0),
+    ("gpt-4o", 2.50, 10.0, 1.25, 0.0),
+    ("gpt-4.1-nano", 0.10, 0.40, 0.025, 0.0),
+    ("gpt-4.1-mini", 0.40, 1.60, 0.10, 0.0),
+    ("gpt-4.1", 2.00, 8.00, 0.50, 0.0),
+    ("o4-mini", 1.10, 4.40, 0.275, 0.0),
+    ("o3-mini", 1.10, 4.40, 0.55, 0.0),
+    ("o3", 2.00, 8.00, 0.50, 0.0),
+    // Google Gemini
+    ("gemini-3-flash", 0.50, 3.00, 0.05, 0.0),
+    ("gemini-3-pro", 2.00, 12.0, 0.20, 0.0),
+    ("gemini-2.5-flash-lite", 0.10, 0.40, 0.025, 0.0),
+    ("gemini-2.5-flash", 0.30, 2.50, 0.075, 0.0),
+    ("gemini-2.5-pro", 1.25, 10.0, 0.31, 0.0),
+    ("gemini-2.0-flash", 0.10, 0.40, 0.025, 0.0),
+    // DeepSeek
+    ("deepseek-reasoner", 0.55, 2.19, 0.14, 0.0),
+    ("deepseek-chat", 0.27, 1.10, 0.07, 0.0),
 ];
 
-/// Cache-token multipliers relative to the input rate (Anthropic-style
-/// economics: cached reads are ~10% of input price, 5m writes ~125%).
-const CACHE_READ_RATE: f64 = 0.1;
-const CACHE_WRITE_RATE: f64 = 1.25;
+fn lookup_fallback_rates(provider: Option<&str>, model: &str) -> Option<(f64, f64, f64, f64)> {
+    if let Some(cost) = crate::models::builtin_model_cost(provider, model) {
+        return Some((cost.input, cost.output, cost.cache_read, cost.cache_write));
+    }
+
+    let lowered = model.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+    let normalized = lowered
+        .rsplit_once('/')
+        .map_or(lowered.as_str(), |(_, tail)| tail);
+
+    let mut best: Option<(&str, f64, f64, f64, f64)> = None;
+    for &(prefix, pin, pout, pcache_read, pcache_write) in PRICING {
+        if normalized.starts_with(prefix) && best.is_none_or(|(b, ..)| prefix.len() > b.len()) {
+            best = Some((prefix, pin, pout, pcache_read, pcache_write));
+        }
+    }
+    best.map(|(_, pin, pout, pcr, pcw)| (pin, pout, pcr, pcw))
+}
 
 #[allow(clippy::cast_precision_loss)] // token counts are far below 2^52
+fn price_fallback_for_provider(
+    provider: Option<&str>,
+    model: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> f64 {
+    let Some((pin, pout, pcache_read, pcache_write)) = lookup_fallback_rates(provider, model)
+    else {
+        return 0.0;
+    };
+    let m = |tokens: u64| tokens as f64 / 1_000_000.0;
+    let cache = m(cache_read).mul_add(pcache_read, m(cache_write) * pcache_write);
+    m(tokens_in).mul_add(pin, m(tokens_out).mul_add(pout, cache))
+}
+
+#[cfg(test)]
 fn price_fallback(
     model: &str,
     tokens_in: u64,
@@ -218,21 +286,7 @@ fn price_fallback(
     cache_read: u64,
     cache_write: u64,
 ) -> f64 {
-    let mut best: Option<(&&str, f64, f64)> = None;
-    for (prefix, pin, pout) in PRICING {
-        if model.starts_with(prefix) && best.is_none_or(|(b, _, _)| prefix.len() > b.len()) {
-            best = Some((prefix, *pin, *pout));
-        }
-    }
-    let Some((_, pin, pout)) = best else {
-        return 0.0;
-    };
-    let m = |tokens: u64| tokens as f64 / 1_000_000.0;
-    let cache = m(cache_read).mul_add(
-        pin * CACHE_READ_RATE,
-        m(cache_write) * pin * CACHE_WRITE_RATE,
-    );
-    m(tokens_in).mul_add(pin, m(tokens_out).mul_add(pout, cache))
+    price_fallback_for_provider(None, model, tokens_in, tokens_out, cache_read, cache_write)
 }
 
 /// Internal accumulator mirroring [`StatsReport`] buckets.
@@ -315,7 +369,8 @@ impl Accumulator {
                 let cost = if recorded > 0.0 {
                     recorded
                 } else {
-                    price_fallback(
+                    price_fallback_for_provider(
+                        msg.provider.as_deref(),
                         msg.model.as_deref().unwrap_or_default(),
                         tokens.input,
                         tokens.output,
@@ -736,6 +791,50 @@ mod tests {
             (report.cost.total - 18.0).abs() < 1e-6,
             "{}",
             report.cost.total
+        );
+    }
+
+    #[test]
+    fn pricing_fallback_uses_catalog_and_model_specific_rates() {
+        // Opus 4.5+ lists at $5/$25, not $15/$75 from the older claude-opus-4 prefix.
+        let opus_45 = price_fallback("claude-opus-4-5", 1_000_000, 1_000_000, 0, 0);
+        assert!((opus_45 - 30.0).abs() < 1e-6, "opus 4.5: {opus_45}");
+        let opus_46 = price_fallback("claude-opus-4-6", 1_000_000, 1_000_000, 0, 0);
+        assert!((opus_46 - 30.0).abs() < 1e-6, "opus 4.6: {opus_46}");
+        // Provider-prefixed IDs still resolve accurately.
+        let opus_46_prefixed =
+            price_fallback("anthropic/claude-opus-4-6", 1_000_000, 1_000_000, 0, 0);
+        assert!(
+            (opus_46_prefixed - 30.0).abs() < 1e-6,
+            "prefixed opus 4.6: {opus_46_prefixed}"
+        );
+        // Opus 4.0 / 4.1 retains its $15/$75 rate.
+        let opus_41 = price_fallback("claude-opus-4-1", 1_000_000, 1_000_000, 0, 0);
+        assert!((opus_41 - 90.0).abs() < 1e-6, "opus 4.1: {opus_41}");
+
+        // Haiku 4.5 lists at $1/$5, not $0.80/$4 from older Haiku 3.5.
+        let haiku_45 = price_fallback("claude-haiku-4-5", 1_000_000, 1_000_000, 0, 0);
+        assert!((haiku_45 - 6.0).abs() < 1e-6, "haiku 4.5: {haiku_45}");
+
+        // GPT-5 and Gemini 2.5 now resolve from the embedded catalog with provider-specific cache rates.
+        let gpt5 = price_fallback("gpt-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((gpt5 - 11.375).abs() < 1e-6, "gpt-5: {gpt5}");
+        let gemini_pro = price_fallback("gemini-2.5-pro", 1_000_000, 1_000_000, 1_000_000, 0);
+        assert!(
+            (gemini_pro - 11.56).abs() < 1e-6,
+            "gemini-2.5-pro: {gemini_pro}"
+        );
+        let gemini_flash = price_fallback("gemini-2.5-flash", 1_000_000, 1_000_000, 0, 0);
+        assert!(
+            (gemini_flash - 2.80).abs() < 1e-6,
+            "gemini-2.5-flash: {gemini_flash}"
+        );
+
+        // Anthropic cache read/write rates apply per-model ($0.50 read, $6.25 write for Opus 4.5).
+        let opus_cache = price_fallback("claude-opus-4-5", 0, 0, 1_000_000, 1_000_000);
+        assert!(
+            (opus_cache - 6.75).abs() < 1e-6,
+            "opus 4.5 cache: {opus_cache}"
         );
     }
 

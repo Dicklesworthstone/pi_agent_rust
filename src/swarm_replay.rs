@@ -948,7 +948,7 @@ pub fn swarm_replay_ordering_cost_units(event_count: u64) -> u64 {
     if event_count <= 1 {
         return event_count;
     }
-    let log_width = u64::from(u64::BITS - event_count.saturating_sub(1).leading_zeros());
+    let log_width = u64::from(event_count.saturating_sub(1).bit_width());
     event_count.saturating_mul(log_width)
 }
 

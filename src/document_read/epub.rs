@@ -484,12 +484,14 @@ fn chapter_text(bytes: &[u8]) -> Result<String> {
                 "title",
                 "track",
             ],
-            move |handlers: &dyn htmd::element_handler::Handlers, element: htmd::Element<'_>| {
+            move |handlers: &dyn htmd::element_handler::Handlers, element: &htmd::Element<'_>| {
                 if handler_overflow.load(Ordering::Relaxed) {
                     return None;
                 }
                 let result = if matches!(element.tag, "table" | "tr" | "td" | "th") {
-                    let content = handlers.walk_children(element.node).content;
+                    let content = handlers
+                        .walk_children(element.node, element.context)
+                        .content;
                     compact_table_content(element.tag, &content).map_or_else(
                         |_| {
                             handler_overflow.store(true, Ordering::Relaxed);
@@ -627,7 +629,8 @@ mod tests {
         assert!(text.contains("**Title:** Reader & Book"));
         assert!(text.contains("**Author:** One Author"));
         assert!(text.find("First chapter").unwrap() < text.find("Second chapter").unwrap());
-        assert!(text.contains("First & important."));
+        // htmd 0.6+ escapes inline `&` as `\&` so CommonMark renderers preserve literal ampersands.
+        assert!(text.contains(r"First \& important."));
         assert!(!text.contains("do_not_show"));
         assert!(!text.contains("Hidden title"));
     }

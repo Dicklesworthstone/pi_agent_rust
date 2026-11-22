@@ -103,11 +103,11 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 ### Release Profile
 
-The default release build optimizes for shipping size while retaining LTO:
+The default release build optimizes for runtime performance (`opt-level = 3`) with fat LTO and symbol stripping:
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize generated code for size
+opt-level = 3       # Optimize generated code for runtime speed
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead

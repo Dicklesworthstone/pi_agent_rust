@@ -2,7 +2,7 @@
 name = "pi_agent_rust"
 version = "0.9.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.97"
 description = "Native AI coding agent CLI - Rust port of Pi Agent"
 authors = ["Jeffrey Emanuel"]
 license-file = "LICENSE"
@@ -218,18 +218,18 @@ clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 clap_complete = "4.5.66"
 
 # Async runtime
-asupersync = { version = "0.5.0", default-features = false, features = ["tls-webpki-roots", "tls-native-roots", "test-internals"] }
+asupersync = { version = "0.6.2", default-features = false, features = ["tls-webpki-roots", "tls-native-roots", "test-internals"] }
 futures = "0.3"
 async-trait = "0.1"
 
 # URL reads (bd-cv653.2.2): HTML reader-mode conversion + PDF text extraction
 # htmd is lean and always on; pdf-extract adds ~6 MiB so it is opt-in
 # (release binary size budget, 22 MiB). `full` includes it.
-htmd = "0.5.5"
+htmd = "0.6.0"
 pdf-extract = { version = "0.12", optional = true }
 # Native archive/document reads. Reuse the existing flate2 backend without
 # enabling ZIP encryption, additional codecs, or the write-only zopfli backend.
-zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "=9.8.1", default-features = false, features = ["deflate-flate2"] }
 quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
 
 # URL parsing/building
@@ -247,8 +247,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
 
 # Native jq-compatible Read filters run in resource-bounded Pi workers.
-jaq-core = "=3.1.1"
-jaq-std = "=3.0.3"
+jaq-core = "=3.1.2"
+jaq-std = "=3.0.4"
 jaq-json = "=2.0.3"
 jaq-fmts = { version = "=0.1.1", default-features = false, features = ["tabular"] }
 
@@ -259,7 +259,7 @@ thiserror = "2"
 # Terminal output (rich_rust for beautiful TUI).
 # rich_rust is shared by non-TUI code paths (plain styled stdout/markdown
 # rendering in src/tui.rs and elsewhere), so it stays unconditional.
-rich_rust = { version = "0.2.3", features = ["markdown"] }
+rich_rust = { version = "0.2.4", features = ["markdown"] }
 # crossterm is the low-level terminal driver used exclusively by the
 # interactive front-end, so it is gated behind the `tui` feature.
 crossterm = { version = "0.29", optional = true }
@@ -294,11 +294,11 @@ arboard = { version = "3.6.1", optional = true }
 # flush that row before retrying, or live thinking and session replay hang.
 # Keep the crossterm backend and existing feature set; this is not a switch
 # to the native backend or an opt-in to the facade's heavier defaults.
-ftui = { version = "0.9.0", default-features = false, features = ["runtime", "crossterm"], optional = true }
+ftui = { version = "0.11.0", default-features = false, features = ["runtime", "crossterm"], optional = true }
 # Markdown rendering for the ftui conversation view. Direct dep because the
 # facade's `extras` feature enables no ftui-extras features (markdown stays
 # off); default-features off keeps the heavy extras (charts, doom, ...) out.
-ftui-extras = { version = "0.9.0", default-features = false, features = ["markdown"], optional = true }
+ftui-extras = { version = "0.11.0", default-features = false, features = ["markdown"], optional = true }
 
 # Filesystem
 dirs = "7"
@@ -311,7 +311,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 # Typed subagent results (bd-cv653.5.1): validate child yields against
 # per-task output schemas.
-jsonschema = { version = "0.58.4", default-features = false }
+jsonschema = { version = "0.62.0", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
 # default-features off: pi's session storage needs only the core engine.
@@ -333,13 +333,13 @@ crossbeam-queue = "0.3"
 # built on asupersync 0.5, the version pi itself uses, so the second copy of
 # asupersync (0.4.11) and its franken-kernel/decision/evidence 0.4.11
 # companions leave the dependency graph.
-fsqlite = { version = "0.4.10", default-features = false, features = ["native", "fts5"] }
+fsqlite = { version = "0.5.1", default-features = false, features = ["native", "fts5"] }
 # The pinned engine's prepare API excludes DDL and transaction statements.
 # Use its own parser/AST for side-effect-free validation of Bun statements and
 # structural sandbox admission; both crates are already engine dependencies.
-fsqlite-ast = "=0.4.10"
-fsqlite-parser = "=0.4.10"
-fsqlite-types = "=0.4.10"
+fsqlite-ast = "=0.5.1"
+fsqlite-parser = "=0.5.1"
+fsqlite-types = "=0.5.1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -355,7 +355,7 @@ signal-hook = "0.4.4"
 base64 = "0.23"
 blake2 = "=0.11.0"
 flate2 = "1.1.9"
-toml = "1.0.3"
+toml = "1.2.2"
 sha2 = "0.11"
 sha1 = "0.11"
 md-5 = "0.11"
@@ -367,8 +367,8 @@ regex = "1.12.3"
 ring = "0.17.14"
 semver = "1.0.27"
 crc32c = "0.6"
-ast-grep-core = "0.45"
-ast-grep-language = { version = "0.45", default-features = false, features = [
+ast-grep-core = "0.51"
+ast-grep-language = { version = "0.51", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
@@ -382,7 +382,7 @@ unicode-normalization = "0.1"
 unicode-segmentation = "=1.13.3"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "3"
-sysinfo = "0.39.6"
+sysinfo = "0.40.4"
 # BPE token counting tables (bd-cv653.7.2.1); enabled via the `bpe-tokens`
 # feature.
 tiktoken-rs = { version = "0.12.0", optional = true }
@@ -390,15 +390,15 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader"] }
 # Sampling profiler (bd-cv653.7.12.1); opt-in via the `profiler` feature —
 # internal signal handling is wrapped by the crate, keeping this crate's
 # forbid(unsafe_code) intact.
-pprof = { version = "0.14", optional = true }
-swc_common = "26.0.0"
-swc_ecma_codegen = "32.0.0"
-swc_ecma_ast = "29.0.0"
-swc_ecma_parser = "45.0.0"
-swc_ecma_transforms_base = "49.0.0"
-swc_ecma_transforms_typescript = "55.0.0"
-swc_ecma_visit = "29.0.0"
-wasmtime = { version = "48.0.10", features = ["component-model"], optional = true }
+pprof = { version = "0.15", optional = true }
+swc_common = "28.0.0"
+swc_ecma_codegen = "34.0.0"
+swc_ecma_ast = "31.0.0"
+swc_ecma_parser = "48.0.0"
+swc_ecma_transforms_base = "52.0.0"
+swc_ecma_transforms_typescript = "58.0.0"
+swc_ecma_visit = "31.0.0"
+wasmtime = { version = "51.0.0", features = ["component-model"], optional = true }
 filetime = "0.2.27"
 
 # Image processing (optional). Formats limited to what the read tool
@@ -417,19 +417,19 @@ image = { version = "0.25", optional = true, default-features = false, features 
 [build-dependencies]
 crc32c = "0.6.8"
 flate2 = "1.1.9"
-vergen-gix = { version = "10.0.1", features = ["build", "cargo", "rustc"] }
+vergen = { version = "10.0.4", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 pretty_assertions = "1"
 insta = { version = "1", features = ["filters"] }
 tempfile = "3.25.0"
-asupersync = { version = "0.5.0", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.6.2", default-features = false, features = ["test-internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
-jsonschema = { version = "0.58.4", default-features = false }
+jsonschema = { version = "0.62.0", default-features = false }
 proptest = "1.10.0"
 wat = "1.255.0"
-toml = "1.0.3"
+toml = "1.2.2"
 # Pinned to the reviewed upstream root-stack configurability change from
 # tokio-rs/loom#412. Loom 0.7.2 hard-codes the model root coroutine to 4 KiB,
 # which overflows before these hostcall models can begin exploring. The exact
@@ -475,7 +475,7 @@ harness = false
 # Keep the global jemalloc override to targets where tikv-jemallocator is a
 # supported allocator choice. BSD-family targets stay on the platform allocator.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 
 # portable-pty already uses this version. Its safe descriptor duplication lets
 # foreground PTY readers become nonblocking while retaining terminal EOF handling.
@@ -587,15 +587,14 @@ path = "tests/hostcall_queue_loom.rs"
 required-features = ["loom-tests"]
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
 
 # Shipped release binaries: dsr builds `--profile dist`. Same LTO, codegen,
-# panic and strip settings as `release`, optimised for speed instead of size.
-# `release` stays the size-budgeted profile that scripts/perf measures.
+# panic, strip, and speed optimization settings (`opt-level = 3`) as `release`.
 [profile.dist]
 inherits = "release"
 opt-level = 3

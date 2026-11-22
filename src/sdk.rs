@@ -9038,7 +9038,7 @@ printf sdk-owned-command-key
             "credential helper root must be reaped before the call settles"
         );
         let child = sysinfo::Pid::from_u32(read_pid("credential-child.pid"));
-        let mut processes = sysinfo::System::new();
+        let mut processes = sysinfo::System::new().expect("initialize sysinfo");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             processes.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[child]), true);

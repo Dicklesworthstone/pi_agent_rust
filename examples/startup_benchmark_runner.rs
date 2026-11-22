@@ -130,7 +130,7 @@ pub struct VerificationReport {
 }
 
 pub fn detect_environment(git_commit: String) -> HostEnvironmentFingerprint {
-    let mut sys = sysinfo::System::new_all();
+    let mut sys = sysinfo::System::new_all().expect("initialize sysinfo");
     sys.refresh_all();
 
     let cpu_brand = sys

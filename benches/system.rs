@@ -174,7 +174,8 @@ fn sample_interactive_idle_rss(
         let pid = sysinfo::Pid::from_u32(pid);
         let mut system = System::new_with_specifics(
             RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
-        );
+        )
+        .expect("initialize sysinfo");
         system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[pid]),
             true,
@@ -700,7 +701,8 @@ fn bench_memory_version(c: &mut Criterion) {
             let pid = sysinfo::Pid::from_u32(child.id());
             let mut system = System::new_with_specifics(
                 RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
-            );
+            )
+            .expect("initialize sysinfo");
             system.refresh_processes_specifics(
                 sysinfo::ProcessesToUpdate::Some(&[pid]),
                 true,

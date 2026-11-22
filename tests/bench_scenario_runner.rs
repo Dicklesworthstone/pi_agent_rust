@@ -190,7 +190,7 @@ fn current_executable_identity() -> &'static std::result::Result<(PathBuf, Strin
 }
 
 fn env_fingerprint() -> Value {
-    let mut system = System::new();
+    let mut system = System::new().expect("initialize sysinfo");
     system.refresh_cpu_all();
     system.refresh_memory();
 
@@ -200,7 +200,7 @@ fn env_fingerprint() -> Value {
         .map_or_else(|| "unknown".to_string(), |cpu| cpu.brand().to_string());
     let cpu_cores = u32::try_from(system.cpus().len()).unwrap_or(u32::MAX);
     let mem_total_mb = system.total_memory() / 1024 / 1024;
-    let os = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
+    let os = System::long_os_version().unwrap_or_else(|_| std::env::consts::OS.to_string());
     let arch = std::env::consts::ARCH.to_string();
     let git_commit =
         option_env!("VERGEN_GIT_SHA").map_or_else(|| "unknown".to_string(), ToString::to_string);
